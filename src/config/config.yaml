@@ -60,7 +60,20 @@ supertable:
   # checksums (content-addressed object store, ZFS, etc.) —
   # skipping the scan trades that storage-layer guarantee for
   # faster cold opens.
-  verify_crc_on_open: true
+  # When the engine verifies a superfile's stored checksums.
+  #
+  #   auto   - verify where bytes arrive and not where they are read, which
+  #            is what Lucene, Elasticsearch and OpenSearch do. The default.
+  #   always - verify the whole blob and every subsection on each open. The
+  #            strictest and by far the most expensive setting.
+  #   never  - never verify; appropriate only where the storage beneath
+  #            already guarantees integrity end to end.
+  crc_verification: auto
+
+  # Deprecated, still honoured so a configuration naming it keeps the
+  # behaviour it asked for: true means `always`, false means `never`.
+  # `crc_verification` wins when both are set.
+  # verify_crc_on_open: true
 
 # Persistent storage wiring. Defaults to in-memory-only. Set
 # `backend: s3` plus `bucket` / `prefix` to make

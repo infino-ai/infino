@@ -26,6 +26,7 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
@@ -114,7 +115,7 @@ fn cache_with_threshold(
         mmap_cold_threshold_secs: threshold_secs,
         mmap_sweep_interval_secs: sweep_interval_secs,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");

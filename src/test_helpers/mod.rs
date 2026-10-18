@@ -106,6 +106,7 @@ use tracing::{Level, subscriber::with_default};
 use tracing_subscriber::fmt;
 
 use crate::{
+    config::CrcVerification,
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
@@ -143,7 +144,7 @@ pub fn default_disk_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
@@ -170,7 +171,7 @@ pub fn lazy_foreground_disk_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);

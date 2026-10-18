@@ -357,10 +357,15 @@ impl DiskCacheStore {
             buf
         };
         let foreground_bytes = Bytes::from(buffer);
+        // Not a landing: this buffer answers the query in flight and the
+        // durable copy is verified by the finalizer below, so checking here
+        // would scan the same bytes twice on the cold path. The buffer
+        // arrived under TLS, which is the guarantee the read path relies on
+        // in every engine we are matching.
         let foreground_reader = SuperfileReader::open_with(
             foreground_bytes,
             OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
+                verify_crc: self.config.crc_verification.verifies_on_open(),
             },
         )?;
         let foreground_reader = Arc::new(foreground_reader);
@@ -820,15 +825,30 @@ impl DiskCacheStore {
         self.cold_fetch_to_disk(&fetch_storage, &storage_uri, &tmp, size)
             .await?;
 
-        // Promote to final path + open as mmap.
-        tokio::fs::rename(&tmp, &final_path).await?;
-        let (mmap, bytes) = mmap_readonly_with_handle(&final_path).map_err(DiskCacheError::Io)?;
-        let reader = SuperfileReader::open_with(
+        // A landing: the whole superfile has just been written to local disk,
+        // the one copy nothing else guards. Verify it once here rather than
+        // on every open of it hereafter.
+        //
+        // Before the promote, not after, and that order is the whole of it.
+        // A file that fails here must never reach the name a later read — or
+        // a later process scanning this directory — would adopt, because
+        // adoption does not re-check it. The two other fill paths verify
+        // their tempfile for the same reason; the mmap survives the rename,
+        // since it is the same inode under a new name.
+        let (mmap, bytes) = mmap_readonly_with_handle(&tmp).map_err(DiskCacheError::Io)?;
+        let reader = match SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: self.config.verify_crc_on_open,
+                verify_crc: self.config.crc_verification.verifies_on_landing(),
             },
-        )?;
+        ) {
+            Ok(reader) => reader,
+            Err(error) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(error.into());
+            }
+        };
+        tokio::fs::rename(&tmp, &final_path).await?;
         let entry = self.build_mmap_entry(Arc::new(reader), mmap, size, None);
 
         let entry = self.admit_entry(*uri, entry);
@@ -952,11 +972,12 @@ async fn finalize_to_mmap(
             guard.sync_all().await?;
         }
         drop(file);
+        // A landing: the finalizer has just completed the file on disk.
         let (mmap, bytes) = mmap_readonly_with_handle(&tmp_path)?;
         let reader = SuperfileReader::open_with(
             bytes,
             OpenOptions {
-                verify_crc: store.config.verify_crc_on_open,
+                verify_crc: store.config.crc_verification.verifies_on_landing(),
             },
         )?;
         // Swap in over the buffered entry, which already carries the whole-size charge. The
@@ -1432,10 +1453,12 @@ async fn lazy_background_fill(
                     .await?
             }
             None => {
+                // A landing: the background fill has just downloaded the
+                // whole superfile and is about to promote it.
                 let reader = SuperfileReader::open_with(
                     bytes,
                     OpenOptions {
-                        verify_crc: store.config.verify_crc_on_open,
+                        verify_crc: store.config.crc_verification.verifies_on_landing(),
                     },
                 )?;
                 store.build_mmap_entry(Arc::new(reader), mmap_arc, size, None)

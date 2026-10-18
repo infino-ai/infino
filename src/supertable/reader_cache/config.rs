@@ -13,7 +13,7 @@ use std::{
     time::Duration,
 };
 
-use crate::supertable::manifest::SuperfileUri;
+use crate::{config::CrcVerification, supertable::manifest::SuperfileUri};
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -140,14 +140,14 @@ pub struct DiskCacheConfig {
     pub promotion_defer_timeout: Duration,
     /// Pluggable eviction policy. Default: [`LruPolicy`].
     pub eviction: Box<dyn CacheEvictionPolicy>,
-    /// Whether the cache's `SuperfileReader::open` calls
-    /// verify CRC. Default `true`. Plumbed independently
-    /// from the supertable's own `verify_crc_on_open` so
-    /// callers constructing a `DiskCacheStore` directly can
-    /// set the right value for their storage backend; the
-    /// supertable typically sets both knobs from the same
-    /// `Config::supertable::verify_crc_on_open` source.
-    pub verify_crc_on_open: bool,
+    /// When the cache verifies a superfile's checksums. Under the
+    /// default [`CrcVerification::Auto`] that is once, as the bytes
+    /// land on the cache disk, and not again on each open of the
+    /// copy they wrote. Plumbed independently from the supertable's
+    /// own policy so callers constructing a `DiskCacheStore`
+    /// directly can set the right value for their storage backend;
+    /// the supertable sets both from one source.
+    pub crc_verification: CrcVerification,
 }
 
 /// Default Tier-1 disk-cache byte budget (10 GiB).
@@ -183,7 +183,7 @@ impl Default for DiskCacheConfig {
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
             promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::default(),
         }
     }
 }
@@ -380,7 +380,7 @@ mod tests {
             config.mmap_sweep_interval_secs,
             DEFAULT_MMAP_SWEEP_INTERVAL_SECS
         );
-        assert!(config.verify_crc_on_open);
+        assert_eq!(config.crc_verification, CrcVerification::Auto);
 
         // The Debug impl elides the boxed policy but must keep the
         // tuning knobs readable for log lines.
@@ -407,6 +407,10 @@ mod tests {
         ] {
             assert!(debug.contains(field), "Debug must print {field}: {debug}");
         }
-        assert!(cfg.verify_crc_on_open, "CRC verification defaults on");
+        assert_eq!(
+            cfg.crc_verification,
+            CrcVerification::Auto,
+            "the cache mirrors the supertable's default policy"
+        );
     }
 }

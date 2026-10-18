@@ -47,6 +47,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
     Bm25SearchOptions,
+    config::CrcVerification,
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
@@ -187,7 +188,7 @@ fn build_supertable() -> (Supertable, Vec<TempDir>) {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: false,
+        crc_verification: CrcVerification::Never,
         ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("disk cache");

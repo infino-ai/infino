@@ -20,6 +20,7 @@ use std::{
 
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::SuperfileReader,
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
@@ -822,7 +823,7 @@ fn fresh_disk_cache_with_mode(
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         promotion_defer_timeout: BENCH_PROMOTION_DEFER_TIMEOUT,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: false,
+        crc_verification: CrcVerification::Never,
     };
     let cache = DiskCacheStore::new_unpinned(storage, cfg).expect("DiskCacheStore");
     (dir, cache)

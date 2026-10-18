@@ -42,6 +42,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
     OptimizeOptions,
+    config::CrcVerification,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
@@ -199,7 +200,7 @@ fn fresh_cache(storage: Arc<dyn StorageProvider>) -> (TempDir, Arc<DiskCacheStor
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: false,
+        crc_verification: CrcVerification::Never,
         ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");

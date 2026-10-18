@@ -20,6 +20,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
+    config::CrcVerification,
     storage::{LocalFsStorageProvider, StorageProvider},
     supertable::{
         Supertable, SupertableOptions,
@@ -301,7 +302,7 @@ fn tombstoned_covered_segment_demotes_to_residual() {
         mmap_cold_threshold_secs: MMAP_TIMER_DISABLED_SECS,
         mmap_sweep_interval_secs: MMAP_TIMER_DISABLED_SECS,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);

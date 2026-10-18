@@ -245,14 +245,94 @@ pub struct SupertableSettings {
     /// every this many bytes and builds one superfile per piece, so the file count follows the
     /// data volume rather than the core count. `0` falls back to one piece per pool thread.
     pub superfile_buffer_split_mb: u64,
-    /// Verify the trailing whole-blob CRC and per-subsection
-    /// CRCs on every `SuperfileReader::open`. Defaults to
-    /// `true`. Set to `false` only when the underlying
-    /// storage already validates checksums (content-
-    /// addressed object store, ZFS, etc.) — skipping the
-    /// scan trades that storage-layer guarantee for faster
-    /// cold opens.
-    pub verify_crc_on_open: bool,
+    /// Deprecated in favour of [`Self::crc_verification`], and still read so
+    /// that a configuration naming it keeps the behaviour it asked for.
+    /// `Some(true)` means [`CrcVerification::Always`], `Some(false)` means
+    /// [`CrcVerification::Never`]. Unknown fields are dropped silently by
+    /// this loader, so removing it outright would turn an operator's explicit
+    /// choice into a default without saying so.
+    pub verify_crc_on_open: Option<bool>,
+
+    /// When the engine verifies a superfile's checksums. See
+    /// [`CrcVerification`]. Takes precedence over
+    /// [`Self::verify_crc_on_open`] when both are set.
+    pub crc_verification: Option<CrcVerification>,
+}
+
+/// When the engine verifies a superfile's stored checksums.
+///
+/// Checksums are always written. This decides when they are read back, which
+/// is a cost question rather than a correctness one: the bytes are the same
+/// either way, and verification only decides whether a corrupt copy is
+/// noticed before it is used.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrcVerification {
+    /// Verify where bytes arrive and not where they are read, which is what
+    /// Lucene, Elasticsearch and OpenSearch do. The default.
+    #[default]
+    Auto,
+    /// Verify the whole blob and every subsection on each open. The strictest
+    /// setting and by far the most expensive: on a billion-document table it
+    /// costs about a hundred times the CPU and a hundred and fifty times the
+    /// peak memory of the queries it precedes.
+    Always,
+    /// Never verify. Appropriate only where the storage beneath already
+    /// guarantees integrity end to end.
+    Never,
+}
+
+impl CrcVerification {
+    /// Whether an open verifies the blob's stored checksums.
+    ///
+    /// The single place the policy becomes a yes or no, so the phases that
+    /// change what `Auto` means change it here and nowhere else.
+    pub fn verifies_on_open(self) -> bool {
+        match self {
+            Self::Always => true,
+            // `Auto` verifies where bytes arrive, not where they are read, so
+            // an open verifies nothing. Lucene, Elasticsearch and OpenSearch
+            // all read without recomputing a checksum, and this is the line
+            // that makes us match them.
+            Self::Auto | Self::Never => false,
+        }
+    }
+
+    /// Whether bytes are verified as they land in the local disk cache.
+    ///
+    /// This is where `Auto` does its checking. A cached superfile is the one
+    /// copy of the data nothing else guards: in flight it is covered by TLS,
+    /// and at rest in the object store by the provider, but the local file is
+    /// written by this process and validated by nobody. Checking it once as
+    /// it lands costs a single pass over bytes already in hand, where
+    /// checking at open costs that pass again on every process start.
+    ///
+    /// This is the same boundary Elasticsearch verifies at, where a segment
+    /// received from another node is checksummed as it is written rather than
+    /// when it is later read.
+    pub fn verifies_on_landing(self) -> bool {
+        match self {
+            Self::Auto | Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+impl SupertableSettings {
+    /// The checksum policy in force, reconciling the current field with the
+    /// deprecated one.
+    ///
+    /// Explicit beats default in both directions, which is the point: an
+    /// operator who asked for verification keeps it when the default moves,
+    /// and one who turned it off does not have it turned back on.
+    pub fn crc_policy(&self) -> CrcVerification {
+        match (self.crc_verification, self.verify_crc_on_open) {
+            (Some(policy), _) => policy,
+            (None, Some(true)) => CrcVerification::Always,
+            (None, Some(false)) => CrcVerification::Never,
+            (None, None) => DEFAULT_CRC_VERIFICATION,
+        }
+    }
 }
 
 impl Default for SupertableSettings {
@@ -263,14 +343,16 @@ impl Default for SupertableSettings {
             id_column: default_id_column(),
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
-            verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
+            verify_crc_on_open: None,
+            crc_verification: None,
         }
     }
 }
 
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
-const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
+/// The policy when a configuration names neither field.
+const DEFAULT_CRC_VERIFICATION: CrcVerification = CrcVerification::Auto;
 
 // Compaction defaults
 const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
@@ -2441,6 +2523,129 @@ supertable:
         assert_eq!(cfg.vector.user_centroids, CentroidAlignment::Local);
         assert_eq!(cfg.vector.drain_consolidate, DrainConsolidate::Kmeans);
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
+    }
+
+    /// The shipped configuration must name a policy the loader understands,
+    /// and it must be the one this work is introducing. Asserted against the
+    /// embedded default rather than a literal so the file and the type cannot
+    /// drift apart silently.
+    #[test]
+    fn the_shipped_default_is_auto() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.supertable.crc_policy(), CrcVerification::Auto);
+    }
+
+    /// Where each policy verifies. The two questions are independent, and
+    /// `Auto` is the only value that answers them differently: it is the
+    /// whole of what "verify when bytes move, not when they are read" means.
+    #[test]
+    fn each_policy_decides_where_it_verifies() {
+        let cases = [
+            (CrcVerification::Always, true, true),
+            (CrcVerification::Auto, false, true),
+            (CrcVerification::Never, false, false),
+        ];
+        for (policy, on_open, on_landing) in cases {
+            assert_eq!(policy.verifies_on_open(), on_open, "{policy:?} at an open");
+            assert_eq!(
+                policy.verifies_on_landing(),
+                on_landing,
+                "{policy:?} when bytes land"
+            );
+        }
+    }
+
+    /// `Never` means never, at either boundary. Worth its own assertion
+    /// because the landing check was added after the open check, and an
+    /// operator who turned verification off must not have it reappear
+    /// somewhere new.
+    #[test]
+    fn never_verifies_at_neither_boundary() {
+        assert!(!CrcVerification::Never.verifies_on_open());
+        assert!(!CrcVerification::Never.verifies_on_landing());
+    }
+
+    /// A configuration naming neither field gets the default policy. This is
+    /// the case every existing deployment without an opinion lands in.
+    #[test]
+    fn naming_neither_field_gives_the_default() {
+        let settings = SupertableSettings::default();
+        assert_eq!(settings.verify_crc_on_open, None);
+        assert_eq!(settings.crc_verification, None);
+        // Named, not compared against the constant: a test that reads the
+        // constant back cannot notice the constant changing, which is the
+        // one thing worth noticing here.
+        assert_eq!(settings.crc_policy(), CrcVerification::Auto);
+    }
+
+    /// The deprecated boolean still decides the policy when it is the only
+    /// thing set. The loader drops unknown fields silently, so dropping this
+    /// field instead of honouring it would turn an operator's explicit choice
+    /// into a default without any diagnostic.
+    #[test]
+    fn the_deprecated_boolean_is_still_honoured() {
+        for (set, expected) in [
+            (true, CrcVerification::Always),
+            (false, CrcVerification::Never),
+        ] {
+            let cfg =
+                Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                    Serialized::defaults(json!({
+                        "supertable": { "verify_crc_on_open": set, "crc_verification": null }
+                    })),
+                ))
+                .expect("config with the deprecated field loads");
+            assert_eq!(
+                cfg.supertable.crc_policy(),
+                expected,
+                "verify_crc_on_open: {set} must still mean {expected:?}"
+            );
+        }
+    }
+
+    /// With both set the current field wins, so a deployment can adopt the
+    /// new name without first deleting the old one.
+    #[test]
+    fn the_current_field_beats_the_deprecated_one() {
+        let cfg = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({
+                "supertable": { "verify_crc_on_open": true, "crc_verification": "never" }
+            })),
+        ))
+        .expect("config naming both loads");
+        assert_eq!(cfg.supertable.crc_policy(), CrcVerification::Never);
+    }
+
+    /// Every value parses from the spelling the configuration file uses.
+    #[test]
+    fn every_policy_parses_from_yaml() {
+        for (text, expected) in [
+            ("auto", CrcVerification::Auto),
+            ("always", CrcVerification::Always),
+            ("never", CrcVerification::Never),
+        ] {
+            let cfg =
+                Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                    Serialized::defaults(json!({
+                        "supertable": { "crc_verification": text }
+                    })),
+                ))
+                .unwrap_or_else(|e| panic!("crc_verification: {text} must parse: {e}"));
+            assert_eq!(cfg.supertable.crc_policy(), expected);
+        }
+    }
+
+    /// What each policy decides at an open. This is the whole of the
+    /// behaviour today, and the one place a later phase changes, so it is
+    /// pinned here to make that change visible rather than incidental.
+    #[test]
+    fn each_policy_decides_whether_an_open_verifies() {
+        assert!(CrcVerification::Always.verifies_on_open());
+        assert!(!CrcVerification::Never.verifies_on_open());
+        assert!(
+            !CrcVerification::Auto.verifies_on_open(),
+            "auto verifies where bytes arrive, so an open verifies nothing"
+        );
     }
 
     #[test]

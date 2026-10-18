@@ -98,8 +98,8 @@ use bytes::Bytes;
 use infino::{
     Bm25SearchOptions,
     config::{
-        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-        SupertableSettings,
+        CompactionSettings, Config, CrcVerification, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings,
     },
     runtime_metrics::UsageMeter,
     superfile::{
@@ -2192,7 +2192,7 @@ pub(crate) mod diag {
             mmap_cold_threshold_secs: 0,
             mmap_sweep_interval_secs: 0,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::Always,
             ..Default::default()
         };
         let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);

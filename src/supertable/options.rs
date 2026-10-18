@@ -69,7 +69,10 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
+    config::{
+        Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
+        ThreadCount,
+    },
     memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -607,7 +610,7 @@ pub struct SupertableOptions {
     /// underlying storage already validates checksums —
     /// content-addressed object stores, ZFS, etc. — to skip
     /// the scan.
-    pub verify_crc_on_open: bool,
+    pub crc_verification: CrcVerification,
     /// Read-path freshness policy. The query path checks the manifest
     /// pointer for the caller per this setting (see [`Consistency`]);
     /// the application never refreshes by hand. Default:
@@ -801,7 +804,7 @@ impl SupertableOptions {
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::default(),
             read_consistency: Consistency::default(),
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
@@ -1048,11 +1051,25 @@ impl SupertableOptions {
         self
     }
 
-    /// Override whether the supertable's `SuperfileReader::open`
-    /// calls verify CRC on the embedded vector blob. Default
-    /// `true`. See [`Self::verify_crc_on_open`].
+    /// Override whether this table's `SuperfileReader::open` calls
+    /// verify checksums. See [`Self::with_crc_verification`] for the
+    /// three-valued setting this is a shim over.
+    ///
+    /// Kept for callers written against the boolean. `true` maps to
+    /// [`CrcVerification::Always`] rather than to the default, because a
+    /// caller passing `true` asked for verification at open and must keep
+    /// it now that the default verifies at a different boundary.
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
-        self.verify_crc_on_open = v;
+        self.crc_verification = match v {
+            true => CrcVerification::Always,
+            false => CrcVerification::Never,
+        };
+        self
+    }
+
+    /// When this table verifies a superfile's stored checksums.
+    pub fn with_crc_verification(mut self, policy: CrcVerification) -> Self {
+        self.crc_verification = policy;
         self
     }
 
@@ -1076,13 +1093,17 @@ impl SupertableOptions {
         self
     }
 
-    /// Build the `SuperfileReader::open_with` options that
-    /// match the current `verify_crc_on_open` setting. Used
-    /// by every supertable-internal callsite that opens a
-    /// superfile so the global config knob applies uniformly.
+    /// Build the `SuperfileReader::open_with` options this table's
+    /// checksum policy calls for at an open. Used by every
+    /// supertable-internal callsite that opens a superfile so the
+    /// policy applies uniformly.
+    ///
+    /// An open is one of the two boundaries the policy distinguishes;
+    /// the disk cache asks about the other one, where bytes land,
+    /// through `CrcVerification::verifies_on_landing`.
     pub(crate) fn superfile_open_options(&self) -> OpenOptions {
         OpenOptions {
-            verify_crc: self.verify_crc_on_open,
+            verify_crc: self.crc_verification.verifies_on_open(),
         }
     }
 
@@ -1139,7 +1160,7 @@ impl SupertableOptions {
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
-        self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        self.crc_verification = cfg.supertable.crc_policy();
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
         self.target_recall = cfg.vector.target_recall;
         self.drain_consolidate = cfg.vector.drain_consolidate;
@@ -1233,7 +1254,7 @@ impl SupertableOptions {
                     cfg.storage.promotion_defer_timeout_secs,
                 ),
                 eviction: Box::new(LruPolicy::new()),
-                verify_crc_on_open: cfg.supertable.verify_crc_on_open,
+                crc_verification: cfg.supertable.crc_policy(),
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
@@ -1820,7 +1841,7 @@ supertable:
     fn new_sets_documented_defaults() {
         let opts = plain_opts();
         assert!(opts.prepopulate_cache_on_commit);
-        assert!(opts.verify_crc_on_open);
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(opts.storage.is_none());
         assert!(opts.disk_cache.is_none());
         assert!(opts.memory_budget_bytes.is_none());
@@ -1890,7 +1911,7 @@ supertable:
         assert_eq!(opts.put_multipart_threshold_bytes, 1);
         assert_eq!(opts.memory_budget_bytes, Some(1 << 30));
         assert!(!opts.prepopulate_cache_on_commit);
-        assert!(!opts.verify_crc_on_open);
+        assert_eq!(opts.crc_verification, CrcVerification::Never);
     }
 
     #[test]
@@ -1945,11 +1966,22 @@ supertable:
     }
 
     #[test]
-    fn superfile_open_options_track_verify_crc_flag() {
+    fn superfile_open_options_track_the_crc_policy() {
+        // The default is `Auto`, which verifies where bytes arrive rather
+        // than at an open, so the open options it produces verify nothing.
         let opts = plain_opts();
-        assert!(opts.superfile_open_options().verify_crc);
-        let opts = opts.with_verify_crc_on_open(false);
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(!opts.superfile_open_options().verify_crc);
+
+        // The boolean builder still means what it meant: `true` asks for
+        // verification and gets the strict policy, not the default.
+        let strict = plain_opts().with_verify_crc_on_open(true);
+        assert_eq!(strict.crc_verification, CrcVerification::Always);
+        assert!(strict.superfile_open_options().verify_crc);
+
+        let off = plain_opts().with_verify_crc_on_open(false);
+        assert_eq!(off.crc_verification, CrcVerification::Never);
+        assert!(!off.superfile_open_options().verify_crc);
     }
 
     #[test]

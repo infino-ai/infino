@@ -36,6 +36,7 @@ use std::{collections::HashSet, sync::Arc, thread};
 
 use arrow_array::{LargeStringArray, RecordBatch};
 use infino::{
+    config::CrcVerification,
     supertable::{
         Supertable,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
@@ -191,7 +192,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);

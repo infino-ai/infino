@@ -2344,7 +2344,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::OptimizeOptions,
+        config::{CrcVerification, OptimizeOptions},
         storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
@@ -4072,7 +4072,7 @@ mod tests {
             mmap_cold_threshold_secs: 0,
             mmap_sweep_interval_secs: 0,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::Always,
             ..Default::default()
         };
         let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> =
@@ -4240,7 +4240,7 @@ mod tests {
             mmap_cold_threshold_secs: 0,
             mmap_sweep_interval_secs: 0,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::Always,
             ..Default::default()
         };
         let pinned_fn: Arc<dyn Fn() -> std::collections::HashSet<SuperfileUri> + Send + Sync> =
@@ -4446,7 +4446,7 @@ mod tests {
             mmap_cold_threshold_secs: 0,
             mmap_sweep_interval_secs: 0,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::Always,
             ..Default::default()
         };
         let pinned_fn: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> =

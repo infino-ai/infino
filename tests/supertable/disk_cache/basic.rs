@@ -40,6 +40,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
     supertable::{
         SuperfileUri,
@@ -183,7 +184,7 @@ fn fresh_cache_with_storage(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");
@@ -328,7 +329,7 @@ async fn eviction_respects_pinned_set() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let cache = DiskCacheStore::new(Arc::clone(&local), cfg, pinned).expect("cache");
@@ -377,7 +378,7 @@ async fn lru_evicts_oldest_unpinned_when_budget_pressure_hits() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");
@@ -428,7 +429,7 @@ async fn reservation_race_preserves_budget_invariant() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let cache = DiskCacheStore::new_unpinned(Arc::clone(&local), cfg).expect("cache");

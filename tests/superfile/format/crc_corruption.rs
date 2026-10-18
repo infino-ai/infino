@@ -23,8 +23,9 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::{
-        SuperfileReader,
+        OpenOptions, SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         format::fts::VERSION_CURRENT,
         vector::distance::normalize,
@@ -139,6 +140,20 @@ fn locate_blobs(bytes: &[u8]) -> ((usize, usize), (usize, usize)) {
 
 /// Flip a single byte in the buffer (XOR with 0xFF) and try to reopen
 /// the superfile. Asserts that open returns Err.
+/// Offset of `postings_offset` within the FTS header.
+const FTS_POSTINGS_OFFSET: usize = 32;
+/// Offset of `doc_lengths_table_offset` within the FTS header.
+const FTS_DOC_LENGTHS_DIR_OFFSET: usize = 40;
+
+/// A `u64` header field, read relative to the FTS blob's start.
+fn header_u64(bytes: &[u8], fts_off: usize, field: usize) -> usize {
+    u64::from_le_bytes(
+        bytes[fts_off + field..fts_off + field + 8]
+            .try_into()
+            .expect("eight header bytes"),
+    ) as usize
+}
+
 fn assert_corruption_rejected(mut bytes: Vec<u8>, position: usize, label: &str) {
     bytes[position] ^= CORRUPTION_FLIP_MASK;
     let result = SuperfileReader::open(Bytes::from(bytes));
@@ -259,6 +274,126 @@ fn corrupt_parquet_trailing_magic_rejected() {
     let bytes = build_corruptable_superfile();
     let target = bytes.len() - 1;
     assert_corruption_rejected(bytes, target, "parquet/trailing magic");
+}
+
+/// Each corruptible region, opened under each policy.
+///
+/// This is the pair the phase turns on: `always` must still reject every
+/// region it rejected before, and `auto` must open every one of them, because
+/// `auto` verifies where bytes arrive rather than where they are read. Both
+/// halves matter. Without the first, the strict mode quietly stopped being
+/// strict; without the second, the phase did not do what it claims and the
+/// cost it was for is still being paid.
+///
+/// Every region is listed rather than one standing in for the rest: the
+/// checks are separate code paths behind one flag, and a flag that reaches
+/// some of them and not others would pass a single-region test. The
+/// doc-lengths directory is deliberately not among them; see the test below
+/// for why it behaves differently.
+#[test]
+fn always_rejects_every_region_that_auto_opens() {
+    /// A region to corrupt: a label, and where in the bytes it lives.
+    type Region = (&'static str, fn(&[u8]) -> usize);
+
+    let regions: [Region; 3] = [
+        ("fts/dict body", |b| locate_blobs(b).0.0 + 100),
+        ("fts/postings region", |b| {
+            let ((fts_off, _), _) = locate_blobs(b);
+            fts_off + header_u64(b, fts_off, FTS_POSTINGS_OFFSET) + 8
+        }),
+        ("fts/doc-lengths array", |b| {
+            let ((fts_off, fts_len), _) = locate_blobs(b);
+            fts_off + fts_len - 8
+        }),
+    ];
+
+    for (label, locate) in regions {
+        let clean = build_corruptable_superfile();
+        let target = locate(&clean);
+
+        let mut corrupt = clean.clone();
+        corrupt[target] ^= CORRUPTION_FLIP_MASK;
+
+        let strict = SuperfileReader::open_with(
+            Bytes::from(corrupt.clone()),
+            OpenOptions {
+                verify_crc: CrcVerification::Always.verifies_on_open(),
+            },
+        );
+        assert!(
+            strict.is_err(),
+            "always must still reject corruption at {label} (byte {target})"
+        );
+
+        let relaxed = SuperfileReader::open_with(
+            Bytes::from(corrupt),
+            OpenOptions {
+                verify_crc: CrcVerification::Auto.verifies_on_open(),
+            },
+        );
+        assert!(
+            relaxed.is_ok(),
+            "auto must open despite corruption at {label} (byte {target}); \
+             it verifies where bytes arrive, not here"
+        );
+    }
+}
+
+/// Corruption of a structural field is refused whatever the policy says,
+/// because it is not caught by a checksum at all.
+///
+/// The doc-lengths directory holds each column's absolute array offset. A
+/// flipped byte there makes the offset point outside the blob, and the open
+/// path's bounds checks reject it before any CRC is consulted. So `auto` is
+/// not blind: it gives up the checksums, not the structural validation.
+///
+/// This is also the signal the later discard-and-refetch phase keys on. A
+/// malformed structure is a corrupt cached copy announcing itself, which is
+/// exactly when refetching the authoritative bytes is the right response.
+#[test]
+fn a_corrupt_structural_field_is_refused_under_every_policy() {
+    for policy in [
+        CrcVerification::Auto,
+        CrcVerification::Always,
+        CrcVerification::Never,
+    ] {
+        let mut bytes = build_corruptable_superfile();
+        let ((fts_off, _), _) = locate_blobs(&bytes);
+        let target = fts_off + header_u64(&bytes, fts_off, FTS_DOC_LENGTHS_DIR_OFFSET) + 8;
+        bytes[target] ^= CORRUPTION_FLIP_MASK;
+
+        let opened = SuperfileReader::open_with(
+            Bytes::from(bytes),
+            OpenOptions {
+                verify_crc: policy.verifies_on_open(),
+            },
+        );
+        assert!(
+            opened.is_err(),
+            "{policy:?} must refuse a corrupt doc-lengths directory: the \
+             offset it holds no longer addresses the blob"
+        );
+    }
+}
+
+/// A clean file opens under every policy. Guards the inverse of the test
+/// above: a strict mode that rejected healthy data would pass that one.
+#[test]
+fn a_clean_file_opens_under_every_policy() {
+    for policy in [
+        CrcVerification::Auto,
+        CrcVerification::Always,
+        CrcVerification::Never,
+    ] {
+        let bytes = build_corruptable_superfile();
+        let opened = SuperfileReader::open_with(
+            Bytes::from(bytes),
+            OpenOptions {
+                verify_crc: policy.verifies_on_open(),
+            },
+        );
+        assert!(opened.is_ok(), "{policy:?} must open an untouched file");
+    }
 }
 
 #[test]

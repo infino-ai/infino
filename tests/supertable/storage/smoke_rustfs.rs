@@ -23,7 +23,7 @@ use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
     InfinoError, VectorSearchOptions,
-    config::{Config, MemorySettings, StorageBackend, StorageSettings},
+    config::{Config, CrcVerification, MemorySettings, StorageBackend, StorageSettings},
     superfile::builder::{FtsConfig, VectorConfig},
     supertable::{
         Supertable,
@@ -269,7 +269,7 @@ fn make_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
