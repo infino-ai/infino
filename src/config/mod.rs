@@ -272,10 +272,11 @@ pub enum CrcVerification {
     /// Lucene, Elasticsearch and OpenSearch do. The default.
     #[default]
     Auto,
-    /// Verify the whole blob and every subsection on each open. The strictest
-    /// setting and by far the most expensive: on a billion-document table it
-    /// costs about a hundred times the CPU and a hundred and fifty times the
-    /// peak memory of the queries it precedes.
+    /// Verify the whole blob and every subsection on each open. The
+    /// strictest setting, and the most expensive by a wide margin: it reads
+    /// every byte of every superfile it opens, including the bytes no query
+    /// touches, so what it costs grows with the data rather than with the
+    /// work being done.
     Always,
     /// Never verify. Appropriate only where the storage beneath already
     /// guarantees integrity end to end.
@@ -285,8 +286,8 @@ pub enum CrcVerification {
 impl CrcVerification {
     /// Whether an open verifies the blob's stored checksums.
     ///
-    /// The single place the policy becomes a yes or no, so the phases that
-    /// change what `Auto` means change it here and nowhere else.
+    /// The single place the policy becomes a yes or no for an open, so what
+    /// `Auto` does on that path is decided here and nowhere else.
     pub fn verifies_on_open(self) -> bool {
         match self {
             Self::Always => true,
@@ -2666,9 +2667,9 @@ supertable:
         }
     }
 
-    /// What each policy decides at an open. This is the whole of the
-    /// behaviour today, and the one place a later phase changes, so it is
-    /// pinned here to make that change visible rather than incidental.
+    /// What each policy decides at an open. Pinned per value rather than
+    /// left to the call sites, so moving any of them is a visible edit to a
+    /// test that states the answer rather than an incidental change.
     #[test]
     fn each_policy_decides_whether_an_open_verifies() {
         assert!(CrcVerification::Always.verifies_on_open());

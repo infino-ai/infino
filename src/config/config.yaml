@@ -54,12 +54,6 @@ supertable:
   # than the core count. Set 0 to fall back to one piece per writer-pool thread.
   superfile_buffer_split_mb: 64
 
-  # Verify the trailing whole-blob CRC and per-subsection CRCs
-  # on every SuperfileReader::open. Defaults to true. Set to
-  # false only when the underlying storage already validates
-  # checksums (content-addressed object store, ZFS, etc.) —
-  # skipping the scan trades that storage-layer guarantee for
-  # faster cold opens.
   # When the engine verifies a superfile's stored checksums.
   #
   #   auto   - verify where bytes arrive and not where they are read, which

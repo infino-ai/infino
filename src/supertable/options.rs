@@ -599,17 +599,13 @@ pub struct SupertableOptions {
     /// set to a tiny value (e.g. `1`) to force every
     /// superfile through the multipart path (useful for tests).
     pub put_multipart_threshold_bytes: u64,
-    /// Whether the supertable's read-side opens of
-    /// `SuperfileReader` should verify the trailing whole-
-    /// blob CRC and per-subsection CRCs. Default `true`. The
-    /// supertable threads this through
-    /// `SuperfileReader::open_with`'s
-    /// `OpenOptions { verify_crc }` on every open it
-    /// performs (writer post-commit summary extraction, disk
-    /// cache cold-fetch finalize). Set `false` when the
-    /// underlying storage already validates checksums —
-    /// content-addressed object stores, ZFS, etc. — to skip
-    /// the scan.
+    /// When this table verifies a superfile's stored checksums: the
+    /// trailing whole-blob CRC and the per-subsection ones. Under the
+    /// default [`CrcVerification::Auto`] that is once, as bytes land in
+    /// the disk cache, and not on the opens that read them back. The
+    /// supertable threads the answer through `SuperfileReader::open_with`'s
+    /// `OpenOptions { verify_crc }` on every open it performs, so one
+    /// setting covers them all.
     pub crc_verification: CrcVerification,
     /// Read-path freshness policy. The query path checks the manifest
     /// pointer for the caller per this setting (see [`Consistency`]);

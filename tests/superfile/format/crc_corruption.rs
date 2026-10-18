@@ -278,12 +278,11 @@ fn corrupt_parquet_trailing_magic_rejected() {
 
 /// Each corruptible region, opened under each policy.
 ///
-/// This is the pair the phase turns on: `always` must still reject every
-/// region it rejected before, and `auto` must open every one of them, because
-/// `auto` verifies where bytes arrive rather than where they are read. Both
-/// halves matter. Without the first, the strict mode quietly stopped being
-/// strict; without the second, the phase did not do what it claims and the
-/// cost it was for is still being paid.
+/// Both halves matter. `always` must still reject every region it rejects,
+/// or the strict mode has quietly stopped being strict; and `auto` must open
+/// every one of them, because it verifies where bytes arrive rather than
+/// where they are read, and a region it still scans is a cost being paid for
+/// nothing.
 ///
 /// Every region is listed rather than one standing in for the rest: the
 /// checks are separate code paths behind one flag, and a flag that reaches
@@ -347,9 +346,9 @@ fn always_rejects_every_region_that_auto_opens() {
 /// path's bounds checks reject it before any CRC is consulted. So `auto` is
 /// not blind: it gives up the checksums, not the structural validation.
 ///
-/// This is also the signal the later discard-and-refetch phase keys on. A
-/// malformed structure is a corrupt cached copy announcing itself, which is
-/// exactly when refetching the authoritative bytes is the right response.
+/// This is also the signal discard-and-refetch keys on. A malformed
+/// structure is a corrupt cached copy announcing itself, which is exactly
+/// when refetching the authoritative bytes is the right response.
 #[test]
 fn a_corrupt_structural_field_is_refused_under_every_policy() {
     for policy in [

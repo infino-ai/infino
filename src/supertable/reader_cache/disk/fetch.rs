@@ -360,8 +360,8 @@ impl DiskCacheStore {
         // Not a landing: this buffer answers the query in flight and the
         // durable copy is verified by the finalizer below, so checking here
         // would scan the same bytes twice on the cold path. The buffer
-        // arrived under TLS, which is the guarantee the read path relies on
-        // in every engine we are matching.
+        // arrived under TLS, which is the integrity guarantee the read path
+        // rests on.
         let foreground_reader = SuperfileReader::open_with(
             foreground_bytes,
             OpenOptions {
