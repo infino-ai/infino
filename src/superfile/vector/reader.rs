@@ -6354,17 +6354,25 @@ fn checked_dir_bounds(
 const SURVIVOR_RANGE_COALESCE_MAX_GAP: usize = 2 * 1024 * 1024;
 const SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH: usize = 2 * 1024 * 1024;
 
+/// The column's whole `codec_meta` region when its quantizer metadata was
+/// left on disk at open: per-cluster scale and offset arrays ahead of the
+/// per-doc norm table for the fitted and residual codecs, the norm table
+/// alone for the fixed-grid single-plane codec. Sized by the codec, never
+/// by the residual layout: a range that assumes the arrays reaches past a
+/// single-plane cell's table into bytes the rerank never reads, and past
+/// the blob when that cell is a small last cell of a packed multi-cell
+/// blob, where the source refuses it and the query fails.
 fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
         return None;
     };
-    let scale_offset_bytes = 2 * (col.n_cent as usize) * col.dim * 4;
-    let norm_bytes = if matches!(col.metric, Metric::L2Sq | Metric::Cosine) {
-        (col.n_docs as usize) * 4
-    } else {
-        0
-    };
-    Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
+    let meta_bytes = col.rerank_codec.codec_meta_bytes(
+        col.dim,
+        col.n_docs as usize,
+        col.n_cent as usize,
+        col.metric,
+    );
+    Some(*scale_abs_off..*scale_abs_off + meta_bytes)
 }
 
 // Reserve from the budget, the bytes a cold fetch is about to allocate, and if
@@ -6580,6 +6588,7 @@ mod tests {
             finish_multi_cell_blob,
         },
         cell_posting::{EncodedCellRow, MaterializedIvfRow},
+        distance::{encode_sq16_row, sq16_decoded_norm_sq},
     };
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
@@ -7579,6 +7588,96 @@ mod tests {
             .search_clusters_async("emb", &q, 3, &[0, 1, 2, 3], 8, None, None, None, None)
             .await
             .expect("lazy multi-cell search");
+        assert_eq!(
+            eager_hits, lazy_hits,
+            "lazy multi-cell search must match the eager reader"
+        );
+    }
+
+    /// A packed multi-cell blob whose last cell holds one row of the
+    /// fixed-grid single-plane codec, whose `codec_meta` is the per-doc norm
+    /// table alone. The lazy reader fetches that table when a query probes
+    /// the cell. Sized as the residual layout, with per-cluster scale and
+    /// offset arrays ahead of the table, the fetch would reach past the cell
+    /// and past the blob, and the source would refuse it. The lazy search must
+    /// answer and match the eager reader.
+    #[tokio::test]
+    async fn multi_cell_lazy_search_probes_a_one_row_single_plane_last_cell() {
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    // Distinct in-grid vectors, not normalized, so every row
+                    // carries its own norm and a misread table changes the order.
+                    let v: Vec<f32> = (0..dim)
+                        .map(|j| {
+                            (((cell as f32 + 1.0) * 0.31 + (i as f32) * 0.17 + (j as f32) * 0.11)
+                                .sin())
+                                * 0.6
+                        })
+                        .collect();
+                    let mut codes = vec![0u8; dim * 2];
+                    encode_sq16_row(&v, &mut codes);
+                    let norm_sq = sq16_decoded_norm_sq(&codes, dim);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq16,
+                            scale: StdArc::from(Vec::<f32>::new()),
+                            offset: StdArc::from(Vec::<f32>::new()),
+                            codes,
+                            residuals: Vec::new(),
+                            norm_sq: Some(norm_sq),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = || VectorConfig {
+            column: "emb".into(),
+            dim,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: None,
+        };
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(), 1, make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(), 1, make_rows(1, 1)).expect("cell 1");
+        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
+        let json = format!(
+            r#"[{{"column":"emb","dim":{dim},"n_cent":1,"rot_seed":1,"metric":"cosine"}}]"#
+        );
+
+        let eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let source = StdArc::new(CountingLazyByteSource::new(blob));
+        // No sync reads: the norm table is left on disk at open and fetched
+        // through the lazy range when the cell is probed.
+        source.disable_sync();
+        let lazy = VectorReader::open_lazy(
+            StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("lazy multi-cell open");
+
+        let q = vec![0.1f32; dim];
+        let (eager_hits, _) = eager
+            .search_clusters_async("emb", &q, 3, &[0, 1], 8, None, None, None, None)
+            .await
+            .expect("eager multi-cell search");
+        let (lazy_hits, _) = lazy
+            .search_clusters_async("emb", &q, 3, &[0, 1], 8, None, None, None, None)
+            .await
+            .expect("lazy multi-cell search must read the one-row last cell's norm table");
         assert_eq!(
             eager_hits, lazy_hits,
             "lazy multi-cell search must match the eager reader"
