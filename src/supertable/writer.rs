@@ -3040,6 +3040,18 @@ impl ShardOutput {
             scalar_stats,
         }
     }
+
+    /// Attach the term-index contribution gathered while these bytes were
+    /// built, under the id the superfile is then published as.
+    pub(in crate::supertable) fn with_term_contribution(
+        mut self,
+        superfile_id: Uuid,
+        contribution: TermContribution,
+    ) -> Self {
+        self.superfile_id = superfile_id;
+        self.term_contribution = Some(contribution);
+        self
+    }
 }
 
 /// Reserve the build's estimated transient heap:
@@ -3192,7 +3204,7 @@ fn build_one_shard_with_layout(
 /// the table keeps a term index: storage-backed, with text columns. The
 /// builder's column names resolve to the ids the index keys terms by; a
 /// column the table does not have contributes nothing.
-fn term_head_sink_for(
+pub(in crate::supertable) fn term_head_sink_for(
     manifest: &ManifestSnapshot,
     superfiles_after: usize,
 ) -> Result<Option<(term_index::HeadSink, usize)>, BuildError> {
