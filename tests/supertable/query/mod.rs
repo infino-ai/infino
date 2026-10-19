@@ -19,6 +19,7 @@ mod score_tolerance;
 pub mod skip_pruning;
 mod stats_fold;
 mod stored_fields;
+mod tier_selection;
 pub mod tombstone_filter;
 mod topk_row_filter;
 mod values_scalar_subquery;

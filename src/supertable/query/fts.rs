@@ -74,6 +74,7 @@ use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    iter::repeat_n,
     slice,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
@@ -139,6 +140,7 @@ use crate::{
             dispatch,
             exec::common::{resolve_hits_named, take_rows_byte_source},
             prune::{PruneLeaf, select_superfiles},
+            tier,
         },
         reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
         schema::FieldId,
@@ -961,7 +963,7 @@ impl SupertableReader {
         }
         all_terms.sort_unstable();
         all_terms.dedup();
-        let ceilings: Option<HashMap<Uuid, f32>> =
+        let mut ceilings: Option<HashMap<Uuid, f32>> =
             match (&term_index, bm25_params, manifest.field_id(column)) {
                 // Ceilings rescale by each term's table idf, so they order and
                 // skip only when the map holds every scored term.
@@ -993,7 +995,61 @@ impl SupertableReader {
                 }
                 _ => None,
             };
-        if let Some(c) = &ceilings {
+        // Tier selection: with every scored term's tier readable, a plain
+        // AND or OR over bare terms chooses its superfiles from the
+        // documents the tiers name — a lower bound on the k-th score before
+        // any open, and per superfile a bound that knows which documents
+        // carry several of the terms. The bounds replace the ceilings; the
+        // seeded threshold goes into the shared floor below.
+        let mut tier_seed: Option<f32> = None;
+        if let (Some(index), None, Some(column_id), true) = (
+            &term_index,
+            bm25_params,
+            manifest.field_id(column),
+            !has_phrases && negatives.is_empty() && (musts.is_empty() || shoulds.is_empty()),
+        ) {
+            let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
+            let selection = tier::select_with_tiers(
+                index,
+                column_id,
+                &scored_terms,
+                !musts.is_empty(),
+                &kept,
+                &global_idf,
+                table_avgdl,
+                k,
+            )
+            .instrument(term_span.clone())
+            .await?;
+            if let Some(selection) = selection {
+                if let Some(stats) = &self.op_stats {
+                    stats.add_tier_read(selection.tier_bytes, selection.entries_read);
+                }
+                let bound_of = |e: &Arc<SuperfileEntry>| {
+                    selection.bounds.get(&e.superfile_id).copied().unwrap_or(
+                        tier::SuperfileBounds {
+                            lb: f32::NEG_INFINITY,
+                            ub: f32::INFINITY,
+                        },
+                    )
+                };
+                kept.sort_by(|a, b| {
+                    let (x, y) = (bound_of(a), bound_of(b));
+                    y.lb.total_cmp(&x.lb).then(y.ub.total_cmp(&x.ub))
+                });
+                ceilings = Some(
+                    kept.iter()
+                        .map(|e| (e.superfile_id, bound_of(e).ub))
+                        .collect(),
+                );
+                if selection.theta_lb.is_finite() {
+                    tier_seed = Some(selection.theta_lb);
+                }
+            }
+        }
+        if tier_seed.is_none()
+            && let Some(c) = &ceilings
+        {
             let ceiling_of =
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
             kept.sort_by(|a, b| ceiling_of(b).total_cmp(&ceiling_of(a)));
@@ -1054,6 +1110,12 @@ impl SupertableReader {
         // beat what earlier units already found. Tombstoned hits are
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
+        // The tiers' lower bound on the k-th score is a floor every kernel
+        // may prune against from its first block; the real scores that
+        // replace these placeholders only raise it.
+        if let Some(seed) = tier_seed {
+            shared.merge(repeat_n(seed, k));
+        }
         let floor_handle = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
         let op_stats = self.op_stats.clone();

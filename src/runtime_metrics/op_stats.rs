@@ -101,6 +101,11 @@ pub struct OpStats {
     /// (musts, shoulds, plain OR terms, and negation filters). Counted once
     /// per superfile even when ranged slices share a cursor set.
     pub fts_postings_bytes: u64,
+    /// Term-index tier bytes a ranked query read to choose its superfiles.
+    pub tier_bytes: u64,
+    /// Term-index tier entries a ranked query decoded to choose its
+    /// superfiles.
+    pub tier_entries: u64,
     /// Vector cells the query's scans actually probed, summed across
     /// superfiles (a cell counts once per superfile scan that chose at
     /// least one of its clusters).
@@ -279,6 +284,8 @@ pub struct OpStats {
 #[derive(Debug, Default)]
 pub(crate) struct OpStatsCollector {
     fts_postings_bytes: AtomicU64,
+    tier_bytes: AtomicU64,
+    tier_entries: AtomicU64,
     vector_cells_scanned: AtomicU64,
     vector_candidates_scanned: AtomicU64,
     vector_rows_reranked: AtomicU64,
@@ -307,6 +314,12 @@ impl OpStatsCollector {
     /// Flush a kernel's posting-bytes tally (one add per superfile).
     pub(crate) fn add_fts_postings_bytes(&self, bytes: u64) {
         self.fts_postings_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Flush what a ranked query read from the term index's tiers.
+    pub(crate) fn add_tier_read(&self, bytes: u64, entries: u64) {
+        self.tier_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.tier_entries.fetch_add(entries, Ordering::Relaxed);
     }
 
     /// Flush one superfile scan's cell + candidate tallies.
@@ -427,6 +440,8 @@ impl OpStatsCollector {
     pub(crate) fn snapshot(&self) -> OpStats {
         OpStats {
             fts_postings_bytes: self.fts_postings_bytes.load(Ordering::Relaxed),
+            tier_bytes: self.tier_bytes.load(Ordering::Relaxed),
+            tier_entries: self.tier_entries.load(Ordering::Relaxed),
             vector_cells_scanned: self.vector_cells_scanned.load(Ordering::Relaxed),
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),
