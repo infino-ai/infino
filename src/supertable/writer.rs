@@ -3691,11 +3691,16 @@ pub(crate) fn build_fts_summary(
 /// built, so the awaited calls resolve without I/O; the bridge only lends
 /// them an executor from this synchronous prepare path. Every term carries
 /// its score ceiling in this superfile, at the superfile's own statistics.
+/// `superfiles_after` is how many superfiles the table holds once this
+/// commit lands: the head depth each superfile contributes per term is its
+/// share of the tier budget, and a first commit of many superfiles would
+/// otherwise contribute as if each were the whole table.
 pub(in crate::supertable) fn build_term_contribution(
     reader: &SuperfileReader,
     manifest: &ManifestSnapshot,
     superfile_id: Uuid,
     id_min: i128,
+    superfiles_after: usize,
 ) -> Result<Option<TermContribution>, BuildError> {
     // No storage, or no text columns: no term index to publish into.
     if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
@@ -3709,7 +3714,7 @@ pub(in crate::supertable) fn build_term_contribution(
         &mut writer,
         &manifest
             .options
-            .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64),
+            .term_index_build_policy(manifest.n_docs_total(), superfiles_after as u64),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -3840,7 +3845,9 @@ pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
-    prepare_superfile_named(inner, &inner.manifest.load(), shard, None)
+    let manifest = inner.manifest.load();
+    let after = manifest.superfiles.len() + 1;
+    prepare_superfile_named(inner, &manifest, shard, None, after)
 }
 
 /// [`prepare_superfile`] with the source stem the entry carries: `Some`
@@ -3852,6 +3859,7 @@ pub(super) fn prepare_superfile_named(
     manifest: &ManifestSnapshot,
     shard: ShardOutput,
     stem: Option<&str>,
+    superfiles_after: usize,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
@@ -3938,8 +3946,13 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
-    let term_contribution =
-        build_term_contribution(&reader, manifest, entry.superfile_id, entry.id_min)?;
+    let term_contribution = build_term_contribution(
+        &reader,
+        manifest,
+        entry.superfile_id,
+        entry.id_min,
+        superfiles_after,
+    )?;
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -4176,7 +4189,9 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
         });
     let scalar_stats = ScalarStatsAgg::from_batches(&batch.schema(), &[&batch]);
     let shard = ShardOutput::new_with_params(bytes, reader.n_docs(), id_min, id_max, scalar_stats);
-    let prepared = prepare_superfile_named(inner, &inner.manifest.load(), shard, None)?
+    let manifest = inner.manifest.load();
+    let after = manifest.superfiles.len() + 1;
+    let prepared = prepare_superfile_named(inner, &manifest, shard, None, after)?
         .ok_or_else(|| BuildError::Store("built superfile holds no rows".into()))?;
     let publish = collect_prepared_superfiles(inner, vec![prepared])?;
     st.block_on_query(persist_superfile_publish_batch_async(
@@ -4229,11 +4244,12 @@ fn prepare_user_superfile_batch_in_scope(
             hints.len()
         )));
     }
+    let after = manifest.superfiles.len() + outputs.len();
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
-        .filter_map(
-            |(shard, hint)| match prepare_superfile_named(inner, manifest, shard, stem) {
+        .filter_map(|(shard, hint)| {
+            match prepare_superfile_named(inner, manifest, shard, stem, after) {
                 Ok(Some(p)) => {
                     Some(
                         finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
@@ -4247,8 +4263,8 @@ fn prepare_user_superfile_batch_in_scope(
                 }
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
-            },
-        )
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
@@ -7622,7 +7638,9 @@ fn commit_shards_via_drain(
             let Some(output) = output else {
                 return Ok(None);
             };
-            let Some(prepared) = prepare_superfile_named(inner, manifest, output, stem)? else {
+            let after = manifest.superfiles.len() + n_packed_shards;
+            let Some(prepared) = prepare_superfile_named(inner, manifest, output, stem, after)?
+            else {
                 return Ok(None);
             };
             let PreparedSuperfile {
@@ -12345,7 +12363,7 @@ pub(crate) async fn try_commit_attempt(
             };
         let policy = current_manifest.options.term_index_build_policy(
             current_manifest.n_docs_total(),
-            current_manifest.superfiles.len() as u64,
+            (current_manifest.superfiles.len() + new_entries.len()) as u64,
         );
         let store = storage.as_ref();
         let reference = async move {

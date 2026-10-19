@@ -593,6 +593,7 @@ async fn append_replacement_rows(
         &manifest,
         preallocated_superfile_id,
         if flat_ids.is_empty() { 0 } else { flat_ids[0] },
+        manifest.superfiles.len() + 1,
     )
     .map_err(|e| AppendPhaseError::SuperfileBuild {
         message: format!("term index contribution: {e}"),

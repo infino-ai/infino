@@ -810,7 +810,9 @@ impl Supertable {
             // load. A merge runs for minutes, so a schema change can land
             // while it does; deriving the entry's summaries from a newer
             // snapshot would key them to columns the output does not hold.
-            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem)?
+            // The merge replaces its inputs with one superfile.
+            let after = (manifest.superfiles.len() + 1).saturating_sub(superfiles.len());
+            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem, after)?
         };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)
