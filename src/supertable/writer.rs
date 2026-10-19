@@ -2935,7 +2935,7 @@ impl SupertableWriter {
                             term_index::reserve_segment(
                                 storage.as_ref(),
                                 contributions,
-                                &term_index::BuildPolicy::default(),
+                                &self.inner.options.term_index_build_policy(),
                                 base,
                                 true,
                             ),
@@ -3704,7 +3704,7 @@ pub(in crate::supertable) fn build_term_contribution(
         reader,
         &manifest.options.legacy_names(),
         &mut writer,
-        &term_index::BuildPolicy::default(),
+        &manifest.options.term_index_build_policy(),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -11084,6 +11084,7 @@ async fn merge_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
+    let policy = manifest.options.term_index_build_policy();
     let scratch = term_index_scratch()?;
     let mut sources =
         term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
@@ -11102,8 +11103,7 @@ async fn merge_term_index(
     };
     if !missing.is_empty() {
         let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
-        let built =
-            term_index::build_onto(old, &contributions, &term_index::BuildPolicy::default())?;
+        let built = term_index::build_onto(old, &contributions, &policy)?;
         term_index::spill_tiers(scratch.path(), built.tiers)?;
         sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
         old = built.root;
@@ -11131,14 +11131,7 @@ async fn merge_term_index(
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
-        move || {
-            term_index::merge_segments(
-                &sources,
-                &tier_dir,
-                &ordinals,
-                &term_index::BuildPolicy::default(),
-            )
-        },
+        move || term_index::merge_segments(&sources, &tier_dir, &ordinals, &policy),
     )
     .instrument(detail_span!(
         "term_index.merge",
@@ -11202,20 +11195,14 @@ async fn fold_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
+    let policy = manifest.options.term_index_build_policy();
     let scratch = term_index_scratch()?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
     let tier_dir = scratch.path().to_path_buf();
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
-        move || {
-            term_index::merge_segments(
-                &sources,
-                &tier_dir,
-                &ordinals,
-                &term_index::BuildPolicy::default(),
-            )
-        },
+        move || term_index::merge_segments(&sources, &tier_dir, &ordinals, &policy),
     )
     .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
     .await
@@ -11244,7 +11231,11 @@ async fn collect_and_build_term_index(
 ) -> Result<term_index::Built, TermIndexError> {
     let scratch = term_index_scratch()?;
     let contributions = collect_contributions(manifest, entries, scratch.path()).await?;
-    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
+    term_index::build_onto(
+        onto,
+        &contributions,
+        &manifest.options.term_index_build_policy(),
+    )
 }
 
 /// Walk each of `entries`' dictionaries, one superfile at a time, spilling
@@ -11258,6 +11249,7 @@ async fn collect_contributions(
     let disk_cache = manifest.options.disk_cache.as_ref();
     let opt_storage = manifest.options.storage.as_ref();
     let legacy = manifest.options.legacy_names();
+    let policy = manifest.options.term_index_build_policy();
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
@@ -11274,13 +11266,7 @@ async fn collect_contributions(
         }
         let mut writer =
             term_index::ContributionWriter::create(dir, entry.superfile_id, entry.id_min)?;
-        write_superfile_terms(
-            &reader,
-            &legacy,
-            &mut writer,
-            &term_index::BuildPolicy::default(),
-        )
-        .await?;
+        write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }

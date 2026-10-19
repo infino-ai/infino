@@ -46,14 +46,15 @@ use std::{
 pub(crate) use build::build;
 use build::build_segment;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, Head, build_onto, merge_segments,
-    tier_path,
+    BuildPolicy, Built, Contribution, ContributionWriter, Head, TIER_ENTRIES_PER_TERM, build_onto,
+    merge_segments, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
-pub(crate) use format::{Location, Posting, Root, Slice, decode_tier_list};
+pub(crate) use format::{Location, Posting, Root, Run, Slice, TierRef, decode_tier_list};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
+pub(crate) use tier::{TierChunk, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
@@ -1106,6 +1107,64 @@ impl TermIndex {
             .into_iter()
             .map(|run| run.expect("every term resolved above"))
             .collect())
+    }
+
+    /// A term's run in each segment that holds it, in segment order.
+    pub(crate) async fn runs(
+        &self,
+        column: FieldId,
+        term: &str,
+    ) -> Result<Vec<Run>, TermIndexError> {
+        let key = column.term_key(term);
+        let refs: Vec<ContentHash> = self
+            .root
+            .slices_for_key(&key)
+            .map(|r| r.content_hash)
+            .collect();
+        let mut out = Vec::with_capacity(refs.len());
+        for hash in refs {
+            let bytes = self.slice_bytes(&hash).await?;
+            if let Some(run) = Slice::open(&bytes)?.run(&key)? {
+                out.push(run);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every entry of a tier, chunk by chunk, in tier order (descending
+    /// impact by block). A query reads a prefix instead; this is the whole
+    /// thing, for tests and tools.
+    pub(crate) async fn tier_entries(
+        &self,
+        tier: &TierRef,
+    ) -> Result<Vec<TierEntry>, TermIndexError> {
+        let mut out = Vec::new();
+        let mut block = Vec::new();
+        for chunk in &tier.chunks {
+            let bytes = self.tier_bytes(&chunk.content_hash).await?;
+            let chunk = TierChunk::open(&bytes)?;
+            for i in 0..chunk.n_blocks() {
+                chunk.decode_block(i, &mut block)?;
+                out.extend_from_slice(&block);
+            }
+        }
+        Ok(out)
+    }
+
+    /// A tier chunk's bytes, resident after the first fetch like a slice.
+    pub(crate) async fn tier_bytes(&self, hash: &ContentHash) -> Result<Bytes, TermIndexError> {
+        if let Some(b) = self.slices.lock().await.get(hash) {
+            return Ok(b);
+        }
+        let bytes = fetch_verified(
+            self.storage.as_ref(),
+            self.disk_cache.as_deref(),
+            &tier_uri(hash),
+            hash,
+        )
+        .await?;
+        self.slices.lock().await.insert(*hash, bytes.clone());
+        Ok(bytes)
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until
@@ -3412,6 +3471,130 @@ mod tests {
                 Err(TermIndexError::Storage(_))
             ),
             "without the cache the missing object is a storage error"
+        );
+    }
+
+    /// The tier objects under `dir`, by name.
+    fn tier_objects(dir: &TempDir) -> HashSet<String> {
+        fs::read_dir(dir.path().join(STORAGE_PREFIX))
+            .map(|entries| {
+                entries
+                    .map(|e| {
+                        e.expect("dir entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .filter(|name| name.starts_with("tier-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What the current root names: every slice, tier list and tier chunk.
+    async fn objects_named_by(root: &Root, storage: &Arc<dyn StorageProvider>) -> HashSet<String> {
+        let mut named: HashSet<String> = root
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter())
+            .map(|s| format!("slice-{}.bin", s.content_hash.to_hex()))
+            .collect();
+        named.extend(
+            root.segments
+                .iter()
+                .filter_map(|s| s.tier_list.as_ref())
+                .map(|l| format!("tier-{}.bin", l.content_hash.to_hex())),
+        );
+        let chunks = tier_chunks_of(storage.as_ref(), &root.segments)
+            .await
+            .expect("tier lists load");
+        named.extend(chunks.iter().map(|h| format!("tier-{}.bin", h.to_hex())));
+        named
+    }
+
+    /// Every commit writes its segment's tier chunks and names them from the
+    /// root; the rebuild carries them into the base; a sweep past the gap
+    /// keeps what the current root names and nothing a replaced root named.
+    #[test]
+    fn commits_write_tiers_the_rebuild_keeps_and_the_sweep_respects() {
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        commit_segment(&st, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let current_ref = || {
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .cloned()
+                .expect("a term-index reference")
+        };
+        let root = rt
+            .block_on(load_root(storage.as_ref(), &current_ref()))
+            .expect("root");
+        assert_eq!(root.segments.len(), 2, "two deltas");
+        assert!(
+            root.segments.iter().all(|s| s.tier_list.is_some()),
+            "each delta has a tier list"
+        );
+        let after_commits = tier_objects(&dir);
+        let named = rt.block_on(objects_named_by(&root, &storage));
+        assert!(
+            after_commits.iter().all(|o| named.contains(o)) && after_commits.len() >= 4,
+            "every tier object on disk is named: {after_commits:?}"
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
+        assert_eq!(runs.len(), 2, "one run per delta");
+        let mut held = 0;
+        for run in &runs {
+            let tier = run.tier.as_ref().expect("a term in every title has a tier");
+            assert!(tier.complete, "every document fits the default budget");
+            held += tier.n_entries;
+            assert!(
+                run.postings.iter().all(|p| p.tail == 0.0),
+                "complete heads leave no tail"
+            );
+        }
+        assert_eq!(
+            held,
+            2 * DOCS_PER_SEGMENT as u64,
+            "the deltas' tiers cover every document"
+        );
+
+        st.optimize(&maintenance_only_options()).expect("optimize");
+        let rebuilt = rt
+            .block_on(load_root(storage.as_ref(), &current_ref()))
+            .expect("root");
+        assert_eq!(rebuilt.segments.len(), 1, "the rebuild folds the deltas");
+        assert!(rebuilt.segments[0].tier_list.is_some());
+        let index = TermIndex::new(rebuilt.clone(), String::new(), Arc::clone(&storage), None);
+        let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
+        assert_eq!(runs.len(), 1, "one run in the rebuilt base");
+        let tier = runs[0].tier.as_ref().expect("the merged run has a tier");
+        assert_eq!(
+            tier.n_entries,
+            2 * DOCS_PER_SEGMENT as u64,
+            "the base tier covers every document"
+        );
+        let entries = rt.block_on(index.tier_entries(tier)).expect("tier entries");
+        assert!(
+            entries
+                .iter()
+                .all(|e| index.superfile_id(e.superfile).is_some()),
+            "every tier entry names a listed superfile"
+        );
+
+        st.gc(Duration::ZERO).expect("gc");
+        let kept = tier_objects(&dir);
+        let named: HashSet<String> = rt
+            .block_on(objects_named_by(&rebuilt, &storage))
+            .into_iter()
+            .filter(|o| o.starts_with("tier-"))
+            .collect();
+        assert_eq!(
+            kept, named,
+            "the sweep keeps exactly the tier objects the current root names"
         );
     }
 
