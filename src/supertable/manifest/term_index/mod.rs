@@ -47,8 +47,9 @@ use build::build_segment;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, Head, HeadSink, build_onto,
-    head_depth_for, merge_segments, tier_entries_for, tier_path,
+    BuildPolicy, Built, Contribution, ContributionWriter, Head, HeadSink, TIER_ENTRIES_MAX,
+    TIER_SHARE_OF_POSTINGS, build_onto, head_depth_for, merge_segments, tier_entries_for,
+    tier_path,
 };
 use bytes::Bytes;
 use format::Segment;

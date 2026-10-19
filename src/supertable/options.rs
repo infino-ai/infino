@@ -84,7 +84,9 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::term_index::{BuildPolicy, head_depth_for, tier_entries_for},
+        manifest::term_index::{
+            BuildPolicy, TIER_ENTRIES_MAX, TIER_SHARE_OF_POSTINGS, head_depth_for, tier_entries_for,
+        },
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -941,12 +943,22 @@ impl SupertableOptions {
     /// What the term-index build takes from these options, for a table of
     /// `n_docs` documents in `n_superfiles` superfiles.
     pub(crate) fn term_index_build_policy(&self, n_docs: u64, n_superfiles: u64) -> BuildPolicy {
-        let tier_entries_per_term = self
-            .term_tier_entries_per_term
-            .unwrap_or_else(|| tier_entries_for(n_docs));
+        // The head depth follows the budget the table's size suggests; the
+        // budget itself the build settles from the terms' frequencies, under
+        // the ceiling, unless the caller fixed it.
+        let suggested = tier_entries_for(n_docs);
+        let (tier_entries_per_term, tier_share_of_postings) = match self.term_tier_entries_per_term
+        {
+            Some(fixed) => (fixed, None),
+            None => (TIER_ENTRIES_MAX, Some(TIER_SHARE_OF_POSTINGS)),
+        };
         BuildPolicy {
             tier_entries_per_term,
-            head_depth_per_superfile: head_depth_for(tier_entries_per_term, n_superfiles),
+            tier_share_of_postings,
+            head_depth_per_superfile: head_depth_for(
+                tier_entries_per_term.min(suggested),
+                n_superfiles,
+            ),
             pool: Some(Arc::clone(&self.writer_pool)),
             ..BuildPolicy::default()
         }

@@ -78,6 +78,18 @@ pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 11;
 /// Largest tier budget the share resolves to: past this the per-term read
 /// outgrows what a query at any supported `k` consumes.
 pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
+/// The share of a table's postings its tiers may hold, by default. The
+/// per-term budget is the largest count at which the sum over terms of
+/// `min(df, budget)` fits this share, found by a pass over the terms
+/// before they are encoded. Normalizing by postings rather than documents
+/// is what keeps short text in bounds: a titles table has a few postings
+/// per document and a fat tail of mid-frequency terms, and a budget sized
+/// by documents copied nearly every posting into a tier. At six percent a
+/// long-text table's tiers come to about nine percent of its bytes.
+pub(crate) const TIER_SHARE_OF_POSTINGS: f64 = 0.06;
+/// Budgets the pre-pass chooses among: a half-octave ladder from the
+/// floor to the ceiling.
+const BUDGET_LADDER_STEPS_PER_OCTAVE: u32 = 2;
 
 /// The tier budget for a table of `n_docs` documents under the default
 /// policy.
@@ -108,9 +120,14 @@ pub(crate) fn head_depth_for(tier_entries: u64, n_superfiles: u64) -> usize {
 pub(crate) struct BuildPolicy {
     /// See [`SLICE_TARGET_BYTES`].
     pub(crate) slice_target_bytes: usize,
-    /// Entries a term's tier keeps table-wide; `0` keeps no tiers. See
-    /// [`tier_entries_for`].
+    /// Entries a term's tier keeps table-wide; `0` keeps no tiers. With
+    /// `tier_share_of_postings` set this is the ceiling, and the build
+    /// chooses the budget under it. See [`tier_entries_for`].
     pub(crate) tier_entries_per_term: u64,
+    /// When set, the budget is the largest count under the ceiling at
+    /// which the tiers hold at most this share of the postings; see
+    /// [`TIER_SHARE_OF_POSTINGS`].
+    pub(crate) tier_share_of_postings: Option<f64>,
     /// See [`head_depth_for`].
     pub(crate) head_depth_per_superfile: usize,
     /// Where the build encodes tiers in parallel; the process-wide pool
@@ -123,9 +140,60 @@ impl Default for BuildPolicy {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
             tier_entries_per_term: TIER_ENTRIES_MAX,
+            tier_share_of_postings: None,
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
         }
+    }
+}
+
+/// Chooses the tier budget from the terms' document frequencies: the
+/// largest budget on a ladder at which the sum over terms of
+/// `min(df, budget)` — the entries the tiers would hold — fits the share
+/// of all postings. Fed one table-wide `df` per term.
+struct BudgetScan {
+    ladder: Vec<u64>,
+    /// Entries the tiers would hold at each rung.
+    held: Vec<u64>,
+    postings: u64,
+}
+
+impl BudgetScan {
+    fn new(floor: u64, ceiling: u64) -> Self {
+        let mut ladder = Vec::new();
+        let mut rung = floor.max(1) as f64;
+        let step = 2f64.powf(1.0 / f64::from(BUDGET_LADDER_STEPS_PER_OCTAVE));
+        while (rung as u64) < ceiling {
+            ladder.push(rung as u64);
+            rung *= step;
+        }
+        ladder.push(ceiling);
+        ladder.dedup();
+        Self {
+            held: vec![0; ladder.len()],
+            ladder,
+            postings: 0,
+        }
+    }
+
+    fn add(&mut self, df: u64) {
+        self.postings += df;
+        for (rung, held) in self.ladder.iter().zip(&mut self.held) {
+            *held += df.min(*rung);
+        }
+    }
+
+    /// The largest rung whose entries fit `share` of the postings; the
+    /// floor when none does.
+    fn pick(&self, share: f64) -> u64 {
+        let cap = (self.postings as f64 * share) as u64;
+        self.ladder
+            .iter()
+            .zip(&self.held)
+            .rev()
+            .find(|(_, held)| **held <= cap)
+            .map(|(rung, _)| *rung)
+            .unwrap_or(self.ladder[0])
     }
 }
 
@@ -645,6 +713,29 @@ impl ContributionReader {
     }
 
     /// The next record, `None` at end of file.
+    /// The next record's key and the posting's document frequency, the
+    /// head left undecoded: what the budget pre-pass needs.
+    fn next_df(&mut self) -> Result<Option<(Vec<u8>, u64)>, TermIndexError> {
+        let Some(record_len) = read_varint_stream(&mut self.rd)? else {
+            return Ok(None);
+        };
+        self.buf.clear();
+        self.buf.resize(record_len as usize, 0);
+        self.rd.read_exact(&mut self.buf)?;
+        let mut at = 0usize;
+        let key_len = read_varint(&self.buf, &mut at)
+            .ok_or_else(|| TermIndexError::Malformed("contribution key length".into()))?
+            as usize;
+        let key = self
+            .buf
+            .get(at..at + key_len)
+            .ok_or_else(|| TermIndexError::Malformed("contribution key".into()))?
+            .to_vec();
+        at += key_len;
+        let posting = read_posting(&self.buf, &mut at)?;
+        Ok(Some((key, posting.df)))
+    }
+
     fn next(&mut self) -> Result<Option<Record>, TermIndexError> {
         let Some(record_len) = read_varint_stream(&mut self.rd)? else {
             return Ok(None);
@@ -1069,6 +1160,105 @@ pub(crate) fn build_onto(
     })
 }
 
+/// Sum one key's frequency across `streams` in key order, feeding each
+/// term's table-wide `df` to a budget scan: the k-way key merge the
+/// builds do, over frequencies alone.
+fn budget_over_streams<S>(
+    mut streams: Vec<S>,
+    mut next: impl FnMut(&mut S) -> Result<Option<(Vec<u8>, u64)>, TermIndexError>,
+    policy: &BuildPolicy,
+) -> Result<u64, TermIndexError> {
+    let Some(share) = policy.tier_share_of_postings else {
+        return Ok(policy.tier_entries_per_term);
+    };
+    if policy.tier_entries_per_term == 0 {
+        return Ok(0);
+    }
+    let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
+    let mut pending: Vec<u64> = vec![0; streams.len()];
+    for (i, stream) in streams.iter_mut().enumerate() {
+        if let Some((key, df)) = next(stream)? {
+            heap.push(Reverse(MergeHead {
+                key,
+                ordinal: i as u32,
+            }));
+            pending[i] = df;
+        }
+    }
+    let mut scan = BudgetScan::new(
+        TIER_ENTRIES_MIN.min(policy.tier_entries_per_term),
+        policy.tier_entries_per_term,
+    );
+    while let Some(Reverse(head)) = heap.pop() {
+        let key = head.key;
+        let mut df = 0u64;
+        let mut source = Some(head.ordinal);
+        while let Some(i) = source {
+            df += pending[i as usize];
+            if let Some((next_key, next_df)) = next(&mut streams[i as usize])? {
+                heap.push(Reverse(MergeHead {
+                    key: next_key,
+                    ordinal: i,
+                }));
+                pending[i as usize] = next_df;
+            }
+            source = match heap.peek() {
+                Some(Reverse(peek)) if peek.key == key => heap.pop().map(|Reverse(h)| h.ordinal),
+                _ => None,
+            };
+        }
+        scan.add(df);
+    }
+    Ok(scan.pick(share))
+}
+
+/// The budget for a build over `contributions`.
+fn contribution_budget(
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<u64, TermIndexError> {
+    if policy.tier_share_of_postings.is_none() {
+        return Ok(policy.tier_entries_per_term);
+    }
+    let readers = contributions
+        .iter()
+        .map(|c| ContributionReader::open(&c.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    budget_over_streams(readers, |r| r.next_df(), policy)
+}
+
+/// The budget for a merge over `sources`, counting only postings of
+/// superfiles that survive `ordinals`.
+fn source_budget(
+    sources: &[Vec<PathBuf>],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+) -> Result<u64, TermIndexError> {
+    if policy.tier_share_of_postings.is_none() {
+        return Ok(policy.tier_entries_per_term);
+    }
+    let cursors: Vec<SegmentCursor> = sources.iter().map(|s| SegmentCursor::new(s)).collect();
+    budget_over_streams(
+        cursors,
+        |c| {
+            Ok(c.next()?.map(|(key, run)| {
+                let df = run
+                    .postings
+                    .iter()
+                    .filter(|p| {
+                        ordinals
+                            .get(p.superfile as usize)
+                            .is_some_and(Option::is_some)
+                    })
+                    .map(|p| p.df)
+                    .sum();
+                (key, df)
+            }))
+        },
+        policy,
+    )
+}
+
 /// Merge contributions into one segment of slices. Superfile ordinals
 /// follow the order of `contributions`, offset by `ordinal_base` — the
 /// number of superfiles the root already names when this segment is a
@@ -1078,6 +1268,13 @@ pub(crate) fn build_segment(
     policy: &BuildPolicy,
     ordinal_base: u32,
 ) -> Result<BuiltSegment, TermIndexError> {
+    // The budget first, from a pass over the keys and frequencies alone;
+    // the heads stay undecoded until the build proper.
+    let policy = &BuildPolicy {
+        tier_entries_per_term: contribution_budget(contributions, policy)?,
+        tier_share_of_postings: None,
+        ..policy.clone()
+    };
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
     let mut pending: Vec<Option<(Posting, Head)>> = Vec::with_capacity(contributions.len());
@@ -1314,6 +1511,13 @@ pub(crate) fn merge_segments(
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
+    // The budget first, from a pass over the runs; a posting of a superfile
+    // that is gone counts for nothing.
+    let policy = &BuildPolicy {
+        tier_entries_per_term: source_budget(sources, ordinals, policy)?,
+        tier_share_of_postings: None,
+        ..policy.clone()
+    };
     let mut cursors: Vec<SegmentCursor> = sources.iter().map(|s| SegmentCursor::new(s)).collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1453,5 +1657,63 @@ mod tests {
             HEAD_DEPTH_MIN,
             "no budget: the floor"
         );
+    }
+
+    /// The scan picks the largest rung at which the tiers' entries fit the
+    /// share of postings: with a fat tail every rung costs the tail in
+    /// full, and the rung is set by the common terms it caps.
+    #[test]
+    fn the_budget_scan_picks_the_largest_rung_under_the_share() {
+        // 1,000 rare terms of df 10 (10,000 postings), 10 common terms of
+        // df 100,000 (1,000,000 postings): 1,010,000 postings in all.
+        let mut scan = BudgetScan::new(64, 1 << 20);
+        for _ in 0..1_000 {
+            scan.add(10);
+        }
+        for _ in 0..10 {
+            scan.add(100_000);
+        }
+        // At 6%: 60,600 entries; the tail takes 10,000, leaving 5,060 per
+        // common term — the ladder's rung at or under that is 4,096.
+        assert_eq!(scan.pick(0.06), 4_096);
+        // At 1%: 10,100 entries, barely the tail; only the floor fits.
+        assert_eq!(scan.pick(0.01), 64);
+        // At 100%: everything fits, up to the ceiling.
+        assert_eq!(scan.pick(1.0), 1 << 20);
+    }
+
+    /// A fixed budget resolves to itself; a share resolves through the scan
+    /// over the merged keys, summing a term's frequency across sources.
+    #[test]
+    fn a_share_policy_sums_each_term_across_sources() {
+        let policy = BuildPolicy {
+            tier_entries_per_term: 1 << 20,
+            tier_share_of_postings: Some(0.5),
+            ..BuildPolicy::default()
+        };
+        // Two sources each holding "a" with df 3,000 and one holding "b"
+        // with df 10: "a" is one term of df 6,000. Half the postings is
+        // 3,005 entries; the ladder's half-octave rung at or under
+        // 3,005 - 10 is 2,896 (2,048 times the square root of two).
+        let sources: Vec<Vec<(Vec<u8>, u64)>> = vec![
+            vec![(b"a".to_vec(), 3_000), (b"b".to_vec(), 10)],
+            vec![(b"a".to_vec(), 3_000)],
+        ];
+        let streams: Vec<std::vec::IntoIter<(Vec<u8>, u64)>> =
+            sources.into_iter().map(Vec::into_iter).collect();
+        let budget = budget_over_streams(streams, |s| Ok(s.next()), &policy).expect("budget");
+        assert_eq!(budget, 2_896);
+        let fixed = BuildPolicy {
+            tier_entries_per_term: 77,
+            tier_share_of_postings: None,
+            ..BuildPolicy::default()
+        };
+        let budget = budget_over_streams(
+            Vec::<std::vec::IntoIter<(Vec<u8>, u64)>>::new(),
+            |s| Ok(s.next()),
+            &fixed,
+        )
+        .expect("budget");
+        assert_eq!(budget, 77);
     }
 }
