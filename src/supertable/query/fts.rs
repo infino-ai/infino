@@ -995,30 +995,46 @@ impl SupertableReader {
                 }
                 _ => None,
             };
-        // Tier selection: with every scored term's tier readable, a plain
-        // AND or OR over bare terms chooses its superfiles from the
-        // documents the tiers name — a lower bound on the k-th score before
-        // any open, and per superfile a bound that knows which documents
-        // carry several of the terms. The bounds replace the ceilings; the
-        // seeded threshold goes into the shared floor below.
-        // Only a complete index can rule a superfile out: one that does not
-        // yet list every live superfile knows nothing about the rest.
+        // Tier selection: with every scored term's tier readable, the query
+        // chooses its superfiles from the documents the tiers name — per
+        // superfile a bound that knows which documents carry several of the
+        // terms, and a superfile a required term has shown holds no
+        // candidate is not opened. The bounds replace the ceilings. A plain
+        // AND, OR or mix over bare terms also gets a lower bound on the k-th
+        // score before any open, seeded into the shared floor below; a
+        // phrase scores only where its words are adjacent and a negation
+        // removes documents, so for those the bounds hold but the k-th
+        // candidate may not survive, and no seed is taken. A scoring
+        // override is not served: the tiers hold impacts at the declared
+        // parameters. Only a complete index can rule a superfile out: one
+        // that does not yet list every live superfile knows nothing about
+        // the rest.
         let mut tier_seed: Option<f32> = None;
         if let (Some(index), None, Some(column_id), true) = (
             &term_index,
             bm25_params,
             manifest.field_id(column),
-            manifest.term_index_complete()
-                && !has_phrases
-                && negatives.is_empty()
-                && (musts.is_empty() || shoulds.is_empty()),
+            manifest.term_index_complete(),
         ) {
             let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
+            // Terms a matching document must carry: bare musts and the words
+            // of must phrases (a word of a should phrase is optional).
+            let required_term = |t: &str| {
+                musts.iter().any(|m| m == t)
+                    || must_phrases.iter().any(|p| p.iter().any(|w| w == t))
+            };
+            let required: u8 = scored_terms
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| required_term(t))
+                .fold(0u8, |m, (i, _)| m | (1u8 << i.min(7)));
+            let can_seed = !has_phrases && negatives.is_empty();
             let selection = tier::select_with_tiers(
                 index,
                 column_id,
                 &scored_terms,
-                !musts.is_empty(),
+                required,
+                can_seed,
                 &kept,
                 &global_idf,
                 table_avgdl,
@@ -1052,7 +1068,7 @@ impl SupertableReader {
                         .map(|e| (e.superfile_id, bound_of(e).ub))
                         .collect(),
                 );
-                if selection.theta_lb.is_finite() {
+                if can_seed && selection.theta_lb.is_finite() {
                     tier_seed = Some(selection.theta_lb);
                 }
             }

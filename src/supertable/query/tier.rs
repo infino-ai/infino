@@ -74,6 +74,10 @@ const MAX_TIER_TERMS: usize = 6;
 /// Entries the merge reads per query before it stops regardless of the
 /// fixpoint test, a safety cap against a pathological query.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 24;
+/// Entries the merge reads when the candidates' scores are not the
+/// query's (a phrase, a negation): there is no threshold to converge on,
+/// so it reads enough to rank the superfiles and exhaust small tiers.
+const INEXACT_ENTRIES_PER_QUERY: u64 = 1 << 16;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -136,16 +140,23 @@ impl Default for TermInFile {
     }
 }
 
-/// Select superfiles for a query over `terms` (all musts for `is_and`, all
-/// shoulds otherwise) with the tiers of `index`. `None` when a term has
-/// postings in a segment without a tier, or there are more terms than the
-/// merge tracks: the caller then orders by ceiling as before.
+/// Select superfiles for a query over `terms` with the tiers of `index`.
+/// `required` is a bit per term (in `terms` order) a matching document must
+/// carry: every bit for a conjunction, none for a disjunction, the musts'
+/// for a mix. `exact` says a candidate's summed impacts are the score the
+/// query would give it; when they are not — a phrase scores only where its
+/// words are adjacent, a negation removes documents — the merge takes no
+/// threshold from them and rules out only what a required term has shown
+/// to hold nothing. `None` when a term has postings in a segment without a
+/// tier, or there are more terms than the merge tracks: the caller then
+/// orders by ceiling as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn select_with_tiers(
     index: &TermIndex,
     column: FieldId,
     terms: &[&str],
-    is_and: bool,
+    required: u8,
+    exact: bool,
     kept: &[std::sync::Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
     table_avgdl: f32,
@@ -316,7 +327,7 @@ pub(crate) async fn select_with_tiers(
                 if cand.2 > best_ub[at] {
                     best_ub[at] = cand.2;
                 }
-                if cand.0 == full {
+                if exact && cand.0 == full {
                     topk.push(std::cmp::Reverse(OrdF32(cand.1)));
                     if topk.len() > k {
                         topk.pop();
@@ -342,7 +353,12 @@ pub(crate) async fn select_with_tiers(
             *slot = f;
         }
         if !theta_lb.is_finite() {
-            if entries_read >= MAX_ENTRIES_PER_QUERY {
+            let cap = if exact {
+                MAX_ENTRIES_PER_QUERY
+            } else {
+                INEXACT_ENTRIES_PER_QUERY
+            };
+            if entries_read >= cap {
                 break;
             }
             continue;
@@ -355,7 +371,7 @@ pub(crate) async fn select_with_tiers(
                 continue;
             }
             let (ub_now, ub_floor) =
-                bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, is_and);
+                bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
             if ub_now * BOUND_SLACK < theta_lb {
                 *out = true;
             } else if ub_floor * BOUND_SLACK < theta_lb {
@@ -369,7 +385,7 @@ pub(crate) async fn select_with_tiers(
 
     let mut bounds = HashMap::with_capacity(n_sf);
     for (slot, e) in kept.iter().enumerate() {
-        let (ub_now, _) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, is_and);
+        let (ub_now, _) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
         let ub = if excluded[slot] {
             f32::NEG_INFINITY
         } else {
@@ -377,7 +393,7 @@ pub(crate) async fn select_with_tiers(
         };
         let mut lb = f32::NEG_INFINITY;
         for m in 1..n_masks {
-            if is_and && m as u8 != full {
+            if m as u8 & required != required {
                 continue;
             }
             lb = lb.max(best_lb[slot * n_masks + m]);
@@ -407,18 +423,18 @@ fn tail_of(p: &Posting) -> f32 {
 /// exhausted and only the tails remained — what further reading can at
 /// best bring the bound down to.
 ///
-/// For a conjunction a candidate missing a term only exists if that term
-/// still has documents in the superfile the merge has not seen: unread
-/// blocks, or a tail above zero. A term whose streams are exhausted with
-/// a zero tail has shown every document it has there, so a candidate
-/// without it is no candidate at all.
+/// A candidate missing a required term only exists if that term still has
+/// documents in the superfile the merge has not seen: unread blocks, or a
+/// tail above zero. A term whose streams are exhausted with a zero tail
+/// has shown every document it has there, so a candidate without it is no
+/// candidate at all.
 fn bounds_of(
     slot: usize,
     n_masks: usize,
     best_ub: &[f32],
     per_term: &[Vec<TermInFile>],
     frontier: &[Option<f32>],
-    is_and: bool,
+    required: u8,
 ) -> (f32, f32) {
     let add = |mask: usize, at_tails: bool| -> f32 {
         let mut sum = 0.0f32;
@@ -431,7 +447,8 @@ fn bounds_of(
                 (false, Some(f)) => f.max(tail),
                 _ => tail,
             };
-            if is_and && unread <= 0.0 && (at_tails || frontier[ti].is_none()) {
+            let needed = required & (1 << ti) != 0;
+            if needed && unread <= 0.0 && (at_tails || frontier[ti].is_none()) {
                 return f32::NEG_INFINITY;
             }
             sum += unread;
