@@ -1411,6 +1411,20 @@ impl SuperfileBuilder {
         })
     }
 
+    /// Hand every FTS term's facts to `sink` as the blob is written, with
+    /// its best `depth` documents by impact (see
+    /// [`FtsBuilder::set_term_head_sink`]). No-op when the table has no
+    /// text columns.
+    pub(crate) fn set_term_head_sink(
+        &mut self,
+        sink: Box<dyn crate::superfile::fts::builder::TermHeadSink>,
+        depth: usize,
+    ) {
+        if let Some(fb) = self.fts_builder.as_mut() {
+            fb.set_term_head_sink(sink, depth);
+        }
+    }
+
     /// Override the FTS builder's in-RAM spill threshold (forwarded
     /// to [`FtsBuilder::set_spill_threshold_bytes`]). No-op if this
     /// `SuperfileBuilder` was constructed without any FTS columns.
