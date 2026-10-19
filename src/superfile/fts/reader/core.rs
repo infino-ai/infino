@@ -4020,7 +4020,7 @@ mod tests {
         loop {
             batches += 1;
             let chunk = r
-                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH)
+                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH, 0)
                 .await
                 .expect("facts batch");
             let done = chunk.len() < BATCH;

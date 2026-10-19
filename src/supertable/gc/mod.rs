@@ -155,12 +155,31 @@ async fn term_index_slices(
             })
         })?;
 
-    Ok(loaded
+    let mut uris: Vec<String> = loaded
         .segments
         .iter()
         .flat_map(|segment| &segment.slices)
         .map(|slice| term_index::slice_uri(&slice.content_hash))
-        .collect())
+        .collect();
+    // The tier lists and, through them, the tier chunks: one small read per
+    // segment that has a tier, never the slices.
+    uris.extend(
+        loaded
+            .segments
+            .iter()
+            .filter_map(|segment| segment.tier_list.as_ref())
+            .map(|list| term_index::tier_uri(&list.content_hash)),
+    );
+    let chunks = term_index::tier_chunks_of(storage, &loaded.segments)
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: root.uri.clone(),
+                source: Box::new(error),
+            })
+        })?;
+    uris.extend(chunks.iter().map(term_index::tier_uri));
+    Ok(uris)
 }
 
 /// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in

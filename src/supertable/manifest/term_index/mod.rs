@@ -32,6 +32,7 @@
 
 pub(crate) mod build;
 pub(crate) mod format;
+pub(crate) mod tier;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -45,11 +46,12 @@ use std::{
 pub(crate) use build::build;
 use build::build_segment;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, build_onto, merge_segments,
+    BuildPolicy, Built, Contribution, ContributionWriter, Head, build_onto, merge_segments,
+    tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
-pub(crate) use format::{Location, Posting, Root, Slice};
+pub(crate) use format::{Location, Posting, Root, Slice, decode_tier_list};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
 use tokio::fs as async_fs;
@@ -254,6 +256,13 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
     object_uri("slice", hash)
 }
 
+/// Storage URI of a tier chunk or a segment's tier list with this content
+/// hash. Both are content-addressed under one kind: a chunk and a list are
+/// told apart by where they are named from, never by their key.
+pub(crate) fn tier_uri(hash: &ContentHash) -> String {
+    object_uri("tier", hash)
+}
+
 async fn put_content_addressed(
     storage: &dyn StorageProvider,
     kind: &str,
@@ -265,14 +274,6 @@ async fn put_content_addressed(
         bytes,
     )
     .await?)
-}
-
-/// Persist one slice; idempotent by content hash.
-pub(crate) async fn write_slice(
-    storage: &dyn StorageProvider,
-    bytes: Vec<u8>,
-) -> Result<RoutingRef, TermIndexError> {
-    put_content_addressed(storage, "slice", bytes).await
 }
 
 /// Persist the root; idempotent by content hash. Call after every slice it
@@ -298,8 +299,30 @@ pub(crate) async fn write_slices(
     storage: &dyn StorageProvider,
     slices: Vec<(ContentHash, Vec<u8>)>,
 ) -> Result<(), TermIndexError> {
-    stream::iter(slices.into_iter().map(|(hash, bytes)| async move {
-        let reference = write_slice(storage, bytes).await?;
+    write_objects(storage, "slice", slices).await
+}
+
+/// Persist every tier chunk and tier list of a build; idempotent by
+/// content hash. Written before the slices that name them, like slices
+/// before the root.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(tiers = tiers.len()))
+)]
+pub(crate) async fn write_tiers(
+    storage: &dyn StorageProvider,
+    tiers: Vec<(ContentHash, Vec<u8>)>,
+) -> Result<(), TermIndexError> {
+    write_objects(storage, "tier", tiers).await
+}
+
+async fn write_objects(
+    storage: &dyn StorageProvider,
+    kind: &'static str,
+    objects: Vec<(ContentHash, Vec<u8>)>,
+) -> Result<(), TermIndexError> {
+    stream::iter(objects.into_iter().map(|(hash, bytes)| async move {
+        let reference = put_content_addressed(storage, kind, bytes).await?;
         debug_assert_eq!(reference.content_hash, hash);
         Ok::<(), TermIndexError>(())
     }))
@@ -315,6 +338,7 @@ pub(crate) async fn write_built(
     storage: &dyn StorageProvider,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     write_root(storage, &built.root).await
 }
@@ -333,6 +357,7 @@ pub(crate) async fn append_delta(
     policy: &BuildPolicy,
 ) -> Result<RoutingRef, TermIndexError> {
     let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     write_root(storage, &built.root).await
 }
@@ -375,6 +400,7 @@ pub(crate) async fn reserve_segment(
         ordinal_base = base,
     )
     .in_scope(|| build_segment(contributions, policy, base))?;
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     Ok(ReservedSegment {
         base,
@@ -446,11 +472,37 @@ pub(crate) fn segments_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a 
     .then(|| &current.segments[prior.segments.len()..])
 }
 
+/// The tier chunks `segments` reference, read from their tier lists.
+pub(crate) async fn tier_chunks_of(
+    storage: &dyn StorageProvider,
+    segments: &[Segment],
+) -> Result<Vec<ContentHash>, TermIndexError> {
+    let mut out = Vec::new();
+    for segment in segments {
+        let Some(list) = &segment.tier_list else {
+            continue;
+        };
+        let bytes = fetch_verified(
+            storage,
+            None,
+            &tier_uri(&list.content_hash),
+            &list.content_hash,
+        )
+        .await?;
+        out.extend(decode_tier_list(&bytes)?);
+    }
+    out.sort_unstable_by_key(|h| h.0);
+    out.dedup();
+    Ok(out)
+}
+
 /// Download every slice of `segments` into `dir`, verified against its
 /// hash, [`SLICE_FETCH_CONCURRENCY`] at a time, and return each segment's
 /// slice files in key order. A slice two segments share is fetched once.
-/// The bytes skip the manifest disk cache: a merge reads each slice once,
-/// and filling the cache with the whole index would evict what queries use.
+/// The segments' tier chunks land in `dir` too, named by [`tier_path`],
+/// so a merge finds them beside the slices. The bytes skip the manifest
+/// disk cache: a merge reads each object once, and filling the cache with
+/// the whole index would evict what queries use.
 pub(crate) async fn download_segments(
     storage: &dyn StorageProvider,
     segments: &[Segment],
@@ -480,6 +532,18 @@ pub(crate) async fn download_segments(
         .buffer_unordered(SLICE_FETCH_CONCURRENCY)
         .try_collect::<()>()
         .await?;
+    let chunks = tier_chunks_of(storage, segments).await?;
+    stream::iter(chunks.into_iter().map(|hash| {
+        let path = tier_path(dir, &hash);
+        async move {
+            let bytes = fetch_verified(storage, None, &tier_uri(&hash), &hash).await?;
+            async_fs::write(&path, &bytes).await?;
+            Ok::<(), TermIndexError>(())
+        }
+    }))
+    .buffer_unordered(SLICE_FETCH_CONCURRENCY)
+    .try_collect::<()>()
+    .await?;
     Ok(segments
         .iter()
         .map(|segment| {
@@ -506,6 +570,18 @@ pub(crate) fn spill_slices(
             Ok(path)
         })
         .collect()
+}
+
+/// Write freshly built tier chunks into `dir`, beside spilled slices, so a
+/// merge finds them where [`download_segments`] would have put them.
+pub(crate) fn spill_tiers(
+    dir: &Path,
+    tiers: Vec<(ContentHash, Vec<u8>)>,
+) -> Result<(), TermIndexError> {
+    for (hash, bytes) in tiers {
+        fs::write(tier_path(dir, &hash), bytes)?;
+    }
+    Ok(())
 }
 
 /// Fetch a content-addressed object, through the manifest disk cache when
@@ -1126,22 +1202,268 @@ mod tests {
                     len: 800,
                 },
             };
-            w.push(key, *df, f32::INFINITY, location).expect("push");
+            w.push(key, *df, f32::INFINITY, location, 0.0, &Head::default())
+                .expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    /// A contribution whose terms carry heads: `(column, term, docs)` with
+    /// each doc `(row, impact)`; df is the doc count and the head is
+    /// complete when `complete_up_to` covers it.
+    fn contribution_with_heads(
+        dir: &TempDir,
+        id: u128,
+        terms: &[(&str, &str, Vec<(u32, f32)>)],
+        complete_up_to: usize,
+    ) -> Contribution {
+        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id), id as i128 * 1000)
+            .expect("create");
+        let mut keyed: Vec<(Vec<u8>, &Vec<(u32, f32)>)> = terms
+            .iter()
+            .map(|(c, t, docs)| (fid(c).term_key(t), docs))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, docs) in keyed {
+            let mut sorted = docs.clone();
+            sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let bound = sorted.first().map(|d| d.1).unwrap_or(0.0);
+            let complete = sorted.len() <= complete_up_to;
+            let kept: Vec<(u32, f32)> = sorted.iter().copied().take(complete_up_to).collect();
+            let tail = if complete {
+                0.0
+            } else {
+                sorted[complete_up_to].1
+            };
+            w.push(
+                &key,
+                docs.len() as u64,
+                bound,
+                Location::None,
+                tail,
+                &Head {
+                    docs: kept,
+                    complete,
+                },
+            )
+            .expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    fn tier_entries_of(
+        built_tiers: &[(ContentHash, Vec<u8>)],
+        tier: &format::TierRef,
+    ) -> Vec<tier::TierEntry> {
+        let by_hash: HashMap<ContentHash, &Vec<u8>> =
+            built_tiers.iter().map(|(h, b)| (*h, b)).collect();
+        let mut out = Vec::new();
+        let mut block = Vec::new();
+        for chunk in &tier.chunks {
+            let chunk = tier::TierChunk::open(by_hash[&chunk.content_hash]).expect("open chunk");
+            for i in 0..chunk.n_blocks() {
+                chunk.decode_block(i, &mut block).expect("decode");
+                out.extend_from_slice(&block);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_build_pools_the_heads_into_a_tier_and_raises_tails_when_it_truncates() {
+        let dir = TempDir::new().expect("tempdir");
+        // Three superfiles; "alpha" has three docs in each, "beta" one.
+        let docs = |base: f32| vec![(1, base + 0.3), (5, base + 0.2), (9, base + 0.1)];
+        let a = contribution_with_heads(
+            &dir,
+            1,
+            &[
+                ("body", "alpha", docs(1.0)),
+                ("body", "beta", vec![(2, 0.5)]),
+            ],
+            8,
+        );
+        let b = contribution_with_heads(&dir, 2, &[("body", "alpha", docs(2.0))], 8);
+        let c = contribution_with_heads(&dir, 3, &[("body", "alpha", docs(3.0))], 8);
+        let policy = BuildPolicy {
+            slice_target_bytes: usize::MAX,
+            tier_entries_per_term: 4,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[a, b, c], &policy).expect("build");
+        let slice = Slice::open(&built.slices[0].1).expect("open");
+        let alpha = slice
+            .run(&fid("body").term_key("alpha"))
+            .expect("run")
+            .expect("alpha is indexed");
+        let tier = alpha.tier.expect("alpha has a tier");
+        assert_eq!(tier.n_entries, 4, "truncated to the budget");
+        assert!(!tier.complete, "a truncated tier is not complete");
+        let entries = tier_entries_of(&built.tiers, &tier);
+        let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
+        ids.sort_unstable();
+        // The four best impacts table-wide: superfile 2's three docs and
+        // superfile 1's best.
+        assert_eq!(ids, vec![(1, 1), (2, 1), (2, 5), (2, 9)]);
+        // Superfile 1 lost its 2.2 and 2.1 docs: its tail rises to 2.2.
+        // Superfile 0 lost everything: its tail is its own best, 1.3.
+        let tail = |sf: u32| {
+            alpha
+                .postings
+                .iter()
+                .find(|p| p.superfile == sf)
+                .expect("posting")
+                .tail
+        };
+        assert_eq!(tail(0), 1.3);
+        assert_eq!(tail(1), 2.2);
+        assert_eq!(tail(2), 0.0, "nothing of superfile 2 was dropped");
+        let beta = slice
+            .run(&fid("body").term_key("beta"))
+            .expect("run")
+            .expect("beta is indexed");
+        let beta_tier = beta.tier.expect("beta has a tier");
+        assert!(beta_tier.complete, "one doc under the budget is complete");
+        assert_eq!(tier_entries_of(&built.tiers, &beta_tier).len(), 1);
+        // The segment's tier list names every chunk.
+        let list = built.root.segments[0].tier_list.expect("tier list");
+        let list_bytes = &built
+            .tiers
+            .iter()
+            .find(|(h, _)| *h == list.content_hash)
+            .expect("list bytes")
+            .1;
+        let named = decode_tier_list(list_bytes).expect("list");
+        assert_eq!(
+            named.len(),
+            built.tiers.len() - 1,
+            "every chunk but the list itself"
+        );
+    }
+
+    #[test]
+    fn merging_segments_with_tiers_writes_what_a_fresh_build_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let make = |id: u128, n: u32| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "alpha", docs(id as f32, n)),
+                    ("body", "gamma", docs(0.5, 2)),
+                ],
+                1000,
+            )
+        };
+        // No source truncates at this budget, so the merge sees every entry
+        // a fresh build would and must write the same bytes.
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let base = build(&[make(1, 60), make(2, 60)], &policy).expect("base");
+        let delta = build_onto(base.root.clone(), &[make(3, 90)], &policy).expect("delta");
+        spill_tiers(dir.path(), base.tiers.clone()).expect("spill base tiers");
+        spill_tiers(dir.path(), delta.tiers.clone()).expect("spill delta tiers");
+        let sources = vec![
+            spill_slices(dir.path(), base.slices).expect("spill base"),
+            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+        ];
+        // Drop the middle superfile; the merge renumbers the survivors.
+        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
+            .expect("merge");
+        let expected = build(&[make(1, 60), make(3, 90)], &policy).expect("survivors");
+        assert_eq!(merged.slices, expected.slices, "slices are byte-identical");
+        assert_eq!(
+            merged.tiers, expected.tiers,
+            "tier chunks and the tier list are byte-identical"
+        );
+        assert_eq!(merged.segment, expected.root.segments[0]);
+    }
+
+    /// A source that already truncated cannot give a merge the entries it
+    /// dropped, so a merge of truncated sources is not a fresh build; what
+    /// it must still be is sound: every posting's tail bounds the impacts
+    /// of that superfile's documents the merged tier does not hold.
+    #[test]
+    fn merging_truncated_tiers_keeps_every_tail_an_upper_bound() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let heads: Vec<(u128, Vec<(u32, f32)>)> =
+            vec![(1, docs(1.0, 60)), (2, docs(2.0, 60)), (3, docs(1.5, 90))];
+        let make = |id: u128| {
+            let d = &heads.iter().find(|h| h.0 == id).expect("heads").1;
+            contribution_with_heads(&dir, id, &[("body", "alpha", d.clone())], 1000)
+        };
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 40,
+            ..BuildPolicy::default()
+        };
+        let base = build(&[make(1), make(2)], &policy).expect("base");
+        let delta = build_onto(base.root.clone(), &[make(3)], &policy).expect("delta");
+        spill_tiers(dir.path(), base.tiers.clone()).expect("spill base tiers");
+        spill_tiers(dir.path(), delta.tiers.clone()).expect("spill delta tiers");
+        let sources = vec![
+            spill_slices(dir.path(), base.slices).expect("spill base"),
+            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+        ];
+        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
+            .expect("merge");
+        let slice = Slice::open(&merged.slices[0].1).expect("open");
+        let run = slice
+            .run(&fid("body").term_key("alpha"))
+            .expect("run")
+            .expect("alpha");
+        let tier = run.tier.expect("tier");
+        assert_eq!(tier.n_entries, 40);
+        assert!(!tier.complete);
+        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.tiers, &tier)
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        // New ordinal 0 is superfile 1, new ordinal 1 is superfile 3.
+        for (ordinal, id) in [(0u32, 1u128), (1, 3)] {
+            let posting = run
+                .postings
+                .iter()
+                .find(|p| p.superfile == ordinal)
+                .expect("posting");
+            for &(row, impact) in &heads.iter().find(|h| h.0 == id).expect("heads").1 {
+                if !held.contains(&(ordinal, row)) {
+                    assert!(
+                        posting.tail >= impact,
+                        "superfile {id} row {row}: impact {impact} above tail {}",
+                        posting.tail
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn contribution_rejects_out_of_order_keys() {
         let dir = TempDir::new().expect("tempdir");
         let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
-        w.push(b"b", 1, 1.0, Location::None).expect("first");
+        w.push(b"b", 1, 1.0, Location::None, 0.0, &Head::default())
+            .expect("first");
         assert!(matches!(
-            w.push(b"a", 1, 1.0, Location::None),
+            w.push(b"a", 1, 1.0, Location::None, 0.0, &Head::default()),
             Err(TermIndexError::Build(m)) if m.contains("ascending")
         ));
         assert!(
-            w.push(b"b", 1, 1.0, Location::None).is_err(),
+            w.push(b"b", 1, 1.0, Location::None, 0.0, &Head::default())
+                .is_err(),
             "equal keys are not ascending"
         );
     }
@@ -1165,6 +1487,7 @@ mod tests {
         let c = contribution(&dir, 3, &[("body", "alpha", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: usize::MAX,
+            ..BuildPolicy::default()
         };
         let built = build(&[a, b, c], &policy).expect("build");
         assert_eq!(
@@ -1249,6 +1572,7 @@ mod tests {
         let a = contribution(&dir, 1, &refs);
         let policy = BuildPolicy {
             slice_target_bytes: 600,
+            ..BuildPolicy::default()
         };
         let built = build(&[a], &policy).expect("build");
         let slices = &built.root.segments[0].slices;
@@ -1299,6 +1623,7 @@ mod tests {
         // Small slices, so the merge has to cut where the build cuts.
         let policy = BuildPolicy {
             slice_target_bytes: 256,
+            ..BuildPolicy::default()
         };
 
         let base = build(&[first, gone], &policy).expect("base");
@@ -1307,8 +1632,9 @@ mod tests {
             spill_slices(dir.path(), base.slices).expect("spill base"),
             spill_slices(dir.path(), delta.slices).expect("spill delta"),
         ];
-        let (segment, slices) =
-            merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
+            .expect("merge");
+        let (segment, slices) = (merged.segment, merged.slices);
 
         let first = make(1, terms(0..60, 1));
         let last = make(3, terms(0..90, 2));
@@ -1337,6 +1663,7 @@ mod tests {
         let b = contribution(&dir, 8, &[("body", "ab005", 9), ("body", "zz", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: 800,
+            ..BuildPolicy::default()
         };
         let built = build(&[a, b], &policy).expect("build");
         let n_slices = built.root.segments[0].slices.len();
@@ -2209,6 +2536,7 @@ mod tests {
     /// A one-slice segment, told apart by `tag`.
     fn tagged_segment(tag: u8) -> Segment {
         Segment {
+            tier_list: None,
             slices: vec![SliceRef {
                 first_key: vec![tag],
                 last_key: vec![tag],
@@ -3528,6 +3856,8 @@ mod tests {
                         offset: 100 * i as u64,
                         len: 64,
                     },
+                    0.0,
+                    &Head::default(),
                 )
                 .expect("push");
                 w.finish().expect("finish")
@@ -3576,12 +3906,15 @@ mod tests {
                 .map(|(i, terms)| {
                     let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1), i as i128).expect("create");
                     for t in terms {
-                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
+                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None, 0.0, &Head::default()).expect("push");
                     }
                     w.finish().expect("finish")
                 })
                 .collect();
-            let policy = BuildPolicy { slice_target_bytes: 512 };
+            let policy = BuildPolicy {
+            slice_target_bytes: 512 ,
+            ..BuildPolicy::default()
+        };
             let built = build(&contributions, &policy).expect("build");
             let store_dir = TempDir::new().expect("store dir");
             let storage: Arc<dyn StorageProvider> =
@@ -4457,6 +4790,7 @@ mod tests {
                 superfile: 0,
                 df: 1,
                 bound: 1.0,
+                tail: 1.0,
                 location: Location::None,
             }]),
         );
@@ -4598,6 +4932,7 @@ mod tests {
             .collect();
         let policy = BuildPolicy {
             slice_target_bytes: BATCH_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
         };
         let store_dir = TempDir::new().expect("store dir");
         let local: Arc<dyn StorageProvider> =
@@ -4691,6 +5026,7 @@ mod tests {
             keys.iter().map(|k| ("record_key", k.as_str(), 1)).collect();
         let policy = BuildPolicy {
             slice_target_bytes: RANDOM_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
         };
         let built = build(&[contribution(&dir, 1, &terms)], &policy).expect("build");
         let slices = &built.root.segments[0].slices;

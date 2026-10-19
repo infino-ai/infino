@@ -3704,6 +3704,7 @@ pub(in crate::supertable) fn build_term_contribution(
         reader,
         &manifest.options.legacy_names(),
         &mut writer,
+        &term_index::BuildPolicy::default(),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -3724,6 +3725,7 @@ async fn write_superfile_terms(
     reader: &SuperfileReader,
     legacy: &LegacyNames,
     writer: &mut term_index::ContributionWriter,
+    policy: &term_index::BuildPolicy,
 ) -> Result<(), TermIndexError> {
     let Some(fts) = reader.fts() else {
         return Ok(());
@@ -3752,30 +3754,44 @@ async fn write_superfile_terms(
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
+                    policy.head_depth_per_superfile,
                 )
                 .await
                 .map_err(|source| TermIndexError::Read {
                     what: "term facts",
                     source,
                 })?;
-            for (term, fact) in &chunk {
+            let n_in_chunk = chunk.len();
+            let last_term = chunk.last().map(|(term, _)| term.clone());
+            for (term, fact) in chunk {
                 let term =
-                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
+                    from_utf8(&term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
-                let (df, bound, location) = match fact {
+                let (df, bound, location, tail, head) = match fact {
                     Some(f) => (
                         f.df,
                         f.bound,
                         term_index::Location::from_dict_value(f.entry),
+                        f.head.tail,
+                        term_index::Head {
+                            docs: f.head.docs,
+                            complete: f.head.complete,
+                        },
                     ),
-                    None => (0, f32::INFINITY, term_index::Location::None),
+                    None => (
+                        0,
+                        f32::INFINITY,
+                        term_index::Location::None,
+                        f32::INFINITY,
+                        term_index::Head::default(),
+                    ),
                 };
-                writer.push(&column_id.term_key(term), df, bound, location)?;
+                writer.push(&column_id.term_key(term), df, bound, location, tail, &head)?;
             }
-            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
-            after = chunk.into_iter().last().map(|(term, _)| term);
+            let done = n_in_chunk < TERM_INDEX_BATCH_TERMS;
+            after = last_term;
             if done {
                 break;
             }
@@ -10990,6 +11006,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         term_index::Built {
                             root: base,
                             slices: Vec::new(),
+                            tiers: Vec::new(),
                         }
                     } else {
                         collect_and_build_term_index(&old, &missing, base).await?
@@ -11010,6 +11027,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
+            term_index::write_tiers(storage.as_ref(), built.tiers).await?;
             term_index::write_slices(storage.as_ref(), built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
@@ -11086,6 +11104,7 @@ async fn merge_term_index(
         let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
         let built =
             term_index::build_onto(old, &contributions, &term_index::BuildPolicy::default())?;
+        term_index::spill_tiers(scratch.path(), built.tiers)?;
         sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
         old = built.root;
     }
@@ -11108,11 +11127,17 @@ async fn merge_term_index(
         .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
         .collect();
 
-    let (segment, slices) = run_on_pool(
+    let tier_dir = scratch.path().to_path_buf();
+    let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
         move || {
-            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
+            term_index::merge_segments(
+                &sources,
+                &tier_dir,
+                &ordinals,
+                &term_index::BuildPolicy::default(),
+            )
         },
     )
     .instrument(detail_span!(
@@ -11122,8 +11147,12 @@ async fn merge_term_index(
     ))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(segment);
-    Ok(term_index::Built { root, slices })
+    root.segments.push(merged.segment);
+    Ok(term_index::Built {
+        root,
+        slices: merged.slices,
+        tiers: merged.tiers,
+    })
 }
 
 /// Fold the delta segments committed since `prior` onto `base`, the build
@@ -11165,6 +11194,7 @@ async fn fold_term_index(
         return Ok(Some(term_index::Built {
             root,
             slices: Vec::new(),
+            tiers: Vec::new(),
         }));
     }
     let storage = manifest
@@ -11174,18 +11204,28 @@ async fn fold_term_index(
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
     let scratch = term_index_scratch()?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
-    let (segment, slices) = run_on_pool(
+    let tier_dir = scratch.path().to_path_buf();
+    let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
         move || {
-            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
+            term_index::merge_segments(
+                &sources,
+                &tier_dir,
+                &ordinals,
+                &term_index::BuildPolicy::default(),
+            )
         },
     )
     .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(segment);
-    Ok(Some(term_index::Built { root, slices }))
+    root.segments.push(merged.segment);
+    Ok(Some(term_index::Built {
+        root,
+        slices: merged.slices,
+        tiers: merged.tiers,
+    }))
 }
 
 /// A scratch directory for one term-index build, removed when dropped.
@@ -11234,7 +11274,13 @@ async fn collect_contributions(
         }
         let mut writer =
             term_index::ContributionWriter::create(dir, entry.superfile_id, entry.id_min)?;
-        write_superfile_terms(&reader, &legacy, &mut writer).await?;
+        write_superfile_terms(
+            &reader,
+            &legacy,
+            &mut writer,
+            &term_index::BuildPolicy::default(),
+        )
+        .await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
