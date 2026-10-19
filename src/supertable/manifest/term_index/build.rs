@@ -53,9 +53,8 @@ use crate::{
 /// measured value.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// Layout new slices are written in. Version 1 until every engine reading
-/// a table can read version 2; an older engine fails on it.
-pub(crate) const SLICE_WRITE_FORMAT: SliceFormat = SliceFormat::Whole;
+/// Layout new slices are written in.
+const SLICE_WRITE_FORMAT: SliceFormat = SliceFormat::Ranged;
 
 /// Knobs the build takes from its caller.
 #[derive(Debug, Clone, Copy)]

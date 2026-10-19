@@ -43,10 +43,10 @@ use std::{
 
 #[cfg(test)]
 pub(crate) use build::build;
+use build::build_segment;
 pub(crate) use build::{
     BuildPolicy, Built, Contribution, ContributionWriter, build_onto, merge_segments,
 };
-use build::{SLICE_WRITE_FORMAT, build_segment};
 use bytes::Bytes;
 pub(crate) use format::{Location, Posting, Root, Slice};
 use format::{RANGED_HEADER_LEN, Segment, SliceFormat, SliceHead, SliceHeader, decode_checked_run};
@@ -593,9 +593,6 @@ pub(crate) struct TermIndex {
     disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
-    /// Whether lookups may read slices by range: only once this engine
-    /// writes version 2 slices, since probing a version 1 slice costs a read.
-    read_by_range: bool,
     /// Slice heads by slice hash; see [`RESIDENT_HEAD_BUDGET_BYTES`].
     heads: std::sync::Mutex<Resident<ContentHash, Arc<Head>>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
@@ -704,7 +701,6 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
-            read_by_range: SLICE_WRITE_FORMAT == SliceFormat::Ranged,
             heads: std::sync::Mutex::new(Resident::new(RESIDENT_HEAD_BUDGET_BYTES, |h| h.weight())),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
@@ -726,13 +722,6 @@ impl TermIndex {
         .await?;
         let root = Root::decode(&bytes)?;
         Ok(Self::new(root, reference.uri.clone(), storage, disk_cache))
-    }
-
-    /// This index, reading slices by range whatever this engine writes.
-    #[cfg(test)]
-    pub(crate) fn reading_by_range(mut self) -> Self {
-        self.read_by_range = true;
-        self
     }
 
     /// The root URI this index was loaded from.
@@ -1062,10 +1051,7 @@ impl TermIndex {
             for (hash, (len, terms_here)) in by_slice {
                 let local = resident.contains(&hash)
                     || self.disk_cache.as_ref().is_some_and(|c| c.contains(&hash));
-                let read_whole = !self.read_by_range
-                    || local
-                    || terms_here.len() > RANGE_READ_MAX_TERMS_PER_SLICE;
-                match read_whole {
+                match local || terms_here.len() > RANGE_READ_MAX_TERMS_PER_SLICE {
                     true => whole.push((hash, terms_here)),
                     false => ranged.push((hash, len, terms_here)),
                 }
@@ -3256,32 +3242,26 @@ mod tests {
         assert!(index.is_indexed(&newest), "the new superfile is listed");
     }
 
-    /// A slice fetched once is served from the manifest disk cache
-    /// afterwards: with the object gone from storage, a fresh index over
-    /// the same cache still answers, and one without the cache does not.
+    /// A slice in the manifest disk cache is read from it whole, not by
+    /// range from storage: with the objects gone from storage, an index
+    /// over the cache still answers, and one without the cache does not.
     #[test]
-    fn slices_are_served_from_the_manifest_disk_cache_once_fetched() {
-        use std::fs;
-
-        use crate::supertable::manifest::disk_cache::ManifestDiskCache;
-
+    fn slices_in_the_manifest_disk_cache_are_read_from_it() {
         let (dir, storage, st) = fresh_table();
         commit_segment(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
         let cache = ManifestDiskCache::new(cache_dir.path().to_path_buf(), 1 << 30).expect("cache");
-        let warm = TermIndex::new(
-            root.clone(),
-            String::new(),
-            Arc::clone(&storage),
-            Some(Arc::clone(&cache)),
-        );
+        let fresh = TermIndex::new(root.clone(), String::new(), Arc::clone(&storage), None);
         let first = rt
-            .block_on(warm.postings(title_id(), "shared"))
+            .block_on(fresh.postings(title_id(), "shared"))
             .expect("fetch through storage");
         assert!(!first.is_empty());
         for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+            let uri = slice_uri(&slice.content_hash);
+            let (bytes, _) = rt.block_on(storage.get(&uri)).expect("slice");
+            rt.block_on(cache.put(slice.content_hash, &bytes));
             fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
         }
         let cached = TermIndex::new(
@@ -4857,6 +4837,25 @@ mod tests {
         ([dir, store_dir], storage, root, terms)
     }
 
+    /// `key`'s postings decoded from whole slices: what a range read must
+    /// reproduce.
+    async fn whole_slice_postings(
+        storage: &dyn StorageProvider,
+        root: &Root,
+        key: &[u8],
+    ) -> Vec<Posting> {
+        let mut out = Vec::new();
+        for r in root.slices_for_key(key) {
+            let (bytes, _) = storage
+                .get(&slice_uri(&r.content_hash))
+                .await
+                .expect("slice");
+            let slice = Slice::open(&bytes).expect("open");
+            out.extend(slice.postings(key).expect("decode").unwrap_or_default());
+        }
+        out
+    }
+
     /// Reading by range answers exactly what whole-slice reads do, over a
     /// version 1 base and a version 2 delta, for present and absent terms.
     #[tokio::test]
@@ -4866,15 +4865,14 @@ mod tests {
         asked.extend(["t00000a", "a", "zzz"]);
         let slow = SlowGets::wrap(Arc::clone(&storage));
         let ranged = TermIndex::new(root.clone(), String::new(), slow.clone(), None)
-            .reading_by_range()
             .postings_many(fid("body"), &asked)
             .await
             .expect("ranged");
-        let whole = TermIndex::new(root, String::new(), storage, None)
-            .postings_many(fid("body"), &asked)
-            .await
-            .expect("whole");
-        assert_eq!(ranged, whole);
+        for (term, run) in asked.iter().zip(&ranged) {
+            let whole =
+                whole_slice_postings(storage.as_ref(), &root, &fid("body").term_key(term)).await;
+            assert_eq!(run.as_slice(), whole.as_slice(), "{term}");
+        }
         assert_eq!(
             ranged[0].iter().map(|p| p.df).collect::<Vec<_>>(),
             vec![1, 7],
@@ -4898,13 +4896,11 @@ mod tests {
             Arc::clone(&storage),
             Some(Arc::clone(&cache)),
         )
-        .reading_by_range()
         .postings_many(fid("body"), &asked)
         .await
         .expect("first");
         let slow = SlowGets::wrap(storage);
         let again = TermIndex::new(root, String::new(), slow.clone(), Some(cache))
-            .reading_by_range()
             .postings_many(fid("body"), &asked)
             .await
             .expect("after restart");
@@ -4999,9 +4995,9 @@ mod tests {
             "test spans many slices"
         );
         assert_eq!(
-            slow.gets.load(Ordering::SeqCst),
+            slow.gets.load(Ordering::SeqCst) + slow.header_reads.load(Ordering::SeqCst),
             needed.len(),
-            "each needed slice fetched once"
+            "each needed slice opened once, whole or by range"
         );
         assert!(
             slow.max_in_flight.load(Ordering::SeqCst) > 1,
