@@ -136,9 +136,20 @@ const ENCODE_BATCH_TERMS: usize = 1 << 13;
 struct TermInput {
     key: Vec<u8>,
     postings: Vec<Posting>,
+    /// Entries already decoded and numbered (a build's heads).
     entries: Vec<TierEntry>,
-    /// Every head that fed `entries` was its term's whole list.
+    /// Tiers still to decode and renumber (a merge's sources), so the
+    /// decoding runs in the parallel batch rather than on the merge thread.
+    sources: Vec<TierSource>,
+    /// Every head or tier that fed the term was its whole list.
     complete: bool,
+}
+
+/// One source run's tier in a merge: its chunks and the slice's tier
+/// object they sit in.
+struct TierSource {
+    object: Arc<Vec<u8>>,
+    chunks: Vec<TierChunkRef>,
 }
 
 /// A term's tier, cut to the budget and encoded, before it is placed.
@@ -161,13 +172,20 @@ struct EncodedTerm {
 /// its tail raised to the best impact dropped, so the tail stays an upper
 /// bound on what the tier does not hold. The budget-th entry is found by
 /// selection, so only the kept entries are sorted.
-fn encode_term(mut term: TermInput, budget: u64) -> EncodedTerm {
+fn encode_term(
+    mut term: TermInput,
+    budget: u64,
+    ordinals: &[Option<u32>],
+) -> Result<EncodedTerm, TermIndexError> {
+    for source in &term.sources {
+        tier_entries(&source.chunks, &source.object, ordinals, &mut term.entries)?;
+    }
     if budget == 0 || term.entries.is_empty() {
-        return EncodedTerm {
+        return Ok(EncodedTerm {
             key: term.key,
             postings: term.postings,
             tier: None,
-        };
+        });
     }
     let order = |a: &TierEntry, b: &TierEntry| {
         b.impact
@@ -195,7 +213,7 @@ fn encode_term(mut term: TermInput, budget: u64) -> EncodedTerm {
         term.entries.sort_unstable_by(order);
     }
     let chunks = encode_tier(&term.entries);
-    EncodedTerm {
+    Ok(EncodedTerm {
         key: term.key,
         postings: term.postings,
         tier: Some(EncodedTier {
@@ -203,7 +221,7 @@ fn encode_term(mut term: TermInput, budget: u64) -> EncodedTerm {
             n_entries: term.entries.len() as u64,
             chunks,
         }),
-    }
+    })
 }
 
 /// One term's head from one superfile, as a contribution carries it.
@@ -568,9 +586,12 @@ struct SegmentWriter {
     tier_entries_per_term: u64,
     /// Terms gathered for the next parallel encoding batch, in key order.
     pending: Vec<TermInput>,
-    /// Tier entries across `pending`.
+    /// Tier entries across `pending`, decoded or still to decode.
     pending_entries: usize,
     pool: Option<Arc<ThreadPool>>,
+    /// How a merge renumbers the ordinals of the tiers it decodes; empty for
+    /// a build, whose entries arrive numbered.
+    ordinals: Arc<[Option<u32>]>,
 }
 
 impl SegmentWriter {
@@ -586,6 +607,15 @@ impl SegmentWriter {
             pending: Vec::new(),
             pending_entries: 0,
             pool: policy.pool.clone(),
+            ordinals: Arc::from(Vec::new()),
+        }
+    }
+
+    /// A writer for a merge, renumbering decoded tiers through `ordinals`.
+    fn for_merge(policy: &BuildPolicy, ordinals: &[Option<u32>]) -> Self {
+        Self {
+            ordinals: Arc::from(ordinals.to_vec()),
+            ..Self::new(policy)
         }
     }
 
@@ -644,39 +674,52 @@ impl SegmentWriter {
         key: &[u8],
         postings: Vec<Posting>,
         entries: Vec<TierEntry>,
+        sources: Vec<TierSource>,
         complete: bool,
-    ) {
+    ) -> Result<(), TermIndexError> {
         self.pending_entries += entries.len();
+        for source in &sources {
+            self.pending_entries += source
+                .chunks
+                .iter()
+                .map(|c| c.n_entries as usize)
+                .sum::<usize>();
+        }
         self.pending.push(TermInput {
             key: key.to_vec(),
             postings,
             entries,
+            sources,
             complete,
         });
         if self.pending_entries >= ENCODE_BATCH_ENTRIES || self.pending.len() >= ENCODE_BATCH_TERMS
         {
-            self.flush_pending();
+            self.flush_pending()?;
         }
+        Ok(())
     }
 
-    /// Encode the queued terms' tiers in parallel, then write each in order.
-    fn flush_pending(&mut self) {
+    /// Decode and encode the queued terms' tiers in parallel, then write
+    /// each in order.
+    fn flush_pending(&mut self) -> Result<(), TermIndexError> {
         let batch = mem::take(&mut self.pending);
         self.pending_entries = 0;
         let budget = self.tier_entries_per_term;
-        let encode = || -> Vec<EncodedTerm> {
+        let ordinals = Arc::clone(&self.ordinals);
+        let encode = || -> Result<Vec<EncodedTerm>, TermIndexError> {
             batch
                 .into_par_iter()
-                .map(|term| encode_term(term, budget))
+                .map(|term| encode_term(term, budget, &ordinals))
                 .collect()
         };
         let encoded = match &self.pool {
             Some(pool) => pool.install(encode),
             None => encode(),
-        };
+        }?;
         for term in encoded {
             self.add_encoded(term);
         }
+        Ok(())
     }
 
     /// Write one encoded term: its chunks go in the tier object of the slice
@@ -722,22 +765,26 @@ impl SegmentWriter {
 
     /// The segment, its slices and their tier objects, each written beside
     /// the slice that names it.
+    #[allow(clippy::type_complexity)]
     fn finish(
         mut self,
-    ) -> (
-        Segment,
-        Vec<(ContentHash, Vec<u8>)>,
-        Vec<(ContentHash, Vec<u8>)>,
-    ) {
-        self.flush_pending();
-        self.cut();
+    ) -> Result<
         (
+            Segment,
+            Vec<(ContentHash, Vec<u8>)>,
+            Vec<(ContentHash, Vec<u8>)>,
+        ),
+        TermIndexError,
+    > {
+        self.flush_pending()?;
+        self.cut();
+        Ok((
             Segment {
                 slices: self.slices,
             },
             self.slice_bytes,
             self.tier_bytes,
-        )
+        ))
     }
 }
 
@@ -891,9 +938,15 @@ pub(crate) fn build_segment(
         // megabytes per superfile, per query, where the postings it wants
         // are kilobytes — so the location is worth most exactly where it
         // was once dropped.
-        writer.add_term(&key, mem::take(&mut run), mem::take(&mut entries), complete);
+        writer.add_term(
+            &key,
+            mem::take(&mut run),
+            mem::take(&mut entries),
+            Vec::new(),
+            complete,
+        )?;
     }
-    let (segment, slices, tiers) = writer.finish();
+    let (segment, slices, tiers) = writer.finish()?;
 
     Ok(BuiltSegment {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
@@ -918,7 +971,7 @@ struct SegmentCursor {
     bytes: Vec<u8>,
     /// The open slice's tier object, read on the first tier the slice
     /// yields; `None` until then and after every slice change.
-    tier: Option<Vec<u8>>,
+    tier: Option<Arc<Vec<u8>>>,
     /// Where the open slice's tier object sits (see [`tier_path`]).
     tier_file: Option<PathBuf>,
     /// Decoded terms not handed out yet.
@@ -968,15 +1021,15 @@ impl SegmentCursor {
     /// The open slice's tier object, read on first use. A run with a tier
     /// always comes from a slice that has one, so a missing file is an
     /// error, not an empty tier.
-    fn tier_bytes(&mut self) -> Result<&[u8], TermIndexError> {
+    fn tier_bytes(&mut self) -> Result<Arc<Vec<u8>>, TermIndexError> {
         if self.tier.is_none() {
             let path = self
                 .tier_file
                 .as_ref()
                 .ok_or_else(|| TermIndexError::Build("tier read before any slice".into()))?;
-            self.tier = Some(fs::read(path)?);
+            self.tier = Some(Arc::new(fs::read(path)?));
         }
-        Ok(self.tier.as_deref().expect("read above"))
+        Ok(Arc::clone(self.tier.as_ref().expect("read above")))
     }
 }
 
@@ -997,13 +1050,13 @@ pub(crate) fn tier_path(dir: &Path, slice_hash: &ContentHash) -> PathBuf {
 /// bounds are recomputed from them, so they stay exact for the entries the
 /// merged blocks hold.
 fn tier_entries(
-    tier: &TierRef,
+    chunks: &[TierChunkRef],
     object: &[u8],
     ordinals: &[Option<u32>],
     out: &mut Vec<TierEntry>,
 ) -> Result<(), TermIndexError> {
     let mut block = Vec::new();
-    for chunk in &tier.chunks {
+    for chunk in chunks {
         let end = chunk
             .offset
             .checked_add(chunk.len)
@@ -1058,13 +1111,13 @@ pub(crate) fn merge_segments(
         }
     }
 
-    let mut writer = SegmentWriter::new(policy);
+    let mut writer = SegmentWriter::for_merge(policy, ordinals);
     let mut run: Vec<Posting> = Vec::new();
-    let mut entries: Vec<TierEntry> = Vec::new();
+    let mut sources: Vec<TierSource> = Vec::new();
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
         run.clear();
-        entries.clear();
+        sources.clear();
         let mut complete = true;
         let mut next = Some(head.ordinal);
         while let Some(source) = next {
@@ -1074,8 +1127,10 @@ pub(crate) fn merge_segments(
             match &source_run.tier {
                 Some(tier) => {
                     complete &= tier.complete;
-                    let object = cursors[source as usize].tier_bytes()?;
-                    tier_entries(tier, object, ordinals, &mut entries)?;
+                    sources.push(TierSource {
+                        object: cursors[source as usize].tier_bytes()?,
+                        chunks: tier.chunks.clone(),
+                    });
                 }
                 // A run without a tier bounds its postings by their tails
                 // alone; the merged tier holds nothing for them and is not
@@ -1104,9 +1159,15 @@ pub(crate) fn merge_segments(
             continue;
         }
         run.sort_unstable_by_key(|p| p.superfile);
-        writer.add_term(&key, mem::take(&mut run), mem::take(&mut entries), complete);
+        writer.add_term(
+            &key,
+            mem::take(&mut run),
+            Vec::new(),
+            mem::take(&mut sources),
+            complete,
+        )?;
     }
-    let (segment, slices, tiers) = writer.finish();
+    let (segment, slices, tiers) = writer.finish()?;
     Ok(MergedSegment {
         segment,
         slices,
