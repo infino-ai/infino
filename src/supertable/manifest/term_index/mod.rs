@@ -46,8 +46,8 @@ use std::{
 pub(crate) use build::build;
 use build::build_segment;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, Head, TIER_ENTRIES_PER_TERM, build_onto,
-    merge_segments, tier_path,
+    BuildPolicy, Built, Contribution, ContributionWriter, Head, build_onto, merge_segments,
+    tier_entries_for, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;

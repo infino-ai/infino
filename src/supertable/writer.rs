@@ -2935,7 +2935,9 @@ impl SupertableWriter {
                             term_index::reserve_segment(
                                 storage.as_ref(),
                                 contributions,
-                                &self.inner.options.term_index_build_policy(),
+                                &self.inner.options.term_index_build_policy(
+                                    self.inner.manifest.load().n_docs_total(),
+                                ),
                                 base,
                                 true,
                             ),
@@ -3704,7 +3706,9 @@ pub(in crate::supertable) fn build_term_contribution(
         reader,
         &manifest.options.legacy_names(),
         &mut writer,
-        &manifest.options.term_index_build_policy(),
+        &manifest
+            .options
+            .term_index_build_policy(manifest.n_docs_total()),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -11084,7 +11088,9 @@ async fn merge_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
-    let policy = manifest.options.term_index_build_policy();
+    let policy = manifest
+        .options
+        .term_index_build_policy(manifest.n_docs_total());
     let scratch = term_index_scratch()?;
     let mut sources =
         term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
@@ -11195,7 +11201,9 @@ async fn fold_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
-    let policy = manifest.options.term_index_build_policy();
+    let policy = manifest
+        .options
+        .term_index_build_policy(manifest.n_docs_total());
     let scratch = term_index_scratch()?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
     let tier_dir = scratch.path().to_path_buf();
@@ -11234,7 +11242,9 @@ async fn collect_and_build_term_index(
     term_index::build_onto(
         onto,
         &contributions,
-        &manifest.options.term_index_build_policy(),
+        &manifest
+            .options
+            .term_index_build_policy(manifest.n_docs_total()),
     )
 }
 
@@ -11249,7 +11259,9 @@ async fn collect_contributions(
     let disk_cache = manifest.options.disk_cache.as_ref();
     let opt_storage = manifest.options.storage.as_ref();
     let legacy = manifest.options.legacy_names();
-    let policy = manifest.options.term_index_build_policy();
+    let policy = manifest
+        .options
+        .term_index_build_policy(manifest.n_docs_total());
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)

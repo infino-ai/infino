@@ -84,7 +84,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::term_index::{BuildPolicy, TIER_ENTRIES_PER_TERM},
+        manifest::term_index::{BuildPolicy, tier_entries_for},
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -224,9 +224,6 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// the ceiling order changes nothing there; pruning begins where tables have
 /// more superfiles than that, which is where it pays.
 const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
-/// Default for [`SupertableOptions::term_tier_entries_per_term`]: see
-/// `term_index::build::TIER_ENTRIES_PER_TERM`.
-const DEFAULT_TERM_TIER_ENTRIES_PER_TERM: u64 = TIER_ENTRIES_PER_TERM;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -387,9 +384,11 @@ pub struct SupertableOptions {
     /// best documents table-wide, read ahead of any superfile open so a
     /// ranked multi-term query opens the superfiles that hold its top k
     /// rather than every one its terms appear in. A term with at most this
-    /// many documents is held whole. `0` keeps no tiers; the ranked path
-    /// then opens by score ceiling alone, as it did before tiers existed.
-    pub term_tier_entries_per_term: u64,
+    /// many documents is held whole. `None` sizes the budget from the
+    /// table: one document in a thousand, within fixed floors; `Some(0)`
+    /// keeps no tiers, and the ranked path opens by score ceiling alone, as
+    /// it did before tiers existed.
+    pub term_tier_entries_per_term: Option<u64>,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -785,7 +784,7 @@ impl SupertableOptions {
             disk_cache: None,
             manifest_disk_cache: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
-            term_tier_entries_per_term: DEFAULT_TERM_TIER_ENTRIES_PER_TERM,
+            term_tier_entries_per_term: None,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -935,14 +934,17 @@ impl SupertableOptions {
     /// Documents the term index keeps per term in its tier (see
     /// [`Self::term_tier_entries_per_term`]); `0` keeps no tiers.
     pub fn with_term_tier_entries_per_term(mut self, entries: u64) -> Self {
-        self.term_tier_entries_per_term = entries;
+        self.term_tier_entries_per_term = Some(entries);
         self
     }
 
-    /// What the term-index build takes from these options.
-    pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
+    /// What the term-index build takes from these options, for a table of
+    /// `n_docs` documents.
+    pub(crate) fn term_index_build_policy(&self, n_docs: u64) -> BuildPolicy {
         BuildPolicy {
-            tier_entries_per_term: self.term_tier_entries_per_term,
+            tier_entries_per_term: self
+                .term_tier_entries_per_term
+                .unwrap_or_else(|| tier_entries_for(n_docs)),
             ..BuildPolicy::default()
         }
     }

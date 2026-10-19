@@ -54,12 +54,27 @@ use crate::{
 /// measured value.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// Entries a term's tier keeps table-wide. The skip rate of a ranked
-/// query is set by `k` against this budget, not by the per-superfile
-/// depth, and it does not move with table size (the k-th joint score
-/// rises as fast as the candidate pool grows); this default serves
-/// `k ≤ 1000` at the median on a long-text corpus.
-pub(crate) const TIER_ENTRIES_PER_TERM: u64 = 1 << 20;
+/// Share of a table's documents a term's tier keeps, table-wide. The skip
+/// rate of a ranked query is set by `k` against the budget, not by the
+/// per-superfile depth, and the budget that serves a given `k` grows with
+/// the table: the k-th joint score rises as fast as the candidate pool
+/// does. One document in a thousand served `k ≤ 1000` at the median on a
+/// billion-document long-text corpus, and the same share serves the same
+/// `k` on a smaller table while keeping a small table from copying most of
+/// its postings into tiers.
+pub(crate) const TIER_SHARE_OF_DOCS: f64 = 1e-3;
+/// Smallest tier budget the share resolves to: below this a tier is not
+/// worth its chunk, and a small table's tiers are its complete lists.
+pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 16;
+/// Largest tier budget the share resolves to: past this the per-term read
+/// outgrows what a query at any supported `k` consumes.
+pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
+
+/// The tier budget for a table of `n_docs` documents under the default
+/// policy.
+pub(crate) fn tier_entries_for(n_docs: u64) -> u64 {
+    ((n_docs as f64 * TIER_SHARE_OF_DOCS) as u64).clamp(TIER_ENTRIES_MIN, TIER_ENTRIES_MAX)
+}
 /// Documents a superfile contributes per term to its head. Four times the
 /// even share of the table-wide budget at a thousand superfiles, so a
 /// superfile richer than average in a term still contributes; the rebuild
@@ -71,7 +86,8 @@ pub(crate) const HEAD_DEPTH_PER_SUPERFILE: usize = 4096;
 pub(crate) struct BuildPolicy {
     /// See [`SLICE_TARGET_BYTES`].
     pub(crate) slice_target_bytes: usize,
-    /// See [`TIER_ENTRIES_PER_TERM`]; `0` keeps no tiers.
+    /// Entries a term's tier keeps table-wide; `0` keeps no tiers. See
+    /// [`tier_entries_for`].
     pub(crate) tier_entries_per_term: u64,
     /// See [`HEAD_DEPTH_PER_SUPERFILE`].
     pub(crate) head_depth_per_superfile: usize,
@@ -81,7 +97,7 @@ impl Default for BuildPolicy {
     fn default() -> Self {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
-            tier_entries_per_term: TIER_ENTRIES_PER_TERM,
+            tier_entries_per_term: TIER_ENTRIES_MAX,
             head_depth_per_superfile: HEAD_DEPTH_PER_SUPERFILE,
         }
     }
@@ -897,4 +913,17 @@ pub(crate) struct MergedSegment {
     pub(crate) segment: Segment,
     pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
     pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_budget_is_a_share_of_the_table_within_its_floors() {
+        assert_eq!(tier_entries_for(0), TIER_ENTRIES_MIN);
+        assert_eq!(tier_entries_for(10_000_000), TIER_ENTRIES_MIN, "10M docs: the floor");
+        assert_eq!(tier_entries_for(1_000_000_000), 1_000_000, "1B docs: one in a thousand");
+        assert_eq!(tier_entries_for(100_000_000_000), TIER_ENTRIES_MAX, "100B docs: the cap");
+    }
 }
