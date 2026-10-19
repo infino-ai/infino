@@ -809,12 +809,11 @@ pub(crate) struct BuiltSegment {
     pub(crate) segment: Segment,
     /// Slice bytes keyed by content hash, in key order.
     pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
-    /// Tier chunks and the segment's tier list, keyed by content hash.
+    /// The slices' tier objects, keyed by content hash.
     pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
 }
 
 /// Merge contributions into a base root: one segment, ordinals from zero.
-#[cfg(test)]
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,

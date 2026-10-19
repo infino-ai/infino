@@ -11111,6 +11111,31 @@ async fn merge_term_index(
         .options
         .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
     let scratch = term_index_scratch()?;
+    // Superfiles no segment lists get one segment of their own, numbered
+    // past the ones `current` lists, and merge like the rest.
+    let missing = unlisted(current, entries);
+    // When nothing `current` lists is still live — a compaction that
+    // replaced every superfile — its segments hold only postings the merge
+    // would drop, so they are not fetched: the fresh build over `entries`
+    // is the index, in `entries` order, as the merge would have numbered it.
+    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+    if !current.superfiles.iter().any(|id| live.contains(id)) {
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let fresh: Vec<Arc<SuperfileEntry>> = missing
+            .iter()
+            .filter(|e| seen.insert(e.superfile_id))
+            .cloned()
+            .collect();
+        let contributions = collect_contributions(manifest, &fresh, scratch.path()).await?;
+        return run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "term-index build",
+            move || term_index::build(&contributions, &policy),
+        )
+        .instrument(detail_span!("term_index.build", superfiles = fresh.len(),))
+        .await
+        .map_err(|e| TermIndexError::Build(e.to_string()))?;
+    }
     let mut sources =
         term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
             .instrument(detail_span!(
@@ -11118,9 +11143,6 @@ async fn merge_term_index(
                 segments = current.segments.len(),
             ))
             .await?;
-    // Superfiles no segment lists get one segment of their own, numbered
-    // past the ones `current` lists, and merge like the rest.
-    let missing = unlisted(current, entries);
     let mut old = Root {
         superfiles: current.superfiles.clone(),
         id_mins: current.id_mins.clone(),

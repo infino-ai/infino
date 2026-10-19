@@ -42,7 +42,6 @@ use std::{
     sync::Arc,
 };
 
-#[cfg(test)]
 pub(crate) use build::build;
 use build::build_segment;
 pub(crate) use build::{
