@@ -348,7 +348,8 @@ pub(crate) async fn select_with_tiers(
             if *out {
                 continue;
             }
-            let (ub_now, ub_floor) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier);
+            let (ub_now, ub_floor) =
+                bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, is_and);
             if ub_now * BOUND_SLACK < theta_lb {
                 *out = true;
             } else if ub_floor * BOUND_SLACK < theta_lb {
@@ -362,7 +363,7 @@ pub(crate) async fn select_with_tiers(
 
     let mut bounds = HashMap::with_capacity(n_sf);
     for (slot, e) in kept.iter().enumerate() {
-        let (ub_now, _) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier);
+        let (ub_now, _) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, is_and);
         let ub = if excluded[slot] {
             f32::NEG_INFINITY
         } else {
@@ -395,14 +396,24 @@ fn tail_of(p: &Posting) -> f32 {
 /// superfile: the best over masks of a known partial plus what the missing
 /// terms can still add, and the sum over all terms for a document outside
 /// every tier.
+/// A superfile's upper bounds: `now`, with every unread block still able
+/// to hold a term's best document, and `floor`, as if every stream were
+/// exhausted and only the tails remained — what further reading can at
+/// best bring the bound down to.
+///
+/// For a conjunction a candidate missing a term only exists if that term
+/// still has documents in the superfile the merge has not seen: unread
+/// blocks, or a tail above zero. A term whose streams are exhausted with
+/// a zero tail has shown every document it has there, so a candidate
+/// without it is no candidate at all.
 fn bounds_of(
     slot: usize,
     n_masks: usize,
     best_ub: &[f32],
     per_term: &[Vec<TermInFile>],
     frontier: &[Option<f32>],
+    is_and: bool,
 ) -> (f32, f32) {
-    let nt = per_term.len();
     let add = |mask: usize, at_tails: bool| -> f32 {
         let mut sum = 0.0f32;
         for (ti, pt) in per_term.iter().enumerate() {
@@ -410,10 +421,14 @@ fn bounds_of(
                 continue;
             }
             let tail = pt[slot].tail;
-            sum += match (at_tails, frontier[ti]) {
+            let unread = match (at_tails, frontier[ti]) {
                 (false, Some(f)) => f.max(tail),
                 _ => tail,
             };
+            if is_and && unread <= 0.0 && (at_tails || frontier[ti].is_none()) {
+                return f32::NEG_INFINITY;
+            }
+            sum += unread;
         }
         sum
     };
@@ -426,7 +441,6 @@ fn bounds_of(
             floor = floor.max(v + add(m, true));
         }
     }
-    let _ = nt;
     (now, floor)
 }
 

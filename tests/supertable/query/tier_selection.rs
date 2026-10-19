@@ -71,13 +71,22 @@ fn document(global: usize) -> String {
         words.push("quokka");
         words.push("tensor");
     }
+    // Two words that never share a document, so their conjunction is empty.
+    words.push(if global.is_multiple_of(2) {
+        "zebra"
+    } else {
+        "yak"
+    });
     words.join(" ")
 }
 
 fn table(dir: &TempDir, tiers: bool) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
+    // Positions, so a phrase query is among the shapes compared.
+    let mut fts = FtsConfig::new("body");
+    fts.positions = true;
+    let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
         .expect("options")
         .with_storage(storage);
     if !tiers {
@@ -121,9 +130,16 @@ fn queries() -> Vec<(String, BoolMode)> {
         "the data search",
         "index vector graph",
         "the search tensor quokka",
+        "zebra yak",
+        "zebra the",
     ] {
         out.push((q.to_owned(), BoolMode::Or));
         out.push((q.to_owned(), BoolMode::And));
+    }
+    // Shapes the tiers do not serve take the ceiling path; they must still
+    // agree, and must not open more than before.
+    for q in ["\"quokka tensor\"", "the -data", "+quokka tensor"] {
+        out.push((q.to_owned(), BoolMode::Or));
     }
     out
 }
@@ -220,4 +236,15 @@ fn a_rare_conjunction_opens_only_its_holders() {
         "opened {opened} superfiles for a k=10 conjunction whose hits sit in {holders}"
     );
     assert!(opened < SUPERFILES as u64, "not every superfile opened");
+}
+
+/// A conjunction of two complete-tier terms that never share a document
+/// is settled by the merge: nothing opens, nothing matches.
+#[test]
+fn an_empty_conjunction_of_complete_tiers_opens_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = table(&dir, true);
+    let (hits, opened, _) = run(&st, "zebra yak", BoolMode::And, 10);
+    assert!(hits.is_empty(), "the words never co-occur");
+    assert_eq!(opened, 0, "the tiers rule every superfile out");
 }

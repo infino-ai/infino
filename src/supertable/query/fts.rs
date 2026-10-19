@@ -1033,6 +1033,11 @@ impl SupertableReader {
                         },
                     )
                 };
+                // A superfile the merge ruled out — every candidate it could
+                // hold is below the threshold, or a conjunction's term has
+                // shown it holds none — is not opened at all; a ceiling of
+                // negative infinity would still tie an empty floor.
+                kept.retain(|e| bound_of(e).ub > f32::NEG_INFINITY);
                 kept.sort_by(|a, b| {
                     let (x, y) = (bound_of(a), bound_of(b));
                     y.lb.total_cmp(&x.lb).then(y.ub.total_cmp(&x.ub))
