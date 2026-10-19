@@ -66,7 +66,8 @@ mydb/                                     database root (the connect() path)
 │   │                                     content-addressed, a few MB each
 │   │           ├ stores : one contiguous range of (column, term) keys: a front-coded
 │   │           │          block dictionary over postings of (superfile ordinal,
-│   │           │          df, score ceiling, postings location)
+│   │           │          df, score ceiling, postings location); version 2 adds
+│   │           │          a CRC per block and per run, so it can be read by range
 │   │           └ used   : exact term routing, part selection, ceiling-ordered
 │   │                      opening, and cursor build without the superfile dictionary
 │   │

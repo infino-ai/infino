@@ -288,7 +288,10 @@ few megabytes covering one contiguous range of `column`-and-term keys —
 a front-coded block dictionary over a postings region — so a lookup
 binary-searches the root for the one slice that can hold the key,
 fetches it, and reads one block; a prefix scan touches one slice or a
-few adjacent ones. Root and slices are content-addressed and immutable,
+few adjacent ones. A version 2 slice also carries a CRC per dictionary
+block and per run, so a lookup can read just the slice's head (header
+and block index), then one block and one run, instead of the whole
+slice. The head is kept in memory and in the disk cache. Root and slices are content-addressed and immutable,
 cached on local disk like manifest parts, and kept live by garbage
 collection for as long as a manifest names them.
 
