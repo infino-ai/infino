@@ -161,8 +161,23 @@ impl ManifestDiskCache {
     /// requested `hash`; a mismatch (disk corruption) is treated as a
     /// miss and the bad file is removed, so the loader transparently
     /// falls back to storage.
-    // A hit is not free: it reads the file and re-hashes it end to end, so
-    // on a large part this is real I/O plus a blake3 pass. `outcome`
+    pub async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
+        self.get_decoded(hash, |bytes| {
+            (ContentHash::of(&bytes) == *hash).then_some(bytes)
+        })
+        .await
+    }
+
+    /// Whether `key` is cached, without reading it.
+    pub(crate) fn contains(&self, key: &ContentHash) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Read the bytes cached under `key` through `decode`, which verifies
+    /// and parses them. `None` from it counts as corruption: the file is
+    /// removed and the lookup misses. For bytes not keyed by their own hash.
+    // A hit is not free: it reads the file and verifies it end to end, so
+    // on a large part this is real I/O plus a hash pass. `outcome`
     // separates the cheap index miss from the expensive verified hit.
     #[cfg_attr(
         feature = "detailed-tracing",
@@ -172,41 +187,44 @@ impl ManifestDiskCache {
             fields(outcome = tracing::field::Empty, bytes = tracing::field::Empty)
         )
     )]
-    pub async fn get(&self, hash: &ContentHash) -> Option<Vec<u8>> {
+    pub(crate) async fn get_decoded<T>(
+        &self,
+        key: &ContentHash,
+        decode: impl FnOnce(Vec<u8>) -> Option<T>,
+    ) -> Option<T> {
         // Fast negative: not in the accounting index ⇒ not cached.
-        if !self.entries.contains_key(hash) {
+        if !self.entries.contains_key(key) {
             record("outcome", "miss");
             self.n_misses.fetch_add(1, Ordering::AcqRel);
             return None;
         }
-        let path = self.cache_path(hash);
+        let path = self.cache_path(key);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(_) => {
                 // File vanished out from under the index (manual
                 // delete, external eviction). Drop the stale entry.
                 record("outcome", "file_missing");
-                self.drop_entry(hash);
+                self.drop_entry(key);
                 self.n_misses.fetch_add(1, Ordering::AcqRel);
                 return None;
             }
         };
-        // Content-addressing guarantee: the bytes must hash to the key.
-        // A mismatch means on-disk corruption — discard and miss.
-        if ContentHash::of(&bytes) != *hash {
+        let len = bytes.len() as u64;
+        let Some(decoded) = decode(bytes) else {
             record("outcome", "corrupt");
             let _ = tokio::fs::remove_file(&path).await;
-            self.drop_entry(hash);
+            self.drop_entry(key);
             self.n_misses.fetch_add(1, Ordering::AcqRel);
             return None;
-        }
-        if let Some(entry) = self.entries.get(hash) {
+        };
+        if let Some(entry) = self.entries.get(key) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
         }
         record("outcome", "hit");
-        record("bytes", bytes.len() as u64);
+        record("bytes", len);
         self.n_hits.fetch_add(1, Ordering::AcqRel);
-        Some(bytes)
+        Some(decoded)
     }
 
     /// Insert a part's compressed bytes under its content hash.
@@ -214,9 +232,9 @@ impl ManifestDiskCache {
     /// Best-effort: the cache is a pure optimization, so any failure
     /// (budget exhausted with no evictable victims, I/O error) is
     /// swallowed — the caller already holds the bytes and can proceed.
-    /// Idempotent: an already-cached hash is a no-op. `hash` must be
-    /// the blake3 of `bytes`; the caller (the loader) has already
-    /// verified this.
+    /// Idempotent: an already-cached hash is a no-op. For bytes read back
+    /// with [`Self::get`], `hash` must be their blake3, which the caller
+    /// has already verified.
     pub async fn put(&self, hash: ContentHash, bytes: &[u8]) {
         if self.entries.contains_key(&hash) {
             return;
