@@ -60,12 +60,12 @@ pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 /// rate of a ranked query is set by `k` against the budget, not by the
 /// per-superfile depth, and the budget that serves a given `k` grows with
 /// the table: the k-th joint score rises as fast as the candidate pool
-/// does. Three documents in ten thousand is what a long-text table affords:
-/// on a ten-million-document corpus the tiers then hold about seven
-/// percent of the postings (the complete lists of the terms under the
-/// budget, which are a thin tail, plus the budget's worth of each common
-/// term), and the same share serves the same `k` on a larger table.
-pub(crate) const TIER_SHARE_OF_DOCS: f64 = 3e-4;
+/// does. Two documents in ten thousand is what a long-text table affords:
+/// on a ten-million-document corpus the tiers then hold about six percent
+/// of the postings (the complete lists of the terms under the budget,
+/// which are a thin tail, plus the budget's worth of each common term),
+/// and the same share serves the same `k` on a larger table.
+pub(crate) const TIER_SHARE_OF_DOCS: f64 = 2e-4;
 /// Smallest tier budget the share resolves to. A small table has few
 /// superfiles, so its opens are cheap whatever the budget, while a large
 /// floor would copy most of its postings into tiers.
@@ -1135,13 +1135,18 @@ mod tests {
         );
         assert_eq!(
             tier_entries_for(10_000_000),
-            3_000,
-            "10M docs: three in ten thousand"
+            TIER_ENTRIES_MIN,
+            "10M docs: two in ten thousand is under the floor"
+        );
+        assert_eq!(
+            tier_entries_for(100_000_000),
+            20_000,
+            "100M docs: two in ten thousand"
         );
         assert_eq!(
             tier_entries_for(1_000_000_000),
-            300_000,
-            "1B docs: three in ten thousand"
+            200_000,
+            "1B docs: two in ten thousand"
         );
         assert_eq!(
             tier_entries_for(100_000_000_000),

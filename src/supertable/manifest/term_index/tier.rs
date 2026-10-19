@@ -16,9 +16,9 @@
 //!
 //! ```text
 //! chunk: n_blocks u32 | crc32c u32
-//!        | per block: max_impact f32 | min_impact f32 | n_entries u32 | byte_len u32
+//!        | per block: max_impact f32 | n_entries u16 | byte_len u32
 //!        | block bodies back to back
-//! block: ordinal_bits u8 | lid_bits u8 | impact_bits u8 | max_impact_bits u32
+//! block: ordinal_bits u8 | lid_bits u8 | impact_bits u8
 //!        | ordinals, bit-packed sorted deltas | local ids, bit-packed
 //!        | impacts as `max_impact_bits - impact_bits`, bit-packed
 //! ```
@@ -36,9 +36,9 @@
 //! patterns order like the values, so each is stored as its distance
 //! below the block's maximum pattern in the bits that distance needs.
 //! Exactness is what lets a merge re-cut tiers without loosening a bound
-//! or changing a byte, and what lets the directory's `max_impact` /
-//! `min_impact` — the minimum of the last block read bounds every entry
-//! not yet read — stay exact across any number of merges.
+//! or changing a byte, and what lets the directory's `max_impact` — which
+//! bounds every entry of its block and of the blocks after it — stay
+//! exact across any number of merges.
 
 use bitpacking::{BitPacker, BitPacker4x};
 
@@ -46,7 +46,7 @@ use super::TermIndexError;
 use crate::{
     superfile::format::checksum::crc32c,
     utils::{
-        bytes::u32_le_at,
+        bytes::{u16_le_at, u32_le_at},
         varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -61,8 +61,8 @@ const LANE: usize = BitPacker4x::BLOCK_LEN;
 const CHUNK_HEADER_LEN: usize = 4 + 4;
 /// Where the chunk's CRC sits in its header: over everything after it.
 const CRC_AT: usize = 4;
-const DIRECTORY_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
-const BLOCK_HEADER_LEN: usize = 3 + 4;
+const DIRECTORY_ENTRY_LEN: usize = 4 + 2 + 4;
+const BLOCK_HEADER_LEN: usize = 3;
 
 /// One tier entry.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -101,7 +101,6 @@ pub(crate) struct TierChunk<'a> {
 #[derive(Debug, Clone, Copy)]
 struct BlockDir {
     max_impact: f32,
-    min_impact: f32,
     n_entries: u32,
     offset: usize,
     len: usize,
@@ -136,8 +135,7 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<EncodedChunk> {
         out.extend_from_slice(&0u32.to_le_bytes());
         for (d, body) in blocks.iter() {
             out.extend_from_slice(&d.max_impact.to_le_bytes());
-            out.extend_from_slice(&d.min_impact.to_le_bytes());
-            out.extend_from_slice(&d.n_entries.to_le_bytes());
+            out.extend_from_slice(&(d.n_entries as u16).to_le_bytes());
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
         }
         for (_, body) in blocks.drain(..) {
@@ -169,7 +167,6 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
         .iter()
         .map(|e| e.impact)
         .fold(f32::NEG_INFINITY, f32::max);
-    let min_impact = block.iter().map(|e| e.impact).fold(f32::INFINITY, f32::min);
     let mut sorted: Vec<TierEntry> = block.to_vec();
     sorted.sort_unstable_by_key(|e| (e.superfile, e.doc_id));
     let n = sorted.len();
@@ -178,7 +175,7 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
     let mut doc_ids = vec![0u32; n];
     let mut codes = vec![0u32; n];
     debug_assert!(
-        min_impact >= 0.0,
+        block.iter().all(|e| e.impact >= 0.0),
         "impacts are non-negative, so their bit patterns order like their values"
     );
     let max_bits = max_impact.to_bits();
@@ -224,7 +221,6 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
     body.push(ordinal_bits);
     body.push(lid_bits);
     body.push(impact_bits);
-    body.extend_from_slice(&max_bits.to_le_bytes());
     for (i, lane) in ordinals[..full].chunks(LANE).enumerate() {
         let written = bp.compress_sorted(lane_initial(i), lane, scratch, ordinal_bits);
         body.extend_from_slice(&scratch[..written]);
@@ -243,7 +239,6 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
     (
         BlockDir {
             max_impact,
-            min_impact,
             n_entries: n as u32,
             offset: 0,
             len: body.len(),
@@ -329,16 +324,14 @@ impl<'a> TierChunk<'a> {
             let at = CHUNK_HEADER_LEN + i * DIRECTORY_ENTRY_LEN;
             let f = |o: usize| u32_le_at(bytes, at + o).ok_or_else(|| malformed("directory entry"));
             let max_impact = f32::from_bits(f(0)?);
-            let min_impact = f32::from_bits(f(4)?);
-            let n_entries = f(8)?;
-            let len = f(12)? as usize;
+            let n_entries = u16_le_at(bytes, at + 4).ok_or_else(|| malformed("directory entry"))?;
+            let len = f(6)? as usize;
             if n_entries == 0 || n_entries as usize > BLOCK_ENTRIES || len < BLOCK_HEADER_LEN {
                 return Err(malformed("directory entry out of range"));
             }
             directory.push(BlockDir {
                 max_impact,
-                min_impact,
-                n_entries,
+                n_entries: u32::from(n_entries),
                 offset,
                 len,
             });
@@ -362,12 +355,6 @@ impl<'a> TierChunk<'a> {
         self.directory[i].max_impact
     }
 
-    /// Exact smallest impact in block `i`; bounds every entry after it.
-    #[cfg(test)]
-    pub(crate) fn block_min(&self, i: usize) -> f32 {
-        self.directory[i].min_impact
-    }
-
     #[cfg(test)]
     pub(crate) fn block_entries(&self, i: usize) -> usize {
         self.directory[i].n_entries as usize
@@ -387,7 +374,7 @@ impl<'a> TierChunk<'a> {
             .ok_or_else(|| malformed("block index"))?;
         let body = &self.bodies[d.offset..d.offset + d.len];
         let (ordinal_bits, lid_bits, impact_bits) = (body[0], body[1], body[2]);
-        let max_bits = u32::from_le_bytes(body[3..7].try_into().expect("4 bytes"));
+        let max_bits = d.max_impact.to_bits();
         let n = d.n_entries as usize;
         let full = n / LANE * LANE;
         let rest = n - full;
@@ -545,12 +532,11 @@ mod tests {
                 let n = chunk.block_entries(i);
                 let block = &entries[at..at + n];
                 assert_eq!(chunk.block_max(i), block[0].impact);
-                assert_eq!(chunk.block_min(i), block[n - 1].impact);
                 assert!(
                     chunk.block_max(i) <= prev_min,
                     "blocks are in descending impact"
                 );
-                prev_min = chunk.block_min(i);
+                prev_min = block[n - 1].impact;
                 at += n;
             }
         }
