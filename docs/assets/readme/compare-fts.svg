@@ -5,8 +5,8 @@
 <line x1="642.4" y1="50" x2="642.4" y2="180" stroke="#DCD6C7"/>
 <text x="250.0" y="66.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#17130F" font-weight="600" text-anchor="end">Infino</text>
 <text x="250.0" y="80.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#5E5749" text-anchor="end">0.11.2</text>
-<rect x="264" y="56" width="268.6" height="8" rx="1" fill="#D6400F"/>
-<text x="854.0" y="63.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#17130F" font-weight="600" text-anchor="end">0.71×</text>
+<rect x="264" y="56" width="264.9" height="8" rx="1" fill="#D6400F"/>
+<text x="854.0" y="63.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#17130F" font-weight="600" text-anchor="end">0.70×</text>
 <rect x="264" y="70" width="283.8" height="8" rx="1" fill="#E8A090"/>
 <text x="854.0" y="77.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#17130F" font-weight="600" text-anchor="end">0.75×</text>
 <text x="250.0" y="110.0" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#5E5749" text-anchor="end">Lucene</text>
