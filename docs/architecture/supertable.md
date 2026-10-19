@@ -320,6 +320,44 @@ k-th score — the in-superfile block-max reasoning lifted one level. And
 its cursors are built from the index's recorded postings locations, so
 the superfile's own dictionary is not read on that path.
 
+A ceiling is a bound on a superfile's best document for one term, and
+on a large table nearly every superfile's ceiling for a common term
+clears the running k-th score, so a query over common terms opened most
+of the table. The index therefore also keeps, per term, a *tier*: the
+term's best documents table-wide by BM25 impact, each as `(superfile,
+local document id, exact impact)`, cut into blocks whose directory
+carries the block's largest and smallest impact. The tier holds a term's
+whole list when the list fits a per-term budget (a small share of the
+table's documents, so the budget grows with the table) and its top of
+that budget otherwise; each posting then also records a *tail*, the
+largest impact of a document in that superfile the tier left out. The
+blocks of every term in a slice sit back to back in that slice's tier
+object, named by offset from the run, so a query reads a block with a
+ranged fetch (each block carries a checksum) and a term's tier costs the
+index a few bytes more in the slice.
+
+A ranked query of plain terms merges its terms' tiers in descending
+impact before it opens anything. Per superfile it learns the best known
+document for every subset of the terms, with a lower and an upper bound
+on its score; from the documents whose score is fully known it takes a
+lower bound on the k-th score, and from the unread blocks' maxima and
+the tails an upper bound on anything it has not seen. Superfiles whose
+upper bound cannot reach the k-th lower bound are not opened, a
+conjunction's superfiles that a complete term has shown hold no joint
+document are not opened, and the k-th lower bound seeds the floor every
+kernel prunes against from its first block. Nothing in the answer
+changes — the superfiles that do open run the same kernels against the
+same floor semantics — only which superfiles open. Impacts are stored at
+the superfile's own statistics and rescaled to the table's as ceilings
+are, upward for an upper bound and downward for a lower one.
+
+Heads are gathered where the postings already are: when a superfile is
+built its terms' best documents are read from its own index with the
+single-term kernel and spilled with the rest of its contribution, the
+delta segment pools them into tiers, and the maintenance rebuild
+re-pools every segment's tiers table-wide. A superfile's bytes are not
+changed by any of this.
+
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new
 superfiles — the manifest marks it incomplete, and part loading keeps
