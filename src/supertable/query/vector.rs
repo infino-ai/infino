@@ -1151,6 +1151,7 @@ fn centroid_router_walk(
     column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     metric: Metric,
+    superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<(Vec<Vec<f32>>, Vec<(usize, u32)>), QueryError> {
     let mut vecs: Vec<Vec<f32>> = Vec::new();
     let mut node_map: Vec<(usize, u32)> = Vec::new();
@@ -1162,7 +1163,12 @@ fn centroid_router_walk(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, column_id, section, sfid)? {
+        // Exclude this superfile's split-superseded cells, matching the scan
+        // path — their fine centroids are dead and must not seed graph nodes.
+        let cell_superseded = superseded.and_then(|m| m.get(&sfid));
+        for (flat, mut vec) in
+            vr.global_fine_cluster_vectors(column, column_id, section, sfid, cell_superseded)?
+        {
             gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
             node_map.push((si, flat));
@@ -1192,10 +1198,12 @@ fn build_centroid_router(
     dim: usize,
     metric: Metric,
     serial: bool,
+    superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<CentroidRouterGraph, QueryError> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let (vecs, node_map) =
-        centroid_router_walk(superfiles, readers, column, column_id, section, metric)?;
+    let (vecs, node_map) = centroid_router_walk(
+        superfiles, readers, column, column_id, section, metric, superseded,
+    )?;
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
     let graph = if serial {
         Hnsw::build_serial(&scorer, HnswParams::default())
@@ -1314,8 +1322,13 @@ fn decode_centroid_router_section(
             continue;
         };
         let sfid = sf.superfile_id;
+        // No superseded filter here: this fills a `(sfid, flat) -> vec` lookup
+        // and then assembles ONLY the persisted node-map entries, which the
+        // settle composed with superseded cells already excluded. Any extra
+        // superseded vec fetched into the map is simply never referenced; a
+        // split clears the section ref, so the persisted map is never stale.
         for (flat, mut vec) in vr
-            .global_fine_cluster_vectors(column, column_id, section, sfid)
+            .global_fine_cluster_vectors(column, column_id, section, sfid, None)
             .ok()?
         {
             gfc_prepare_for_metric(metric, &mut vec);
@@ -1378,7 +1391,15 @@ pub(crate) async fn compose_centroid_router_section(
     // these fixed bytes). Parallel keeps the one-time publish cheap.
     let column_id = manifest.field_id(column)?;
     let router = match build_centroid_router(
-        entries, &readers, column, column_id, section, dim, metric, false,
+        entries,
+        &readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+        false,
+        manifest.get_superseded_cells(),
     ) {
         Ok(router) => router,
         Err(error) => {
@@ -4688,6 +4709,7 @@ impl SupertableReader {
                     dim,
                     metric,
                     serial_build,
+                    manifest.get_superseded_cells(),
                 )?
             }
         };
@@ -10203,6 +10225,7 @@ mod tests {
                     dim,
                     metric,
                     false,
+                    None,
                 )
                 .expect("build_centroid_router");
                 assert!(!built.node_map.is_empty(), "fixture must produce a router");
@@ -10249,6 +10272,86 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// A split supersedes the coarse parent cell but leaves its superfile in
+    /// place until a later merge. The centroid-router graph is built over fine
+    /// centroids, so it MUST exclude a superseded cell's fine centroids — the
+    /// scan path already skips those cells, so a graph node pointing at one is a
+    /// dead pick that spends fanout and returns nothing. Regression: phase-1 (the
+    /// router build) once lacked the superseded filter phase-2 (scan) has, so a
+    /// freshly-split, un-merged table carried its dead parent centroids in the
+    /// graph (on a 1B index the resident centroid set measured ~2x the live
+    /// fine-cluster count until a merge reclaimed the parents).
+    #[test]
+    fn centroid_router_skips_superseded_cells() {
+        use crate::supertable::manifest::list::PartitionStrategy;
+
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        block_on_mt(async {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let manifest = hr.manifest();
+            let entries = manifest.get_all_superfiles_loaded().await.expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+            let column_id = manifest.field_id("emb").expect("emb id");
+            let dim = FIXTURE_DIM;
+
+            let n_cent = match manifest.get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+                other => panic!("hidden index must be VectorCell, got {other:?}"),
+            };
+            let per_sf = |cells: BTreeSet<u32>| -> BTreeMap<Uuid, BTreeSet<u32>> {
+                entries
+                    .iter()
+                    .map(|e| (e.superfile_id, cells.clone()))
+                    .collect()
+            };
+            let node_count = |ss: Option<&BTreeMap<Uuid, BTreeSet<u32>>>| {
+                build_centroid_router(
+                    &entries,
+                    &readers,
+                    "emb",
+                    column_id,
+                    section.as_ref(),
+                    dim,
+                    Metric::Cosine,
+                    false,
+                    ss,
+                )
+                .expect("router build")
+                .node_map
+                .len()
+            };
+
+            let full = node_count(None);
+            assert!(
+                full >= 2,
+                "fixture must carry multiple fine centroids, got {full}"
+            );
+            // A populated cell is one whose supersession drops router nodes.
+            let cell_a = (0..n_cent)
+                .find(|&c| node_count(Some(&per_sf(BTreeSet::from([c])))) < full)
+                .expect("at least one populated cell");
+            let without_a = node_count(Some(&per_sf(BTreeSet::from([cell_a]))));
+            let mut others: BTreeSet<u32> = (0..n_cent).collect();
+            others.remove(&cell_a);
+            let only_a = node_count(Some(&per_sf(others)));
+
+            assert!(
+                without_a < full,
+                "superseding a populated cell must drop its fine centroids from the \
+                 router graph"
+            );
+            assert_eq!(
+                without_a + only_a,
+                full,
+                "the superseded filter partitions the fine centroids exactly — a \
+                 split's dead parent cells must not leak into the router graph"
+            );
         });
     }
 
@@ -10300,6 +10403,7 @@ mod tests {
                 dim,
                 Metric::Cosine,
                 false,
+                None,
             )
             .expect("build_centroid_router");
             let bytes = encode_centroid_router_section(&built, &entries, dim);
