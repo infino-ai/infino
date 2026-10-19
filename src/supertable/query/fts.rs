@@ -1001,12 +1001,17 @@ impl SupertableReader {
         // any open, and per superfile a bound that knows which documents
         // carry several of the terms. The bounds replace the ceilings; the
         // seeded threshold goes into the shared floor below.
+        // Only a complete index can rule a superfile out: one that does not
+        // yet list every live superfile knows nothing about the rest.
         let mut tier_seed: Option<f32> = None;
         if let (Some(index), None, Some(column_id), true) = (
             &term_index,
             bm25_params,
             manifest.field_id(column),
-            !has_phrases && negatives.is_empty() && (musts.is_empty() || shoulds.is_empty()),
+            manifest.term_index_complete()
+                && !has_phrases
+                && negatives.is_empty()
+                && (musts.is_empty() || shoulds.is_empty()),
         ) {
             let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
             let selection = tier::select_with_tiers(

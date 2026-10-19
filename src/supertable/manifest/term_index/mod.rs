@@ -32,6 +32,8 @@
 
 pub(crate) mod build;
 pub(crate) mod format;
+#[cfg(test)]
+mod stats_tool;
 pub(crate) mod tier;
 
 use std::{

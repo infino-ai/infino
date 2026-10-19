@@ -38,7 +38,7 @@
 //! superfile's, and by the average-length factor — up for an upper bound,
 //! down for a lower one — so a bound stays a bound at the table's average.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
@@ -153,6 +153,12 @@ pub(crate) async fn select_with_tiers(
 ) -> Result<Option<TierSelection>, TermIndexError> {
     let nt = terms.len();
     if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() {
+        return Ok(None);
+    }
+    // A superfile the root does not list has postings the merge would never
+    // see; bounding it at nothing would be wrong, so no selection is made.
+    let listed: HashSet<Uuid> = index.root().superfiles.iter().copied().collect();
+    if kept.iter().any(|e| !listed.contains(&e.superfile_id)) {
         return Ok(None);
     }
     // Kept superfiles by ordinal: what an entry's ordinal resolves to, and
