@@ -72,8 +72,13 @@ const LOWER_SLACK: f32 = 1.0 - 8.0 * f32::EPSILON;
 /// the per-superfile table has one slot per mask.
 const MAX_TIER_TERMS: usize = 6;
 /// Entries the merge reads per query before it stops regardless of the
-/// fixpoint test, a safety cap against a pathological query.
-const MAX_ENTRIES_PER_QUERY: u64 = 1 << 24;
+/// fixpoint test. On long text the test converges within a few blocks per
+/// term; on short text nearly every candidate ties, every unread block can
+/// still hold a tie, and the test never converges — on a titles table it
+/// read whole tiers of a hundred thousand entries per term and took a
+/// hundred milliseconds. What has been read by then still bounds every
+/// superfile soundly; the merge just stops refining.
+const MAX_ENTRIES_PER_QUERY: u64 = 1 << 17;
 /// Entries the merge reads when the candidates' scores are not the
 /// query's (a phrase, a negation): there is no threshold to converge on,
 /// so it reads enough to rank the superfiles and exhaust small tiers.
