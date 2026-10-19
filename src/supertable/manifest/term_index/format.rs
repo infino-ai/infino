@@ -464,10 +464,15 @@ impl Root {
 
 /// Append one posting to a run.
 pub(crate) fn push_posting(out: &mut Vec<u8>, p: &Posting) {
-    push_varint(out, p.superfile);
+    // The tail rides a flag bit on the ordinal: most terms' tiers hold
+    // their whole list in every superfile, and a zero tail costs nothing.
+    let has_tail = p.tail != 0.0;
+    push_varint(out, (p.superfile << 1) | u32::from(has_tail));
     push_u64_varint(out, p.df);
     out.extend_from_slice(&p.bound.to_le_bytes());
-    out.extend_from_slice(&p.tail.to_le_bytes());
+    if has_tail {
+        out.extend_from_slice(&p.tail.to_le_bytes());
+    }
     match p.location {
         Location::None => out.push(LOC_NONE),
         Location::Pfor { offset, len } => {
@@ -503,7 +508,7 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
         Some(t) => {
             out.push(TIER_PRESENT);
             out.push(t.complete as u8);
-            out.extend_from_slice(&t.n_entries.to_le_bytes());
+            push_u64_varint(&mut out, t.n_entries);
             push_chunk_refs(&mut out, &t.chunks);
         }
     }
@@ -515,7 +520,8 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
 
 /// Decode one posting at `at`, advancing it.
 pub(crate) fn read_posting(bytes: &[u8], at: &mut usize) -> Result<Posting, TermIndexError> {
-    let superfile = read_varint(bytes, at).ok_or_else(|| malformed("posting superfile"))?;
+    let tagged = read_varint(bytes, at).ok_or_else(|| malformed("posting superfile"))?;
+    let (superfile, has_tail) = (tagged >> 1, tagged & 1 == 1);
     let df = read_u64_varint(bytes, at).ok_or_else(|| malformed("posting df"))?;
     let end = at
         .checked_add(F32_LEN)
@@ -525,14 +531,18 @@ pub(crate) fn read_posting(bytes: &[u8], at: &mut usize) -> Result<Posting, Term
         .ok_or_else(|| malformed("posting bound"))?;
     let bound = f32::from_le_bytes(bound_bytes.try_into().expect("4 bytes"));
     *at = end;
-    let end = at
-        .checked_add(F32_LEN)
-        .ok_or_else(|| malformed("posting tail"))?;
-    let tail_bytes = bytes
-        .get(*at..end)
-        .ok_or_else(|| malformed("posting tail"))?;
-    let tail = f32::from_le_bytes(tail_bytes.try_into().expect("4 bytes"));
-    *at = end;
+    let tail = if has_tail {
+        let end = at
+            .checked_add(F32_LEN)
+            .ok_or_else(|| malformed("posting tail"))?;
+        let tail_bytes = bytes
+            .get(*at..end)
+            .ok_or_else(|| malformed("posting tail"))?;
+        *at = end;
+        f32::from_le_bytes(tail_bytes.try_into().expect("4 bytes"))
+    } else {
+        0.0
+    };
     let tag = *bytes
         .get(*at)
         .ok_or_else(|| malformed("posting location tag"))?;
@@ -587,8 +597,8 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
                 .ok_or_else(|| malformed("run tier complete"))?
                 != 0;
             at += 1;
-            let n_entries = u64_le_at(bytes, at).ok_or_else(|| malformed("run tier entries"))?;
-            at += U64_LEN;
+            let n_entries =
+                read_u64_varint(bytes, &mut at).ok_or_else(|| malformed("run tier entries"))?;
             let chunks = read_chunk_refs(bytes, &mut at)?;
             Some(TierRef {
                 complete,

@@ -15,13 +15,19 @@
 //! the chunk header is what verifies a chunk read on its own.
 //!
 //! ```text
-//! chunk: magic "INFTTIR1" | version u32 | n_blocks u32 | crc32c u32
+//! chunk: n_blocks u32 | crc32c u32
 //!        | per block: max_impact f32 | min_impact f32 | n_entries u32 | byte_len u32
 //!        | block bodies back to back
 //! block: ordinal_bits u8 | lid_bits u8 | impact_bits u8 | max_impact_bits u32
 //!        | ordinals, bit-packed sorted deltas | local ids, bit-packed
 //!        | impacts as `max_impact_bits - impact_bits`, bit-packed
 //! ```
+//!
+//! A chunk's layout is versioned by the slice that names it, so it carries
+//! no magic of its own. Each stream is packed in lanes of [`LANE`] values
+//! by the SIMD packer, and the block's final partial lane densely at the
+//! same width: most terms' tiers are a handful of entries, and a lane
+//! padded to full width would cost them a hundred times their size.
 //!
 //! Inside a block the entries are stored sorted by `(ordinal, local id)`
 //! — the block is always consumed whole, so its internal order carries
@@ -45,10 +51,6 @@ use crate::{
     },
 };
 
-/// Identifies a tier chunk and its layout family.
-pub(crate) const TIER_MAGIC: &[u8; 8] = b"INFTTIR1";
-/// Layout version of a tier chunk.
-pub(crate) const TIER_FORMAT_VERSION: u32 = 1;
 /// Entries per block, the unit a reader consumes at a time. A multiple of
 /// the bit-packer's lane width.
 pub(crate) const BLOCK_ENTRIES: usize = 4096;
@@ -56,10 +58,9 @@ pub(crate) const BLOCK_ENTRIES: usize = 4096;
 /// at small `k` reads one or two chunks per term.
 pub(crate) const CHUNK_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const LANE: usize = BitPacker4x::BLOCK_LEN;
-const MAGIC_LEN: usize = 8;
-const CHUNK_HEADER_LEN: usize = MAGIC_LEN + 4 + 4 + 4;
+const CHUNK_HEADER_LEN: usize = 4 + 4;
 /// Where the chunk's CRC sits in its header: over everything after it.
-const CRC_AT: usize = MAGIC_LEN + 4 + 4;
+const CRC_AT: usize = 4;
 const DIRECTORY_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
 const BLOCK_HEADER_LEN: usize = 3 + 4;
 
@@ -131,8 +132,6 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<EncodedChunk> {
                 + blocks.len() * DIRECTORY_ENTRY_LEN
                 + blocks.iter().map(|(_, b)| b.len()).sum::<usize>(),
         );
-        out.extend_from_slice(TIER_MAGIC);
-        out.extend_from_slice(&TIER_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         for (d, body) in blocks.iter() {
@@ -174,10 +173,10 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
     let mut sorted: Vec<TierEntry> = block.to_vec();
     sorted.sort_unstable_by_key(|e| (e.superfile, e.doc_id));
     let n = sorted.len();
-    let padded = n.div_ceil(LANE) * LANE;
-    let mut ordinals = vec![0u32; padded];
-    let mut doc_ids = vec![0u32; padded];
-    let mut codes = vec![0u32; padded];
+    let full = n / LANE * LANE;
+    let mut ordinals = vec![0u32; n];
+    let mut doc_ids = vec![0u32; n];
+    let mut codes = vec![0u32; n];
     debug_assert!(
         min_impact >= 0.0,
         "impacts are non-negative, so their bit patterns order like their values"
@@ -188,52 +187,59 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
         doc_ids[i] = e.doc_id;
         codes[i] = max_bits - e.impact.to_bits();
     }
-    // Pad the sorted lane with the last ordinal so the sorted packer's
-    // non-decreasing contract holds.
-    let last = ordinals[n - 1];
-    for slot in &mut ordinals[n..] {
-        *slot = last;
-    }
     let bp = BitPacker4x::new();
     // Each lane's deltas start from the previous lane's last ordinal, so a
     // lane costs only the spread of its own ordinals, not their magnitude.
-    let lane_initial = |lanes: &[u32], i: usize| if i == 0 { 0 } else { lanes[i * LANE - 1] };
-    let ordinal_bits = ordinals
+    let lane_initial = |i: usize| if i == 0 { 0 } else { ordinals[i * LANE - 1] };
+    // The partial lane is stored as deltas too, at a width the SIMD packer
+    // would have chosen for them.
+    let tail_deltas: Vec<u32> = (full..n)
+        .map(|i| ordinals[i] - if i == 0 { 0 } else { ordinals[i - 1] })
+        .collect();
+    let width = |values: &[u32]| values.iter().map(|v| bits_for(*v)).max().unwrap_or(0);
+    let ordinal_bits = ordinals[..full]
         .chunks(LANE)
         .enumerate()
-        .map(|(i, lane)| bp.num_bits_sorted(lane_initial(&ordinals, i), lane))
+        .map(|(i, lane)| bp.num_bits_sorted(lane_initial(i), lane))
         .max()
-        .unwrap_or(0);
-    let lid_bits = doc_ids
+        .unwrap_or(0)
+        .max(width(&tail_deltas));
+    let lid_bits = doc_ids[..full]
         .chunks(LANE)
         .map(|lane| bp.num_bits(lane))
         .max()
-        .unwrap_or(0);
-    let impact_bits = codes
+        .unwrap_or(0)
+        .max(width(&doc_ids[full..]));
+    let impact_bits = codes[..full]
         .chunks(LANE)
         .map(|lane| bp.num_bits(lane))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(width(&codes[full..]));
     let mut body = Vec::with_capacity(
         BLOCK_HEADER_LEN
-            + padded * (ordinal_bits as usize + lid_bits as usize + impact_bits as usize) / 8,
+            + n * (ordinal_bits as usize + lid_bits as usize + impact_bits as usize) / 8
+            + 3,
     );
     body.push(ordinal_bits);
     body.push(lid_bits);
     body.push(impact_bits);
     body.extend_from_slice(&max_bits.to_le_bytes());
-    for (i, lane) in ordinals.chunks(LANE).enumerate() {
-        let written = bp.compress_sorted(lane_initial(&ordinals, i), lane, scratch, ordinal_bits);
+    for (i, lane) in ordinals[..full].chunks(LANE).enumerate() {
+        let written = bp.compress_sorted(lane_initial(i), lane, scratch, ordinal_bits);
         body.extend_from_slice(&scratch[..written]);
     }
-    for lane in doc_ids.chunks(LANE) {
+    pack_dense(&tail_deltas, ordinal_bits, &mut body);
+    for lane in doc_ids[..full].chunks(LANE) {
         let written = bp.compress(lane, scratch, lid_bits);
         body.extend_from_slice(&scratch[..written]);
     }
-    for lane in codes.chunks(LANE) {
+    pack_dense(&doc_ids[full..], lid_bits, &mut body);
+    for lane in codes[..full].chunks(LANE) {
         let written = bp.compress(lane, scratch, impact_bits);
         body.extend_from_slice(&scratch[..written]);
     }
+    pack_dense(&codes[full..], impact_bits, &mut body);
     (
         BlockDir {
             max_impact,
@@ -244,6 +250,47 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
         },
         body,
     )
+}
+
+/// Bits that hold `v`.
+fn bits_for(v: u32) -> u8 {
+    (32 - v.leading_zeros()) as u8
+}
+
+/// Bytes a dense run of `n` values at `bits` each takes.
+fn dense_len(n: usize, bits: u8) -> usize {
+    (n * bits as usize).div_ceil(8)
+}
+
+/// Append `values` at `bits` each, least significant bit first, no
+/// padding between values; the run ends on a byte boundary.
+fn pack_dense(values: &[u32], bits: u8, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + dense_len(values.len(), bits), 0);
+    let mut bit = 0usize;
+    for &v in values {
+        for b in 0..bits as usize {
+            if v >> b & 1 == 1 {
+                out[start + (bit + b) / 8] |= 1 << ((bit + b) % 8);
+            }
+        }
+        bit += bits as usize;
+    }
+}
+
+/// Read `n` values packed by [`pack_dense`] from the start of `bytes`.
+fn unpack_dense(bytes: &[u8], n: usize, bits: u8, out: &mut [u32]) {
+    let mut bit = 0usize;
+    for slot in out.iter_mut().take(n) {
+        let mut v = 0u32;
+        for b in 0..bits as usize {
+            if bytes[(bit + b) / 8] >> ((bit + b) % 8) & 1 == 1 {
+                v |= 1 << b;
+            }
+        }
+        *slot = v;
+        bit += bits as usize;
+    }
 }
 
 impl<'a> TierChunk<'a> {
@@ -260,24 +307,12 @@ impl<'a> TierChunk<'a> {
         Ok(())
     }
 
-    /// Parse a chunk's directory, refusing an unknown magic or version.
+    /// Parse a chunk's directory.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         if bytes.len() < CHUNK_HEADER_LEN {
             return Err(malformed("short header"));
         }
-        if &bytes[..MAGIC_LEN] != TIER_MAGIC {
-            return Err(malformed("bad magic"));
-        }
-        let version = u32_le_at(bytes, MAGIC_LEN).ok_or_else(|| malformed("version"))?;
-        if version != TIER_FORMAT_VERSION {
-            return Err(TermIndexError::UnsupportedVersion {
-                what: "tier chunk",
-                found: version,
-                expected: TIER_FORMAT_VERSION,
-            });
-        }
-        let n_blocks =
-            u32_le_at(bytes, MAGIC_LEN + 4).ok_or_else(|| malformed("block count"))? as usize;
+        let n_blocks = u32_le_at(bytes, 0).ok_or_else(|| malformed("block count"))? as usize;
         let dir_end = CHUNK_HEADER_LEN
             .checked_add(
                 n_blocks
@@ -354,29 +389,40 @@ impl<'a> TierChunk<'a> {
         let (ordinal_bits, lid_bits, impact_bits) = (body[0], body[1], body[2]);
         let max_bits = u32::from_le_bytes(body[3..7].try_into().expect("4 bytes"));
         let n = d.n_entries as usize;
-        let lanes = n.div_ceil(LANE);
-        let lane_bytes = |bits: u8| LANE * bits as usize / 8;
-        let need = BLOCK_HEADER_LEN
-            + lanes * (lane_bytes(ordinal_bits) + lane_bytes(lid_bits) + lane_bytes(impact_bits));
+        let full = n / LANE * LANE;
+        let rest = n - full;
+        let lanes = full / LANE;
+        let stream = |bits: u8| lanes * LANE * bits as usize / 8 + dense_len(rest, bits);
+        let need = BLOCK_HEADER_LEN + stream(ordinal_bits) + stream(lid_bits) + stream(impact_bits);
         if body.len() != need || ordinal_bits > 32 || lid_bits > 32 || impact_bits > 32 {
             return Err(malformed("block body length"));
         }
         let bp = BitPacker4x::new();
-        let mut ordinals = vec![0u32; lanes * LANE];
-        let mut doc_ids = vec![0u32; lanes * LANE];
-        let mut codes = vec![0u32; lanes * LANE];
+        let mut ordinals = vec![0u32; n];
+        let mut doc_ids = vec![0u32; n];
+        let mut codes = vec![0u32; n];
         let mut at = BLOCK_HEADER_LEN;
         let mut initial = 0u32;
-        for lane in ordinals.chunks_mut(LANE) {
+        for lane in ordinals[..full].chunks_mut(LANE) {
             at += bp.decompress_sorted(initial, &body[at..], lane, ordinal_bits);
             initial = lane[LANE - 1];
         }
-        for lane in doc_ids.chunks_mut(LANE) {
+        unpack_dense(&body[at..], rest, ordinal_bits, &mut ordinals[full..]);
+        at += dense_len(rest, ordinal_bits);
+        for v in &mut ordinals[full..] {
+            initial = initial.wrapping_add(*v);
+            *v = initial;
+        }
+        for lane in doc_ids[..full].chunks_mut(LANE) {
             at += bp.decompress(&body[at..], lane, lid_bits);
         }
-        for lane in codes.chunks_mut(LANE) {
+        unpack_dense(&body[at..], rest, lid_bits, &mut doc_ids[full..]);
+        at += dense_len(rest, lid_bits);
+        for lane in codes[..full].chunks_mut(LANE) {
             at += bp.decompress(&body[at..], lane, impact_bits);
         }
+        unpack_dense(&body[at..], rest, impact_bits, &mut codes[full..]);
+        at += dense_len(rest, impact_bits);
         debug_assert_eq!(at, body.len());
         out.reserve(n);
         for i in 0..n {
@@ -569,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bad_magic_version_and_truncation() {
+    fn rejects_a_bad_crc_and_truncation() {
         let chunks = encode_tier(&sample(5_000, 10, 1_000, 5));
         let bytes = &chunks[0].bytes;
         let mut flipped = bytes.clone();
@@ -583,22 +629,35 @@ mod tests {
             "a flipped body byte fails the crc"
         );
         TierChunk::verify(bytes).expect("intact bytes pass");
-        let mut bad = bytes.clone();
-        bad[0] = b'X';
-        assert!(matches!(
-            TierChunk::open(&bad),
-            Err(TermIndexError::Malformed(_))
-        ));
-        let mut bad = bytes.clone();
-        bad[MAGIC_LEN] = 9;
-        assert!(matches!(
-            TierChunk::open(&bad),
-            Err(TermIndexError::UnsupportedVersion {
-                what: "tier chunk",
-                found: 9,
-                ..
-            })
-        ));
         assert!(TierChunk::open(&bytes[..bytes.len() - 1]).is_err());
+        assert!(TierChunk::open(&bytes[..CHUNK_HEADER_LEN - 1]).is_err());
+    }
+
+    /// Most terms' tiers are a handful of entries; they must cost a handful
+    /// of bytes, not a padded lane of each stream, and round-trip exactly.
+    #[test]
+    fn small_tiers_are_small_and_exact() {
+        for n in [1usize, 2, 3, 7, 127, 129, 4095, 4097] {
+            let entries = sample(n, 1_080, 1_000_000, n as u64);
+            let chunks = encode_tier(&entries);
+            let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
+            let fixed = CHUNK_HEADER_LEN + DIRECTORY_ENTRY_LEN * chunks.len() + BLOCK_HEADER_LEN;
+            assert!(
+                bytes <= fixed * entries.len().div_ceil(BLOCK_ENTRIES) + 8 * n,
+                "{n} entries took {bytes} bytes"
+            );
+            let decoded = decode_all(&chunks);
+            let mut want: Vec<(u32, u32, u32)> = entries
+                .iter()
+                .map(|e| (e.superfile, e.doc_id, e.impact.to_bits()))
+                .collect();
+            let mut got: Vec<(u32, u32, u32)> = decoded
+                .iter()
+                .map(|e| (e.superfile, e.doc_id, e.impact.to_bits()))
+                .collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            assert_eq!(want, got, "{n} entries round-trip");
+        }
     }
 }

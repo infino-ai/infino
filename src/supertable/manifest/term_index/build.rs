@@ -60,16 +60,16 @@ pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 /// rate of a ranked query is set by `k` against the budget, not by the
 /// per-superfile depth, and the budget that serves a given `k` grows with
 /// the table: the k-th joint score rises as fast as the candidate pool
-/// does. One document in a thousand served `k ≤ 1000` at the median on a
-/// billion-document long-text corpus, and the same share serves the same
-/// `k` on a smaller table while keeping a small table from copying most of
-/// its postings into tiers.
-pub(crate) const TIER_SHARE_OF_DOCS: f64 = 1e-3;
+/// does. Three documents in ten thousand is what a long-text table affords:
+/// on a ten-million-document corpus the tiers then hold about seven
+/// percent of the postings (the complete lists of the terms under the
+/// budget, which are a thin tail, plus the budget's worth of each common
+/// term), and the same share serves the same `k` on a larger table.
+pub(crate) const TIER_SHARE_OF_DOCS: f64 = 3e-4;
 /// Smallest tier budget the share resolves to. A small table has few
 /// superfiles, so its opens are cheap whatever the budget, while a large
-/// floor would copy most of its postings into tiers: nearly every term of
-/// a ten-million-document table falls under a budget of sixty thousand.
-pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 13;
+/// floor would copy most of its postings into tiers.
+pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 11;
 /// Largest tier budget the share resolves to: past this the per-term read
 /// outgrows what a query at any supported `k` consumes.
 pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
@@ -77,7 +77,7 @@ pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
 /// The tier budget for a table of `n_docs` documents under the default
 /// policy.
 pub(crate) fn tier_entries_for(n_docs: u64) -> u64 {
-    ((n_docs as f64 * TIER_SHARE_OF_DOCS) as u64).clamp(TIER_ENTRIES_MIN, TIER_ENTRIES_MAX)
+    ((n_docs as f64 * TIER_SHARE_OF_DOCS).round() as u64).clamp(TIER_ENTRIES_MIN, TIER_ENTRIES_MAX)
 }
 /// Most documents a superfile contributes per term to its head, and the
 /// default when the table's shape is not known. The depth a table wants is
@@ -1135,13 +1135,13 @@ mod tests {
         );
         assert_eq!(
             tier_entries_for(10_000_000),
-            10_000,
-            "10M docs: one in a thousand"
+            3_000,
+            "10M docs: three in ten thousand"
         );
         assert_eq!(
             tier_entries_for(1_000_000_000),
-            1_000_000,
-            "1B docs: one in a thousand"
+            300_000,
+            "1B docs: three in ten thousand"
         );
         assert_eq!(
             tier_entries_for(100_000_000_000),
