@@ -83,6 +83,11 @@ const MAX_ENTRIES_PER_QUERY: u64 = 1 << 17;
 /// query's (a phrase, a negation): there is no threshold to converge on,
 /// so it reads enough to rank the superfiles and exhaust small tiers.
 const INEXACT_ENTRIES_PER_QUERY: u64 = 1 << 16;
+/// Rounds of the merge — one block each — that may pass without any
+/// frontier falling, any candidate appearing or any superfile ruled out
+/// before the merge stops: on short text the impacts tie across whole
+/// tiers, and once a round changes nothing, reading on can only add ties.
+const STALE_ROUNDS_BEFORE_STOP: u32 = 2;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +291,11 @@ pub(crate) async fn select_with_tiers(
     // hold, `None` once every stream of the term is exhausted.
     let mut frontier: Vec<Option<f32>> = vec![Some(f32::INFINITY); nt];
     let mut excluded = vec![false; n_sf];
+    // What the last round left behind, to tell a round that moved nothing.
+    let mut prev_frontier = frontier.clone();
+    let mut prev_candidates = 0usize;
+    let mut prev_excluded = 0usize;
+    let mut stale_rounds = 0u32;
 
     loop {
         // The stream whose next block has the highest (scaled) maximum.
@@ -357,33 +367,43 @@ pub(crate) async fn select_with_tiers(
             }
             *slot = f;
         }
-        if !theta_lb.is_finite() {
-            let cap = if exact {
-                MAX_ENTRIES_PER_QUERY
-            } else {
-                INEXACT_ENTRIES_PER_QUERY
-            };
-            if entries_read >= cap {
-                break;
-            }
-            continue;
-        }
         // Exclude what cannot compete, and test whether reading on could
         // exclude anything more.
         let mut can_still_shrink = false;
-        for (slot, out) in excluded.iter_mut().enumerate() {
-            if *out {
-                continue;
+        if theta_lb.is_finite() {
+            for (slot, out) in excluded.iter_mut().enumerate() {
+                if *out {
+                    continue;
+                }
+                let (ub_now, ub_floor) =
+                    bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
+                if ub_now * BOUND_SLACK < theta_lb {
+                    *out = true;
+                } else if ub_floor * BOUND_SLACK < theta_lb {
+                    can_still_shrink = true;
+                }
             }
-            let (ub_now, ub_floor) =
-                bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
-            if ub_now * BOUND_SLACK < theta_lb {
-                *out = true;
-            } else if ub_floor * BOUND_SLACK < theta_lb {
-                can_still_shrink = true;
+            if !can_still_shrink {
+                break;
             }
         }
-        if !can_still_shrink || entries_read >= MAX_ENTRIES_PER_QUERY {
+        let n_excluded = excluded.iter().filter(|e| **e).count();
+        let moved = frontier != prev_frontier
+            || acc.len() != prev_candidates
+            || n_excluded != prev_excluded;
+        prev_frontier.clone_from(&frontier);
+        prev_candidates = acc.len();
+        prev_excluded = n_excluded;
+        stale_rounds = if moved { 0 } else { stale_rounds + 1 };
+        if stale_rounds >= STALE_ROUNDS_BEFORE_STOP {
+            break;
+        }
+        let cap = if exact {
+            MAX_ENTRIES_PER_QUERY
+        } else {
+            INEXACT_ENTRIES_PER_QUERY
+        };
+        if entries_read >= cap {
             break;
         }
     }

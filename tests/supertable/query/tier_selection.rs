@@ -248,3 +248,72 @@ fn an_empty_conjunction_of_complete_tiers_opens_nothing() {
     assert!(hits.is_empty(), "the words never co-occur");
     assert_eq!(opened, 0, "the tiers rule every superfile out");
 }
+
+/// Short text: every document scores the same, so every unread block can
+/// still hold a tie and the merge's threshold test never settles. It must
+/// still stop after a round that moved nothing, read a small part of the
+/// tiers, and give the same answer as the table without tiers.
+#[test]
+fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
+    const SUPERFILES_TIED: usize = 6;
+    const DOCS_PER_SUPERFILE_TIED: usize = 3_000;
+    let build = |tiers: bool| -> (TempDir, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
+            .expect("options")
+            .with_storage(storage);
+        if !tiers {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        for _ in 0..SUPERFILES_TIED {
+            let docs: Vec<&str> = (0..DOCS_PER_SUPERFILE_TIED)
+                .map(|i| {
+                    if i % 3 == 0 {
+                        "alpha beta"
+                    } else {
+                        "alpha gamma"
+                    }
+                })
+                .collect();
+            let col: ArrayRef = Arc::new(LargeStringArray::from(docs));
+            w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        // One segment, so a term's tier is a few blocks rather than one per
+        // commit, and the early stop has something to skip.
+        st.optimize(&infino::OptimizeOptions::default())
+            .expect("optimize");
+        (dir, st)
+    };
+    let (_with_dir, with) = build(true);
+    let (_without_dir, without) = build(false);
+    for (query, mode) in [
+        ("alpha beta", BoolMode::Or),
+        ("alpha beta", BoolMode::And),
+        ("alpha gamma", BoolMode::And),
+    ] {
+        for k in [10usize, 100] {
+            let (a, _, _) = run(&with, query, mode, k);
+            let (b, _, _) = run(&without, query, mode, k);
+            assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer");
+            let (_, stats) = with_op_stats(|| {
+                with.reader()
+                    .expect("reader")
+                    .bm25_hits("body", query, k, Bm25SearchOptions::new().with_mode(mode))
+                    .expect("search")
+            });
+            let total = (SUPERFILES_TIED * DOCS_PER_SUPERFILE_TIED) as u64;
+            assert!(
+                stats.tier_entries < total,
+                "{query:?} {mode:?} k={k}: read {} tier entries of at least {total}",
+                stats.tier_entries
+            );
+        }
+    }
+}
