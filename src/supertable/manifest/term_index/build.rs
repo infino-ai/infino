@@ -22,12 +22,13 @@
 
 use std::{
     cmp::Reverse,
+    collections::HashMap,
     collections::{BinaryHeap, VecDeque},
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
     mem,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use rayon::{ThreadPool, prelude::*};
@@ -43,7 +44,11 @@ use super::{
     tier::{EncodedChunk, TierChunk, TierChunkRef, TierEntry, encode_tier},
 };
 use crate::{
-    supertable::manifest::part::ContentHash,
+    superfile::{
+        error::BuildError,
+        fts::builder::{TermHeadFacts, TermHeadSink},
+    },
+    supertable::{manifest::part::ContentHash, schema::FieldId},
     utils::{
         terms::{DictEntry, TermBlockWriter},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
@@ -277,6 +282,24 @@ impl ContributionWriter {
         })
     }
 
+    /// A writer for one part of a contribution — one column's terms —
+    /// under `dir`, named `part`; the parts are joined in key order once
+    /// every column is written.
+    fn create_part(dir: &Path, part: usize) -> Result<Self, TermIndexError> {
+        let path = dir.join(format!("part-{part}.terms"));
+        let out = BufWriter::new(File::create(&path)?);
+        Ok(Self {
+            out,
+            path,
+            scratch: None,
+            superfile_id: Uuid::nil(),
+            id_min: 0,
+            prev_key: Vec::new(),
+            n_terms: 0,
+            record: Vec::new(),
+        })
+    }
+
     /// Like [`Self::create`], spilling into a scratch directory of its own
     /// under the system temporary directory; the directory lives as long as
     /// the finished contribution does.
@@ -346,6 +369,203 @@ impl ContributionWriter {
             path: self.path,
             _scratch: self.scratch,
         })
+    }
+}
+
+/// Gathers a superfile's term-index contribution from the builder that
+/// writes the superfile, term by term as the postings are written, so no
+/// second pass reads them back. The builder hands terms over column by
+/// column in its own column order; each column's terms land in a part of
+/// their own, and the parts are joined in ascending key order at the end.
+/// Shared between the builder, which drives it, and the caller, which
+/// takes the contribution once the build is done.
+#[derive(Clone)]
+pub(crate) struct HeadSink {
+    inner: Arc<Mutex<HeadSinkState>>,
+}
+
+struct HeadSinkState {
+    scratch: TempDir,
+    /// Column name to the id its keys are written under; a column not
+    /// here is not indexed and contributes nothing.
+    columns: HashMap<String, FieldId>,
+    /// `(key prefix, writer)` per column seen so far.
+    parts: Vec<(Vec<u8>, ContributionWriter)>,
+    /// The column the last term belonged to, so a run of terms finds its
+    /// part without a lookup.
+    current: Option<(String, usize)>,
+}
+
+impl HeadSink {
+    pub(crate) fn new(columns: HashMap<String, FieldId>) -> Result<Self, TermIndexError> {
+        let scratch = tempfile::Builder::new()
+            .prefix("infino-term-index-")
+            .tempdir()?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(HeadSinkState {
+                scratch,
+                columns,
+                parts: Vec::new(),
+                current: None,
+            })),
+        })
+    }
+
+    /// The finished contribution for `superfile_id`, once the builder that
+    /// fed this sink has finished.
+    pub(crate) fn into_contribution(
+        self,
+        superfile_id: Uuid,
+        id_min: i128,
+    ) -> Result<Contribution, TermIndexError> {
+        let state = Arc::try_unwrap(self.inner)
+            .map_err(|_| TermIndexError::Build("term head sink still in use".into()))?
+            .into_inner()
+            .map_err(|_| TermIndexError::Build("term head sink poisoned".into()))?;
+        let HeadSinkState {
+            scratch, mut parts, ..
+        } = state;
+        parts.sort_by(|a, b| a.0.cmp(&b.0));
+        let path = scratch.path().join(format!("{superfile_id}.terms"));
+        let mut out = BufWriter::new(File::create(&path)?);
+        for (_, writer) in parts {
+            let part = writer.finish()?;
+            let mut file = File::open(&part.path)?;
+            io::copy(&mut file, &mut out)?;
+            fs::remove_file(&part.path)?;
+        }
+        out.flush()?;
+        Ok(Contribution {
+            superfile_id,
+            id_min,
+            path,
+            _scratch: Some(scratch),
+        })
+    }
+}
+
+impl TermHeadSink for HeadSink {
+    fn term(
+        &mut self,
+        column: &str,
+        term: &str,
+        facts: &TermHeadFacts<'_>,
+    ) -> Result<(), BuildError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| BuildError::Io(io::Error::other("term head sink poisoned")))?;
+        let state = &mut *state;
+        let part = match &state.current {
+            Some((name, part)) if name == column => *part,
+            _ => {
+                let Some(id) = state.columns.get(column).copied() else {
+                    return Ok(());
+                };
+                let prefix = id.term_key("");
+                let part = match state.parts.iter().position(|(p, _)| *p == prefix) {
+                    Some(part) => part,
+                    None => {
+                        let writer = ContributionWriter::create_part(
+                            state.scratch.path(),
+                            state.parts.len(),
+                        )
+                        .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))?;
+                        state.parts.push((prefix, writer));
+                        state.parts.len() - 1
+                    }
+                };
+                state.current = Some((column.to_owned(), part));
+                part
+            }
+        };
+        let (prefix, writer) = &mut state.parts[part];
+        let mut key = prefix.clone();
+        key.extend_from_slice(term.as_bytes());
+        writer
+            .push(
+                &key,
+                facts.df,
+                facts.bound,
+                Location::from_dict_value(facts.entry),
+                facts.tail,
+                &Head {
+                    docs: facts.head.to_vec(),
+                    complete: facts.complete,
+                },
+            )
+            .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))
+    }
+
+    fn finish(&mut self) -> Result<(), BuildError> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| BuildError::Io(io::Error::other("term head sink poisoned")))?;
+        for (_, writer) in &mut state.parts {
+            writer
+                .out
+                .flush()
+                .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))?;
+        }
+        Ok(())
+    }
+}
+
+/// The first record on which two contributions differ, described, or
+/// `None` when they are the same record for record.
+#[cfg(test)]
+pub(crate) fn first_contribution_difference(
+    a: &Path,
+    b: &Path,
+) -> Result<Option<String>, TermIndexError> {
+    let (mut ra, mut rb) = (ContributionReader::open(a)?, ContributionReader::open(b)?);
+    let mut n = 0usize;
+    loop {
+        let (x, y) = (ra.next()?, rb.next()?);
+        match (x, y) {
+            (None, None) => return Ok(None),
+            (Some(x), None) | (None, Some(x)) => {
+                return Ok(Some(format!(
+                    "record {n}: only one side has {:?}",
+                    String::from_utf8_lossy(&x.key)
+                )));
+            }
+            (Some(x), Some(y)) => {
+                let same = x.key == y.key
+                    && x.posting.df == y.posting.df
+                    && x.posting.bound.to_bits() == y.posting.bound.to_bits()
+                    && x.posting.tail.to_bits() == y.posting.tail.to_bits()
+                    && x.posting.location == y.posting.location
+                    && x.head.complete == y.head.complete
+                    && x.head.docs.len() == y.head.docs.len()
+                    && x.head
+                        .docs
+                        .iter()
+                        .zip(&y.head.docs)
+                        .all(|(p, q)| p.0 == q.0 && p.1.to_bits() == q.1.to_bits());
+                if !same {
+                    return Ok(Some(format!(
+                        "record {n} {:?} / {:?}: df {} vs {}, bound {:?} vs {:?}, tail {:?} vs {:?}, location {:?} vs {:?}, complete {} vs {}, head {:?} vs {:?}",
+                        String::from_utf8_lossy(&x.key),
+                        String::from_utf8_lossy(&y.key),
+                        x.posting.df,
+                        y.posting.df,
+                        x.posting.bound,
+                        y.posting.bound,
+                        x.posting.tail,
+                        y.posting.tail,
+                        x.posting.location,
+                        y.posting.location,
+                        x.head.complete,
+                        y.head.complete,
+                        &x.head.docs[..x.head.docs.len().min(6)],
+                        &y.head.docs[..y.head.docs.len().min(6)],
+                    )));
+                }
+            }
+        }
+        n += 1;
     }
 }
 

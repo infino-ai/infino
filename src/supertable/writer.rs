@@ -2838,6 +2838,7 @@ impl SupertableWriter {
         // superfiles, and pre-drain queries fall back to them.
         // The shard build is the append's own CPU — measured on the pool
         // threads that run it, folded into the op's collector.
+        let superfiles_after = manifest.superfiles.len() + shards.len();
         let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
@@ -2845,6 +2846,7 @@ impl SupertableWriter {
                 &manifest,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
+                superfiles_after,
             )
         })?;
         let superfiles = outputs.len();
@@ -2997,6 +2999,13 @@ impl Drop for SupertableWriter {
 /// re-decode through DataFusion or parquet-rs's stats reader.
 pub struct ShardOutput {
     bytes: Bytes,
+    /// The id the superfile is published under, minted at build time so a
+    /// contribution gathered while building can name it.
+    superfile_id: Uuid,
+    /// The superfile's term-index contribution, gathered while it was
+    /// built; `None` when the build gathered none and the prepare reads it
+    /// from the finished bytes.
+    term_contribution: Option<TermContribution>,
     n_docs: u64,
     /// `id_min` / `id_max`: only meaningful when `n_docs > 0`.
     /// For a 0-doc shard (empty slice — shouldn't happen given
@@ -3023,6 +3032,8 @@ impl ShardOutput {
     ) -> Self {
         Self {
             bytes,
+            superfile_id: Uuid::new_v4(),
+            term_contribution: None,
             n_docs,
             id_min,
             id_max,
@@ -3065,12 +3076,16 @@ fn reserve_build_scratch(
 /// vector layout override. Runs on a rayon worker thread inside the writer
 /// pool's `install`. The commit path always passes an explicit layout +
 /// optional global centroids.
+/// `superfiles_after` is how many superfiles the table holds once the
+/// commit this shard belongs to lands; it sizes the head each term
+/// contributes to the term index (see [`build_term_contribution`]).
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
     provided_centroids: Option<std::sync::Arc<[f32]>>,
+    superfiles_after: usize,
 ) -> Result<ShardOutput, BuildError> {
     let options = &inner.options;
     let mut builder = SuperfileBuilder::new(
@@ -3078,6 +3093,13 @@ fn build_one_shard_with_layout(
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
+    // The term-index contribution is gathered as the postings are written
+    // rather than read back from the finished superfile.
+    let superfile_id = Uuid::new_v4();
+    let head_sink = term_head_sink_for(manifest, superfiles_after)?;
+    if let Some((sink, depth)) = &head_sink {
+        builder.set_term_head_sink(Box::new(sink.clone()), *depth);
+    }
 
     let scalar_schema = manifest.scalar_schema();
     // The supertable always prepends the id column at index 0 of the
@@ -3151,13 +3173,42 @@ fn build_one_shard_with_layout(
         (id_min, id_max)
     };
 
+    let term_contribution = head_sink
+        .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
+        .transpose()
+        .map_err(|e| BuildError::Store(e.to_string()))?;
     Ok(ShardOutput {
         bytes,
+        superfile_id,
+        term_contribution,
         n_docs,
         id_min,
         id_max,
         scalar_stats,
     })
+}
+
+/// The sink a shard build hands its terms to, with the head depth, when
+/// the table keeps a term index: storage-backed, with text columns. The
+/// builder's column names resolve to the ids the index keys terms by; a
+/// column the table does not have contributes nothing.
+fn term_head_sink_for(
+    manifest: &ManifestSnapshot,
+    superfiles_after: usize,
+) -> Result<Option<(term_index::HeadSink, usize)>, BuildError> {
+    if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
+        return Ok(None);
+    }
+    let columns: HashMap<String, FieldId> = manifest
+        .fts_configs()
+        .iter()
+        .filter_map(|c| Some((c.column.clone(), manifest.field_id(&c.column)?)))
+        .collect();
+    let policy = manifest
+        .options
+        .term_index_build_policy(manifest.n_docs_total(), superfiles_after as u64);
+    let sink = term_index::HeadSink::new(columns).map_err(|e| BuildError::Store(e.to_string()))?;
+    Ok(Some((sink, policy.head_depth_per_superfile)))
 }
 
 /// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
@@ -3923,7 +3974,7 @@ pub(super) fn prepare_superfile_named(
         // Hidden cell superfile; stamped by the hidden manifest's own
         // `update`. Irrelevant to the user-side drain watermark.
         birth_version: 0,
-        superfile_id: uuid::Uuid::new_v4(),
+        superfile_id: shard.superfile_id,
         uri,
         stem: stem.map(str::to_owned),
         physical_schema: Some(Arc::new(PhysicalSchema::of_reader(
@@ -3946,13 +3997,18 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
-    let term_contribution = build_term_contribution(
-        &reader,
-        manifest,
-        entry.superfile_id,
-        entry.id_min,
-        superfiles_after,
-    )?;
+    // A build that gathered its contribution as it wrote hands it over;
+    // one that did not has it read from the finished bytes.
+    let term_contribution = match shard.term_contribution {
+        Some(contribution) => Some(contribution),
+        None => build_term_contribution(
+            &reader,
+            manifest,
+            entry.superfile_id,
+            entry.id_min,
+            superfiles_after,
+        )?,
+    };
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -7276,6 +7332,8 @@ fn build_one_shard_from_packed_cells(
 
     Ok(ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs,
         id_min,
         id_max,
@@ -7390,6 +7448,8 @@ fn build_prepared_from_spilled_cells(
     };
     let shard = ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs: n_docs as u64,
         id_min,
         id_max,
@@ -7851,6 +7911,8 @@ fn build_one_packed_shard_via_drain(
 
     Ok(Some(ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs,
         id_min,
         id_max,
@@ -15836,6 +15898,99 @@ supertable:
     #[test]
     fn merge_ranges_empty_input_is_empty() {
         assert!(merge_ranges(Vec::new()).is_empty());
+    }
+
+    /// What a builder gathers for the term index as it writes a superfile
+    /// is exactly what a reader derives from the finished bytes: the same
+    /// terms, frequencies, bounds, locations, heads and tails, byte for
+    /// byte. The corpus has a term above the head depth (a tail and a
+    /// truncated head), one with tied impacts (the tie order), and one
+    /// with a single posting (the inline entry).
+    #[test]
+    fn a_builder_gathered_contribution_is_the_reader_derived_one() {
+        for positions in [false, true] {
+            gathered_matches_derived(positions);
+        }
+    }
+
+    /// One run of the comparison, with the column's positions on or off:
+    /// positions change which single-posting terms inline and give short
+    /// terms the positional form.
+    fn gathered_matches_derived(positions: bool) {
+        const DOCS: usize = 300;
+        const HEAD_DEPTH: usize = 64;
+        let mut fts = FtsConfig::new("title");
+        fts.positions = positions;
+        let options =
+            SupertableOptions::new(schema_id_title(), vec![fts], vec![]).expect("valid options");
+        let st = Supertable::create(options).expect("create");
+        let manifest = st.reader().expect("reader").manifest().clone();
+        let titles: Vec<String> = (0..DOCS)
+            .map(|i| {
+                let mut words = vec!["alpha"; 1 + i % 5];
+                words.extend(std::iter::repeat_n("filler", i % 7));
+                if i % 30 == 0 {
+                    words.extend(["beta", "beta"]);
+                }
+                if i == 17 {
+                    words.push("gamma");
+                }
+                words.join(" ")
+            })
+            .collect();
+        let ids = Decimal128Array::from_iter_values((1..=DOCS as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 0)
+            .expect("ids");
+        let batch = RecordBatch::try_new(
+            manifest.scalar_schema(),
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(
+                    titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+        let columns = HashMap::from([(
+            "title".to_owned(),
+            manifest.field_id("title").expect("title id"),
+        )]);
+        let sink = term_index::HeadSink::new(columns).expect("sink");
+        let mut builder = SuperfileBuilder::new(builder_options_of(&manifest)).expect("builder");
+        builder.set_term_head_sink(Box::new(sink.clone()), HEAD_DEPTH);
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(builder.finish().expect("finish"));
+        let superfile_id = Uuid::new_v4();
+        let gathered = sink
+            .into_contribution(superfile_id, 1)
+            .expect("gathered contribution");
+
+        let reader = SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
+            .expect("open");
+        let mut writer =
+            term_index::ContributionWriter::create_in_scratch(superfile_id, 1).expect("writer");
+        let policy = term_index::BuildPolicy {
+            head_depth_per_superfile: HEAD_DEPTH,
+            ..term_index::BuildPolicy::default()
+        };
+        bridge_sync_to_async(write_superfile_terms(
+            &reader,
+            &manifest.options.legacy_names(),
+            &mut writer,
+            &policy,
+        ))
+        .expect("derived facts");
+        let derived = writer.finish().expect("derived contribution");
+
+        let a = std::fs::read(&gathered.path).expect("gathered bytes");
+        let b = std::fs::read(&derived.path).expect("derived bytes");
+        assert!(!a.is_empty(), "the corpus has terms");
+        let difference = term_index::first_contribution_difference(&gathered.path, &derived.path)
+            .expect("both readable");
+        assert!(
+            a == b,
+            "positions {positions}: the gathered contribution is the derived one, byte for byte; first difference: {difference:?}"
+        );
     }
 
     // ---- build_subsection_offsets on real superfile bytes ------------
