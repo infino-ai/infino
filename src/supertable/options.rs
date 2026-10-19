@@ -947,6 +947,7 @@ impl SupertableOptions {
         BuildPolicy {
             tier_entries_per_term,
             head_depth_per_superfile: head_depth_for(tier_entries_per_term, n_superfiles),
+            pool: Some(Arc::clone(&self.writer_pool)),
             ..BuildPolicy::default()
         }
     }
