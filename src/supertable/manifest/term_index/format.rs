@@ -245,6 +245,9 @@ pub(crate) struct SliceRef {
     pub(crate) content_hash: ContentHash,
     /// Slice byte length, so a fetch can be sized before it is issued.
     pub(crate) len: u64,
+    /// The slice's tier object — its terms' tier chunks back to back, in
+    /// key order — when any of its runs has a tier.
+    pub(crate) tier: Option<ObjectRef>,
 }
 
 /// A content-addressed object's name and size.
@@ -259,30 +262,6 @@ pub(crate) struct ObjectRef {
 pub(crate) struct Segment {
     /// Slices in ascending key order, non-overlapping.
     pub(crate) slices: Vec<SliceRef>,
-    /// The segment's tier list, when any of its runs has a tier.
-    pub(crate) tier_list: Option<ObjectRef>,
-}
-
-/// Encode a tier list: the chunk hashes back to back.
-pub(crate) fn encode_tier_list(hashes: &[ContentHash]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(hashes.len() * HASH_LEN);
-    for h in hashes {
-        out.extend_from_slice(&h.0);
-    }
-    out
-}
-
-/// Decode a tier list.
-pub(crate) fn decode_tier_list(bytes: &[u8]) -> Result<Vec<ContentHash>, TermIndexError> {
-    if !bytes.len().is_multiple_of(HASH_LEN) {
-        return Err(malformed(
-            "tier list: length is not a whole number of hashes",
-        ));
-    }
-    Ok(bytes
-        .chunks_exact(HASH_LEN)
-        .map(|c| ContentHash(c.try_into().expect("32 bytes")))
-        .collect())
 }
 
 /// The resident root.
@@ -384,13 +363,13 @@ impl Root {
                 push_bytes_u32_len(&mut out, &s.last_key);
                 out.extend_from_slice(&s.content_hash.0);
                 out.extend_from_slice(&s.len.to_le_bytes());
+                let (hash, len) = match &s.tier {
+                    Some(r) => (r.content_hash, r.len),
+                    None => (ContentHash([0u8; HASH_LEN]), 0),
+                };
+                out.extend_from_slice(&hash.0);
+                out.extend_from_slice(&len.to_le_bytes());
             }
-            let (hash, len) = match &seg.tier_list {
-                Some(r) => (r.content_hash, r.len),
-                None => (ContentHash([0u8; HASH_LEN]), 0),
-            };
-            out.extend_from_slice(&hash.0);
-            out.extend_from_slice(&len.to_le_bytes());
         }
         out
     }
@@ -419,23 +398,24 @@ impl Root {
                 let hash = c.take(HASH_LEN, "slice hash")?;
                 let content_hash = ContentHash(hash.try_into().expect("32 bytes"));
                 let len = c.u64("slice length")?;
+                let hash = c.take(HASH_LEN, "slice tier hash")?;
+                let tier_len = c.u64("slice tier length")?;
+                let tier = match hash.iter().all(|b| *b == 0) && tier_len == 0 {
+                    true => None,
+                    false => Some(ObjectRef {
+                        content_hash: ContentHash(hash.try_into().expect("32 bytes")),
+                        len: tier_len,
+                    }),
+                };
                 slices.push(SliceRef {
                     first_key,
                     last_key,
                     content_hash,
                     len,
+                    tier,
                 });
             }
-            let hash = c.take(HASH_LEN, "segment tier list hash")?;
-            let len = c.u64("segment tier list length")?;
-            let tier_list = match hash.iter().all(|b| *b == 0) && len == 0 {
-                true => None,
-                false => Some(ObjectRef {
-                    content_hash: ContentHash(hash.try_into().expect("32 bytes")),
-                    len,
-                }),
-            };
-            segments.push(Segment { slices, tier_list });
+            segments.push(Segment { slices });
         }
         if c.at != bytes.len() {
             return Err(malformed("root: trailing bytes"));
@@ -813,7 +793,7 @@ mod tests {
             n_entries: 1_234_567,
             chunks: (0..2)
                 .map(|i| TierChunkRef {
-                    content_hash: ContentHash::of(&[i as u8; 8]),
+                    offset: i * 4_000_000,
                     len: 4_000_000 - i,
                     n_entries: 600_000 + i,
                 })
@@ -893,6 +873,10 @@ mod tests {
             last_key: last.as_bytes().to_vec(),
             content_hash: ContentHash([tag; HASH_LEN]),
             len: tag as u64 * 1000,
+            tier: tag.is_multiple_of(2).then(|| ObjectRef {
+                content_hash: ContentHash([tag ^ 0xFF; HASH_LEN]),
+                len: tag as u64 * 10,
+            }),
         }
     }
 
@@ -904,11 +888,9 @@ mod tests {
             segments: vec![
                 Segment {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
-                    tier_list: None,
                 },
                 Segment {
                     slices: vec![slice_ref("c", "d", 3)],
-                    tier_list: None,
                 },
             ],
         };
@@ -967,6 +949,7 @@ mod tests {
             last_key: b.to_vec(),
             content_hash: ContentHash([n; 32]),
             len: 1,
+            tier: None,
         };
         let root = Root {
             superfiles: vec![],
@@ -977,7 +960,6 @@ mod tests {
                     hi(&[0xFF, 0x01], &[0xFF, 0x05], 2),
                     hi(&[0xFF, 0x06], &[0xFF, 0xFF], 3),
                 ],
-                tier_list: None,
             }],
         };
         let hashes: Vec<u8> = root
@@ -999,11 +981,9 @@ mod tests {
             segments: vec![
                 Segment {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
-                    tier_list: None,
                 },
                 Segment {
                     slices: vec![slice_ref("c", "d", 3)],
-                    tier_list: None,
                 },
             ],
         };
@@ -1038,7 +1018,6 @@ mod tests {
                     slice_ref("ac", "b", 2),
                     slice_ref("ba", "c", 3),
                 ],
-                tier_list: None,
             }],
         };
         let hits: Vec<u8> = root

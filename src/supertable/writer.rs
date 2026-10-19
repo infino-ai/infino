@@ -2937,6 +2937,7 @@ impl SupertableWriter {
                                 contributions,
                                 &self.inner.options.term_index_build_policy(
                                     self.inner.manifest.load().n_docs_total(),
+                                    self.inner.manifest.load().superfiles.len() as u64,
                                 ),
                                 base,
                                 true,
@@ -3708,7 +3709,7 @@ pub(in crate::supertable) fn build_term_contribution(
         &mut writer,
         &manifest
             .options
-            .term_index_build_policy(manifest.n_docs_total()),
+            .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -11090,7 +11091,7 @@ async fn merge_term_index(
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total());
+        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
     let scratch = term_index_scratch()?;
     let mut sources =
         term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
@@ -11110,7 +11111,12 @@ async fn merge_term_index(
     if !missing.is_empty() {
         let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
         let built = term_index::build_onto(old, &contributions, &policy)?;
-        term_index::spill_tiers(scratch.path(), built.tiers)?;
+        let fresh = built
+            .root
+            .segments
+            .last()
+            .expect("a build onto a root appends its segment");
+        term_index::spill_tiers(scratch.path(), &fresh.slices, built.tiers)?;
         sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
         old = built.root;
     }
@@ -11133,11 +11139,10 @@ async fn merge_term_index(
         .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
         .collect();
 
-    let tier_dir = scratch.path().to_path_buf();
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
-        move || term_index::merge_segments(&sources, &tier_dir, &ordinals, &policy),
+        move || term_index::merge_segments(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!(
         "term_index.merge",
@@ -11203,14 +11208,13 @@ async fn fold_term_index(
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total());
+        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
     let scratch = term_index_scratch()?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
-    let tier_dir = scratch.path().to_path_buf();
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
-        move || term_index::merge_segments(&sources, &tier_dir, &ordinals, &policy),
+        move || term_index::merge_segments(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
     .await
@@ -11244,7 +11248,7 @@ async fn collect_and_build_term_index(
         &contributions,
         &manifest
             .options
-            .term_index_build_policy(manifest.n_docs_total()),
+            .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64),
     )
 }
 
@@ -11261,7 +11265,7 @@ async fn collect_contributions(
     let legacy = manifest.options.legacy_names();
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total());
+        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
     let mut contributions = Vec::with_capacity(entries.len());
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
@@ -12339,7 +12343,10 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let policy = term_index::BuildPolicy::default();
+        let policy = current_manifest.options.term_index_build_policy(
+            current_manifest.n_docs_total(),
+            current_manifest.superfiles.len() as u64,
+        );
         let store = storage.as_ref();
         let reference = async move {
             match reserved_segment {

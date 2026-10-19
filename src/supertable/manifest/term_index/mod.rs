@@ -46,15 +46,17 @@ use std::{
 pub(crate) use build::build;
 use build::build_segment;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, Head, build_onto, merge_segments,
-    tier_entries_for, tier_path,
+    BuildPolicy, Built, Contribution, ContributionWriter, Head, build_onto, head_depth_for,
+    merge_segments, tier_entries_for, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
-pub(crate) use format::{Location, Posting, Root, Run, Slice, TierRef, decode_tier_list};
+#[cfg(test)]
+pub(crate) use format::TierRef;
+pub(crate) use format::{Location, Posting, Root, Run, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
-pub(crate) use tier::{TierChunk, TierEntry};
+pub(crate) use tier::{TierChunk, TierChunkRef, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
@@ -473,35 +475,11 @@ pub(crate) fn segments_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a 
     .then(|| &current.segments[prior.segments.len()..])
 }
 
-/// The tier chunks `segments` reference, read from their tier lists.
-pub(crate) async fn tier_chunks_of(
-    storage: &dyn StorageProvider,
-    segments: &[Segment],
-) -> Result<Vec<ContentHash>, TermIndexError> {
-    let mut out = Vec::new();
-    for segment in segments {
-        let Some(list) = &segment.tier_list else {
-            continue;
-        };
-        let bytes = fetch_verified(
-            storage,
-            None,
-            &tier_uri(&list.content_hash),
-            &list.content_hash,
-        )
-        .await?;
-        out.extend(decode_tier_list(&bytes)?);
-    }
-    out.sort_unstable_by_key(|h| h.0);
-    out.dedup();
-    Ok(out)
-}
-
 /// Download every slice of `segments` into `dir`, verified against its
 /// hash, [`SLICE_FETCH_CONCURRENCY`] at a time, and return each segment's
 /// slice files in key order. A slice two segments share is fetched once.
-/// The segments' tier chunks land in `dir` too, named by [`tier_path`],
-/// so a merge finds them beside the slices. The bytes skip the manifest
+/// Each slice's tier object lands in `dir` too, named by [`tier_path`],
+/// so a merge finds it beside the slice. The bytes skip the manifest
 /// disk cache: a merge reads each object once, and filling the cache with
 /// the whole index would evict what queries use.
 pub(crate) async fn download_segments(
@@ -517,6 +495,7 @@ pub(crate) async fn download_segments(
         .filter(|slice| unique.insert(slice.content_hash))
         .map(|slice| {
             let path = path_of(&slice.content_hash);
+            let tier_file = tier_path(dir, &slice.content_hash);
             async move {
                 let bytes = fetch_verified(
                     storage,
@@ -526,6 +505,16 @@ pub(crate) async fn download_segments(
                 )
                 .await?;
                 async_fs::write(&path, &bytes).await?;
+                if let Some(tier) = &slice.tier {
+                    let bytes = fetch_verified(
+                        storage,
+                        None,
+                        &tier_uri(&tier.content_hash),
+                        &tier.content_hash,
+                    )
+                    .await?;
+                    async_fs::write(&tier_file, &bytes).await?;
+                }
                 Ok::<(), TermIndexError>(())
             }
         });
@@ -533,18 +522,6 @@ pub(crate) async fn download_segments(
         .buffer_unordered(SLICE_FETCH_CONCURRENCY)
         .try_collect::<()>()
         .await?;
-    let chunks = tier_chunks_of(storage, segments).await?;
-    stream::iter(chunks.into_iter().map(|hash| {
-        let path = tier_path(dir, &hash);
-        async move {
-            let bytes = fetch_verified(storage, None, &tier_uri(&hash), &hash).await?;
-            async_fs::write(&path, &bytes).await?;
-            Ok::<(), TermIndexError>(())
-        }
-    }))
-    .buffer_unordered(SLICE_FETCH_CONCURRENCY)
-    .try_collect::<()>()
-    .await?;
     Ok(segments
         .iter()
         .map(|segment| {
@@ -573,14 +550,23 @@ pub(crate) fn spill_slices(
         .collect()
 }
 
-/// Write freshly built tier chunks into `dir`, beside spilled slices, so a
-/// merge finds them where [`download_segments`] would have put them.
+/// Write freshly built tier objects into `dir`, each beside the spilled
+/// slice of `slices` that names it, so a merge finds them where
+/// [`download_segments`] would have put them.
 pub(crate) fn spill_tiers(
     dir: &Path,
+    slices: &[format::SliceRef],
     tiers: Vec<(ContentHash, Vec<u8>)>,
 ) -> Result<(), TermIndexError> {
+    let slice_of: HashMap<ContentHash, ContentHash> = slices
+        .iter()
+        .filter_map(|s| Some((s.tier.as_ref()?.content_hash, s.content_hash)))
+        .collect();
     for (hash, bytes) in tiers {
-        fs::write(tier_path(dir, &hash), bytes)?;
+        let slice = slice_of
+            .get(&hash)
+            .ok_or_else(|| TermIndexError::Build("a built tier object no slice names".into()))?;
+        fs::write(tier_path(dir, slice), bytes)?;
     }
     Ok(())
 }
@@ -628,6 +614,14 @@ pub(crate) async fn load_root(
     Root::decode(&bytes)
 }
 
+/// A term's run from one slice, with the slice's tier object when the
+/// slice has one: what a run's chunk offsets are relative to.
+#[derive(Debug, Clone)]
+pub(crate) struct SliceRun {
+    pub(crate) tier_object: Option<ContentHash>,
+    pub(crate) run: Run,
+}
+
 /// The resident half of the index plus a cache of fetched slices.
 ///
 /// A slice is fetched whole on first use and kept; slices are immutable
@@ -647,6 +641,9 @@ pub(crate) struct TermIndex {
     disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
+    /// Fetched tier chunks by `(tier object, offset)`, under the same
+    /// budget as the slices.
+    tier_chunks: tokio::sync::Mutex<Resident<(ContentHash, u64), Bytes>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
     runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
@@ -725,6 +722,10 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
+            tier_chunks: tokio::sync::Mutex::new(Resident::new(
+                RESIDENT_SLICE_BUDGET_BYTES,
+                Bytes::len,
+            )),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
     }
@@ -1109,23 +1110,29 @@ impl TermIndex {
             .collect())
     }
 
-    /// A term's run in each segment that holds it, in segment order.
+    /// A term's run in each segment that holds it, in segment order, each
+    /// with the tier object of the slice it came from.
     pub(crate) async fn runs(
         &self,
         column: FieldId,
         term: &str,
-    ) -> Result<Vec<Run>, TermIndexError> {
+    ) -> Result<Vec<SliceRun>, TermIndexError> {
         let key = column.term_key(term);
-        let refs: Vec<ContentHash> = self
+        let refs: Vec<(ContentHash, Option<ContentHash>)> = self
             .root
             .slices_for_key(&key)
-            .map(|r| r.content_hash)
+            .map(|r| (r.content_hash, r.tier.as_ref().map(|t| t.content_hash)))
             .collect();
         let mut out = Vec::with_capacity(refs.len());
-        for hash in refs {
+        for (hash, tier_object) in refs {
             let bytes = self.slice_bytes(&hash).await?;
             if let Some(run) = Slice::open(&bytes)?.run(&key)? {
-                out.push(run);
+                if run.tier.is_some() && tier_object.is_none() {
+                    return Err(TermIndexError::Malformed(
+                        "a run has a tier but its slice names no tier object".into(),
+                    ));
+                }
+                out.push(SliceRun { tier_object, run });
             }
         }
         Ok(out)
@@ -1133,15 +1140,17 @@ impl TermIndex {
 
     /// Every entry of a tier, chunk by chunk, in tier order (descending
     /// impact by block). A query reads a prefix instead; this is the whole
-    /// thing, for tests and tools.
+    /// thing, for tests.
+    #[cfg(test)]
     pub(crate) async fn tier_entries(
         &self,
+        object: &ContentHash,
         tier: &TierRef,
     ) -> Result<Vec<TierEntry>, TermIndexError> {
         let mut out = Vec::new();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
-            let bytes = self.tier_bytes(&chunk.content_hash).await?;
+            let bytes = self.tier_chunk(object, chunk).await?;
             let chunk = TierChunk::open(&bytes)?;
             for i in 0..chunk.n_blocks() {
                 chunk.decode_block(i, &mut block)?;
@@ -1151,19 +1160,27 @@ impl TermIndex {
         Ok(out)
     }
 
-    /// A tier chunk's bytes, resident after the first fetch like a slice.
-    pub(crate) async fn tier_bytes(&self, hash: &ContentHash) -> Result<Bytes, TermIndexError> {
-        if let Some(b) = self.slices.lock().await.get(hash) {
+    /// One tier chunk's bytes: a ranged read of its slice's tier object,
+    /// verified by the chunk's own CRC, resident afterwards like a slice.
+    pub(crate) async fn tier_chunk(
+        &self,
+        object: &ContentHash,
+        chunk: &TierChunkRef,
+    ) -> Result<Bytes, TermIndexError> {
+        let key = (*object, chunk.offset);
+        if let Some(b) = self.tier_chunks.lock().await.get(&key) {
             return Ok(b);
         }
-        let bytes = fetch_verified(
-            self.storage.as_ref(),
-            self.disk_cache.as_deref(),
-            &tier_uri(hash),
-            hash,
-        )
-        .await?;
-        self.slices.lock().await.insert(*hash, bytes.clone());
+        let end = chunk
+            .offset
+            .checked_add(chunk.len)
+            .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+        let bytes = self
+            .storage
+            .get_range(&tier_uri(object), chunk.offset..end)
+            .await?;
+        TierChunk::verify(&bytes)?;
+        self.tier_chunks.lock().await.insert(key, bytes.clone());
         Ok(bytes)
     }
 
@@ -1310,16 +1327,28 @@ mod tests {
         w.finish().expect("finish")
     }
 
+    /// The entries of `tier`, read from the first slice's tier object among
+    /// `built_tiers`: these fixtures build one slice.
     fn tier_entries_of(
+        segment: &Segment,
         built_tiers: &[(ContentHash, Vec<u8>)],
         tier: &format::TierRef,
     ) -> Vec<tier::TierEntry> {
-        let by_hash: HashMap<ContentHash, &Vec<u8>> =
-            built_tiers.iter().map(|(h, b)| (*h, b)).collect();
+        let object = segment.slices[0]
+            .tier
+            .as_ref()
+            .expect("the slice has a tier object");
+        let bytes = &built_tiers
+            .iter()
+            .find(|(h, _)| *h == object.content_hash)
+            .expect("the tier object is among the built")
+            .1;
         let mut out = Vec::new();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
-            let chunk = tier::TierChunk::open(by_hash[&chunk.content_hash]).expect("open chunk");
+            let range = chunk.offset as usize..(chunk.offset + chunk.len) as usize;
+            tier::TierChunk::verify(&bytes[range.clone()]).expect("crc");
+            let chunk = tier::TierChunk::open(&bytes[range]).expect("open chunk");
             for i in 0..chunk.n_blocks() {
                 chunk.decode_block(i, &mut block).expect("decode");
                 out.extend_from_slice(&block);
@@ -1358,7 +1387,7 @@ mod tests {
         let tier = alpha.tier.expect("alpha has a tier");
         assert_eq!(tier.n_entries, 4, "truncated to the budget");
         assert!(!tier.complete, "a truncated tier is not complete");
-        let entries = tier_entries_of(&built.tiers, &tier);
+        let entries = tier_entries_of(&built.root.segments[0], &built.tiers, &tier);
         let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
         ids.sort_unstable();
         // The four best impacts table-wide: superfile 2's three docs and
@@ -1383,21 +1412,17 @@ mod tests {
             .expect("beta is indexed");
         let beta_tier = beta.tier.expect("beta has a tier");
         assert!(beta_tier.complete, "one doc under the budget is complete");
-        assert_eq!(tier_entries_of(&built.tiers, &beta_tier).len(), 1);
-        // The segment's tier list names every chunk.
-        let list = built.root.segments[0].tier_list.expect("tier list");
-        let list_bytes = &built
-            .tiers
-            .iter()
-            .find(|(h, _)| *h == list.content_hash)
-            .expect("list bytes")
-            .1;
-        let named = decode_tier_list(list_bytes).expect("list");
         assert_eq!(
-            named.len(),
-            built.tiers.len() - 1,
-            "every chunk but the list itself"
+            tier_entries_of(&built.root.segments[0], &built.tiers, &beta_tier).len(),
+            1
         );
+        // One tier object per slice, named by the slice and sized exactly.
+        let segment = &built.root.segments[0];
+        assert_eq!(segment.slices.len(), 1);
+        let object = segment.slices[0].tier.as_ref().expect("tier object");
+        assert_eq!(built.tiers.len(), 1, "one tier object for the one slice");
+        assert_eq!(built.tiers[0].0, object.content_hash);
+        assert_eq!(built.tiers[0].1.len() as u64, object.len);
     }
 
     #[test]
@@ -1428,20 +1453,29 @@ mod tests {
         };
         let base = build(&[make(1, 60), make(2, 60)], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[make(3, 90)], &policy).expect("delta");
-        spill_tiers(dir.path(), base.tiers.clone()).expect("spill base tiers");
-        spill_tiers(dir.path(), delta.tiers.clone()).expect("spill delta tiers");
+        spill_tiers(
+            dir.path(),
+            &base.root.segments[0].slices,
+            base.tiers.clone(),
+        )
+        .expect("spill base tiers");
+        spill_tiers(
+            dir.path(),
+            &delta.root.segments[1].slices,
+            delta.tiers.clone(),
+        )
+        .expect("spill delta tiers");
         let sources = vec![
             spill_slices(dir.path(), base.slices).expect("spill base"),
             spill_slices(dir.path(), delta.slices).expect("spill delta"),
         ];
         // Drop the middle superfile; the merge renumbers the survivors.
-        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
-            .expect("merge");
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let expected = build(&[make(1, 60), make(3, 90)], &policy).expect("survivors");
         assert_eq!(merged.slices, expected.slices, "slices are byte-identical");
         assert_eq!(
             merged.tiers, expected.tiers,
-            "tier chunks and the tier list are byte-identical"
+            "the tier objects are byte-identical"
         );
         assert_eq!(merged.segment, expected.root.segments[0]);
     }
@@ -1471,14 +1505,23 @@ mod tests {
         };
         let base = build(&[make(1), make(2)], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[make(3)], &policy).expect("delta");
-        spill_tiers(dir.path(), base.tiers.clone()).expect("spill base tiers");
-        spill_tiers(dir.path(), delta.tiers.clone()).expect("spill delta tiers");
+        spill_tiers(
+            dir.path(),
+            &base.root.segments[0].slices,
+            base.tiers.clone(),
+        )
+        .expect("spill base tiers");
+        spill_tiers(
+            dir.path(),
+            &delta.root.segments[1].slices,
+            delta.tiers.clone(),
+        )
+        .expect("spill delta tiers");
         let sources = vec![
             spill_slices(dir.path(), base.slices).expect("spill base"),
             spill_slices(dir.path(), delta.slices).expect("spill delta"),
         ];
-        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
-            .expect("merge");
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let slice = Slice::open(&merged.slices[0].1).expect("open");
         let run = slice
             .run(&fid("body").term_key("alpha"))
@@ -1487,7 +1530,7 @@ mod tests {
         let tier = run.tier.expect("tier");
         assert_eq!(tier.n_entries, 40);
         assert!(!tier.complete);
-        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.tiers, &tier)
+        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.segment, &merged.tiers, &tier)
             .iter()
             .map(|e| (e.superfile, e.doc_id))
             .collect();
@@ -1691,8 +1734,7 @@ mod tests {
             spill_slices(dir.path(), base.slices).expect("spill base"),
             spill_slices(dir.path(), delta.slices).expect("spill delta"),
         ];
-        let merged = merge_segments(&sources, dir.path(), &[Some(0), None, Some(1)], &policy)
-            .expect("merge");
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let (segment, slices) = (merged.segment, merged.slices);
 
         let first = make(1, terms(0..60, 1));
@@ -2595,12 +2637,12 @@ mod tests {
     /// A one-slice segment, told apart by `tag`.
     fn tagged_segment(tag: u8) -> Segment {
         Segment {
-            tier_list: None,
             slices: vec![SliceRef {
                 first_key: vec![tag],
                 last_key: vec![tag],
                 content_hash: ContentHash::of(&[tag]),
                 len: 1,
+                tier: None,
             }],
         }
     }
@@ -3492,7 +3534,7 @@ mod tests {
     }
 
     /// What the current root names: every slice, tier list and tier chunk.
-    async fn objects_named_by(root: &Root, storage: &Arc<dyn StorageProvider>) -> HashSet<String> {
+    fn objects_named_by(root: &Root) -> HashSet<String> {
         let mut named: HashSet<String> = root
             .segments
             .iter()
@@ -3502,13 +3544,10 @@ mod tests {
         named.extend(
             root.segments
                 .iter()
-                .filter_map(|s| s.tier_list.as_ref())
-                .map(|l| format!("tier-{}.bin", l.content_hash.to_hex())),
+                .flat_map(|s| s.slices.iter())
+                .filter_map(|s| s.tier.as_ref())
+                .map(|t| format!("tier-{}.bin", t.content_hash.to_hex())),
         );
-        let chunks = tier_chunks_of(storage.as_ref(), &root.segments)
-            .await
-            .expect("tier lists load");
-        named.extend(chunks.iter().map(|h| format!("tier-{}.bin", h.to_hex())));
         named
     }
 
@@ -3534,20 +3573,28 @@ mod tests {
             .expect("root");
         assert_eq!(root.segments.len(), 2, "two deltas");
         assert!(
-            root.segments.iter().all(|s| s.tier_list.is_some()),
-            "each delta has a tier list"
+            root.segments
+                .iter()
+                .all(|s| s.slices.iter().any(|slice| slice.tier.is_some())),
+            "each delta has a tier object"
         );
         let after_commits = tier_objects(&dir);
-        let named = rt.block_on(objects_named_by(&root, &storage));
+        let named = objects_named_by(&root);
+        let with_tier = root
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter())
+            .filter(|s| s.tier.is_some())
+            .count();
         assert!(
-            after_commits.iter().all(|o| named.contains(o)) && after_commits.len() >= 4,
-            "every tier object on disk is named: {after_commits:?}"
+            after_commits.iter().all(|o| named.contains(o)) && after_commits.len() == with_tier,
+            "every tier object on disk is a slice's and named: {after_commits:?}"
         );
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
         assert_eq!(runs.len(), 2, "one run per delta");
         let mut held = 0;
-        for run in &runs {
+        for SliceRun { run, .. } in &runs {
             let tier = run.tier.as_ref().expect("a term in every title has a tier");
             assert!(tier.complete, "every document fits the default budget");
             held += tier.n_entries;
@@ -3567,17 +3614,29 @@ mod tests {
             .block_on(load_root(storage.as_ref(), &current_ref()))
             .expect("root");
         assert_eq!(rebuilt.segments.len(), 1, "the rebuild folds the deltas");
-        assert!(rebuilt.segments[0].tier_list.is_some());
+        assert!(
+            rebuilt.segments[0]
+                .slices
+                .iter()
+                .any(|slice| slice.tier.is_some())
+        );
         let index = TermIndex::new(rebuilt.clone(), String::new(), Arc::clone(&storage), None);
         let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
         assert_eq!(runs.len(), 1, "one run in the rebuilt base");
-        let tier = runs[0].tier.as_ref().expect("the merged run has a tier");
+        let object = runs[0].tier_object.expect("the slice has a tier object");
+        let tier = runs[0]
+            .run
+            .tier
+            .as_ref()
+            .expect("the merged run has a tier");
         assert_eq!(
             tier.n_entries,
             2 * DOCS_PER_SEGMENT as u64,
             "the base tier covers every document"
         );
-        let entries = rt.block_on(index.tier_entries(tier)).expect("tier entries");
+        let entries = rt
+            .block_on(index.tier_entries(&object, tier))
+            .expect("tier entries");
         assert!(
             entries
                 .iter()
@@ -3588,7 +3647,7 @@ mod tests {
         st.gc(Duration::ZERO).expect("gc");
         let kept = tier_objects(&dir);
         let named: HashSet<String> = rt
-            .block_on(objects_named_by(&rebuilt, &storage))
+            .block_on(async { objects_named_by(&rebuilt) })
             .into_iter()
             .filter(|o| o.starts_with("tier-"))
             .collect();

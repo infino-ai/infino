@@ -7,12 +7,15 @@
 //!
 //! A tier is a sequence of entries `(superfile ordinal, local doc id,
 //! impact)` in descending impact, cut into blocks of [`BLOCK_ENTRIES`]
-//! and the blocks into content-addressed *chunks* of at most
-//! [`CHUNK_TARGET_BYTES`], read in order and usually only in part: a
-//! query stops once the blocks it has read bound everything it has not.
+//! and the blocks into *chunks* of at most [`CHUNK_TARGET_BYTES`], read
+//! in order and usually only in part: a query stops once the blocks it
+//! has read bound everything it has not. The chunks of every term in a
+//! slice sit back to back in that slice's tier object, so a run names its
+//! chunks by offset and a query reads one with a ranged fetch; the CRC in
+//! the chunk header is what verifies a chunk read on its own.
 //!
 //! ```text
-//! chunk: magic "INFTTIR1" | version u32 | n_blocks u32
+//! chunk: magic "INFTTIR1" | version u32 | n_blocks u32 | crc32c u32
 //!        | per block: max_impact f32 | min_impact f32 | n_entries u32 | byte_len u32
 //!        | block bodies back to back
 //! block: ordinal_bits u8 | lid_bits u8 | impact_bits u8 | max_impact_bits u32
@@ -35,8 +38,11 @@ use bitpacking::{BitPacker, BitPacker4x};
 
 use super::TermIndexError;
 use crate::{
-    supertable::manifest::part::ContentHash,
-    utils::bytes::{u32_le_at, u64_le_at},
+    superfile::format::checksum::crc32c,
+    utils::{
+        bytes::u32_le_at,
+        varint::{push_u64_varint, push_varint, read_u64_varint, read_varint},
+    },
 };
 
 /// Identifies a tier chunk and its layout family.
@@ -51,7 +57,9 @@ pub(crate) const BLOCK_ENTRIES: usize = 4096;
 pub(crate) const CHUNK_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const LANE: usize = BitPacker4x::BLOCK_LEN;
 const MAGIC_LEN: usize = 8;
-const CHUNK_HEADER_LEN: usize = MAGIC_LEN + 4 + 4;
+const CHUNK_HEADER_LEN: usize = MAGIC_LEN + 4 + 4 + 4;
+/// Where the chunk's CRC sits in its header: over everything after it.
+const CRC_AT: usize = MAGIC_LEN + 4 + 4;
 const DIRECTORY_ENTRY_LEN: usize = 4 + 4 + 4 + 4;
 const BLOCK_HEADER_LEN: usize = 3 + 4;
 
@@ -67,13 +75,20 @@ pub(crate) struct TierEntry {
     pub(crate) impact: f32,
 }
 
-/// Where one chunk of a term's tier lives and how much of the tier it
-/// holds, so a prefix read fetches only the chunks it needs.
+/// Where one chunk of a term's tier sits in its slice's tier object and
+/// how much of the tier it holds, so a prefix read fetches only the chunks
+/// it needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TierChunkRef {
-    pub(crate) content_hash: ContentHash,
+    pub(crate) offset: u64,
     pub(crate) len: u64,
     pub(crate) n_entries: u64,
+}
+
+/// One encoded chunk before it is placed in a tier object.
+pub(crate) struct EncodedChunk {
+    pub(crate) n_entries: u64,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// A chunk's bytes with its block directory parsed.
@@ -96,8 +111,8 @@ fn malformed(what: &str) -> TermIndexError {
 }
 
 /// Cut `entries` — in descending impact — into blocks and chunks. Returns
-/// each chunk's bytes with its hash and entry count, in tier order.
-pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<(TierChunkRef, Vec<u8>)> {
+/// each chunk's bytes with its entry count, in tier order.
+pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<EncodedChunk> {
     debug_assert!(
         entries.windows(2).all(|w| w[0].impact >= w[1].impact),
         "tier entries must be in descending impact"
@@ -106,8 +121,7 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<(TierChunkRef, Vec<u8>)>
     let mut blocks: Vec<(BlockDir, Vec<u8>)> = Vec::new();
     let mut chunk_bytes = 0usize;
     let mut scratch = vec![0u8; LANE * 4];
-    let flush = |blocks: &mut Vec<(BlockDir, Vec<u8>)>,
-                 chunks: &mut Vec<(TierChunkRef, Vec<u8>)>| {
+    let flush = |blocks: &mut Vec<(BlockDir, Vec<u8>)>, chunks: &mut Vec<EncodedChunk>| {
         if blocks.is_empty() {
             return;
         }
@@ -120,6 +134,7 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<(TierChunkRef, Vec<u8>)>
         out.extend_from_slice(TIER_MAGIC);
         out.extend_from_slice(&TIER_FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
         for (d, body) in blocks.iter() {
             out.extend_from_slice(&d.max_impact.to_le_bytes());
             out.extend_from_slice(&d.min_impact.to_le_bytes());
@@ -129,15 +144,12 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<(TierChunkRef, Vec<u8>)>
         for (_, body) in blocks.drain(..) {
             out.extend_from_slice(&body);
         }
-        let content_hash = ContentHash::of(&out);
-        chunks.push((
-            TierChunkRef {
-                content_hash,
-                len: out.len() as u64,
-                n_entries,
-            },
-            out,
-        ));
+        let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
+        out[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+        chunks.push(EncodedChunk {
+            n_entries,
+            bytes: out,
+        });
     };
     for block in entries.chunks(BLOCK_ENTRIES) {
         let (dir, body) = encode_block(block, &mut scratch);
@@ -235,6 +247,19 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
 }
 
 impl<'a> TierChunk<'a> {
+    /// Check a chunk's CRC: what a chunk fetched by range, without its
+    /// object's hash, is verified by. Once per fetch, not per open.
+    pub(crate) fn verify(bytes: &[u8]) -> Result<(), TermIndexError> {
+        if bytes.len() < CHUNK_HEADER_LEN {
+            return Err(malformed("short header"));
+        }
+        let stored = u32_le_at(bytes, CRC_AT).ok_or_else(|| malformed("crc"))?;
+        if stored != crc32c(&bytes[CHUNK_HEADER_LEN..]) {
+            return Err(TermIndexError::HashMismatch);
+        }
+        Ok(())
+    }
+
     /// Parse a chunk's directory, refusing an unknown magic or version.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         if bytes.len() < CHUNK_HEADER_LEN {
@@ -303,10 +328,12 @@ impl<'a> TierChunk<'a> {
     }
 
     /// Exact smallest impact in block `i`; bounds every entry after it.
+    #[cfg(test)]
     pub(crate) fn block_min(&self, i: usize) -> f32 {
         self.directory[i].min_impact
     }
 
+    #[cfg(test)]
     pub(crate) fn block_entries(&self, i: usize) -> usize {
         self.directory[i].n_entries as usize
     }
@@ -365,11 +392,11 @@ impl<'a> TierChunk<'a> {
 
 /// Serialize a chunk list into a run header.
 pub(crate) fn push_chunk_refs(out: &mut Vec<u8>, chunks: &[TierChunkRef]) {
-    crate::utils::varint::push_varint(out, chunks.len() as u32);
+    push_varint(out, chunks.len() as u32);
     for c in chunks {
-        out.extend_from_slice(&c.content_hash.0);
-        out.extend_from_slice(&c.len.to_le_bytes());
-        out.extend_from_slice(&c.n_entries.to_le_bytes());
+        push_u64_varint(out, c.offset);
+        push_u64_varint(out, c.len);
+        push_u64_varint(out, c.n_entries);
     }
 }
 
@@ -378,20 +405,14 @@ pub(crate) fn read_chunk_refs(
     bytes: &[u8],
     at: &mut usize,
 ) -> Result<Vec<TierChunkRef>, TermIndexError> {
-    let n = crate::utils::varint::read_varint(bytes, at).ok_or_else(|| malformed("chunk count"))?
-        as usize;
+    let n = read_varint(bytes, at).ok_or_else(|| malformed("chunk count"))? as usize;
     let mut out = Vec::with_capacity(n.min(1024));
     for _ in 0..n {
-        let hash = bytes
-            .get(*at..*at + 32)
-            .ok_or_else(|| malformed("chunk hash"))?;
-        *at += 32;
-        let len = u64_le_at(bytes, *at).ok_or_else(|| malformed("chunk len"))?;
-        *at += 8;
-        let n_entries = u64_le_at(bytes, *at).ok_or_else(|| malformed("chunk entries"))?;
-        *at += 8;
+        let offset = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk offset"))?;
+        let len = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk len"))?;
+        let n_entries = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk entries"))?;
         out.push(TierChunkRef {
-            content_hash: ContentHash(hash.try_into().expect("32 bytes")),
+            offset,
             len,
             n_entries,
         });
@@ -433,11 +454,12 @@ mod tests {
         out
     }
 
-    fn decode_all(chunks: &[(TierChunkRef, Vec<u8>)]) -> Vec<TierEntry> {
+    fn decode_all(chunks: &[EncodedChunk]) -> Vec<TierEntry> {
         let mut all = Vec::new();
         let mut buf = Vec::new();
-        for (_, bytes) in chunks {
-            let chunk = TierChunk::open(bytes).expect("open");
+        for c in chunks {
+            TierChunk::verify(&c.bytes).expect("crc");
+            let chunk = TierChunk::open(&c.bytes).expect("open");
             for i in 0..chunk.n_blocks() {
                 chunk.decode_block(i, &mut buf).expect("decode");
                 all.extend_from_slice(&buf);
@@ -471,8 +493,8 @@ mod tests {
         let chunks = encode_tier(&entries);
         let mut prev_min = f32::INFINITY;
         let mut at = 0usize;
-        for (_, bytes) in &chunks {
-            let chunk = TierChunk::open(bytes).expect("open");
+        for c in &chunks {
+            let chunk = TierChunk::open(&c.bytes).expect("open");
             for i in 0..chunk.n_blocks() {
                 let n = chunk.block_entries(i);
                 let block = &entries[at..at + n];
@@ -511,18 +533,16 @@ mod tests {
         let entries = sample(1_500_000, 1_080, 1_000_000, 3);
         let chunks = encode_tier(&entries);
         assert!(chunks.len() > 1, "1.5M entries exceed one 4 MiB chunk");
-        let total: u64 = chunks.iter().map(|(r, _)| r.n_entries).sum();
+        let total: u64 = chunks.iter().map(|c| c.n_entries).sum();
         assert_eq!(total, entries.len() as u64);
-        for (r, bytes) in &chunks {
-            assert_eq!(r.len as usize, bytes.len());
-            assert_eq!(r.content_hash, ContentHash::of(bytes));
+        for c in &chunks {
             assert!(
-                bytes.len() <= CHUNK_TARGET_BYTES + 64 * 1024,
+                c.bytes.len() <= CHUNK_TARGET_BYTES + 64 * 1024,
                 "chunk {} over target",
-                bytes.len()
+                c.bytes.len()
             );
         }
-        let bytes: usize = chunks.iter().map(|(_, b)| b.len()).sum();
+        let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
         let per_entry = bytes as f64 / entries.len() as f64;
         assert!(
             per_entry <= 5.8,
@@ -535,7 +555,7 @@ mod tests {
     fn chunk_refs_round_trip_in_a_run_header() {
         let refs: Vec<TierChunkRef> = (0..3)
             .map(|i| TierChunkRef {
-                content_hash: ContentHash::of(&[i as u8; 4]),
+                offset: i * 1_000,
                 len: 1_000 + i,
                 n_entries: 40_000 * (i + 1),
             })
@@ -551,7 +571,18 @@ mod tests {
     #[test]
     fn rejects_bad_magic_version_and_truncation() {
         let chunks = encode_tier(&sample(5_000, 10, 1_000, 5));
-        let bytes = &chunks[0].1;
+        let bytes = &chunks[0].bytes;
+        let mut flipped = bytes.clone();
+        let last = flipped.len() - 1;
+        flipped[last] ^= 1;
+        assert!(
+            matches!(
+                TierChunk::verify(&flipped),
+                Err(TermIndexError::HashMismatch)
+            ),
+            "a flipped body byte fails the crc"
+        );
+        TierChunk::verify(bytes).expect("intact bytes pass");
         let mut bad = bytes.clone();
         bad[0] = b'X';
         assert!(matches!(

@@ -36,9 +36,9 @@ use super::{
     TermIndexError,
     format::{
         Location, ObjectRef, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
-        encode_run_with_tier, encode_slice, encode_tier_list, push_posting, read_posting,
+        encode_run_with_tier, encode_slice, push_posting, read_posting,
     },
-    tier::{TierChunk, TierEntry, encode_tier},
+    tier::{EncodedChunk, TierChunk, TierChunkRef, TierEntry, encode_tier},
 };
 use crate::{
     supertable::manifest::part::ContentHash,
@@ -63,9 +63,11 @@ pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 /// `k` on a smaller table while keeping a small table from copying most of
 /// its postings into tiers.
 pub(crate) const TIER_SHARE_OF_DOCS: f64 = 1e-3;
-/// Smallest tier budget the share resolves to: below this a tier is not
-/// worth its chunk, and a small table's tiers are its complete lists.
-pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 16;
+/// Smallest tier budget the share resolves to. A small table has few
+/// superfiles, so its opens are cheap whatever the budget, while a large
+/// floor would copy most of its postings into tiers: nearly every term of
+/// a ten-million-document table falls under a budget of sixty thousand.
+pub(crate) const TIER_ENTRIES_MIN: u64 = 1 << 13;
 /// Largest tier budget the share resolves to: past this the per-term read
 /// outgrows what a query at any supported `k` consumes.
 pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
@@ -75,11 +77,24 @@ pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
 pub(crate) fn tier_entries_for(n_docs: u64) -> u64 {
     ((n_docs as f64 * TIER_SHARE_OF_DOCS) as u64).clamp(TIER_ENTRIES_MIN, TIER_ENTRIES_MAX)
 }
-/// Documents a superfile contributes per term to its head. Four times the
-/// even share of the table-wide budget at a thousand superfiles, so a
-/// superfile richer than average in a term still contributes; the rebuild
-/// truncates table-wide.
-pub(crate) const HEAD_DEPTH_PER_SUPERFILE: usize = 4096;
+/// Most documents a superfile contributes per term to its head, and the
+/// default when the table's shape is not known. The depth a table wants is
+/// a few times the budget's even share per superfile (see
+/// [`head_depth_for`]), so a superfile richer than average in a term still
+/// contributes; the rebuild truncates table-wide.
+pub(crate) const HEAD_DEPTH_MAX: usize = 4096;
+/// Fewest documents a superfile contributes per term: enough that a term's
+/// best documents in one superfile are always on hand.
+pub(crate) const HEAD_DEPTH_MIN: usize = 64;
+/// How many times the budget's even share a superfile's head holds.
+const HEAD_DEPTH_OVER_SHARE: u64 = 4;
+
+/// The per-superfile head depth for a table of `n_superfiles` with a tier
+/// budget of `tier_entries` per term.
+pub(crate) fn head_depth_for(tier_entries: u64, n_superfiles: u64) -> usize {
+    let share = tier_entries.saturating_mul(HEAD_DEPTH_OVER_SHARE) / n_superfiles.max(1);
+    (share as usize).clamp(HEAD_DEPTH_MIN, HEAD_DEPTH_MAX)
+}
 
 /// Knobs the build takes from its caller.
 #[derive(Debug, Clone, Copy)]
@@ -89,7 +104,7 @@ pub(crate) struct BuildPolicy {
     /// Entries a term's tier keeps table-wide; `0` keeps no tiers. See
     /// [`tier_entries_for`].
     pub(crate) tier_entries_per_term: u64,
-    /// See [`HEAD_DEPTH_PER_SUPERFILE`].
+    /// See [`head_depth_for`].
     pub(crate) head_depth_per_superfile: usize,
 }
 
@@ -98,7 +113,7 @@ impl Default for BuildPolicy {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
             tier_entries_per_term: TIER_ENTRIES_MAX,
-            head_depth_per_superfile: HEAD_DEPTH_PER_SUPERFILE,
+            head_depth_per_superfile: HEAD_DEPTH_MAX,
         }
     }
 }
@@ -431,7 +446,8 @@ impl SliceBuilder {
         self.postings.len() + self.dict.encoded_len()
     }
 
-    fn finish(self) -> Option<(SliceRef, Vec<u8>)> {
+    /// The slice and its tier object, when its terms wrote any tier chunks.
+    fn finish(self, tier: Option<ObjectRef>) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
         let dict = self.dict.finish().expect("Vec sink cannot fail");
         let bytes = encode_slice(&dict, &self.postings);
@@ -442,6 +458,7 @@ impl SliceBuilder {
                 last_key: self.last_key,
                 content_hash,
                 len: bytes.len() as u64,
+                tier,
             },
             bytes,
         ))
@@ -453,9 +470,11 @@ impl SliceBuilder {
 /// bytes.
 struct SegmentWriter {
     current: SliceBuilder,
+    /// The open slice's tier object so far: its terms' chunks back to back.
+    current_tier: Vec<u8>,
     slices: Vec<SliceRef>,
     slice_bytes: Vec<(ContentHash, Vec<u8>)>,
-    /// Tier chunks of every term written so far, in key order.
+    /// The tier objects of the slices cut so far, keyed by content hash.
     tier_bytes: Vec<(ContentHash, Vec<u8>)>,
     target_bytes: usize,
     tier_entries_per_term: u64,
@@ -465,6 +484,7 @@ impl SegmentWriter {
     fn new(policy: &BuildPolicy) -> Self {
         Self {
             current: SliceBuilder::new(),
+            current_tier: Vec::new(),
             slices: Vec::new(),
             slice_bytes: Vec::new(),
             tier_bytes: Vec::new(),
@@ -476,11 +496,47 @@ impl SegmentWriter {
     /// Append one term, first cutting the slice when the run would push it
     /// past the target.
     fn add(&mut self, key: &[u8], run: &[u8]) {
-        if self.current.n_terms > 0 && self.current.encoded_bytes() + run.len() > self.target_bytes
-        {
+        if self.cuts_before(run.len()) {
             self.cut();
         }
         self.current.add(key, run);
+    }
+
+    /// Whether a run of `run_len` bytes starts a new slice.
+    fn cuts_before(&self, run_len: usize) -> bool {
+        self.current.n_terms > 0 && self.current.encoded_bytes() + run_len > self.target_bytes
+    }
+
+    /// Place `chunks` at the end of the open slice's tier object and name
+    /// them from there.
+    fn place_chunks(&mut self, chunks: &[EncodedChunk]) -> Vec<TierChunkRef> {
+        let mut refs = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            refs.push(TierChunkRef {
+                offset: self.current_tier.len() as u64,
+                len: c.bytes.len() as u64,
+                n_entries: c.n_entries,
+            });
+            self.current_tier.extend_from_slice(&c.bytes);
+        }
+        refs
+    }
+
+    /// The chunk list `chunks` would get in the open slice's tier object.
+    fn refs_at(&self, chunks: &[EncodedChunk]) -> Vec<TierChunkRef> {
+        let mut at = self.current_tier.len() as u64;
+        chunks
+            .iter()
+            .map(|c| {
+                let r = TierChunkRef {
+                    offset: at,
+                    len: c.bytes.len() as u64,
+                    n_entries: c.n_entries,
+                };
+                at += r.len;
+                r
+            })
+            .collect()
     }
 
     /// Append one term with its postings and the tier entries gathered for
@@ -519,27 +575,44 @@ impl SegmentWriter {
             entries.truncate(budget);
         }
         let chunks = encode_tier(&entries);
-        let tier = TierRef {
+        let mut tier = TierRef {
             complete: complete && !truncated,
             n_entries: entries.len() as u64,
-            chunks: chunks.iter().map(|(r, _)| r.clone()).collect(),
+            chunks: self.refs_at(&chunks),
         };
-        self.tier_bytes
-            .extend(chunks.into_iter().map(|(r, bytes)| (r.content_hash, bytes)));
-        self.add(key, &encode_run_with_tier(Some(&tier), postings));
+        // The chunks go in the tier object of the slice the term lands in:
+        // a cut moves the term to a fresh slice, whose object starts empty.
+        let mut run = encode_run_with_tier(Some(&tier), postings);
+        if self.cuts_before(run.len()) {
+            self.cut();
+            tier.chunks = self.refs_at(&chunks);
+            run = encode_run_with_tier(Some(&tier), postings);
+        }
+        let placed = self.place_chunks(&chunks);
+        debug_assert_eq!(placed, tier.chunks);
+        self.current.add(key, &run);
     }
 
     fn cut(&mut self) {
+        let tier = (!self.current_tier.is_empty()).then(|| {
+            let bytes = mem::take(&mut self.current_tier);
+            let reference = ObjectRef {
+                content_hash: ContentHash::of(&bytes),
+                len: bytes.len() as u64,
+            };
+            self.tier_bytes.push((reference.content_hash, bytes));
+            reference
+        });
         if let Some((reference, bytes)) =
-            mem::replace(&mut self.current, SliceBuilder::new()).finish()
+            mem::replace(&mut self.current, SliceBuilder::new()).finish(tier)
         {
             self.slice_bytes.push((reference.content_hash, bytes));
             self.slices.push(reference);
         }
     }
 
-    /// The segment, its slices and its tier chunks. The segment's tier
-    /// list names every chunk; it is written beside the slices.
+    /// The segment, its slices and their tier objects, each written beside
+    /// the slice that names it.
     fn finish(
         mut self,
     ) -> (
@@ -548,20 +621,9 @@ impl SegmentWriter {
         Vec<(ContentHash, Vec<u8>)>,
     ) {
         self.cut();
-        let tier_list = (!self.tier_bytes.is_empty()).then(|| {
-            let hashes: Vec<ContentHash> = self.tier_bytes.iter().map(|(h, _)| *h).collect();
-            let bytes = encode_tier_list(&hashes);
-            let reference = ObjectRef {
-                content_hash: ContentHash::of(&bytes),
-                len: bytes.len() as u64,
-            };
-            self.tier_bytes.push((reference.content_hash, bytes));
-            reference
-        });
         (
             Segment {
                 slices: self.slices,
-                tier_list,
             },
             self.slice_bytes,
             self.tier_bytes,
@@ -575,7 +637,7 @@ pub(crate) struct Built {
     pub(crate) root: Root,
     /// Slice bytes keyed by content hash, in key order.
     pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
-    /// Tier chunks and the segment's tier list, keyed by content hash.
+    /// The slices' tier objects, keyed by content hash.
     pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
 }
 
@@ -744,6 +806,11 @@ struct SegmentCursor {
     files: VecDeque<PathBuf>,
     /// The open slice's bytes; empty before the first file.
     bytes: Vec<u8>,
+    /// The open slice's tier object, read on the first tier the slice
+    /// yields; `None` until then and after every slice change.
+    tier: Option<Vec<u8>>,
+    /// Where the open slice's tier object sits (see [`tier_path`]).
+    tier_file: Option<PathBuf>,
     /// Decoded terms not handed out yet.
     batch: VecDeque<(Vec<u8>, Run)>,
     /// The last key decoded from the open slice, where the next batch
@@ -756,6 +823,8 @@ impl SegmentCursor {
         Self {
             files: files.iter().cloned().collect(),
             bytes: Vec::new(),
+            tier: None,
+            tier_file: None,
             batch: VecDeque::new(),
             last_key: None,
         }
@@ -779,32 +848,59 @@ impl SegmentCursor {
             let Some(path) = self.files.pop_front() else {
                 return Ok(None);
             };
-            self.bytes = fs::read(path)?;
+            self.bytes = fs::read(&path)?;
+            self.tier = None;
+            self.tier_file = Some(path.with_extension(TIER_FILE_EXTENSION));
             self.last_key = None;
         }
     }
+
+    /// The open slice's tier object, read on first use. A run with a tier
+    /// always comes from a slice that has one, so a missing file is an
+    /// error, not an empty tier.
+    fn tier_bytes(&mut self) -> Result<&[u8], TermIndexError> {
+        if self.tier.is_none() {
+            let path = self
+                .tier_file
+                .as_ref()
+                .ok_or_else(|| TermIndexError::Build("tier read before any slice".into()))?;
+            self.tier = Some(fs::read(path)?);
+        }
+        Ok(self.tier.as_deref().expect("read above"))
+    }
 }
 
-/// Where a tier chunk sits on local disk once downloaded or spilled.
-pub(crate) fn tier_path(dir: &Path, hash: &ContentHash) -> PathBuf {
-    dir.join(format!("{}.tier", hash.to_hex()))
+/// Extension of a slice's tier object on local disk, beside the slice file
+/// that shares its stem.
+const TIER_FILE_EXTENSION: &str = "tier";
+
+/// Where a slice's tier object sits on local disk once downloaded or
+/// spilled: beside the slice file, named by the slice's hash.
+pub(crate) fn tier_path(dir: &Path, slice_hash: &ContentHash) -> PathBuf {
+    dir.join(format!("{}.{TIER_FILE_EXTENSION}", slice_hash.to_hex()))
 }
 
-/// Every entry of a run's tier, read from the chunks under `tier_dir`,
-/// renumbered through `ordinals`; entries of superfiles that are gone are
-/// dropped. Impacts come back as the stored lower bounds, which is what a
-/// merged tier may carry: the directory bounds are recomputed from them,
-/// so they stay exact for the entries the merged blocks hold.
+/// Every entry of a run's tier, read from its chunks in `object` (the
+/// slice's tier object), renumbered through `ordinals`; entries of
+/// superfiles that are gone are dropped. Impacts come back as the stored
+/// lower bounds, which is what a merged tier may carry: the directory
+/// bounds are recomputed from them, so they stay exact for the entries the
+/// merged blocks hold.
 fn tier_entries(
     tier: &TierRef,
-    tier_dir: &Path,
+    object: &[u8],
     ordinals: &[Option<u32>],
     out: &mut Vec<TierEntry>,
 ) -> Result<(), TermIndexError> {
     let mut block = Vec::new();
     for chunk in &tier.chunks {
-        let bytes = fs::read(tier_path(tier_dir, &chunk.content_hash))?;
-        let chunk = TierChunk::open(&bytes)?;
+        let end = chunk
+            .offset
+            .checked_add(chunk.len)
+            .filter(|end| *end <= object.len() as u64)
+            .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
+        let bytes = &object[chunk.offset as usize..end as usize];
+        let chunk = TierChunk::open(bytes)?;
         for i in 0..chunk.n_blocks() {
             chunk.decode_block(i, &mut block)?;
             out.extend(block.iter().filter_map(|e| {
@@ -822,10 +918,10 @@ fn tier_entries(
 /// Merge segments into one, renumbering every posting through
 /// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
 /// result, and is dropped when that is `None` (a superfile that is gone, or
-/// padding). `sources` holds each segment's slice files in key order;
-/// `tier_dir` holds every tier chunk the segments reference (see
-/// [`tier_path`]). Tiers merge the same way: their entries are pooled,
-/// renumbered and re-cut at the policy's budget.
+/// padding). `sources` holds each segment's slice files in key order, each
+/// with its tier object beside it (see [`tier_path`]). Tiers merge the same
+/// way: their entries are pooled, renumbered and re-cut at the policy's
+/// budget.
 ///
 /// Runs come out in ascending new ordinal and are cut into slices exactly
 /// as [`build_segment`] cuts them, so a merge whose ordinals follow the
@@ -833,7 +929,6 @@ fn tier_entries(
 /// build.
 pub(crate) fn merge_segments(
     sources: &[Vec<PathBuf>],
-    tier_dir: &Path,
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
@@ -869,7 +964,8 @@ pub(crate) fn merge_segments(
             match &source_run.tier {
                 Some(tier) => {
                     complete &= tier.complete;
-                    tier_entries(tier, tier_dir, ordinals, &mut entries)?;
+                    let object = cursors[source as usize].tier_bytes()?;
+                    tier_entries(tier, object, ordinals, &mut entries)?;
                 }
                 // A run without a tier bounds its postings by their tails
                 // alone; the merged tier holds nothing for them and is not
@@ -922,8 +1018,45 @@ mod tests {
     #[test]
     fn the_default_budget_is_a_share_of_the_table_within_its_floors() {
         assert_eq!(tier_entries_for(0), TIER_ENTRIES_MIN);
-        assert_eq!(tier_entries_for(10_000_000), TIER_ENTRIES_MIN, "10M docs: the floor");
-        assert_eq!(tier_entries_for(1_000_000_000), 1_000_000, "1B docs: one in a thousand");
-        assert_eq!(tier_entries_for(100_000_000_000), TIER_ENTRIES_MAX, "100B docs: the cap");
+        assert_eq!(
+            tier_entries_for(1_000_000),
+            TIER_ENTRIES_MIN,
+            "1M docs: the floor"
+        );
+        assert_eq!(
+            tier_entries_for(10_000_000),
+            10_000,
+            "10M docs: one in a thousand"
+        );
+        assert_eq!(
+            tier_entries_for(1_000_000_000),
+            1_000_000,
+            "1B docs: one in a thousand"
+        );
+        assert_eq!(
+            tier_entries_for(100_000_000_000),
+            TIER_ENTRIES_MAX,
+            "100B docs: the cap"
+        );
+        assert_eq!(
+            head_depth_for(1_000_000, 1_080),
+            3_703,
+            "1B at 1 GiB superfiles"
+        );
+        assert_eq!(
+            head_depth_for(10_000, 22),
+            1_818,
+            "10M at 512 MiB superfiles"
+        );
+        assert_eq!(
+            head_depth_for(10_000, 1),
+            HEAD_DEPTH_MAX,
+            "one superfile: the cap"
+        );
+        assert_eq!(
+            head_depth_for(0, 1_000),
+            HEAD_DEPTH_MIN,
+            "no budget: the floor"
+        );
     }
 }
