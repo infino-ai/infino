@@ -590,7 +590,12 @@ impl Candidates {
         let Some(&slot) = slot_of.get(&id) else {
             return;
         };
-        let cand = self.acc.entry((e.superfile, e.doc_id)).or_insert((0, 0.0));
+        let mut fresh = false;
+        let cand = self.acc.entry((e.superfile, e.doc_id)).or_insert_with(|| {
+            fresh = true;
+            (0, 0.0)
+        });
+        let before = cand.0;
         cand.0 |= 1 << ti;
         cand.1 += scoring.contribution(ti, e);
         let (lb, ub) = (cand.1 * self.lb_slack, cand.1 * self.ub_slack);
@@ -604,8 +609,12 @@ impl Candidates {
         // A candidate carrying every required term is a document the query
         // returns, and its contributions so far are a lower bound on its
         // score: for a disjunction any candidate, for a conjunction one
-        // with every term, for a mix one with every must.
-        if self.exact && cand.0 & self.required == self.required {
+        // with every term, for a mix one with every must. It enters the
+        // threshold heap once, when it first qualifies — the heap counts
+        // documents, and a document that grew later would otherwise hold
+        // two of the `k` places and raise the threshold past the k-th.
+        let qualifies = |mask: u8| mask & self.required == self.required;
+        if self.exact && (fresh || !qualifies(before)) && qualifies(cand.0) {
             self.topk.push(Reverse(OrdF32(lb)));
             if self.topk.len() > self.k {
                 self.topk.pop();
