@@ -22,8 +22,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::HashMap,
-    collections::{BinaryHeap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
     fmt,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
@@ -42,7 +41,7 @@ use super::{
         Location, ObjectRef, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
         encode_run_with_tier, encode_slice, push_posting, read_posting,
     },
-    tier::{EncodedChunk, TierChunk, TierChunkRef, TierEntry, encode_tier},
+    tier::{ColumnScoring, EncodedChunk, TierChunk, TierChunkRef, TierEntry, encode_tier},
 };
 use crate::{
     superfile::{
@@ -153,7 +152,17 @@ pub(crate) struct BuildPolicy {
     /// cut rather than keep its bytes: a table-wide rebuild produces more
     /// index than a host holds in memory.
     pub(crate) spill_to_disk: bool,
+    /// For a merge: per superfile of the merged root, by ordinal, the
+    /// average length and parameters its tier keys are computed at — the
+    /// superfile's own, as the manifest records them. A build takes these
+    /// from its contributions instead. A superfile or column absent here
+    /// keys at [`ColumnScoring::default`].
+    pub(crate) scoring_by_ordinal: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>,
 }
+
+/// How a segment writer keys an entry: by the superfile ordinal and column
+/// it belongs to.
+type ScoringOf = Arc<dyn Fn(u32, FieldId) -> ColumnScoring + Send + Sync>;
 
 /// Bytes a build produced: resident, or in a scratch file the build spilled
 /// them to, whose directory lives as long as any reference to it.
@@ -205,6 +214,7 @@ impl Default for BuildPolicy {
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
             spill_to_disk: false,
+            scoring_by_ordinal: Arc::new(Vec::new()),
         }
     }
 }
@@ -304,15 +314,17 @@ struct EncodedTerm {
     tier: Option<EncodedTier>,
 }
 
-/// Sort, cut and encode one term's tier. The tier is truncated to
-/// `budget`; a posting whose superfile loses entries to the truncation has
-/// its tail raised to the best impact dropped, so the tail stays an upper
+/// Sort, cut and encode one term's tier, each entry keyed at its
+/// superfile's scoring (`scoring_of`, by ordinal). The tier is truncated
+/// to `budget`; a posting whose superfile loses entries to the truncation
+/// has its tail raised to the best key dropped, so the tail stays an upper
 /// bound on what the tier does not hold. The budget-th entry is found by
 /// selection, so only the kept entries are sorted.
 fn encode_term(
     mut term: TermInput,
     budget: u64,
     ordinals: &[Option<u32>],
+    scoring_of: &dyn Fn(u32) -> ColumnScoring,
 ) -> Result<EncodedTerm, TermIndexError> {
     for source in &term.sources {
         tier_entries(&source.chunks, &source.object, ordinals, &mut term.entries)?;
@@ -324,35 +336,41 @@ fn encode_term(
             tier: None,
         });
     }
-    let order = |a: &TierEntry, b: &TierEntry| {
-        b.impact
-            .total_cmp(&a.impact)
-            .then(a.superfile.cmp(&b.superfile))
-            .then(a.doc_id.cmp(&b.doc_id))
+    let mut keyed: Vec<(f32, TierEntry)> = term
+        .entries
+        .iter()
+        .map(|e| (scoring_of(e.superfile).key(e.tf, e.len), *e))
+        .collect();
+    let order = |a: &(f32, TierEntry), b: &(f32, TierEntry)| {
+        b.0.total_cmp(&a.0)
+            .then(a.1.superfile.cmp(&b.1.superfile))
+            .then(a.1.doc_id.cmp(&b.1.doc_id))
     };
     let budget = budget as usize;
-    let truncated = term.entries.len() > budget;
+    let truncated = keyed.len() > budget;
     if truncated {
-        term.entries.select_nth_unstable_by(budget, order);
-        let (kept, dropped) = term.entries.split_at_mut(budget);
-        for d in dropped.iter() {
+        keyed.select_nth_unstable_by(budget, order);
+        let (kept, dropped) = keyed.split_at_mut(budget);
+        for (key, d) in dropped.iter() {
             if let Ok(i) = term
                 .postings
                 .binary_search_by_key(&d.superfile, |p| p.superfile)
-                && term.postings[i].tail < d.impact
+                && term.postings[i].tail < *key
             {
-                term.postings[i].tail = d.impact;
+                term.postings[i].tail = *key;
             }
         }
         kept.sort_unstable_by(order);
-        term.entries.truncate(budget);
+        keyed.truncate(budget);
     } else {
-        term.entries.sort_unstable_by(order);
+        keyed.sort_unstable_by(order);
     }
-    let n_entries = term.entries.len() as u64;
-    let (chunks, inline) = match term.entries.len() <= TIER_INLINE_MAX {
-        true => (Vec::new(), term.entries),
-        false => (encode_tier(&term.entries), Vec::new()),
+    let n_entries = keyed.len() as u64;
+    let keys: Vec<f32> = keyed.iter().map(|(k, _)| *k).collect();
+    let entries: Vec<TierEntry> = keyed.into_iter().map(|(_, e)| e).collect();
+    let (chunks, inline) = match entries.len() <= TIER_INLINE_MAX {
+        true => (Vec::new(), entries),
+        false => (encode_tier(&entries, &keys), Vec::new()),
     };
     Ok(EncodedTerm {
         key: term.key,
@@ -367,10 +385,10 @@ fn encode_term(
 }
 
 /// One term's head from one superfile, as a contribution carries it.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Head {
-    /// `(row, impact)` in descending impact.
-    pub(crate) docs: Vec<(u32, f32)>,
+    /// `(row, term frequency, length bucket)` in descending key.
+    pub(crate) docs: Vec<(u32, u32, u8)>,
     /// The head is the term's whole posting list in that superfile.
     pub(crate) complete: bool,
 }
@@ -378,7 +396,7 @@ pub(crate) struct Head {
 /// One superfile's terms, spilled to a file in key order.
 ///
 /// Record: `record_len varint | key_len varint | key | posting | complete u8
-/// | n_head varint | per head doc: row varint, impact f32 LE`, where the
+/// | n_head varint | per head doc: row varint, tf varint, len u8`, where the
 /// posting's superfile ordinal is left zero — the merge assigns ordinals
 /// by the order contributions are handed to it. The outer length lets the
 /// reader take exactly one record from the stream.
@@ -391,12 +409,18 @@ pub(crate) struct ContributionWriter {
     scratch: Option<TempDir>,
     superfile_id: Uuid,
     id_min: i128,
+    scoring: BTreeMap<FieldId, ColumnScoring>,
     prev_key: Vec<u8>,
     n_terms: u64,
     record: Vec<u8>,
 }
 
 impl ContributionWriter {
+    /// Record the scoring `column`'s heads are keyed at.
+    pub(crate) fn set_scoring(&mut self, column: FieldId, scoring: ColumnScoring) {
+        self.scoring.insert(column, scoring);
+    }
+
     /// Start a contribution for `superfile_id`, whose smallest doc id is
     /// `id_min`, spilling under `dir`.
     pub(crate) fn create(
@@ -413,6 +437,7 @@ impl ContributionWriter {
             scratch: None,
             superfile_id,
             id_min,
+            scoring: BTreeMap::new(),
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
@@ -431,6 +456,7 @@ impl ContributionWriter {
             scratch: None,
             superfile_id: Uuid::nil(),
             id_min: 0,
+            scoring: BTreeMap::new(),
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
@@ -483,9 +509,10 @@ impl ContributionWriter {
         );
         self.record.push(head.complete as u8);
         push_varint(&mut self.record, head.docs.len() as u32);
-        for &(row, impact) in &head.docs {
+        for &(row, tf, len) in &head.docs {
             push_varint(&mut self.record, row);
-            self.record.extend_from_slice(&impact.to_le_bytes());
+            push_varint(&mut self.record, tf);
+            self.record.push(len);
         }
         let mut frame = Vec::with_capacity(self.record.len() + 4);
         push_varint(&mut frame, self.record.len() as u32);
@@ -503,6 +530,7 @@ impl ContributionWriter {
         Ok(Contribution {
             superfile_id: self.superfile_id,
             id_min: self.id_min,
+            scoring: self.scoring,
             path: self.path,
             _scratch: self.scratch,
         })
@@ -531,6 +559,8 @@ struct HeadSinkState {
     /// The column the last term belonged to, so a run of terms finds its
     /// part without a lookup.
     current: Option<(String, usize)>,
+    /// Per column, the scoring the builder's heads are keyed at.
+    scoring: BTreeMap<FieldId, ColumnScoring>,
 }
 
 impl HeadSink {
@@ -544,6 +574,7 @@ impl HeadSink {
                 columns,
                 parts: Vec::new(),
                 current: None,
+                scoring: BTreeMap::new(),
             })),
         })
     }
@@ -560,7 +591,10 @@ impl HeadSink {
             .into_inner()
             .map_err(|_| TermIndexError::Build("term head sink poisoned".into()))?;
         let HeadSinkState {
-            scratch, mut parts, ..
+            scratch,
+            mut parts,
+            scoring,
+            ..
         } = state;
         parts.sort_by(|a, b| a.0.cmp(&b.0));
         let path = scratch.path().join(format!("{superfile_id}.terms"));
@@ -575,6 +609,7 @@ impl HeadSink {
         Ok(Contribution {
             superfile_id,
             id_min,
+            scoring,
             path,
             _scratch: Some(scratch),
         })
@@ -616,6 +651,15 @@ impl TermHeadSink for HeadSink {
                 part
             }
         };
+        if let Some(id) = state.columns.get(column).copied() {
+            state.scoring.insert(
+                id,
+                ColumnScoring {
+                    avgdl: facts.avgdl,
+                    params: facts.params,
+                },
+            );
+        }
         let (prefix, writer) = &mut state.parts[part];
         let mut key = prefix.clone();
         key.extend_from_slice(term.as_bytes());
@@ -675,12 +719,7 @@ pub(crate) fn first_contribution_difference(
                     && x.posting.tail.to_bits() == y.posting.tail.to_bits()
                     && x.posting.location == y.posting.location
                     && x.head.complete == y.head.complete
-                    && x.head.docs.len() == y.head.docs.len()
-                    && x.head
-                        .docs
-                        .iter()
-                        .zip(&y.head.docs)
-                        .all(|(p, q)| p.0 == q.0 && p.1.to_bits() == q.1.to_bits());
+                    && x.head.docs == y.head.docs;
                 if !same {
                     return Ok(Some(format!(
                         "record {n} {:?} / {:?}: df {} vs {}, bound {:?} vs {:?}, tail {:?} vs {:?}, location {:?} vs {:?}, complete {} vs {}, head {:?} vs {:?}",
@@ -713,6 +752,9 @@ pub(crate) struct Contribution {
     pub(crate) superfile_id: Uuid,
     /// That superfile's smallest doc id.
     pub(crate) id_min: i128,
+    /// Per column, the average length and parameters the superfile scores
+    /// at: what its entries' keys and tails are computed at.
+    pub(crate) scoring: BTreeMap<FieldId, ColumnScoring>,
     /// The spill file.
     pub(crate) path: PathBuf,
     /// The scratch directory holding it, when this contribution owns one;
@@ -836,12 +878,15 @@ impl ContributionReader {
         for _ in 0..n {
             let row = read_varint(&self.buf, &mut at)
                 .ok_or_else(|| TermIndexError::Malformed("contribution head row".into()))?;
-            let raw = self
+            let tf = read_varint(&self.buf, &mut at).ok_or_else(|| {
+                TermIndexError::Malformed("contribution head term frequency".into())
+            })?;
+            let len = *self
                 .buf
-                .get(at..at + 4)
-                .ok_or_else(|| TermIndexError::Malformed("contribution head impact".into()))?;
-            docs.push((row, f32::from_le_bytes(raw.try_into().expect("4 bytes"))));
-            at += 4;
+                .get(at)
+                .ok_or_else(|| TermIndexError::Malformed("contribution head length".into()))?;
+            at += 1;
+            docs.push((row, tf, len));
         }
         if at != self.buf.len() {
             return Err(TermIndexError::Malformed(
@@ -966,6 +1011,8 @@ struct SegmentWriter {
     spill: Option<Arc<TempDir>>,
     target_bytes: usize,
     tier_entries_per_term: u64,
+    /// The scoring an entry is keyed at, by superfile ordinal and column.
+    scoring: ScoringOf,
     /// Terms gathered for the next parallel encoding batch, in key order.
     pending: Vec<TermInput>,
     /// Tier entries across `pending`, decoded or still to decode.
@@ -977,7 +1024,7 @@ struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    fn new(policy: &BuildPolicy) -> Result<Self, TermIndexError> {
+    fn new(policy: &BuildPolicy, scoring: ScoringOf) -> Result<Self, TermIndexError> {
         let spill = match policy.spill_to_disk {
             true => Some(Arc::new(
                 tempfile::Builder::new()
@@ -995,6 +1042,7 @@ impl SegmentWriter {
             spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
+            scoring,
             pending: Vec::new(),
             pending_entries: 0,
             pool: policy.pool.clone(),
@@ -1002,11 +1050,19 @@ impl SegmentWriter {
         })
     }
 
-    /// A writer for a merge, renumbering decoded tiers through `ordinals`.
+    /// A writer for a merge, renumbering decoded tiers through `ordinals`
+    /// and keying entries by the policy's per-ordinal scoring.
     fn for_merge(policy: &BuildPolicy, ordinals: &[Option<u32>]) -> Result<Self, TermIndexError> {
+        let by_ordinal = Arc::clone(&policy.scoring_by_ordinal);
+        let scoring: ScoringOf = Arc::new(move |ordinal, column| {
+            by_ordinal
+                .get(ordinal as usize)
+                .and_then(|columns| columns.get(&column).copied())
+                .unwrap_or_default()
+        });
         Ok(Self {
             ordinals: Arc::from(ordinals.to_vec()),
-            ..Self::new(policy)?
+            ..Self::new(policy, scoring)?
         })
     }
 
@@ -1114,10 +1170,14 @@ impl SegmentWriter {
         self.pending_entries = 0;
         let budget = self.tier_entries_per_term;
         let ordinals = Arc::clone(&self.ordinals);
+        let scoring = Arc::clone(&self.scoring);
         let encode = || -> Result<Vec<EncodedTerm>, TermIndexError> {
             batch
                 .into_par_iter()
-                .map(|term| encode_term(term, budget, &ordinals))
+                .map(|term| {
+                    let column = FieldId::of_term_key(&term.key).unwrap_or(FieldId(u32::MAX));
+                    encode_term(term, budget, &ordinals, &|ordinal| scoring(ordinal, column))
+                })
                 .collect()
         };
         let encoded = match &self.pool {
@@ -1397,7 +1457,16 @@ pub(crate) fn build_segment(
         readers.push(rd);
     }
 
-    let mut writer = SegmentWriter::new(policy)?;
+    let scoring: Vec<BTreeMap<FieldId, ColumnScoring>> =
+        contributions.iter().map(|c| c.scoring.clone()).collect();
+    let scoring: ScoringOf = Arc::new(move |ordinal: u32, column| {
+        ordinal
+            .checked_sub(ordinal_base)
+            .and_then(|i| scoring.get(i as usize))
+            .and_then(|columns| columns.get(&column).copied())
+            .unwrap_or_default()
+    });
+    let mut writer = SegmentWriter::new(policy, scoring)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
 
@@ -1417,10 +1486,11 @@ pub(crate) fn build_segment(
                 .expect("pending posting for heap head");
             p.superfile = ordinal_base + ordinal;
             complete &= h.complete;
-            entries.extend(h.docs.iter().map(|&(doc_id, impact)| TierEntry {
+            entries.extend(h.docs.iter().map(|&(doc_id, tf, len)| TierEntry {
                 superfile: p.superfile,
                 doc_id,
-                impact,
+                tf,
+                len,
             }));
             run.push(p);
             if let Some(next) = readers[ordinal as usize].next()? {
@@ -1589,8 +1659,7 @@ fn tier_entries(
             out.extend(block.iter().filter_map(|e| {
                 Some(TierEntry {
                     superfile: (*ordinals.get(e.superfile as usize)?)?,
-                    doc_id: e.doc_id,
-                    impact: e.impact,
+                    ..*e
                 })
             }));
         }
@@ -1660,8 +1729,7 @@ pub(crate) fn merge_segments(
                         entries.extend(tier.inline.iter().filter_map(|e| {
                             Some(TierEntry {
                                 superfile: (*ordinals.get(e.superfile as usize)?)?,
-                                doc_id: e.doc_id,
-                                impact: e.impact,
+                                ..*e
                             })
                         }));
                     } else {

@@ -48,7 +48,10 @@ use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use crate::{
-    superfile::fts::{bm25::idf as bm25_idf, reader::GlobalTermIdf},
+    superfile::fts::{
+        bm25::{Bm25Params, dequantize_len, score_with_dl_norm_k1},
+        reader::GlobalTermIdf,
+    },
     supertable::{
         manifest::{
             SuperfileEntry,
@@ -62,6 +65,10 @@ use crate::{
     },
 };
 
+/// Terms up to which a candidate's summed contributions equal the kernel's
+/// score bit for bit: one term is one product, two commute, three or more
+/// depend on the order the kernel adds them in.
+const EXACT_SUM_TERMS: usize = 2;
 /// Widening applied to an upper bound before it is compared against the
 /// threshold: the bound is assembled from separately rounded terms the
 /// score itself does not go through. Mirrors the term index's ceiling
@@ -132,37 +139,28 @@ struct Stream {
     scale_up: f32,
 }
 
-/// Per (term, kept superfile): how a stored impact maps to the query's
-/// scoring, and what the superfile can still contribute beyond the tier.
-#[derive(Clone, Copy)]
+/// Per (term, kept superfile): what the superfile can still contribute
+/// beyond the tier, and how a stored key scales into a bound there.
+#[derive(Clone, Copy, Default)]
 struct TermInFile {
-    /// Multiplies a stored impact into a lower bound at the table's stats.
-    scale_lb: f32,
-    /// Multiplies a stored impact into an upper bound at the table's stats.
+    /// Multiplies a stored key — at the superfile's own average length —
+    /// into an upper bound on a score at the table's.
     scale_ub: f32,
     /// Upper bound, at the table's stats, on a document the tier does not
     /// hold.
     tail: f32,
 }
 
-impl Default for TermInFile {
-    fn default() -> Self {
-        Self {
-            scale_lb: 0.0,
-            scale_ub: 0.0,
-            tail: 0.0,
-        }
-    }
-}
-
 /// Select superfiles for a query over `terms` with the tiers of `index`.
 /// `required` is a bit per term (in `terms` order) a matching document must
 /// carry: every bit for a conjunction, none for a disjunction, the musts'
-/// for a mix. `exact` says a candidate's summed impacts are the score the
-/// query would give it; when they are not — a phrase scores only where its
-/// words are adjacent, a negation removes documents — the merge takes no
-/// threshold from them and rules out only what a required term has shown
-/// to hold nothing. `None` when a term has postings in a segment without a
+/// for a mix. `exact` says a candidate's summed contributions are the score
+/// the query would give it; when they are not — a phrase scores only where
+/// its words are adjacent, a negation removes documents — the merge takes
+/// no threshold from them and rules out only what a required term has shown
+/// to hold nothing. `params` are the column's declared parameters, which
+/// every kept superfile scores at. `None` when a term has postings in a
+/// segment without a
 /// tier, or there are more terms than the merge tracks: the caller then
 /// orders by ceiling as before.
 #[allow(clippy::too_many_arguments)]
@@ -172,9 +170,10 @@ pub(crate) async fn select_with_tiers(
     terms: &[&str],
     required: u8,
     exact: bool,
-    kept: &[std::sync::Arc<SuperfileEntry>],
+    kept: &[Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
     table_avgdl: f32,
+    params: Bm25Params,
     k: usize,
 ) -> Result<Option<TierSelection>, TermIndexError> {
     let nt = terms.len();
@@ -193,36 +192,30 @@ pub(crate) async fn select_with_tiers(
     for (i, e) in kept.iter().enumerate() {
         slot_of.insert(e.superfile_id, i);
     }
-    let scored_docs: Vec<u64> = kept
-        .iter()
-        .map(|e| {
-            e.fts_summary
-                .get(&column)
-                .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
-                .unwrap_or(e.n_docs)
-        })
-        .collect();
-    // Average-length factors per kept superfile: a file built at a smaller
-    // average scores at most `table/baked` higher at the table's, and one
-    // built at a larger average at least `table/baked` of its stored score.
-    let avgdl_factor: Vec<(f32, f32)> = kept
-        .iter()
-        .map(|e| {
-            match e
-                .fts_summary
-                .get(&column)
-                .and_then(|s| s.baked_avgdl)
-                .filter(|b| *b > 0.0)
-            {
-                Some(baked) if baked < table_avgdl => (1.0, (table_avgdl / baked).next_up()),
-                Some(baked) if baked > table_avgdl => ((table_avgdl / baked).next_down(), 1.0),
-                _ => (1.0, 1.0),
-            }
-        })
-        .collect();
+    // Every kept superfile scores at the table's average length (its norm
+    // table is rebuilt there when it records the average it was built at),
+    // so a candidate's contribution is computed exactly as its kernel
+    // would. A superfile that records no average is scored at an average
+    // the index does not know, so no selection is made.
+    let mut scale_up: Vec<f32> = Vec::with_capacity(kept.len());
+    for e in kept {
+        let Some(baked) = baked_avgdl_of(e, column) else {
+            return Ok(None);
+        };
+        // A superfile built at a smaller average scores at most
+        // `table/baked` higher at the table's: the length norm falls by at
+        // most that ratio, and `tf / (tf + norm)` rises by no more than the
+        // norm falls.
+        scale_up.push(if baked < table_avgdl {
+            (table_avgdl / baked).next_up()
+        } else {
+            1.0
+        });
+    }
 
     let n_sf = kept.len();
     let mut per_term: Vec<Vec<TermInFile>> = vec![vec![TermInFile::default(); n_sf]; nt];
+    let mut idf: Vec<f32> = Vec::with_capacity(nt);
     let mut streams: Vec<Stream> = Vec::new();
     // Entries of tiers small enough to ride in their runs, with their term.
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
@@ -230,6 +223,7 @@ pub(crate) async fn select_with_tiers(
         let Some(&idf_table) = global_idf.get(*term) else {
             return Ok(None);
         };
+        idf.push(idf_table);
         let runs = index.runs(column, term).await?;
         let mut scale_up_max = 0.0f32;
         for SliceRun { tier_object, run } in runs.iter() {
@@ -247,18 +241,9 @@ pub(crate) async fn select_with_tiers(
                 let Some(&slot) = slot_of.get(&id) else {
                     continue;
                 };
-                let n = scored_docs[slot];
-                let local_idf = bm25_idf(n, p.df.min(n));
-                let ratio = if local_idf > 0.0 {
-                    idf_table / local_idf
-                } else {
-                    1.0
-                };
-                let (down, up) = avgdl_factor[slot];
                 let entry = TermInFile {
-                    scale_lb: ratio * down * LOWER_SLACK,
-                    scale_ub: ratio * up,
-                    tail: tail_of(p) * ratio * up,
+                    scale_ub: idf_table * scale_up[slot],
+                    tail: tail_of(p) * idf_table * scale_up[slot],
                 };
                 scale_up_max = scale_up_max.max(entry.scale_ub);
                 per_term[ti][slot] = entry;
@@ -287,6 +272,21 @@ pub(crate) async fn select_with_tiers(
     }
 
     let n_masks = 1usize << nt;
+    // A contribution is the kernel's own arithmetic, so a one- or two-term
+    // sum is the score bit for bit (addition commutes); a longer sum can
+    // land an ulp from the kernel's, which adds in its own order, so its
+    // bounds take the slack a product of roundings needs.
+    let exact_scores = exact && nt <= EXACT_SUM_TERMS;
+    let (lb_slack, ub_slack) = if exact_scores {
+        (1.0, 1.0)
+    } else {
+        (LOWER_SLACK, BOUND_SLACK)
+    };
+    let scoring = Scoring {
+        idf,
+        params,
+        avgdl: table_avgdl,
+    };
     let mut cands = Candidates {
         acc: FxHashMap::default(),
         best_lb: vec![f32::NEG_INFINITY; n_sf * n_masks],
@@ -296,6 +296,8 @@ pub(crate) async fn select_with_tiers(
         full: (n_masks - 1) as u8,
         k,
         exact,
+        lb_slack,
+        ub_slack,
     };
     let mut theta_lb = f32::NEG_INFINITY;
     let mut tier_bytes = 0u64;
@@ -315,7 +317,7 @@ pub(crate) async fn select_with_tiers(
     // part in the first round's threshold and exclusion like a read block.
     entries_read += inline.len() as u64;
     for (ti, e) in &inline {
-        cands.absorb(*ti, e, index, &slot_of, &per_term);
+        cands.absorb(*ti, e, index, &slot_of, &scoring);
     }
 
     // Each round settles what is known — threshold, frontiers, exclusions
@@ -406,7 +408,7 @@ pub(crate) async fn select_with_tiers(
         dir.decode_block(s.block, &body, &mut decoded)?;
         entries_read += decoded.len() as u64;
         for e in &decoded {
-            cands.absorb(s.term, e, index, &slot_of, &per_term);
+            cands.absorb(s.term, e, index, &slot_of, &scoring);
         }
         s.block += 1;
     }
@@ -443,11 +445,40 @@ pub(crate) async fn select_with_tiers(
     }))
 }
 
+/// How a tier entry's contribution to a query is computed: the kernel's
+/// arithmetic at the table's statistics.
+struct Scoring {
+    /// Per term, the table-wide idf the kernel weights it with.
+    idf: Vec<f32>,
+    params: Bm25Params,
+    /// The average length every kept superfile scores at.
+    avgdl: f32,
+}
+
+impl Scoring {
+    /// What term `ti` contributes to the score of a document of `e.tf`
+    /// occurrences and length bucket `e.len`: the kernel's own expression.
+    fn contribution(&self, ti: usize, e: &TierEntry) -> f32 {
+        let norm = self.params.dl_norm_k1(dequantize_len(e.len), self.avgdl);
+        score_with_dl_norm_k1(self.idf[ti], e.tf, norm)
+    }
+}
+
+/// The average length `entry`'s `column` was built at, as its manifest
+/// summary records it.
+fn baked_avgdl_of(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
+    entry
+        .fts_summary
+        .get(&column)
+        .and_then(|s| s.baked_avgdl)
+        .filter(|b| *b > 0.0)
+}
+
 /// What the merge knows of the documents the tiers have shown it.
 struct Candidates {
-    /// Per (superfile ordinal, row): the terms seen and the summed lower
-    /// and upper bounds of their impacts.
-    acc: FxHashMap<(u32, u32), (u8, f32, f32)>,
+    /// Per (superfile ordinal, row): the terms seen and their summed
+    /// contributions.
+    acc: FxHashMap<(u32, u32), (u8, f32)>,
     /// Per superfile, per term mask: best known lower-bound sum.
     best_lb: Vec<f32>,
     /// Per superfile, per term mask: best known upper-bound sum.
@@ -458,8 +489,12 @@ struct Candidates {
     /// The mask of every term.
     full: u8,
     k: usize,
-    /// Whether a full candidate's lower bound is a score the query gives.
+    /// Whether a full candidate's sum is a score the query gives.
     exact: bool,
+    /// What a sum is narrowed and widened by for its lower and upper bound:
+    /// one when the sum is the kernel's bit for bit.
+    lb_slack: f32,
+    ub_slack: f32,
 }
 
 impl Candidates {
@@ -470,7 +505,7 @@ impl Candidates {
         e: &TierEntry,
         index: &TermIndex,
         slot_of: &HashMap<Uuid, usize>,
-        per_term: &[Vec<TermInFile>],
+        scoring: &Scoring,
     ) {
         let Some(id) = index.superfile_id(e.superfile) else {
             return;
@@ -478,23 +513,19 @@ impl Candidates {
         let Some(&slot) = slot_of.get(&id) else {
             return;
         };
-        let tf = per_term[ti][slot];
-        let cand = self
-            .acc
-            .entry((e.superfile, e.doc_id))
-            .or_insert((0, 0.0, 0.0));
+        let cand = self.acc.entry((e.superfile, e.doc_id)).or_insert((0, 0.0));
         cand.0 |= 1 << ti;
-        cand.1 += e.impact * tf.scale_lb;
-        cand.2 += e.impact * tf.scale_ub;
+        cand.1 += scoring.contribution(ti, e);
+        let (lb, ub) = (cand.1 * self.lb_slack, cand.1 * self.ub_slack);
         let at = slot * self.n_masks + cand.0 as usize;
-        if cand.1 > self.best_lb[at] {
-            self.best_lb[at] = cand.1;
+        if lb > self.best_lb[at] {
+            self.best_lb[at] = lb;
         }
-        if cand.2 > self.best_ub[at] {
-            self.best_ub[at] = cand.2;
+        if ub > self.best_ub[at] {
+            self.best_ub[at] = ub;
         }
         if self.exact && cand.0 == self.full {
-            self.topk.push(Reverse(OrdF32(cand.1)));
+            self.topk.push(Reverse(OrdF32(lb)));
             if self.topk.len() > self.k {
                 self.topk.pop();
             }

@@ -367,8 +367,9 @@ fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
 /// the amount of *skipped work* depends on segment completion order.
 struct SharedTopK {
     k: usize,
-    /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
-    heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
+    /// Min-heap (via `Reverse`) of the best `k` scores seen so far, each
+    /// with the largest `_id` its superfile holds.
+    heap: Mutex<BinaryHeap<Reverse<FloorEntry>>>,
     /// The current floor — `NEG_INFINITY` until `k` scores have been
     /// seen, monotone after. Shared with the atom walks as their live
     /// mid-walk bar (see [`LiveFloor`]), so it rises both from finished
@@ -376,19 +377,30 @@ struct SharedTopK {
     floor: LiveFloor,
 }
 
-/// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
-/// are finite, but `f32` still needs an `Ord` shim).
+/// One score in the [`SharedTopK`] heap with the largest `_id` of the
+/// superfile it came from: what a tie at the floor is compared against.
+/// Ordered by score, then by `_id` range *descending*, so of two equal
+/// scores the one from the higher range is the lesser and leaves the
+/// heap first: the stable top-k keeps the lower `_id` of a tie, and so
+/// does the heap — a seed placeholder (`i128::MAX`) in particular gives
+/// way to a real score equal to it. BM25 scores are finite, but `f32`
+/// still needs an `Ord` shim.
 #[derive(PartialEq)]
-struct OrdScore(f32);
-impl Eq for OrdScore {}
-impl PartialOrd for OrdScore {
+struct FloorEntry {
+    score: f32,
+    id_max: i128,
+}
+impl Eq for FloorEntry {}
+impl PartialOrd for FloorEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for OrdScore {
+impl Ord for FloorEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.id_max.cmp(&self.id_max))
     }
 }
 
@@ -412,28 +424,47 @@ impl SharedTopK {
         &self.floor
     }
 
-    /// Merge one finished segment's (tombstone-surviving) scores and
-    /// publish the new kth-best as the floor once k scores are known.
-    fn merge(&self, scores: impl IntoIterator<Item = f32>) {
+    /// Merge one finished segment's (tombstone-surviving) scores, from a
+    /// superfile whose `_id`s reach `id_max`, and publish the new kth-best
+    /// as the floor once k scores are known.
+    fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
         let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
-        for s in scores {
+        for score in scores {
+            let entry = FloorEntry { score, id_max };
             if heap.len() < self.k {
-                heap.push(Reverse(OrdScore(s)));
-            } else if let Some(Reverse(OrdScore(min))) = heap.peek()
-                && s > *min
+                heap.push(Reverse(entry));
+            } else if let Some(Reverse(min)) = heap.peek()
+                && entry > *min
             {
                 heap.pop();
-                heap.push(Reverse(OrdScore(s)));
+                heap.push(Reverse(entry));
             }
         }
         if heap.len() == self.k
-            && let Some(Reverse(OrdScore(min))) = heap.peek()
+            && let Some(Reverse(FloorEntry { score: min, .. })) = heap.peek()
         {
             // `raise` rather than a plain store: running walks may have
             // published a higher local kth than this merge's heap min,
             // and the floor must never move down.
             self.floor.raise(*min);
         }
+    }
+
+    /// Whether a superfile whose `_id`s start at `id_min` and whose
+    /// ceiling equals `floor` can be skipped: `k` scores are known, and
+    /// every one at the floor came from a superfile whose `_id`s all lie
+    /// below `id_min`. The final top-k breaks a tie at the k-th score by
+    /// ascending `_id`, so a document of this superfile tied at the floor
+    /// ranks behind each of those, and one below it is out regardless.
+    /// Sound only when superfile `_id` ranges are disjoint, which the
+    /// caller checks. A seed placeholder carries `i128::MAX` and so never
+    /// justifies a skip.
+    fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
+        let heap = self.heap.lock().expect("SharedTopK mutex poisoned");
+        heap.len() >= self.k
+            && heap
+                .iter()
+                .all(|Reverse(e)| e.score != floor || e.id_max < id_min)
     }
 }
 
@@ -549,6 +580,37 @@ pub(crate) async fn memo_from_locations(
 /// on its own; a ceiling that rounding put an ulp below a real score is
 /// protected by the widening the term index applies to every ceiling
 /// (`CEILING_SLACK`), not by this test.
+/// What a ranked fan-out unit carries to its kernel and its skip test.
+#[derive(Clone)]
+struct UnitParams {
+    /// The doc-id sub-range the unit scores, `None` for the whole superfile.
+    range: Option<(u32, u32)>,
+    superfile_id: Uuid,
+    uri: SuperfileUri,
+    /// The highest score the unit can reach, from the term index.
+    ceiling: f32,
+    /// The superfile's `_id` range.
+    id_min: i128,
+    id_max: i128,
+}
+
+/// Whether the `_id` ranges of `kept` are pairwise disjoint: when they are,
+/// every document of a superfile with a larger `id_min` has a larger `_id`
+/// than every document of one with a smaller, and the stable top-k's tie
+/// order between two superfiles' documents is known before either is
+/// opened. An empty superfile's range is meaningless and is skipped.
+fn id_ranges_disjoint(kept: &[Arc<SuperfileEntry>]) -> bool {
+    let mut ranges: Vec<(i128, i128)> = kept
+        .iter()
+        .filter(|e| e.n_docs > 0)
+        .map(|e| (e.id_min, e.id_max))
+        .collect();
+    ranges.sort_unstable();
+    ranges
+        .windows(2)
+        .all(|w| w[0].1 < w[1].0 && w[0].0 <= w[0].1)
+}
+
 pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     // Written as "not strictly less" rather than `>=` so an incomparable
     // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
@@ -580,6 +642,16 @@ fn table_scoring(column: &str, params: Option<Bm25Params>, avgdl: Option<f32>) -
         params,
         avgdl: avgdl.map(|avgdl| (column, avgdl)),
     }
+}
+
+/// The parameters `column` declares, which every superfile scores it at
+/// unless a query overrides them.
+fn column_params(manifest: &ManifestSnapshot, column: &str) -> Option<Bm25Params> {
+    manifest
+        .fts_configs()
+        .iter()
+        .find(|c| c.column == column)
+        .map(|c| c.bm25)
 }
 
 /// The average length `entry`'s `column` was built at, as its manifest
@@ -1029,19 +1101,35 @@ impl SupertableReader {
                 .filter(|(_, t)| required_term(t))
                 .fold(0u8, |m, (i, _)| m | (1u8 << i.min(7)));
             let can_seed = !has_phrases && negatives.is_empty();
-            let selection = tier::select_with_tiers(
-                index,
-                column_id,
-                &scored_terms,
-                required,
-                can_seed,
-                &kept,
-                &global_idf,
-                table_avgdl,
-                k,
-            )
-            .instrument(term_span.clone())
-            .await?;
+            // A term repeated in the query is weighted by its count in the
+            // kernels; the tiers score each term once, so such a query is
+            // not served.
+            let repeated = musts
+                .iter()
+                .chain(shoulds.iter())
+                .chain(must_phrases.iter().flat_map(|p| p.iter()))
+                .chain(should_phrases.iter().flat_map(|p| p.iter()))
+                .count()
+                != scored_terms.len();
+            let selection = match column_params(manifest, column) {
+                Some(params) if !repeated => {
+                    tier::select_with_tiers(
+                        index,
+                        column_id,
+                        &scored_terms,
+                        required,
+                        can_seed,
+                        &kept,
+                        &global_idf,
+                        table_avgdl,
+                        params,
+                        k,
+                    )
+                    .instrument(term_span.clone())
+                    .await?
+                }
+                _ => None,
+            };
             if let Some(selection) = selection {
                 if let Some(stats) = &self.op_stats {
                     stats.add_tier_read(selection.tier_bytes, selection.entries_read);
@@ -1059,9 +1147,13 @@ impl SupertableReader {
                 // shown it holds none — is not opened at all; a ceiling of
                 // negative infinity would still tie an empty floor.
                 kept.retain(|e| bound_of(e).ub > f32::NEG_INFINITY);
+                // Equal bounds open in `_id` order, so a run of superfiles
+                // that can only tie is settled by the first of them.
                 kept.sort_by(|a, b| {
                     let (x, y) = (bound_of(a), bound_of(b));
-                    y.lb.total_cmp(&x.lb).then(y.ub.total_cmp(&x.ub))
+                    y.lb.total_cmp(&x.lb)
+                        .then(y.ub.total_cmp(&x.ub))
+                        .then(a.id_min.cmp(&b.id_min))
                 });
                 ceilings = Some(
                     kept.iter()
@@ -1078,7 +1170,11 @@ impl SupertableReader {
         {
             let ceiling_of =
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
-            kept.sort_by(|a, b| ceiling_of(b).total_cmp(&ceiling_of(a)));
+            kept.sort_by(|a, b| {
+                ceiling_of(b)
+                    .total_cmp(&ceiling_of(a))
+                    .then(a.id_min.cmp(&b.id_min))
+            });
         }
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
@@ -1105,10 +1201,7 @@ impl SupertableReader {
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(
-            Arc<SuperfileEntry>,
-            (Option<(u32, u32)>, Uuid, SuperfileUri, f32),
-        )> = work_units
+        let units: Vec<(Arc<SuperfileEntry>, UnitParams)> = work_units
             .into_iter()
             .map(|u| {
                 let suid = u.entry.superfile_id;
@@ -1117,9 +1210,22 @@ impl SupertableReader {
                     .as_ref()
                     .and_then(|c| c.get(&suid).copied())
                     .unwrap_or(f32::INFINITY);
-                (u.entry, (u.range, suid, uri, ceiling))
+                let params = UnitParams {
+                    range: u.range,
+                    superfile_id: suid,
+                    uri,
+                    ceiling,
+                    id_min: u.entry.id_min,
+                    id_max: u.entry.id_max,
+                };
+                (u.entry, params)
             })
             .collect();
+        // A superfile whose ceiling only ties the running k-th score is
+        // skipped once the tie is settled by `_id` order, which needs the
+        // superfiles' `_id` ranges disjoint and an exact comparison: no
+        // tolerance widening the floor.
+        let tie_walk = score_tolerance <= 0.0 && id_ranges_disjoint(&kept);
 
         let must_arc: Arc<Vec<String>> = Arc::new(musts);
         let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
@@ -1140,7 +1246,7 @@ impl SupertableReader {
         // may prune against from its first block; the real scores that
         // replace these placeholders only raise it.
         if let Some(seed) = tier_seed {
-            shared.merge(repeat_n(seed, k));
+            shared.merge(i128::MAX, repeat_n(seed, k));
         }
         let floor_handle = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
@@ -1181,13 +1287,14 @@ impl SupertableReader {
                 .collect(),
             None => HashSet::new(),
         });
-        let kernel = move |r: Arc<SuperfileReader>,
-                           (range, suid, uri, _ceiling): (
-            Option<(u32, u32)>,
-            Uuid,
-            SuperfileUri,
-            f32,
-        )| {
+        let kernel = move |r: Arc<SuperfileReader>, params: UnitParams| {
+            let UnitParams {
+                range,
+                superfile_id: suid,
+                uri,
+                id_max,
+                ..
+            } = params;
             let avgdl = at_table_avgdl.contains(&suid).then_some(table_avgdl);
             let column_arc = Arc::clone(&column_arc);
             let must_arc = Arc::clone(&must_arc);
@@ -1408,12 +1515,13 @@ impl SupertableReader {
                 // always safe).
                 match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
                     Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                        id_max,
                         hits.iter()
                             .filter(|(d, _)| !bitmap.contains(d.get()))
                             .map(|(_, s)| *s),
                     ),
                     Some(Err(_)) => {}
-                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+                    _ => shared.merge(id_max, hits.iter().map(|(_, s)| *s)),
                 }
                 Ok(rows_as_local_ids(hits))
             }
@@ -1423,18 +1531,21 @@ impl SupertableReader {
             // Units are in descending ceiling order. A unit whose ceiling is
             // strictly below the running k-th score cannot place a document
             // in the top k — not even a tie the stable `_id` order could
-            // admit — so it is never opened.
+            // admit — so it is never opened; one whose ceiling equals it
+            // can only tie, and is not opened either once every document
+            // at the floor precedes its own in `_id` order.
             true => {
                 let window = manifest.options.bound_ordered_open_window.max(1);
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
                     window,
-                    move |(_, _, _, ceiling): &(Option<(u32, u32)>, Uuid, SuperfileUri, f32)| {
-                        !ceiling_can_compete(
-                            *ceiling,
-                            competitive_floor(floor_handle.floor(), score_tolerance),
-                        )
+                    move |params: &UnitParams| {
+                        let floor = competitive_floor(floor_handle.floor(), score_tolerance);
+                        !ceiling_can_compete(params.ceiling, floor)
+                            || (tie_walk
+                                && params.ceiling == floor
+                                && floor_handle.tie_skippable(floor, params.id_min))
                     },
                     kernel,
                 )
@@ -3196,6 +3307,74 @@ mod tests {
     /// A tolerance raises the bar a superfile's ceiling has to clear, which
     /// is the whole mechanism: a ceiling that would have been read because it
     /// ties the k-th score is skipped once the caller accepts a shortfall.
+    /// A superfile whose ceiling ties the floor is skippable once `k`
+    /// scores are known and every one at the floor came from superfiles
+    /// below its `_id` range; a seed placeholder, or a floor score from a
+    /// superfile at or above that range, keeps it open.
+    #[test]
+    fn a_tie_at_the_floor_is_skipped_only_behind_lower_ids() {
+        let shared = SharedTopK::new(3);
+        assert!(!shared.tie_skippable(1.0, 100), "no scores known yet");
+        shared.merge(300, [2.0, 1.0, 1.0]);
+        assert_eq!(shared.floor(), 1.0);
+        assert!(
+            !shared.tie_skippable(1.0, 100),
+            "ties from a superfile reaching id 300 are not settled for id 100"
+        );
+        assert!(
+            shared.tie_skippable(1.0, 400),
+            "but they are for one past it"
+        );
+        // Equal scores from a lower range take the tied places.
+        shared.merge(50, [1.0, 1.0]);
+        assert!(
+            shared.tie_skippable(1.0, 100),
+            "both ties now sit below id 100"
+        );
+        assert!(
+            !shared.tie_skippable(1.0, 50),
+            "a tie at id 50 is not below id 50"
+        );
+        let seeded = SharedTopK::new(2);
+        seeded.merge(i128::MAX, [1.0, 1.0]);
+        assert!(
+            !seeded.tie_skippable(1.0, 100),
+            "a seed is no document and justifies no skip"
+        );
+        seeded.merge(10, [1.0, 1.0]);
+        assert!(
+            seeded.tie_skippable(1.0, 100),
+            "real scores equal to the seeds replace them"
+        );
+    }
+
+    #[test]
+    fn id_ranges_are_disjoint_only_when_no_two_overlap() {
+        let entry = |id_min: i128, id_max: i128| {
+            let mut e = (*manifest_entry(1)).clone();
+            e.id_min = id_min;
+            e.id_max = id_max;
+            Arc::new(e)
+        };
+        assert!(id_ranges_disjoint(&[
+            entry(0, 9),
+            entry(10, 19),
+            entry(20, 20)
+        ]));
+        assert!(
+            !id_ranges_disjoint(&[entry(0, 10), entry(10, 19)]),
+            "a shared id"
+        );
+        assert!(
+            !id_ranges_disjoint(&[entry(0, 30), entry(10, 19)]),
+            "nested"
+        );
+        assert!(
+            id_ranges_disjoint(&[entry(0, 9), manifest_entry(0), entry(10, 19)]),
+            "an empty superfile's range is skipped"
+        );
+    }
+
     #[test]
     fn a_tolerance_raises_the_bar() {
         let floor = 100.0f32;
@@ -3265,8 +3444,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units,
-        ceilings_at_table_avgdl, fanout_for,
+        BoolMode, FanOut, SharedTopK, SuperfileHit, SupertableReader, build_work_units,
+        ceilings_at_table_avgdl, fanout_for, id_ranges_disjoint,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},

@@ -63,9 +63,12 @@ pub(crate) struct TermIndexFact {
 /// superfile: its best documents by impact and what it holds back.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct TermHead {
-    /// `(row, impact)` in descending impact, at most the depth asked for.
-    pub(crate) docs: Vec<(u32, f32)>,
-    /// Impact of the best document not in `docs`; `0.0` when `complete`.
+    /// `(row, term frequency, length bucket)` in descending impact, at
+    /// most the depth asked for.
+    pub(crate) docs: Vec<(u32, u32, u8)>,
+    /// The length-normalized term frequency — `tf / (tf + norm)` at this
+    /// file's average length and parameters — of the best document not in
+    /// `docs`; `0.0` when `complete`.
     pub(crate) tail: f32,
     /// `docs` is the term's whole posting list here.
     pub(crate) complete: bool,
@@ -509,7 +512,7 @@ impl FtsReader {
     /// beat the running `depth`-th impact are skipped undecoded, as the
     /// single-term search skips them; the cursor is consumed.
     fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> TermHead {
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(depth + 1);
+        let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> = BinaryHeap::with_capacity(depth + 1);
         let mut tail = 0.0f32;
         while !cursor.is_exhausted() {
             if heap.len() > depth
@@ -520,27 +523,33 @@ impl FtsReader {
                 continue;
             }
             let doc = cursor.current_doc_id();
-            let score =
-                bm25::score_with_dl_norm_k1(cursor.idf_weight, cursor.current_tf(), norms.get(doc));
+            let tf = cursor.current_tf();
+            let score = bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, norms.get(doc));
             if heap.len() <= depth {
-                heap.push(TopKEntry(score, FtsDocId::new(doc)));
+                heap.push(TopKEntry(score, (FtsDocId::new(doc), tf)));
             } else if let Some(mut worst) = heap.peek_mut()
                 && score > worst.0
             {
-                *worst = TopKEntry(score, FtsDocId::new(doc));
+                *worst = TopKEntry(score, (FtsDocId::new(doc), tf));
             }
             cursor.next();
         }
         // One more than the depth was kept so the tail is the first
-        // document left out, exactly.
+        // document left out, exactly: its key, as the term index orders
+        // its tiers, at the average length and parameters this file scores
+        // at.
         let complete = heap.len() <= depth;
         let mut hits = drain_top_k_desc(heap);
         if !complete {
-            tail = hits.pop().map(|(_, s)| s).unwrap_or(0.0);
+            tail = hits
+                .pop()
+                .map(|((id, tf), _)| bm25::tf_factor(tf, norms.get(id.get())))
+                .unwrap_or(0.0);
         }
+        let buckets = norms.buckets();
         let docs = hits
             .into_iter()
-            .map(|(id, impact)| (self.row_of(id).get(), impact))
+            .map(|((id, tf), _)| (self.row_of(id).get(), tf, buckets[id.get() as usize]))
             .collect();
         TermHead {
             docs,
@@ -605,7 +614,11 @@ impl FtsReader {
                     let head = match head_depth {
                         0 => TermHead::none(bound),
                         _ => TermHead {
-                            docs: vec![(self.row_of(FtsDocId::new(doc_id)).get(), bound)],
+                            docs: vec![(
+                                self.row_of(FtsDocId::new(doc_id)).get(),
+                                col_meta.inline_tf(tf),
+                                col_meta.dl_norm_k1().buckets()[doc_id as usize],
+                            )],
                             tail: 0.0,
                             complete: true,
                         },
@@ -1466,24 +1479,40 @@ mod tests {
                 .search_with_floor("body", &[&term], DEPTH + 1, BoolMode::Or, f32::NEG_INFINITY)
                 .await
                 .expect("ranked");
+            // The head carries facts; scored with the file's own norms and
+            // idf they are the ranking's scores, bit for bit.
+            let norms = r.columns[0].dl_norm_k1();
+            let idf = bm25::idf(u64::from(N_DOCS), fact.df);
+            let got: Vec<(u32, f32)> = fact
+                .head
+                .docs
+                .iter()
+                .map(|&(row, tf, bucket)| {
+                    assert_eq!(bucket, norms.buckets()[row as usize], "{term:?} row {row}");
+                    (row, bm25::score_with_dl_norm_k1(idf, tf, norms.get(row)))
+                })
+                .collect();
             let want: Vec<(u32, f32)> = ranked
                 .iter()
                 .take(DEPTH)
                 .map(|(row, s)| (row.get(), *s))
                 .collect();
-            assert_eq!(fact.head.docs, want, "head of {term:?} is the top-{DEPTH}");
+            assert_eq!(got, want, "head of {term:?} is the top-{DEPTH}");
             let df = fact.df as usize;
             assert_eq!(fact.head.complete, df <= DEPTH, "{term:?}: df {df}");
+            // The tail is the key of the first document left out: its score
+            // over the idf, which the ranking only knows as a product.
             let want_tail = match ranked.get(DEPTH) {
                 Some((_, s)) => *s,
                 None => 0.0,
             };
-            assert_eq!(
-                fact.head.tail, want_tail,
-                "tail of {term:?} is the first document left out"
+            let tail_score = fact.head.tail * idf;
+            assert!(
+                (tail_score - want_tail).abs() <= want_tail.abs() * 1e-5,
+                "tail of {term:?} is the first document left out: {tail_score} vs {want_tail}"
             );
             assert!(
-                fact.head.docs.first().is_none_or(|d| d.1 <= fact.bound),
+                got.first().is_none_or(|d| d.1 <= fact.bound),
                 "the head never exceeds the bound"
             );
         }

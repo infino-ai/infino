@@ -51,7 +51,7 @@ use crate::{
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
-    utils::terms::make_key,
+    utils::terms::{KEY_SEPARATOR, make_key},
 };
 
 /// How many fields a table may hold before an append or schema write
@@ -126,6 +126,13 @@ impl FieldId {
     /// a rename changes nothing at the table level.
     pub(crate) fn term_key(self, term: &str) -> Vec<u8> {
         make_key(&self.to_string(), term)
+    }
+
+    /// The column a term key names: the decimal id before the separator.
+    pub(crate) fn of_term_key(key: &[u8]) -> Option<Self> {
+        let end = key.iter().position(|b| *b == KEY_SEPARATOR)?;
+        let id = str::from_utf8(&key[..end]).ok()?.parse().ok()?;
+        Some(Self(id))
     }
 }
 

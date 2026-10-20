@@ -48,11 +48,13 @@
 //! ```
 //!
 //! `tier` names the term's tier chunks (`tier.rs`): its best documents
-//! table-wide, read in impact order ahead of any superfile open; absent
+//! table-wide, read in key order ahead of any superfile open; absent
 //! when the build's policy keeps no tier for the term. `tail` is the
-//! largest impact of a document of the term in that superfile that the
+//! largest key of a document of the term in that superfile that the
 //! tier does *not* hold — zero when it holds them all — so a reader that
 //! has consumed the tier knows what the superfile can still contribute.
+//! Keys are at the superfile's own average length and the column's
+//! parameters, so a superfile's entries and tail order consistently.
 //!
 //! `location` mirrors the superfile dictionary's own value for the term —
 //! a PFOR or short-form byte range relative to that superfile's postings
@@ -213,10 +215,12 @@ pub(crate) struct Posting {
     /// `f32::INFINITY` is a valid (useless) bound and is what a build
     /// that did not collect bounds writes.
     pub(crate) bound: f32,
-    /// Upper bound on the impact of any document of the term in that
-    /// superfile that the term's tier does not hold; `0.0` when the tier
-    /// holds every one (or the superfile has none), `bound` when no head
-    /// was collected for it.
+    /// Upper bound on the tier key — the length-normalized term frequency
+    /// at the superfile's own average length and the column's parameters —
+    /// of any document of the term in that superfile that the term's tier
+    /// does not hold; `0.0` when the tier holds every one (or the
+    /// superfile has none), `f32::INFINITY` when no head was collected for
+    /// it.
     pub(crate) tail: f32,
     /// Where the postings sit in that superfile, if carried.
     pub(crate) location: Location,
@@ -521,7 +525,8 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
             for e in &t.inline {
                 push_varint(&mut out, e.superfile);
                 push_varint(&mut out, e.doc_id);
-                out.extend_from_slice(&e.impact.to_le_bytes());
+                push_varint(&mut out, e.tf);
+                out.push(e.len);
             }
         }
         Some(t) => {
@@ -640,17 +645,17 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
                     read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry ordinal"))?;
                 let doc_id =
                     read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry row"))?;
-                let end = at
-                    .checked_add(F32_LEN)
-                    .ok_or_else(|| malformed("inline entry impact"))?;
-                let raw = bytes
-                    .get(at..end)
-                    .ok_or_else(|| malformed("inline entry impact"))?;
-                at = end;
+                let tf = read_varint(bytes, &mut at)
+                    .ok_or_else(|| malformed("inline entry term frequency"))?;
+                let len = *bytes
+                    .get(at)
+                    .ok_or_else(|| malformed("inline entry length"))?;
+                at += 1;
                 inline.push(TierEntry {
                     superfile,
                     doc_id,
-                    impact: f32::from_le_bytes(raw.try_into().expect("4 bytes")),
+                    tf,
+                    len,
                 });
             }
             Some(TierRef {
@@ -876,17 +881,20 @@ mod tests {
                 TierEntry {
                     superfile: 0,
                     doc_id: 7,
-                    impact: 2.5,
+                    tf: 3,
+                    len: 12,
                 },
                 TierEntry {
                     superfile: 3,
                     doc_id: 100_000,
-                    impact: 2.25,
+                    tf: 2,
+                    len: 12,
                 },
                 TierEntry {
                     superfile: 3,
                     doc_id: 100_001,
-                    impact: 0.125,
+                    tf: 1,
+                    len: 200,
                 },
             ],
         }

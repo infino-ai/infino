@@ -127,6 +127,7 @@ use crate::{
                 sub_hdr,
             },
         },
+        fts::bm25::Bm25Params,
         fts::builder::doc_lengths_entry_size,
         reader::vector_layout_from_kv,
         vector::{
@@ -3819,6 +3820,11 @@ async fn write_superfile_terms(
             source,
         })?;
     for (_, column, column_id) in &columns {
+        if let (Some(avgdl), Some(params)) =
+            (fts.column_baked_avgdl(column), fts.column_params(column))
+        {
+            writer.set_scoring(*column_id, term_index::ColumnScoring { avgdl, params });
+        }
         let mut after: Option<Vec<u8>> = None;
         loop {
             let chunk = fts
@@ -11253,6 +11259,10 @@ async fn merge_term_index(
         .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
         .collect();
 
+    let policy = term_index::BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
+        ..policy
+    };
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
@@ -11323,6 +11333,10 @@ async fn fold_term_index(
     let policy = manifest
         .options
         .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
+    let policy = term_index::BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
+        ..policy
+    };
     let scratch = term_index_scratch()?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
     let merged = run_on_pool(
@@ -11368,6 +11382,48 @@ async fn collect_and_build_term_index(
 
 /// Walk each of `entries`' dictionaries, one superfile at a time, spilling
 /// its contribution under `dir`.
+/// Per superfile of `superfiles`, by position, the average length and
+/// parameters each text column scores at, as the manifest records them:
+/// what a merge keys the superfile's tier entries at. A superfile the
+/// manifest does not list, or a column it records no average for, is left
+/// out and keys at the default.
+fn scoring_by_ordinal(
+    manifest: &ManifestSnapshot,
+    superfiles: &[Uuid],
+) -> Vec<BTreeMap<FieldId, term_index::ColumnScoring>> {
+    let by_id: HashMap<Uuid, &Arc<SuperfileEntry>> = manifest
+        .superfiles
+        .iter()
+        .map(|e| (e.superfile_id, e))
+        .collect();
+    let columns: Vec<(FieldId, Bm25Params)> = manifest
+        .fts_configs()
+        .iter()
+        .filter_map(|c| Some((manifest.field_id(&c.column)?, c.bm25)))
+        .collect();
+    superfiles
+        .iter()
+        .map(|id| {
+            let Some(entry) = by_id.get(id) else {
+                return BTreeMap::new();
+            };
+            columns
+                .iter()
+                .filter_map(|(column, params)| {
+                    let avgdl = entry.fts_summary.get(column)?.baked_avgdl?;
+                    Some((
+                        *column,
+                        term_index::ColumnScoring {
+                            avgdl,
+                            params: *params,
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],

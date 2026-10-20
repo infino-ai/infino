@@ -1429,11 +1429,20 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) bound: f32,
     /// The dictionary entry written for the term.
     pub(crate) entry: DictEntry,
-    /// The best documents by impact as `(row, impact)`, in descending
-    /// impact then ascending blob document id, at most the sink's depth.
-    pub(crate) head: &'a [(u32, f32)],
-    /// The best impact `head` left out; `0.0` when it holds them all.
+    /// The best documents by impact as `(row, term frequency, length
+    /// bucket)`, in descending impact then ascending blob document id, at
+    /// most the sink's depth.
+    pub(crate) head: &'a [(u32, u32, u8)],
+    /// The length-normalized term frequency — `tf / (tf + norm)` at this
+    /// blob's average length and parameters, the factor a score multiplies
+    /// the idf by — of the best document `head` left out; `0.0` when it
+    /// holds them all.
     pub(crate) tail: f32,
+    /// The average length this blob scores the column at, and so the
+    /// average `tail` and the heads' keys are at.
+    pub(crate) avgdl: f32,
+    /// The column's parameters, likewise.
+    pub(crate) params: bm25::Bm25Params,
     /// `head` is the term's whole list here.
     pub(crate) complete: bool,
 }
@@ -1442,17 +1451,21 @@ pub(crate) struct TermHeadFacts<'a> {
 #[derive(Default)]
 struct HeadOut {
     df: u64,
-    docs: Vec<(u32, f32)>,
+    docs: Vec<(u32, u32, u8)>,
     bound: f32,
     tail: f32,
     complete: bool,
+    /// The average length and parameters `tail` is keyed at.
+    avgdl: f32,
+    params: bm25::Bm25Params,
 }
 
-/// Heap entry for the head: the heap's top is the worst kept document —
-/// the lowest impact, and among equal impacts the larger document id —
-/// so a tie keeps the smaller id, as a reader's top-k does.
+/// Heap entry for the head — impact, blob document id, term frequency:
+/// the heap's top is the worst kept document — the lowest impact, and
+/// among equal impacts the larger document id — so a tie keeps the
+/// smaller id, as a reader's top-k does.
 #[derive(PartialEq)]
-struct HeadEntry(f32, u32);
+struct HeadEntry(f32, u32, u32);
 impl Eq for HeadEntry {}
 impl PartialOrd for HeadEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -1483,33 +1496,43 @@ fn term_head(
     heap.clear();
     out.df = pairs.len() as u64;
     let mut bound = 0.0f32;
-    for (&(doc, _), &score) in pairs.iter().zip(scores) {
+    for (&(doc, tf), &score) in pairs.iter().zip(scores) {
         bound = bound.max(score);
         if heap.len() <= depth {
-            heap.push(HeadEntry(score, doc));
+            heap.push(HeadEntry(score, doc, tf));
         } else if let Some(mut worst) = heap.peek_mut()
             && score > worst.0
         {
-            *worst = HeadEntry(score, doc);
+            *worst = HeadEntry(score, doc, tf);
         }
     }
     out.complete = heap.len() <= depth;
-    out.docs.clear();
-    out.docs
-        .extend(heap.drain().map(|HeadEntry(score, doc)| (doc, score)));
-    out.docs
-        .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut kept: Vec<HeadEntry> = heap.drain().collect();
+    kept.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    // The key of a document: what the term index orders its tiers by.
+    let key = |doc: u32, tf: u32| {
+        bm25::tf_factor(
+            tf,
+            enc.params
+                .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
+        )
+    };
     out.tail = if out.complete {
         0.0
     } else {
-        out.docs.pop().map(|(_, s)| s).unwrap_or(0.0)
+        kept.pop()
+            .map(|HeadEntry(_, doc, tf)| key(doc, tf))
+            .unwrap_or(0.0)
     };
-    if let Some(rows) = enc.rows {
-        for (doc, _) in &mut out.docs {
-            *doc = rows[*doc as usize];
-        }
-    }
+    out.docs.clear();
+    out.docs
+        .extend(kept.into_iter().map(|HeadEntry(_, doc, tf)| {
+            let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
+            (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
+        }));
     out.bound = bound;
+    out.avgdl = enc.avgdl;
+    out.params = enc.params;
 }
 
 impl Default for FtsBuilder {
@@ -4643,6 +4666,8 @@ fn write_term<W: Write>(
                 entry: dict_entry,
                 head: &head.docs,
                 tail: head.tail,
+                avgdl: head.avgdl,
+                params: head.params,
                 complete: head.complete,
             },
         )?;

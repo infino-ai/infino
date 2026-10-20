@@ -292,9 +292,7 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
-    /// The buckets this table scores by. Test-only: the query path indexes
-    /// them and never needs the slice.
-    #[cfg(test)]
+    /// The buckets this table scores by.
     pub(super) fn buckets(&self) -> &[u8] {
         &self.bytes
     }

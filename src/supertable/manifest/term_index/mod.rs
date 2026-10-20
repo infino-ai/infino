@@ -58,7 +58,7 @@ pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
-pub(crate) use tier::{TierChunkRef, TierDirectory, TierEntry};
+pub(crate) use tier::{ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
@@ -1408,8 +1408,22 @@ mod tests {
     }
 
     /// A contribution whose terms carry heads: `(column, term, docs)` with
-    /// each doc `(row, impact)`; df is the doc count and the head is
+    /// each doc `(row, weight)`; df is the doc count and the head is
     /// complete when `complete_up_to` covers it.
+    /// The facts a fixture document of weight `w` is planted with: a term
+    /// frequency of a hundred times the weight at length bucket zero, so
+    /// the key orders like the weight.
+    fn facts_of(w: f32) -> (u32, u8) {
+        ((w * 100.0).round() as u32, 0)
+    }
+
+    /// The tier key of a fixture document of weight `w`, at the scoring
+    /// the fixtures plant their heads at.
+    fn key_of(w: f32) -> f32 {
+        let (tf, len) = facts_of(w);
+        ColumnScoring::default().key(tf, len)
+    }
+
     fn contribution_with_heads(
         dir: &TempDir,
         id: u128,
@@ -1418,21 +1432,29 @@ mod tests {
     ) -> Contribution {
         let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id), id as i128 * 1000)
             .expect("create");
-        let mut keyed: Vec<(Vec<u8>, &Vec<(u32, f32)>)> = terms
+        let mut keyed: Vec<(Vec<u8>, &str, &Vec<(u32, f32)>)> = terms
             .iter()
-            .map(|(c, t, docs)| (fid(c).term_key(t), docs))
+            .map(|(c, t, docs)| (fid(c).term_key(t), *c, docs))
             .collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
-        for (key, docs) in keyed {
+        for (key, column, docs) in keyed {
+            w.set_scoring(fid(column), ColumnScoring::default());
             let mut sorted = docs.clone();
             sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
             let bound = sorted.first().map(|d| d.1).unwrap_or(0.0);
             let complete = sorted.len() <= complete_up_to;
-            let kept: Vec<(u32, f32)> = sorted.iter().copied().take(complete_up_to).collect();
+            let kept: Vec<(u32, u32, u8)> = sorted
+                .iter()
+                .take(complete_up_to)
+                .map(|&(row, w)| {
+                    let (tf, len) = facts_of(w);
+                    (row, tf, len)
+                })
+                .collect();
             let tail = if complete {
                 0.0
             } else {
-                sorted[complete_up_to].1
+                key_of(sorted[complete_up_to].1)
             };
             w.push(
                 &key,
@@ -1538,8 +1560,8 @@ mod tests {
                 .expect("posting")
                 .tail
         };
-        assert_eq!(tail(0), 1.3);
-        assert_eq!(tail(1), 2.2);
+        assert_eq!(tail(0), key_of(1.3));
+        assert_eq!(tail(1), key_of(2.2));
         assert_eq!(tail(2), 0.0, "nothing of superfile 2 was dropped");
         let beta = slice
             .run(&fid("body").term_key("beta"))
@@ -1793,8 +1815,8 @@ mod tests {
 
     /// A source that already truncated cannot give a merge the entries it
     /// dropped, so a merge of truncated sources is not a fresh build; what
-    /// it must still be is sound: every posting's tail bounds the impacts
-    /// of that superfile's documents the merged tier does not hold.
+    /// it must still be is sound: every posting's tail bounds the keys of
+    /// that superfile's documents the merged tier does not hold.
     #[test]
     fn merging_truncated_tiers_keeps_every_tail_an_upper_bound() {
         let dir = TempDir::new().expect("tempdir");
@@ -1853,11 +1875,12 @@ mod tests {
                 .iter()
                 .find(|p| p.superfile == ordinal)
                 .expect("posting");
-            for &(row, impact) in &heads.iter().find(|h| h.0 == id).expect("heads").1 {
+            for &(row, w) in &heads.iter().find(|h| h.0 == id).expect("heads").1 {
                 if !held.contains(&(ordinal, row)) {
                     assert!(
-                        posting.tail >= impact,
-                        "superfile {id} row {row}: impact {impact} above tail {}",
+                        posting.tail >= key_of(w),
+                        "superfile {id} row {row}: key {} above tail {}",
+                        key_of(w),
                         posting.tail
                     );
                 }

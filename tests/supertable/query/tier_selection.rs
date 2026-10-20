@@ -261,9 +261,12 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // Opens one at a time, so a superfile that can only tie the k-th
+        // score is asked about after the first has set the floor.
         let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
             .expect("options")
-            .with_storage(storage);
+            .with_storage(storage)
+            .with_bound_ordered_open_window(1);
         if !tiers {
             options = options.with_term_tier_entries_per_term(0);
         }
@@ -313,6 +316,16 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
                 stats.tier_entries < total,
                 "{query:?} {mode:?} k={k}: read {} tier entries of at least {total}",
                 stats.tier_entries
+            );
+            // Every superfile holds the same documents, so after the first
+            // open every other can only tie the k-th score, and a tie is
+            // settled by `_id` order: the first superfile's documents come
+            // first, so the rest are not opened. The tiers' bound for a
+            // candidate is its score bit for bit, which is what lets the
+            // tie be recognised before the open.
+            assert_eq!(
+                stats.score_pruning_survived, 1,
+                "{query:?} {mode:?} k={k}: only the first superfile is opened"
             );
         }
     }

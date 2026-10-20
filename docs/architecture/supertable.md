@@ -324,12 +324,19 @@ A ceiling is a bound on a superfile's best document for one term, and
 on a large table nearly every superfile's ceiling for a common term
 clears the running k-th score, so a query over common terms opened most
 of the table. The index therefore also keeps, per term, a *tier*: the
-term's best documents table-wide by BM25 impact, each as `(superfile,
-local document id, exact impact)`, cut into blocks whose directory
-carries the block's largest impact. The tier holds a term's whole list
-when the list fits a per-term budget and its top of that budget
-otherwise; each posting then also records a *tail*, the largest impact
-of a document in that superfile the tier left out. The budget is settled
+term's best documents table-wide, each as `(superfile, local document
+id, term frequency, length bucket)` — the facts a score is computed
+from, not a score, so a reader computes a candidate's contribution
+exactly as the superfile's kernel would (the table's idf times
+`tf / (tf + norm)` at the same quantized length) and a one- or two-term
+query knows its candidates' scores bit for bit before any open. Entries
+are ordered by the length-normalized term frequency at the superfile's
+own average length, cut into blocks whose directory carries the block's
+largest such key; a reader scales a key to the table's average as it
+scales any stored ceiling. The tier holds a term's whole list when the
+list fits a per-term budget and its top of that budget otherwise; each
+posting then also records a *tail*, the largest key of a document in
+that superfile the tier left out. The budget is settled
 by the build itself from a pass over the terms' frequencies: the largest
 count at which the tiers hold a small share of all postings, so a table
 of short texts, whose postings are few per document and whose
