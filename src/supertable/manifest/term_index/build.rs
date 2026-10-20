@@ -96,6 +96,11 @@ const BUDGET_LADDER_STEPS_PER_OCTAVE: u32 = 2;
 /// postings; the ladder has to reach down to a handful, where the tiers
 /// are the few best documents of each term and no more.
 const BUDGET_LADDER_FLOOR: u64 = 8;
+/// Entries the tiers may always hold, whatever the share: a small table's
+/// share of its postings is a few thousand entries, and a floor of this
+/// many — a few hundred kilobytes — keeps its lists complete instead of
+/// cutting them to the ladder's lowest rung for no saving worth having.
+const BUDGET_CAP_MIN_ENTRIES: u64 = 1 << 16;
 
 /// The tier budget for a table of `n_docs` documents under the default
 /// policy.
@@ -235,10 +240,10 @@ impl BudgetScan {
         }
     }
 
-    /// The largest rung whose entries fit `share` of the postings; the
-    /// floor when none does.
-    fn pick(&self, share: f64) -> u64 {
-        let cap = (self.postings as f64 * share) as u64;
+    /// The largest rung whose entries fit `share` of the postings, or
+    /// `min_cap` entries when that is more; the floor when none does.
+    fn pick(&self, share: f64, min_cap: u64) -> u64 {
+        let cap = ((self.postings as f64 * share) as u64).max(min_cap);
         self.ladder
             .iter()
             .zip(&self.held)
@@ -1295,7 +1300,7 @@ fn budget_over_streams<S>(
         }
         scan.add(df);
     }
-    Ok(scan.pick(share))
+    Ok(scan.pick(share, BUDGET_CAP_MIN_ENTRIES))
 }
 
 /// The budget for a build over `contributions`.
@@ -1761,11 +1766,14 @@ mod tests {
         }
         // At 6%: 60,600 entries; the tail takes 10,000, leaving 5,060 per
         // common term — the ladder's rung at or under that is 4,096.
-        assert_eq!(scan.pick(0.06), 4_096);
+        assert_eq!(scan.pick(0.06, 0), 4_096);
         // At 1%: 10,100 entries, barely the tail; only the floor fits.
-        assert_eq!(scan.pick(0.01), 64);
+        assert_eq!(scan.pick(0.01, 0), 64);
         // At 100%: everything fits, up to the ceiling.
-        assert_eq!(scan.pick(1.0), 1 << 20);
+        assert_eq!(scan.pick(1.0, 0), 1 << 20);
+        // A minimum cap lifts a small table above the share: at 1% with a
+        // 60,600-entry floor the pick is what 6% gave.
+        assert_eq!(scan.pick(0.01, 60_600), 4_096);
     }
 
     /// A fixed budget resolves to itself; a share resolves through the scan
@@ -1777,18 +1785,18 @@ mod tests {
             tier_share_of_postings: Some(0.5),
             ..BuildPolicy::default()
         };
-        // Two sources each holding "a" with df 3,000 and one holding "b"
-        // with df 10: "a" is one term of df 6,000. Half the postings is
-        // 3,005 entries; the ladder's half-octave rung at or under
-        // 3,005 - 10 is 2,896 (2,048 times the square root of two).
+        // Two sources each holding "a" with df 300,000 and one holding "b"
+        // with df 10: "a" is one term of df 600,000. Half the postings is
+        // 300,005 entries; the ladder's half-octave rung at or under
+        // 300,005 - 10 is 262,144.
         let sources: Vec<Vec<(Vec<u8>, u64)>> = vec![
-            vec![(b"a".to_vec(), 3_000), (b"b".to_vec(), 10)],
-            vec![(b"a".to_vec(), 3_000)],
+            vec![(b"a".to_vec(), 300_000), (b"b".to_vec(), 10)],
+            vec![(b"a".to_vec(), 300_000)],
         ];
         let streams: Vec<std::vec::IntoIter<(Vec<u8>, u64)>> =
             sources.into_iter().map(Vec::into_iter).collect();
         let budget = budget_over_streams(streams, |s| Ok(s.next()), &policy).expect("budget");
-        assert_eq!(budget, 2_896);
+        assert_eq!(budget, 262_144);
         let fixed = BuildPolicy {
             tier_entries_per_term: 77,
             tier_share_of_postings: None,
