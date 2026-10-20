@@ -88,9 +88,14 @@ pub(crate) const TIER_ENTRIES_MAX: u64 = 1 << 22;
 /// by documents copied nearly every posting into a tier. At six percent a
 /// long-text table's tiers come to about nine percent of its bytes.
 pub(crate) const TIER_SHARE_OF_POSTINGS: f64 = 0.06;
-/// Budgets the pre-pass chooses among: a half-octave ladder from the
-/// floor to the ceiling.
+/// Budgets the pre-pass chooses among: a half-octave ladder from
+/// [`BUDGET_LADDER_FLOOR`] to the ceiling.
 const BUDGET_LADDER_STEPS_PER_OCTAVE: u32 = 2;
+/// The smallest budget the share may settle on. A titles table's tail is
+/// so fat that even two thousand entries per term held most of its
+/// postings; the ladder has to reach down to a handful, where the tiers
+/// are the few best documents of each term and no more.
+const BUDGET_LADDER_FLOOR: u64 = 8;
 
 /// The tier budget for a table of `n_docs` documents under the default
 /// policy.
@@ -1267,7 +1272,7 @@ fn budget_over_streams<S>(
         }
     }
     let mut scan = BudgetScan::new(
-        TIER_ENTRIES_MIN.min(policy.tier_entries_per_term),
+        BUDGET_LADDER_FLOOR.min(policy.tier_entries_per_term),
         policy.tier_entries_per_term,
     );
     while let Some(Reverse(head)) = heap.pop() {
