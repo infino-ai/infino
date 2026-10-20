@@ -494,6 +494,7 @@ impl Supertable {
                         .unwrap_or(0),
                     n_docs: entry.n_docs,
                     tombstoned_docs,
+                    id_min: entry.id_min,
                     sealed_by_other,
                     birth_version: entry.birth_version,
                     stale_type: !unconverted_columns(entry, &schema, &manifest.options.id_column)

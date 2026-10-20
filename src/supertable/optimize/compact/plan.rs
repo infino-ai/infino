@@ -39,6 +39,10 @@ pub struct SuperfileStats {
     pub size_bytes: u64,
     pub n_docs: u64,
     pub tombstoned_docs: u64,
+    /// The smallest document id the superfile holds: the key compaction
+    /// packs neighbours by, so merged outputs keep the disjoint, monotone
+    /// id ranges ingest gave their inputs.
+    pub id_min: i128,
     /// Already owned by another compaction so skip it.
     pub sealed_by_other: bool,
     /// Commit version the superfile was born at. A merged superfile carries
@@ -162,12 +166,18 @@ fn pack_partition(
         .filter(|s| !s.sealed_by_other && (s.size_bytes < target_bytes || s.stale_type))
         .collect();
 
-    // Most-deleted first (reclaim space soonest), then smallest, then ID.
+    // Neighbours by document id pack together: ingest gives each superfile
+    // a contiguous id range disjoint from every other's, and a job over
+    // adjacent ranges produces an output whose range is as disjoint and as
+    // monotone as its inputs'. A ranked search leans on that — a superfile
+    // whose best document can only tie the k-th score is settled by id
+    // order, which is only decidable when ranges do not interleave. Every
+    // sub-target superfile is a candidate regardless, so tombstoned space is
+    // reclaimed in the same pass as before, in id order rather than
+    // most-deleted first.
     candidates.sort_by(|a, b| {
-        let lhs = a.tombstoned_docs as u128 * b.n_docs.max(1) as u128;
-        let rhs = b.tombstoned_docs as u128 * a.n_docs.max(1) as u128;
-        rhs.cmp(&lhs)
-            .then(a.size_bytes.cmp(&b.size_bytes))
+        a.id_min
+            .cmp(&b.id_min)
             .then(a.superfile_id.cmp(&b.superfile_id))
     });
 
@@ -273,6 +283,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             size_bytes: mib(size_mib),
             n_docs,
             tombstoned_docs: tombstoned,
+            id_min: id as i128,
             sealed_by_other: false,
             birth_version: 0,
             stale_type: false,
@@ -427,13 +438,29 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert_eq!(jobs[0].estimated_output_bytes, mib(1000));
     }
 
+    /// Candidates pack by document id, whatever order they are listed in
+    /// and however deleted: a job's inputs are id-adjacent, so its output's
+    /// range does not interleave with any other output's.
     #[test]
-    fn prefers_most_deleted_first() {
-        let mut segs: Vec<_> = (0..9).map(|i| seg(i, 100, 1000, 0)).collect();
-        let dead_heavy = seg(100, 100, 1000, 900);
-        segs.push(dead_heavy.clone());
+    fn packs_id_adjacent_superfiles_together() {
+        // Ten sub-target superfiles listed out of id order, one of them
+        // mostly deleted; each job fills to the target from the lowest ids.
+        let order = [7u128, 2, 9, 0, 4, 1, 8, 3, 6, 5];
+        let segs: Vec<_> = order
+            .iter()
+            .map(|&i| seg(i, 300, 1000, if i == 9 { 900 } else { 0 }))
+            .collect();
         let jobs = select(&segs, &default_cfg());
-        assert_eq!(jobs[0].inputs[0], dead_heavy.superfile_id);
+        assert!(jobs.len() >= 2, "several jobs");
+        let mut seen = 0u128;
+        for job in &jobs {
+            let ids: Vec<u128> = job.inputs.iter().map(|u| u.as_u128()).collect();
+            assert!(
+                ids.windows(2).all(|w| w[0] < w[1]) && ids[0] == seen,
+                "job inputs are the next ids in order: {ids:?} after {seen}"
+            );
+            seen = ids[ids.len() - 1] + 1;
+        }
     }
 
     #[test]
@@ -541,6 +568,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
                 size_bytes: mib(size_mib),
                 n_docs,
                 tombstoned_docs: n_docs * tombstone_pct / 100,
+                id_min: index as i128,
                 sealed_by_other,
                 birth_version,
                 stale_type: false,
