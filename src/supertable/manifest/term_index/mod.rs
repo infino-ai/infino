@@ -58,7 +58,7 @@ pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
-pub(crate) use tier::{ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
+pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 

@@ -57,14 +57,20 @@ use crate::{
             SuperfileEntry,
             part::ContentHash,
             term_index::{
-                Posting, SliceRun, TermIndex, TermIndexError, TierChunkRef, TierDirectory,
-                TierEntry,
+                BLOCK_ENTRIES, Posting, SliceRun, TermIndex, TermIndexError, TierChunkRef,
+                TierDirectory, TierEntry,
             },
         },
         schema::FieldId,
     },
 };
 
+/// Blocks per term a merge reads before it gives up on a threshold: a
+/// conjunction whose terms' best documents are not each other's has found
+/// fewer than `k` joint candidates by then, and reading on to the cap costs
+/// more than the opens it might save. The bounds read so far stay sound
+/// and order the opens; nothing is excluded without a threshold.
+const THRESHOLD_PROBE_BLOCKS_PER_TERM: usize = 4;
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
@@ -302,7 +308,7 @@ pub(crate) async fn select_with_tiers(
         best_ub: vec![f32::NEG_INFINITY; n_sf * n_masks],
         topk: BinaryHeap::with_capacity(k + 1),
         n_masks,
-        full: (n_masks - 1) as u8,
+        required,
         k,
         exact,
         lb_slack,
@@ -389,6 +395,10 @@ pub(crate) async fn select_with_tiers(
             INEXACT_ENTRIES_PER_QUERY
         };
         if entries_read >= cap {
+            break;
+        }
+        let probe = (THRESHOLD_PROBE_BLOCKS_PER_TERM * BLOCK_ENTRIES * nt) as u64;
+        if !theta_lb.is_finite() && entries_read >= probe {
             break;
         }
         // The stream whose next block has the highest (scaled) maximum.
@@ -519,10 +529,10 @@ struct Candidates {
     /// The `k` best lower bounds among documents carrying every term.
     topk: BinaryHeap<Reverse<OrdF32>>,
     n_masks: usize,
-    /// The mask of every term.
-    full: u8,
+    /// The mask of the terms a matching document must carry.
+    required: u8,
     k: usize,
-    /// Whether a full candidate's sum is a score the query gives.
+    /// Whether a candidate's sum is a score the query gives.
     exact: bool,
     /// What a sum is narrowed and widened by for its lower and upper bound:
     /// one when the sum is the kernel's bit for bit.
@@ -557,7 +567,11 @@ impl Candidates {
         if ub > self.best_ub[at] {
             self.best_ub[at] = ub;
         }
-        if self.exact && cand.0 == self.full {
+        // A candidate carrying every required term is a document the query
+        // returns, and its contributions so far are a lower bound on its
+        // score: for a disjunction any candidate, for a conjunction one
+        // with every term, for a mix one with every must.
+        if self.exact && cand.0 & self.required == self.required {
             self.topk.push(Reverse(OrdF32(lb)));
             if self.topk.len() > self.k {
                 self.topk.pop();
@@ -565,7 +579,8 @@ impl Candidates {
         }
     }
 
-    /// The k-th best full candidate's lower bound, once `k` have been seen.
+    /// The k-th best lower bound among candidates carrying the required
+    /// terms, once `k` have been seen.
     fn threshold(&self) -> Option<f32> {
         if self.topk.len() < self.k {
             return None;
