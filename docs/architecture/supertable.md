@@ -340,7 +340,10 @@ memory for the uploads in flight, not for the index. The
 blocks of every term in a slice sit back to back in that slice's tier
 object, named by offset from the run, so a query reads a block with a
 ranged fetch (each block carries a checksum) and a term's tier costs the
-index a few bytes more in the slice.
+index a few bytes more in the slice. A tier of no more than a few entries
+is written in the run itself instead: on a table of short texts most
+terms have a posting or two, and a block's fixed header would outweigh
+them.
 
 A ranked query of plain terms merges its terms' tiers in descending
 impact before it opens anything. Per superfile it learns the best known

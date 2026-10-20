@@ -38,7 +38,10 @@
 //! superfile's, and by the average-length factor — up for an upper bound,
 //! down for a lower one — so a bound stays a bound at the table's average.
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap, HashSet},
+};
 
 use bytes::Bytes;
 use rustc_hash::FxHashMap;
@@ -219,6 +222,8 @@ pub(crate) async fn select_with_tiers(
     let n_sf = kept.len();
     let mut per_term: Vec<Vec<TermInFile>> = vec![vec![TermInFile::default(); n_sf]; nt];
     let mut streams: Vec<Stream> = Vec::new();
+    // Entries of tiers small enough to ride in their runs, with their term.
+    let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     for (ti, term) in terms.iter().enumerate() {
         let Some(&idf_table) = global_idf.get(*term) else {
             return Ok(None);
@@ -232,9 +237,6 @@ pub(crate) async fn select_with_tiers(
                 // kept none for the term; no sound frontier exists for it.
                 None if run.postings.is_empty() => continue,
                 None => return Ok(None),
-            };
-            let Some(object) = *tier_object else {
-                return Ok(None);
             };
             for p in &run.postings {
                 let Some(id) = index.superfile_id(p.superfile) else {
@@ -259,6 +261,13 @@ pub(crate) async fn select_with_tiers(
                 scale_up_max = scale_up_max.max(entry.scale_ub);
                 per_term[ti][slot] = entry;
             }
+            if tier.chunks.is_empty() {
+                inline.extend(tier.inline.iter().map(|e| (ti, *e)));
+                continue;
+            }
+            let Some(object) = *tier_object else {
+                return Ok(None);
+            };
             streams.push(Stream {
                 term: ti,
                 object,
@@ -276,13 +285,16 @@ pub(crate) async fn select_with_tiers(
     }
 
     let n_masks = 1usize << nt;
-    let full = (n_masks - 1) as u8;
-    let mut acc: FxHashMap<(u32, u32), (u8, f32, f32)> = FxHashMap::default();
-    // Per superfile, per mask: best known (lower-bound sum, upper-bound sum).
-    let mut best_lb = vec![f32::NEG_INFINITY; n_sf * n_masks];
-    let mut best_ub = vec![f32::NEG_INFINITY; n_sf * n_masks];
-    let mut topk: std::collections::BinaryHeap<std::cmp::Reverse<OrdF32>> =
-        std::collections::BinaryHeap::with_capacity(k + 1);
+    let mut cands = Candidates {
+        acc: FxHashMap::default(),
+        best_lb: vec![f32::NEG_INFINITY; n_sf * n_masks],
+        best_ub: vec![f32::NEG_INFINITY; n_sf * n_masks],
+        topk: BinaryHeap::with_capacity(k + 1),
+        n_masks,
+        full: (n_masks - 1) as u8,
+        k,
+        exact,
+    };
     let mut theta_lb = f32::NEG_INFINITY;
     let mut tier_bytes = 0u64;
     let mut entries_read = 0u64;
@@ -297,66 +309,20 @@ pub(crate) async fn select_with_tiers(
     let mut prev_excluded = 0usize;
     let mut stale_rounds = 0u32;
 
+    // The inline entries are in hand before any chunk is read; they take
+    // part in the first round's threshold and exclusion like a read block.
+    entries_read += inline.len() as u64;
+    for (ti, e) in &inline {
+        cands.absorb(*ti, e, index, &slot_of, &per_term);
+    }
+
+    // Each round settles what is known — threshold, frontiers, exclusions
+    // — then reads the block most likely to move them.
     loop {
-        // The stream whose next block has the highest (scaled) maximum.
-        let mut pick: Option<(usize, f32)> = None;
-        for (si, s) in streams.iter_mut().enumerate() {
-            let Some(max) = next_block_max(index, s, &mut tier_bytes).await? else {
-                continue;
-            };
-            let scaled = max * s.scale_up;
-            if pick.is_none_or(|(_, m)| scaled > m) {
-                pick = Some((si, scaled));
-            }
+        if let Some(min) = cands.threshold() {
+            theta_lb = min;
         }
-        let Some((si, _)) = pick else {
-            break;
-        };
-        // Read it.
-        {
-            let s = &mut streams[si];
-            let bytes = s
-                .bytes
-                .as_ref()
-                .expect("a stream with a next block has its chunk loaded");
-            let chunk = TierChunk::open(bytes)?;
-            chunk.decode_block(s.block, &mut decoded)?;
-            entries_read += decoded.len() as u64;
-            let ti = s.term;
-            for e in &decoded {
-                let Some(id) = index.superfile_id(e.superfile) else {
-                    continue;
-                };
-                let Some(&slot) = slot_of.get(&id) else {
-                    continue;
-                };
-                let tf = per_term[ti][slot];
-                let cand = acc.entry((e.superfile, e.doc_id)).or_insert((0, 0.0, 0.0));
-                cand.0 |= 1 << ti;
-                cand.1 += e.impact * tf.scale_lb;
-                cand.2 += e.impact * tf.scale_ub;
-                let at = slot * n_masks + cand.0 as usize;
-                if cand.1 > best_lb[at] {
-                    best_lb[at] = cand.1;
-                }
-                if cand.2 > best_ub[at] {
-                    best_ub[at] = cand.2;
-                }
-                if exact && cand.0 == full {
-                    topk.push(std::cmp::Reverse(OrdF32(cand.1)));
-                    if topk.len() > k {
-                        topk.pop();
-                    }
-                }
-            }
-            s.block += 1;
-        }
-        if topk.len() >= k
-            && let Some(std::cmp::Reverse(OrdF32(min))) = topk.peek()
-        {
-            theta_lb = *min;
-        }
-        // Frontiers after this block.
+        // Frontiers over the unread blocks.
         for (ti, slot) in frontier.iter_mut().enumerate() {
             let mut f: Option<f32> = None;
             for s in streams.iter_mut().filter(|s| s.term == ti) {
@@ -375,8 +341,14 @@ pub(crate) async fn select_with_tiers(
                 if *out {
                     continue;
                 }
-                let (ub_now, ub_floor) =
-                    bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
+                let (ub_now, ub_floor) = bounds_of(
+                    slot,
+                    n_masks,
+                    &cands.best_ub,
+                    &per_term,
+                    &frontier,
+                    required,
+                );
                 if ub_now * BOUND_SLACK < theta_lb {
                     *out = true;
                 } else if ub_floor * BOUND_SLACK < theta_lb {
@@ -389,10 +361,10 @@ pub(crate) async fn select_with_tiers(
         }
         let n_excluded = excluded.iter().filter(|e| **e).count();
         let moved = frontier != prev_frontier
-            || acc.len() != prev_candidates
+            || cands.acc.len() != prev_candidates
             || n_excluded != prev_excluded;
         prev_frontier.clone_from(&frontier);
-        prev_candidates = acc.len();
+        prev_candidates = cands.acc.len();
         prev_excluded = n_excluded;
         stale_rounds = if moved { 0 } else { stale_rounds + 1 };
         if stale_rounds >= STALE_ROUNDS_BEFORE_STOP {
@@ -406,11 +378,44 @@ pub(crate) async fn select_with_tiers(
         if entries_read >= cap {
             break;
         }
+        // The stream whose next block has the highest (scaled) maximum.
+        let mut pick: Option<(usize, f32)> = None;
+        for (si, s) in streams.iter_mut().enumerate() {
+            let Some(max) = next_block_max(index, s, &mut tier_bytes).await? else {
+                continue;
+            };
+            let scaled = max * s.scale_up;
+            if pick.is_none_or(|(_, m)| scaled > m) {
+                pick = Some((si, scaled));
+            }
+        }
+        let Some((si, _)) = pick else {
+            break;
+        };
+        let s = &mut streams[si];
+        let bytes = s
+            .bytes
+            .as_ref()
+            .expect("a stream with a next block has its chunk loaded");
+        let chunk = TierChunk::open(bytes)?;
+        chunk.decode_block(s.block, &mut decoded)?;
+        entries_read += decoded.len() as u64;
+        for e in &decoded {
+            cands.absorb(s.term, e, index, &slot_of, &per_term);
+        }
+        s.block += 1;
     }
 
     let mut bounds = HashMap::with_capacity(n_sf);
     for (slot, e) in kept.iter().enumerate() {
-        let (ub_now, _) = bounds_of(slot, n_masks, &best_ub, &per_term, &frontier, required);
+        let (ub_now, _) = bounds_of(
+            slot,
+            n_masks,
+            &cands.best_ub,
+            &per_term,
+            &frontier,
+            required,
+        );
         let ub = if excluded[slot] {
             f32::NEG_INFINITY
         } else {
@@ -421,7 +426,7 @@ pub(crate) async fn select_with_tiers(
             if m as u8 & required != required {
                 continue;
             }
-            lb = lb.max(best_lb[slot * n_masks + m]);
+            lb = lb.max(cands.best_lb[slot * n_masks + m]);
         }
         bounds.insert(e.superfile_id, SuperfileBounds { lb, ub });
     }
@@ -431,6 +436,73 @@ pub(crate) async fn select_with_tiers(
         tier_bytes,
         entries_read,
     }))
+}
+
+/// What the merge knows of the documents the tiers have shown it.
+struct Candidates {
+    /// Per (superfile ordinal, row): the terms seen and the summed lower
+    /// and upper bounds of their impacts.
+    acc: FxHashMap<(u32, u32), (u8, f32, f32)>,
+    /// Per superfile, per term mask: best known lower-bound sum.
+    best_lb: Vec<f32>,
+    /// Per superfile, per term mask: best known upper-bound sum.
+    best_ub: Vec<f32>,
+    /// The `k` best lower bounds among documents carrying every term.
+    topk: BinaryHeap<Reverse<OrdF32>>,
+    n_masks: usize,
+    /// The mask of every term.
+    full: u8,
+    k: usize,
+    /// Whether a full candidate's lower bound is a score the query gives.
+    exact: bool,
+}
+
+impl Candidates {
+    /// Fold one tier entry of term `ti` in.
+    fn absorb(
+        &mut self,
+        ti: usize,
+        e: &TierEntry,
+        index: &TermIndex,
+        slot_of: &HashMap<Uuid, usize>,
+        per_term: &[Vec<TermInFile>],
+    ) {
+        let Some(id) = index.superfile_id(e.superfile) else {
+            return;
+        };
+        let Some(&slot) = slot_of.get(&id) else {
+            return;
+        };
+        let tf = per_term[ti][slot];
+        let cand = self
+            .acc
+            .entry((e.superfile, e.doc_id))
+            .or_insert((0, 0.0, 0.0));
+        cand.0 |= 1 << ti;
+        cand.1 += e.impact * tf.scale_lb;
+        cand.2 += e.impact * tf.scale_ub;
+        let at = slot * self.n_masks + cand.0 as usize;
+        if cand.1 > self.best_lb[at] {
+            self.best_lb[at] = cand.1;
+        }
+        if cand.2 > self.best_ub[at] {
+            self.best_ub[at] = cand.2;
+        }
+        if self.exact && cand.0 == self.full {
+            self.topk.push(Reverse(OrdF32(cand.1)));
+            if self.topk.len() > self.k {
+                self.topk.pop();
+            }
+        }
+    }
+
+    /// The k-th best full candidate's lower bound, once `k` have been seen.
+    fn threshold(&self) -> Option<f32> {
+        if self.topk.len() < self.k {
+            return None;
+        }
+        self.topk.peek().map(|Reverse(OrdF32(min))| *min)
+    }
 }
 
 /// The upper bound on a document a posting's tier does not hold: the
@@ -523,12 +595,12 @@ async fn next_block_max(
 struct OrdF32(f32);
 impl Eq for OrdF32 {}
 impl PartialOrd for OrdF32 {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for OrdF32 {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+    fn cmp(&self, other: &Self) -> Ordering {
         self.0.total_cmp(&other.0)
     }
 }

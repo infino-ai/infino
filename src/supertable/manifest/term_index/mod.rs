@@ -1164,9 +1164,10 @@ impl TermIndex {
         for (hash, tier_object) in refs {
             let bytes = self.slice_bytes(&hash).await?;
             if let Some(run) = Slice::open(&bytes)?.run(&key)? {
-                if run.tier.is_some() && tier_object.is_none() {
+                let chunked = run.tier.as_ref().is_some_and(|t| !t.chunks.is_empty());
+                if chunked && tier_object.is_none() {
                     return Err(TermIndexError::Malformed(
-                        "a run has a tier but its slice names no tier object".into(),
+                        "a run has tier chunks but its slice names no tier object".into(),
                     ));
                 }
                 out.push(SliceRun { tier_object, run });
@@ -1189,7 +1190,7 @@ impl TermIndex {
         object: &ContentHash,
         tier: &TierRef,
     ) -> Result<Vec<TierEntry>, TermIndexError> {
-        let mut out = Vec::new();
+        let mut out = tier.inline.clone();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
             let bytes = self.tier_chunk(object, chunk).await?;
@@ -1272,6 +1273,7 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
+        build::TIER_INLINE_MAX,
         format::{ROOT_MAGIC, Segment, SliceRef},
         *,
     };
@@ -1369,18 +1371,21 @@ mod tests {
         w.finish().expect("finish")
     }
 
-    /// The entries of `tier`, read from the first slice's tier object among
-    /// `built_tiers`: these fixtures build one slice.
     /// A built object's bytes, wherever the build kept them.
     fn bytes_of(built: &BuiltBytes) -> Vec<u8> {
         built.read().expect("built bytes")
     }
 
+    /// The entries of `tier`: inline, or read from the first slice's tier
+    /// object among `built_tiers` (these fixtures build one slice).
     fn tier_entries_of(
         segment: &Segment,
         built_tiers: &[(ContentHash, BuiltBytes)],
         tier: &format::TierRef,
     ) -> Vec<tier::TierEntry> {
+        if tier.chunks.is_empty() {
+            return tier.inline.clone();
+        }
         let object = segment.slices[0]
             .tier
             .as_ref()
@@ -1467,13 +1472,116 @@ mod tests {
             tier_entries_of(&built.root.segments[0], &built.tiers, &beta_tier).len(),
             1
         );
-        // One tier object per slice, named by the slice and sized exactly.
+        // Both tiers are a few entries: they ride in their runs, and the
+        // slice has no tier object.
+        assert!(tier.chunks.is_empty() && beta_tier.chunks.is_empty());
         let segment = &built.root.segments[0];
         assert_eq!(segment.slices.len(), 1);
-        let object = segment.slices[0].tier.as_ref().expect("tier object");
-        assert_eq!(built.tiers.len(), 1, "one tier object for the one slice");
-        assert_eq!(built.tiers[0].0, object.content_hash);
-        assert_eq!(bytes_of(&built.tiers[0].1).len() as u64, object.len);
+        assert!(segment.slices[0].tier.is_none(), "nothing to chunk");
+        assert!(built.tiers.is_empty());
+    }
+
+    /// A tier of more than a few entries is chunked into the slice's tier
+    /// object; one of a few rides in the run. A merge keeps each where it
+    /// belongs and renumbers the inline entries like the chunked ones.
+    #[test]
+    fn a_tier_of_a_few_entries_rides_in_the_run() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let per_file = (TIER_INLINE_MAX / 2 + 1) as u32;
+        let make = |id: u128| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "common", docs(id as f32, per_file)),
+                    ("body", "rare", docs(0.5, 2)),
+                ],
+                1000,
+            )
+        };
+        let policy = BuildPolicy {
+            slice_target_bytes: usize::MAX,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[make(1), make(2)], &policy).expect("build");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
+        let run_of = |term: &str| {
+            slice
+                .run(&fid("body").term_key(term))
+                .expect("run")
+                .expect("indexed")
+        };
+        let common = run_of("common").tier.expect("tier");
+        let rare = run_of("rare").tier.expect("tier");
+        assert!(
+            !common.chunks.is_empty() && common.inline.is_empty(),
+            "more than a few entries are chunked"
+        );
+        assert!(
+            rare.chunks.is_empty() && rare.inline.len() == 4,
+            "a few entries ride in the run: {rare:?}"
+        );
+        assert!(rare.complete && common.complete);
+        let segment = &built.root.segments[0];
+        assert_eq!(
+            built.tiers.len(),
+            1,
+            "one tier object, for the chunked tier"
+        );
+        assert_eq!(
+            tier_entries_of(segment, &built.tiers, &common).len(),
+            2 * per_file as usize
+        );
+        let mut inline_ids: Vec<(u32, u32)> = rare
+            .inline
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        inline_ids.sort_unstable();
+        assert_eq!(inline_ids, vec![(0, 0), (0, 3), (1, 0), (1, 3)]);
+
+        // A merge that drops the first superfile renumbers the second to
+        // ordinal 0 in the inline entries as in the chunked ones.
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
+        let sources = vec![spill_slices(scratch.path(), built.slices).expect("place slices")];
+        let merged = merge_segments(&sources, &[None, Some(0)], &policy).expect("merge");
+        let merged_bytes = bytes_of(&merged.slices[0].1);
+        let merged_slice = Slice::open(&merged_bytes).expect("open");
+        let rare = merged_slice
+            .run(&fid("body").term_key("rare"))
+            .expect("run")
+            .expect("indexed")
+            .tier
+            .expect("tier");
+        let mut ids: Vec<(u32, u32)> = rare
+            .inline
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![(0, 0), (0, 3)]);
+        let common = merged_slice
+            .run(&fid("body").term_key("common"))
+            .expect("run")
+            .expect("indexed")
+            .tier
+            .expect("tier");
+        assert_eq!(
+            common.chunks.is_empty(),
+            per_file as usize <= TIER_INLINE_MAX,
+            "the merged tier is placed by its merged size"
+        );
+        let entries = tier_entries_of(&merged.segment, &merged.tiers, &common);
+        assert!(entries.iter().all(|e| e.superfile == 0));
+        assert_eq!(entries.len(), per_file as usize);
     }
 
     /// A build that spills writes each slice and tier object to a scratch

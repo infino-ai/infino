@@ -96,6 +96,11 @@ const BUDGET_LADDER_STEPS_PER_OCTAVE: u32 = 2;
 /// postings; the ladder has to reach down to a handful, where the tiers
 /// are the few best documents of each term and no more.
 const BUDGET_LADDER_FLOOR: u64 = 8;
+/// A tier of at most this many entries rides in its run instead of a
+/// chunk: a few bytes against a chunk's fixed header, directory and block
+/// header, which on a titles table — where most terms have a posting or
+/// two — came to more than the entries themselves.
+pub(crate) const TIER_INLINE_MAX: usize = 8;
 /// Entries the tiers may always hold, whatever the share: a small table's
 /// share of its postings is a few thousand entries, and a floor of this
 /// many — a few hundred kilobytes — keeps its lists complete instead of
@@ -282,11 +287,13 @@ struct TierSource {
     chunks: Vec<TierChunkRef>,
 }
 
-/// A term's tier, cut to the budget and encoded, before it is placed.
+/// A term's tier, cut to the budget and encoded, before it is placed: in
+/// chunks, or inline when small.
 struct EncodedTier {
     complete: bool,
     n_entries: u64,
     chunks: Vec<EncodedChunk>,
+    inline: Vec<TierEntry>,
 }
 
 /// A term ready to be written: postings with their tails raised, and the
@@ -342,14 +349,19 @@ fn encode_term(
     } else {
         term.entries.sort_unstable_by(order);
     }
-    let chunks = encode_tier(&term.entries);
+    let n_entries = term.entries.len() as u64;
+    let (chunks, inline) = match term.entries.len() <= TIER_INLINE_MAX {
+        true => (Vec::new(), term.entries),
+        false => (encode_tier(&term.entries), Vec::new()),
+    };
     Ok(EncodedTerm {
         key: term.key,
         postings: term.postings,
         tier: Some(EncodedTier {
             complete: term.complete && !truncated,
-            n_entries: term.entries.len() as u64,
+            n_entries,
             chunks,
+            inline,
         }),
     })
 }
@@ -1128,6 +1140,7 @@ impl SegmentWriter {
             complete: encoded.complete,
             n_entries: encoded.n_entries,
             chunks: self.refs_at(&encoded.chunks),
+            inline: encoded.inline,
         };
         let mut run = encode_run_with_tier(Some(&tier), &term.postings);
         if self.cuts_before(run.len()) {
@@ -1628,10 +1641,12 @@ pub(crate) fn merge_segments(
     let mut writer = SegmentWriter::for_merge(policy, ordinals)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
+    let mut entries: Vec<TierEntry> = Vec::new();
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
         run.clear();
         sources.clear();
+        entries.clear();
         let mut complete = true;
         let mut next = Some(head.ordinal);
         while let Some(source) = next {
@@ -1641,10 +1656,20 @@ pub(crate) fn merge_segments(
             match &source_run.tier {
                 Some(tier) => {
                     complete &= tier.complete;
-                    sources.push(TierSource {
-                        object: cursors[source as usize].tier_bytes()?,
-                        chunks: tier.chunks.clone(),
-                    });
+                    if tier.chunks.is_empty() {
+                        entries.extend(tier.inline.iter().filter_map(|e| {
+                            Some(TierEntry {
+                                superfile: (*ordinals.get(e.superfile as usize)?)?,
+                                doc_id: e.doc_id,
+                                impact: e.impact,
+                            })
+                        }));
+                    } else {
+                        sources.push(TierSource {
+                            object: cursors[source as usize].tier_bytes()?,
+                            chunks: tier.chunks.clone(),
+                        });
+                    }
                 }
                 // A run without a tier bounds its postings by their tails
                 // alone; the merged tier holds nothing for them and is not
@@ -1676,7 +1701,7 @@ pub(crate) fn merge_segments(
         writer.add_term(
             &key,
             mem::take(&mut run),
-            Vec::new(),
+            mem::take(&mut entries),
             mem::take(&mut sources),
             complete,
         )?;

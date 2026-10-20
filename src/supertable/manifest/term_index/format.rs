@@ -70,7 +70,7 @@ use uuid::Uuid;
 
 use super::{
     TermIndexError,
-    tier::{TierChunkRef, push_chunk_refs, read_chunk_refs},
+    tier::{TierChunkRef, TierEntry, push_chunk_refs, read_chunk_refs},
 };
 use crate::{
     supertable::manifest::{part::ContentHash, term_range::prefix_upper_bound},
@@ -98,6 +98,10 @@ pub(crate) const SLICE_FORMAT_VERSION: u32 = 2;
 const TIER_ABSENT: u8 = 0;
 /// Run header tag: a tier reference follows.
 const TIER_PRESENT: u8 = 1;
+/// Run header tag: the tier's entries follow in the run itself. A term of a
+/// few postings keeps its whole tier here — a handful of bytes — rather
+/// than in a chunk of its own, whose fixed cost would outweigh them.
+const TIER_INLINE: u8 = 2;
 
 const MAGIC_LEN: usize = 8;
 const U32_LEN: usize = 4;
@@ -217,14 +221,17 @@ pub(crate) struct Posting {
 }
 
 /// A term's tier, as its run names it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct TierRef {
     /// Every document of the term, table-wide, is in the tier.
     pub(crate) complete: bool,
-    /// Entries across all chunks.
+    /// Entries across all chunks, or inline.
     pub(crate) n_entries: u64,
-    /// The chunks in tier order.
+    /// The chunks in tier order; empty when the entries are inline.
     pub(crate) chunks: Vec<TierChunkRef>,
+    /// The entries themselves, in tier order, when the tier is small
+    /// enough to ride in the run.
+    pub(crate) inline: Vec<TierEntry>,
 }
 
 /// A term's run: its tier, if any, and one posting per superfile.
@@ -505,6 +512,16 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
     push_varint(&mut out, postings.len() as u32);
     match tier {
         None => out.push(TIER_ABSENT),
+        Some(t) if t.chunks.is_empty() => {
+            out.push(TIER_INLINE);
+            out.push(t.complete as u8);
+            push_varint(&mut out, t.inline.len() as u32);
+            for e in &t.inline {
+                push_varint(&mut out, e.superfile);
+                push_varint(&mut out, e.doc_id);
+                out.extend_from_slice(&e.impact.to_le_bytes());
+            }
+        }
         Some(t) => {
             out.push(TIER_PRESENT);
             out.push(t.complete as u8);
@@ -604,6 +621,41 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
                 complete,
                 n_entries,
                 chunks,
+                inline: Vec::new(),
+            })
+        }
+        TIER_INLINE => {
+            let complete = *bytes
+                .get(at)
+                .ok_or_else(|| malformed("run tier complete"))?
+                != 0;
+            at += 1;
+            let n =
+                read_varint(bytes, &mut at).ok_or_else(|| malformed("run tier entries"))? as usize;
+            let mut inline = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                let superfile =
+                    read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry ordinal"))?;
+                let doc_id =
+                    read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry row"))?;
+                let end = at
+                    .checked_add(F32_LEN)
+                    .ok_or_else(|| malformed("inline entry impact"))?;
+                let raw = bytes
+                    .get(at..end)
+                    .ok_or_else(|| malformed("inline entry impact"))?;
+                at = end;
+                inline.push(TierEntry {
+                    superfile,
+                    doc_id,
+                    impact: f32::from_le_bytes(raw.try_into().expect("4 bytes")),
+                });
+            }
+            Some(TierRef {
+                complete,
+                n_entries: n as u64,
+                chunks: Vec::new(),
+                inline,
             })
         }
         other => {
@@ -808,6 +860,33 @@ mod tests {
                     n_entries: 600_000 + i,
                 })
                 .collect(),
+            inline: Vec::new(),
+        }
+    }
+
+    /// A tier small enough to ride in the run.
+    fn sample_inline_tier() -> TierRef {
+        TierRef {
+            complete: true,
+            n_entries: 3,
+            chunks: Vec::new(),
+            inline: vec![
+                TierEntry {
+                    superfile: 0,
+                    doc_id: 7,
+                    impact: 2.5,
+                },
+                TierEntry {
+                    superfile: 3,
+                    doc_id: 100_000,
+                    impact: 2.25,
+                },
+                TierEntry {
+                    superfile: 3,
+                    doc_id: 100_001,
+                    impact: 0.125,
+                },
+            ],
         }
     }
 
@@ -819,6 +898,15 @@ mod tests {
         assert_eq!(run.tier, Some(sample_tier()));
         assert_eq!(run.postings, postings);
         assert_eq!(decode_run(&bytes).expect("postings only"), postings);
+        let inline = encode_run_with_tier(Some(&sample_inline_tier()), &postings);
+        let run = decode_run_with_tier(&inline).expect("decode");
+        assert_eq!(run.tier, Some(sample_inline_tier()));
+        assert_eq!(run.postings, postings);
+        assert_eq!(decode_run(&inline).expect("postings only"), postings);
+        assert!(
+            decode_run_with_tier(&inline[..inline.len() - 1]).is_err(),
+            "a truncated inline tier is refused"
+        );
         let without = encode_run(&postings);
         assert_eq!(decode_run_with_tier(&without).expect("decode").tier, None);
         let mut bad = without.clone();
