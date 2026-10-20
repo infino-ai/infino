@@ -41,9 +41,9 @@
 use std::{
     cmp::{Ordering, Reverse},
     collections::{BinaryHeap, HashMap, HashSet},
+    sync::Arc,
 };
 
-use bytes::Bytes;
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
@@ -54,7 +54,8 @@ use crate::{
             SuperfileEntry,
             part::ContentHash,
             term_index::{
-                Posting, SliceRun, TermIndex, TermIndexError, TierChunk, TierChunkRef, TierEntry,
+                Posting, SliceRun, TermIndex, TermIndexError, TierChunkRef, TierDirectory,
+                TierEntry,
             },
         },
         schema::FieldId,
@@ -110,7 +111,7 @@ pub(crate) struct TierSelection {
     /// Lower bound on the final k-th score; `NEG_INFINITY` when fewer than
     /// `k` documents were seen with every term.
     pub(crate) theta_lb: f32,
-    /// Tier chunk bytes consumed.
+    /// Tier bytes consumed: directories and block bodies.
     pub(crate) tier_bytes: u64,
     /// Tier entries decoded.
     pub(crate) entries_read: u64,
@@ -124,7 +125,8 @@ struct Stream {
     chunks: Vec<TierChunkRef>,
     chunk: usize,
     block: usize,
-    bytes: Option<Bytes>,
+    /// The current chunk's directory, once read.
+    dir: Option<Arc<TierDirectory>>,
     /// Largest scale any kept superfile applies to this term's stored
     /// impacts, so a block maximum bounds every superfile's unread entries.
     scale_up: f32,
@@ -274,7 +276,7 @@ pub(crate) async fn select_with_tiers(
                 chunks: tier.chunks.clone(),
                 chunk: 0,
                 block: 0,
-                bytes: None,
+                dir: None,
                 scale_up: scale_up_max,
             });
         }
@@ -393,12 +395,15 @@ pub(crate) async fn select_with_tiers(
             break;
         };
         let s = &mut streams[si];
-        let bytes = s
-            .bytes
+        let dir = s
+            .dir
             .as_ref()
-            .expect("a stream with a next block has its chunk loaded");
-        let chunk = TierChunk::open(bytes)?;
-        chunk.decode_block(s.block, &mut decoded)?;
+            .expect("a stream with a next block has its directory");
+        let body = index
+            .tier_block(&s.object, &s.chunks[s.chunk], dir, s.block)
+            .await?;
+        tier_bytes += body.len() as u64;
+        dir.decode_block(s.block, &body, &mut decoded)?;
         entries_read += decoded.len() as u64;
         for e in &decoded {
             cands.absorb(s.term, e, index, &slot_of, &per_term);
@@ -564,8 +569,8 @@ fn bounds_of(
     (now, floor)
 }
 
-/// The next unread block's maximum impact in `s`, loading the chunk that
-/// holds it; `None` once the stream is exhausted.
+/// The next unread block's maximum impact in `s`, reading the directory
+/// of the chunk that holds it; `None` once the stream is exhausted.
 async fn next_block_max(
     index: &TermIndex,
     s: &mut Stream,
@@ -575,18 +580,17 @@ async fn next_block_max(
         let Some(chunk_ref) = s.chunks.get(s.chunk) else {
             return Ok(None);
         };
-        if s.bytes.is_none() {
-            let bytes = index.tier_chunk(&s.object, chunk_ref).await?;
-            *tier_bytes += bytes.len() as u64;
-            s.bytes = Some(bytes);
+        if s.dir.is_none() {
+            s.dir = Some(index.tier_directory(&s.object, chunk_ref).await?);
+            *tier_bytes += TierDirectory::len_for(chunk_ref.n_entries) as u64;
         }
-        let chunk = TierChunk::open(s.bytes.as_ref().expect("loaded above"))?;
-        if s.block < chunk.n_blocks() {
-            return Ok(Some(chunk.block_max(s.block)));
+        let dir = s.dir.as_ref().expect("read above");
+        if s.block < dir.n_blocks() {
+            return Ok(Some(dir.block_max(s.block)));
         }
         s.chunk += 1;
         s.block = 0;
-        s.bytes = None;
+        s.dir = None;
     }
 }
 

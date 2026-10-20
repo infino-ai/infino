@@ -58,7 +58,7 @@ pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
-pub(crate) use tier::{TierChunk, TierChunkRef, TierEntry};
+pub(crate) use tier::{TierChunkRef, TierDirectory, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
@@ -90,6 +90,17 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 /// slice is re-read from the manifest disk cache (a local read) only after
 /// it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Bytes a miss on a tier block fetches at once: the block and the ones
+/// after it up to this many bytes, in one ranged read. A merge consumes a
+/// stream's blocks in order, so the window turns a round trip per block
+/// into one per several, while a query that stops after a block or two
+/// has not paid for a whole chunk.
+const TIER_READ_WINDOW_BYTES: usize = 256 * 1024;
+
+/// Parsed tier chunk directories kept per loaded index, by `(tier object,
+/// chunk offset)`: a few bytes per block, so a count bound.
+const RESIDENT_TIER_DIRECTORIES: usize = 16 * 1024;
 
 /// A stored bound is exact, but a ceiling reaches the query through a
 /// handful of roundings — the idf ratio, its product with the bound, a
@@ -663,9 +674,12 @@ pub(crate) struct TermIndex {
     disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
-    /// Fetched tier chunks by `(tier object, offset)`, under the same
-    /// budget as the slices.
-    tier_chunks: tokio::sync::Mutex<Resident<(ContentHash, u64), Bytes>>,
+    /// Fetched tier block bodies by `(tier object, body offset)`, under the
+    /// same byte budget as the slices.
+    tier_blocks: tokio::sync::Mutex<Resident<(ContentHash, u64), Bytes>>,
+    /// Parsed tier chunk directories by `(tier object, chunk offset)`; see
+    /// [`RESIDENT_TIER_DIRECTORIES`].
+    tier_dirs: tokio::sync::Mutex<Resident<(ContentHash, u64), Arc<TierDirectory>>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
     runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
@@ -750,10 +764,11 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
-            tier_chunks: tokio::sync::Mutex::new(Resident::new(
+            tier_blocks: tokio::sync::Mutex::new(Resident::new(
                 RESIDENT_SLICE_BUDGET_BYTES,
                 Bytes::len,
             )),
+            tier_dirs: tokio::sync::Mutex::new(Resident::new(RESIDENT_TIER_DIRECTORIES, |_| 1)),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
             tier_runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
@@ -1181,7 +1196,7 @@ impl TermIndex {
         Ok(out)
     }
 
-    /// Every entry of a tier, chunk by chunk, in tier order (descending
+    /// Every entry of a tier, block by block, in tier order (descending
     /// impact by block). A query reads a prefix instead; this is the whole
     /// thing, for tests.
     #[cfg(test)]
@@ -1193,38 +1208,102 @@ impl TermIndex {
         let mut out = tier.inline.clone();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
-            let bytes = self.tier_chunk(object, chunk).await?;
-            let chunk = TierChunk::open(&bytes)?;
-            for i in 0..chunk.n_blocks() {
-                chunk.decode_block(i, &mut block)?;
+            let dir = self.tier_directory(object, chunk).await?;
+            for i in 0..dir.n_blocks() {
+                let body = self.tier_block(object, chunk, &dir, i).await?;
+                dir.decode_block(i, &body, &mut block)?;
                 out.extend_from_slice(&block);
             }
         }
         Ok(out)
     }
 
-    /// One tier chunk's bytes: a ranged read of its slice's tier object,
-    /// verified by the chunk's own CRC, resident afterwards like a slice.
-    pub(crate) async fn tier_chunk(
+    /// One chunk's block directory: a ranged read of the chunk's head,
+    /// sized from the entry count its run records, verified by the
+    /// directory's own CRC and resident afterwards.
+    pub(crate) async fn tier_directory(
         &self,
         object: &ContentHash,
         chunk: &TierChunkRef,
-    ) -> Result<Bytes, TermIndexError> {
+    ) -> Result<Arc<TierDirectory>, TermIndexError> {
         let key = (*object, chunk.offset);
-        if let Some(b) = self.tier_chunks.lock().await.get(&key) {
-            return Ok(b);
+        if let Some(d) = self.tier_dirs.lock().await.get(&key) {
+            return Ok(d);
         }
+        let len = (TierDirectory::len_for(chunk.n_entries) as u64).min(chunk.len);
         let end = chunk
             .offset
-            .checked_add(chunk.len)
+            .checked_add(len)
             .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
         let bytes = self
             .storage
             .get_range(&tier_uri(object), chunk.offset..end)
             .await?;
-        TierChunk::verify(&bytes)?;
-        self.tier_chunks.lock().await.insert(key, bytes.clone());
-        Ok(bytes)
+        let dir = TierDirectory::parse(&bytes)?;
+        if dir.chunk_len() as u64 != chunk.len {
+            return Err(TermIndexError::Malformed(
+                "tier chunk directory does not match the run's chunk length".into(),
+            ));
+        }
+        let dir = Arc::new(dir);
+        self.tier_dirs.lock().await.insert(key, Arc::clone(&dir));
+        Ok(dir)
+    }
+
+    /// Block `i` of a chunk, by the directory's range: a ranged read of the
+    /// block and the ones after it up to [`TIER_READ_WINDOW_BYTES`], each
+    /// verified by its own CRC and resident afterwards.
+    pub(crate) async fn tier_block(
+        &self,
+        object: &ContentHash,
+        chunk: &TierChunkRef,
+        dir: &TierDirectory,
+        i: usize,
+    ) -> Result<Bytes, TermIndexError> {
+        if i >= dir.n_blocks() {
+            return Err(TermIndexError::Malformed("tier block index".into()));
+        }
+        let first = dir.block_range(i);
+        let key = (*object, chunk.offset + first.start as u64);
+        if let Some(b) = self.tier_blocks.lock().await.get(&key) {
+            return Ok(b);
+        }
+        // The window: this block, then the following ones while they fit.
+        let mut last = i;
+        while last + 1 < dir.n_blocks()
+            && dir.block_range(last + 1).end - first.start <= TIER_READ_WINDOW_BYTES
+        {
+            last += 1;
+        }
+        let span = first.start..dir.block_range(last).end;
+        let start = chunk
+            .offset
+            .checked_add(span.start as u64)
+            .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
+        let end = chunk
+            .offset
+            .checked_add(span.end as u64)
+            .filter(|e| *e <= chunk.offset + chunk.len)
+            .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
+        let bytes = self
+            .storage
+            .get_range(&tier_uri(object), start..end)
+            .await?;
+        if bytes.len() != span.len() {
+            return Err(TermIndexError::Malformed("short tier block read".into()));
+        }
+        let mut out = None;
+        let mut resident = self.tier_blocks.lock().await;
+        for b in i..=last {
+            let r = dir.block_range(b);
+            let body = bytes.slice(r.start - span.start..r.end - span.start);
+            dir.verify_block(b, &body)?;
+            resident.insert((*object, chunk.offset + r.start as u64), body.clone());
+            if b == i {
+                out = Some(body);
+            }
+        }
+        Ok(out.expect("the first block of the window"))
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until

@@ -11,12 +11,15 @@
 //! in order and usually only in part: a query stops once the blocks it
 //! has read bound everything it has not. The chunks of every term in a
 //! slice sit back to back in that slice's tier object, so a run names its
-//! chunks by offset and a query reads one with a ranged fetch; the CRC in
-//! the chunk header is what verifies a chunk read on its own.
+//! chunks by offset. A query reads a chunk's directory with one ranged
+//! fetch — sized from the entry count the run records, every block but
+//! the last being full — and then only the blocks it consumes, each with
+//! its own fetch; the directory and each block carry their own CRC, so a
+//! read of either verifies on its own.
 //!
 //! ```text
-//! chunk: n_blocks u32 | crc32c u32
-//!        | per block: max_impact f32 | n_entries u16 | byte_len u32
+//! chunk: n_blocks u32 | directory crc32c u32
+//!        | per block: max_impact f32 | n_entries u16 | byte_len u32 | crc32c u32
 //!        | block bodies back to back
 //! block: ordinal_bits u8 | lid_bits u8 | impact_bits u8
 //!        | ordinals, bit-packed sorted deltas | local ids, bit-packed
@@ -40,6 +43,8 @@
 //! bounds every entry of its block and of the blocks after it — stay
 //! exact across any number of merges.
 
+use std::ops::Range;
+
 use bitpacking::{BitPacker, BitPacker4x};
 
 use super::TermIndexError;
@@ -59,9 +64,10 @@ pub(crate) const BLOCK_ENTRIES: usize = 4096;
 pub(crate) const CHUNK_TARGET_BYTES: usize = 4 * 1024 * 1024;
 const LANE: usize = BitPacker4x::BLOCK_LEN;
 const CHUNK_HEADER_LEN: usize = 4 + 4;
-/// Where the chunk's CRC sits in its header: over everything after it.
+/// Where the directory's CRC sits in the header: over the directory
+/// entries that follow it.
 const CRC_AT: usize = 4;
-const DIRECTORY_ENTRY_LEN: usize = 4 + 2 + 4;
+const DIRECTORY_ENTRY_LEN: usize = 4 + 2 + 4 + 4;
 const BLOCK_HEADER_LEN: usize = 3;
 
 /// One tier entry.
@@ -92,18 +98,29 @@ pub(crate) struct EncodedChunk {
     pub(crate) bytes: Vec<u8>,
 }
 
-/// A chunk's bytes with its block directory parsed.
+/// A chunk's block directory: where each block sits in the chunk, its
+/// entry count, its exact largest impact and its CRC. What a query reads
+/// first, to pick blocks by their maxima and fetch only those.
+#[derive(Debug)]
+pub(crate) struct TierDirectory {
+    blocks: Vec<BlockDir>,
+}
+
+/// A whole chunk in hand — directory and bodies — as a build or a merge
+/// has it.
 pub(crate) struct TierChunk<'a> {
-    directory: Vec<BlockDir>,
-    bodies: &'a [u8],
+    directory: TierDirectory,
+    bytes: &'a [u8],
 }
 
 #[derive(Debug, Clone, Copy)]
 struct BlockDir {
     max_impact: f32,
     n_entries: u32,
+    /// Byte offset of the body from the chunk's start.
     offset: usize,
     len: usize,
+    crc: u32,
 }
 
 fn malformed(what: &str) -> TermIndexError {
@@ -137,12 +154,13 @@ pub(crate) fn encode_tier(entries: &[TierEntry]) -> Vec<EncodedChunk> {
             out.extend_from_slice(&d.max_impact.to_le_bytes());
             out.extend_from_slice(&(d.n_entries as u16).to_le_bytes());
             out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-        }
-        for (_, body) in blocks.drain(..) {
-            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32c(body).to_le_bytes());
         }
         let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
         out[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+        for (_, body) in blocks.drain(..) {
+            out.extend_from_slice(&body);
+        }
         chunks.push(EncodedChunk {
             n_entries,
             bytes: out,
@@ -242,6 +260,7 @@ fn encode_block(block: &[TierEntry], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) 
             n_entries: n as u32,
             offset: 0,
             len: body.len(),
+            crc: 0,
         },
         body,
     )
@@ -288,22 +307,18 @@ fn unpack_dense(bytes: &[u8], n: usize, bits: u8, out: &mut [u32]) {
     }
 }
 
-impl<'a> TierChunk<'a> {
-    /// Check a chunk's CRC: what a chunk fetched by range, without its
-    /// object's hash, is verified by. Once per fetch, not per open.
-    pub(crate) fn verify(bytes: &[u8]) -> Result<(), TermIndexError> {
-        if bytes.len() < CHUNK_HEADER_LEN {
-            return Err(malformed("short header"));
-        }
-        let stored = u32_le_at(bytes, CRC_AT).ok_or_else(|| malformed("crc"))?;
-        if stored != crc32c(&bytes[CHUNK_HEADER_LEN..]) {
-            return Err(TermIndexError::HashMismatch);
-        }
-        Ok(())
+impl TierDirectory {
+    /// Bytes the directory of a chunk holding `n_entries` takes, header
+    /// included: every block but the last is full, so the block count
+    /// follows from the entry count the run records, and a reader sizes
+    /// the directory fetch before it has read a byte of the chunk.
+    pub(crate) fn len_for(n_entries: u64) -> usize {
+        CHUNK_HEADER_LEN + (n_entries as usize).div_ceil(BLOCK_ENTRIES) * DIRECTORY_ENTRY_LEN
     }
 
-    /// Parse a chunk's directory.
-    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
+    /// Parse a directory from the start of a chunk; `bytes` may be the
+    /// directory alone or the whole chunk. Verifies the directory's CRC.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, TermIndexError> {
         if bytes.len() < CHUNK_HEADER_LEN {
             return Err(malformed("short header"));
         }
@@ -318,61 +333,94 @@ impl<'a> TierChunk<'a> {
         if bytes.len() < dir_end {
             return Err(malformed("short directory"));
         }
-        let mut directory = Vec::with_capacity(n_blocks);
-        let mut offset = 0usize;
+        let stored = u32_le_at(bytes, CRC_AT).ok_or_else(|| malformed("crc"))?;
+        if stored != crc32c(&bytes[CHUNK_HEADER_LEN..dir_end]) {
+            return Err(TermIndexError::HashMismatch);
+        }
+        let mut blocks = Vec::with_capacity(n_blocks);
+        let mut offset = dir_end;
         for i in 0..n_blocks {
             let at = CHUNK_HEADER_LEN + i * DIRECTORY_ENTRY_LEN;
             let f = |o: usize| u32_le_at(bytes, at + o).ok_or_else(|| malformed("directory entry"));
             let max_impact = f32::from_bits(f(0)?);
             let n_entries = u16_le_at(bytes, at + 4).ok_or_else(|| malformed("directory entry"))?;
             let len = f(6)? as usize;
+            let crc = f(10)?;
             if n_entries == 0 || n_entries as usize > BLOCK_ENTRIES || len < BLOCK_HEADER_LEN {
                 return Err(malformed("directory entry out of range"));
             }
-            directory.push(BlockDir {
+            // Every block but the last is full, which is what lets a reader
+            // size the directory from the entry count alone.
+            if i + 1 < n_blocks && n_entries as usize != BLOCK_ENTRIES {
+                return Err(malformed("a block before the last is not full"));
+            }
+            blocks.push(BlockDir {
                 max_impact,
                 n_entries: u32::from(n_entries),
                 offset,
                 len,
+                crc,
             });
             offset = offset
                 .checked_add(len)
                 .ok_or_else(|| malformed("block offsets"))?;
         }
-        let bodies = &bytes[dir_end..];
-        if bodies.len() != offset {
-            return Err(malformed("body length does not match the directory"));
-        }
-        Ok(Self { directory, bodies })
+        Ok(Self { blocks })
     }
 
     pub(crate) fn n_blocks(&self) -> usize {
-        self.directory.len()
+        self.blocks.len()
     }
 
     /// Exact largest impact in block `i`.
     pub(crate) fn block_max(&self, i: usize) -> f32 {
-        self.directory[i].max_impact
+        self.blocks[i].max_impact
     }
 
     #[cfg(test)]
     pub(crate) fn block_entries(&self, i: usize) -> usize {
-        self.directory[i].n_entries as usize
+        self.blocks[i].n_entries as usize
     }
 
-    /// Decode block `i` into `out` (cleared first); entries are in
-    /// `(ordinal, doc id)` order.
+    /// Where block `i`'s body sits, as byte offsets from the chunk's start.
+    pub(crate) fn block_range(&self, i: usize) -> Range<usize> {
+        let d = &self.blocks[i];
+        d.offset..d.offset + d.len
+    }
+
+    /// Where the chunk's bodies end: the chunk's byte length.
+    pub(crate) fn chunk_len(&self) -> usize {
+        self.blocks
+            .last()
+            .map_or(CHUNK_HEADER_LEN, |d| d.offset + d.len)
+    }
+
+    /// Check block `i`'s body against its CRC: what a body fetched by
+    /// range is verified by. Once per fetch, not per decode.
+    pub(crate) fn verify_block(&self, i: usize, body: &[u8]) -> Result<(), TermIndexError> {
+        let d = self.blocks.get(i).ok_or_else(|| malformed("block index"))?;
+        if body.len() != d.len {
+            return Err(malformed("block body length"));
+        }
+        if crc32c(body) != d.crc {
+            return Err(TermIndexError::HashMismatch);
+        }
+        Ok(())
+    }
+
+    /// Decode block `i` from its body into `out` (cleared first); entries
+    /// are in `(ordinal, doc id)` order.
     pub(crate) fn decode_block(
         &self,
         i: usize,
+        body: &[u8],
         out: &mut Vec<TierEntry>,
     ) -> Result<(), TermIndexError> {
         out.clear();
-        let d = self
-            .directory
-            .get(i)
-            .ok_or_else(|| malformed("block index"))?;
-        let body = &self.bodies[d.offset..d.offset + d.len];
+        let d = self.blocks.get(i).ok_or_else(|| malformed("block index"))?;
+        if body.len() != d.len || body.len() < BLOCK_HEADER_LEN {
+            return Err(malformed("block body length"));
+        }
         let (ordinal_bits, lid_bits, impact_bits) = (body[0], body[1], body[2]);
         let max_bits = d.max_impact.to_bits();
         let n = d.n_entries as usize;
@@ -420,6 +468,57 @@ impl<'a> TierChunk<'a> {
             });
         }
         Ok(())
+    }
+}
+
+impl<'a> TierChunk<'a> {
+    /// Check a whole chunk: its directory's CRC and every block's.
+    #[cfg(test)]
+    pub(crate) fn verify(bytes: &'a [u8]) -> Result<(), TermIndexError> {
+        let chunk = Self::open(bytes)?;
+        for i in 0..chunk.n_blocks() {
+            chunk
+                .directory
+                .verify_block(i, &bytes[chunk.directory.block_range(i)])?;
+        }
+        Ok(())
+    }
+
+    /// Parse a whole chunk's directory and check its bodies fit it.
+    pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
+        let directory = TierDirectory::parse(bytes)?;
+        if bytes.len() != directory.chunk_len() {
+            return Err(malformed("body length does not match the directory"));
+        }
+        Ok(Self { directory, bytes })
+    }
+
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.directory.n_blocks()
+    }
+
+    /// Exact largest impact in block `i`.
+    #[cfg(test)]
+    pub(crate) fn block_max(&self, i: usize) -> f32 {
+        self.directory.block_max(i)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn block_entries(&self, i: usize) -> usize {
+        self.directory.block_entries(i)
+    }
+
+    /// Decode block `i` into `out` (cleared first).
+    pub(crate) fn decode_block(
+        &self,
+        i: usize,
+        out: &mut Vec<TierEntry>,
+    ) -> Result<(), TermIndexError> {
+        if i >= self.n_blocks() {
+            return Err(malformed("block index"));
+        }
+        let body = &self.bytes[self.directory.block_range(i)];
+        self.directory.decode_block(i, body, out)
     }
 }
 
@@ -617,6 +716,51 @@ mod tests {
         TierChunk::verify(bytes).expect("intact bytes pass");
         assert!(TierChunk::open(&bytes[..bytes.len() - 1]).is_err());
         assert!(TierChunk::open(&bytes[..CHUNK_HEADER_LEN - 1]).is_err());
+        let mut dir_flipped = bytes.clone();
+        dir_flipped[CHUNK_HEADER_LEN] ^= 1;
+        assert!(
+            matches!(
+                TierDirectory::parse(&dir_flipped),
+                Err(TermIndexError::HashMismatch)
+            ),
+            "a flipped directory byte fails the directory crc"
+        );
+        let dir = TierDirectory::parse(bytes).expect("directory");
+        let body = &bytes[dir.block_range(0)];
+        let mut flipped_body = body.to_vec();
+        flipped_body[BLOCK_HEADER_LEN] ^= 1;
+        assert!(matches!(
+            dir.verify_block(0, &flipped_body),
+            Err(TermIndexError::HashMismatch)
+        ));
+        dir.verify_block(0, body).expect("intact body");
+    }
+
+    /// A reader sizes a chunk's directory from the entry count its run
+    /// records and parses it from that prefix alone; the blocks it then
+    /// fetches by the directory's ranges decode to the chunk's entries.
+    #[test]
+    fn a_directory_prefix_sized_from_the_entry_count_reads_the_blocks() {
+        let entries = sample(30_000, 50, 100_000, 9);
+        let chunks = encode_tier(&entries);
+        let mut all = Vec::new();
+        let mut buf = Vec::new();
+        for c in &chunks {
+            let dir_len = TierDirectory::len_for(c.n_entries);
+            let dir = TierDirectory::parse(&c.bytes[..dir_len]).expect("directory from the prefix");
+            assert_eq!(dir.chunk_len(), c.bytes.len());
+            assert_eq!(
+                dir.n_blocks(),
+                (c.n_entries as usize).div_ceil(BLOCK_ENTRIES)
+            );
+            for i in 0..dir.n_blocks() {
+                let body = &c.bytes[dir.block_range(i)];
+                dir.verify_block(i, body).expect("crc");
+                dir.decode_block(i, body, &mut buf).expect("decode");
+                all.extend_from_slice(&buf);
+            }
+        }
+        assert_eq!(all.len(), entries.len());
     }
 
     /// Most terms' tiers are a handful of entries; they must cost a handful
