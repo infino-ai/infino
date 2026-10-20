@@ -1468,12 +1468,13 @@ impl Ord for HeadEntry {
     }
 }
 
-/// Score every posting of a term and keep its best `depth` documents, the
-/// way a reader's single-term search ranks them: `depth + 1` are kept so
-/// the first document left out is the tail, exactly.
+/// Keep a term's best `depth` documents by `scores` (one per posting, as
+/// a reader scores them), the way a reader's single-term search ranks
+/// them: `depth + 1` are kept so the first document left out is the tail,
+/// exactly.
 fn term_head(
     pairs: &[(u32, u32)],
-    idf_t: f32,
+    scores: &[f32],
     enc: &TermEncoding<'_>,
     heap: &mut BinaryHeap<HeadEntry>,
     out: &mut HeadOut,
@@ -1482,14 +1483,7 @@ fn term_head(
     heap.clear();
     out.df = pairs.len() as u64;
     let mut bound = 0.0f32;
-    for &(doc, tf) in pairs {
-        let score = bm25::score(
-            idf_t,
-            tf,
-            bm25::stored_len(enc.doc_lengths[doc as usize]),
-            enc.avgdl,
-            enc.params,
-        );
+    for (&(doc, _), &score) in pairs.iter().zip(scores) {
         bound = bound.max(score);
         if heap.len() <= depth {
             heap.push(HeadEntry(score, doc));
@@ -3957,9 +3951,11 @@ fn assemble_and_write_blob<W: Write>(
 /// chunk (same allocation, just `Vec::clear` between iterations).
 #[derive(Default)]
 struct TermScratch {
-    /// The term's head for the sink, when one is attached.
+    /// The term's head for the sink, when one is attached, and each
+    /// posting's score, computed once for the head and the block maxima.
     head: HeadOut,
     head_heap: BinaryHeap<HeadEntry>,
+    scores: Vec<f32>,
     /// Per-block doc_id column passed to `encode_block`. Re-used by
     /// taking it into a Block, encoding, and taking it back. Capacity
     /// stabilises at `BLOCK_LEN` after the first dense term.
@@ -4275,7 +4271,23 @@ fn encode_term(
     let df = pairs.len() as u64;
     if enc.heads {
         let idf_t = bm25::idf(n_scored_docs as u64, df);
-        term_head(pairs, idf_t, enc, &mut scratch.head_heap, &mut scratch.head);
+        scratch.scores.clear();
+        scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
+            bm25::score(
+                idf_t,
+                tf,
+                bm25::stored_len(col_doc_lengths[doc as usize]),
+                avgdl,
+                params,
+            )
+        }));
+        term_head(
+            pairs,
+            &scratch.scores,
+            enc,
+            &mut scratch.head_heap,
+            &mut scratch.head,
+        );
     }
 
     // A df=1 posting inlines into the dictionary entry when the WHOLE
@@ -4361,7 +4373,7 @@ fn encode_term(
         if block_tfs.capacity() < BLOCK_LEN {
             block_tfs.reserve(BLOCK_LEN - block_tfs.capacity());
         }
-        for chunk in pairs.chunks(BLOCK_LEN) {
+        for (at, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
             block_doc_ids.clear();
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
@@ -4381,19 +4393,26 @@ fn encode_term(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            let block_max = block_doc_ids
-                .iter()
-                .zip(block_tfs.iter())
-                .map(|(&d, &t)| {
-                    bm25::score(
-                        idf_t,
-                        t,
-                        bm25::stored_len(col_doc_lengths[d as usize]),
-                        avgdl,
-                        params,
-                    )
-                })
-                .fold(0.0f32, f32::max);
+            // With a head gathered the scores are already in hand, from the
+            // same arithmetic.
+            let block_max = match enc.heads {
+                true => scratch.scores[at * BLOCK_LEN..at * BLOCK_LEN + chunk.len()]
+                    .iter()
+                    .fold(0.0f32, |m, &s| m.max(s)),
+                false => block_doc_ids
+                    .iter()
+                    .zip(block_tfs.iter())
+                    .map(|(&d, &t)| {
+                        bm25::score(
+                            idf_t,
+                            t,
+                            bm25::stored_len(col_doc_lengths[d as usize]),
+                            avgdl,
+                            params,
+                        )
+                    })
+                    .fold(0.0f32, f32::max),
+            };
             block_maxes.push(block_max);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
