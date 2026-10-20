@@ -11424,37 +11424,70 @@ fn scoring_by_ordinal(
         .collect()
 }
 
+/// Superfiles whose terms an index rebuild walks at once. Each walk is one
+/// open reader and a pass over its dictionary and postings — a few hundred
+/// megabytes resident and a core's worth of work — so a table of a thousand
+/// superfiles rebuilds in minutes rather than hours, within a bounded
+/// footprint.
+const CONTRIBUTION_WALKS_AT_ONCE: usize = 16;
+
+/// Each of `entries`' term-index contributions, in `entries` order, walked
+/// [`CONTRIBUTION_WALKS_AT_ONCE`] superfiles at a time.
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     dir: &Path,
 ) -> Result<Vec<TermContribution>, TermIndexError> {
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let opt_storage = manifest.options.storage.as_ref();
     let legacy = manifest.options.legacy_names();
     let policy = manifest
         .options
         .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
-    let mut contributions = Vec::with_capacity(entries.len());
+    let walks = Arc::new(Semaphore::new(CONTRIBUTION_WALKS_AT_ONCE));
+    let mut tasks = Vec::with_capacity(entries.len());
     for entry in entries {
-        let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
+        let permit = Arc::clone(&walks)
+            .acquire_owned()
+            .await
+            .map_err(|_| TermIndexError::Build("contribution walks closed".into()))?;
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let legacy = legacy.clone();
+        let policy = policy.clone();
+        let dir = dir.to_path_buf();
+        let entry = Arc::clone(entry);
+        tasks.push(tokio::spawn(async move {
+            let _walking = permit;
+            let reader = open_reader(
+                &store,
+                disk_cache.as_ref(),
+                storage.as_ref(),
+                &entry,
+                ReadIntent::Stream,
+            )
             .await
             .map_err(TermIndexError::Open)?;
-        // The walk reads most of the FTS section, whose reads skip the block
-        // cache, so each would be its own GET. Fetch the section in bulk first.
-        // On failure the walk still works, read by read.
-        if let Some(cache) = disk_cache
-            && let Some((start, len)) = entry.subsection_offsets.as_ref().and_then(|o| o.fts)
-            && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
-        {
-            warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
-        }
-        let mut writer =
-            term_index::ContributionWriter::create(dir, entry.superfile_id, entry.id_min)?;
-        write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
-        contributions.push(writer.finish()?);
-        drop(reader);
+            // The walk reads most of the FTS section, whose reads skip the
+            // block cache, so each would be its own GET. Fetch the section in
+            // bulk first. On failure the walk still works, read by read.
+            if let Some(cache) = disk_cache.as_ref()
+                && let Some((start, len)) = entry.subsection_offsets.as_ref().and_then(|o| o.fts)
+                && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
+            {
+                warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
+            }
+            let mut writer =
+                term_index::ContributionWriter::create(&dir, entry.superfile_id, entry.id_min)?;
+            write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
+            writer.finish()
+        }));
+    }
+    let mut contributions = Vec::with_capacity(entries.len());
+    for task in tasks {
+        contributions.push(
+            task.await
+                .map_err(|e| TermIndexError::Build(format!("contribution walk: {e}")))??,
+        );
     }
     Ok(contributions)
 }
