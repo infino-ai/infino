@@ -49,7 +49,7 @@ use uuid::Uuid;
 
 use crate::{
     superfile::fts::{
-        bm25::{Bm25Params, dequantize_len, score_with_dl_norm_k1},
+        bm25::{Bm25Params, dequantize_len, idf as bm25_idf, score_with_dl_norm_k1},
         reader::GlobalTermIdf,
     },
     supertable::{
@@ -67,10 +67,15 @@ use crate::{
 
 /// Blocks per term a merge reads before it gives up on a threshold: a
 /// conjunction whose terms' best documents are not each other's has found
-/// fewer than `k` joint candidates by then, and reading on to the cap costs
-/// more than the opens it might save. The bounds read so far stay sound
-/// and order the opens; nothing is excluded without a threshold.
-const THRESHOLD_PROBE_BLOCKS_PER_TERM: usize = 4;
+/// fewer than `k` joint candidates in its first block of each, and reading
+/// on costs more than the opens it might save. The bounds read so far stay
+/// sound and order the opens; nothing is excluded without a threshold.
+const THRESHOLD_PROBE_BLOCKS_PER_TERM: usize = 1;
+/// Blocks per term a merge reads with a threshold but without having ruled
+/// any superfile out before it stops: on a table where every superfile
+/// holds competitive documents the bounds never fall below the threshold,
+/// and the opens then follow the bounds as they would the ceilings.
+const EXCLUSION_PROBE_BLOCKS_PER_TERM: usize = 4;
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
@@ -161,6 +166,11 @@ struct TermInFile {
     /// Upper bound, at the table's stats, on a document the tier does not
     /// hold.
     tail: f32,
+    /// Upper bound, at the table's stats, on any document of the term in
+    /// the superfile: its stored ceiling, which caps the frontier — the
+    /// best unread entry anywhere — for this superfile. Zero when the
+    /// superfile holds no document of the term.
+    ceiling: f32,
 }
 
 /// Select superfiles for a query over `terms` with the tiers of `index`.
@@ -225,6 +235,15 @@ pub(crate) async fn select_with_tiers(
         });
     }
 
+    let scored_docs: Vec<u64> = kept
+        .iter()
+        .map(|e| {
+            e.fts_summary
+                .get(&column)
+                .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                .unwrap_or(e.n_docs)
+        })
+        .collect();
     let n_sf = kept.len();
     let mut per_term: Vec<Vec<TermInFile>> = vec![vec![TermInFile::default(); n_sf]; nt];
     let mut idf: Vec<f32> = Vec::with_capacity(nt);
@@ -256,9 +275,20 @@ pub(crate) async fn select_with_tiers(
                 let Some(&slot) = slot_of.get(&id) else {
                     continue;
                 };
+                // The stored ceiling is an impact at the superfile's own
+                // idf; the ratio to the table's rescales it, as the ceiling
+                // path does.
+                let n = scored_docs[slot];
+                let local_idf = bm25_idf(n, p.df.min(n));
+                let ratio = if local_idf > 0.0 {
+                    idf_table / local_idf
+                } else {
+                    1.0
+                };
                 let entry = TermInFile {
                     scale_ub: idf_table * scale_up[slot],
                     tail: tail_of(p) * idf_table * scale_up[slot],
+                    ceiling: p.bound * ratio * scale_up[slot],
                 };
                 scale_up_max = scale_up_max.max(entry.scale_ub);
                 per_term[ti][slot] = entry;
@@ -399,6 +429,10 @@ pub(crate) async fn select_with_tiers(
         }
         let probe = (THRESHOLD_PROBE_BLOCKS_PER_TERM * BLOCK_ENTRIES * nt) as u64;
         if !theta_lb.is_finite() && entries_read >= probe {
+            break;
+        }
+        let probe = (EXCLUSION_PROBE_BLOCKS_PER_TERM * BLOCK_ENTRIES * nt) as u64;
+        if n_excluded == 0 && entries_read >= probe {
             break;
         }
         // The stream whose next block has the highest (scaled) maximum.
@@ -623,13 +657,16 @@ fn bounds_of(
             if mask & (1 << ti) != 0 {
                 continue;
             }
-            let tail = pt[slot].tail;
+            let TermInFile { tail, ceiling, .. } = pt[slot];
+            // The frontier bounds every unread entry anywhere; the
+            // superfile's own ceiling bounds its documents, so the lesser
+            // holds. A superfile without the term has a ceiling of zero.
             let unread = match (at_tails, frontier[ti]) {
-                (false, Some(f)) => f.max(tail),
+                (false, Some(f)) => f.max(tail).min(ceiling),
                 _ => tail,
             };
             let needed = required & (1 << ti) != 0;
-            if needed && unread <= 0.0 && (at_tails || frontier[ti].is_none()) {
+            if needed && unread <= 0.0 && (at_tails || frontier[ti].is_none() || ceiling <= 0.0) {
                 return f32::NEG_INFINITY;
             }
             sum += unread;
