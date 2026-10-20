@@ -389,23 +389,16 @@ impl Supertable {
             inner.manifest.load().partition_strategy(),
             Some(PartitionStrategy::VectorCell { .. })
         );
-        // Superfile-id snapshot for the recalibration trigger below: splits
-        // and merges both change the id set, and both invalidate a stamped
-        // probe law (splits change the cell geometry, merges rebuild the
-        // merged cells' fine IVFs).
-        let snapshot_ids = || -> HashSet<Uuid> {
-            inner
-                .manifest
-                .load()
-                .superfiles
-                .iter()
-                .map(|e| e.superfile_id)
-                .collect()
-        };
-        let pre_pass_ids = if hidden_ivf {
-            snapshot_ids()
+        // Grid size before the split phase. A split grows `n_cent` (a merge
+        // never does), so comparing it to the post-pass count tells the
+        // recalibration trigger whether the grid actually changed.
+        let pre_pass_n_cent: u32 = if hidden_ivf {
+            match inner.manifest.load().partition_strategy() {
+                Some(PartitionStrategy::VectorCell { clusters, .. }) => clusters.n_cent,
+                _ => 0,
+            }
         } else {
-            HashSet::new()
+            0
         };
         // Optimize phase timers ([optphase]); gated, off by default.
         let phase_timers = global().diagnostics.optimize_phase_timers;
@@ -547,15 +540,39 @@ impl Supertable {
             }
             _ => false,
         };
+        // The two changes that move the probe-width law: a split changed the
+        // grid, or the corpus grew past the configured fraction since the last
+        // recalibration. A plain append or a shard-only merge does not.
+        let grid_or_growth = || match inner.manifest.load().partition_strategy() {
+            Some(PartitionStrategy::VectorCell {
+                routing, clusters, ..
+            }) => {
+                let grid_restructured = clusters.n_cent != pre_pass_n_cent;
+                let cur_rows: u64 = inner
+                    .manifest
+                    .load()
+                    .superfiles
+                    .iter()
+                    .map(|e| e.n_docs)
+                    .sum();
+                let corpus_grew = corpus_grew_enough(
+                    cur_rows,
+                    routing.last_recal_rows,
+                    global().vector.recal_growth_fraction,
+                );
+                grid_restructured || corpus_grew
+            }
+            _ => false,
+        };
         // Recalibration is the O(N) query-serving calibration — gate it by the
-        // caller's policy (default Auto). Skip runs no recalibration; Force always
-        // runs it; Auto keeps the changed-or-lagging condition. Storage work above
-        // already ran regardless of the policy.
+        // caller's policy (default Auto). Skip runs none; Force always runs it;
+        // Auto runs it only on a grid or growth change, or a lagging rerank
+        // law. Storage work above already ran regardless of the policy.
         let run_recalibrate = hidden_ivf
             && match recalibrate {
                 RecalibratePolicy::Skip => false,
                 RecalibratePolicy::Force => true,
-                RecalibratePolicy::Auto => snapshot_ids() != pre_pass_ids || rerank_lags(),
+                RecalibratePolicy::Auto => grid_or_growth() || rerank_lags(),
             };
         if run_recalibrate {
             if phase_timers {
@@ -1637,6 +1654,15 @@ fn has_room_for_another_merge(available: Option<u64>, total: Option<u64>) -> boo
         return true;
     };
     total > 0 && available.saturating_mul(100) / total >= MERGE_MEMORY_RESERVE_PERCENT
+}
+
+/// Whether the corpus grew enough since the last full recalibration to run
+/// another one. No new rows never triggers it. `last_recal_rows == 0` (fresh
+/// table or older manifest) counts as grown, so the first optimize
+/// recalibrates once. `fraction == 0.0` triggers on any growth.
+fn corpus_grew_enough(cur_rows: u64, last_recal_rows: u64, fraction: f64) -> bool {
+    let since = cur_rows.saturating_sub(last_recal_rows);
+    since > 0 && since as f64 >= fraction * last_recal_rows.max(1) as f64
 }
 
 /// How much of the staleness window a commit keeps in hand. A seal younger
@@ -6194,6 +6220,32 @@ mod tests {
         assert!(has_room_for_another_merge(None, Some(SOME_BYTES)));
         assert!(has_room_for_another_merge(Some(SOME_BYTES), None));
         assert!(!has_room_for_another_merge(Some(SOME_BYTES), Some(0)));
+    }
+
+    /// The growth trigger: no growth never fires, below the fraction waits, at
+    /// or above it fires, and a watermark of 0 (fresh/upgraded table) fires
+    /// once.
+    #[test]
+    fn corpus_growth_recalibration_trigger() {
+        assert!(!corpus_grew_enough(1_000, 1_000, 0.5), "no growth");
+        assert!(
+            !corpus_grew_enough(900, 1_000, 0.5),
+            "a shrink is not growth"
+        );
+        assert!(!corpus_grew_enough(1_400, 1_000, 0.5), "+40% < 50%");
+        assert!(corpus_grew_enough(1_500, 1_000, 0.5), "+50% == threshold");
+        assert!(corpus_grew_enough(2_500, 1_000, 0.5), "+150% > 50%");
+
+        // A watermark of 0 (fresh table or older manifest) recalibrates once.
+        assert!(corpus_grew_enough(1, 0, 0.5));
+        assert!(
+            !corpus_grew_enough(0, 0, 0.5),
+            "an empty table has nothing to calibrate"
+        );
+
+        // fraction 0.0 fires on any growth, but not on none.
+        assert!(corpus_grew_enough(1_001, 1_000, 0.0));
+        assert!(!corpus_grew_enough(1_000, 1_000, 0.0));
     }
 
     // ---- concurrent jobs ------------------------------------------------
