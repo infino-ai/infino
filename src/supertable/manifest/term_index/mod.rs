@@ -669,6 +669,12 @@ pub(crate) struct TermIndex {
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
     runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
+    /// A term's runs per segment with their tier objects, by key, under the
+    /// same count budget: a repeated term then opens no slice at all. The
+    /// slices themselves outgrow their byte budget on a large table, so
+    /// without this every query re-read and re-verified one slice per
+    /// segment per term.
+    tier_runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<SliceRun>>>>,
 }
 
 /// A bounded resident set, least recently used first out: `weigh` gives
@@ -749,6 +755,7 @@ impl TermIndex {
                 Bytes::len,
             )),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
+            tier_runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
     }
 
@@ -1138,8 +1145,16 @@ impl TermIndex {
         &self,
         column: FieldId,
         term: &str,
-    ) -> Result<Vec<SliceRun>, TermIndexError> {
+    ) -> Result<Arc<Vec<SliceRun>>, TermIndexError> {
         let key = column.term_key(term);
+        if let Some(runs) = self
+            .tier_runs
+            .lock()
+            .expect("resident tier runs lock")
+            .get(&key)
+        {
+            return Ok(runs);
+        }
         let refs: Vec<(ContentHash, Option<ContentHash>)> = self
             .root
             .slices_for_key(&key)
@@ -1157,6 +1172,11 @@ impl TermIndex {
                 out.push(SliceRun { tier_object, run });
             }
         }
+        let out = Arc::new(out);
+        self.tier_runs
+            .lock()
+            .expect("resident tier runs lock")
+            .insert(key, Arc::clone(&out));
         Ok(out)
     }
 
@@ -3707,7 +3727,7 @@ mod tests {
         let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
         assert_eq!(runs.len(), 2, "one run per delta");
         let mut held = 0;
-        for SliceRun { run, .. } in &runs {
+        for SliceRun { run, .. } in runs.iter() {
             let tier = run.tier.as_ref().expect("a term in every title has a tier");
             assert!(tier.complete, "every document fits the default budget");
             held += tier.n_entries;

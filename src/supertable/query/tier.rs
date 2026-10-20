@@ -225,7 +225,7 @@ pub(crate) async fn select_with_tiers(
         };
         let runs = index.runs(column, term).await?;
         let mut scale_up_max = 0.0f32;
-        for SliceRun { tier_object, run } in runs {
+        for SliceRun { tier_object, run } in runs.iter() {
             let tier = match &run.tier {
                 Some(t) => t,
                 // Postings without a tier: this segment predates tiers or
@@ -233,7 +233,7 @@ pub(crate) async fn select_with_tiers(
                 None if run.postings.is_empty() => continue,
                 None => return Ok(None),
             };
-            let Some(object) = tier_object else {
+            let Some(object) = *tier_object else {
                 return Ok(None);
             };
             for p in &run.postings {
