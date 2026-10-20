@@ -960,6 +960,7 @@ impl SupertableOptions {
                 n_superfiles,
             ),
             pool: Some(Arc::clone(&self.writer_pool)),
+            spill_to_disk: true,
             ..BuildPolicy::default()
         }
     }

@@ -47,9 +47,9 @@ use build::build_segment;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, Head, HeadSink, TIER_ENTRIES_MAX,
-    TIER_SHARE_OF_POSTINGS, build_onto, head_depth_for, merge_segments, tier_entries_for,
-    tier_path,
+    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, Head, HeadSink,
+    TIER_ENTRIES_MAX, TIER_SHARE_OF_POSTINGS, build_onto, head_depth_for, merge_segments,
+    tier_entries_for, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
@@ -302,7 +302,7 @@ pub(crate) async fn write_root(
 )]
 pub(crate) async fn write_slices(
     storage: &dyn StorageProvider,
-    slices: Vec<(ContentHash, Vec<u8>)>,
+    slices: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     write_objects(storage, "slice", slices).await
 }
@@ -316,7 +316,7 @@ pub(crate) async fn write_slices(
 )]
 pub(crate) async fn write_tiers(
     storage: &dyn StorageProvider,
-    tiers: Vec<(ContentHash, Vec<u8>)>,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     write_objects(storage, "tier", tiers).await
 }
@@ -324,9 +324,15 @@ pub(crate) async fn write_tiers(
 async fn write_objects(
     storage: &dyn StorageProvider,
     kind: &'static str,
-    objects: Vec<(ContentHash, Vec<u8>)>,
+    objects: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
-    stream::iter(objects.into_iter().map(|(hash, bytes)| async move {
+    // A spilled object is read back only as its upload starts, so at most
+    // the uploads in flight are resident at once.
+    stream::iter(objects.into_iter().map(|(hash, built)| async move {
+        let bytes = match built {
+            BuiltBytes::Resident(bytes) => bytes,
+            BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+        };
         let reference = put_content_addressed(storage, kind, bytes).await?;
         debug_assert_eq!(reference.content_hash, hash);
         Ok::<(), TermIndexError>(())
@@ -540,16 +546,30 @@ pub(crate) async fn download_segments(
 /// them like downloaded ones.
 pub(crate) fn spill_slices(
     dir: &Path,
-    slices: Vec<(ContentHash, Vec<u8>)>,
+    slices: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<Vec<PathBuf>, TermIndexError> {
     slices
         .into_iter()
-        .map(|(hash, bytes)| {
+        .map(|(hash, built)| {
             let path = dir.join(format!("{}.slice", hash.to_hex()));
-            fs::write(&path, bytes)?;
+            place_built(&path, built)?;
             Ok(path)
         })
         .collect()
+}
+
+/// Put `built` at `path`: a resident object is written, a spilled one is
+/// linked or copied from where the build left it.
+fn place_built(path: &Path, built: BuiltBytes) -> Result<(), TermIndexError> {
+    match built {
+        BuiltBytes::Resident(bytes) => fs::write(path, bytes)?,
+        BuiltBytes::Spilled { path: from, .. } => {
+            if from != path && fs::hard_link(&from, path).is_err() {
+                fs::copy(&from, path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write freshly built tier objects into `dir`, each beside the spilled
@@ -558,17 +578,17 @@ pub(crate) fn spill_slices(
 pub(crate) fn spill_tiers(
     dir: &Path,
     slices: &[format::SliceRef],
-    tiers: Vec<(ContentHash, Vec<u8>)>,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     let slice_of: HashMap<ContentHash, ContentHash> = slices
         .iter()
         .filter_map(|s| Some((s.tier.as_ref()?.content_hash, s.content_hash)))
         .collect();
-    for (hash, bytes) in tiers {
+    for (hash, built) in tiers {
         let slice = slice_of
             .get(&hash)
             .ok_or_else(|| TermIndexError::Build("a built tier object no slice names".into()))?;
-        fs::write(tier_path(dir, slice), bytes)?;
+        place_built(&tier_path(dir, slice), built)?;
     }
     Ok(())
 }
@@ -1331,20 +1351,28 @@ mod tests {
 
     /// The entries of `tier`, read from the first slice's tier object among
     /// `built_tiers`: these fixtures build one slice.
+    /// A built object's bytes, wherever the build kept them.
+    fn bytes_of(built: &BuiltBytes) -> Vec<u8> {
+        built.read().expect("built bytes")
+    }
+
     fn tier_entries_of(
         segment: &Segment,
-        built_tiers: &[(ContentHash, Vec<u8>)],
+        built_tiers: &[(ContentHash, BuiltBytes)],
         tier: &format::TierRef,
     ) -> Vec<tier::TierEntry> {
         let object = segment.slices[0]
             .tier
             .as_ref()
             .expect("the slice has a tier object");
-        let bytes = &built_tiers
-            .iter()
-            .find(|(h, _)| *h == object.content_hash)
-            .expect("the tier object is among the built")
-            .1;
+        let bytes = bytes_of(
+            &built_tiers
+                .iter()
+                .find(|(h, _)| *h == object.content_hash)
+                .expect("the tier object is among the built")
+                .1,
+        );
+        let bytes = &bytes;
         let mut out = Vec::new();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
@@ -1381,7 +1409,8 @@ mod tests {
             ..BuildPolicy::default()
         };
         let built = build(&[a, b, c], &policy).expect("build");
-        let slice = Slice::open(&built.slices[0].1).expect("open");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
         let alpha = slice
             .run(&fid("body").term_key("alpha"))
             .expect("run")
@@ -1424,7 +1453,80 @@ mod tests {
         let object = segment.slices[0].tier.as_ref().expect("tier object");
         assert_eq!(built.tiers.len(), 1, "one tier object for the one slice");
         assert_eq!(built.tiers[0].0, object.content_hash);
-        assert_eq!(built.tiers[0].1.len() as u64, object.len);
+        assert_eq!(bytes_of(&built.tiers[0].1).len() as u64, object.len);
+    }
+
+    /// A build that spills writes each slice and tier object to a scratch
+    /// file as it is cut and keeps none of their bytes; what it spills is
+    /// byte for byte what a resident build keeps, and a merge over the
+    /// spilled files reads them where it would find downloaded ones.
+    #[test]
+    fn a_spilling_build_writes_what_a_resident_build_keeps() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let make = |id: u128, n: u32| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "alpha", docs(id as f32, n)),
+                    ("body", "beta", docs(0.5, 2)),
+                    ("body", "gamma", docs(1.5, n)),
+                    ("body", "delta", docs(2.5, 3)),
+                ],
+                1000,
+            )
+        };
+        let resident = BuildPolicy {
+            slice_target_bytes: 48,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let spilling = BuildPolicy {
+            spill_to_disk: true,
+            ..resident.clone()
+        };
+        let kept = build(&[make(1, 60), make(2, 60)], &resident).expect("resident build");
+        let spilled = build(&[make(1, 60), make(2, 60)], &spilling).expect("spilling build");
+        assert!(kept.slices.len() > 1, "several slices, so several files");
+        assert_eq!(kept.slices, spilled.slices, "same slices, byte for byte");
+        assert_eq!(
+            kept.tiers, spilled.tiers,
+            "same tier objects, byte for byte"
+        );
+        assert!(
+            spilled
+                .slices
+                .iter()
+                .chain(&spilled.tiers)
+                .all(|(_, b)| matches!(b, BuiltBytes::Spilled { .. })),
+            "every object of the spilling build is on disk"
+        );
+        assert!(
+            kept.slices
+                .iter()
+                .chain(&kept.tiers)
+                .all(|(_, b)| matches!(b, BuiltBytes::Resident(_))),
+            "every object of the resident build is in memory"
+        );
+        // The spilled files feed a merge as downloaded ones would.
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(
+            scratch.path(),
+            &spilled.root.segments[0].slices,
+            spilled.tiers,
+        )
+        .expect("place tiers");
+        let sources = vec![spill_slices(scratch.path(), spilled.slices).expect("place slices")];
+        let merged = merge_segments(&sources, &[Some(0), Some(1)], &resident).expect("merge");
+        assert_eq!(
+            merged.slices, kept.slices,
+            "a merge of the spilled files rebuilds the same slices"
+        );
     }
 
     #[test]
@@ -1524,7 +1626,8 @@ mod tests {
             spill_slices(dir.path(), delta.slices).expect("spill delta"),
         ];
         let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
-        let slice = Slice::open(&merged.slices[0].1).expect("open");
+        let slice_bytes = bytes_of(&merged.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
         let run = slice
             .run(&fid("body").term_key("alpha"))
             .expect("run")
@@ -1600,7 +1703,8 @@ mod tests {
         );
         assert_eq!(built.root.segments.len(), 1);
         assert_eq!(built.slices.len(), 1, "everything fits one slice");
-        let slice = Slice::open(&built.slices[0].1).expect("open");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
 
         let alpha = slice
             .postings(&fid("body").term_key("alpha"))
@@ -1656,8 +1760,11 @@ mod tests {
         all_keys.sort();
         assert_eq!(s.first_key, all_keys[0]);
         assert_eq!(s.last_key, all_keys[3]);
-        assert_eq!(s.content_hash, ContentHash::of(&built.slices[0].1));
-        assert_eq!(s.len as usize, built.slices[0].1.len());
+        assert_eq!(
+            s.content_hash,
+            ContentHash::of(&bytes_of(&built.slices[0].1))
+        );
+        assert_eq!(s.len as usize, bytes_of(&built.slices[0].1).len());
     }
 
     /// Slices are cut at term boundaries once the target is reached, so
@@ -1691,7 +1798,11 @@ mod tests {
                 "slices are disjoint and ordered"
             );
         }
-        let by_hash: HashMap<_, _> = built.slices.iter().cloned().collect();
+        let by_hash: HashMap<_, _> = built
+            .slices
+            .iter()
+            .map(|(h, b)| (*h, bytes_of(b)))
+            .collect();
         for (c, t, d) in &terms {
             let key = fid(c).term_key(t);
             let hits: Vec<_> = built.root.slices_for_key(&key).collect();
@@ -3850,7 +3961,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let c = contribution(&dir, 1, &[("title", "alpha", 5)]);
         let built = build(&[c], &BuildPolicy::default()).expect("build");
-        let mut bytes = built.slices[0].1.clone();
+        let mut bytes = bytes_of(&built.slices[0].1);
         assert!(Slice::open(&bytes).is_ok());
         bytes.push(0);
         assert!(
@@ -4111,8 +4222,8 @@ mod tests {
         let run: Vec<Posting> = built
             .slices
             .iter()
-            .filter_map(|(_, bytes)| {
-                Slice::open(bytes)
+            .filter_map(|(_, built)| {
+                Slice::open(&bytes_of(built))
                     .expect("open")
                     .postings(&fid("body").term_key("common"))
                     .expect("ok")

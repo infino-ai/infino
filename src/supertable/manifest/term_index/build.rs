@@ -24,6 +24,7 @@ use std::{
     cmp::Reverse,
     collections::HashMap,
     collections::{BinaryHeap, VecDeque},
+    fmt,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Write},
     mem,
@@ -133,6 +134,51 @@ pub(crate) struct BuildPolicy {
     /// Where the build encodes tiers in parallel; the process-wide pool
     /// when the caller has none to offer.
     pub(crate) pool: Option<Arc<ThreadPool>>,
+    /// Write each finished slice and tier object to a scratch file as it is
+    /// cut rather than keep its bytes: a table-wide rebuild produces more
+    /// index than a host holds in memory.
+    pub(crate) spill_to_disk: bool,
+}
+
+/// Bytes a build produced: resident, or in a scratch file the build spilled
+/// them to, whose directory lives as long as any reference to it.
+#[derive(Clone)]
+pub(crate) enum BuiltBytes {
+    Resident(Vec<u8>),
+    Spilled {
+        /// Held only to keep the scratch directory, and the file, alive.
+        _dir: Arc<TempDir>,
+        path: PathBuf,
+    },
+}
+
+impl BuiltBytes {
+    /// The bytes, read back when spilled.
+    pub(crate) fn read(&self) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Resident(bytes) => Ok(bytes.clone()),
+            Self::Spilled { path, .. } => fs::read(path),
+        }
+    }
+}
+
+impl fmt::Debug for BuiltBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resident(bytes) => write!(f, "Resident({} bytes)", bytes.len()),
+            Self::Spilled { path, .. } => write!(f, "Spilled({})", path.display()),
+        }
+    }
+}
+
+/// Equal when the bytes are, wherever they sit.
+impl PartialEq for BuiltBytes {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.read(), other.read()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 impl Default for BuildPolicy {
@@ -143,6 +189,7 @@ impl Default for BuildPolicy {
             tier_share_of_postings: None,
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
+            spill_to_disk: false,
         }
     }
 }
@@ -890,9 +937,11 @@ struct SegmentWriter {
     /// The open slice's tier object so far: its terms' chunks back to back.
     current_tier: Vec<u8>,
     slices: Vec<SliceRef>,
-    slice_bytes: Vec<(ContentHash, Vec<u8>)>,
+    slice_bytes: Vec<(ContentHash, BuiltBytes)>,
     /// The tier objects of the slices cut so far, keyed by content hash.
-    tier_bytes: Vec<(ContentHash, Vec<u8>)>,
+    tier_bytes: Vec<(ContentHash, BuiltBytes)>,
+    /// Where cut slices and tier objects are spilled, when they are.
+    spill: Option<Arc<TempDir>>,
     target_bytes: usize,
     tier_entries_per_term: u64,
     /// Terms gathered for the next parallel encoding batch, in key order.
@@ -906,37 +955,63 @@ struct SegmentWriter {
 }
 
 impl SegmentWriter {
-    fn new(policy: &BuildPolicy) -> Self {
-        Self {
+    fn new(policy: &BuildPolicy) -> Result<Self, TermIndexError> {
+        let spill = match policy.spill_to_disk {
+            true => Some(Arc::new(
+                tempfile::Builder::new()
+                    .prefix("infino-term-index-")
+                    .tempdir()?,
+            )),
+            false => None,
+        };
+        Ok(Self {
             current: SliceBuilder::new(),
             current_tier: Vec::new(),
             slices: Vec::new(),
             slice_bytes: Vec::new(),
             tier_bytes: Vec::new(),
+            spill,
             target_bytes: policy.slice_target_bytes,
             tier_entries_per_term: policy.tier_entries_per_term,
             pending: Vec::new(),
             pending_entries: 0,
             pool: policy.pool.clone(),
             ordinals: Arc::from(Vec::new()),
-        }
+        })
     }
 
     /// A writer for a merge, renumbering decoded tiers through `ordinals`.
-    fn for_merge(policy: &BuildPolicy, ordinals: &[Option<u32>]) -> Self {
-        Self {
+    fn for_merge(policy: &BuildPolicy, ordinals: &[Option<u32>]) -> Result<Self, TermIndexError> {
+        Ok(Self {
             ordinals: Arc::from(ordinals.to_vec()),
-            ..Self::new(policy)
+            ..Self::new(policy)?
+        })
+    }
+
+    /// Keep `bytes` resident, or spill them to `name` under the scratch
+    /// directory when the build spills.
+    fn keep(&self, name: &str, bytes: Vec<u8>) -> Result<BuiltBytes, TermIndexError> {
+        match &self.spill {
+            None => Ok(BuiltBytes::Resident(bytes)),
+            Some(dir) => {
+                let path = dir.path().join(name);
+                fs::write(&path, &bytes)?;
+                Ok(BuiltBytes::Spilled {
+                    _dir: Arc::clone(dir),
+                    path,
+                })
+            }
         }
     }
 
     /// Append one term, first cutting the slice when the run would push it
     /// past the target.
-    fn add(&mut self, key: &[u8], run: &[u8]) {
+    fn add(&mut self, key: &[u8], run: &[u8]) -> Result<(), TermIndexError> {
         if self.cuts_before(run.len()) {
-            self.cut();
+            self.cut()?;
         }
         self.current.add(key, run);
+        Ok(())
     }
 
     /// Whether a run of `run_len` bytes starts a new slice.
@@ -1028,17 +1103,16 @@ impl SegmentWriter {
             None => encode(),
         }?;
         for term in encoded {
-            self.add_encoded(term);
+            self.add_encoded(term)?;
         }
         Ok(())
     }
 
     /// Write one encoded term: its chunks go in the tier object of the slice
     /// the term lands in, so a cut moves them to the fresh slice's object.
-    fn add_encoded(&mut self, term: EncodedTerm) {
+    fn add_encoded(&mut self, term: EncodedTerm) -> Result<(), TermIndexError> {
         let Some(encoded) = term.tier else {
-            self.add(&term.key, &encode_run(&term.postings));
-            return;
+            return self.add(&term.key, &encode_run(&term.postings));
         };
         let mut tier = TierRef {
             complete: encoded.complete,
@@ -1047,31 +1121,38 @@ impl SegmentWriter {
         };
         let mut run = encode_run_with_tier(Some(&tier), &term.postings);
         if self.cuts_before(run.len()) {
-            self.cut();
+            self.cut()?;
             tier.chunks = self.refs_at(&encoded.chunks);
             run = encode_run_with_tier(Some(&tier), &term.postings);
         }
         let placed = self.place_chunks(&encoded.chunks);
         debug_assert_eq!(placed, tier.chunks);
         self.current.add(&term.key, &run);
+        Ok(())
     }
 
-    fn cut(&mut self) {
-        let tier = (!self.current_tier.is_empty()).then(|| {
-            let bytes = mem::take(&mut self.current_tier);
-            let reference = ObjectRef {
-                content_hash: ContentHash::of(&bytes),
-                len: bytes.len() as u64,
-            };
-            self.tier_bytes.push((reference.content_hash, bytes));
-            reference
+    /// Cut the open slice, and its tier object when it has one. A spilled
+    /// slice is named by its hash and its tier object beside it by the same
+    /// hash, as [`tier_path`] places them for a merge.
+    fn cut(&mut self) -> Result<(), TermIndexError> {
+        let tier_bytes = (!self.current_tier.is_empty()).then(|| mem::take(&mut self.current_tier));
+        let tier = tier_bytes.as_ref().map(|bytes| ObjectRef {
+            content_hash: ContentHash::of(bytes),
+            len: bytes.len() as u64,
         });
         if let Some((reference, bytes)) =
             mem::replace(&mut self.current, SliceBuilder::new()).finish(tier)
         {
-            self.slice_bytes.push((reference.content_hash, bytes));
+            let stem = reference.content_hash.to_hex();
+            if let (Some(object), Some(bytes)) = (tier, tier_bytes) {
+                let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
+                self.tier_bytes.push((object.content_hash, kept));
+            }
+            let kept = self.keep(&format!("{stem}.slice"), bytes)?;
+            self.slice_bytes.push((reference.content_hash, kept));
             self.slices.push(reference);
         }
+        Ok(())
     }
 
     /// The segment, its slices and their tier objects, each written beside
@@ -1082,13 +1163,13 @@ impl SegmentWriter {
     ) -> Result<
         (
             Segment,
-            Vec<(ContentHash, Vec<u8>)>,
-            Vec<(ContentHash, Vec<u8>)>,
+            Vec<(ContentHash, BuiltBytes)>,
+            Vec<(ContentHash, BuiltBytes)>,
         ),
         TermIndexError,
     > {
         self.flush_pending()?;
-        self.cut();
+        self.cut()?;
         Ok((
             Segment {
                 slices: self.slices,
@@ -1104,9 +1185,9 @@ pub(crate) struct Built {
     /// The root, not yet written.
     pub(crate) root: Root,
     /// Slice bytes keyed by content hash, in key order.
-    pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
+    pub(crate) slices: Vec<(ContentHash, BuiltBytes)>,
     /// The slices' tier objects, keyed by content hash.
-    pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
+    pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
 /// One merged segment: the superfiles it covers (in ordinal order, starting
@@ -1119,9 +1200,9 @@ pub(crate) struct BuiltSegment {
     /// The segment's slices, in key order.
     pub(crate) segment: Segment,
     /// Slice bytes keyed by content hash, in key order.
-    pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
+    pub(crate) slices: Vec<(ContentHash, BuiltBytes)>,
     /// The slices' tier objects, keyed by content hash.
-    pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
+    pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
 /// Merge contributions into a base root: one segment, ordinals from zero.
@@ -1293,7 +1374,7 @@ pub(crate) fn build_segment(
         readers.push(rd);
     }
 
-    let mut writer = SegmentWriter::new(policy);
+    let mut writer = SegmentWriter::new(policy)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
 
@@ -1534,7 +1615,7 @@ pub(crate) fn merge_segments(
         }
     }
 
-    let mut writer = SegmentWriter::for_merge(policy, ordinals);
+    let mut writer = SegmentWriter::for_merge(policy, ordinals)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     while let Some(Reverse(head)) = heap.pop() {
@@ -1601,8 +1682,8 @@ pub(crate) fn merge_segments(
 /// What [`merge_segments`] produces: the segment and the bytes it names.
 pub(crate) struct MergedSegment {
     pub(crate) segment: Segment,
-    pub(crate) slices: Vec<(ContentHash, Vec<u8>)>,
-    pub(crate) tiers: Vec<(ContentHash, Vec<u8>)>,
+    pub(crate) slices: Vec<(ContentHash, BuiltBytes)>,
+    pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
 #[cfg(test)]
