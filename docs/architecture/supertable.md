@@ -326,11 +326,17 @@ clears the running k-th score, so a query over common terms opened most
 of the table. The index therefore also keeps, per term, a *tier*: the
 term's best documents table-wide by BM25 impact, each as `(superfile,
 local document id, exact impact)`, cut into blocks whose directory
-carries the block's largest and smallest impact. The tier holds a term's
-whole list when the list fits a per-term budget (a small share of the
-table's documents, so the budget grows with the table) and its top of
-that budget otherwise; each posting then also records a *tail*, the
-largest impact of a document in that superfile the tier left out. The
+carries the block's largest impact. The tier holds a term's whole list
+when the list fits a per-term budget and its top of that budget
+otherwise; each posting then also records a *tail*, the largest impact
+of a document in that superfile the tier left out. The budget is settled
+by the build itself from a pass over the terms' frequencies: the largest
+count at which the tiers hold a small share of all postings, so a table
+of short texts, whose postings are few per document and whose
+mid-frequency terms are many, gets a budget as bounded as a table of
+long ones. A build writes each slice and tier object to scratch as it
+cuts it and uploads from there, so a rebuild of the whole index needs
+memory for the uploads in flight, not for the index. The
 blocks of every term in a slice sit back to back in that slice's tier
 object, named by offset from the run, so a query reads a block with a
 ranged fetch (each block carries a checksum) and a term's tier costs the
