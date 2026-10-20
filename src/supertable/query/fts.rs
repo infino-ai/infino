@@ -75,7 +75,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     iter::repeat_n,
-    slice,
+    mem, slice,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
@@ -1082,6 +1082,12 @@ impl SupertableReader {
         // that does not yet list every live superfile knows nothing about
         // the rest.
         let mut tier_seed: Option<f32> = None;
+        // Superfiles the tiers answer for outright: their hits, tagged as a
+        // kernel's would be, and the scores to raise the shared floor with
+        // before any open. A scope admits rows the index cannot see, so a
+        // scoped search opens as before.
+        let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
+        let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
         if let (Some(index), None, Some(column_id), true) = (
             &term_index,
             bm25_params,
@@ -1130,9 +1136,45 @@ impl SupertableReader {
                 }
                 _ => None,
             };
-            if let Some(selection) = selection {
+            if let Some(mut selection) = selection {
                 if let Some(stats) = &self.op_stats {
                     stats.add_tier_read(selection.tier_bytes, selection.entries_read);
+                }
+                if scope.is_none() && !selection.resolved.is_empty() {
+                    let resolved = mem::take(&mut selection.resolved);
+                    let ids: Vec<Uuid> = resolved.keys().copied().collect();
+                    let now = Instant::now();
+                    if let Some(cache) = &self.tombstone_cache {
+                        cache.prefetch(&ids, now).await;
+                    }
+                    let mut answered: HashSet<Uuid> = HashSet::new();
+                    for entry in &kept {
+                        let Some(hits) = resolved.get(&entry.superfile_id) else {
+                            continue;
+                        };
+                        // A tombstone sidecar that cannot be read leaves the
+                        // superfile to the kernel, which filters as it opens.
+                        let hits: Vec<(u32, f32)> = match self
+                            .tombstone_cache
+                            .as_ref()
+                            .map(|c| c.bitmap_for(entry.superfile_id, now))
+                        {
+                            Some(Ok(bitmap)) => hits
+                                .iter()
+                                .copied()
+                                .filter(|(doc, _)| !bitmap.contains(*doc))
+                                .collect(),
+                            Some(Err(_)) => continue,
+                            None => hits.clone(),
+                        };
+                        answered.insert(entry.superfile_id);
+                        resolved_scores.push((entry.id_max, hits.iter().map(|h| h.1).collect()));
+                        resolved_units.push(dispatch::tag_hits(entry, hits));
+                    }
+                    if let Some(stats) = &self.op_stats {
+                        stats.add_superfiles_resolved(answered.len() as u64);
+                    }
+                    kept.retain(|e| !answered.contains(&e.superfile_id));
                 }
                 let bound_of = |e: &Arc<SuperfileEntry>| {
                     selection.bounds.get(&e.superfile_id).copied().unwrap_or(
@@ -1247,6 +1289,11 @@ impl SupertableReader {
         // replace these placeholders only raise it.
         if let Some(seed) = tier_seed {
             shared.merge(i128::MAX, repeat_n(seed, k));
+        }
+        // Scores the index settled are real documents at known ids: they
+        // raise the floor and settle ties before the first open.
+        for (id_max, scores) in resolved_scores {
+            shared.merge(id_max, scores);
         }
         let floor_handle = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
@@ -1558,6 +1605,8 @@ impl SupertableReader {
                     .await?
             }
         };
+        let mut per_unit = per_unit;
+        per_unit.extend(resolved_units);
         let hits = select_top_k_stable(self, per_unit, k).await?;
         Ok(hits)
     }

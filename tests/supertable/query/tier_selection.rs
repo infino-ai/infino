@@ -13,6 +13,7 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
+use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode,
     runtime_metrics::op_stats::with_op_stats,
@@ -229,13 +230,54 @@ fn a_rare_conjunction_opens_only_its_holders() {
     let (hits, opened, holders) = run(&st, "quokka tensor", BoolMode::And, 10);
     assert!(!hits.is_empty(), "the planted pair matches");
     // Both terms are under the budget, so their tiers are complete and the
-    // merge knows every document that carries both: only the superfiles
-    // holding a top-10 document (or one tied with the tenth) need open.
-    assert!(
-        opened <= holders as u64 + 2,
+    // merge knows every document that carries both, with its score as the
+    // kernel computes it: the index answers outright and nothing opens.
+    assert_eq!(
+        opened, 0,
         "opened {opened} superfiles for a k=10 conjunction whose hits sit in {holders}"
     );
-    assert!(opened < SUPERFILES as u64, "not every superfile opened");
+    let (_, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits(
+                "body",
+                "quokka tensor",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
+            )
+            .expect("search")
+    });
+    assert_eq!(
+        stats.superfiles_resolved, SUPERFILES as u64,
+        "every superfile is answered from the index"
+    );
+}
+
+/// A document deleted after the index was built is in the tiers but not
+/// in the table: a superfile the index answers for leaves it out, as an
+/// opened one would.
+#[test]
+fn a_resolved_superfile_respects_tombstones() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    // Document 97 carries the planted pair; delete it in both tables.
+    let doomed = document(97);
+    for st in [&with, &without] {
+        st.delete(col("body").eq(lit(doomed.as_str())))
+            .expect("delete");
+    }
+    for k in [1usize, 10, 100] {
+        let (a, opened, _) = run(&with, "quokka tensor", BoolMode::And, k);
+        let (b, _, _) = run(&without, "quokka tensor", BoolMode::And, k);
+        assert_eq!(a, b, "k={k}: same answer after the delete");
+        assert!(
+            a.iter().all(|&(sf, row, _)| !(sf == 0 && row == 97)),
+            "k={k}: the deleted document is not returned"
+        );
+        assert_eq!(opened, 0, "k={k}: still answered from the index");
+    }
 }
 
 /// A conjunction of two complete-tier terms that never share a document

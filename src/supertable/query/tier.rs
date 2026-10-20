@@ -118,6 +118,12 @@ pub(crate) struct TierSelection {
     /// Lower bound on the final k-th score; `NEG_INFINITY` when fewer than
     /// `k` documents were seen with every term.
     pub(crate) theta_lb: f32,
+    /// Per superfile the index answers for outright — every term's tier
+    /// holds the term's whole list and the merge read all of it, with
+    /// scores the kernel would compute bit for bit — its matching
+    /// documents as `(row, score)`. Such a superfile need not be opened;
+    /// tombstones still apply. Empty unless the scores are exact.
+    pub(crate) resolved: HashMap<Uuid, Vec<(u32, f32)>>,
     /// Tier bytes consumed: directories and block bodies.
     pub(crate) tier_bytes: u64,
     /// Tier entries decoded.
@@ -216,6 +222,8 @@ pub(crate) async fn select_with_tiers(
     let n_sf = kept.len();
     let mut per_term: Vec<Vec<TermInFile>> = vec![vec![TermInFile::default(); n_sf]; nt];
     let mut idf: Vec<f32> = Vec::with_capacity(nt);
+    // Per term, whether every segment's tier holds the term's whole list.
+    let mut complete: Vec<bool> = vec![true; nt];
     let mut streams: Vec<Stream> = Vec::new();
     // Entries of tiers small enough to ride in their runs, with their term.
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
@@ -234,6 +242,7 @@ pub(crate) async fn select_with_tiers(
                 None if run.postings.is_empty() => continue,
                 None => return Ok(None),
             };
+            complete[ti] &= tier.complete;
             for p in &run.postings {
                 let Some(id) = index.superfile_id(p.superfile) else {
                     continue;
@@ -437,9 +446,33 @@ pub(crate) async fn select_with_tiers(
         }
         bounds.insert(e.superfile_id, SuperfileBounds { lb, ub });
     }
+    // With every term's whole list read and every score exact, the index
+    // knows each superfile's matching documents and their scores: the
+    // candidates carrying the required terms, as the kernel would find and
+    // score them.
+    let mut resolved: HashMap<Uuid, Vec<(u32, f32)>> = HashMap::new();
+    let all_read = complete.iter().all(|c| *c) && frontier.iter().all(Option::is_none);
+    if exact_scores && all_read {
+        for (&(ordinal, doc_id), &(mask, sum)) in &cands.acc {
+            if mask & required != required {
+                continue;
+            }
+            let Some(id) = index.superfile_id(ordinal) else {
+                continue;
+            };
+            if slot_of.contains_key(&id) {
+                resolved.entry(id).or_default().push((doc_id, sum));
+            }
+        }
+        // A kept superfile no candidate names holds no match at all.
+        for e in kept {
+            resolved.entry(e.superfile_id).or_default();
+        }
+    }
     Ok(Some(TierSelection {
         bounds,
         theta_lb,
+        resolved,
         tier_bytes,
         entries_read,
     }))

@@ -106,6 +106,9 @@ pub struct OpStats {
     /// Term-index tier entries a ranked query decoded to choose its
     /// superfiles.
     pub tier_entries: u64,
+    /// Superfiles a ranked query answered from the term index's tiers
+    /// alone, without opening them.
+    pub superfiles_resolved: u64,
     /// Vector cells the query's scans actually probed, summed across
     /// superfiles (a cell counts once per superfile scan that chose at
     /// least one of its clusters).
@@ -286,6 +289,7 @@ pub(crate) struct OpStatsCollector {
     fts_postings_bytes: AtomicU64,
     tier_bytes: AtomicU64,
     tier_entries: AtomicU64,
+    superfiles_resolved: AtomicU64,
     vector_cells_scanned: AtomicU64,
     vector_candidates_scanned: AtomicU64,
     vector_rows_reranked: AtomicU64,
@@ -320,6 +324,11 @@ impl OpStatsCollector {
     pub(crate) fn add_tier_read(&self, bytes: u64, entries: u64) {
         self.tier_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.tier_entries.fetch_add(entries, Ordering::Relaxed);
+    }
+
+    /// Flush the superfiles a ranked query answered from the tiers alone.
+    pub(crate) fn add_superfiles_resolved(&self, n: u64) {
+        self.superfiles_resolved.fetch_add(n, Ordering::Relaxed);
     }
 
     /// Flush one superfile scan's cell + candidate tallies.
@@ -442,6 +451,7 @@ impl OpStatsCollector {
             fts_postings_bytes: self.fts_postings_bytes.load(Ordering::Relaxed),
             tier_bytes: self.tier_bytes.load(Ordering::Relaxed),
             tier_entries: self.tier_entries.load(Ordering::Relaxed),
+            superfiles_resolved: self.superfiles_resolved.load(Ordering::Relaxed),
             vector_cells_scanned: self.vector_cells_scanned.load(Ordering::Relaxed),
             vector_candidates_scanned: self.vector_candidates_scanned.load(Ordering::Relaxed),
             vector_rows_reranked: self.vector_rows_reranked.load(Ordering::Relaxed),

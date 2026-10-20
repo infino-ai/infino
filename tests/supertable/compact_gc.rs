@@ -87,6 +87,85 @@ fn commit_titles(st: &Supertable, titles: &[&str]) {
     w.commit().expect("commit");
 }
 
+/// Compaction packs superfiles by their smallest id, so the superfiles an
+/// optimize leaves keep the disjoint, ordered id ranges ingest gave their
+/// inputs — what lets a ranked query settle a tie at the k-th score by id
+/// before opening. Enough commits to fill several outputs at the target.
+#[test]
+fn optimize_leaves_superfile_id_ranges_disjoint_and_in_order() {
+    const COMMITS: usize = 40;
+    const TITLES_PER_COMMIT: usize = 1_000;
+    const WORDS_PER_TITLE: usize = 12;
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    // Titles of pseudo-random words, so the superfiles do not compress to
+    // nothing and the optimize has several outputs to cut.
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    for _ in 0..COMMITS {
+        let titles: Vec<String> = (0..TITLES_PER_COMMIT)
+            .map(|_| {
+                (0..WORDS_PER_TITLE)
+                    .map(|_| format!("w{}", next() % 50_000))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        commit_titles(&st, &refs);
+    }
+    let ranges = |st: &Supertable| -> Vec<(i128, i128)> {
+        let reader = st.reader().expect("reader");
+        let mut v: Vec<(i128, i128)> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .filter(|e| e.n_docs > 0)
+            .map(|e| (e.id_min, e.id_max))
+            .collect();
+        v.sort_unstable();
+        v
+    };
+    let before = ranges(&st);
+    assert_eq!(before.len(), COMMITS);
+    assert!(
+        before.windows(2).all(|w| w[0].1 < w[1].0),
+        "ingest gives disjoint, ascending ranges: {before:?}"
+    );
+    st.optimize(&small_optimize_opts()).expect("optimize");
+    let after = ranges(&st);
+    assert!(
+        after.len() > 1 && after.len() < COMMITS,
+        "several outputs, fewer than the inputs: {}",
+        after.len()
+    );
+    assert!(
+        after.windows(2).all(|w| w[0].1 < w[1].0),
+        "the outputs' ranges stay disjoint and ascending: {after:?}"
+    );
+    // Ids are minted with gaps between commits, so the outputs cover the
+    // inputs' span rather than a dense count: the first output starts where
+    // the first input did and the last ends where the last input did.
+    assert_eq!(
+        after.first().map(|r| r.0),
+        before.first().map(|r| r.0),
+        "the first output starts where the first input did"
+    );
+    assert_eq!(
+        after.last().map(|r| r.1),
+        before.last().map(|r| r.1),
+        "the last output ends where the last input did"
+    );
+}
+
 #[test]
 fn compact_then_gc_removes_stale_files_and_preserves_queries() {
     let dir = TempDir::new().expect("tempdir");

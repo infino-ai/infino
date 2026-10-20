@@ -3576,7 +3576,7 @@ mod tests {
             runtime_metrics::op_stats::{self, with_op_stats},
         };
 
-        let (_dir, _storage, st) = fresh_table_with_open_window(1);
+        let (_dir, _storage, st) = fresh_table_with_open_window_no_tiers(1);
         // Every title is three tokens, so length normalization is identical
         // everywhere and `alpha shared x` scores the same in both superfiles
         // under table-wide statistics. The second superfile's tf-2 title
@@ -4677,6 +4677,23 @@ mod tests {
         table_with(|o| o.with_bound_ordered_open_window(window))
     }
 
+    /// A table whose index keeps no tiers, so a ranked query takes the
+    /// ceiling-ordered path and opens superfiles: what the open-count tests
+    /// of that path exercise. With tiers the same queries are answered from
+    /// the index without opening anything.
+    fn fresh_table_with_open_window_no_tiers(
+        window: usize,
+    ) -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        table_with(|o| {
+            o.with_bound_ordered_open_window(window)
+                .with_term_tier_entries_per_term(0)
+        })
+    }
+
     fn commit_titles(st: &crate::supertable::Supertable, titles: &[String]) {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
         let arr: ArrayRef = Arc::new(LargeStringArray::from(
@@ -4727,7 +4744,7 @@ mod tests {
             runtime_metrics::op_stats::{self, with_op_stats},
         };
 
-        let (_dir, _storage, st) = fresh_table_with_open_window(1);
+        let (_dir, _storage, st) = fresh_table_with_open_window_no_tiers(1);
         // Segment 0 carries `alpha` three times per title — a clearly higher
         // ceiling than the single occurrence in segments 1 and 2.
         for segment in 0..3 {
