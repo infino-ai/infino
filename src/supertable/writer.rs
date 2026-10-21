@@ -111,6 +111,7 @@ use crate::{
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector},
+        rss::available_memory_bytes,
     },
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -11424,15 +11425,23 @@ fn scoring_by_ordinal(
         .collect()
 }
 
-/// Superfiles whose terms an index rebuild walks at once. Each walk is one
-/// open reader and a pass over its dictionary and postings — a few hundred
-/// megabytes resident and a core's worth of work — so a table of a thousand
-/// superfiles rebuilds in minutes rather than hours, within a bounded
-/// footprint.
-const CONTRIBUTION_WALKS_AT_ONCE: usize = 16;
+/// The most superfiles an index rebuild walks at once. Each walk is one
+/// open reader and a pass over its dictionary and postings — a core's worth
+/// of work — so a table of a thousand superfiles rebuilds in minutes rather
+/// than hours.
+const CONTRIBUTION_WALKS_MAX: usize = 16;
+/// Memory one walk is budgeted at: the reader's resident dictionary and
+/// norms, its prefetched postings and the head heaps, on a superfile of a
+/// gigabyte. The walks at once are the memory available over this, up to
+/// the maximum: sixteen walks over a billion-document table peaked an
+/// 85 GB host at 84 GB.
+const CONTRIBUTION_WALK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Walks at once when the available memory cannot be read.
+const CONTRIBUTION_WALKS_FALLBACK: usize = 4;
 
 /// Each of `entries`' term-index contributions, in `entries` order, walked
-/// [`CONTRIBUTION_WALKS_AT_ONCE`] superfiles at a time.
+/// as many superfiles at a time as memory allows, up to
+/// [`CONTRIBUTION_WALKS_MAX`].
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
@@ -11442,7 +11451,10 @@ async fn collect_contributions(
     let policy = manifest
         .options
         .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
-    let walks = Arc::new(Semaphore::new(CONTRIBUTION_WALKS_AT_ONCE));
+    let width = available_memory_bytes().map_or(CONTRIBUTION_WALKS_FALLBACK, |bytes| {
+        ((bytes / CONTRIBUTION_WALK_BYTES) as usize).clamp(1, CONTRIBUTION_WALKS_MAX)
+    });
+    let walks = Arc::new(Semaphore::new(width));
     let mut tasks = Vec::with_capacity(entries.len());
     for entry in entries {
         let permit = Arc::clone(&walks)
