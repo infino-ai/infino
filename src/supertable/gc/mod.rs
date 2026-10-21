@@ -164,10 +164,7 @@ async fn term_index_slices(
         .flat_map(|slice| {
             [Some(term_index::slice_uri(&slice.content_hash))]
                 .into_iter()
-                .chain([slice
-                    .tier
-                    .as_ref()
-                    .map(|t| term_index::tier_uri(&t.content_hash))])
+                .chain([slice.tier.as_ref().map(term_index::tier_uri)])
         })
         .flatten()
         .collect();

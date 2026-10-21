@@ -1196,8 +1196,7 @@ impl SupertableReader {
             let gidf = global_idf.clone();
             // Every term is in the map (the guard above); the fallback
             // only satisfies the type.
-            let idf_used =
-                move |term: &str, _local: f32| gidf.get(term).copied().unwrap_or(f32::INFINITY);
+            let idf_used = move |term: &str| gidf.get(term).copied().unwrap_or(f32::INFINITY);
             let mut c = index
                 .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
                 .instrument(term_span.clone())

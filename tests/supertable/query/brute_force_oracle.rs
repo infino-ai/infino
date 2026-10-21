@@ -175,6 +175,17 @@ fn build_supertable_with_params(
     n_superfiles: usize,
     params: OracleBm25Params,
 ) -> Supertable {
+    build_supertable_with(corpus, n_superfiles, params, |o| o)
+}
+
+/// The fixture with `params`, its options passed through `configure`
+/// before the table is created.
+fn build_supertable_with(
+    corpus: &[(u64, String)],
+    n_superfiles: usize,
+    params: OracleBm25Params,
+    configure: impl FnOnce(SupertableOptions) -> SupertableOptions,
+) -> Supertable {
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(RAYON_POOL_THREADS)
@@ -195,6 +206,7 @@ fn build_supertable_with_params(
     )
     .expect("opts")
     .with_writer_pool(pool);
+    let opts = configure(opts);
 
     let st = Supertable::create(opts).expect("create");
     let mut w = st.writer().expect("writer");
@@ -1001,6 +1013,122 @@ fn oracle_zipfian_corpus_query_shapes_match() {
              supertable={inf:?} oracle={ora:?}",
         );
     }
+}
+
+// ---- the tiers' progressive merge ----------------------------------
+
+/// Superfiles in the tier-merge arm.
+const TIER_SUPERFILES: usize = 8;
+/// Documents in the tier-merge corpus: 500 per superfile, so a common
+/// term has hundreds of documents in each.
+const TIER_DOCS: usize = 4_000;
+/// Documents each superfile keeps per term: two blocks, so a common
+/// term's head is read block by block and bounded by its tails, while a
+/// rare term's head is whole.
+const TIER_HEAD_DEPTH: usize = 128;
+/// The `k` values the tier-merge arm compares at.
+const TIER_KS: [usize; 4] = [1, 10, 100, 1000];
+
+/// The tiers' merge, with heads cut to two blocks, returns hit for hit
+/// and score for score what the ceiling path returns on the same table
+/// — for one, two, three and four terms, as disjunctions and
+/// conjunctions, at every `k` — and both agree with the brute-force
+/// reference. The merge is exercised, not bypassed: the index reads tier
+/// entries for every query, and answers a rare conjunction outright.
+#[test]
+fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
+    let corp = zipfian_corpus(TIER_DOCS, 7);
+    let params = OracleBm25Params::default();
+    // A term index needs storage: both arms are tables on disk. Opens
+    // are one at a time on both, so the counts below are the bounds'
+    // doing and not a race between the opens in a window.
+    let storage_in = |dir: &TempDir| -> Arc<dyn StorageProvider> {
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"))
+    };
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with_tiers = build_supertable_with(&corp, TIER_SUPERFILES, params, |o| {
+        o.with_storage(storage_in(&with_dir))
+            .with_term_head_depth(TIER_HEAD_DEPTH)
+            .with_bound_ordered_open_window(1)
+    });
+    let without_tiers = build_supertable_with(&corp, TIER_SUPERFILES, params, |o| {
+        o.with_storage(storage_in(&without_dir))
+            .with_term_tier_entries_per_term(0)
+            .with_bound_ordered_open_window(1)
+    });
+    let oracles = build_oracles(&corp, TIER_SUPERFILES);
+    let chunk_size = TIER_DOCS / TIER_SUPERFILES;
+
+    let queries: [(&str, &str, BoolMode); 10] = [
+        ("single_common", "term00001", BoolMode::Or),
+        ("single_mid", "term00200", BoolMode::Or),
+        ("single_rare", "term05000", BoolMode::Or),
+        ("two_common_or", "term00001 term00002", BoolMode::Or),
+        ("two_common_and", "term00001 term00002", BoolMode::And),
+        ("common_mid_and", "term00003 term00300", BoolMode::And),
+        ("common_rare_and", "term00001 term03000", BoolMode::And),
+        ("three_or", "term00005 term00050 term00500", BoolMode::Or),
+        ("three_and", "term00001 term00002 term00003", BoolMode::And),
+        (
+            "four_or",
+            "term00010 term00020 term00030 term00040",
+            BoolMode::Or,
+        ),
+    ];
+    let hits_of = |st: &Supertable, q: &str, mode: BoolMode, k: usize| {
+        let (hits, stats) = infino::runtime_metrics::op_stats::with_op_stats(|| {
+            st.reader()
+                .expect("reader")
+                .bm25_hits("title", q, k, Bm25SearchOptions::new().with_mode(mode))
+                .expect("search")
+        });
+        let ids = supertable_to_global_ids(st, hits.clone(), chunk_size);
+        let scored: Vec<(u64, f32)> = ids.into_iter().zip(hits.iter().map(|h| h.score)).collect();
+        (scored, stats)
+    };
+    for (label, q, mode) in queries {
+        for k in TIER_KS {
+            let (tiered, stats) = hits_of(&with_tiers, q, mode, k);
+            let (plain, _) = hits_of(&without_tiers, q, mode, k);
+            assert_eq!(
+                tiered, plain,
+                "{label} k={k}: the tiers' merge must return what the ceiling path returns"
+            );
+            assert!(
+                stats.tier_entries > 0,
+                "{label} k={k}: the merge read no tier entries"
+            );
+            // The reference: the same ranking, up to the one-byte length
+            // quantization at the boundary of the top k.
+            let mut terms: Vec<String> = Vec::new();
+            default_tokenizer().tokenize_each(q, &mut |t| terms.push(t.to_owned()));
+            let reference = match mode {
+                BoolMode::And => brute_force_and_top_k(&oracles, q, k),
+                _ => brute_force_terms_top_k(&oracles, &terms, k),
+            };
+            let got: HashSet<u64> = tiered.iter().map(|h| h.0).collect();
+            let want: HashSet<u64> = reference.iter().copied().collect();
+            let common = got.intersection(&want).count();
+            let target = got.len().min(want.len());
+            assert!(
+                common * 10 >= target * 9,
+                "{label} k={k}: top-{k} overlap {common}/{target} below 90%"
+            );
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{label} k={k}: the engine and the reference return different counts"
+            );
+        }
+    }
+    // A rare conjunction's heads are whole, so the index answers it
+    // without opening a superfile.
+    let (_, stats) = hits_of(&with_tiers, "term03000 term03001", BoolMode::And, 10);
+    assert_eq!(
+        stats.score_pruning_survived, 0,
+        "a conjunction of rare terms is answered from the index"
+    );
 }
 
 // ---- single-term global-idf skip path ------------------------------

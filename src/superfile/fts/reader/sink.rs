@@ -71,7 +71,10 @@ impl LiveFloor {
 /// Tie-break: larger doc_id is "greater", so on equal scores the
 /// smaller doc_id survives in the heap.
 #[derive(Debug, Copy, Clone)]
-pub(super) struct TopKEntry<I = FtsDocId>(pub(super) f32, pub(super) I);
+pub(in crate::superfile::fts) struct TopKEntry<I = FtsDocId>(
+    pub(in crate::superfile::fts) f32,
+    pub(in crate::superfile::fts) I,
+);
 impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0 && self.1 == other.1

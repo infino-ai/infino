@@ -47,8 +47,8 @@ use build::build_segment;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, Head, HeadSink,
-    build_onto, merge_segments, tier_path,
+    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
+    HeadSink, build_onto, merge_segments, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
@@ -63,10 +63,7 @@ use uuid::Uuid;
 
 use crate::{
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
-    superfile::{
-        FtsError,
-        fts::{bm25::idf as bm25_idf, reader::BoolMode},
-    },
+    superfile::{FtsError, fts::reader::BoolMode},
     supertable::{
         error::QueryError,
         manifest::{
@@ -271,9 +268,7 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
     object_uri("slice", hash)
 }
 
-/// Storage URI of a tier chunk or a segment's tier list with this content
-/// hash. Both are content-addressed under one kind: a chunk and a list are
-/// told apart by where they are named from, never by their key.
+/// Storage URI of a slice's tier object with this content hash.
 pub(crate) fn tier_uri(hash: &ContentHash) -> String {
     object_uri("tier", hash)
 }
@@ -524,13 +519,7 @@ pub(crate) async fn download_segments(
                 .await?;
                 async_fs::write(&path, &bytes).await?;
                 if let Some(tier) = &slice.tier {
-                    let bytes = fetch_verified(
-                        storage,
-                        None,
-                        &tier_uri(&tier.content_hash),
-                        &tier.content_hash,
-                    )
-                    .await?;
+                    let bytes = fetch_verified(storage, None, &tier_uri(tier), tier).await?;
                     async_fs::write(&tier_file, &bytes).await?;
                 }
                 Ok::<(), TermIndexError>(())
@@ -592,7 +581,7 @@ pub(crate) fn spill_tiers(
 ) -> Result<(), TermIndexError> {
     let slice_of: HashMap<ContentHash, ContentHash> = slices
         .iter()
-        .filter_map(|s| Some((s.tier.as_ref()?.content_hash, s.content_hash)))
+        .filter_map(|s| Some((s.tier?, s.content_hash)))
         .collect();
     for (hash, built) in tiers {
         let slice = slice_of
@@ -740,20 +729,6 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
         self.by_use.insert(self.tick, key.clone());
         self.map.insert(key, (value, self.tick));
     }
-}
-
-/// A term's idf within one superfile of `n_scored` scored documents, where
-/// it has `df` of them: what the superfile's stored impacts are computed
-/// at.
-pub(crate) fn local_idf(n_scored: u64, df: u64) -> f32 {
-    bm25_idf(n_scored, df.min(n_scored))
-}
-
-/// The factor that takes an impact computed at `local` to one at the idf
-/// `query` weights the term with; one when the superfile's idf is not
-/// positive.
-pub(crate) fn idf_ratio(local: f32, query: f32) -> f32 {
-    if local > 0.0 { query / local } else { 1.0 }
 }
 
 impl TermIndex {
@@ -906,21 +881,10 @@ impl TermIndex {
         terms: &[&str],
         phrases: &[Vec<&str>],
         entries: &[Arc<SuperfileEntry>],
-        idf_used: &(dyn Fn(&str, f32) -> f32 + Sync),
+        idf_used: &(dyn Fn(&str) -> f32 + Sync),
     ) -> Result<HashMap<Uuid, f32>, TermIndexError> {
-        let scored_docs: HashMap<Uuid, u64> = entries
-            .iter()
-            .map(|e| {
-                let n = e
-                    .fts_summary
-                    .get(&column_id)
-                    .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
-                    .unwrap_or(e.n_docs);
-                (e.superfile_id, n)
-            })
-            .collect();
-        // Per term: superfile → (bound rescaled to the query's idf, bound / local idf).
-        let mut per_term: HashMap<&str, HashMap<Uuid, (f32, f32)>> = HashMap::new();
+        // Per term: superfile → the key of its best document there.
+        let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
         let mut all_terms: Vec<&str> = terms.to_vec();
         all_terms.extend(phrases.iter().flatten().copied());
         all_terms.sort_unstable();
@@ -932,17 +896,7 @@ impl TermIndex {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
-                let Some(&n) = scored_docs.get(&id) else {
-                    continue;
-                };
-                let local = local_idf(n, p.df);
-                let ratio = idf_ratio(local, idf_used(term, local));
-                let scaled = if local > 0.0 {
-                    p.bound / local
-                } else {
-                    p.bound
-                };
-                by_sf.insert(id, (p.bound * ratio, scaled));
+                by_sf.insert(id, p.bound);
             }
             per_term.insert(term, by_sf);
         }
@@ -955,8 +909,8 @@ impl TermIndex {
             }
             let mut ceiling = 0.0f32;
             for term in terms {
-                if let Some((rescaled, _)) = per_term.get(term).and_then(|m| m.get(&id)) {
-                    ceiling += rescaled;
+                if let Some(bound) = per_term.get(term).and_then(|m| m.get(&id)) {
+                    ceiling += bound * idf_used(term);
                 }
             }
             for phrase in phrases {
@@ -965,17 +919,9 @@ impl TermIndex {
                 let mut complete = true;
                 for member in phrase {
                     match per_term.get(member).and_then(|m| m.get(&id)) {
-                        Some((rescaled, scaled)) => {
-                            // rescaled = bound × (idf_used / local_idf); recover idf_used
-                            // from the pair without a second idf call.
-                            let local_scaled = *scaled;
-                            let idf = if local_scaled > 0.0 {
-                                rescaled / local_scaled
-                            } else {
-                                0.0
-                            };
-                            idf_sum += idf;
-                            min_scaled = min_scaled.min(local_scaled);
+                        Some(bound) => {
+                            idf_sum += idf_used(member);
+                            min_scaled = min_scaled.min(*bound);
                         }
                         None => {
                             complete = false;
@@ -1182,7 +1128,7 @@ impl TermIndex {
         let refs: Vec<(ContentHash, Option<ContentHash>)> = self
             .root
             .slices_for_key(&key)
-            .map(|r| (r.content_hash, r.tier.as_ref().map(|t| t.content_hash)))
+            .map(|r| (r.content_hash, r.tier))
             .collect();
         let mut out = Vec::with_capacity(refs.len());
         for (hash, tier_object) in refs {
@@ -1256,7 +1202,7 @@ impl TermIndex {
             .get_range(&tier_uri(object), chunk.offset..end)
             .await?;
         let fetched = bytes.len() as u64;
-        let dir = TierDirectory::parse(&bytes)?;
+        let dir = TierDirectory::parse(&bytes, chunk.n_blocks)?;
         if dir.chunk_len() as u64 != chunk.len {
             return Err(TermIndexError::Malformed(
                 "tier chunk directory does not match the run's chunk length".into(),
@@ -1426,6 +1372,7 @@ mod tests {
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
+        superfile::fts::bm25,
         supertable::{
             Supertable,
             manifest::{
@@ -1468,7 +1415,7 @@ mod tests {
                     len: 800,
                 },
             };
-            w.push(key, *df, f32::INFINITY, location, 0.0, &Head::default())
+            w.push(key, *df, f32::INFINITY, location, 0.0, &[])
                 .expect("push");
         }
         w.finish().expect("finish")
@@ -1508,7 +1455,7 @@ mod tests {
             w.set_scoring(fid(column), ColumnScoring::default());
             let mut sorted = docs.clone();
             sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let bound = sorted.first().map(|d| d.1).unwrap_or(0.0);
+            let bound = sorted.first().map(|d| key_of(d.1)).unwrap_or(0.0);
             let complete = sorted.len() <= complete_up_to;
             let kept: Vec<(u32, u32, u8)> = sorted
                 .iter()
@@ -1523,18 +1470,8 @@ mod tests {
             } else {
                 key_of(sorted[complete_up_to].1)
             };
-            w.push(
-                &key,
-                docs.len() as u64,
-                bound,
-                Location::None,
-                tail,
-                &Head {
-                    docs: kept,
-                    complete,
-                },
-            )
-            .expect("push");
+            w.push(&key, docs.len() as u64, bound, Location::None, tail, &kept)
+                .expect("push");
         }
         w.finish().expect("finish")
     }
@@ -1561,21 +1498,18 @@ mod tests {
         let bytes = bytes_of(
             &built_tiers
                 .iter()
-                .find(|(h, _)| *h == object.content_hash)
+                .find(|(h, _)| h == object)
                 .expect("the tier object is among the built")
                 .1,
         );
-        let bytes = &bytes;
         let mut out = Vec::new();
-        let mut block = Vec::new();
         for chunk in &tier.chunks {
             let range = chunk.offset as usize..(chunk.offset + chunk.len) as usize;
-            tier::TierChunk::verify(&bytes[range.clone()]).expect("crc");
-            let chunk = tier::TierChunk::open(&bytes[range]).expect("open chunk");
-            for i in 0..chunk.n_blocks() {
-                chunk.decode_block(i, &mut block).expect("decode");
-                out.extend_from_slice(&block);
-            }
+            tier::TierChunk::verify(&bytes[range.clone()], chunk.n_blocks).expect("crc");
+            tier::TierChunk::open(&bytes[range], chunk.n_blocks)
+                .expect("open chunk")
+                .entries(&mut out)
+                .expect("decode");
         }
         out
     }
@@ -1612,8 +1546,11 @@ mod tests {
         // Nine entries over three superfiles against a budget of four: the
         // depth drops to one for every superfile alike, so each keeps its
         // best document and the tier holds three.
-        assert_eq!(tier.n_entries, 3, "one per superfile under the budget");
-        assert!(!tier.complete, "a truncated tier is not complete");
+        assert_eq!(tier.inline.len(), 3, "one per superfile under the budget");
+        assert!(
+            alpha.postings.iter().all(|p| p.tail > 0.0),
+            "a truncated tier leaves every superfile a tail"
+        );
         let entries = tier_entries_of(&built.root.segments[0], &built.tiers, &tier);
         let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
         ids.sort_unstable();
@@ -1635,7 +1572,10 @@ mod tests {
             .expect("run")
             .expect("beta is indexed");
         let beta_tier = beta.tier.expect("beta has a tier");
-        assert!(beta_tier.complete, "one doc under the budget is complete");
+        assert!(
+            beta.postings.iter().all(|p| p.tail == 0.0),
+            "one doc under the budget leaves no tail"
+        );
         assert_eq!(
             tier_entries_of(&built.root.segments[0], &built.tiers, &beta_tier).len(),
             1
@@ -1696,7 +1636,14 @@ mod tests {
             rare.chunks.is_empty() && rare.inline.len() == 4,
             "a few entries ride in the run: {rare:?}"
         );
-        assert!(rare.complete && common.complete);
+        assert!(
+            run_of("rare")
+                .postings
+                .iter()
+                .chain(run_of("common").postings.iter())
+                .all(|p| p.tail == 0.0),
+            "whole heads leave no tail"
+        );
         let segment = &built.root.segments[0];
         assert_eq!(
             built.tiers.len(),
@@ -1929,12 +1876,15 @@ mod tests {
             .expect("run")
             .expect("alpha");
         let tier = run.tier.expect("tier");
-        assert_eq!(tier.n_entries, 40);
-        assert!(!tier.complete);
+        assert!(
+            run.postings.iter().any(|p| p.tail > 0.0),
+            "a truncated tier leaves a tail"
+        );
         let held: HashSet<(u32, u32)> = tier_entries_of(&merged.segment, &merged.tiers, &tier)
             .iter()
             .map(|e| (e.superfile, e.doc_id))
             .collect();
+        assert_eq!(held.len(), 40);
         // New ordinal 0 is superfile 1, new ordinal 1 is superfile 3.
         for (ordinal, id) in [(0u32, 1u128), (1, 3)] {
             let posting = run
@@ -1959,15 +1909,14 @@ mod tests {
     fn contribution_rejects_out_of_order_keys() {
         let dir = TempDir::new().expect("tempdir");
         let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
-        w.push(b"b", 1, 1.0, Location::None, 0.0, &Head::default())
+        w.push(b"b", 1, 1.0, Location::None, 0.0, &[])
             .expect("first");
         assert!(matches!(
-            w.push(b"a", 1, 1.0, Location::None, 0.0, &Head::default()),
+            w.push(b"a", 1, 1.0, Location::None, 0.0, &[]),
             Err(TermIndexError::Build(m)) if m.contains("ascending")
         ));
         assert!(
-            w.push(b"b", 1, 1.0, Location::None, 0.0, &Head::default())
-                .is_err(),
+            w.push(b"b", 1, 1.0, Location::None, 0.0, &[]).is_err(),
             "equal keys are not ascending"
         );
     }
@@ -2061,7 +2010,6 @@ mod tests {
             s.content_hash,
             ContentHash::of(&bytes_of(&built.slices[0].1))
         );
-        assert_eq!(s.len as usize, bytes_of(&built.slices[0].1).len());
     }
 
     /// Slices are cut at term boundaries once the target is reached, so
@@ -3051,7 +2999,6 @@ mod tests {
                 first_key: vec![tag],
                 last_key: vec![tag],
                 content_hash: ContentHash::of(&[tag]),
-                len: 1,
                 tier: None,
             }],
         }
@@ -3523,7 +3470,7 @@ mod tests {
                     .iter()
                     .map(|p| p.df)
                     .sum();
-                (term, bm25_idf(scored_total, df))
+                (term, bm25::idf(scored_total, df))
             })
             .collect();
         // (query, plain terms, phrases)
@@ -3540,7 +3487,7 @@ mod tests {
         ];
         for (query, terms, phrases) in &queries {
             let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
-            let idf_used = |term: &str, _local: f32| global_idf[term];
+            let idf_used = |term: &str| global_idf[term];
             let ceilings = rt
                 .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
                 .expect("ceilings");
@@ -3608,7 +3555,7 @@ mod tests {
             subsection_offsets: None,
         });
         let entries = vec![entry];
-        let local = |_: &str, idf: f32| idf;
+        let local = |_: &str| 1.0f32;
         // The contribution keyed `title` by the test's stable id; the entry
         // has no summary, so that id reads the same as any other there.
         let title = fid("title");
@@ -3956,7 +3903,7 @@ mod tests {
                 .iter()
                 .flat_map(|s| s.slices.iter())
                 .filter_map(|s| s.tier.as_ref())
-                .map(|t| format!("tier-{}.bin", t.content_hash.to_hex())),
+                .map(|t| format!("tier-{}.bin", t.to_hex())),
         );
         named
     }
@@ -4004,10 +3951,13 @@ mod tests {
         let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
         assert_eq!(runs.len(), 2, "one run per delta");
         let mut held = 0;
-        for SliceRun { run, .. } in runs.iter() {
+        for SliceRun { tier_object, run } in runs.iter() {
             let tier = run.tier.as_ref().expect("a term in every title has a tier");
-            assert!(tier.complete, "every document fits the default budget");
-            held += tier.n_entries;
+            let object = tier_object.unwrap_or_else(|| ContentHash::of(b""));
+            held += rt
+                .block_on(index.tier_entries(&object, tier))
+                .expect("tier entries")
+                .len() as u64;
             assert!(
                 run.postings.iter().all(|p| p.tail == 0.0),
                 "complete heads leave no tail"
@@ -4039,14 +3989,14 @@ mod tests {
             .tier
             .as_ref()
             .expect("the merged run has a tier");
-        assert_eq!(
-            tier.n_entries,
-            2 * DOCS_PER_SEGMENT as u64,
-            "the base tier covers every document"
-        );
         let entries = rt
             .block_on(index.tier_entries(&object, tier))
             .expect("tier entries");
+        assert_eq!(
+            entries.len(),
+            2 * DOCS_PER_SEGMENT,
+            "the base tier covers every document"
+        );
         assert!(
             entries
                 .iter()
@@ -4509,7 +4459,7 @@ mod tests {
                         len: 64,
                     },
                     0.0,
-                    &Head::default(),
+                    &[],
                 )
                 .expect("push");
                 w.finish().expect("finish")
@@ -4558,7 +4508,7 @@ mod tests {
                 .map(|(i, terms)| {
                     let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1), i as i128).expect("create");
                     for t in terms {
-                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None, 0.0, &Head::default()).expect("push");
+                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None, 0.0, &[]).expect("push");
                     }
                     w.finish().expect("finish")
                 })
@@ -4690,14 +4640,26 @@ mod tests {
                 (e.superfile_id, sf)
             })
             .collect();
+        let n_docs: HashMap<Uuid, u64> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| (e.superfile_id, e.n_docs))
+            .collect();
         for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
             let postings = rt
                 .block_on(index.postings(title_id(), term))
                 .expect("lookup");
             assert!(!postings.is_empty(), "{term} is indexed");
+            // A posting's bound is a key; at the superfile's own idf it
+            // bounds the superfile's own scores, an ulp of rounding aside.
             let bounds: HashMap<Uuid, f32> = postings
                 .iter()
-                .map(|p| (index.superfile_id(p.superfile).expect("ordinal"), p.bound))
+                .map(|p| {
+                    let sf = index.superfile_id(p.superfile).expect("ordinal");
+                    let ceiling = p.bound * bm25::idf(n_docs[&sf], p.df) * CEILING_SLACK;
+                    (sf, ceiling)
+                })
                 .collect();
             for (sf, b) in &bounds {
                 assert!(
@@ -5702,8 +5664,19 @@ mod tests {
         assert!(slices.len() > 2, "the keys fill several slices");
         // Every slice but the last was cut when the next term would not
         // fit, so it is within one term of the target, above or below.
+        let bytes_by_hash = |s: &SliceRef| {
+            bytes_of(
+                &built
+                    .slices
+                    .iter()
+                    .find(|(h, _)| *h == s.content_hash)
+                    .expect("slice bytes")
+                    .1,
+            )
+            .len()
+        };
         for s in &slices[..slices.len() - 1] {
-            let len = s.len as usize;
+            let len = bytes_by_hash(s);
             assert!(
                 len <= RANDOM_SLICE_TARGET_BYTES + RANDOM_SLICE_TOLERANCE_BYTES,
                 "slice of {len} bytes overshoots the {RANDOM_SLICE_TARGET_BYTES}-byte target"

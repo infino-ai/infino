@@ -16,7 +16,7 @@ use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
 use datafusion::prelude::{col, lit};
 use infino::{
     Bm25SearchOptions, BoolMode,
-    runtime_metrics::op_stats::with_op_stats,
+    runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
@@ -94,9 +94,13 @@ fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
     // Positions, so a phrase query is among the shapes compared.
     let mut fts = FtsConfig::new("body");
     fts.positions = true;
+    // Opens one at a time, so how many superfiles a query opens is a
+    // property of the bounds and not of the race between the opens in a
+    // window.
     let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
         .expect("options")
-        .with_storage(storage);
+        .with_storage(storage)
+        .with_bound_ordered_open_window(1);
     if !tiers {
         options = options.with_term_tier_entries_per_term(0);
     }
@@ -155,16 +159,16 @@ fn queries() -> Vec<(String, BoolMode)> {
     out
 }
 
-/// `(superfile in commit order, row, score)` per hit, the superfiles the
-/// query opened, and the distinct superfiles among the hits. Superfiles
-/// are named by their place in id order so two tables built from the same
-/// commits compare.
+/// `(superfile in commit order, row, score)` per hit, the query's work
+/// (opens, index entries read, superfiles the index answered for), and the
+/// distinct superfiles among the hits. Superfiles are named by their place
+/// in id order so two tables built from the same commits compare.
 fn run(
     st: &Supertable,
     query: &str,
     mode: BoolMode,
     k: usize,
-) -> (Vec<(usize, u32, f32)>, u64, usize) {
+) -> (Vec<(usize, u32, f32)>, OpStats, usize) {
     let reader = st.reader().expect("reader");
     let mut order: Vec<(i128, infino::supertable::manifest::SuperfileUri)> = reader
         .manifest()
@@ -196,7 +200,12 @@ fn run(
         .map(|r| r.0)
         .collect::<std::collections::HashSet<_>>()
         .len();
-    (rows, stats.score_pruning_survived, holders)
+    (rows, stats, holders)
+}
+
+/// Superfiles a query opened.
+fn opened(stats: &OpStats) -> u64 {
+    stats.score_pruning_survived
 }
 
 #[test]
@@ -209,8 +218,9 @@ fn tiers_change_which_superfiles_open_and_nothing_else() {
     let mut compared = 0usize;
     for (query, mode) in queries() {
         for k in KS {
-            let (a, opened_with, _) = run(&with, &query, mode, k);
-            let (b, opened_without, _) = run(&without, &query, mode, k);
+            let (a, with_stats, _) = run(&with, &query, mode, k);
+            let (b, without_stats, _) = run(&without, &query, mode, k);
+            let (opened_with, opened_without) = (opened(&with_stats), opened(&without_stats));
             assert_eq!(
                 a, b,
                 "{query:?} {mode:?} k={k}: the tiers must not change the answer"
@@ -237,26 +247,17 @@ fn tiers_change_which_superfiles_open_and_nothing_else() {
 fn a_rare_conjunction_opens_only_its_holders() {
     let dir = TempDir::new().expect("tempdir");
     let st = table(&dir, true);
-    let (hits, opened, holders) = run(&st, "quokka tensor", BoolMode::And, 10);
+    let (hits, stats, holders) = run(&st, "quokka tensor", BoolMode::And, 10);
     assert!(!hits.is_empty(), "the planted pair matches");
     // Both terms are under the budget, so their tiers are complete and the
     // merge knows every document that carries both, with its score as the
     // kernel computes it: the index answers outright and nothing opens.
     assert_eq!(
-        opened, 0,
-        "opened {opened} superfiles for a k=10 conjunction whose hits sit in {holders}"
+        opened(&stats),
+        0,
+        "opened {} superfiles for a k=10 conjunction whose hits sit in {holders}",
+        opened(&stats)
     );
-    let (_, stats) = with_op_stats(|| {
-        st.reader()
-            .expect("reader")
-            .bm25_hits(
-                "body",
-                "quokka tensor",
-                10,
-                Bm25SearchOptions::new().with_mode(BoolMode::And),
-            )
-            .expect("search")
-    });
     // A superfile that holds a hit is answered from the index; one the
     // threshold ruled out is neither answered nor opened.
     assert!(
@@ -283,22 +284,25 @@ fn a_resolved_superfile_respects_tombstones() {
             .expect("delete");
     }
     for k in [1usize, 10, 100] {
-        let (a, opened, _) = run(&with, "quokka tensor", BoolMode::And, k);
+        let (a, stats, _) = run(&with, "quokka tensor", BoolMode::And, k);
         let (b, _, _) = run(&without, "quokka tensor", BoolMode::And, k);
         assert_eq!(a, b, "k={k}: same answer after the delete");
         assert!(
             a.iter().all(|&(sf, row, _)| !(sf == 0 && row == 97)),
             "k={k}: the deleted document is not returned"
         );
-        assert_eq!(opened, 0, "k={k}: still answered from the index");
+        assert_eq!(opened(&stats), 0, "k={k}: still answered from the index");
     }
 }
 
 /// With every superfile's head cut to 64 documents, a common term's head
 /// is read a block at a time and the superfiles it cannot rule out are
 /// opened — and the answer is still hit for hit the ceiling path's, at
-/// every k, for every shape. The heads of rare terms stay whole, so their
-/// conjunction is still answered in the index.
+/// every k, for every shape, with fewer opens over the whole matrix. (A
+/// single query can open one more: a head cut this short may not hold the
+/// best joint document, so the survivors' open order can differ from the
+/// ceilings'.) The heads of rare terms stay whole, so their conjunction is
+/// still answered in the index.
 #[test]
 fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
     const DEPTH: usize = 64;
@@ -306,34 +310,28 @@ fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
     let without_dir = TempDir::new().expect("tempdir");
     let with = table_with(&with_dir, true, Some(DEPTH));
     let without = table(&without_dir, false);
+    let (mut opened_with, mut opened_without) = (0u64, 0u64);
     for (query, mode) in queries() {
         for k in KS {
-            let (a, opened_with, _) = run(&with, &query, mode, k);
-            let (b, opened_without, _) = run(&without, &query, mode, k);
+            let (a, with_stats, _) = run(&with, &query, mode, k);
+            let (b, without_stats, _) = run(&without, &query, mode, k);
             assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer at depth 64");
-            assert!(
-                opened_with <= opened_without,
-                "{query:?} {mode:?} k={k}: opened {opened_with} with heads, {opened_without} without"
-            );
+            opened_with += opened(&with_stats);
+            opened_without += opened(&without_stats);
         }
     }
-    let (hits, opened, _) = run(&with, "quokka tensor", BoolMode::And, 10);
+    assert!(
+        opened_with < opened_without,
+        "cut heads opened {opened_with} superfiles over the matrix, ceilings {opened_without}"
+    );
+    let (hits, stats, _) = run(&with, "quokka tensor", BoolMode::And, 10);
     assert!(!hits.is_empty());
     assert_eq!(
-        opened, 0,
+        opened(&stats),
+        0,
         "the rare conjunction is still answered in the index"
     );
-    let (_, stats) = with_op_stats(|| {
-        with.reader()
-            .expect("reader")
-            .bm25_hits(
-                "body",
-                "the data",
-                10,
-                Bm25SearchOptions::new().with_mode(BoolMode::And),
-            )
-            .expect("search")
-    });
+    let (_, stats, _) = run(&with, "the data", BoolMode::And, 10);
     let held = (2 * SUPERFILES * DEPTH) as u64;
     assert!(
         stats.tier_entries <= held,
@@ -348,9 +346,9 @@ fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
 fn an_empty_conjunction_of_complete_tiers_opens_nothing() {
     let dir = TempDir::new().expect("tempdir");
     let st = table(&dir, true);
-    let (hits, opened, _) = run(&st, "zebra yak", BoolMode::And, 10);
+    let (hits, stats, _) = run(&st, "zebra yak", BoolMode::And, 10);
     assert!(hits.is_empty(), "the words never co-occur");
-    assert_eq!(opened, 0, "the tiers rule every superfile out");
+    assert_eq!(opened(&stats), 0, "the tiers rule every superfile out");
 }
 
 /// Short text: every document scores the same, so every unread block can
@@ -406,15 +404,9 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
         ("alpha gamma", BoolMode::And),
     ] {
         for k in [10usize, 100] {
-            let (a, _, _) = run(&with, query, mode, k);
+            let (a, stats, _) = run(&with, query, mode, k);
             let (b, _, _) = run(&without, query, mode, k);
             assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer");
-            let (_, stats) = with_op_stats(|| {
-                with.reader()
-                    .expect("reader")
-                    .bm25_hits("body", query, k, Bm25SearchOptions::new().with_mode(mode))
-                    .expect("search")
-            });
             let total = (SUPERFILES_TIED * DOCS_PER_SUPERFILE_TIED) as u64;
             assert!(
                 stats.tier_entries < total,

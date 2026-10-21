@@ -2937,9 +2937,7 @@ impl SupertableWriter {
                             term_index::reserve_segment(
                                 storage.as_ref(),
                                 contributions,
-                                &self.inner.options.term_index_build_policy(
-                                    self.inner.manifest.load().n_docs_total(),
-                                ),
+                                &self.inner.options.term_index_build_policy(),
                                 base,
                                 true,
                             ),
@@ -3042,6 +3040,11 @@ impl ShardOutput {
 
     /// Attach the term-index contribution gathered while these bytes were
     /// built, under the id the superfile is then published as.
+    /// The id the superfile is published under.
+    pub(in crate::supertable) fn superfile_id(&self) -> Uuid {
+        self.superfile_id
+    }
+
     pub(in crate::supertable) fn with_term_contribution(
         mut self,
         superfile_id: Uuid,
@@ -3183,7 +3186,8 @@ fn build_one_shard_with_layout(
     let term_contribution = head_sink
         .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
         .transpose()
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        .map_err(|e| BuildError::Store(e.to_string()))?
+        .flatten();
     Ok(ShardOutput {
         bytes,
         superfile_id,
@@ -3210,9 +3214,7 @@ pub(in crate::supertable) fn term_head_sink_for(
         .iter()
         .filter_map(|c| Some((c.column.clone(), manifest.field_id(&c.column)?)))
         .collect();
-    let policy = manifest
-        .options
-        .term_index_build_policy(manifest.n_docs_total());
+    let policy = manifest.options.term_index_build_policy();
     let sink = term_index::HeadSink::new(columns).map_err(|e| BuildError::Store(e.to_string()))?;
     Ok(Some((sink, policy.head_depth_per_superfile)))
 }
@@ -3765,9 +3767,7 @@ pub(in crate::supertable) fn build_term_contribution(
         reader,
         &manifest.options.legacy_names(),
         &mut writer,
-        &manifest
-            .options
-            .term_index_build_policy(manifest.n_docs_total()),
+        &manifest.options.term_index_build_policy(),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -3843,17 +3843,14 @@ async fn write_superfile_terms(
                         f.bound,
                         term_index::Location::from_dict_value(f.entry),
                         f.head.tail,
-                        term_index::Head {
-                            docs: f.head.docs,
-                            complete: f.head.complete,
-                        },
+                        f.head.docs,
                     ),
                     None => (
                         0,
                         f32::INFINITY,
                         term_index::Location::None,
                         f32::INFINITY,
-                        term_index::Head::default(),
+                        Vec::new(),
                     ),
                 };
                 writer.push(&column_id.term_key(term), df, bound, location, tail, &head)?;
@@ -11164,9 +11161,7 @@ async fn merge_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
-    let policy = manifest
-        .options
-        .term_index_build_policy(manifest.n_docs_total());
+    let policy = manifest.options.term_index_build_policy();
     let scratch = term_index_scratch()?;
     // Superfiles no segment lists get one segment of their own, numbered
     // past the ones `current` lists, and merge like the rest.
@@ -11307,9 +11302,7 @@ async fn fold_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
-    let policy = manifest
-        .options
-        .term_index_build_policy(manifest.n_docs_total());
+    let policy = manifest.options.term_index_build_policy();
     let policy = term_index::BuildPolicy {
         scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
         ..policy
@@ -11351,9 +11344,7 @@ async fn collect_and_build_term_index(
     term_index::build_onto(
         onto,
         &contributions,
-        &manifest
-            .options
-            .term_index_build_policy(manifest.n_docs_total()),
+        &manifest.options.term_index_build_policy(),
     )
 }
 
@@ -11424,9 +11415,7 @@ async fn collect_contributions(
     dir: &Path,
 ) -> Result<Vec<TermContribution>, TermIndexError> {
     let legacy = manifest.options.legacy_names();
-    let policy = manifest
-        .options
-        .term_index_build_policy(manifest.n_docs_total());
+    let policy = manifest.options.term_index_build_policy();
     let width = available_memory_bytes().map_or(CONTRIBUTION_WALKS_FALLBACK, |bytes| {
         ((bytes / CONTRIBUTION_WALK_BYTES) as usize).clamp(1, CONTRIBUTION_WALKS_MAX)
     });
@@ -12534,9 +12523,7 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let policy = current_manifest
-            .options
-            .term_index_build_policy(current_manifest.n_docs_total());
+        let policy = current_manifest.options.term_index_build_policy();
         let store = storage.as_ref();
         let reference = async move {
             match reserved_segment {
@@ -16051,7 +16038,8 @@ supertable:
         let superfile_id = Uuid::new_v4();
         let gathered = sink
             .into_contribution(superfile_id, 1)
-            .expect("gathered contribution");
+            .expect("gathered contribution")
+            .expect("the builder drove the sink to its end");
 
         let reader = SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
             .expect("open");

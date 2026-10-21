@@ -84,7 +84,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::term_index::{BuildPolicy, HEAD_DEPTH},
+        manifest::term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -953,14 +953,17 @@ impl SupertableOptions {
         self
     }
 
-    /// What the term-index build takes from these options, for a table of
-    /// `n_docs` documents.
-    pub(crate) fn term_index_build_policy(&self, _n_docs: u64) -> BuildPolicy {
-        // Every superfile keeps its head to the same depth; the cap on a
-        // term's entries binds only when the caller sets one.
+    /// What the term-index build takes from these options.
+    pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
+        // Every superfile keeps its head to the same depth, at least one
+        // document and at most what the index holds; the cap on a term's
+        // entries binds only when the caller sets one.
         BuildPolicy {
             tier_entries_per_term: self.term_tier_entries_per_term.unwrap_or(u64::MAX),
-            head_depth_per_superfile: self.term_head_depth.unwrap_or(HEAD_DEPTH),
+            head_depth_per_superfile: self
+                .term_head_depth
+                .unwrap_or(HEAD_DEPTH)
+                .clamp(1, HEAD_DEPTH_MAX),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
             ..BuildPolicy::default()

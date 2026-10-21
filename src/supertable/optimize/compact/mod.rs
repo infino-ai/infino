@@ -758,10 +758,10 @@ impl Supertable {
         let mut term_heads: Option<(Box<dyn TermHeadSink>, usize)> = head_sink
             .as_ref()
             .map(|(sink, depth)| (Box::new(sink.clone()) as Box<dyn TermHeadSink>, *depth));
-        let (merged_bytes, superfile_stats, gathered) = run_on_pool(
+        let (merged_bytes, superfile_stats) = run_on_pool(
             Some(maint_pool()?),
             "compaction merge",
-            move || -> Result<(Bytes, _, bool), BuildError> {
+            move || -> Result<(Bytes, _), BuildError> {
                 let _span = detail_span!(
                     "merge_build",
                     output_bytes = tracing::field::Empty,
@@ -802,7 +802,7 @@ impl Supertable {
                     .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
                 record("output_bytes", bytes.len() as u64);
                 usage.finish();
-                Ok((bytes, stats, term_heads.is_none()))
+                Ok((bytes, stats))
             },
         )
         .await
@@ -815,11 +815,15 @@ impl Supertable {
             superfile_stats.id_max,
             superfile_stats.scalar_stats,
         );
-        if let (true, Some((sink, _))) = (gathered, head_sink) {
-            let superfile_id = Uuid::new_v4();
-            let contribution = sink
-                .into_contribution(superfile_id, superfile_stats.id_min)
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+        // A merge that drove the sink to its end hands the contribution
+        // over; one that wrote no postings leaves the superfile's terms to
+        // be read from its bytes.
+        if let Some((sink, _)) = head_sink
+            && let Some(contribution) = sink
+                .into_contribution(shard.superfile_id(), superfile_stats.id_min)
+                .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            let superfile_id = shard.superfile_id();
             shard = shard.with_term_contribution(superfile_id, contribution);
         }
 

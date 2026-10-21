@@ -71,7 +71,7 @@ use crate::{
             part::ContentHash,
             term_index::{
                 BLOCK_ENTRIES, SliceRun, TermIndex, TermIndexError, TierChunkRef, TierDirectory,
-                TierEntry, idf_ratio, local_idf,
+                TierEntry,
             },
         },
         schema::FieldId,
@@ -301,16 +301,6 @@ pub(crate) async fn select_with_tiers(
             scale_up,
         });
     }
-    let scored_docs: Vec<u64> = kept
-        .iter()
-        .map(|e| {
-            e.fts_summary
-                .get(&query.column)
-                .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
-                .unwrap_or(e.n_docs)
-        })
-        .collect();
-
     let runs_per_term =
         try_join_all(terms.iter().map(|term| index.runs(query.column, term))).await?;
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
@@ -348,11 +338,11 @@ pub(crate) async fn select_with_tiers(
                 };
                 let slot = &mut slots[si];
                 slot.ordinal = p.superfile;
-                // The stored ceiling is an impact at the superfile's own idf;
-                // the ratio to the table's rescales it, as the ceiling path
-                // does. The tail is a key at the superfile's own average.
-                let ratio = idf_ratio(local_idf(scored_docs[si], p.df), idf_table);
-                let ceiling = p.bound * ratio * slot.scale_up;
+                // The stored bound and tail are keys at the superfile's own
+                // average; the table's idf and the scale to its average make
+                // them bounds on the term's contribution, as the ceiling
+                // path makes its ceilings.
+                let ceiling = p.bound * idf_table * slot.scale_up;
                 // A build that recorded no tail leaves the ceiling as the
                 // bound.
                 let tail = if p.tail.is_finite() {
@@ -714,8 +704,11 @@ fn join(heads: &[HeadState], out: &mut Vec<(u32, u8, f32)>) {
 /// superfile, from what has been read of it: a document read under some
 /// terms scores at most its known sum plus the tails of the terms it has
 /// not been read under; one read under none at most the sum of the tails.
-/// A superfile that lacks a required term holds no match at all. The lower
-/// bound is the best known sum of a document carrying every required term.
+/// A required term's head read to its end holds every document of the
+/// term there, so a document outside it carries no such term and is no
+/// candidate; a superfile that lacks a required term holds no match at
+/// all. The lower bound is the best known sum of a document carrying every
+/// required term.
 fn bounds_of(
     heads: &[HeadState],
     joined: &[(u32, u8, f32)],
@@ -723,15 +716,29 @@ fn bounds_of(
     ub_slack: f32,
 ) -> (f32, f32) {
     let mut tails = [0.0f32; MAX_TIER_TERMS];
+    // Required terms whose heads are whole: a candidate must be in them.
+    let mut settled = 0u8;
     for (ti, h) in heads.iter().enumerate() {
-        if required & (1 << ti) != 0 && h.ceiling <= 0.0 && h.docs.is_empty() {
-            return (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        if required & (1 << ti) != 0 {
+            if h.ceiling <= 0.0 && h.docs.is_empty() {
+                return (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            }
+            if h.tail <= 0.0 {
+                settled |= 1 << ti;
+            }
         }
         tails[ti] = h.tail;
     }
-    let mut ub: f32 = tails[..heads.len()].iter().sum();
+    let mut ub = if settled == 0 {
+        tails[..heads.len()].iter().sum()
+    } else {
+        f32::NEG_INFINITY
+    };
     let mut lb = f32::NEG_INFINITY;
     for &(_, mask, sum) in joined {
+        if mask & settled != settled {
+            continue;
+        }
         let missing: f32 = (0..heads.len())
             .filter(|t| mask & (1 << t) == 0)
             .map(|t| tails[t])
@@ -786,6 +793,91 @@ impl Ord for OrdF32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cases the bound oracle below draws.
+    const BOUND_CASES: u64 = 4_000;
+    /// Documents in the oracle's universe per case.
+    const UNIVERSE: u32 = 48;
+    /// Most terms the oracle joins.
+    const TERMS: usize = 4;
+
+    /// The bounds hold against every corpus the read heads could have come
+    /// from: documents outside a term's head carry at most that term's tail
+    /// (nothing when the head was read to its end), and the true best
+    /// candidate's score sits between the lower and the upper bound.
+    #[test]
+    fn bounds_hold_against_every_corpus_the_heads_allow() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..BOUND_CASES {
+            let nt = 1 + (next() % TERMS as u64) as usize;
+            let required = (next() % (1u64 << nt)) as u8;
+            // Per term: a head of documents with contributions, and a tail
+            // (zero means the head is whole); every document outside the
+            // head takes a hidden contribution within the tail.
+            let mut heads: Vec<HeadState> = Vec::with_capacity(nt);
+            let mut truth: Vec<Vec<f32>> = Vec::with_capacity(nt);
+            for _ in 0..nt {
+                let whole = next() % 3 == 0;
+                let in_head = (next() % u64::from(UNIVERSE)) as u32;
+                let tail = if whole {
+                    0.0
+                } else {
+                    (next() % 1000) as f32 / 1000.0
+                };
+                let mut docs: Vec<(u32, f32)> = Vec::new();
+                let mut contribution = vec![0.0f32; UNIVERSE as usize];
+                for doc in 0..UNIVERSE {
+                    if next() % u64::from(UNIVERSE) < u64::from(in_head) {
+                        // A head entry contributes at least the tail: the
+                        // head is the term's best documents.
+                        let c = tail + (next() % 1000) as f32 / 1000.0;
+                        docs.push((doc, c));
+                        contribution[doc as usize] = c;
+                    } else if !whole && next() % 2 == 0 {
+                        contribution[doc as usize] = tail * (next() % 1000) as f32 / 1000.0;
+                    }
+                }
+                let ceiling = docs.iter().map(|d| d.1).fold(tail, f32::max);
+                heads.push(HeadState {
+                    docs,
+                    tail,
+                    ceiling,
+                    done: whole,
+                    source: None,
+                });
+                truth.push(contribution);
+            }
+            let mut joined = Vec::new();
+            join(&heads, &mut joined);
+            let (ub, lb) = bounds_of(&heads, &joined, required, 1.0);
+            // The truth: the best document carrying every required term.
+            let mut best = f32::NEG_INFINITY;
+            for doc in 0..UNIVERSE as usize {
+                let contributions = truth.iter().map(|t| t[doc]);
+                let carries_required = contributions
+                    .clone()
+                    .enumerate()
+                    .all(|(t, c)| required & (1 << t) == 0 || c > 0.0);
+                if carries_required {
+                    best = best.max(contributions.sum());
+                }
+            }
+            assert!(
+                best <= ub * BOUND_SLACK,
+                "case {case}: the best candidate {best} exceeds the upper bound {ub}"
+            );
+            assert!(
+                lb <= best || lb == f32::NEG_INFINITY,
+                "case {case}: the lower bound {lb} exceeds the best candidate {best}"
+            );
+        }
+    }
 
     #[test]
     fn merge_sorted_keeps_rows_ascending() {

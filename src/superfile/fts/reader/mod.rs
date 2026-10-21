@@ -24,6 +24,7 @@ mod test_util;
 mod work;
 
 pub use core::*;
+pub(in crate::superfile::fts) use sink::TopKEntry;
 
 #[cfg(test)]
 pub(crate) use count::TermIndexFact;

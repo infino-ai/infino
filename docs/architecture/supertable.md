@@ -341,13 +341,10 @@ the head the key of the best document the head left out — which bounds
 what the superfile can still hold beyond what was read; a reader scales
 a key to the table's average as it scales any stored ceiling. A head
 keeps a superfile's whole list when the list is short and its best
-documents to a fixed depth otherwise, a per-term budget lowering that
-depth for every superfile alike when a term is common everywhere. The budget is settled
-by the build itself from a pass over the terms' frequencies: the largest
-count at which the tiers hold a small share of all postings, so a table
-of short texts, whose postings are few per document and whose
-mid-frequency terms are many, gets a budget as bounded as a table of
-long ones. A build writes each slice and tier object to scratch as it
+documents to a fixed depth otherwise; a per-term cap, when a table sets
+one, lowers that depth for every superfile alike. A posting records the
+key of its superfile's best document as the term's bound there, so a
+ceiling needs no per-superfile statistics to compute. A build writes each slice and tier object to scratch as it
 cuts it and uploads from there, so a rebuild of the whole index needs
 memory for the uploads in flight, not for the index. The
 blocks of every term in a slice sit back to back in that slice's tier
@@ -373,12 +370,14 @@ same floor semantics — only which superfiles open. Impacts are stored at
 the superfile's own statistics and rescaled to the table's as ceilings
 are, upward for an upper bound and downward for a lower one.
 
-Heads are gathered where the postings already are: when a superfile is
-built its terms' best documents are read from its own index with the
-single-term kernel and spilled with the rest of its contribution, the
-delta segment pools them into tiers, and the maintenance rebuild
-re-pools every segment's tiers table-wide. A superfile's bytes are not
-changed by any of this.
+Heads are gathered where the postings already are: the builder that
+writes a superfile hands each term's best documents to a sink as it
+writes the term's postings, and the sink spills them as the superfile's
+contribution; a superfile built without the sink has its heads read
+from its own index with the single-term kernel instead, which gives the
+same bytes. The delta segment pools the contributions into tiers, and
+the maintenance rebuild re-pools every segment's tiers table-wide. A
+superfile's bytes are not changed by any of this.
 
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new

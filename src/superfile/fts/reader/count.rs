@@ -50,8 +50,9 @@ fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> 
 pub(crate) struct TermIndexFact {
     /// Documents in this superfile containing the term.
     pub(crate) df: u64,
-    /// Upper bound on the term's BM25 score here, at this superfile's own
-    /// statistics.
+    /// The largest key — the length-normalized term frequency at this
+    /// superfile's own average length and parameters, the factor a score
+    /// multiplies the idf by — of a document of the term here.
     pub(crate) bound: f32,
     /// The term's dictionary entry: where its postings sit.
     pub(crate) entry: DictEntry,
@@ -68,22 +69,8 @@ pub(crate) struct TermHead {
     pub(crate) docs: Vec<(u32, u32, u8)>,
     /// The length-normalized term frequency — `tf / (tf + norm)` at this
     /// file's average length and parameters — of the best document not in
-    /// `docs`; `0.0` when `complete`.
+    /// `docs`; `0.0` when `docs` is the term's whole posting list here.
     pub(crate) tail: f32,
-    /// `docs` is the term's whole posting list here.
-    pub(crate) complete: bool,
-}
-
-impl TermHead {
-    /// A head that holds nothing and bounds the rest by `bound`: what a
-    /// caller that asked for no depth gets.
-    fn none(bound: f32) -> Self {
-        Self {
-            docs: Vec::new(),
-            tail: bound,
-            complete: false,
-        }
-    }
 }
 
 impl FtsReader {
@@ -492,11 +479,7 @@ impl FtsReader {
             .zip(cursors)
             .map(|(entry, cursor)| {
                 let mut cursor = cursor?;
-                let bound = cursor.term_max_bm25;
-                let head = match head_depth {
-                    0 => TermHead::none(bound),
-                    depth => self.head_of(&mut cursor, norms, depth),
-                };
+                let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,
                     bound,
@@ -508,11 +491,15 @@ impl FtsReader {
     }
 
     /// The best `depth` documents of a scored cursor by impact, with the
-    /// best impact left out as the tail. Blocks whose maximum cannot
-    /// beat the running `depth`-th impact are skipped undecoded, as the
-    /// single-term search skips them; the cursor is consumed.
-    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> TermHead {
-        let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> = BinaryHeap::with_capacity(depth + 1);
+    /// best impact left out as the tail, and the largest key among them —
+    /// the term's bound here. Blocks whose maximum cannot beat the running
+    /// `depth`-th impact are skipped undecoded, as the single-term search
+    /// skips them; the cursor is consumed.
+    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> (TermHead, f32) {
+        // Most terms have a document or two: the heap is sized by what the
+        // term has, up to the depth and the tail.
+        let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> =
+            BinaryHeap::with_capacity((depth + 1).min(cursor.df as usize + 1));
         let mut tail = 0.0f32;
         while !cursor.is_exhausted() {
             if heap.len() > depth
@@ -540,22 +527,23 @@ impl FtsReader {
         // at.
         let complete = heap.len() <= depth;
         let mut hits = drain_top_k_desc(heap);
+        // The key of a document, as the term index orders its tiers. The
+        // bound is the largest over the documents kept: the best by impact
+        // is among them, and impact orders as the key does.
+        let key = |id: FtsDocId, tf: u32| bm25::tf_factor(tf, norms.get(id.get()));
+        let bound = hits
+            .iter()
+            .map(|&((id, tf), _)| key(id, tf))
+            .fold(0.0f32, f32::max);
         if !complete {
-            tail = hits
-                .pop()
-                .map(|((id, tf), _)| bm25::tf_factor(tf, norms.get(id.get())))
-                .unwrap_or(0.0);
+            tail = hits.pop().map(|((id, tf), _)| key(id, tf)).unwrap_or(0.0);
         }
         let buckets = norms.buckets();
         let docs = hits
             .into_iter()
             .map(|((id, tf), _)| (self.row_of(id).get(), tf, buckets[id.get() as usize]))
             .collect();
-        TermHead {
-            docs,
-            tail,
-            complete,
-        }
+        (TermHead { docs, tail }, bound)
     }
 
     /// Up to `limit` of `column`'s terms after `after` (from the first when
@@ -587,41 +575,23 @@ impl FtsReader {
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
         let col_meta = &self.columns[column_id as usize];
-        // What a cursor built for an inline term would score it at: this
-        // superfile's own idf for df = 1, unweighted.
-        //
-        // A column no row in this superfile filled has no scored documents
-        // and so no inline term to score — `df = 1` against `n_docs = 0` is
-        // not a ratio, so it is not computed. Reachable on a table where one
-        // indexed column is sparse enough to miss a whole superfile.
-        let inline_idf = match col_meta.scored_doc_count() {
-            0 => 0.0,
-            scored => bm25::idf(scored, 1),
-        };
-
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
         for (term, entry) in entries {
             let fact = match entry {
                 DictEntry::Inline { doc_id, tf } => {
-                    let bound = bm25::score_with_dl_norm_k1(
-                        inline_idf,
-                        col_meta.inline_tf(tf),
-                        col_meta.dl_norm_k1().get(doc_id),
-                    );
-                    // The one posting is the whole list: its score is the
-                    // bound, and the head is that document.
-                    let head = match head_depth {
-                        0 => TermHead::none(bound),
-                        _ => TermHead {
-                            docs: vec![(
-                                self.row_of(FtsDocId::new(doc_id)).get(),
-                                col_meta.inline_tf(tf),
-                                col_meta.dl_norm_k1().buckets()[doc_id as usize],
-                            )],
-                            tail: 0.0,
-                            complete: true,
-                        },
+                    // The one posting is the whole list: its key is the
+                    // bound, the head is that document, and nothing is left
+                    // out.
+                    let tf = col_meta.inline_tf(tf);
+                    let bound = bm25::tf_factor(tf, col_meta.dl_norm_k1().get(doc_id));
+                    let head = TermHead {
+                        docs: vec![(
+                            self.row_of(FtsDocId::new(doc_id)).get(),
+                            tf,
+                            col_meta.dl_norm_k1().buckets()[doc_id as usize],
+                        )],
+                        tail: 0.0,
                     };
                     Some(TermIndexFact {
                         df: 1,
@@ -1499,7 +1469,11 @@ mod tests {
                 .collect();
             assert_eq!(got, want, "head of {term:?} is the top-{DEPTH}");
             let df = fact.df as usize;
-            assert_eq!(fact.head.complete, df <= DEPTH, "{term:?}: df {df}");
+            assert_eq!(
+                fact.head.tail == 0.0,
+                df <= DEPTH,
+                "{term:?}: df {df} leaves a tail only past the depth"
+            );
             // The tail is the key of the first document left out: its score
             // over the idf, which the ranking only knows as a product.
             let want_tail = match ranked.get(DEPTH) {
@@ -1511,20 +1485,21 @@ mod tests {
                 (tail_score - want_tail).abs() <= want_tail.abs() * 1e-5,
                 "tail of {term:?} is the first document left out: {tail_score} vs {want_tail}"
             );
-            assert!(
-                got.first().is_none_or(|d| d.1 <= fact.bound),
-                "the head never exceeds the bound"
+            // The bound is the largest key of the term's documents: at
+            // least every head document's, and the tail's.
+            let head_max_key = fact
+                .head
+                .docs
+                .iter()
+                .map(|&(row, tf, _)| bm25::tf_factor(tf, norms.get(row)))
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                fact.bound, head_max_key,
+                "{term:?}: the bound is the best key"
             );
-        }
-        // Depth zero asks for nothing and bounds the rest by the bound.
-        let none = r
-            .term_index_facts_after(&dict_bytes, "body", None, 64, 0)
-            .await
-            .expect("facts");
-        for (_, fact) in none {
-            let fact = fact.expect("fact");
             assert!(
-                fact.head.docs.is_empty() && !fact.head.complete && fact.head.tail == fact.bound
+                fact.head.tail <= fact.bound,
+                "{term:?}: the tail is under the bound"
             );
         }
     }

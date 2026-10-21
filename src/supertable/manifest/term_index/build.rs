@@ -38,11 +38,12 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        Location, ObjectRef, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
+        Location, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
         encode_run_with_tier, encode_slice, push_posting, read_posting,
     },
     tier::{
-        ColumnScoring, EncodedChunk, HeadGroup, TierChunk, TierChunkRef, TierEntry, encode_tier,
+        BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, TierChunk, TierChunkRef, TierEntry,
+        encode_tier,
     },
 };
 use crate::{
@@ -119,6 +120,7 @@ pub(crate) enum BuiltBytes {
     },
 }
 
+#[cfg(test)]
 impl BuiltBytes {
     /// The bytes, read back when spilled.
     pub(crate) fn read(&self) -> io::Result<Vec<u8>> {
@@ -139,6 +141,7 @@ impl fmt::Debug for BuiltBytes {
 }
 
 /// Equal when the bytes are, wherever they sit.
+#[cfg(test)]
 impl PartialEq for BuiltBytes {
     fn eq(&self, other: &Self) -> bool {
         match (self.read(), other.read()) {
@@ -178,8 +181,6 @@ struct TermInput {
     /// Tiers still to decode and renumber (a merge's sources), so the
     /// decoding runs in the parallel batch rather than on the merge thread.
     sources: Vec<TierSource>,
-    /// Every head or tier that fed the term was its whole list.
-    complete: bool,
 }
 
 /// One source run's tier in a merge: its chunks and the slice's tier
@@ -192,8 +193,6 @@ struct TierSource {
 /// A term's tier, cut to the budget and encoded, before it is placed: in
 /// chunks, or inline when small.
 struct EncodedTier {
-    complete: bool,
-    n_entries: u64,
     chunks: Vec<EncodedChunk>,
     inline: Vec<TierEntry>,
 }
@@ -228,18 +227,17 @@ fn encode_term(
             tier: None,
         });
     }
-    // One group per superfile, each in descending key.
-    let mut keyed: Vec<(f32, TierEntry)> = term
-        .entries
-        .iter()
-        .map(|e| (scoring_of(e.superfile).key(e.tf, e.len), *e))
-        .collect();
-    keyed.sort_unstable_by(|a, b| {
-        a.1.superfile
-            .cmp(&b.1.superfile)
-            .then(b.0.total_cmp(&a.0))
-            .then(a.1.doc_id.cmp(&b.1.doc_id))
-    });
+    // One group per superfile, each keyed at that superfile's scoring and
+    // put in descending key.
+    term.entries.sort_unstable_by_key(|e| e.superfile);
+    let mut keyed: Vec<(f32, TierEntry)> = Vec::with_capacity(term.entries.len());
+    for g in term.entries.chunk_by(|a, b| a.superfile == b.superfile) {
+        let scoring = scoring_of(g[0].superfile);
+        let start = keyed.len();
+        keyed.extend(g.iter().map(|e| (scoring.key(e.tf, e.len), *e)));
+        keyed[start..]
+            .sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.doc_id.cmp(&b.1.doc_id)));
+    }
     let n_groups = keyed
         .chunk_by(|a, b| a.1.superfile == b.1.superfile)
         .count();
@@ -253,30 +251,23 @@ fn encode_term(
     if held(depth) > budget {
         depth = ((budget / n_groups.max(1) as u64) as usize).max(1);
     }
-    let mut truncated = false;
     let mut groups: Vec<HeadGroup> = Vec::with_capacity(n_groups);
     for g in keyed.chunk_by(|a, b| a.1.superfile == b.1.superfile) {
         let ordinal = g[0].1.superfile;
         let keep = g.len().min(depth);
-        let mut tail = 0.0f32;
-        if keep < g.len() {
-            truncated = true;
-            tail = g[keep].0;
-            if let Ok(i) = term
-                .postings
-                .binary_search_by_key(&ordinal, |p| p.superfile)
-                && term.postings[i].tail < tail
-            {
-                term.postings[i].tail = tail;
-            }
-        }
-        // A posting's own tail — what its head left out before this build —
-        // bounds what the group leaves out when the group is kept whole.
-        if let Ok(i) = term
+        // The group's tail: the key of the best document it leaves out, or
+        // the posting's own tail — what its head left out before this build
+        // — when the group is kept whole; the posting records the larger.
+        let posting = term
             .postings
             .binary_search_by_key(&ordinal, |p| p.superfile)
-        {
-            tail = tail.max(term.postings[i].tail);
+            .ok();
+        let mut tail = posting.map_or(0.0, |i| term.postings[i].tail);
+        if keep < g.len() {
+            tail = tail.max(g[keep].0);
+            if let Some(i) = posting {
+                term.postings[i].tail = tail;
+            }
         }
         groups.push(HeadGroup {
             ordinal,
@@ -285,8 +276,8 @@ fn encode_term(
             tail,
         });
     }
-    let n_entries: u64 = groups.iter().map(|g| g.entries.len() as u64).sum();
-    let (chunks, inline) = match n_entries as usize <= TIER_INLINE_MAX {
+    let n_entries: usize = groups.iter().map(|g| g.entries.len()).sum();
+    let (chunks, inline) = match n_entries <= TIER_INLINE_MAX {
         true => (
             Vec::new(),
             groups
@@ -299,27 +290,13 @@ fn encode_term(
     Ok(EncodedTerm {
         key: term.key,
         postings: term.postings,
-        tier: Some(EncodedTier {
-            complete: term.complete && !truncated,
-            n_entries,
-            chunks,
-            inline,
-        }),
+        tier: Some(EncodedTier { chunks, inline }),
     })
-}
-
-/// One term's head from one superfile, as a contribution carries it.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct Head {
-    /// `(row, term frequency, length bucket)` in descending key.
-    pub(crate) docs: Vec<(u32, u32, u8)>,
-    /// The head is the term's whole posting list in that superfile.
-    pub(crate) complete: bool,
 }
 
 /// One superfile's terms, spilled to a file in key order.
 ///
-/// Record: `record_len varint | key_len varint | key | posting | complete u8
+/// Record: `record_len varint | key_len varint | key | posting
 /// | n_head varint | per head doc: row varint, tf varint, len u8`, where the
 /// posting's superfile ordinal is left zero — the merge assigns ordinals
 /// by the order contributions are handed to it. The outer length lets the
@@ -337,6 +314,8 @@ pub(crate) struct ContributionWriter {
     prev_key: Vec<u8>,
     n_terms: u64,
     record: Vec<u8>,
+    /// The record's length prefix.
+    frame: Vec<u8>,
 }
 
 impl ContributionWriter {
@@ -365,6 +344,7 @@ impl ContributionWriter {
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
+            frame: Vec::new(),
         })
     }
 
@@ -384,6 +364,7 @@ impl ContributionWriter {
             prev_key: Vec::new(),
             n_terms: 0,
             record: Vec::new(),
+            frame: Vec::new(),
         })
     }
 
@@ -402,7 +383,9 @@ impl ContributionWriter {
         Ok(writer)
     }
 
-    /// Append one term. Keys must arrive in strictly ascending order.
+    /// Append one term with its head — `(row, term frequency, length
+    /// bucket)` in descending key — and the tail the head leaves. Keys must
+    /// arrive in strictly ascending order.
     pub(crate) fn push(
         &mut self,
         key: &[u8],
@@ -410,7 +393,7 @@ impl ContributionWriter {
         bound: f32,
         location: Location,
         tail: f32,
-        head: &Head,
+        head: &[(u32, u32, u8)],
     ) -> Result<(), TermIndexError> {
         if self.n_terms > 0 && key <= self.prev_key.as_slice() {
             return Err(TermIndexError::Build(format!(
@@ -431,16 +414,15 @@ impl ContributionWriter {
                 location,
             },
         );
-        self.record.push(head.complete as u8);
-        push_varint(&mut self.record, head.docs.len() as u32);
-        for &(row, tf, len) in &head.docs {
+        push_varint(&mut self.record, head.len() as u32);
+        for &(row, tf, len) in head {
             push_varint(&mut self.record, row);
             push_varint(&mut self.record, tf);
             self.record.push(len);
         }
-        let mut frame = Vec::with_capacity(self.record.len() + 4);
-        push_varint(&mut frame, self.record.len() as u32);
-        self.out.write_all(&frame)?;
+        self.frame.clear();
+        push_varint(&mut self.frame, self.record.len() as u32);
+        self.out.write_all(&self.frame)?;
         self.out.write_all(&self.record)?;
         self.prev_key.clear();
         self.prev_key.extend_from_slice(key);
@@ -485,6 +467,11 @@ struct HeadSinkState {
     current: Option<(String, usize)>,
     /// Per column, the scoring the builder's heads are keyed at.
     scoring: BTreeMap<FieldId, ColumnScoring>,
+    /// The key of the term being written: the part's prefix and the term.
+    key: Vec<u8>,
+    /// The builder said it was done: without that the sink holds part of
+    /// a contribution, not one.
+    finished: bool,
 }
 
 impl HeadSink {
@@ -499,21 +486,28 @@ impl HeadSink {
                 parts: Vec::new(),
                 current: None,
                 scoring: BTreeMap::new(),
+                key: Vec::new(),
+                finished: false,
             })),
         })
     }
 
     /// The finished contribution for `superfile_id`, once the builder that
-    /// fed this sink has finished.
+    /// fed this sink has finished; `None` when no builder drove the sink to
+    /// its end — a superfile without a text index has nothing to
+    /// contribute, and a caller must not take an empty contribution for one.
     pub(crate) fn into_contribution(
         self,
         superfile_id: Uuid,
         id_min: i128,
-    ) -> Result<Contribution, TermIndexError> {
+    ) -> Result<Option<Contribution>, TermIndexError> {
         let state = Arc::try_unwrap(self.inner)
             .map_err(|_| TermIndexError::Build("term head sink still in use".into()))?
             .into_inner()
             .map_err(|_| TermIndexError::Build("term head sink poisoned".into()))?;
+        if !state.finished {
+            return Ok(None);
+        }
         let HeadSinkState {
             scratch,
             mut parts,
@@ -530,13 +524,13 @@ impl HeadSink {
             fs::remove_file(&part.path)?;
         }
         out.flush()?;
-        Ok(Contribution {
+        Ok(Some(Contribution {
             superfile_id,
             id_min,
             scoring,
             path,
             _scratch: Some(scratch),
-        })
+        }))
     }
 }
 
@@ -558,6 +552,15 @@ impl TermHeadSink for HeadSink {
                 let Some(id) = state.columns.get(column).copied() else {
                     return Ok(());
                 };
+                // The scoring is the column's, so a column change records
+                // it once for the run of terms that follows.
+                state.scoring.insert(
+                    id,
+                    ColumnScoring {
+                        avgdl: facts.avgdl,
+                        params: facts.params,
+                    },
+                );
                 let prefix = id.term_key("");
                 let part = match state.parts.iter().position(|(p, _)| *p == prefix) {
                     Some(part) => part,
@@ -575,29 +578,18 @@ impl TermHeadSink for HeadSink {
                 part
             }
         };
-        if let Some(id) = state.columns.get(column).copied() {
-            state.scoring.insert(
-                id,
-                ColumnScoring {
-                    avgdl: facts.avgdl,
-                    params: facts.params,
-                },
-            );
-        }
         let (prefix, writer) = &mut state.parts[part];
-        let mut key = prefix.clone();
-        key.extend_from_slice(term.as_bytes());
+        state.key.clear();
+        state.key.extend_from_slice(prefix);
+        state.key.extend_from_slice(term.as_bytes());
         writer
             .push(
-                &key,
+                &state.key,
                 facts.df,
                 facts.bound,
                 Location::from_dict_value(facts.entry),
                 facts.tail,
-                &Head {
-                    docs: facts.head.to_vec(),
-                    complete: facts.complete,
-                },
+                facts.head,
             )
             .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))
     }
@@ -613,6 +605,7 @@ impl TermHeadSink for HeadSink {
                 .flush()
                 .map_err(|e| BuildError::Io(io::Error::other(e.to_string())))?;
         }
+        state.finished = true;
         Ok(())
     }
 }
@@ -642,11 +635,10 @@ pub(crate) fn first_contribution_difference(
                     && x.posting.bound.to_bits() == y.posting.bound.to_bits()
                     && x.posting.tail.to_bits() == y.posting.tail.to_bits()
                     && x.posting.location == y.posting.location
-                    && x.head.complete == y.head.complete
-                    && x.head.docs == y.head.docs;
+                    && x.head == y.head;
                 if !same {
                     return Ok(Some(format!(
-                        "record {n} {:?} / {:?}: df {} vs {}, bound {:?} vs {:?}, tail {:?} vs {:?}, location {:?} vs {:?}, complete {} vs {}, head {:?} vs {:?}",
+                        "record {n} {:?} / {:?}: df {} vs {}, bound {:?} vs {:?}, tail {:?} vs {:?}, location {:?} vs {:?}, head {:?} vs {:?}",
                         String::from_utf8_lossy(&x.key),
                         String::from_utf8_lossy(&y.key),
                         x.posting.df,
@@ -657,10 +649,8 @@ pub(crate) fn first_contribution_difference(
                         y.posting.tail,
                         x.posting.location,
                         y.posting.location,
-                        x.head.complete,
-                        y.head.complete,
-                        &x.head.docs[..x.head.docs.len().min(6)],
-                        &y.head.docs[..y.head.docs.len().min(6)],
+                        &x.head[..x.head.len().min(6)],
+                        &y.head[..y.head.len().min(6)],
                     )));
                 }
             }
@@ -693,11 +683,11 @@ struct ContributionReader {
 }
 
 /// One decoded record: the key, the posting (ordinal not yet set) and the
-/// head.
+/// head as `(row, term frequency, length bucket)` in descending key.
 struct Record {
     key: Vec<u8>,
     posting: Posting,
-    head: Head,
+    head: Vec<(u32, u32, u8)>,
 }
 
 /// Largest byte length one encoded `u64` can occupy (10 × 7 bits).
@@ -766,12 +756,6 @@ impl ContributionReader {
             .to_vec();
         at += key_len;
         let posting = read_posting(&self.buf, &mut at)?;
-        let complete = *self
-            .buf
-            .get(at)
-            .ok_or_else(|| TermIndexError::Malformed("contribution head flag".into()))?
-            != 0;
-        at += 1;
         let n = read_varint(&self.buf, &mut at)
             .ok_or_else(|| TermIndexError::Malformed("contribution head count".into()))?
             as usize;
@@ -797,7 +781,7 @@ impl ContributionReader {
         Ok(Some(Record {
             key,
             posting,
-            head: Head { docs, complete },
+            head: docs,
         }))
     }
 }
@@ -879,7 +863,7 @@ impl SliceBuilder {
     }
 
     /// The slice and its tier object, when its terms wrote any tier chunks.
-    fn finish(self, tier: Option<ObjectRef>) -> Option<(SliceRef, Vec<u8>)> {
+    fn finish(self, tier: Option<ContentHash>) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
         let dict = self.dict.finish().expect("Vec sink cannot fail");
         let bytes = encode_slice(&dict, &self.postings);
@@ -889,7 +873,6 @@ impl SliceBuilder {
                 first_key,
                 last_key: self.last_key,
                 content_hash,
-                len: bytes.len() as u64,
                 tier,
             },
             bytes,
@@ -1001,23 +984,8 @@ impl SegmentWriter {
         self.current.n_terms > 0 && self.current.encoded_bytes() + run_len > self.target_bytes
     }
 
-    /// Place `chunks` at the end of the open slice's tier object and name
-    /// them from there.
-    fn place_chunks(&mut self, chunks: &[EncodedChunk]) -> Vec<TierChunkRef> {
-        let mut refs = Vec::with_capacity(chunks.len());
-        for c in chunks {
-            refs.push(TierChunkRef {
-                offset: self.current_tier.len() as u64,
-                len: c.bytes.len() as u64,
-                n_entries: c.n_entries,
-                n_blocks: c.n_blocks,
-            });
-            self.current_tier.extend_from_slice(&c.bytes);
-        }
-        refs
-    }
-
-    /// The chunk list `chunks` would get in the open slice's tier object.
+    /// The chunk list `chunks` get at the end of the open slice's tier
+    /// object.
     fn refs_at(&self, chunks: &[EncodedChunk]) -> Vec<TierChunkRef> {
         let mut at = self.current_tier.len() as u64;
         chunks
@@ -1026,7 +994,6 @@ impl SegmentWriter {
                 let r = TierChunkRef {
                     offset: at,
                     len: c.bytes.len() as u64,
-                    n_entries: c.n_entries,
                     n_blocks: c.n_blocks,
                 };
                 at += r.len;
@@ -1035,24 +1002,30 @@ impl SegmentWriter {
             .collect()
     }
 
+    /// Place `chunks` at the end of the open slice's tier object, where
+    /// [`Self::refs_at`] named them.
+    fn place_chunks(&mut self, chunks: &[EncodedChunk]) {
+        for c in chunks {
+            self.current_tier.extend_from_slice(&c.bytes);
+        }
+    }
+
     /// Queue one term with its postings (ascending superfile) and the tier
-    /// entries gathered for it, in any order; `complete` says every head
-    /// that fed `entries` was its term's whole list. Terms are encoded in
-    /// parallel a batch at a time and written in the order queued.
+    /// entries gathered for it, in any order. Terms are encoded in parallel
+    /// a batch at a time and written in the order queued.
     fn add_term(
         &mut self,
         key: &[u8],
         postings: Vec<Posting>,
         entries: Vec<TierEntry>,
         sources: Vec<TierSource>,
-        complete: bool,
     ) -> Result<(), TermIndexError> {
         self.pending_entries += entries.len();
         for source in &sources {
             self.pending_entries += source
                 .chunks
                 .iter()
-                .map(|c| c.n_entries as usize)
+                .map(|c| c.n_blocks as usize * BLOCK_ENTRIES)
                 .sum::<usize>();
         }
         self.pending.push(TermInput {
@@ -1060,7 +1033,6 @@ impl SegmentWriter {
             postings,
             entries,
             sources,
-            complete,
         });
         if self.pending_entries >= ENCODE_BATCH_ENTRIES || self.pending.len() >= ENCODE_BATCH_TERMS
         {
@@ -1106,8 +1078,6 @@ impl SegmentWriter {
             return self.add(&term.key, &encode_run(&term.postings));
         };
         let mut tier = TierRef {
-            complete: encoded.complete,
-            n_entries: encoded.n_entries,
             chunks: self.refs_at(&encoded.chunks),
             inline: encoded.inline,
         };
@@ -1117,8 +1087,7 @@ impl SegmentWriter {
             tier.chunks = self.refs_at(&encoded.chunks);
             run = encode_run_with_tier(Some(&tier), &term.postings);
         }
-        let placed = self.place_chunks(&encoded.chunks);
-        debug_assert_eq!(placed, tier.chunks);
+        self.place_chunks(&encoded.chunks);
         self.current.add(&term.key, &run);
         Ok(())
     }
@@ -1128,17 +1097,14 @@ impl SegmentWriter {
     /// hash, as [`tier_path`] places them for a merge.
     fn cut(&mut self) -> Result<(), TermIndexError> {
         let tier_bytes = (!self.current_tier.is_empty()).then(|| mem::take(&mut self.current_tier));
-        let tier = tier_bytes.as_ref().map(|bytes| ObjectRef {
-            content_hash: ContentHash::of(bytes),
-            len: bytes.len() as u64,
-        });
+        let tier = tier_bytes.as_ref().map(|bytes| ContentHash::of(bytes));
         if let Some((reference, bytes)) =
             mem::replace(&mut self.current, SliceBuilder::new()).finish(tier)
         {
             let stem = reference.content_hash.to_hex();
-            if let (Some(object), Some(bytes)) = (tier, tier_bytes) {
+            if let (Some(hash), Some(bytes)) = (tier, tier_bytes) {
                 let kept = self.keep(&format!("{stem}.{TIER_FILE_EXTENSION}"), bytes)?;
-                self.tier_bytes.push((object.content_hash, kept));
+                self.tier_bytes.push((hash, kept));
             }
             let kept = self.keep(&format!("{stem}.slice"), bytes)?;
             self.slice_bytes.push((reference.content_hash, kept));
@@ -1242,15 +1208,10 @@ pub(crate) fn build_segment(
     policy: &BuildPolicy,
     ordinal_base: u32,
 ) -> Result<BuiltSegment, TermIndexError> {
-    // The budget first, from a pass over the keys and frequencies alone;
-    // the heads stay undecoded until the build proper.
-    let policy = &BuildPolicy {
-        tier_entries_per_term: policy.tier_entries_per_term,
-        ..policy.clone()
-    };
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
-    let mut pending: Vec<Option<(Posting, Head)>> = Vec::with_capacity(contributions.len());
+    let mut pending: Vec<Option<(Posting, Vec<(u32, u32, u8)>)>> =
+        Vec::with_capacity(contributions.len());
     for (ordinal, c) in contributions.iter().enumerate() {
         let mut rd = ContributionReader::open(&c.path)?;
         match rd.next()? {
@@ -1283,10 +1244,9 @@ pub(crate) fn build_segment(
         let key = head.key;
         run.clear();
         entries.clear();
-        let mut complete = true;
         let mut take = |ordinal: u32,
                         run: &mut Vec<Posting>,
-                        pending: &mut Vec<Option<(Posting, Head)>>,
+                        pending: &mut Vec<Option<(Posting, Vec<(u32, u32, u8)>)>>,
                         readers: &mut Vec<ContributionReader>,
                         heap: &mut BinaryHeap<Reverse<MergeHead>>|
          -> Result<(), TermIndexError> {
@@ -1294,8 +1254,7 @@ pub(crate) fn build_segment(
                 .take()
                 .expect("pending posting for heap head");
             p.superfile = ordinal_base + ordinal;
-            complete &= h.complete;
-            entries.extend(h.docs.iter().map(|&(doc_id, tf, len)| TierEntry {
+            entries.extend(h.iter().map(|&(doc_id, tf, len)| TierEntry {
                 superfile: p.superfile,
                 doc_id,
                 tf,
@@ -1342,7 +1301,6 @@ pub(crate) fn build_segment(
             mem::take(&mut run),
             mem::take(&mut entries),
             Vec::new(),
-            complete,
         )?;
     }
     let (segment, slices, tiers) = writer.finish()?;
@@ -1462,16 +1420,14 @@ fn tier_entries(
             .filter(|end| *end <= object.len() as u64)
             .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
         let bytes = &object[chunk.offset as usize..end as usize];
-        let chunk = TierChunk::open(bytes)?;
-        for i in 0..chunk.n_blocks() {
-            chunk.decode_block(i, &mut block)?;
-            out.extend(block.iter().filter_map(|e| {
-                Some(TierEntry {
-                    superfile: (*ordinals.get(e.superfile as usize)?)?,
-                    ..*e
-                })
-            }));
-        }
+        block.clear();
+        TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
+        out.extend(block.iter().filter_map(|e| {
+            Some(TierEntry {
+                superfile: (*ordinals.get(e.superfile as usize)?)?,
+                ..*e
+            })
+        }));
     }
     Ok(())
 }
@@ -1493,12 +1449,6 @@ pub(crate) fn merge_segments(
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
-    // The budget first, from a pass over the runs; a posting of a superfile
-    // that is gone counts for nothing.
-    let policy = &BuildPolicy {
-        tier_entries_per_term: policy.tier_entries_per_term,
-        ..policy.clone()
-    };
     let mut cursors: Vec<SegmentCursor> = sources.iter().map(|s| SegmentCursor::new(s)).collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1524,33 +1474,27 @@ pub(crate) fn merge_segments(
         run.clear();
         sources.clear();
         entries.clear();
-        let mut complete = true;
         let mut next = Some(head.ordinal);
         while let Some(source) = next {
             let source_run = pending[source as usize]
                 .take()
                 .expect("pending run for heap head");
-            match &source_run.tier {
-                Some(tier) => {
-                    complete &= tier.complete;
-                    if tier.chunks.is_empty() {
-                        entries.extend(tier.inline.iter().filter_map(|e| {
-                            Some(TierEntry {
-                                superfile: (*ordinals.get(e.superfile as usize)?)?,
-                                ..*e
-                            })
-                        }));
-                    } else {
-                        sources.push(TierSource {
-                            object: cursors[source as usize].tier_bytes()?,
-                            chunks: tier.chunks.clone(),
-                        });
-                    }
+            // A run without a tier bounds its postings by their tails
+            // alone; the merged tier holds nothing for them.
+            if let Some(tier) = &source_run.tier {
+                if tier.chunks.is_empty() {
+                    entries.extend(tier.inline.iter().filter_map(|e| {
+                        Some(TierEntry {
+                            superfile: (*ordinals.get(e.superfile as usize)?)?,
+                            ..*e
+                        })
+                    }));
+                } else {
+                    sources.push(TierSource {
+                        object: cursors[source as usize].tier_bytes()?,
+                        chunks: tier.chunks.clone(),
+                    });
                 }
-                // A run without a tier bounds its postings by their tails
-                // alone; the merged tier holds nothing for them and is not
-                // complete.
-                None => complete = false,
             }
             run.extend(source_run.postings.into_iter().filter_map(|mut p| {
                 p.superfile = (*ordinals.get(p.superfile as usize)?)?;
@@ -1579,7 +1523,6 @@ pub(crate) fn merge_segments(
             mem::take(&mut run),
             mem::take(&mut entries),
             mem::take(&mut sources),
-            complete,
         )?;
     }
     let (segment, slices, tiers) = writer.finish()?;

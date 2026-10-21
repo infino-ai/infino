@@ -11,14 +11,14 @@
 //! | per superfile: uuid | smallest doc id i128 LE
 //! | n_segments u32 | per segment: n_slices u32
 //!     | per slice: first_key (u32 len + bytes) | last_key (u32 len + bytes)
-//!                | content hash (32 B) | slice byte length u64
-//!     | tier list: content hash (32 B, all zero when the segment has none) | byte length u64
+//!                | content hash (32 B)
+//!                | tier object content hash (32 B, all zero when no run of the slice has one)
 //! ```
 //!
-//! A segment's *tier list* names every tier chunk its runs reference
-//! (`tier.rs`): a flat sequence of content hashes, one small object, so
-//! garbage collection and a segment merge can enumerate the chunks
-//! without reading the slices.
+//! A slice's *tier object* holds its terms' tier chunks (`tier.rs`) back
+//! to back; a run names its chunks by offset into it. Both the slice and
+//! its tier object are content-addressed, so garbage collection enumerates
+//! them from the root alone.
 //!
 //! Superfiles are listed once; every posting names its superfile by
 //! *ordinal* into that list, so a posting is a few bytes rather than a
@@ -41,20 +41,25 @@
 //!
 //! ```text
 //! n_postings varint
-//! | tier: present u8 [| complete u8 | n_entries u64 LE | n_chunks varint
-//!                     | per chunk: content hash (32 B) | byte length u64 LE | entries u64 LE]
-//! | per posting: superfile ordinal varint | df varint
-//!                   | bound f32 LE | tail f32 LE | location tag u8 [| location payload]
+//! | tier tag u8: absent | chunked [| n_chunks varint
+//!                                  | per chunk: offset varint | byte length varint | n_blocks varint]
+//!                      | inline [| n_entries varint | per entry: ordinal varint | row varint | tf varint | len u8]
+//! | per posting: superfile ordinal varint (<< 1 | has tail) | df varint
+//!                   | bound f32 LE [| tail f32 LE] | location tag u8 [| location payload]
 //! ```
 //!
-//! `tier` names the term's tier chunks (`tier.rs`): its best documents
-//! table-wide, read in key order ahead of any superfile open; absent
-//! when the build's policy keeps no tier for the term. `tail` is the
-//! largest key of a document of the term in that superfile that the
-//! tier does *not* hold — zero when it holds them all — so a reader that
-//! has consumed the tier knows what the superfile can still contribute.
-//! Keys are at the superfile's own average length and the column's
-//! parameters, so a superfile's entries and tail order consistently.
+//! `tier` names the term's tier chunks (`tier.rs`): per superfile, its
+//! best documents, read ahead of any superfile open; absent when the
+//! build's policy keeps no tier for the term, inline in the run when it
+//! is a handful of entries. `bound` is the largest *key* — the
+//! length-normalized term frequency, the factor a score multiplies the
+//! idf by — of a document of the term in that superfile, and `tail` the
+//! largest key of one the tier does *not* hold — zero when it holds them
+//! all — so a reader that has consumed the tier knows what the superfile
+//! can still contribute. Keys are at the superfile's own average length
+//! and the column's parameters, so a superfile's entries, bound and tail
+//! order consistently, and a reader scales them to the table's statistics
+//! as it rescales any ceiling.
 //!
 //! `location` mirrors the superfile dictionary's own value for the term —
 //! a PFOR or short-form byte range relative to that superfile's postings
@@ -91,15 +96,15 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// `3` keys terms by the column's field id instead of its name; `4` is
 /// the root whose slices carry tails and tiers (slice version 2); `5` is
 /// the root whose slices are at version 3; `6` the root whose slices are at
-/// version 4. A root at an older version does not decode: the index is
-/// rebuilt, not translated.
+/// version 4 and names each slice's tier object by hash alone. A root at an
+/// older version does not decode: the index is rebuilt, not translated.
 pub(crate) const ROOT_FORMAT_VERSION: u32 = 6;
 /// Layout version of a slice. `2` added the per-posting tail and the
 /// run's tier reference; `3` keeps a small tier in the run and gives a
 /// tier chunk a directory CRC and a CRC per block, so a block is read on
 /// its own; `4` lays a tier out per superfile, in regions of one block per
 /// superfile, with the superfile and its tail in each block's directory
-/// entry.
+/// entry, and stores a posting's bound as a key rather than a score.
 pub(crate) const SLICE_FORMAT_VERSION: u32 = 4;
 /// Run header tag: the term has no tier.
 const TIER_ABSENT: u8 = 0;
@@ -213,10 +218,12 @@ pub(crate) struct Posting {
     pub(crate) superfile: u32,
     /// Gross document frequency of the term in that superfile.
     pub(crate) df: u64,
-    /// Upper bound on the BM25 score the term can reach in that
-    /// superfile, at the superfile's declared scoring parameters.
-    /// `f32::INFINITY` is a valid (useless) bound and is what a build
-    /// that did not collect bounds writes.
+    /// Upper bound on the tier key — the length-normalized term frequency
+    /// at the superfile's own average length and the column's parameters,
+    /// the factor a score multiplies the term's idf by — of any document of
+    /// the term in that superfile: the key of its best document.
+    /// `f32::INFINITY` is a valid (useless) bound and is what a build that
+    /// did not collect bounds writes.
     pub(crate) bound: f32,
     /// Upper bound on the tier key — the length-normalized term frequency
     /// at the superfile's own average length and the column's parameters —
@@ -232,10 +239,6 @@ pub(crate) struct Posting {
 /// A term's tier, as its run names it.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct TierRef {
-    /// Every document of the term, table-wide, is in the tier.
-    pub(crate) complete: bool,
-    /// Entries across all chunks, or inline.
-    pub(crate) n_entries: u64,
     /// The chunks in tier order; empty when the entries are inline.
     pub(crate) chunks: Vec<TierChunkRef>,
     /// The entries themselves, in tier order, when the tier is small
@@ -259,18 +262,9 @@ pub(crate) struct SliceRef {
     pub(crate) last_key: Vec<u8>,
     /// Content hash of the slice bytes; also names the object.
     pub(crate) content_hash: ContentHash,
-    /// Slice byte length, so a fetch can be sized before it is issued.
-    pub(crate) len: u64,
-    /// The slice's tier object — its terms' tier chunks back to back, in
-    /// key order — when any of its runs has a tier.
-    pub(crate) tier: Option<ObjectRef>,
-}
-
-/// A content-addressed object's name and size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ObjectRef {
-    pub(crate) content_hash: ContentHash,
-    pub(crate) len: u64,
+    /// The content hash of the slice's tier object — its terms' tier chunks
+    /// back to back, in key order — when any of its runs has a tier.
+    pub(crate) tier: Option<ContentHash>,
 }
 
 /// One build's slice list. The base is segment 0; deltas append.
@@ -378,13 +372,8 @@ impl Root {
                 push_bytes_u32_len(&mut out, &s.first_key);
                 push_bytes_u32_len(&mut out, &s.last_key);
                 out.extend_from_slice(&s.content_hash.0);
-                out.extend_from_slice(&s.len.to_le_bytes());
-                let (hash, len) = match &s.tier {
-                    Some(r) => (r.content_hash, r.len),
-                    None => (ContentHash([0u8; HASH_LEN]), 0),
-                };
-                out.extend_from_slice(&hash.0);
-                out.extend_from_slice(&len.to_le_bytes());
+                let tier = s.tier.unwrap_or(ContentHash([0u8; HASH_LEN]));
+                out.extend_from_slice(&tier.0);
             }
         }
         out
@@ -413,21 +402,15 @@ impl Root {
                 let last_key = c.bytes_u32_len("slice last key")?.to_vec();
                 let hash = c.take(HASH_LEN, "slice hash")?;
                 let content_hash = ContentHash(hash.try_into().expect("32 bytes"));
-                let len = c.u64("slice length")?;
                 let hash = c.take(HASH_LEN, "slice tier hash")?;
-                let tier_len = c.u64("slice tier length")?;
-                let tier = match hash.iter().all(|b| *b == 0) && tier_len == 0 {
+                let tier = match hash.iter().all(|b| *b == 0) {
                     true => None,
-                    false => Some(ObjectRef {
-                        content_hash: ContentHash(hash.try_into().expect("32 bytes")),
-                        len: tier_len,
-                    }),
+                    false => Some(ContentHash(hash.try_into().expect("32 bytes"))),
                 };
                 slices.push(SliceRef {
                     first_key,
                     last_key,
                     content_hash,
-                    len,
                     tier,
                 });
             }
@@ -523,7 +506,6 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
         None => out.push(TIER_ABSENT),
         Some(t) if t.chunks.is_empty() => {
             out.push(TIER_INLINE);
-            out.push(t.complete as u8);
             push_varint(&mut out, t.inline.len() as u32);
             for e in &t.inline {
                 push_varint(&mut out, e.superfile);
@@ -534,8 +516,6 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
         }
         Some(t) => {
             out.push(TIER_PRESENT);
-            out.push(t.complete as u8);
-            push_u64_varint(&mut out, t.n_entries);
             push_chunk_refs(&mut out, &t.chunks);
         }
     }
@@ -619,27 +599,13 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
     let tier = match tag {
         TIER_ABSENT => None,
         TIER_PRESENT => {
-            let complete = *bytes
-                .get(at)
-                .ok_or_else(|| malformed("run tier complete"))?
-                != 0;
-            at += 1;
-            let n_entries =
-                read_u64_varint(bytes, &mut at).ok_or_else(|| malformed("run tier entries"))?;
             let chunks = read_chunk_refs(bytes, &mut at)?;
             Some(TierRef {
-                complete,
-                n_entries,
                 chunks,
                 inline: Vec::new(),
             })
         }
         TIER_INLINE => {
-            let complete = *bytes
-                .get(at)
-                .ok_or_else(|| malformed("run tier complete"))?
-                != 0;
-            at += 1;
             let n =
                 read_varint(bytes, &mut at).ok_or_else(|| malformed("run tier entries"))? as usize;
             let mut inline = Vec::with_capacity(n.min(64));
@@ -662,8 +628,6 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
                 });
             }
             Some(TierRef {
-                complete,
-                n_entries: n as u64,
                 chunks: Vec::new(),
                 inline,
             })
@@ -861,13 +825,10 @@ mod tests {
 
     fn sample_tier() -> TierRef {
         TierRef {
-            complete: false,
-            n_entries: 1_234_567,
             chunks: (0..2)
                 .map(|i| TierChunkRef {
                     offset: i * 4_000_000,
                     len: 4_000_000 - i,
-                    n_entries: 600_000 + i,
                     n_blocks: 1_078,
                 })
                 .collect(),
@@ -878,8 +839,6 @@ mod tests {
     /// A tier small enough to ride in the run.
     fn sample_inline_tier() -> TierRef {
         TierRef {
-            complete: true,
-            n_entries: 3,
             chunks: Vec::new(),
             inline: vec![
                 TierEntry {
@@ -984,11 +943,9 @@ mod tests {
             first_key: first.as_bytes().to_vec(),
             last_key: last.as_bytes().to_vec(),
             content_hash: ContentHash([tag; HASH_LEN]),
-            len: tag as u64 * 1000,
-            tier: tag.is_multiple_of(2).then(|| ObjectRef {
-                content_hash: ContentHash([tag ^ 0xFF; HASH_LEN]),
-                len: tag as u64 * 10,
-            }),
+            tier: tag
+                .is_multiple_of(2)
+                .then_some(ContentHash([tag ^ 0xFF; HASH_LEN])),
         }
     }
 
@@ -1060,7 +1017,6 @@ mod tests {
             first_key: a.to_vec(),
             last_key: b.to_vec(),
             content_hash: ContentHash([n; 32]),
-            len: 1,
             tier: None,
         };
         let root = Root {

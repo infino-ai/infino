@@ -111,7 +111,7 @@ use crate::{
             bm25,
             positions::{TermRuns, encode_group, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
-            reader::ColumnLengthStats,
+            reader::{ColumnLengthStats, TopKEntry},
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
             tokenize::{StandardTokenizer, Tokenizer},
@@ -1424,8 +1424,9 @@ pub(crate) trait TermHeadSink: Send {
 pub(crate) struct TermHeadFacts<'a> {
     /// Documents carrying the term in this blob.
     pub(crate) df: u64,
-    /// The largest BM25 impact of the term in this blob, exactly as a
-    /// reader scores it.
+    /// The largest key — the length-normalized term frequency at this
+    /// blob's average length and parameters, the factor a score multiplies
+    /// the idf by — of a document of the term in this blob.
     pub(crate) bound: f32,
     /// The dictionary entry written for the term.
     pub(crate) entry: DictEntry,
@@ -1443,8 +1444,6 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) avgdl: f32,
     /// The column's parameters, likewise.
     pub(crate) params: bm25::Bm25Params,
-    /// `head` is the term's whole list here.
-    pub(crate) complete: bool,
 }
 
 /// A term's head as the encoder gathers it.
@@ -1454,62 +1453,46 @@ struct HeadOut {
     docs: Vec<(u32, u32, u8)>,
     bound: f32,
     tail: f32,
-    complete: bool,
     /// The average length and parameters `tail` is keyed at.
     avgdl: f32,
     params: bm25::Bm25Params,
-}
-
-/// Heap entry for the head — impact, blob document id, term frequency:
-/// the heap's top is the worst kept document — the lowest impact, and
-/// among equal impacts the larger document id — so a tie keeps the
-/// smaller id, as a reader's top-k does.
-#[derive(PartialEq)]
-struct HeadEntry(f32, u32, u32);
-impl Eq for HeadEntry {}
-impl PartialOrd for HeadEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for HeadEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .0
-            .total_cmp(&self.0)
-            .then_with(|| self.1.cmp(&other.1))
-    }
+    /// The documents kept, drained from the heap: `(doc, tf)` with the
+    /// score, in descending score.
+    kept: Vec<((u32, u32), f32)>,
 }
 
 /// Keep a term's best `depth` documents by `scores` (one per posting, as
 /// a reader scores them), the way a reader's single-term search ranks
 /// them: `depth + 1` are kept so the first document left out is the tail,
-/// exactly.
+/// exactly. The heap entry is the reader's own, so a tie keeps the smaller
+/// document id as a reader's top-k does.
 fn term_head(
     pairs: &[(u32, u32)],
     scores: &[f32],
     enc: &TermEncoding<'_>,
-    heap: &mut BinaryHeap<HeadEntry>,
+    heap: &mut BinaryHeap<TopKEntry<(u32, u32)>>,
     out: &mut HeadOut,
 ) {
     let depth = enc.head_depth;
     heap.clear();
     out.df = pairs.len() as u64;
-    let mut bound = 0.0f32;
     for (&(doc, tf), &score) in pairs.iter().zip(scores) {
-        bound = bound.max(score);
         if heap.len() <= depth {
-            heap.push(HeadEntry(score, doc, tf));
+            heap.push(TopKEntry(score, (doc, tf)));
         } else if let Some(mut worst) = heap.peek_mut()
             && score > worst.0
         {
-            *worst = HeadEntry(score, doc, tf);
+            *worst = TopKEntry(score, (doc, tf));
         }
     }
-    out.complete = heap.len() <= depth;
-    let mut kept: Vec<HeadEntry> = heap.drain().collect();
-    kept.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-    // The key of a document: what the term index orders its tiers by.
+    let complete = heap.len() <= depth;
+    out.kept.clear();
+    out.kept.extend(heap.drain().map(|TopKEntry(s, d)| (d, s)));
+    out.kept
+        .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    // The key of a document: what the term index orders its tiers by. The
+    // bound is the largest over the documents kept: the best by impact is
+    // among them, and impact orders as the key does.
     let key = |doc: u32, tf: u32| {
         bm25::tf_factor(
             tf,
@@ -1517,20 +1500,24 @@ fn term_head(
                 .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
         )
     };
-    out.tail = if out.complete {
+    out.bound = out
+        .kept
+        .iter()
+        .map(|&((doc, tf), _)| key(doc, tf))
+        .fold(0.0f32, f32::max);
+    out.tail = if complete {
         0.0
     } else {
-        kept.pop()
-            .map(|HeadEntry(_, doc, tf)| key(doc, tf))
+        out.kept
+            .pop()
+            .map(|((doc, tf), _)| key(doc, tf))
             .unwrap_or(0.0)
     };
     out.docs.clear();
-    out.docs
-        .extend(kept.into_iter().map(|HeadEntry(_, doc, tf)| {
-            let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
-            (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
-        }));
-    out.bound = bound;
+    out.docs.extend(out.kept.iter().map(|&((doc, tf), _)| {
+        let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
+        (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
+    }));
     out.avgdl = enc.avgdl;
     out.params = enc.params;
 }
@@ -3977,7 +3964,7 @@ struct TermScratch {
     /// The term's head for the sink, when one is attached, and each
     /// posting's score, computed once for the head and the block maxima.
     head: HeadOut,
-    head_heap: BinaryHeap<HeadEntry>,
+    head_heap: BinaryHeap<TopKEntry<(u32, u32)>>,
     scores: Vec<f32>,
     /// Per-block doc_id column passed to `encode_block`. Re-used by
     /// taking it into a Block, encoding, and taking it back. Capacity
@@ -4655,20 +4642,12 @@ fn write_term<W: Write>(
             term,
             &TermHeadFacts {
                 df: head.df,
-                // A reader takes a long term's bound from its stored block
-                // maxima widened by an ulp, so a score that rounds above
-                // the stored maximum never prunes its own document; a short
-                // or inline term's it scores on the spot, exactly.
-                bound: match dict_entry {
-                    DictEntry::Pfor { short: false, .. } => head.bound.next_up(),
-                    _ => head.bound,
-                },
+                bound: head.bound,
                 entry: dict_entry,
                 head: &head.docs,
                 tail: head.tail,
                 avgdl: head.avgdl,
                 params: head.params,
-                complete: head.complete,
             },
         )?;
     }
