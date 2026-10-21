@@ -55,7 +55,7 @@ use format::Segment;
 #[cfg(test)]
 pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice};
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::fs as async_fs;
@@ -742,6 +742,20 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
     }
 }
 
+/// A term's idf within one superfile of `n_scored` scored documents, where
+/// it has `df` of them: what the superfile's stored impacts are computed
+/// at.
+pub(crate) fn local_idf(n_scored: u64, df: u64) -> f32 {
+    bm25_idf(n_scored, df.min(n_scored))
+}
+
+/// The factor that takes an impact computed at `local` to one at the idf
+/// `query` weights the term with; one when the superfile's idf is not
+/// positive.
+pub(crate) fn idf_ratio(local: f32, query: f32) -> f32 {
+    if local > 0.0 { query / local } else { 1.0 }
+}
+
 impl TermIndex {
     /// Wrap a loaded root.
     pub(crate) fn new(
@@ -921,14 +935,10 @@ impl TermIndex {
                 let Some(&n) = scored_docs.get(&id) else {
                     continue;
                 };
-                let local_idf = bm25_idf(n, p.df.min(n));
-                let ratio = if local_idf > 0.0 {
-                    idf_used(term, local_idf) / local_idf
-                } else {
-                    1.0
-                };
-                let scaled = if local_idf > 0.0 {
-                    p.bound / local_idf
+                let local = local_idf(n, p.df);
+                let ratio = idf_ratio(local, idf_used(term, local));
+                let scaled = if local > 0.0 {
+                    p.bound / local
                 } else {
                     p.bound
                 };
@@ -1207,29 +1217,36 @@ impl TermIndex {
         let mut out = tier.inline.clone();
         let mut block = Vec::new();
         for chunk in &tier.chunks {
-            let dir = self.tier_directory(object, chunk).await?;
-            for i in 0..dir.n_blocks() {
-                let body = self.tier_block(object, chunk, &dir, i).await?;
-                dir.decode_block(i, &body, &mut block)?;
+            let (dir, _) = self.tier_directory(object, chunk).await?;
+            let all: Vec<usize> = (0..dir.n_blocks()).collect();
+            let (bodies, _) = self.tier_blocks(object, chunk, &dir, &all).await?;
+            for (i, body) in bodies.iter().enumerate() {
+                dir.decode_block(i, body, &mut block)?;
                 out.extend_from_slice(&block);
             }
         }
         Ok(out)
     }
 
-    /// One chunk's block directory: a ranged read of the chunk's head,
-    /// sized from the entry count its run records, verified by the
-    /// directory's own CRC and resident afterwards.
+    /// One chunk's block directory, with the bytes the call fetched: a
+    /// ranged read of the chunk's head covering the directory and the
+    /// blocks after it up to [`TIER_READ_WINDOW_BYTES`] — the first region
+    /// of every superfile, which the first round of a merge reads anyway —
+    /// verified by the directory's own CRC and each block's, all resident
+    /// afterwards.
     pub(crate) async fn tier_directory(
         &self,
         object: &ContentHash,
         chunk: &TierChunkRef,
-    ) -> Result<Arc<TierDirectory>, TermIndexError> {
+    ) -> Result<(Arc<TierDirectory>, u64), TermIndexError> {
         let key = (*object, chunk.offset);
         if let Some(d) = self.tier_dirs.lock().await.get(&key) {
-            return Ok(d);
+            return Ok((d, 0));
         }
-        let len = (TierDirectory::len_for(chunk.n_blocks) as u64).min(chunk.len);
+        let dir_len = TierDirectory::len_for(chunk.n_blocks) as u64;
+        let len = dir_len
+            .saturating_add(TIER_READ_WINDOW_BYTES as u64)
+            .min(chunk.len);
         let end = chunk
             .offset
             .checked_add(len)
@@ -1238,6 +1255,7 @@ impl TermIndex {
             .storage
             .get_range(&tier_uri(object), chunk.offset..end)
             .await?;
+        let fetched = bytes.len() as u64;
         let dir = TierDirectory::parse(&bytes)?;
         if dir.chunk_len() as u64 != chunk.len {
             return Err(TermIndexError::Malformed(
@@ -1246,63 +1264,113 @@ impl TermIndex {
         }
         let dir = Arc::new(dir);
         self.tier_dirs.lock().await.insert(key, Arc::clone(&dir));
-        Ok(dir)
+        let mut resident = self.tier_blocks.lock().await;
+        for b in 0..dir.n_blocks() {
+            let r = dir.block_range(b);
+            if r.end > bytes.len() {
+                break;
+            }
+            let body = bytes.slice(r);
+            dir.verify_block(b, &body)?;
+            resident.insert(
+                (*object, chunk.offset + dir.block_range(b).start as u64),
+                body,
+            );
+        }
+        Ok((dir, fetched))
     }
 
-    /// Block `i` of a chunk, by the directory's range: a ranged read of the
-    /// block and the ones after it up to [`TIER_READ_WINDOW_BYTES`], each
-    /// verified by its own CRC and resident afterwards.
-    pub(crate) async fn tier_block(
+    /// The bodies of `blocks` of a chunk, by the directory's ranges, with
+    /// the bytes the call fetched. Blocks not resident are read in windows
+    /// of up to [`TIER_READ_WINDOW_BYTES`] — a window starts at a missing
+    /// block and takes the blocks after it while they fit, so the regions
+    /// of neighbouring superfiles come in one read — issued together; every
+    /// block read is verified by its own CRC and resident afterwards.
+    pub(crate) async fn tier_blocks(
         &self,
         object: &ContentHash,
         chunk: &TierChunkRef,
         dir: &TierDirectory,
-        i: usize,
-    ) -> Result<Bytes, TermIndexError> {
-        if i >= dir.n_blocks() {
-            return Err(TermIndexError::Malformed("tier block index".into()));
-        }
-        let first = dir.block_range(i);
-        let key = (*object, chunk.offset + first.start as u64);
-        if let Some(b) = self.tier_blocks.lock().await.get(&key) {
-            return Ok(b);
-        }
-        // The window: this block, then the following ones while they fit.
-        let mut last = i;
-        while last + 1 < dir.n_blocks()
-            && dir.block_range(last + 1).end - first.start <= TIER_READ_WINDOW_BYTES
+        blocks: &[usize],
+    ) -> Result<(Vec<Bytes>, u64), TermIndexError> {
+        let mut out: Vec<Option<Bytes>> = vec![None; blocks.len()];
+        let mut missing: Vec<usize> = Vec::new();
         {
-            last += 1;
-        }
-        let span = first.start..dir.block_range(last).end;
-        let start = chunk
-            .offset
-            .checked_add(span.start as u64)
-            .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
-        let end = chunk
-            .offset
-            .checked_add(span.end as u64)
-            .filter(|e| *e <= chunk.offset + chunk.len)
-            .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
-        let bytes = self
-            .storage
-            .get_range(&tier_uri(object), start..end)
-            .await?;
-        if bytes.len() != span.len() {
-            return Err(TermIndexError::Malformed("short tier block read".into()));
-        }
-        let mut out = None;
-        let mut resident = self.tier_blocks.lock().await;
-        for b in i..=last {
-            let r = dir.block_range(b);
-            let body = bytes.slice(r.start - span.start..r.end - span.start);
-            dir.verify_block(b, &body)?;
-            resident.insert((*object, chunk.offset + r.start as u64), body.clone());
-            if b == i {
-                out = Some(body);
+            let mut resident = self.tier_blocks.lock().await;
+            for (slot, &i) in blocks.iter().enumerate() {
+                if i >= dir.n_blocks() {
+                    return Err(TermIndexError::Malformed("tier block index".into()));
+                }
+                let key = (*object, chunk.offset + dir.block_range(i).start as u64);
+                match resident.get(&key) {
+                    Some(b) => out[slot] = Some(b),
+                    None => missing.push(i),
+                }
             }
         }
-        Ok(out.expect("the first block of the window"))
+        if missing.is_empty() {
+            return Ok((out.into_iter().flatten().collect(), 0));
+        }
+        missing.sort_unstable();
+        missing.dedup();
+        // Windows: each starts at a missing block and spans the blocks after
+        // it that fit; the next window starts at the first missing block
+        // beyond.
+        let mut windows: Vec<(usize, usize)> = Vec::new();
+        let mut at = 0usize;
+        while at < missing.len() {
+            let first = missing[at];
+            let start = dir.block_range(first).start;
+            let mut last = first;
+            while last + 1 < dir.n_blocks()
+                && dir.block_range(last + 1).end - start <= TIER_READ_WINDOW_BYTES
+            {
+                last += 1;
+            }
+            windows.push((first, last));
+            while at < missing.len() && missing[at] <= last {
+                at += 1;
+            }
+        }
+        let uri = tier_uri(object);
+        let fetches = try_join_all(windows.iter().map(|&(first, last)| {
+            let span = dir.block_range(first).start..dir.block_range(last).end;
+            let uri = uri.clone();
+            async move {
+                let start = chunk
+                    .offset
+                    .checked_add(span.start as u64)
+                    .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
+                let end = chunk
+                    .offset
+                    .checked_add(span.end as u64)
+                    .filter(|e| *e <= chunk.offset + chunk.len)
+                    .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
+                let bytes = self.storage.get_range(&uri, start..end).await?;
+                if bytes.len() != span.len() {
+                    return Err(TermIndexError::Malformed("short tier block read".into()));
+                }
+                Ok::<_, TermIndexError>((span.start, bytes))
+            }
+        }))
+        .await?;
+        let mut fetched = 0u64;
+        let mut resident = self.tier_blocks.lock().await;
+        for (&(first, last), (span_start, bytes)) in windows.iter().zip(fetches) {
+            fetched += bytes.len() as u64;
+            for b in first..=last {
+                let r = dir.block_range(b);
+                let body = bytes.slice(r.start - span_start..r.end - span_start);
+                dir.verify_block(b, &body)?;
+                for (slot, &i) in blocks.iter().enumerate() {
+                    if i == b {
+                        out[slot] = Some(body.clone());
+                    }
+                }
+                resident.insert((*object, chunk.offset + r.start as u64), body);
+            }
+        }
+        Ok((out.into_iter().flatten().collect(), fetched))
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until

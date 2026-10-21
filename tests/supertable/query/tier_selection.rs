@@ -257,9 +257,13 @@ fn a_rare_conjunction_opens_only_its_holders() {
             )
             .expect("search")
     });
-    assert_eq!(
-        stats.superfiles_resolved, SUPERFILES as u64,
-        "every superfile is answered from the index"
+    // A superfile that holds a hit is answered from the index; one the
+    // threshold ruled out is neither answered nor opened.
+    assert!(
+        stats.superfiles_resolved >= holders as u64
+            && stats.superfiles_resolved <= SUPERFILES as u64,
+        "{} superfiles answered from the index for {holders} holders",
+        stats.superfiles_resolved
     );
 }
 

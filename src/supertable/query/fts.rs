@@ -75,7 +75,7 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     iter::repeat_n,
-    mem, slice,
+    slice,
     sync::{Arc, Mutex, RwLock},
     time::Instant,
 };
@@ -664,7 +664,7 @@ fn column_params(manifest: &ManifestSnapshot, column: &str) -> Option<Bm25Params
 /// that average rather than the table's: its stored bounds and term-index
 /// ceilings only hold there, and without the value nothing can rescale
 /// them before the file is opened.
-fn baked_avgdl(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
+pub(super) fn baked_avgdl(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
     entry
         .fts_summary
         .get(&column)
@@ -1040,189 +1040,169 @@ impl SupertableReader {
         }
         all_terms.sort_unstable();
         all_terms.dedup();
-        let mut ceilings: Option<HashMap<Uuid, f32>> =
-            match (&term_index, bm25_params, manifest.field_id(column)) {
-                // Ceilings rescale by each term's table idf, so they order and
-                // skip only when the map holds every scored term.
-                (Some(index), None, Some(column_id))
-                    if all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
-                {
-                    let terms: Vec<&str> = musts
-                        .iter()
-                        .chain(shoulds.iter())
-                        .map(String::as_str)
-                        .collect();
-                    let phrases: Vec<Vec<&str>> = must_phrases
-                        .iter()
-                        .chain(should_phrases.iter())
-                        .map(|p| p.iter().map(String::as_str).collect())
-                        .collect();
-                    let gidf = global_idf.clone();
-                    // Every term is in the map (the guard above); the fallback
-                    // only satisfies the type.
-                    let idf_used = move |term: &str, _local: f32| {
-                        gidf.get(term).copied().unwrap_or(f32::INFINITY)
-                    };
-                    let mut ceilings = index
-                        .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
-                        .instrument(term_span.clone())
-                        .await?;
-                    ceilings_at_table_avgdl(&mut ceilings, &kept, column_id, table_avgdl);
-                    Some(ceilings)
-                }
-                _ => None,
-            };
+        // The index serves a ranked query when every scored term's idf is
+        // table-wide and no scoring override is in force: ceilings and
+        // tiers hold impacts at the declared parameters.
+        let index_column = match (&term_index, bm25_params, manifest.field_id(column)) {
+            (Some(index), None, Some(column_id))
+                if all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
+            {
+                Some((index, column_id))
+            }
+            _ => None,
+        };
+        let mut ceilings: Option<HashMap<Uuid, f32>> = None;
         // Tier selection: with every scored term's tier readable, the query
         // chooses its superfiles from the documents the tiers name — per
         // superfile a bound that knows which documents carry several of the
         // terms, and a superfile a required term has shown holds no
-        // candidate is not opened. The bounds replace the ceilings. A plain
-        // AND, OR or mix over bare terms also gets a lower bound on the k-th
-        // score before any open, seeded into the shared floor below; a
-        // phrase scores only where its words are adjacent and a negation
-        // removes documents, so for those the bounds hold but the k-th
-        // candidate may not survive, and no seed is taken. A scoring
-        // override is not served: the tiers hold impacts at the declared
-        // parameters. Only a complete index can rule a superfile out: one
-        // that does not yet list every live superfile knows nothing about
-        // the rest.
+        // candidate is not opened. The bounds replace the ceilings, and the
+        // merge's lower bound on the k-th score is seeded into the shared
+        // floor below. A phrase scores only where its words are adjacent
+        // and a negation removes documents, so neither takes a bound from
+        // the tiers: such a query keeps the ceilings, as does one with more
+        // terms than the merge tracks. Only a complete index can rule a
+        // superfile out: one that does not yet list every live superfile
+        // knows nothing about the rest.
         let mut tier_seed: Option<f32> = None;
         // Superfiles the tiers answer for outright: their hits, tagged as a
         // kernel's would be, and the scores to raise the shared floor with
-        // before any open. A scope admits rows the index cannot see, so a
-        // scoped search opens as before.
+        // before any open.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
-        // A phrase scores only where its words are adjacent and a negation
-        // removes documents, so neither takes a threshold from the tiers,
-        // and a superfile's bound from them is its ceiling: the merge would
-        // read for nothing. Such a query keeps the ceilings.
         let tiers_serve = !has_phrases
             && negatives.is_empty()
+            && scored.len() <= tier::MAX_TIER_TERMS
+            && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
-        if let (Some(index), None, Some(column_id), true, true) = (
-            &term_index,
-            bm25_params,
-            manifest.field_id(column),
-            manifest.term_index_complete(),
-            tiers_serve,
-        ) {
+        let mut selected = false;
+        if let Some((index, column_id)) = index_column
+            && tiers_serve
+        {
             let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
-            // Terms a matching document must carry: bare musts and the words
-            // of must phrases (a word of a should phrase is optional).
-            let required_term = |t: &str| {
-                musts.iter().any(|m| m == t)
-                    || must_phrases.iter().any(|p| p.iter().any(|w| w == t))
-            };
+            // Terms a matching document must carry: the musts.
             let required: u8 = scored_terms
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| required_term(t))
-                .fold(0u8, |m, (i, _)| m | (1u8 << i.min(7)));
-            let can_seed = !has_phrases && negatives.is_empty();
+                .filter(|(_, t)| musts.iter().any(|m| m == *t))
+                .fold(0u8, |m, (i, _)| m | (1u8 << i));
             // A term repeated in the query is weighted by its count in the
             // kernels; the tiers score each term once, so such a query is
             // not served.
-            let repeated = musts
-                .iter()
-                .chain(shoulds.iter())
-                .chain(must_phrases.iter().flat_map(|p| p.iter()))
-                .chain(should_phrases.iter().flat_map(|p| p.iter()))
-                .count()
-                != scored_terms.len();
+            let repeated = musts.len() + shoulds.len() != scored_terms.len();
             let selection = match column_params(manifest, column) {
                 Some(params) if !repeated => {
-                    tier::select_with_tiers(
-                        index,
-                        column_id,
-                        &scored_terms,
+                    let query = tier::TierQuery {
+                        column: column_id,
+                        terms: &scored_terms,
                         required,
-                        can_seed,
-                        &kept,
-                        &global_idf,
+                        k,
                         table_avgdl,
                         params,
-                        k,
+                        // A scope admits rows the index cannot see, so a
+                        // scoped search opens as before.
+                        want_resolved: scope.is_none(),
+                    };
+                    tier::select_with_tiers(
+                        index,
+                        &query,
+                        &kept,
+                        &global_idf,
+                        &manifest.options.reader_pool,
                     )
                     .instrument(term_span.clone())
                     .await?
                 }
                 _ => None,
             };
-            if let Some(mut selection) = selection {
+            if let Some(selection) = selection {
+                selected = true;
                 if let Some(stats) = &self.op_stats {
                     stats.add_tier_read(selection.tier_bytes, selection.entries_read);
                 }
-                if scope.is_none() && !selection.resolved.is_empty() {
-                    let resolved = mem::take(&mut selection.resolved);
-                    let ids: Vec<Uuid> = resolved.keys().copied().collect();
+                let mut answered: Vec<bool> = vec![false; kept.len()];
+                if !selection.resolved.is_empty() {
                     let now = Instant::now();
                     if let Some(cache) = &self.tombstone_cache {
+                        let ids: Vec<Uuid> = selection
+                            .resolved
+                            .iter()
+                            .map(|(si, _)| kept[*si].superfile_id)
+                            .collect();
                         cache.prefetch(&ids, now).await;
                     }
-                    let mut answered: HashSet<Uuid> = HashSet::new();
-                    for entry in &kept {
-                        let Some(hits) = resolved.get(&entry.superfile_id) else {
-                            continue;
-                        };
+                    for (si, mut hits) in selection.resolved {
+                        let entry = &kept[si];
                         // A tombstone sidecar that cannot be read leaves the
                         // superfile to the kernel, which filters as it opens.
-                        let hits: Vec<(u32, f32)> = match self
-                            .tombstone_cache
-                            .as_ref()
-                            .map(|c| c.bitmap_for(entry.superfile_id, now))
-                        {
-                            Some(Ok(bitmap)) => hits
-                                .iter()
-                                .copied()
-                                .filter(|(doc, _)| !bitmap.contains(*doc))
-                                .collect(),
-                            Some(Err(_)) => continue,
-                            None => hits.clone(),
-                        };
-                        answered.insert(entry.superfile_id);
+                        if let Some(cache) = &self.tombstone_cache {
+                            match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
+                                Ok(Some(bitmap)) => hits.retain(|(doc, _)| !bitmap.contains(*doc)),
+                                Ok(None) => {}
+                                Err(_) => continue,
+                            }
+                        }
+                        answered[si] = true;
                         resolved_scores.push((entry.id_max, hits.iter().map(|h| h.1).collect()));
                         resolved_units.push(dispatch::tag_hits(entry, hits));
                     }
                     if let Some(stats) = &self.op_stats {
-                        stats.add_superfiles_resolved(answered.len() as u64);
+                        stats.add_superfiles_resolved(answered.iter().filter(|a| **a).count() as u64);
                     }
-                    kept.retain(|e| !answered.contains(&e.superfile_id));
                 }
-                let bound_of = |e: &Arc<SuperfileEntry>| {
-                    selection.bounds.get(&e.superfile_id).copied().unwrap_or(
-                        tier::SuperfileBounds {
-                            lb: f32::NEG_INFINITY,
-                            ub: f32::INFINITY,
-                        },
-                    )
-                };
-                // A superfile the merge ruled out — every candidate it could
-                // hold is below the threshold, or a conjunction's term has
-                // shown it holds none — is not opened at all; a ceiling of
-                // negative infinity would still tie an empty floor.
-                kept.retain(|e| bound_of(e).ub > f32::NEG_INFINITY);
-                // Equal bounds open in `_id` order, so a run of superfiles
-                // that can only tie is settled by the first of them.
-                kept.sort_by(|a, b| {
-                    let (x, y) = (bound_of(a), bound_of(b));
+                // A superfile the index answered for, or one the merge ruled
+                // out — every candidate it could hold is below the threshold,
+                // or a conjunction's term has shown it holds none — is not
+                // opened. The rest open by their best known candidate; equal
+                // bounds open in `_id` order, so a run of superfiles that can
+                // only tie is settled by the first of them.
+                let mut ordered: Vec<(Arc<SuperfileEntry>, tier::SuperfileBounds)> = kept
+                    .drain(..)
+                    .zip(selection.bounds)
+                    .enumerate()
+                    .filter(|(si, (_, b))| !answered[*si] && b.ub > f32::NEG_INFINITY)
+                    .map(|(_, pair)| pair)
+                    .collect();
+                ordered.sort_by(|(a, x), (b, y)| {
                     y.lb.total_cmp(&x.lb)
                         .then(y.ub.total_cmp(&x.ub))
                         .then(a.id_min.cmp(&b.id_min))
                 });
                 ceilings = Some(
-                    kept.iter()
-                        .map(|e| (e.superfile_id, bound_of(e).ub))
+                    ordered
+                        .iter()
+                        .map(|(e, b)| (e.superfile_id, b.ub))
                         .collect(),
                 );
-                if can_seed && selection.theta_lb.is_finite() {
+                kept = ordered.into_iter().map(|(e, _)| e).collect();
+                if selection.theta_lb.is_finite() {
                     tier_seed = Some(selection.theta_lb);
                 }
             }
         }
-        if tier_seed.is_none()
-            && let Some(c) = &ceilings
-        {
+        if !selected && let Some((index, column_id)) = index_column {
+            // Ceilings rescale by each term's table idf, so they order and
+            // skip only when the map holds every scored term.
+            let terms: Vec<&str> = musts
+                .iter()
+                .chain(shoulds.iter())
+                .map(String::as_str)
+                .collect();
+            let phrases: Vec<Vec<&str>> = must_phrases
+                .iter()
+                .chain(should_phrases.iter())
+                .map(|p| p.iter().map(String::as_str).collect())
+                .collect();
+            let gidf = global_idf.clone();
+            // Every term is in the map (the guard above); the fallback
+            // only satisfies the type.
+            let idf_used =
+                move |term: &str, _local: f32| gidf.get(term).copied().unwrap_or(f32::INFINITY);
+            let mut c = index
+                .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
+                .instrument(term_span.clone())
+                .await?;
+            ceilings_at_table_avgdl(&mut c, &kept, column_id, table_avgdl);
             let ceiling_of =
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
             kept.sort_by(|a, b| {
@@ -1230,6 +1210,7 @@ impl SupertableReader {
                     .total_cmp(&ceiling_of(a))
                     .then(a.id_min.cmp(&b.id_min))
             });
+            ceilings = Some(c);
         }
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
@@ -1276,12 +1257,6 @@ impl SupertableReader {
                 (u.entry, params)
             })
             .collect();
-        // A superfile whose ceiling only ties the running k-th score is
-        // skipped once the tie is settled by `_id` order, which needs the
-        // superfiles' `_id` ranges disjoint and an exact comparison: no
-        // tolerance widening the floor.
-        let tie_walk = score_tolerance <= 0.0 && id_ranges_disjoint(&kept);
-
         let must_arc: Arc<Vec<String>> = Arc::new(musts);
         let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
@@ -1596,6 +1571,11 @@ impl SupertableReader {
             // at the floor precedes its own in `_id` order.
             true => {
                 let window = manifest.options.bound_ordered_open_window.max(1);
+                // A superfile whose ceiling only ties the running k-th score
+                // is skipped once the tie is settled by `_id` order, which
+                // needs the superfiles' `_id` ranges disjoint and an exact
+                // comparison: no tolerance widening the floor.
+                let tie_walk = score_tolerance <= 0.0 && id_ranges_disjoint(&kept);
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
@@ -3020,6 +3000,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
@@ -3072,6 +3055,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
@@ -3123,6 +3109,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
