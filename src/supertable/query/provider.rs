@@ -91,7 +91,7 @@ use parquet::{
         arrow_reader::{
             ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
-        async_reader::{AsyncFileReader, ParquetObjectReader},
+        async_reader::AsyncFileReader,
     },
     errors,
     file::metadata::ParquetMetaData,
@@ -121,7 +121,7 @@ use crate::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::{
-                common::{BoundPredicate, PushedPredicate, take_rows},
+                common::{BoundPredicate, ObjectStoreAsyncReader, PushedPredicate, take_rows},
                 metered_exec::MeteredExec,
             },
             fts::{memos_from_plan_locations, plan_locations_for},
@@ -141,12 +141,6 @@ use crate::{
 /// DataFusion `SessionContext`; callers reference it as
 /// `FROM supertable`.
 pub(crate) const TABLE_NAME: &str = "supertable";
-
-/// Distance between the endpoints of a min/max range that covers a
-/// 64-bit column type's entire domain (`0 ..= u64::MAX` for `UInt64`,
-/// `i64::MIN ..= i64::MAX` for `Int64`, and the same span for `Date64`
-/// / `Timestamp`). See [`spans_full_domain`].
-const FULL_DOMAIN_ENDPOINT_DISTANCE: u64 = u64::MAX;
 
 /// Object-store URL *prefix* the surviving superfiles are registered under
 /// for a scan. The authority is arbitrary — only a key into the session's
@@ -752,11 +746,7 @@ impl SupertableProvider {
                 // One read of the column's statistics per superfile; the
                 // four folds below share it.
                 let reads = read_column(entries, column);
-                // A range covering the column type's whole domain is
-                // withheld rather than reported — see `spans_full_domain`.
-                if let Some((min, max)) = scalar_min_max(&reads)
-                    && !spans_full_domain(&min, &max)
-                {
+                if let Some((min, max)) = scalar_min_max(&reads) {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
@@ -893,36 +883,6 @@ fn scalar_min_max(reads: &[Option<ColumnStats<'_>>]) -> Option<(ScalarValue, Sca
         };
     }
     acc
-}
-
-/// Whether `[min, max]` covers the column type's entire domain, the one
-/// range shape whose bounds are withheld from the reported statistics.
-///
-/// The planner counts the values an interval holds as `max - min + 1`. A
-/// whole-domain range needs `u64::MAX + 1`, which wraps to zero, and the
-/// row estimate then divides by that count: every `<`, `>`, and `BETWEEN`
-/// on the column fails an assertion before it runs. Withholding the bounds
-/// routes the estimate through the planner's "range unknown" fallback and
-/// costs nothing for filtering, since a range holding every representable
-/// value skips no superfile, row group, or page.
-///
-/// Any 64-bit integer or temporal type qualifies once both endpoints
-/// appear, hence a span test rather than a type test. Floats are excluded
-/// deliberately: the planner counts them by bit pattern and already guards
-/// that path, while the value distance used here saturates on a wide
-/// range, so without the exclusion an ordinary `Float64` column would
-/// match and lose its bounds for nothing.
-///
-/// TODO: delete on the move to DataFusion 55, which carries the upstream
-/// fix (checked add, no count on overflow):
-/// <https://github.com/apache/datafusion/pull/22309>
-fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
-    // Never returns `None` for a reason a caller must handle: a missing or
-    // uncountable distance simply means "not whole-domain", and the bounds
-    // are reported as before. `usize` widens to `u64` losslessly on every
-    // supported target, so the comparison cannot fail either.
-    !min.data_type().is_floating()
-        && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
 /// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
@@ -1701,7 +1661,7 @@ impl fmt::Debug for CachedMetadataReaderFactory {
 /// delegate to the plain object-store reader; `get_metadata` returns
 /// the open-time parse instead of re-fetching the footer.
 struct CachedMetadataReader {
-    inner: ParquetObjectReader,
+    inner: ObjectStoreAsyncReader,
     /// `None` only for a file outside the survivors loop (never
     /// expected) — falls back to the inner reader's footer fetch.
     meta: Option<Arc<ParquetMetaData>>,
@@ -1739,11 +1699,13 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
         _metrics: &ExecutionPlanMetricsSet,
     ) -> DfResult<Box<dyn AsyncFileReader + Send>> {
         let location = &partitioned_file.object_meta.location;
-        let mut inner = ParquetObjectReader::new(Arc::clone(&self.store), location.clone())
-            .with_file_size(partitioned_file.object_meta.size);
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint);
-        }
+        let inner = ObjectStoreAsyncReader::new(
+            Arc::clone(&self.store),
+            location.clone(),
+            Some(partitioned_file.object_meta.size),
+            metadata_size_hint,
+            false,
+        );
         Ok(Box::new(CachedMetadataReader {
             meta: self
                 .footers
@@ -3176,58 +3138,6 @@ mod tests {
         assert_eq!(cs.max_value, Precision::Exact(ScalarValue::Int64(Some(20))));
         // One null planted in superfile 1.
         assert_eq!(cs.null_count, Precision::Exact(1));
-    }
-
-    /// A whole-domain min/max range is withheld from the reported
-    /// statistics; anything narrower is reported as usual. See
-    /// [`spans_full_domain`] for why the widest range is the harmful one.
-    #[test]
-    fn whole_domain_bounds_are_withheld_from_reported_statistics() {
-        let full = [
-            (
-                ScalarValue::UInt64(Some(0)),
-                ScalarValue::UInt64(Some(u64::MAX)),
-            ),
-            (
-                ScalarValue::Int64(Some(i64::MIN)),
-                ScalarValue::Int64(Some(i64::MAX)),
-            ),
-        ];
-        for (min, max) in &full {
-            assert!(spans_full_domain(min, max), "{min} .. {max}");
-        }
-
-        let narrower = [
-            (
-                ScalarValue::UInt64(Some(0)),
-                ScalarValue::UInt64(Some(u64::MAX - 1)),
-            ),
-            (
-                ScalarValue::UInt64(Some(1)),
-                ScalarValue::UInt64(Some(u64::MAX)),
-            ),
-            (
-                ScalarValue::Int64(Some(i64::MIN + 1)),
-                ScalarValue::Int64(Some(i64::MAX)),
-            ),
-            (ScalarValue::Int64(Some(1)), ScalarValue::Int64(Some(20))),
-            // A float range wider than any integer domain: the planner
-            // counts float intervals by bit pattern, not by value, and
-            // already guards that path.
-            (
-                ScalarValue::Float64(Some(f64::MIN)),
-                ScalarValue::Float64(Some(f64::MAX)),
-            ),
-            // A singleton, and a type the planner never counts anyway.
-            (ScalarValue::UInt64(Some(7)), ScalarValue::UInt64(Some(7))),
-            (
-                ScalarValue::LargeUtf8(Some("alpha".into())),
-                ScalarValue::LargeUtf8(Some("omega".into())),
-            ),
-        ];
-        for (min, max) in &narrower {
-            assert!(!spans_full_domain(min, max), "{min} .. {max}");
-        }
     }
 
     /// A one-document superfile entry carrying `scalar_stats` and nothing

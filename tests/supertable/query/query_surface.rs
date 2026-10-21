@@ -19,11 +19,14 @@
 
 use std::sync::Arc;
 
+use arrow::compute::cast;
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray, RecordBatch,
+    StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
 use infino::{
+    InfinoError,
     superfile::builder::FtsConfig,
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_vector_config,
@@ -333,6 +336,72 @@ fn base_table_scan_supports_aggregates_and_projection() {
         .query_sql("SELECT title, rating FROM supertable ORDER BY rating DESC LIMIT 2")
         .expect("ordered projection");
     assert!(row_count(&top) <= 2, "LIMIT 2 caps the projection");
+}
+
+/// `unnest` in the select list, ordered by a column the select list
+/// leaves out. This is valid SQL that the planner cannot yet plan: to sort
+/// by `rating` it adds the column beneath the `unnest` but not to the
+/// projection above it, so the sort cannot see it. The caller must get a
+/// query error it can act on, never an engine fault; before DataFusion 55
+/// the same query failed an internal assertion while rebuilding the
+/// `unnest`. Selecting `rating` is the rewrite that plans, and it must
+/// return the rows in `rating` order. Once the planner carries the column
+/// through, the first query should return those rows too.
+#[test]
+fn unnest_ordered_by_a_column_not_selected() {
+    let st = demo_table();
+    let error = st
+        .reader()
+        .expect("reader")
+        .query_sql(
+            "SELECT title, unnest(regexp_match(title, '(rust)')) AS m FROM supertable \
+             WHERE title LIKE '%rust%' ORDER BY rating",
+        )
+        .expect_err("the planner cannot carry `rating` past the unnest");
+    let error = InfinoError::from(error);
+    assert!(
+        matches!(error, InfinoError::Query(_)),
+        "a query the planner cannot plan is the caller's to rewrite, not an engine fault: {error:?}"
+    );
+
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql(
+            "SELECT title, rating, unnest(regexp_match(title, '(rust)')) AS m FROM supertable \
+             WHERE title LIKE '%rust%' ORDER BY rating",
+        )
+        .expect("unnest ordered by a selected column");
+
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let column = |name: &str| {
+            let index = batch.schema().index_of(name).expect("column");
+            cast(batch.column(index), &DataType::Utf8).expect("cast to Utf8")
+        };
+        let (titles, matches) = (column("title"), column("m"));
+        let titles = titles.as_any().downcast_ref::<StringArray>().expect("Utf8");
+        let matches = matches
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("Utf8");
+        for i in 0..batch.num_rows() {
+            rows.push((titles.value(i).to_owned(), matches.value(i).to_owned()));
+        }
+    }
+    // The `rust` titles in rating order: ratings 0, 3, 7, 9, 12, 15.
+    let expected: Vec<(String, String)> = [
+        "rust async",
+        "go rust",
+        "rust systems",
+        "rust web",
+        "rust embedded",
+        "rust async runtime",
+    ]
+    .iter()
+    .map(|title| ((*title).to_owned(), "rust".to_owned()))
+    .collect();
+    assert_eq!(rows, expected);
 }
 
 /// `EXPLAIN` over the base-table scan formats the `SupertableProvider`

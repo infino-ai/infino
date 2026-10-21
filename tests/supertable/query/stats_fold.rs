@@ -10,11 +10,10 @@
 //! a real scan; results must stay correct either way.
 //!
 //! The same statistics reach the planner a second way, as the column
-//! bounds behind its row estimate for a filter. Bounds covering a type's
-//! entire domain are withheld there (see `spans_full_domain` in
-//! `supertable::query::provider`), so the last group below pins both
-//! halves of that: range filters on such a column return rows, and
-//! withholding the bounds does not cost the aggregate fold.
+//! bounds behind its row estimate for a filter. A range covering a type's
+//! entire domain holds one more value than a 64-bit count can, so the last
+//! group below pins both uses on such a column: range filters return the
+//! right rows, and the aggregate fold still answers without a scan.
 
 #![deny(clippy::unwrap_used)]
 
@@ -398,7 +397,7 @@ const SPLIT_NS_SECOND: [i64; 2] = [10, i64::MAX];
 /// Threshold for the split-domain query, chosen so every superfile
 /// survives pruning: the first still holds `5`, the second only larger
 /// values. A threshold that pruned either would narrow the folded range
-/// and stop exercising the withholding at all.
+/// below the whole domain and stop exercising it at all.
 const SPLIT_THRESHOLD: i64 = 0;
 
 fn single_superfile_writer_pool() -> Arc<ThreadPool> {
@@ -518,10 +517,9 @@ fn scalar_u64(st: &Supertable, sql: &str) -> u64 {
 }
 
 /// Every comparison shape over a whole-domain column returns the right
-/// rows. `=` and the boundary `>=` always worked, because they collapse
-/// the column's range to a single point and take a distinct-count path
-/// that never divides; they are here so a change to the withholding rule
-/// can't quietly break the side that was fine.
+/// rows. `=` and the boundary `>=` collapse the column's range to a single
+/// point and take a distinct-count path that never counts the range; they
+/// are here so a change to the range path can't quietly break that side.
 #[test]
 fn full_domain_column_answers_every_comparison_shape() {
     let st = full_domain_u64_table();
@@ -570,10 +568,9 @@ fn range_filter_holds_when_domain_is_split_across_superfiles() {
     );
 }
 
-/// Withholding whole-domain bounds costs the aggregate fold nothing.
-/// Both extremes are still the right answer, and the query is still
-/// answered without a scan: the fold reads the per-superfile stats
-/// directly, so it never saw the withheld bounds.
+/// A whole-domain column still folds `MIN` / `MAX` / `COUNT(*)` from the
+/// manifest statistics: both extremes are the right answer, and the
+/// query is answered without a scan.
 #[test]
 fn full_domain_column_still_folds_min_max_without_scanning() {
     let st = full_domain_u64_table();

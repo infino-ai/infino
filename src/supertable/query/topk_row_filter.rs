@@ -61,7 +61,8 @@ use datafusion::{
     physical_expr_common::physical_expr::is_volatile,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, filter::FilterExec, projection::ProjectionExec, sorts::sort::SortExec,
+        ExecutionPlan, filter::FilterExec, projection::ProjectionExec,
+        replace_children_if_necessary, sorts::sort::SortExec,
     },
 };
 use rustc_hash::FxHashSet;
@@ -100,9 +101,10 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
             let Some(input) = row_filtered(sort.input(), sort_columns, Vec::new())? else {
                 return Ok(Transformed::no(node));
             };
-            Ok(Transformed::yes(
-                Arc::clone(&node).with_new_children(vec![input])?,
-            ))
+            Ok(Transformed::yes(replace_children_if_necessary(
+                Arc::clone(&node),
+                vec![input],
+            )?))
         })
         .map(|t| t.data)
     }
@@ -133,7 +135,7 @@ fn row_filtered(
             return Ok(None);
         };
         return with_row_filter(scan, footers, &sort_columns, &filters)
-            .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
+            .map(|scan| replace_children_if_necessary(Arc::clone(plan), vec![scan]))
             .transpose();
     }
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
@@ -164,7 +166,7 @@ fn row_filtered(
     };
     // Rebuild this node over the marked scan below it.
     row_filtered(child, sort_columns, filters)?
-        .map(|child| Arc::clone(plan).with_new_children(vec![child]))
+        .map(|child| replace_children_if_necessary(Arc::clone(plan), vec![child]))
         .transpose()
 }
 

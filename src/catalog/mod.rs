@@ -1282,7 +1282,7 @@ impl Connection {
 /// (`ALTER TABLE`, an `INSERT` inside a CTE): planning fails on those before the plan check
 /// runs, and they would otherwise read as SQL a later version might support.
 fn read_only_statement(state: &SessionState, sql: &str) -> Result<DFStatement, InfinoError> {
-    let recursion_limit = state.config().options().sql_parser.recursion_limit;
+    let recursion_limit = state.config().options().sql_parser.recursion_limit.get();
 
     let mut statements = DFParserBuilder::new(sql)
         .with_dialect(&GenericDialect {})

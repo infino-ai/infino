@@ -990,6 +990,11 @@ const LIKE_NEEDLE_STRIDE: usize = 4;
 const LIKE_PADDING: &str = " the quick brown fox jumps over the lazy dog again and again \
                             the quick brown fox jumps over the lazy dog again and again \
                             the quick brown fox jumps over the lazy dog again and again";
+/// A title that sorts after `nimble` and holds no needle. With it in the
+/// table, the `title` range in the row-group statistics covers the prefix
+/// `nimble%`, so those statistics alone cannot rule a row group out and the
+/// index's candidates reach the decode.
+const LIKE_RANGE_CAP: &str = "zebra rust";
 
 /// A `standard`-analyzer table for the `LIKE` pushdown: the substring
 /// `nimble` occurs only inside the term `nimblefox`, planted in every
@@ -1033,7 +1038,7 @@ fn a_like_predicate_is_answered_from_the_index() {
     // FTS work the counters must show. The same query used to decode
     // every row of `title` to test the substring.
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, true, &[]);
+    let db = sql_like_fixture(&dir, true, &[LIKE_RANGE_CAP.to_owned()]);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
     assert!(
         stats.fts_postings_bytes > 0,
@@ -1059,11 +1064,11 @@ fn a_like_predicate_is_answered_from_the_index() {
     );
 
     // A prefix pattern widens through the dictionary too. No stored value
-    // starts with `nimble` (they all start with `filler`), so the answer is
-    // empty — but the index still hands the scan the rows holding a term
-    // that starts with it, and only the FilterExec rejects them. Decoding
-    // exactly those candidates is the signature of the index path: a plain
-    // scan would decode every row.
+    // starts with `nimble` (they start with `filler`, or are the
+    // `LIKE_RANGE_CAP` row), so the answer is empty — but the index still
+    // hands the scan the rows holding a term that starts with it, and only
+    // the FilterExec rejects them. Decoding exactly those candidates is the
+    // signature of the index path: a plain scan would decode every row.
     let (batches, prefix) = with_op_stats(|| {
         db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
             .expect("query_sql")

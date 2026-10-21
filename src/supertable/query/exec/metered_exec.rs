@@ -48,13 +48,13 @@ use std::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::{
-    common::{Statistics, config::ConfigOptions},
+    common::{Statistics, config::ConfigOptions, tree_node::TreeNodeRecursion},
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
     physical_expr::{PhysicalExpr, PhysicalSortExpr},
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
-        SendableRecordBatchStream, SortOrderPushdownResult,
+        ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
+        SendableRecordBatchStream, SortOrderPushdownResult, StatisticsArgs,
         execution_plan::CardinalityEffect,
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -173,6 +173,15 @@ impl ExecutionPlan for MeteredExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
+    ) -> DfResult<TreeNodeRecursion> {
+        // The meter evaluates nothing; its child's expressions are the
+        // child's own to report.
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
@@ -198,11 +207,28 @@ impl ExecutionPlan for MeteredExec {
         vec![true; self.children().len()]
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> DfResult<Arc<Statistics>> {
-        // The default is `Statistics::new_unknown`, which would hide the
-        // manifest statistics the provider attaches and stop the aggregate
-        // rule folding COUNT/MIN/MAX into a constant.
-        self.input.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        // The default skips the child, and its statistics would then arrive
+        // as `Statistics::new_unknown` below.
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> DfResult<Arc<Statistics>> {
+        // The child's statistics, unchanged. The default is
+        // `Statistics::new_unknown`, which would hide the manifest
+        // statistics the provider attaches and stop the aggregate rule
+        // folding COUNT/MIN/MAX into a constant.
+        match input_stats {
+            [child] => Ok(Arc::clone(child)),
+            _ => Err(DataFusionError::Internal(format!(
+                "MeteredExec requires exactly one child's statistics; got {}",
+                input_stats.len()
+            ))),
+        }
     }
 
     fn repartitioned(

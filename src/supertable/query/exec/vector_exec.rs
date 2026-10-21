@@ -42,10 +42,11 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::tree_node::TreeNodeRecursion,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, PhysicalExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
@@ -331,6 +332,15 @@ impl ExecutionPlan for VectorSearchExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
+    ) -> DfResult<TreeNodeRecursion> {
+        // The pushed `WHERE` is held as a logical expression and bound per
+        // batch while executing; this node owns no physical expression.
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

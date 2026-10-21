@@ -44,7 +44,10 @@ use datafusion::{
     datasource::provider_as_source,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::ExecutionProps},
-    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType},
+    logical_expr::{
+        Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType,
+        physical_planning_context::PhysicalPlanningContext,
+    },
     physical_expr::{PhysicalExpr, create_physical_expr},
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
@@ -53,15 +56,15 @@ use futures::{
     FutureExt, TryStreamExt,
     future::{BoxFuture, try_join_all},
 };
-use object_store::{ObjectStore, path::Path as ObjPath};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, path::Path as ObjPath};
 use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::ArrowReaderOptions,
-        async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
+        async_reader::{AsyncFileReader, MetadataSuffixFetch, ParquetRecordBatchStreamBuilder},
     },
     errors::{ParquetError, Result as ParquetResult},
-    file::metadata::ParquetMetaData,
+    file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader},
 };
 use rayon::{ThreadPool, prelude::*};
 use tracing::{Instrument, Span};
@@ -522,8 +525,15 @@ impl PushedPredicate {
     /// that carries every column in `self.columns`.
     pub(crate) fn bind(&self, schema: &SchemaRef) -> DfResult<BoundPredicate> {
         let df_schema = DFSchema::try_from(Arc::clone(schema))?;
-        create_physical_expr(&self.conjunction, &df_schema, &ExecutionProps::new())
-            .map(BoundPredicate)
+        // Bound while the function executes, outside physical planning, so
+        // the planning context is the empty one, as the props are.
+        create_physical_expr(
+            &self.conjunction,
+            &df_schema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .map(BoundPredicate)
     }
 }
 
@@ -1310,12 +1320,120 @@ pub(crate) async fn take_rows_object_store(
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
-    let mut object_reader = ParquetObjectReader::new(store, path).with_preload_offset_index(true);
-    if let Some(size) = file_size.filter(|&s| s > 0) {
-        // Skip the size-discovery HEAD when the manifest already knows it.
-        object_reader = object_reader.with_file_size(size);
-    }
+    // A size the manifest knows bounds the footer read; without one the
+    // footer comes from a suffix request instead. The offset index comes
+    // with the footer so the row selection can skip the pages no requested
+    // row lands on.
+    let object_reader =
+        ObjectStoreAsyncReader::new(store, path, file_size.filter(|&s| s > 0), None, true);
     take_rows_async(object_reader, file_schema, n_docs, local_doc_ids, names).await
+}
+
+/// [`AsyncFileReader`] over one Parquet file in an [`ObjectStore`].
+///
+/// Each byte range is one ranged GET (`get_ranges` for a batch). The footer
+/// is one bounded GET when the file's size is known and one suffix GET when
+/// it is not, so an unknown size never costs a HEAD. Page-index policies set
+/// in the caller's [`ArrowReaderOptions`] take precedence over
+/// `preload_offset_index`.
+pub(crate) struct ObjectStoreAsyncReader {
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    file_size: Option<u64>,
+    /// Bytes to fetch from the file's end on the first footer read.
+    footer_size_hint: Option<usize>,
+    /// Whether the footer read also loads the offset index.
+    preload_offset_index: bool,
+}
+
+impl ObjectStoreAsyncReader {
+    pub(crate) fn new(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        file_size: Option<u64>,
+        footer_size_hint: Option<usize>,
+        preload_offset_index: bool,
+    ) -> Self {
+        Self {
+            store,
+            path,
+            file_size,
+            footer_size_hint,
+            preload_offset_index,
+        }
+    }
+}
+
+impl AsyncFileReader for ObjectStoreAsyncReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        async move {
+            self.store
+                .get_range(&self.path, range)
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))
+        }
+        .boxed()
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
+        async move {
+            self.store
+                .get_ranges(&self.path, &ranges)
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))
+        }
+        .boxed()
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+        async move {
+            let mut metadata = ParquetMetaDataReader::new()
+                .with_metadata_options(options.map(|o| o.metadata_options().clone()))
+                .with_offset_index_policy(PageIndexPolicy::from(self.preload_offset_index))
+                .with_prefetch_hint(self.footer_size_hint);
+            if let Some(options) = options
+                && (options.column_index_policy() != PageIndexPolicy::Skip
+                    || options.offset_index_policy() != PageIndexPolicy::Skip)
+            {
+                metadata = metadata
+                    .with_column_index_policy(options.column_index_policy())
+                    .with_offset_index_policy(options.offset_index_policy());
+            }
+            let metadata = match self.file_size {
+                Some(file_size) => metadata.load_and_finish(self, file_size).await?,
+                None => metadata.load_via_suffix_and_finish(self).await?,
+            };
+            Ok(Arc::new(metadata))
+        }
+        .boxed()
+    }
+}
+
+impl MetadataSuffixFetch for &mut ObjectStoreAsyncReader {
+    fn fetch_suffix(&mut self, suffix: usize) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        let options = GetOptions {
+            range: Some(GetRange::Suffix(suffix as u64)),
+            ..Default::default()
+        };
+        async move {
+            let response = self
+                .store
+                .get_opts(&self.path, options)
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            response
+                .bytes()
+                .await
+                .map_err(|error| ParquetError::External(Box::new(error)))
+        }
+        .boxed()
+    }
 }
 
 async fn take_rows_async<R>(

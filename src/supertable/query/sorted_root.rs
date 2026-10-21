@@ -34,6 +34,7 @@ use datafusion::{
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, Partitioning, repartition::RepartitionExec,
+        replace_children_if_necessary,
     },
 };
 
@@ -87,7 +88,10 @@ fn unsplit_sorted_stream(
         return Ok(None);
     }
     match unsplit_sorted_stream(child)? {
-        Some(child) => Ok(Some(Arc::clone(plan).with_new_children(vec![child])?)),
+        Some(child) => Ok(Some(replace_children_if_necessary(
+            Arc::clone(plan),
+            vec![child],
+        )?)),
         None => Ok(None),
     }
 }

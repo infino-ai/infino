@@ -33,10 +33,11 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::tree_node::TreeNodeRecursion,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableType},
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, PhysicalExpr},
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
@@ -326,6 +327,15 @@ impl ExecutionPlan for MatchExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DfResult<TreeNodeRecursion>,
+    ) -> DfResult<TreeNodeRecursion> {
+        // The pushed `WHERE` is held as a logical expression and bound per
+        // batch while executing; this node owns no physical expression.
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn with_new_children(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
@@ -394,7 +404,7 @@ mod tests {
     use datafusion::{
         error::DataFusionError,
         execution::TaskContext,
-        physical_plan::{DisplayFormatType, ExecutionPlan},
+        physical_plan::{DisplayFormatType, ExecutionPlan, replace_children_if_necessary},
     };
     use rayon::ThreadPoolBuilder;
 
@@ -645,10 +655,9 @@ mod tests {
         let arc: Arc<dyn ExecutionPlan> = Arc::new(exec);
         assert!(arc.downcast_ref::<MatchExec>().is_some());
 
-        // `with_new_children` returns the same node (it has none).
-        let same = Arc::clone(&arc)
-            .with_new_children(vec![])
-            .expect("with_new_children");
+        // Replacing its children returns the same node (it has none).
+        let same = replace_children_if_necessary(Arc::clone(&arc), vec![])
+            .expect("replace_children_if_necessary");
         assert_eq!(same.name(), "MatchExec");
     }
 

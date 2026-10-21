@@ -119,15 +119,15 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_nightly)"] }
 
 [dependencies]
 # Format / parquet
-arrow = "58"
+arrow = "59"
 # `chrono-tz` resolves a named time zone (`America/New_York`) to its
 # offsets. The JSON row mapper needs it to read a naive timestamp string
 # as the wall clock of its column's zone; without it such a string would
 # silently land hours away. Already in the graph through datafusion, named
 # here so a change there cannot take it away.
-arrow-array = { version = "58", features = ["chrono-tz"] }
-arrow-schema = "58"
-parquet = { version = "58", features = ["async", "object_store"] }
+arrow-array = { version = "59", features = ["chrono-tz"] }
+arrow-schema = "59"
+parquet = { version = "59", features = ["async", "object_store"] }
 
 # SIMD primitives
 bitpacking = "0.9"
@@ -228,13 +228,7 @@ tracing = "0.1"
 # against a per-Supertable cached Runtime. Tokio is single-worker
 # here: it drives DataFusion's I/O state machine, not CPU-bound work
 # (CPU work for skip + fan-out lives on the rayon reader pool).
-#
-# On bumping to 55: drop `spans_full_domain` in
-# `src/supertable/query/provider.rs`. It works around a cardinality
-# overflow that 54.x still carries; 55 has the upstream fix
-# (https://github.com/apache/datafusion/pull/22309), so the guard becomes
-# dead weight that only costs us statistics.
-datafusion = "54"
+datafusion = "55"
 # `macros` enables `#[tokio::test]` for the async DataFusion
 # integration tests; runtime weight on a release build is just the
 # proc-macro, so we keep it in [dependencies] rather than re-listing
@@ -242,7 +236,7 @@ datafusion = "54"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
 
 # Object-store backend. `object_store` is already
-# transitive via DataFusion 53 (0.12.5) and parquet 58 (0.13.2);
+# transitive via DataFusion 55 and parquet 59 (both 0.13);
 # we pin our direct usage to 0.13 to match parquet — which is the
 # version with the conditional-put surface we need for the
 # manifest pointer's OCC + atomic-create semantics.
@@ -353,7 +347,7 @@ infino-bench-utils = { path = "benches/utils" }
 # tests/hydrate.rs reads a Parquet fixture to Arrow batches. `parquet` is already
 # a direct dependency; this only adds the `arrow` feature, dev-only (the engine
 # doesn't need it). Keep the version in sync with the [dependencies] entry.
-parquet = { version = "58", features = ["arrow"] }
+parquet = { version = "59", features = ["arrow"] }
 
 # `test-util` adds tokio's paused-clock test surface
 # (`start_paused`), which lets concurrency regression tests drive
@@ -381,9 +375,9 @@ wiremock = "0.6"
 # JSON request-matchers, and DataFusion `Expr` predicates for update/delete.
 # Same versions as the normal deps (no new surface); listed here so the separate
 # integration-test crate can name them directly.
-arrow = "58"
+arrow = "59"
 serde_json = "1"
-datafusion = "54"
+datafusion = "55"
 
 # Comparator for the supertable's FTS bloom — bench-only.
 fastbloom = "0.17"
