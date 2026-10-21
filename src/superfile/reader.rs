@@ -1421,6 +1421,7 @@ impl SuperfileReader {
                 prefetched: None,
                 live_floor: None,
                 allow: None,
+                exact_count: false,
             },
             k,
             f32::NEG_INFINITY,
@@ -1808,6 +1809,17 @@ impl SuperfileReader {
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self.fts_scored(scoring)?;
         Ok(fts.run_prepared(prep)?)
+    }
+
+    /// [`Self::run_prepared`] for clauses prepared with
+    /// `ClauseLists::exact_count`: the top-k plus the exact match count.
+    pub(crate) fn run_prepared_with_count(
+        &self,
+        prep: PreparedClauses,
+        scoring: &ScoringView<'_>,
+    ) -> Result<(Vec<(RowId, f32)>, u64), ReadError> {
+        let fts = self.fts_scored(scoring)?;
+        Ok(fts.run_prepared_with_count(prep)?)
     }
 
     /// The FTS reader a scored query should read through: this

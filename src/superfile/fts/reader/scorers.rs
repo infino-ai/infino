@@ -16,7 +16,8 @@ use super::{
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
-        AndSink, CollectSink, MustShouldSink, ScoreSink, TopKEntry, drain_top_k_desc, replace_worst,
+        AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink,
+        TopKEntry, drain_top_k_desc, replace_worst,
     },
 };
 use crate::superfile::{
@@ -697,7 +698,7 @@ impl FtsReader {
     pub(super) fn run_and_intersect(
         &self,
         column_id: u32,
-        mut cursors: Vec<TermCursor>,
+        cursors: Vec<TermCursor>,
         k: usize,
         filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
@@ -716,18 +717,57 @@ impl FtsReader {
             filter,
             floor_eff,
         };
-        if and_prefer_membership(&cursors) {
-            // Rarest-driven membership walk: bit-test the common terms instead
-            // of decoding their blocks to align them (the flat-merge's dominant
-            // cost on rare∧common). See `and_membership_scored`.
-            self.and_membership_scored(cursors, dl_norm_k1, &mut sink);
-        } else {
-            // Smallest-df cursor at index 0 = leader. Ascending-df order reduces
-            // the expected number of leapfrog bumps per candidate.
-            cursors.sort_by_key(|c| c.block_count());
-            self.and_flat_merge(&mut cursors, dl_norm_k1, &mut sink);
-        }
+        self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// [`Self::run_and_intersect`] with pruning off: every intersection
+    /// doc is scored and counted. Returns the top-k and the exact count.
+    pub(super) fn run_and_intersect_counted(
+        &self,
+        column_id: u32,
+        cursors: Vec<TermCursor>,
+        k: usize,
+        filter: Option<&mut ExcludeFilter>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        if cursors.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1();
+
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut sink = ScoreCountSink {
+            heap: &mut heap,
+            k,
+            filter,
+            count: 0,
+        };
+        self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
+        let count = sink.count;
+        Ok((drain_top_k_desc(heap), count))
+    }
+
+    /// The ranked AND walk for `cursors`, feeding every intersection doc
+    /// to `sink`: the rarest-driven membership walk when the gate prefers
+    /// it, else the block flat-merge with the smallest list leading.
+    fn and_scored_walk<S: AndSink>(
+        &self,
+        mut cursors: Vec<TermCursor>,
+        dl_norm_k1: &NormTable,
+        sink: &mut S,
+    ) {
+        if and_prefer_membership(&cursors) {
+            // Bit-test the common terms instead of decoding their blocks to
+            // align them. See `and_membership_scored`.
+            self.and_membership_scored(cursors, dl_norm_k1, sink);
+        } else {
+            // Smallest-df cursor leads; ascending-df order reduces the
+            // expected leapfrog bumps per candidate.
+            cursors.sort_by_key(|c| c.block_count());
+            self.and_flat_merge(&mut cursors, dl_norm_k1, sink);
+        }
     }
 
     /// Ranked AND via a rarest-driven membership walk, for the rare∧common shape the
@@ -929,6 +969,39 @@ impl FtsReader {
         };
         self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
         Ok(drain_top_k_desc(heap))
+    }
+
+    /// [`Self::run_must_should`] with pruning off: every must-intersection
+    /// doc is scored and counted. Returns the top-k and the exact count.
+    pub(super) fn run_must_should_counted(
+        &self,
+        column_id: u32,
+        mut must_cursors: Vec<TermCursor>,
+        should_cursors: Vec<TermCursor>,
+        k: usize,
+        filter: Option<&mut ExcludeFilter>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        debug_assert!(
+            !must_cursors.is_empty() && !should_cursors.is_empty(),
+            "dispatch routes empty-side shapes to the AND/OR kernels"
+        );
+        let col_meta = &self.columns[column_id as usize];
+        let dl_norm_k1 = col_meta.dl_norm_k1();
+        must_cursors.sort_by_key(|c| c.block_count());
+
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut sink = MustShouldCountSink {
+            heap: &mut heap,
+            k,
+            filter,
+            shoulds: should_cursors,
+            dl_norm_k1,
+            count: 0,
+        };
+        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+        let count = sink.count;
+        Ok((drain_top_k_desc(heap), count))
     }
 
     /// Unranked multi-term AND: the matching doc ids in ascending order
@@ -2411,12 +2484,13 @@ impl FtsReader {
     /// block skipping — every doc in the union of the cursor postings
     /// is scored and offered to the top-K heap.
     ///
-    /// **Not on the production path.** `dispatch_or_algo` routes
-    /// to MaxScore+BMM or the windowed union; this function is reachable
-    /// only via `search_with_algo_for_bench(OrAlgo::Exhaustive)`. It exists
-    /// because the supertable bench surfaced one specific shape where
-    /// it narrowly wins, and we want the option available for future
-    /// re-routing work without re-implementing it.
+    /// **Not on the ranked path.** `dispatch_or_algo` routes to
+    /// MaxScore+BMM or the windowed union. This walk serves the exact-count
+    /// search (`run_prepared_with_count`), which has to visit every match,
+    /// and the bench selector `search_with_algo_for_bench(OrAlgo::Exhaustive)`,
+    /// kept because the supertable bench surfaced one shape where it
+    /// narrowly wins. A must-not `filter` drops a doc before it is scored
+    /// or counted.
     ///
     /// **When this can beat BMM (measured at 10M × 8 superfiles)**:
     /// - **Prefix expansions over very-rare terms, in parallel mode.**
@@ -2467,20 +2541,20 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
-    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
+        mut filter: Option<&mut ExcludeFilter>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
+        let mut count = 0u64;
 
         loop {
-            // Find smallest current doc_id across all live cursors —
-            // the next candidate to score. Exhausted cursors report
-            // `u32::MAX`, which can't be smaller than any live cursor's
-            // doc_id, so this terminates naturally when every cursor
-            // has been drained.
+            // The smallest current doc_id across the live cursors is the
+            // next candidate; exhausted cursors report `u32::MAX`, so the
+            // loop ends once every cursor is drained.
             let mut candidate = u32::MAX;
             for cursor in &cursors {
                 let d = cursor.current_doc_id();
@@ -2491,17 +2565,24 @@ impl FtsReader {
             if candidate == u32::MAX {
                 break;
             }
+            let admitted = match filter.as_deref_mut() {
+                Some(f) => f.admits(candidate),
+                None => true,
+            };
 
-            // Score: sum BM25 from every cursor positioned at the
-            // candidate doc. Pack up to 4 cursors per SIMD scoring
-            // call, matching the BMM essential-scoring shape.
+            // Score: sum BM25 from every cursor at the candidate, four
+            // cursors per SIMD call. Every cursor at the candidate advances,
+            // admitted or not.
             let norm = dl_norm_k1.get(candidate);
             let mut score: f32 = 0.0;
             let mut idfs = [0.0_f32; 4];
             let mut tfs = [0.0_f32; 4];
             let mut packed = 0;
             for cursor in cursors.iter_mut() {
-                if cursor.current_doc_id() == candidate {
+                if cursor.current_doc_id() != candidate {
+                    continue;
+                }
+                if admitted {
                     idfs[packed] = cursor.idf_weight;
                     tfs[packed] = cursor.current_tf() as f32;
                     packed += 1;
@@ -2511,15 +2592,22 @@ impl FtsReader {
                         tfs = [0.0; 4];
                         packed = 0;
                     }
-                    cursor.next();
                 }
+                cursor.next();
+            }
+            if !admitted {
+                continue;
             }
             if packed > 0 {
                 score += bm25::score_simd_x4(idfs, tfs, norm);
             }
+            count += 1;
+            if k == 0 {
+                continue;
+            }
 
-            // Top-K update. `threshold` mirrors `heap.peek().0` so
-            // the replace-or-skip branch doesn't re-peek per iter.
+            // Top-K update. `threshold` mirrors `heap.peek().0` so the
+            // replace-or-skip branch doesn't re-peek per iteration.
             if heap.len() < k {
                 heap.push(TopKEntry(score, FtsDocId::new(candidate)));
                 if heap.len() == k {
@@ -2531,7 +2619,7 @@ impl FtsReader {
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok((drain_top_k_desc(heap), count))
     }
 
     /// Multi-term OR dispatch. Routes every union to the one windowed MaxScore
@@ -2545,6 +2633,8 @@ impl FtsReader {
     /// ([`Self::run_exhaustive_union`]) remain in the tree only as bench
     /// baselines and the correctness oracle, reachable via
     /// `search_with_algo_for_bench`; the dispatcher routes to none of them.
+    /// The exact-count search (`run_prepared_with_count`) takes the
+    /// exhaustive walk directly, since a count has to visit every match.
     pub(super) fn dispatch_or_algo(
         &self,
         column_id: u32,
@@ -2628,7 +2718,9 @@ impl FtsReader {
         match algo {
             OrAlgo::Bmm => self.run_max_score_bmm(column_id, cursors, k, None, f32::NEG_INFINITY),
             OrAlgo::WandBmw => self.run_wand_bmw(column_id, cursors, k),
-            OrAlgo::Exhaustive => self.run_exhaustive_union(column_id, cursors, k),
+            OrAlgo::Exhaustive => self
+                .run_exhaustive_union(column_id, cursors, k, None)
+                .map(|(hits, _)| hits),
             OrAlgo::Windowed => {
                 self.run_windowed_union(column_id, cursors, k, None, f32::NEG_INFINITY, 0, u32::MAX)
             }

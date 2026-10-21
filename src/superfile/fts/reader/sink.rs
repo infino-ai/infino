@@ -249,19 +249,89 @@ impl AndSink for MustShouldSink<'_> {
     }
 
     fn emit(&mut self, doc: u32, must_score: f32) {
-        let norm = self.dl_norm_k1.get(doc);
         let mut score = must_score;
-        for c in &mut self.shoulds {
-            c.skip_to(doc);
-            if !c.is_exhausted() && c.current_doc_id() == doc {
-                score += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), norm);
-            }
-        }
+        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
         // Floor gate on the FULL score — a must-only score below the
         // floor can still survive once its shoulds are added.
         if score > self.floor_eff {
             and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
         }
+    }
+}
+
+/// Add each should term's BM25 at `doc` to `score`, streaming the
+/// cursors forward to it. Accumulates in cursor order so the ranked and
+/// the counted must+should sinks produce the same bits.
+#[inline]
+fn add_should_scores(shoulds: &mut [TermCursor], doc: u32, norm: f32, score: &mut f32) {
+    for c in shoulds {
+        c.skip_to(doc);
+        if !c.is_exhausted() && c.current_doc_id() == doc {
+            *score += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), norm);
+        }
+    }
+}
+
+/// Ranked sink that scores every intersection doc and counts them. The
+/// bar stays at `NEG_INFINITY`, so the walk prunes nothing; a negated
+/// doc is neither scored nor counted.
+pub(super) struct ScoreCountSink<'a> {
+    pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
+    pub(super) k: usize,
+    pub(super) filter: Option<&'a mut ExcludeFilter>,
+    pub(super) count: u64,
+}
+
+impl AndSink for ScoreCountSink<'_> {
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn screenable(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, doc: u32, score: f32) {
+        if let Some(f) = self.filter.as_deref_mut()
+            && !f.admits(doc)
+        {
+            return;
+        }
+        self.count += 1;
+        and_heap_push(self.heap, self.k, None, score, doc);
+    }
+}
+
+/// [`MustShouldSink`] without pruning: every must-intersection doc is
+/// scored and counted, and the shoulds only add to its score.
+pub(super) struct MustShouldCountSink<'a> {
+    pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
+    pub(super) k: usize,
+    pub(super) filter: Option<&'a mut ExcludeFilter>,
+    pub(super) shoulds: Vec<TermCursor>,
+    pub(super) dl_norm_k1: &'a NormTable,
+    pub(super) count: u64,
+}
+
+impl AndSink for MustShouldCountSink<'_> {
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn screenable(&self) -> bool {
+        false
+    }
+
+    fn emit(&mut self, doc: u32, must_score: f32) {
+        if let Some(f) = self.filter.as_deref_mut()
+            && !f.admits(doc)
+        {
+            return;
+        }
+        self.count += 1;
+        let mut score = must_score;
+        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
+        and_heap_push(self.heap, self.k, None, score, doc);
     }
 }
 

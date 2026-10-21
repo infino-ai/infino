@@ -207,10 +207,16 @@ impl FtsReader {
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
         live_floor: Option<&LiveFloor>,
-    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
+        exact_count: bool,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        debug_assert!(
+            !exact_count || (floor_eff == f32::NEG_INFINITY && live_floor.is_none()),
+            "an exact count takes no floor"
+        );
         let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut count = 0u64;
         // The strict-below admission cutoff, refreshed from the live
         // floor: everything published there is a real kth-best, so the
         // same `next_down` the caller applied to its snapshot keeps
@@ -258,6 +264,7 @@ impl FtsReader {
                 };
                 let floor_live = floor_now();
                 if admitted {
+                    count += 1;
                     let norm = dl_norm_k1.get(doc);
                     let score: f32 = shoulds
                         .iter()
@@ -272,7 +279,7 @@ impl FtsReader {
                 let Some(next) = doc.checked_add(1) else {
                     break;
                 };
-                let bar = match heap.len() >= k {
+                let bar = match !exact_count && heap.len() >= k {
                     true => heap.peek().expect("heap len == k").0.max(floor_live),
                     false => floor_live,
                 };
@@ -282,7 +289,7 @@ impl FtsReader {
                     }
                 }
             }
-            return Ok(drain_top_k_desc(heap));
+            return Ok((drain_top_k_desc(heap), count));
         }
 
         // Must-driven walk, two-phase per candidate: (1) align every must by its
@@ -300,7 +307,7 @@ impl FtsReader {
         let mut target = 0u32;
         'docs: loop {
             let floor_live = floor_now();
-            let bar = match heap.len() >= k {
+            let bar = match !exact_count && heap.len() >= k {
                 true => heap.peek().expect("heap len == k").0.max(floor_live),
                 false => floor_live,
             };
@@ -353,6 +360,7 @@ impl FtsReader {
                         None => true,
                     };
                 if admitted {
+                    count += 1;
                     let norm = dl_norm_k1.get(aligned);
                     let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
                     for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
@@ -372,7 +380,7 @@ impl FtsReader {
             };
             target = next;
         }
-        Ok(drain_top_k_desc(heap))
+        Ok((drain_top_k_desc(heap), count))
     }
 
     /// Single-column BM25 search.
@@ -496,6 +504,7 @@ impl FtsReader {
         if k == 0 {
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
+                count: 0,
                 postings_bytes: 0,
                 planned_ranges: 0,
                 kernel_cpu_ns: 0,
@@ -505,6 +514,7 @@ impl FtsReader {
             if lists.no_negative_atoms() {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
                     postings_bytes: 0,
                     planned_ranges: 0,
                     kernel_cpu_ns: 0,
@@ -532,6 +542,7 @@ impl FtsReader {
                 let built: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
                     postings_bytes: atom_cursor_bytes(&built),
                     planned_ranges: atom_planned_ranges(&built) + must_dict,
                     kernel_cpu_ns: 0,
@@ -586,7 +597,7 @@ impl FtsReader {
             // its on-CPU time here (sync section, no awaits inside).
             // Gated: an unmetered process must not pay the procfs reads.
             let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-            let result = self.run_atoms_search(
+            let (hits, count) = self.run_atoms_search(
                 column_id,
                 must_atoms,
                 should_atoms,
@@ -594,9 +605,11 @@ impl FtsReader {
                 filter,
                 floor_eff,
                 lists.live_floor,
+                lists.exact_count,
             )?;
             return Ok(PreparedClauses::Done {
-                hits: result,
+                hits,
+                count,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: thread_cpu_delta_ns(kernel_start),
@@ -651,7 +664,7 @@ impl FtsReader {
         // query's idf and rescales its stored bounds by the exact linear
         // ratio to it, so the skip decisions stay as tight as they would
         // be at the idf the bounds were stored at.
-        if lists.musts.len() + lists.shoulds.len() == 1 {
+        if !lists.exact_count && lists.musts.len() + lists.shoulds.len() == 1 {
             let term = lists
                 .musts
                 .iter()
@@ -679,6 +692,7 @@ impl FtsReader {
             dict_ranges += 1;
             return Ok(PreparedClauses::Done {
                 hits: result,
+                count: 0,
                 postings_bytes: term_work.postings_bytes + filter_postings_bytes,
                 planned_ranges: term_work.planned_ranges + filter_ranges + dict_ranges,
                 kernel_cpu_ns,
@@ -703,6 +717,7 @@ impl FtsReader {
                     neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges) + dict_ranges;
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
                     postings_bytes,
                     planned_ranges,
                     kernel_cpu_ns: 0,
@@ -738,6 +753,7 @@ impl FtsReader {
                 + dict_ranges;
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
+                count: 0,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: 0,
@@ -831,6 +847,70 @@ impl FtsReader {
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.run_prepared_in_blob_ids(prep)
             .map(|h| self.hits_to_rows(h))
+    }
+
+    /// [`Self::search_excluding`] scoring every match in one pass: the
+    /// top-k plus the exact match count. Nothing is pruned, so this does
+    /// more work than the ranked search. The supertable fan-out pairs
+    /// `prepare_clauses` with `run_prepared_with_count` itself; this
+    /// single-call form is what the kernel tests drive.
+    #[cfg(test)]
+    pub(crate) async fn search_excluding_with_count(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+    ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        let lists = ClauseLists {
+            exact_count: true,
+            live_floor: None,
+            ..lists
+        };
+        let prep = self
+            .prepare_clauses(column, lists, k, f32::NEG_INFINITY)
+            .await?;
+        self.run_prepared_with_count(prep)
+    }
+
+    /// [`Self::run_prepared`] for clauses prepared with
+    /// `ClauseLists::exact_count`: scores every match and returns the
+    /// top-k with the exact match count.
+    pub(crate) fn run_prepared_with_count(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        let (hits, count) = match prep {
+            PreparedClauses::Done { hits, count, .. } => (hits, count),
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_and_intersect_counted(column_id, must_cursors, k, filter.as_mut())?,
+            PreparedClauses::MustShould {
+                column_id,
+                must_cursors,
+                should_cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_must_should_counted(
+                column_id,
+                must_cursors,
+                should_cursors,
+                k,
+                filter.as_mut(),
+            )?,
+            PreparedClauses::Or {
+                column_id,
+                cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_exhaustive_union(column_id, cursors, k, filter.as_mut())?,
+        };
+        Ok((self.hits_to_rows(hits), count))
     }
 
     /// [`Self::run_prepared`] without the translation, for the one caller
@@ -1714,6 +1794,149 @@ mod tests {
     const TABLE_IDF_K: usize = 10;
     /// An arbitrary table-wide idf to score with.
     const TABLE_IDF: f32 = 1.5;
+
+    /// For every term clause shape, the exact-count walk returns the
+    /// pruned search's top-k, and a count equal both to the number of
+    /// matches and to the unranked count path's answer.
+    #[tokio::test]
+    async fn exact_count_matches_pruned_hits_and_unranked_count() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        // (musts, shoulds, negatives) over the 3-doc `body` corpus.
+        let shapes: &[(&[&str], &[&str], &[&str])] = &[
+            (&[], &["rust"], &[]),
+            (&["rust"], &[], &[]),
+            (&[], &["rust", "java"], &[]),
+            (&["rust", "runtime"], &[], &[]),
+            (&["rust"], &["tokio"], &[]),
+            (&[], &["rust", "java"], &["tokio"]),
+            (&["rust"], &[], &["tokio"]),
+            (&["rust", "zzz"], &[], &[]),
+            (&[], &["zzz"], &[]),
+        ];
+        for &(musts, shoulds, negatives) in shapes {
+            let lists = || ClauseLists {
+                musts,
+                shoulds,
+                negatives,
+                ..ClauseLists::default()
+            };
+            let label = format!("{musts:?} {shoulds:?} {negatives:?}");
+            let matches = r
+                .search_excluding("body", lists(), TABLE_IDF_K, f32::NEG_INFINITY)
+                .await
+                .expect("every match")
+                .len() as u64;
+            let (terms, mode) = match musts.is_empty() {
+                true => (shoulds, BoolMode::Or),
+                false => (musts, BoolMode::And),
+            };
+            let unranked = r
+                .atoms_match_count("body", terms, &[], mode, negatives, &[])
+                .await
+                .expect("unranked count")
+                .0;
+            for k in [1usize, 2, TABLE_IDF_K] {
+                let pruned = r
+                    .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                    .await
+                    .expect("pruned search");
+                let (hits, count) = r
+                    .search_excluding_with_count("body", lists(), k)
+                    .await
+                    .expect("counted search");
+                assert_eq!(hits, pruned, "hits for {label} k={k}");
+                assert_eq!(count, matches, "count for {label} k={k}");
+                assert_eq!(count, unranked, "unranked count for {label} k={k}");
+            }
+        }
+    }
+
+    /// Phrase shapes take the atom walk; with pruning off it must still
+    /// return the pruned walk's top-k and the match walk's count.
+    #[tokio::test]
+    async fn exact_count_matches_on_phrase_shapes() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open phrase blob");
+        let phrase = |a: &str, b: &str| vec![Phrase::adjacent(vec![a.to_string(), b.to_string()])];
+        let new_york = phrase("new", "york");
+        let new_haven = phrase("new", "haven");
+        // (must terms, must phrases, should phrases, negative phrases)
+        let shapes: &[(
+            &[&str],
+            &[Phrase<String>],
+            &[Phrase<String>],
+            &[Phrase<String>],
+        )] = &[
+            (&[], &[], &new_york, &[]),
+            (&[], &new_york, &[], &[]),
+            (&["city"], &new_york, &[], &[]),
+            (&[], &new_york, &new_haven, &[]),
+            (&[], &[], &new_york, &new_haven),
+            (&["york"], &[], &[], &new_york),
+        ];
+        for &(musts, must_phrases, should_phrases, negative_phrases) in shapes {
+            let lists = || ClauseLists {
+                musts,
+                must_phrases,
+                should_phrases,
+                negative_phrases,
+                ..ClauseLists::default()
+            };
+            let label =
+                format!("{musts:?} {must_phrases:?} {should_phrases:?} {negative_phrases:?}");
+            let matches = r
+                .search_excluding("title", lists(), TABLE_IDF_K, f32::NEG_INFINITY)
+                .await
+                .expect("every match")
+                .len() as u64;
+            let (phrases, mode) = match musts.is_empty() && must_phrases.is_empty() {
+                true => (should_phrases, BoolMode::Or),
+                false => (must_phrases, BoolMode::And),
+            };
+            let unranked = r
+                .atoms_match_count("title", musts, phrases, mode, &[], negative_phrases)
+                .await
+                .expect("unranked count")
+                .0;
+            for k in [1usize, 2, TABLE_IDF_K] {
+                let pruned = r
+                    .search_excluding("title", lists(), k, f32::NEG_INFINITY)
+                    .await
+                    .expect("pruned search");
+                let (hits, count) = r
+                    .search_excluding_with_count("title", lists(), k)
+                    .await
+                    .expect("counted search");
+                assert_eq!(hits, pruned, "hits for {label} k={k}");
+                assert_eq!(count, matches, "count for {label} k={k}");
+                assert_eq!(count, unranked, "unranked count for {label} k={k}");
+            }
+        }
+    }
+
+    /// A pushed-down row set bounds the count as it bounds the hits.
+    #[tokio::test]
+    async fn exact_count_honours_the_allow_set() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let allow: Arc<RoaringBitmap> = Arc::new([0u32, 2].into_iter().collect());
+        let lists = || ClauseLists {
+            shoulds: &["rust", "java"],
+            allow: Some(Arc::clone(&allow)),
+            ..ClauseLists::default()
+        };
+        let pruned = r
+            .search_excluding("body", lists(), 1, f32::NEG_INFINITY)
+            .await
+            .expect("pruned search");
+        let (hits, count) = r
+            .search_excluding_with_count("body", lists(), 1)
+            .await
+            .expect("counted search");
+        assert_eq!(hits, pruned);
+        assert_eq!(count, 2, "docs 0 and 2 are allowed and match");
+    }
 
     /// A table-wide search scores with its map's idf alone: a scored term
     /// the map leaves out is an error, never this superfile's own idf.
