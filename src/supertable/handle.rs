@@ -23,7 +23,7 @@ use std::{
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
 use tokio::runtime::Runtime;
@@ -45,9 +45,9 @@ use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    storage::{PrefixedStorageProvider, StorageError},
+    storage::{PrefixedStorageProvider, StorageError, StorageProvider},
     superfile::{
-        builder::{BuilderOptions, VectorConfig},
+        builder::{BuilderOptions, FtsConfig, VectorConfig},
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -84,6 +84,28 @@ use crate::{
         reader_cache::ReaderCacheError,
     },
 };
+
+// Columns of the hidden source-file list (see `source_file_list_schema`).
+/// `file` or `folder`: which kind of source the row describes.
+const SOURCE_FILES_KIND: &str = "kind";
+/// The file's number, carried on every user row loaded from it.
+const SOURCE_FILES_FILE_NO: &str = "file_no";
+/// The object key of the file or folder.
+const SOURCE_FILES_KEY: &str = "key";
+/// The file's version marker as the store reported it when it was loaded.
+const SOURCE_FILES_MARKER: &str = "marker";
+/// The file's size in bytes, as listed.
+const SOURCE_FILES_SIZE: &str = "size";
+/// The file's modification time in ms since the epoch, as listed.
+const SOURCE_FILES_MTIME_MS: &str = "mtime_ms";
+/// Rows the file yielded.
+const SOURCE_FILES_ROWS: &str = "rows";
+/// When the file's rows landed, in ms since the epoch.
+const SOURCE_FILES_LOADED_MS: &str = "loaded_ms";
+/// When the folder was last listed, in ms since the epoch.
+const SOURCE_FILES_LISTED_MS: &str = "listed_ms";
+/// Whether the folder's last listing found a change.
+const SOURCE_FILES_CHANGED: &str = "changed";
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -189,6 +211,10 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
+    /// Hidden sibling supertable listing the source files this table was
+    /// loaded from. Present only on a table created with
+    /// [`SupertableOptions::source_file_list`]; its prefix is on the manifest.
+    pub(super) source_file_list: Option<Arc<Supertable>>,
     /// Set once at open when the hidden vector index is **configured and
     /// materialized** (its storage pointer exists) but fails to load/open — i.e.
     /// present-but-broken, distinct from never-configured or not-yet-drained
@@ -537,6 +563,7 @@ impl Supertable {
                                 hidden_arc,
                                 hidden_manifest,
                                 None,
+                                None,
                                 TableRole::VectorIndex,
                             )
                             .await
@@ -564,7 +591,15 @@ impl Supertable {
                 // handle materializes the index.
                 Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
                 Ok(None) => {
-                    match create_table_async(hidden_opts, None, None, TableRole::VectorIndex).await
+                    match create_table_async(
+                        hidden_opts,
+                        None,
+                        None,
+                        None,
+                        None,
+                        TableRole::VectorIndex,
+                    )
+                    .await
                     {
                         Ok(table) => (Some(Arc::new(table)), None),
                         Err(e) => {
@@ -584,8 +619,15 @@ impl Supertable {
         } else {
             (None, None)
         };
-        let handle =
-            open_table_async(options_arc, manifest, vector_index_table, TableRole::User).await?;
+        let source_file_list = open_source_file_list(options_arc.as_ref(), &manifest).await?;
+        let handle = open_table_async(
+            options_arc,
+            manifest,
+            vector_index_table,
+            source_file_list,
+            TableRole::User,
+        )
+        .await?;
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
@@ -629,6 +671,8 @@ impl Supertable {
                         hidden_opts,
                         None,
                         Some(prefix.clone()),
+                        None,
+                        None,
                         TableRole::VectorIndex,
                     )
                     .await?,
@@ -639,10 +683,32 @@ impl Supertable {
         } else {
             None
         };
+        // The source-file list, when asked for, is a second hidden table made
+        // the same way: created first under its own prefix, then recorded on
+        // the user manifest the create below persists.
+        let source_files_storage_prefix = options
+            .source_file_list
+            .then(generate_source_files_storage_prefix);
+        let source_file_list = match source_files_storage_prefix.as_deref() {
+            Some(prefix) => Some(Arc::new(
+                create_table_async(
+                    source_file_list_options(&options, prefix)?,
+                    None,
+                    None,
+                    None,
+                    None,
+                    TableRole::SourceFiles,
+                )
+                .await?,
+            )),
+            None => None,
+        };
         create_table_async(
             options,
             vector_index_table,
             vector_index_storage_prefix,
+            source_file_list,
+            source_files_storage_prefix,
             TableRole::User,
         )
         .await
@@ -748,6 +814,12 @@ impl Supertable {
     fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
     }
+    }
+
+    /// The hidden source-file list beside this table, `None` unless the
+    /// table was created with one.
+    pub(crate) fn source_file_list(&self) -> Option<&Arc<Supertable>> {
+        self.inner.source_file_list.as_ref()
     }
 
     test_visible! {
@@ -1733,10 +1805,6 @@ fn build_vector_index_options(
 ) -> Option<SupertableOptions> {
     let storage_prefix =
         resolve_vector_index_storage_prefix(user_opts, user_manifest, create_prefix)?;
-    let storage = user_opts.storage.as_ref()?;
-    let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
-        PrefixedStorageProvider::new(Arc::clone(storage), storage_prefix.as_str()),
-    );
     let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
     for vc in &user_opts.vector_columns {
         let item_field = Arc::new(arrow_schema::Field::new(
@@ -1767,15 +1835,15 @@ fn build_vector_index_options(
             ..vc.clone()
         })
         .collect();
-    let mut hidden_opts =
-        SupertableOptions::new(hidden_schema, vec![], hidden_vector_columns).ok()?;
-    hidden_opts = hidden_opts
-        .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_reader_pool(Arc::clone(&user_opts.reader_pool))
-        .with_writer_pool(Arc::clone(&user_opts.writer_pool))
-        .with_read_consistency(user_opts.read_consistency);
-    hidden_opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
+    let mut hidden_opts = hidden_table_options(
+        user_opts,
+        storage_prefix.as_str(),
+        hidden_schema,
+        vec![],
+        hidden_vector_columns,
+    )
+    .ok()?
+    .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf);
     // Hidden-manifest summaries hydrate stripped unconditionally (the fp32
     // wire home is the slow-CAS centroid section), so the consumer memory
     // mode has nothing left to gate there. Keep it off on the derived
@@ -1787,9 +1855,6 @@ fn build_vector_index_options(
     // paths resolve counts through its own options.
     hidden_opts.user_cell_count = user_opts.user_cell_count;
     hidden_opts.hidden_cell_count = user_opts.hidden_cell_count;
-    if let Some(cache) = user_opts.disk_cache.as_ref() {
-        hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
-    }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
             train_global_centroids(manifest, hidden_vector_cell_count(user_opts))
@@ -1805,6 +1870,99 @@ fn build_vector_index_options(
     Some(hidden_opts)
 }
 
+/// Options for a hidden table at `prefix` under the user table's storage,
+/// running on the user table's pools, read consistency, memory budget and
+/// disk cache. Shared by the vector index and the source-file list, so the
+/// two hidden tables are made the same way.
+fn hidden_table_options(
+    user_opts: &SupertableOptions,
+    prefix: &str,
+    schema: SchemaRef,
+    fts_columns: Vec<FtsConfig>,
+    vector_columns: Vec<VectorConfig>,
+) -> Result<SupertableOptions, BuildError> {
+    let storage = user_opts.storage.as_ref().ok_or_else(|| {
+        BuildError::Store(format!("hidden table {prefix} requires options.storage"))
+    })?;
+    let sub_storage: Arc<dyn StorageProvider> =
+        Arc::new(PrefixedStorageProvider::new(Arc::clone(storage), prefix));
+    let mut opts = SupertableOptions::new(schema, fts_columns, vector_columns)?
+        .with_storage(sub_storage)
+        .with_reader_pool(Arc::clone(&user_opts.reader_pool))
+        .with_writer_pool(Arc::clone(&user_opts.writer_pool))
+        .with_read_consistency(user_opts.read_consistency);
+    opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
+    if let Some(cache) = user_opts.disk_cache.as_ref() {
+        opts = opts.with_disk_cache(Arc::clone(cache));
+    }
+    Ok(opts)
+}
+
+fn generate_source_files_storage_prefix() -> String {
+    format!("_infino_{}_sync", Uuid::new_v4())
+}
+
+/// The source-file list's fixed schema: one row per source file, or per
+/// source folder (`kind` says which). File rows carry the file's number,
+/// version marker, size, modification time, rows and load time; folder
+/// rows carry when the folder was last listed and whether it had changed.
+/// A column that does not apply to a row's kind is null.
+fn source_file_list_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new(SOURCE_FILES_KIND, DataType::LargeUtf8, false),
+        Field::new(SOURCE_FILES_FILE_NO, DataType::UInt32, true),
+        Field::new(SOURCE_FILES_KEY, DataType::LargeUtf8, false),
+        Field::new(SOURCE_FILES_MARKER, DataType::LargeUtf8, true),
+        Field::new(SOURCE_FILES_SIZE, DataType::UInt64, true),
+        Field::new(SOURCE_FILES_MTIME_MS, DataType::Int64, true),
+        Field::new(SOURCE_FILES_ROWS, DataType::UInt64, true),
+        Field::new(SOURCE_FILES_LOADED_MS, DataType::Int64, true),
+        Field::new(SOURCE_FILES_LISTED_MS, DataType::Int64, true),
+        Field::new(SOURCE_FILES_CHANGED, DataType::Boolean, true),
+    ]))
+}
+
+/// Options for the source-file list at `prefix`. `kind` and `key` carry
+/// full-text indexes, which is what exact and token matches on them run on.
+fn source_file_list_options(
+    user_opts: &SupertableOptions,
+    prefix: &str,
+) -> Result<SupertableOptions, BuildError> {
+    hidden_table_options(
+        user_opts,
+        prefix,
+        source_file_list_schema(),
+        vec![
+            FtsConfig::new(SOURCE_FILES_KIND),
+            FtsConfig::new(SOURCE_FILES_KEY),
+        ],
+        vec![],
+    )
+}
+
+/// Open the source-file list `user_manifest` records, or `None` when it
+/// records none. The list is created before the manifest that names it, so
+/// a recorded list that will not open is an error, never an absent list: a
+/// loader told there is no list would load every file again.
+async fn open_source_file_list(
+    user_opts: &SupertableOptions,
+    user_manifest: &ManifestSnapshot,
+) -> Result<Option<Arc<Supertable>>, OpenError> {
+    let Some(prefix) = user_manifest.source_files_storage_prefix() else {
+        return Ok(None);
+    };
+    let opts = Arc::new(source_file_list_options(user_opts, prefix)?);
+    let storage = opts.storage.clone().ok_or_else(|| {
+        OpenError::Build(BuildError::Store(
+            "the source-file list requires options.storage".into(),
+        ))
+    })?;
+    let manifest = ManifestSnapshot::load(None, storage, Some(Arc::clone(&opts))).await?;
+    Ok(Some(Arc::new(
+        open_table_async(opts, manifest, None, None, TableRole::SourceFiles).await?,
+    )))
+}
+
 /// Build one supertable handle. Leaf — never creates a hidden sibling.
 #[cfg_attr(
     feature = "detailed-tracing",
@@ -1817,6 +1975,7 @@ async fn build_handle(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    source_file_list: Option<Arc<Supertable>>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let tombstone_cache = build_tombstone_cache(&options, &manifest);
@@ -1837,6 +1996,7 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
+        source_file_list,
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
@@ -1865,6 +2025,8 @@ async fn create_table_async(
     options: SupertableOptions,
     vector_index_table: Option<Arc<Supertable>>,
     vector_index_storage_prefix: Option<String>,
+    source_file_list: Option<Arc<Supertable>>,
+    source_files_storage_prefix: Option<String>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let options = Arc::new(options);
@@ -1874,30 +2036,34 @@ async fn create_table_async(
     // another process (`open` requires a pointer). This doesn't shift the id
     // sequence: the first append still commits `manifest_id 1`. An in-memory
     // table keeps the lighter in-process-only empty snapshot.
-    let (manifest, vector_index_table) = if let Some(storage) = options.storage.clone() {
+    let (manifest, vector_index_table, source_file_list) = if let Some(storage) =
+        options.storage.clone()
+    {
         let materialized = Arc::new(
             ManifestSnapshot::materialized_empty_with_vector_index_prefix(
                 options.clone(),
                 vector_index_storage_prefix,
+                source_files_storage_prefix,
             ),
         );
         // `expected_prev_etag = None` is the initial-commit shape: no prior
         // pointer to fence on.
         match materialized.write(storage.as_ref(), None, &[]).await {
-            Ok(()) => (materialized, vector_index_table),
+            Ok(()) => (materialized, vector_index_table, source_file_list),
             // Lost the initial-pointer race to a concurrent creator on the
             // same storage: adopt their committed manifest rather than
             // failing — `create` is create-or-open, and a pointer that
             // appeared between the caller's probe and this write is the same
             // as "pointer already present". Drop the loser's pre-built
-            // hidden handle (it used a freshly generated prefix the durable
+            // hidden handles (they used freshly generated prefixes the durable
             // manifest does not track) and reopen against the winner's
-            // stamped prefix.
+            // stamped prefixes.
             Err(CommitError::WriteContentionExhausted) => {
                 let adopted = ManifestSnapshot::load(None, storage, Some(options.clone())).await?;
                 let reconciled =
                     reconcile_vector_index_table_to_manifest(options.as_ref(), &adopted).await?;
-                (adopted, reconciled)
+                let source_file_list = open_source_file_list(options.as_ref(), &adopted).await?;
+                (adopted, reconciled, source_file_list)
             }
             Err(e) => return Err(e.into()),
         }
@@ -1908,9 +2074,17 @@ async fn create_table_async(
                 vector_index_storage_prefix,
             )),
             vector_index_table,
+            source_file_list,
         )
     };
-    build_handle(options, manifest, vector_index_table, role).await
+    build_handle(
+        options,
+        manifest,
+        vector_index_table,
+        source_file_list,
+        role,
+    )
+    .await
 }
 
 /// After a lost create-race, open (or bootstrap) the hidden vector-index
@@ -1934,7 +2108,14 @@ async fn reconcile_vector_index_table_to_manifest(
             let hidden_manifest =
                 ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
             Ok(Some(Arc::new(
-                open_table_async(hidden_arc, hidden_manifest, None, TableRole::VectorIndex).await?,
+                open_table_async(
+                    hidden_arc,
+                    hidden_manifest,
+                    None,
+                    None,
+                    TableRole::VectorIndex,
+                )
+                .await?,
             )))
         }
         Ok(None) => {
@@ -1946,6 +2127,7 @@ async fn reconcile_vector_index_table_to_manifest(
                 let materialized = Arc::new(
                     ManifestSnapshot::materialized_empty_with_vector_index_prefix(
                         Arc::clone(&hidden_arc),
+                        None,
                         None,
                     ),
                 );
@@ -1963,7 +2145,7 @@ async fn reconcile_vector_index_table_to_manifest(
                 ))
             };
             Ok(Some(Arc::new(
-                build_handle(hidden_arc, manifest, None, TableRole::VectorIndex).await?,
+                build_handle(hidden_arc, manifest, None, None, TableRole::VectorIndex).await?,
             )))
         }
         Err(e) => Err(OpenError::Storage(StorageError::Permanent {
@@ -1978,9 +2160,17 @@ async fn open_table_async(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    source_file_list: Option<Arc<Supertable>>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
-    build_handle(options, manifest, vector_index_table, role).await
+    build_handle(
+        options,
+        manifest,
+        vector_index_table,
+        source_file_list,
+        role,
+    )
+    .await
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {

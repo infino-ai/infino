@@ -439,6 +439,17 @@ impl Connection {
             .check_analyzers()
             .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
+        // The source-file list is a table on storage beside this one; a
+        // catalog with no storage, or one forwarding to a hosted service,
+        // has nowhere to put it.
+        if indexes.has_source_file_list()
+            && !matches!(self.inner.store, CatalogStore::Storage { .. })
+        {
+            return Err(InfinoError::Unsupported(
+                "a source-file list needs a storage-backed connection".to_string(),
+            )
+            .with_context("create_table", Some(name)));
+        }
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -551,7 +562,9 @@ impl Connection {
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
+                opts = opts
+                    .with_read_consistency(self.inner.options.read_consistency)
+                    .with_source_file_list(indexes.has_source_file_list());
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a

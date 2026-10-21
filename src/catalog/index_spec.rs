@@ -228,6 +228,7 @@ impl From<String> for FtsField {
 pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
+    source_file_list: bool,
 }
 
 impl IndexSpec {
@@ -265,6 +266,32 @@ impl IndexSpec {
             rerank_codec: None,
         });
         self
+    }
+
+    /// Create the table with a hidden source-file list beside it: a second
+    /// table, stored under this one's location and never listed in the
+    /// catalog, for a loader that keeps the table matching a set of source
+    /// files to record one row per file (its key, version marker, size,
+    /// modification time, rows and load time) and per folder it lists.
+    /// Reach it with [`Supertable::source_file_list`]; dropping the table
+    /// with purge removes it.
+    ///
+    /// A table created without this has no list, and this cannot be added
+    /// later. Needs a storage-backed connection; a `memory://` or hosted
+    /// connection refuses it at `create_table`. The table's manifest names
+    /// the list, so every engine that writes the table must be at least the
+    /// version that created it: an older one would drop the name on its
+    /// next commit.
+    ///
+    /// [`Supertable::source_file_list`]: crate::Supertable::source_file_list
+    pub fn source_file_list(mut self) -> Self {
+        self.source_file_list = true;
+        self
+    }
+
+    /// Whether the table is created with a source-file list.
+    pub(crate) fn has_source_file_list(&self) -> bool {
+        self.source_file_list
     }
 
     /// The same declaration, carrying a seed and codec a schema document

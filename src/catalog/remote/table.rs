@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
+    OptimizeOptions, ReindexError, ReindexOptions, Supertable, VectorFilter,
     catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
@@ -355,6 +355,12 @@ impl Table for RemoteTable {
     fn gc(&self, _safety_gap: Duration) -> Result<GcReport, GcError> {
         // Retention/GC on a hosted table is server-side; not a client operation.
         Err(GcError::NoStorage)
+    }
+
+    fn source_file_list(&self) -> Option<Supertable> {
+        // A hosted table is never created with one: `create_table` refuses
+        // the flag on a hosted connection.
+        None
     }
 
     #[cfg(any(test, feature = "test-helpers"))]

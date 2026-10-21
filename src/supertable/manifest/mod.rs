@@ -537,10 +537,13 @@ impl ManifestSnapshot {
     /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
     /// `vector_index_storage_prefix` is the hidden-sibling subtree the caller
     /// generated at create (`None` for tables without vector columns, and for
-    /// the hidden sibling itself).
+    /// the hidden sibling itself); `source_files_storage_prefix` likewise for
+    /// the hidden source-file list (`None` unless the table was created with
+    /// one).
     pub(crate) fn materialized_empty_with_vector_index_prefix(
         options: Arc<SupertableOptions>,
         vector_index_storage_prefix: Option<String>,
+        source_files_storage_prefix: Option<String>,
     ) -> Self {
         let strategy = options.effective_partition_strategy();
         let list = Self::build_list(
@@ -549,6 +552,7 @@ impl ManifestSnapshot {
             0,
             Vec::new(),
             vector_index_storage_prefix.clone(),
+            source_files_storage_prefix,
             BTreeMap::new(),
             BTreeMap::new(),
         );
@@ -588,6 +592,7 @@ impl ManifestSnapshot {
         manifest_id: u64,
         parts: Vec<ManifestPartEntry>,
         vector_index_storage_prefix: Option<String>,
+        source_files_storage_prefix: Option<String>,
         tombstone_seqs: BTreeMap<Uuid, u64>,
         superseded_cells: BTreeMap<Uuid, BTreeSet<u32>>,
     ) -> Manifest {
@@ -600,6 +605,7 @@ impl ManifestSnapshot {
             commit_token: Uuid::new_v4(),
             partition_strategy: strategy,
             vector_index_storage_prefix,
+            source_files_storage_prefix,
             global_vector_index: None,
             drained_ranges: Default::default(),
             deleted_user_ids_inline: None,
@@ -947,6 +953,15 @@ impl ManifestSnapshot {
             return Some(prefix);
         }
         self.superfile_list.vector_index_storage_prefix.as_deref()
+    }
+
+    /// Hidden source-file list prefix recorded on this manifest's list.
+    /// Only a durable table has one: the list is created on storage, so an
+    /// in-process-only manifest (no list) never records it.
+    pub(crate) fn source_files_storage_prefix(&self) -> Option<&str> {
+        self.list
+            .as_ref()
+            .and_then(|list| list.source_files_storage_prefix.as_deref())
     }
 
     fn stamp_vector_index_storage_prefix(&self, has_vector_columns: bool) -> Option<String> {
@@ -2685,6 +2700,9 @@ impl ManifestSnapshot {
             } else {
                 self.stamp_vector_index_storage_prefix(!self.vector_configs().is_empty())
             },
+            // Set once at create and carried on every commit after; a hidden
+            // table never has one, so nothing to guard here.
+            source_files_storage_prefix: self.source_files_storage_prefix().map(str::to_owned),
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self
                 .list
@@ -6372,6 +6390,7 @@ mod tests {
                     n_buckets: 64,
                 },
                 vector_index_storage_prefix: None,
+                source_files_storage_prefix: None,
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -6879,6 +6898,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7066,6 +7086,7 @@ mod tests {
                     n_buckets: 1,
                 },
                 vector_index_storage_prefix: None,
+                source_files_storage_prefix: None,
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -7210,6 +7231,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7290,6 +7312,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
@@ -7897,6 +7920,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
@@ -8112,6 +8136,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -8635,6 +8660,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -8813,6 +8839,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -8975,6 +9002,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9191,6 +9219,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9301,6 +9330,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9438,6 +9468,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9565,6 +9596,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9710,6 +9742,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9865,6 +9898,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10034,6 +10068,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10269,6 +10304,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10376,6 +10412,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10499,6 +10536,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10647,6 +10685,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10792,6 +10831,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10889,6 +10929,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11005,6 +11046,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11148,6 +11190,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,

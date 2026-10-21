@@ -534,6 +534,7 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            source_files_storage_prefix: None,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,

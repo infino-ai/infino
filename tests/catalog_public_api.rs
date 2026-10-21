@@ -13,12 +13,19 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
+use datafusion::prelude::{col, lit};
 use infino::{
-    BoolMode, IndexSpec, Metric, OptimizeOptions,
+    BoolMode, IndexSpec, InfinoError, Metric, OptimizeOptions, Supertable,
     arrow_array::{
-        Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
+        Array, ArrayRef, BooleanArray, FixedSizeListArray, Float32Array, Int64Array,
+        LargeStringArray, RecordBatch, StringArray, UInt32Array, UInt64Array,
     },
     arrow_schema::{DataType, Field, Schema, SchemaRef},
     connect,
@@ -36,6 +43,30 @@ const FIRST_BATCH: &[&str] = &["the quick brown fox", "a lazy sleeping dog"];
 /// Titles committed in the second batch, so maintenance has two
 /// superfiles to compact.
 const SECOND_BATCH: &[&str] = &["a red clever fox fox", "an old grey wolf"];
+
+// Source-file list fixtures.
+/// Directory-name suffix of the hidden source-file list under a table.
+const SOURCE_FILES_DIR_SUFFIX: &str = "_sync";
+/// Directory-name suffix of the hidden vector index under a table.
+const VECTOR_INDEX_DIR_SUFFIX: &str = "_vector_index";
+/// Prefix every hidden table's directory name starts with.
+const HIDDEN_DIR_PREFIX: &str = "_infino_";
+/// The manifest key naming the source-file list.
+const SOURCE_FILES_MANIFEST_KEY: &str = "source_files_storage_prefix";
+/// Two source files the list records, by key.
+const FILE_KEYS: [&str; 2] = [
+    "events/2026-01-01/part-0.json",
+    "events/2026-01-02/part-0.json",
+];
+/// The numbers the list gives those files.
+const FILE_NOS: [u32; 2] = [7, 8];
+/// The version markers the files were read at.
+const FILE_MARKERS: [&str; 2] = ["1700000000000001", "1700000000000002"];
+/// Bytes, modification time, rows and load time recorded for each file.
+const FILE_SIZE: u64 = 4_096;
+const FILE_MTIME_MS: i64 = 1_700_000_000_000;
+const FILE_ROWS: u64 = 690;
+const FILE_LOADED_MS: i64 = 1_700_000_100_000;
 
 fn vector_field(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -251,4 +282,244 @@ fn open_table_returns_a_live_handle_on_a_fresh_connection() {
         )
         .expect("vector_search");
     assert_eq!(first_title(&hits), FIRST_BATCH[1]);
+}
+
+/// A title-only schema: a table with no vector column, so no vector index.
+fn title_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "title",
+        DataType::LargeUtf8,
+        false,
+    )]))
+}
+
+/// One file row per entry of the fixtures, shaped by the list's own schema.
+fn file_rows(list: &Supertable) -> RecordBatch {
+    let n = FILE_KEYS.len();
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(LargeStringArray::from(vec!["file"; n])),
+        Arc::new(UInt32Array::from(FILE_NOS.to_vec())),
+        Arc::new(LargeStringArray::from(FILE_KEYS.to_vec())),
+        Arc::new(LargeStringArray::from(FILE_MARKERS.to_vec())),
+        Arc::new(UInt64Array::from(vec![FILE_SIZE; n])),
+        Arc::new(Int64Array::from(vec![FILE_MTIME_MS; n])),
+        Arc::new(UInt64Array::from(vec![FILE_ROWS; n])),
+        Arc::new(Int64Array::from(vec![FILE_LOADED_MS; n])),
+        Arc::new(Int64Array::from(vec![None::<i64>; n])),
+        Arc::new(BooleanArray::from(vec![None::<bool>; n])),
+    ];
+    RecordBatch::try_new(list.schema(), columns).expect("file rows match the list schema")
+}
+
+/// The `file_no` of every row an exact match on `key` returns.
+fn file_nos_for(list: &Supertable, key: &str) -> Vec<u32> {
+    list.exact_match("key", key, Some(&["file_no"]))
+        .expect("exact_match on key")
+        .iter()
+        .flat_map(|b| {
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .expect("file_no is u32");
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Every directory under `root` named like a hidden table with `suffix`.
+fn hidden_dirs(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with(HIDDEN_DIR_PREFIX) && name.ends_with(suffix) {
+                found.push(path.clone());
+            }
+            stack.push(path);
+        }
+    }
+    found
+}
+
+/// Whether any `.json` file under `root`, outside the hidden tables, names
+/// the source-file list.
+fn user_manifests_name_the_list(root: &Path) -> bool {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if !name.starts_with(HIDDEN_DIR_PREFIX) {
+                    stack.push(path);
+                }
+            } else if name.ends_with(".json")
+                && fs::read_to_string(&path)
+                    .expect("read manifest")
+                    .contains(SOURCE_FILES_MANIFEST_KEY)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// A table created with a source-file list has one: written and read
+/// through the parent's handle, named on the parent's manifest, reopened
+/// from it by a fresh connection, never listed, and purged with the table.
+#[test]
+fn source_file_list_is_hidden_reopened_and_purged_with_its_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table(
+                "docs",
+                title_schema(),
+                IndexSpec::new().fts("title").source_file_list(),
+            )
+            .expect("create_table with a source-file list");
+        let list = docs.source_file_list().expect("the list exists");
+        list.append(&file_rows(&list)).expect("append file rows");
+        assert_eq!(file_nos_for(&list, FILE_KEYS[0]), vec![FILE_NOS[0]]);
+        assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
+    }
+    let list_dirs = hidden_dirs(dir.path(), SOURCE_FILES_DIR_SUFFIX);
+    assert_eq!(list_dirs.len(), 1, "one source-file list under the table");
+    assert!(files_under(&list_dirs[0]) > 0, "the list holds objects");
+    assert!(
+        hidden_dirs(dir.path(), VECTOR_INDEX_DIR_SUFFIX).is_empty(),
+        "no vector columns, no vector index"
+    );
+    assert!(user_manifests_name_the_list(dir.path()));
+
+    // A fresh connection finds the list from the manifest alone, and a
+    // file's row can be replaced: tombstone it, append the new one.
+    let db = connect(&uri).expect("reconnect");
+    assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
+    let list = db
+        .open_table("docs")
+        .expect("open_table")
+        .source_file_list()
+        .expect("reopened from the manifest");
+    assert_eq!(file_nos_for(&list, FILE_KEYS[1]), vec![FILE_NOS[1]]);
+    let stats = list
+        .delete(col("file_no").eq(lit(FILE_NOS[1])))
+        .expect("delete a file's row");
+    assert_eq!(stats.n_tombstoned(), 1);
+    assert!(file_nos_for(&list, FILE_KEYS[1]).is_empty());
+    assert_eq!(file_nos_for(&list, FILE_KEYS[0]), vec![FILE_NOS[0]]);
+
+    db.drop_table("docs", true).expect("drop_table purge");
+    // Purge deletes objects; a local directory may outlive its last file.
+    assert_eq!(
+        hidden_dirs(dir.path(), SOURCE_FILES_DIR_SUFFIX)
+            .iter()
+            .map(|d| files_under(d))
+            .sum::<usize>(),
+        0,
+        "purge removes the list's objects with the table"
+    );
+}
+
+/// Files anywhere under `root`.
+fn files_under(root: &Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// A table created without the flag has no list and its manifest never
+/// names one.
+#[test]
+fn a_table_without_the_flag_has_no_source_file_list() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let docs = db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    let batch = RecordBatch::try_new(
+        title_schema(),
+        vec![Arc::new(LargeStringArray::from(FIRST_BATCH.to_vec()))],
+    )
+    .expect("batch");
+    docs.append(&batch).expect("append");
+    assert!(docs.source_file_list().is_none());
+    assert!(
+        db.open_table("docs")
+            .expect("open_table")
+            .source_file_list()
+            .is_none()
+    );
+    assert!(hidden_dirs(dir.path(), SOURCE_FILES_DIR_SUFFIX).is_empty());
+    assert!(!user_manifests_name_the_list(dir.path()));
+}
+
+/// A table with vector columns and the flag carries both hidden tables, and
+/// vector search still runs over its own index.
+#[test]
+fn a_table_with_vectors_and_the_flag_has_both_hidden_tables() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = table_schema();
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", EMB_DIM, Metric::Cosine)
+                .source_file_list(),
+        )
+        .expect("create_table");
+    docs.append(&build_batch(schema, FIRST_BATCH, 0))
+        .expect("append");
+    let list = docs.source_file_list().expect("the list exists");
+    list.append(&file_rows(&list)).expect("append file rows");
+    assert_eq!(hidden_dirs(dir.path(), SOURCE_FILES_DIR_SUFFIX).len(), 1);
+    assert_eq!(hidden_dirs(dir.path(), VECTOR_INDEX_DIR_SUFFIX).len(), 1);
+    let hits = docs
+        .vector_search(
+            "emb",
+            &unit_embedding(1),
+            SEARCH_TOP_K,
+            None,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("vector_search");
+    assert_eq!(first_title(&hits), FIRST_BATCH[1]);
+}
+
+/// A connection with no storage refuses the flag rather than creating a
+/// table without the list it was asked for.
+#[test]
+fn a_memory_connection_refuses_a_source_file_list() {
+    let db = connect("memory://").expect("connect");
+    let err = db
+        .create_table(
+            "docs",
+            title_schema(),
+            IndexSpec::new().fts("title").source_file_list(),
+        )
+        .expect_err("no storage, no list");
+    assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
+    assert!(db.list_tables().expect("list").is_empty());
 }
