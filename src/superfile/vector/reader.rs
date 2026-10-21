@@ -1922,6 +1922,7 @@ impl VectorReader {
         column_id: FieldId,
         section: &crate::supertable::slow_vector_state::CentroidSection,
         superfile_id: uuid::Uuid,
+        superseded: Option<&BTreeSet<u32>>,
     ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return Ok(Vec::new());
@@ -1932,6 +1933,14 @@ impl VectorReader {
                 continue;
             }
             let cell_id = self.cell_ids.get(ci).copied();
+            // A cell superseded by an in-place split carries dead on-disk blocks
+            // whose live rows now sit in the split's child cells. Its fine
+            // centroids must not seed centroid-router graph nodes: the scan path
+            // already skips these cells, so a node pointing at one is a dead pick
+            // that spends fanout and returns nothing.
+            if superseded.is_some_and(|ss| cell_id.is_some_and(|c| ss.contains(&c))) {
+                continue;
+            }
             // A read of the local spill file, not of the superfile's source.
             let Some(bytes) = section
                 .read_cell_bytes(superfile_id, column_id, cell_id)

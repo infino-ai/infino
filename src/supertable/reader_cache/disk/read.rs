@@ -38,10 +38,12 @@ impl DiskCacheStore {
     /// stays keyed by `uri`. With `offsets` (the manifest's footer and blob layout) a cold open
     /// fetches what it needs in one round trip.
     ///
-    /// If the file cannot be admitted ([`DiskCacheError::BudgetExceeded`], usually one superfile
-    /// larger than the whole budget), the query streams it uncached through
-    /// [`Self::open_range_only`] instead of failing. [`ReadIntent::Load`] is rejected: a whole-file
-    /// read cannot degrade like that, so it uses [`Self::reader_synchronous_with_storage`].
+    /// If a whole-file fetch cannot be admitted ([`DiskCacheError::BudgetExceeded`]: the hybrid
+    /// mode's download of one superfile larger than the whole budget), the query streams it
+    /// uncached through [`Self::open_range_only`] instead of failing. A lazy open never gets there:
+    /// past the budget it stays a lazy entry, charging the blocks it reads, and later opens of the
+    /// file find it. [`ReadIntent::Load`] is rejected: a whole-file read cannot degrade like that,
+    /// so it uses [`Self::reader_synchronous_with_storage`].
     pub async fn open_for_query(
         self: &Arc<Self>,
         uri: &SuperfileUri,
