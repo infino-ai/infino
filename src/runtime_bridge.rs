@@ -180,9 +180,17 @@ where
     R: Send + 'static,
 {
     let (tx, rx) = oneshot::channel();
-    spawn_on(pool, move || {
+    // The work runs inside the caller's span; the result is sent only once
+    // the span has been left and released, so the awaiting task never
+    // outruns a pool thread still holding the span open.
+    let f = carry_span(f);
+    let job = move || {
         let _ = tx.send(f());
-    });
+    };
+    match pool {
+        Some(pool) => pool.spawn(job),
+        None => rayon::spawn(job),
+    }
     rx.await.map_err(|_| PoolDropped(what))
 }
 

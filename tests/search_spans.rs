@@ -343,10 +343,18 @@ fn search_spans_split_into_phases_only_where_there_is_something_to_split() {
     ends_before(&spans, "fts.select_superfiles", "fts.fanout");
     ends_before(&spans, "fts.term_index", "fts.fanout");
     // Ranked by score ceiling, so a unit that can no longer reach the top
-    // `k` is skipped unopened, and uncounted.
+    // `k` is skipped unopened, and uncounted; a superfile the term index
+    // answers for outright is never a unit at all, and the root counts it.
     let fanout = span(&spans, "fts.fanout");
     let opened = tier_total(fanout);
-    assert!(opened > 0 && Some(opened) <= fanout.field("units"));
+    assert!(Some(opened) <= fanout.field("units"));
+    let resolved = span(&spans, "fts.term_index")
+        .field("resolved")
+        .expect("resolved");
+    assert!(
+        opened + resolved > 0,
+        "the search opened {opened} superfiles and resolved {resolved} in the index"
+    );
 
     // The same search on one superfile keeps only its root and resolve.
     let (spans, _) = trace_of(&capture, "bm25_search", bm25(&one));

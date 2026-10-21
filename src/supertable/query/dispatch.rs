@@ -761,14 +761,19 @@ where
         + 'static,
     Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
 {
+    let tiers = OpenTierCounts::for_current_span();
+    // Nothing to open — the index answered for every superfile, or the
+    // floor ruled them all out — is still an outcome the phase reports.
     if units.is_empty() {
+        if let Some(tiers) = &tiers {
+            tiers.record_on(&Span::current());
+        }
         return Ok(Vec::new());
     }
     trace!(
         units = units.len(),
         window, "fanning query out across superfiles in ceiling order"
     );
-    let tiers = OpenTierCounts::for_current_span();
     let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm, tiers.clone()).await;
     // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
     if units.len() == 1 {

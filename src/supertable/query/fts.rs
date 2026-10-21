@@ -1024,8 +1024,15 @@ impl SupertableReader {
         // One span over the three awaits that read the term index (its load,
         // the score ceilings, the postings locations), with the synchronous
         // work between them.
+        // It also reports what the tiers settled: superfiles answered from
+        // the index, and superfiles ruled out before any open.
         let term_span = trace::phase(phases, || {
-            detail_span!("fts.term_index", terms = tracing::field::Empty)
+            detail_span!(
+                "fts.term_index",
+                terms = tracing::field::Empty,
+                resolved = tracing::field::Empty,
+                ruled_out = tracing::field::Empty,
+            )
         });
         let term_index = manifest.term_index().instrument(term_span.clone()).await?;
         // Every scored term, phrase members included, once: what the index
@@ -1173,6 +1180,12 @@ impl SupertableReader {
                         .iter()
                         .map(|(e, b)| (e.superfile_id, b.ub))
                         .collect(),
+                );
+                let resolved = answered.iter().filter(|a| **a).count();
+                term_span.record("resolved", resolved as u64);
+                term_span.record(
+                    "ruled_out",
+                    (answered.len() - resolved - ordered.len()) as u64,
                 );
                 kept = ordered.into_iter().map(|(e, _)| e).collect();
                 if selection.theta_lb.is_finite() {
