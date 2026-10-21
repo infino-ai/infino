@@ -36,6 +36,13 @@
 //! or two, and the survivors open in order of their best known candidate
 //! with `θ_lb` seeded as the shared floor. A superfile whose heads for
 //! every term were read to the end is answered from the index outright.
+//! A round that neither rules a superfile out nor raises the threshold
+//! ends the merge: where every superfile holds competitive documents the
+//! bounds never fall below the threshold, and each further round would
+//! cost what the opens then cost anyway. While the threshold still rises
+//! the merge reads on — a conjunction's candidates may sit deeper than
+//! the first block, and a required term's head read to its end rules out
+//! every superfile where the terms never meet.
 //!
 //! Scores are the kernel's own arithmetic at the table's statistics (see
 //! [`Scoring`]); keys and tails stored at a superfile's own average length
@@ -92,9 +99,12 @@ const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
 /// for the same document, and a threshold an ulp above a real k-th score
 /// would prune a document tied with it. The mirror of [`BOUND_SLACK`].
 const LOWER_SLACK: f32 = 1.0 - 8.0 * f32::EPSILON;
-/// Most query terms the merge serves: a candidate's terms are a bit set in
-/// a byte, and the per-superfile state has one slot per term.
-pub(crate) const MAX_TIER_TERMS: usize = 6;
+/// Most query terms the merge serves. One term is one product and two
+/// commute, so a candidate's sum is the kernel's score bit for bit and the
+/// bounds are tight; past two the bounds carry slack and the sum of tails
+/// grows with the terms, so the merge rarely rules a superfile out and
+/// costs every round for nothing — such queries keep the ceilings.
+pub(crate) const MAX_TIER_TERMS: usize = 2;
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
@@ -490,13 +500,16 @@ pub(crate) async fn select_with_tiers(
             break;
         }
         // Decode, score, join and bound, as one wave on the reader pool.
-        merge = run_on_pool(Some(pool), "tier merge", move || {
-            merge.round(reads);
-            merge
+        let theta_before = merge.theta_lb;
+        let (next, excluded) = run_on_pool(Some(pool), "tier merge", move || {
+            let excluded = merge.round(reads);
+            (merge, excluded)
         })
         .await
         .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
-        if !read_any || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
+        merge = next;
+        let stalled = merge.theta_lb.is_finite() && excluded == 0 && merge.theta_lb <= theta_before;
+        if !read_any || stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
             break;
         }
     }
@@ -543,8 +556,9 @@ impl Merge {
     /// One round's decoding: per superfile that read a block, its heads
     /// grow and its join and bounds are recomputed, in parallel; then the
     /// threshold over every superfile's candidates, and the exclusion of
-    /// what cannot reach it.
-    fn round(&mut self, reads: Vec<Vec<BlockRead>>) {
+    /// what cannot reach it. Returns how many superfiles the round ruled
+    /// out.
+    fn round(&mut self, reads: Vec<Vec<BlockRead>>) -> usize {
         let required = self.required;
         let (k, lb_slack, ub_slack) = (self.k, self.lb_slack, self.ub_slack);
         let scoring = &self.scoring;
@@ -615,14 +629,17 @@ impl Merge {
             self.theta_lb = self.theta_lb.max(kth);
         }
         // Rule out what cannot compete.
+        let mut excluded = 0usize;
         if self.theta_lb.is_finite() {
             let theta = self.theta_lb;
             for slot in self.slots.iter_mut() {
                 if slot.live && slot.ub * BOUND_SLACK < theta {
                     slot.live = false;
+                    excluded += 1;
                 }
             }
         }
+        excluded
     }
 }
 
@@ -798,8 +815,8 @@ mod tests {
     const BOUND_CASES: u64 = 4_000;
     /// Documents in the oracle's universe per case.
     const UNIVERSE: u32 = 48;
-    /// Most terms the oracle joins.
-    const TERMS: usize = 4;
+    /// Most terms the oracle joins: what the merge serves.
+    const TERMS: usize = MAX_TIER_TERMS;
 
     /// The bounds hold against every corpus the read heads could have come
     /// from: documents outside a term's head carry at most that term's tail

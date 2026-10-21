@@ -229,8 +229,12 @@ fn tiers_change_which_superfiles_open_and_nothing_else() {
             if opened_with < opened_without {
                 fewer += 1;
             }
+            // The merge stops once a round with a threshold rules nothing
+            // out, and the survivors then open by their best known
+            // candidate rather than by ceiling, so a query can open one
+            // superfile more than the ceilings did; never many more.
             assert!(
-                opened_with <= opened_without,
+                opened_with <= opened_without + 1,
                 "{query:?} {mode:?} k={k}: tiers opened {opened_with} superfiles, ceilings {opened_without}"
             );
         }

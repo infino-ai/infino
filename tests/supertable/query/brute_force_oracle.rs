@@ -1095,14 +1095,18 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
                 tiered, plain,
                 "{label} k={k}: the tiers' merge must return what the ceiling path returns"
             );
-            assert!(
+            // The merge serves one- and two-term queries; the rest keep the
+            // ceiling path, where the same answer costs no tier read.
+            let mut terms: Vec<String> = Vec::new();
+            default_tokenizer().tokenize_each(q, &mut |t| terms.push(t.to_owned()));
+            assert_eq!(
                 stats.tier_entries > 0,
-                "{label} k={k}: the merge read no tier entries"
+                terms.len() <= 2,
+                "{label} k={k}: {} tier entries read",
+                stats.tier_entries
             );
             // The reference: the same ranking, up to the one-byte length
             // quantization at the boundary of the top k.
-            let mut terms: Vec<String> = Vec::new();
-            default_tokenizer().tokenize_each(q, &mut |t| terms.push(t.to_owned()));
             let reference = match mode {
                 BoolMode::And => brute_force_and_top_k(&oracles, q, k),
                 _ => brute_force_terms_top_k(&oracles, &terms, k),
