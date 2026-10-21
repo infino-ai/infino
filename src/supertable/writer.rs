@@ -9796,7 +9796,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
     // Rows this recalibration measured, stamped below as the new growth
     // baseline for the optimize trigger.
-    let scan_rows: u64 = manifest.superfiles.iter().map(|e| e.n_docs).sum();
+    let scan_rows: u64 = manifest.n_docs_total();
     let mut cal =
         opann::WidthLawCalibration::new(clusters.dim as usize, metric, inner.options.target_recall);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`

@@ -542,27 +542,26 @@ impl Supertable {
         };
         // The two changes that move the probe-width law: a split changed the
         // grid, or the corpus grew past the configured fraction since the last
-        // recalibration. A plain append or a shard-only merge does not.
-        let grid_or_growth = || match inner.manifest.load().partition_strategy() {
-            Some(PartitionStrategy::VectorCell {
-                routing, clusters, ..
-            }) => {
-                let grid_restructured = clusters.n_cent != pre_pass_n_cent;
-                let cur_rows: u64 = inner
-                    .manifest
-                    .load()
-                    .superfiles
-                    .iter()
-                    .map(|e| e.n_docs)
-                    .sum();
-                let corpus_grew = corpus_grew_enough(
-                    cur_rows,
-                    routing.last_recal_rows,
-                    global().vector.recal_growth_fraction,
-                );
-                grid_restructured || corpus_grew
+        // recalibration. A plain append or a shard-only merge does not. (A
+        // merge can leave the fine-depth law shallow until the next recal, but
+        // only the stamped serving path reads it; the centroid-graph router
+        // does not.)
+        let grid_or_growth = || {
+            let manifest = inner.manifest.load_full();
+            match manifest.partition_strategy() {
+                Some(PartitionStrategy::VectorCell {
+                    routing, clusters, ..
+                }) => {
+                    let grid_restructured = clusters.n_cent != pre_pass_n_cent;
+                    let corpus_grew = corpus_grew_enough(
+                        manifest.n_docs_total(),
+                        routing.last_recal_rows,
+                        global().vector.recal_growth_fraction,
+                    );
+                    grid_restructured || corpus_grew
+                }
+                _ => false,
             }
-            _ => false,
         };
         // Recalibration is the O(N) query-serving calibration — gate it by the
         // caller's policy (default Auto). Skip runs none; Force always runs it;
