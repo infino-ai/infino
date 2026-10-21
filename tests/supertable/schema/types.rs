@@ -236,6 +236,36 @@ fn a_rewrite_flips_at_once_and_compaction_converts_the_files() {
         .expect("the column can change again once converted");
 }
 
+/// Text with whitespace around its digits is not a number: such a value
+/// reads as null once the column is retyped, both while its file is still
+/// text and after compaction converts it. Arrow trims that whitespace from
+/// version 59 on; the engine keeps the rule its tables were written under.
+#[test]
+fn text_with_whitespace_around_its_digits_reads_as_null_when_retyped() {
+    let (_dir, db, table) = storage_table(
+        Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::LargeUtf8,
+            true,
+        )])),
+        IndexSpec::new(),
+    );
+    table
+        .append(&batch(vec![(
+            "s",
+            strings(vec![Some("5"), Some(" 6"), Some("7 "), Some("\t8")]),
+        )]))
+        .expect("append strings");
+
+    db.apply_schema(TABLE, &retype("s", DataType::Int64), None)
+        .expect("flip");
+    let expected = vec!["5", "null", "null", "null"];
+    assert_eq!(column(&db, "s"), expected, "read through the text file");
+
+    table.optimize(&compact()).expect("optimize converts");
+    assert_eq!(column(&db, "s"), expected, "read after conversion");
+}
+
 #[test]
 fn retyping_back_before_optimize_reads_the_originals() {
     let (_dir, db, table) = storage_table(

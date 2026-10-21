@@ -13,9 +13,14 @@
 //! and through the engine's one cast kernel when the file holds the column
 //! in another type. A file matching the table rewrites nothing.
 
-use std::sync::Arc;
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
-use arrow_schema::SchemaRef;
+use arrow_array::RecordBatch;
+use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::{
     common::{
         Result, ScalarValue,
@@ -23,6 +28,7 @@ use datafusion::{
         tree_node::{Transformed, TransformedResult, TreeNode},
     },
     error::DataFusionError,
+    logical_expr::ColumnarValue,
     physical_expr::{
         PhysicalExpr,
         expressions::{CastExpr, Column, Literal},
@@ -33,7 +39,8 @@ use datafusion::{
 use crate::supertable::{
     manifest::ManifestSnapshot,
     schema::{
-        LegacyNames, PhysicalKind, PhysicalSchema, TableSchema, cast::CAST_OPTIONS,
+        LegacyNames, PhysicalKind, PhysicalSchema, TableSchema,
+        cast::{CAST_OPTIONS, null_padded_numbers, parses_text_as_number},
         map::FileSchemaMap,
     },
 };
@@ -132,20 +139,113 @@ impl TableExprAdapter {
             }
             return Ok(Transformed::yes(Arc::new(resolved)));
         }
+        // DataFusion's cast parses text with Arrow's rules; the engine's
+        // whitespace rule (see `schema::cast`) runs first, so a scan reads
+        // what the cast kernel and compaction read.
+        let input: Arc<dyn PhysicalExpr> =
+            if parses_text_as_number(&stored.data_type, logical_field.data_type()) {
+                Arc::new(NullPaddedNumbers {
+                    input: Arc::new(resolved),
+                    to: logical_field.data_type().clone(),
+                })
+            } else {
+                Arc::new(resolved)
+            };
         Ok(Transformed::yes(Arc::new(CastExpr::new_with_target_field(
-            Arc::new(resolved),
+            input,
             Arc::new(logical_field.clone()),
             Some(CAST_OPTIONS),
         ))))
     }
 }
 
+/// Text about to be cast to the number type `to`, with each value that has
+/// whitespace around its digits set to null first: the cast kernel's rule,
+/// applied inside a scan.
+#[derive(Debug, Eq)]
+struct NullPaddedNumbers {
+    input: Arc<dyn PhysicalExpr>,
+    to: DataType,
+}
+
+// `Arc<dyn PhysicalExpr>` compares and hashes through the trait object, so
+// these are written out rather than derived.
+impl PartialEq for NullPaddedNumbers {
+    fn eq(&self, other: &Self) -> bool {
+        self.input.eq(&other.input) && self.to == other.to
+    }
+}
+
+impl Hash for NullPaddedNumbers {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.input.hash(state);
+        self.to.hash(state);
+    }
+}
+
+impl fmt::Display for NullPaddedNumbers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "null_padded_numbers({})", self.input)
+    }
+}
+
+impl PhysicalExpr for NullPaddedNumbers {
+    fn return_field(&self, input_schema: &Schema) -> Result<FieldRef> {
+        let field = self.input.return_field(input_schema)?;
+        Ok(Arc::new(field.as_ref().clone().with_nullable(true)))
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        match self.input.evaluate(batch)? {
+            ColumnarValue::Array(array) => {
+                Ok(ColumnarValue::Array(null_padded_numbers(&array, &self.to)?))
+            }
+            ColumnarValue::Scalar(scalar) => {
+                let array = null_padded_numbers(&scalar.to_array()?, &self.to)?;
+                Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(
+                    &array, 0,
+                )?))
+            }
+        }
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if children.len() != 1 {
+            return Err(DataFusionError::Internal(format!(
+                "NullPaddedNumbers takes exactly one input; got {}",
+                children.len()
+            )));
+        }
+        Ok(Arc::new(NullPaddedNumbers {
+            input: children.swap_remove(0),
+            to: self.to.clone(),
+        }))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // In SQL terms it is the column itself; the cast above it is what
+        // shows.
+        self.input.fmt_sql(f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Array, Decimal128Array, LargeStringArray};
+    use arrow_schema::Field;
 
     use super::*;
     use crate::supertable::schema::{FieldId, with_field_id};
+
+    /// Precision of the `_id` column, as the fixtures store it.
+    const ID_PRECISION: u8 = 38;
 
     fn table() -> Arc<TableSchema> {
         Arc::new(TableSchema::from_user_schema(&Schema::new(vec![
@@ -225,5 +325,48 @@ mod tests {
             cast.cast_options().safe,
             "a value that does not fit is null, not an error"
         );
+        assert!(
+            cast.expr().downcast_ref::<Column>().is_some(),
+            "a number read as another number needs no text rule"
+        );
+    }
+
+    #[test]
+    fn text_read_as_a_number_keeps_the_whitespace_rule() {
+        let physical: SchemaRef = Arc::new(Schema::new(vec![
+            stamped("_id", 0, DataType::Decimal128(ID_PRECISION, 0)),
+            stamped("title", 1, DataType::LargeUtf8),
+            stamped("score", 2, DataType::LargeUtf8),
+        ]));
+        let adapter = factory()
+            .create(logical(), Arc::clone(&physical))
+            .expect("adapter");
+        let score = adapter
+            .rewrite(Arc::new(Column::new("score", 2)))
+            .expect("rewrite");
+        let cast = score.downcast_ref::<CastExpr>().expect("cast");
+        assert!(
+            cast.expr().downcast_ref::<NullPaddedNumbers>().is_some(),
+            "the text is guarded before DataFusion parses it"
+        );
+
+        let ids = Decimal128Array::from(vec![1, 2, 3])
+            .with_precision_and_scale(ID_PRECISION, 0)
+            .expect("decimal ids");
+        let batch = RecordBatch::try_new(
+            physical,
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(vec!["a", "b", "c"])),
+                Arc::new(LargeStringArray::from(vec!["5", " 5", "5 "])),
+            ],
+        )
+        .expect("batch");
+        let ColumnarValue::Array(scores) = score.evaluate(&batch).expect("evaluate") else {
+            panic!("a column evaluates to an array");
+        };
+        assert!(scores.is_valid(0));
+        assert!(scores.is_null(1));
+        assert!(scores.is_null(2));
     }
 }
