@@ -42,13 +42,12 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) use build::build;
 use build::build_segment;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
     BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, build_onto, merge_segments, tier_path,
+    HeadSink, build, build_onto, merge_segments, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;

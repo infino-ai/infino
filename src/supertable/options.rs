@@ -84,9 +84,11 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
         manifest::{
-            SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
+            SuperfileUri, UserCentroidCache,
+            disk_cache::ManifestDiskCache,
+            list::PartitionStrategy,
+            term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
         },
         schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},

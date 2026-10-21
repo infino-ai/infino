@@ -128,8 +128,7 @@ use crate::{
                 sub_hdr,
             },
         },
-        fts::bm25::Bm25Params,
-        fts::builder::doc_lengths_entry_size,
+        fts::{bm25::Bm25Params, builder::doc_lengths_entry_size},
         reader::vector_layout_from_kv,
         vector::{
             builder::{
