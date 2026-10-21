@@ -181,7 +181,10 @@ pub(crate) struct MergeInputs<'a> {
 /// Each arm is chosen by what the inputs hold, and the carrying arms move
 /// the inputs' posting lists across rather than rebuilding them —
 /// re-tokenizing a corpus to merge it costs far more and changes nothing
-/// while the index config is the same.
+/// while the index config is the same. When it is not the same — a file
+/// written before a column's index was added mid-table — the vector arms
+/// re-tokenize too (see `SuperfileBuilder::merge_rows_to`), so a table that
+/// gained an indexed column while it was being written still compacts.
 pub(crate) struct CompactionMerge;
 
 impl SuperfileMerge for CompactionMerge {
@@ -2333,13 +2336,13 @@ mod tests {
         *,
     };
     use crate::{
-        BoolMode, VectorSearchOptions,
+        BoolMode, Stemmer, Stopwords, VectorSearchOptions,
         config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
         superfile::{
             builder::{FtsConfig, VectorConfig},
-            fts::reader::Bm25SearchOptions,
+            fts::{bm25::Bm25Params, reader::Bm25SearchOptions},
             reader::SuperfileReader,
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
@@ -2349,7 +2352,10 @@ mod tests {
             manifest::commit::{
                 MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
             },
-            schema::change::{FieldPatch, SchemaPatch},
+            schema::{
+                ColumnIndex,
+                change::{FieldPatch, SchemaPatch},
+            },
             storage::{LocalFsStorageProvider, StorageProvider},
             writer::persist_commit_async,
         },
@@ -3578,6 +3584,140 @@ mod tests {
             .expect("token_match on merged superfile")
             .0;
         assert_eq!(fts_hits.len(), 4, "all four 'alpha' docs must match");
+    }
+
+    /// Compaction over files that disagree on which columns are indexed:
+    /// the table indexed `body` after its first file was written. The
+    /// vector merge used to refuse such inputs with an FTS schema mismatch,
+    /// so a table that gained an indexed column while it was being written
+    /// could never be compacted; the merge now re-analyzes every file's
+    /// text and the output carries the table's index.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merge_superfiles_reanalyzes_files_written_before_a_column_s_index() {
+        const DIM: usize = 16;
+        let emb_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let emb_type = DataType::FixedSizeList(Arc::clone(&emb_field), DIM as i32);
+        let first_schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("emb", emb_type.clone(), false),
+        ]));
+        // An IVF-mergeable codec, so compaction takes the vector splice.
+        let opts = SupertableOptions::new(
+            Arc::clone(&first_schema),
+            vec![FtsConfig::new("title")],
+            vec![default_vector_config("emb", 42).with_rerank_codec(RerankCodec::Sq8Residual)],
+        )
+        .expect("options with an sq8 vector column")
+        .with_writer_pool(Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("1-thread writer pool"),
+        ));
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(opts.with_storage(Arc::clone(&storage))).expect("create");
+
+        // One-hot vectors, one axis per row.
+        let emb = |axes: &[usize]| -> ArrayRef {
+            let mut flat = vec![0.0f32; axes.len() * DIM];
+            for (row, &ax) in axes.iter().enumerate() {
+                flat[row * DIM + ax] = 1.0;
+            }
+            Arc::new(
+                FixedSizeListArray::try_new(
+                    Arc::clone(&emb_field),
+                    DIM as i32,
+                    Arc::new(Float32Array::from(flat)),
+                    None,
+                )
+                .expect("fixed-size-list"),
+            )
+        };
+        {
+            let batch = RecordBatch::try_new(
+                Arc::clone(&first_schema),
+                vec![
+                    Arc::new(LargeStringArray::from(vec!["alpha one", "alpha two"])) as ArrayRef,
+                    emb(&[0, 1]),
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        // The table gains an indexed column.
+        st.apply_schema(
+            &SchemaPatch::new(vec![
+                FieldPatch::named("body")
+                    .with_type(DataType::LargeUtf8)
+                    .with_index(ColumnIndex::Fts {
+                        stopwords: Stopwords::None,
+                        stemmer: Stemmer::None,
+                        positions: false,
+                        stored: true,
+                        bm25: Bm25Params::STANDARD,
+                    }),
+            ]),
+            None,
+        )
+        .expect("add an indexed column");
+        {
+            let second_schema = Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("emb", emb_type.clone(), false),
+                Field::new("body", DataType::LargeUtf8, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                second_schema,
+                vec![
+                    Arc::new(LargeStringArray::from(vec!["beta one", "beta two"])) as ArrayRef,
+                    emb(&[2, 3]),
+                    Arc::new(LargeStringArray::from(vec!["fresh text", "fresh words"])) as ArrayRef,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+
+        let reader = st.reader().expect("reader");
+        let mut superfiles: Vec<Arc<SuperfileEntry>> =
+            reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(superfiles.len(), 2, "two ingest superfiles");
+        superfiles.sort_by_key(|sf| sf.id_min);
+
+        let merged = st
+            .merge_superfiles(&superfiles, &no_tombstones())
+            .await
+            .expect("a merge over files that disagree on the indexed columns");
+        let merged_reader = merged
+            .open_reader()
+            .expect("merged superfile should have bytes")
+            .expect("open reader on merged superfile");
+        assert_eq!(merged_reader.n_docs(), 4);
+        let fts = merged_reader.fts().expect("fts index");
+        assert_eq!(fts.fts_columns().collect::<Vec<_>>(), vec!["title", "body"]);
+        let hits = merged_reader
+            .token_match("body", &["fresh"], BoolMode::And)
+            .await
+            .expect("token_match body")
+            .0;
+        assert_eq!(hits.len(), 2, "the second file's body postings");
+        let hits = merged_reader
+            .token_match("title", &["alpha"], BoolMode::And)
+            .await
+            .expect("token_match title")
+            .0;
+        assert_eq!(hits.len(), 2, "the first file's title postings");
+        assert!(
+            merged_reader.vec().is_some(),
+            "the vector index survives the merge"
+        );
     }
 
     /// A merge is not charged to the connection memory budget.
