@@ -1006,9 +1006,9 @@ impl TermIndex {
     /// [`Self::postings`] for each of `terms`, in the same order.
     ///
     /// Terms not already in memory are grouped by slice and each slice is
-    /// read once, in parallel. A slice held locally or asked for many terms
-    /// is read whole; otherwise each term costs one block read and one run
-    /// read.
+    /// read once, in parallel. Slices are read whole unless the lookup needs
+    /// more remote slices than [`SLICE_FETCH_CONCURRENCY`]; then each term of
+    /// a remote slice costs one block read and one run read.
     pub(crate) async fn postings_many(
         &self,
         column: FieldId,
@@ -1045,16 +1045,27 @@ impl TermIndex {
                 .map(|run| run.expect("every term was resident"))
                 .collect());
         }
-        let (mut whole, mut ranged) = (Vec::new(), Vec::new());
+        let (mut whole, mut remote) = (Vec::new(), Vec::new());
         {
             let resident = self.slices.lock().await;
             for (hash, (len, terms_here)) in by_slice {
                 let local = resident.contains(&hash)
                     || self.disk_cache.as_ref().is_some_and(|c| c.contains(&hash));
-                match local || terms_here.len() > RANGE_READ_MAX_TERMS_PER_SLICE {
+                match local {
                     true => whole.push((hash, terms_here)),
-                    false => ranged.push((hash, len, terms_here)),
+                    false => remote.push((hash, len, terms_here)),
                 }
+            }
+        }
+        // A range read takes more round trips than a whole fetch and keeps
+        // nothing for later lookups, so it pays off only when whole fetches
+        // would need more than one wave.
+        let by_range = remote.len() > SLICE_FETCH_CONCURRENCY;
+        let mut ranged = Vec::new();
+        for (hash, len, terms_here) in remote {
+            match by_range && terms_here.len() <= RANGE_READ_MAX_TERMS_PER_SLICE {
+                true => ranged.push((hash, len, terms_here)),
+                false => whole.push((hash, terms_here)),
             }
         }
         let keys = &keys;
@@ -4789,7 +4800,7 @@ mod tests {
     }
 
     /// Terms in the range-read tests, over slices small enough to need many.
-    const RANGE_TEST_TERMS: usize = 300;
+    const RANGE_TEST_TERMS: usize = 900;
     const RANGE_TEST_SLICE_TARGET_BYTES: usize = 512;
 
     /// A version 1 base over [`RANGE_TEST_TERMS`] terms plus a version 2
@@ -4831,8 +4842,8 @@ mod tests {
         let root = load_root(storage.as_ref(), &reference).await.expect("load");
         assert_eq!(root.segments.len(), 2);
         assert!(
-            root.segments[1].slices.len() > 2,
-            "delta spans several slices"
+            root.segments[1].slices.len() > SLICE_FETCH_CONCURRENCY,
+            "the delta alone needs more than one wave of whole fetches"
         );
         ([dir, store_dir], storage, root, terms)
     }
@@ -4880,6 +4891,31 @@ mod tests {
         );
         assert!(ranged[asked.len() - 1].is_empty(), "absent term");
         assert!(slow.ranges.load(Ordering::SeqCst) > 0, "read by range");
+    }
+
+    /// A lookup that needs few slices reads them whole: one fetch each,
+    /// kept for later lookups, and no range reads.
+    #[tokio::test]
+    async fn a_lookup_over_few_slices_reads_them_whole() {
+        let (_dirs, storage, root, terms) = mixed_format_index().await;
+        let asked = [terms[0].as_str(), terms[RANGE_TEST_TERMS - 1].as_str()];
+        let slow = SlowGets::wrap(storage);
+        let index = TermIndex::new(root.clone(), String::new(), slow.clone(), None);
+        index
+            .postings_many(fid("body"), &asked)
+            .await
+            .expect("lookup");
+        let needed: HashSet<ContentHash> = asked
+            .iter()
+            .flat_map(|t| {
+                root.slices_for_key(&fid("body").term_key(t))
+                    .map(|r| r.content_hash)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(needed.len() <= SLICE_FETCH_CONCURRENCY);
+        assert_eq!(slow.gets.load(Ordering::SeqCst), needed.len());
+        assert_eq!(slow.ranges.load(Ordering::SeqCst), 0, "no range reads");
     }
 
     /// After a restart over the same disk cache, slice heads come from the
