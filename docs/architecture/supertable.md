@@ -323,20 +323,26 @@ the superfile's own dictionary is not read on that path.
 A ceiling is a bound on a superfile's best document for one term, and
 on a large table nearly every superfile's ceiling for a common term
 clears the running k-th score, so a query over common terms opened most
-of the table. The index therefore also keeps, per term, a *tier*: the
-term's best documents table-wide, each as `(superfile, local document
-id, term frequency, length bucket)` — the facts a score is computed
-from, not a score, so a reader computes a candidate's contribution
-exactly as the superfile's kernel would (the table's idf times
-`tf / (tf + norm)` at the same quantized length) and a one- or two-term
-query knows its candidates' scores bit for bit before any open. Entries
-are ordered by the length-normalized term frequency at the superfile's
-own average length, cut into blocks whose directory carries the block's
-largest such key; a reader scales a key to the table's average as it
-scales any stored ceiling. The tier holds a term's whole list when the
-list fits a per-term budget and its top of that budget otherwise; each
-posting then also records a *tail*, the largest key of a document in
-that superfile the tier left out. The budget is settled
+of the table. The index therefore also keeps, per term and per
+superfile, a *head*: the term's best documents in that superfile, each
+as `(local document id, term frequency, length bucket)` — the facts a
+score is computed from, not a score, so a reader computes a candidate's
+contribution exactly as the superfile's kernel would (the table's idf
+times `tf / (tf + norm)` at the same quantized length) and a one- or
+two-term query knows its candidates' scores bit for bit before any open.
+A head is ordered by the length-normalized term frequency at the
+superfile's own average length and cut into blocks of 64; the blocks
+are laid out in *regions*, region `r` holding block `r` of every
+superfile deep enough, so one ranged fetch reads the first block of
+every superfile and a later fetch deepens one superfile alone. Each
+block's directory entry carries the superfile, the block's largest key
+and its *tail* — the key of the first document past the block, or past
+the head the key of the best document the head left out — which bounds
+what the superfile can still hold beyond what was read; a reader scales
+a key to the table's average as it scales any stored ceiling. A head
+keeps a superfile's whole list when the list is short and its best
+documents to a fixed depth otherwise, a per-term budget lowering that
+depth for every superfile alike when a term is common everywhere. The budget is settled
 by the build itself from a pass over the terms' frequencies: the largest
 count at which the tiers hold a small share of all postings, so a table
 of short texts, whose postings are few per document and whose

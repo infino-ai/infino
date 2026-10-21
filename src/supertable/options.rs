@@ -84,9 +84,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
-        manifest::term_index::{
-            BuildPolicy, TIER_ENTRIES_MAX, TIER_SHARE_OF_POSTINGS, head_depth_for, tier_entries_for,
-        },
+        manifest::term_index::{BuildPolicy, HEAD_DEPTH},
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -383,14 +381,21 @@ pub struct SupertableOptions {
     /// width: a one-thread pool must not serialize fifteen superfile opens.
     pub bound_ordered_open_window: usize,
     /// Documents the term index keeps per term in its *tier* — a term's
-    /// best documents table-wide, read ahead of any superfile open so a
+    /// best documents per superfile, read ahead of any superfile open so a
     /// ranked multi-term query opens the superfiles that hold its top k
-    /// rather than every one its terms appear in. A term with at most this
-    /// many documents is held whole. `None` sizes the budget from the
-    /// table: one document in a thousand, within fixed floors; `Some(0)`
-    /// keeps no tiers, and the ranked path opens by score ceiling alone, as
-    /// it did before tiers existed.
+    /// rather than every one its terms appear in. The cap on a term's
+    /// entries across all superfiles: when the superfiles' heads together
+    /// exceed it, every head is cut to the same shallower depth. `None`
+    /// leaves the heads at [`Self::term_head_depth`]; `Some(0)` keeps no
+    /// tiers, and the ranked path opens by score ceiling alone, as it did
+    /// before tiers existed.
     pub term_tier_entries_per_term: Option<u64>,
+    /// Documents each superfile keeps per term in its head (see
+    /// `term_tier_entries_per_term`). `None` is the engine's depth, chosen
+    /// so that a superfile's tail — the first document its head leaves out
+    /// — sits well below its best, which is what lets a query rule the
+    /// superfile out without opening it.
+    pub term_head_depth: Option<usize>,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -787,6 +792,7 @@ impl SupertableOptions {
             manifest_disk_cache: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
+            term_head_depth: None,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -940,25 +946,21 @@ impl SupertableOptions {
         self
     }
 
+    /// Documents each superfile keeps per term in its head (see
+    /// [`Self::term_head_depth`]).
+    pub fn with_term_head_depth(mut self, depth: usize) -> Self {
+        self.term_head_depth = Some(depth);
+        self
+    }
+
     /// What the term-index build takes from these options, for a table of
-    /// `n_docs` documents in `n_superfiles` superfiles.
-    pub(crate) fn term_index_build_policy(&self, n_docs: u64, n_superfiles: u64) -> BuildPolicy {
-        // The head depth follows the budget the table's size suggests; the
-        // budget itself the build settles from the terms' frequencies, under
-        // the ceiling, unless the caller fixed it.
-        let suggested = tier_entries_for(n_docs);
-        let (tier_entries_per_term, tier_share_of_postings) = match self.term_tier_entries_per_term
-        {
-            Some(fixed) => (fixed, None),
-            None => (TIER_ENTRIES_MAX, Some(TIER_SHARE_OF_POSTINGS)),
-        };
+    /// `n_docs` documents.
+    pub(crate) fn term_index_build_policy(&self, _n_docs: u64) -> BuildPolicy {
+        // Every superfile keeps its head to the same depth; the cap on a
+        // term's entries binds only when the caller sets one.
         BuildPolicy {
-            tier_entries_per_term,
-            tier_share_of_postings,
-            head_depth_per_superfile: head_depth_for(
-                tier_entries_per_term.min(suggested),
-                n_superfiles,
-            ),
+            tier_entries_per_term: self.term_tier_entries_per_term.unwrap_or(u64::MAX),
+            head_depth_per_superfile: self.term_head_depth.unwrap_or(HEAD_DEPTH),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
             ..BuildPolicy::default()

@@ -754,8 +754,7 @@ impl Supertable {
         let merge = Arc::clone(&merge);
         // The merged superfile replaces its inputs; a merge that writes
         // postings gathers the term-index contribution as it goes.
-        let superfiles_after = (manifest.superfiles.len() + 1).saturating_sub(superfiles.len());
-        let head_sink = term_head_sink_for(&manifest, superfiles_after)?;
+        let head_sink = term_head_sink_for(&manifest)?;
         let mut term_heads: Option<(Box<dyn TermHeadSink>, usize)> = head_sink
             .as_ref()
             .map(|(sink, depth)| (Box::new(sink.clone()) as Box<dyn TermHeadSink>, *depth));
@@ -839,8 +838,7 @@ impl Supertable {
             // while it does; deriving the entry's summaries from a newer
             // snapshot would key them to columns the output does not hold.
             // The merge replaces its inputs with one superfile.
-            let after = (manifest.superfiles.len() + 1).saturating_sub(superfiles.len());
-            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem, after)?
+            prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem)?
         };
 
         prepared_superfile.ok_or(BuildError::NoDocsToBuild)

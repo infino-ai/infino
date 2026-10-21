@@ -9,34 +9,35 @@
 //! every superfile holds a near-best document for every common term, so
 //! the sum of per-term maxima is near its ceiling everywhere. What does
 //! tell them apart is a *document* that scores on several of the query's
-//! terms, and the tier carries exactly that: each term's best documents
-//! table-wide, by impact, with the superfile and row of each.
+//! terms, and the tier carries exactly that: per superfile, each term's
+//! best documents there — its *head* — with the facts their scores are
+//! computed from, in blocks, each block followed by a *tail* that bounds
+//! every document of the superfile the block leaves unread.
 //!
-//! The merge reads the query terms' tiers in descending impact, a block
-//! at a time, and keeps per superfile and per set of terms seen (a
-//! *mask*) the best partial score of any document. Two bounds fall out:
+//! The merge proceeds in rounds. The first reads one block of every
+//! superfile for every term; each later round reads the next block of
+//! only the superfiles that are still in play. After each round, per
+//! superfile, the documents read so far are joined across the terms, and
+//! two bounds fall out:
 //!
-//! - `θ_lb`, a lower bound on the final k-th score — the k-th best score
-//!   among documents every term has reported, whose scores are therefore
-//!   final.
+//! - `θ_lb`, a lower bound on the final k-th score: the k-th best sum
+//!   among documents carrying every required term, whose scores can only
+//!   grow as more of their terms are read.
 //! - `ub(s)`, an upper bound on any document of superfile `s`: the best
-//!   over masks of a known partial score plus, for each term the mask
-//!   lacks, the *frontier* — the largest impact that term can still
-//!   contribute in `s`, which is the next unread block's maximum while the
-//!   tier is being read and the superfile's stored tail once it is not.
+//!   over its known documents of the known sum plus, for each term not yet
+//!   seen for it, that term's tail in `s`; or, for a document in no head
+//!   yet, the sum of the tails.
 //!
 //! A superfile whose `ub(s)` falls below `θ_lb` holds no document that can
-//! place in the top k and is never opened. The walk stops when reading on
-//! could exclude nothing more: every surviving superfile's bound stays at
-//! or above `θ_lb` even with its frontiers lowered all the way to its
-//! tails. The survivors open in order of their best known candidate, with
-//! `θ_lb` seeded as the shared floor, so even the first open prunes from
-//! its first block.
+//! place in the top k and is never opened. The tails fall quickly with
+//! depth on long documents, so most superfiles are ruled out after a block
+//! or two, and the survivors open in order of their best known candidate
+//! with `θ_lb` seeded as the shared floor. A superfile whose heads for
+//! every term were read to the end is answered from the index outright.
 //!
-//! Scores are rescaled from each superfile's own statistics to the
-//! query's, as the ceilings are: by the ratio of the table idf to the
-//! superfile's, and by the average-length factor — up for an upper bound,
-//! down for a lower one — so a bound stays a bound at the table's average.
+//! Scores are the kernel's own arithmetic at the table's statistics (see
+//! [`Scoring`]); keys and tails stored at a superfile's own average length
+//! are scaled to the table's as the ceilings are.
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -44,7 +45,6 @@ use std::{
     sync::Arc,
 };
 
-use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use crate::{
@@ -57,27 +57,14 @@ use crate::{
             SuperfileEntry,
             part::ContentHash,
             term_index::{
-                BLOCK_ENTRIES, Posting, SliceRun, TermIndex, TermIndexError, TierChunkRef,
-                TierDirectory, TierEntry,
+                BLOCK_ENTRIES, SliceRun, TermIndex, TermIndexError, TierChunkRef, TierDirectory,
+                TierEntry,
             },
         },
         schema::FieldId,
     },
 };
 
-/// Blocks per term a merge reads before it gives up on a threshold: a
-/// conjunction whose terms' best documents are not each other's has found
-/// fewer than `k` joint candidates in its first block of each, and reading
-/// on costs more than the opens it might save. The bounds read so far stay
-/// sound and order the opens; nothing is excluded without a threshold.
-const THRESHOLD_PROBE_BLOCKS_PER_TERM: usize = 1;
-/// Blocks in all a merge reads with a threshold but without having ruled
-/// any superfile out before it stops: on a table where every superfile
-/// holds competitive documents the bounds never fall below the threshold,
-/// and the opens then follow the bounds as they would the ceilings. A
-/// total rather than a per-term count, so a query of many terms does not
-/// read many times more before giving up.
-const EXCLUSION_PROBE_BLOCKS: usize = 8;
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
@@ -95,23 +82,10 @@ const LOWER_SLACK: f32 = 1.0 - 8.0 * f32::EPSILON;
 /// Most query terms the merge tracks masks for: masks are a bit set, and
 /// the per-superfile table has one slot per mask.
 const MAX_TIER_TERMS: usize = 6;
-/// Entries the merge reads per query before it stops regardless of the
-/// fixpoint test. On long text the test converges within a few blocks per
-/// term; on short text nearly every candidate ties, every unread block can
-/// still hold a tie, and the test never converges — on a titles table it
-/// read whole tiers of a hundred thousand entries per term and took a
-/// hundred milliseconds. What has been read by then still bounds every
-/// superfile soundly; the merge just stops refining.
-const MAX_ENTRIES_PER_QUERY: u64 = 1 << 17;
-/// Entries the merge reads when the candidates' scores are not the
-/// query's (a phrase, a negation): there is no threshold to converge on,
-/// so it reads enough to rank the superfiles and exhaust small tiers.
-const INEXACT_ENTRIES_PER_QUERY: u64 = 1 << 16;
-/// Rounds of the merge — one block each — that may pass without any
-/// frontier falling, any candidate appearing or any superfile ruled out
-/// before the merge stops: on short text the impacts tie across whole
-/// tiers, and once a round changes nothing, reading on can only add ties.
-const STALE_ROUNDS_BEFORE_STOP: u32 = 2;
+/// Entries the merge reads per query before it stops regardless of what is
+/// still in play. What has been read by then still bounds every superfile
+/// soundly; the merge just stops refining.
+const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -129,13 +103,13 @@ pub(crate) struct TierSelection {
     /// Bounds per kept superfile, keyed by superfile id.
     pub(crate) bounds: HashMap<Uuid, SuperfileBounds>,
     /// Lower bound on the final k-th score; `NEG_INFINITY` when fewer than
-    /// `k` documents were seen with every term.
+    /// `k` documents were seen with every required term.
     pub(crate) theta_lb: f32,
-    /// Per superfile the index answers for outright — every term's tier
-    /// holds the term's whole list and the merge read all of it, with
-    /// scores the kernel would compute bit for bit — its matching
-    /// documents as `(row, score)`. Such a superfile need not be opened;
-    /// tombstones still apply. Empty unless the scores are exact.
+    /// Per superfile the index answers for outright — every term's head
+    /// there was read to its end, with scores the kernel would compute bit
+    /// for bit — its matching documents as `(row, score)`. Such a superfile
+    /// need not be opened; tombstones still apply. Empty unless the scores
+    /// are exact.
     pub(crate) resolved: HashMap<Uuid, Vec<(u32, f32)>>,
     /// Tier bytes consumed: directories and block bodies.
     pub(crate) tier_bytes: u64,
@@ -143,36 +117,48 @@ pub(crate) struct TierSelection {
     pub(crate) entries_read: u64,
 }
 
-/// One tier being read: its chunks in order and where the read stands.
-struct Stream {
-    term: usize,
-    /// The tier object the chunks' offsets are relative to.
+/// One term's chunked tier in one segment: where its regions sit, and
+/// their directories once read.
+struct Source {
     object: ContentHash,
     chunks: Vec<TierChunkRef>,
-    chunk: usize,
-    block: usize,
-    /// The current chunk's directory, once read.
-    dir: Option<Arc<TierDirectory>>,
-    /// Largest scale any kept superfile applies to this term's stored
-    /// impacts, so a block maximum bounds every superfile's unread entries.
-    scale_up: f32,
+    dirs: Vec<Option<Arc<TierDirectory>>>,
 }
 
-/// Per (term, kept superfile): what the superfile can still contribute
-/// beyond the tier, and how a stored key scales into a bound there.
-#[derive(Clone, Copy, Default)]
-struct TermInFile {
-    /// Multiplies a stored key — at the superfile's own average length —
-    /// into an upper bound on a score at the table's.
-    scale_ub: f32,
-    /// Upper bound, at the table's stats, on a document the tier does not
-    /// hold.
+/// What the merge knows of one term in one kept superfile.
+#[derive(Clone)]
+struct HeadState {
+    /// Documents read so far as `(row, contribution)`, in ascending row.
+    docs: Vec<(u32, f32)>,
+    /// Upper bound, at the table's stats, on the contribution of any
+    /// document of the superfile not in `docs`. Zero once every document
+    /// is in `docs`.
     tail: f32,
-    /// Upper bound, at the table's stats, on any document of the term in
-    /// the superfile: its stored ceiling, which caps the frontier — the
-    /// best unread entry anywhere — for this superfile. Zero when the
+    /// Upper bound, at the table's stats, on the term's contribution to
+    /// any document of the superfile: its stored ceiling. Zero when the
     /// superfile holds no document of the term.
     ceiling: f32,
+    /// Blocks read so far.
+    blocks: usize,
+    /// Nothing more of the head can be read: it was read to its end, or
+    /// the superfile holds no block beyond.
+    done: bool,
+    /// Which of the term's sources holds this superfile's head, when
+    /// chunked.
+    source: Option<usize>,
+}
+
+impl HeadState {
+    fn absent() -> Self {
+        Self {
+            docs: Vec::new(),
+            tail: 0.0,
+            ceiling: 0.0,
+            blocks: 0,
+            done: true,
+            source: None,
+        }
+    }
 }
 
 /// Select superfiles for a query over `terms` with the tiers of `index`.
@@ -184,9 +170,8 @@ struct TermInFile {
 /// no threshold from them and rules out only what a required term has shown
 /// to hold nothing. `params` are the column's declared parameters, which
 /// every kept superfile scores at. `None` when a term has postings in a
-/// segment without a
-/// tier, or there are more terms than the merge tracks: the caller then
-/// orders by ceiling as before.
+/// segment without a tier, a kept superfile is not in the root, or a
+/// table-wide idf is missing: the caller then keeps its ceilings.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn select_with_tiers(
     index: &TermIndex,
@@ -210,8 +195,6 @@ pub(crate) async fn select_with_tiers(
     if kept.iter().any(|e| !listed.contains(&e.superfile_id)) {
         return Ok(None);
     }
-    // Kept superfiles by ordinal: what an entry's ordinal resolves to, and
-    // the per-superfile statistics the rescale needs.
     let mut slot_of: HashMap<Uuid, usize> = HashMap::with_capacity(kept.len());
     for (i, e) in kept.iter().enumerate() {
         slot_of.insert(e.superfile_id, i);
@@ -236,7 +219,6 @@ pub(crate) async fn select_with_tiers(
             1.0
         });
     }
-
     let scored_docs: Vec<u64> = kept
         .iter()
         .map(|e| {
@@ -247,12 +229,11 @@ pub(crate) async fn select_with_tiers(
         })
         .collect();
     let n_sf = kept.len();
-    let mut per_term: Vec<Vec<TermInFile>> = vec![vec![TermInFile::default(); n_sf]; nt];
+
     let mut idf: Vec<f32> = Vec::with_capacity(nt);
-    // Per term, whether every segment's tier holds the term's whole list.
-    let mut complete: Vec<bool> = vec![true; nt];
-    let mut streams: Vec<Stream> = Vec::new();
-    // Entries of tiers small enough to ride in their runs, with their term.
+    let mut heads: Vec<Vec<HeadState>> = vec![vec![HeadState::absent(); nt]; n_sf];
+    let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
+    let mut ordinal_of: Vec<u32> = vec![u32::MAX; n_sf];
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     for (ti, term) in terms.iter().enumerate() {
         let Some(&idf_table) = global_idf.get(*term) else {
@@ -260,16 +241,28 @@ pub(crate) async fn select_with_tiers(
         };
         idf.push(idf_table);
         let runs = index.runs(column, term).await?;
-        let mut scale_up_max = 0.0f32;
         for SliceRun { tier_object, run } in runs.iter() {
             let tier = match &run.tier {
                 Some(t) => t,
                 // Postings without a tier: this segment predates tiers or
-                // kept none for the term; no sound frontier exists for it.
+                // kept none for the term; no sound bound exists for it.
                 None if run.postings.is_empty() => continue,
                 None => return Ok(None),
             };
-            complete[ti] &= tier.complete;
+            let chunked = !tier.chunks.is_empty();
+            let source = if chunked {
+                let Some(object) = *tier_object else {
+                    return Ok(None);
+                };
+                sources[ti].push(Source {
+                    object,
+                    dirs: vec![None; tier.chunks.len()],
+                    chunks: tier.chunks.clone(),
+                });
+                Some(sources[ti].len() - 1)
+            } else {
+                None
+            };
             for p in &run.postings {
                 let Some(id) = index.superfile_id(p.superfile) else {
                     continue;
@@ -277,9 +270,10 @@ pub(crate) async fn select_with_tiers(
                 let Some(&slot) = slot_of.get(&id) else {
                     continue;
                 };
-                // The stored ceiling is an impact at the superfile's own
-                // idf; the ratio to the table's rescales it, as the ceiling
-                // path does.
+                ordinal_of[slot] = p.superfile;
+                // The stored ceiling is an impact at the superfile's own idf;
+                // the ratio to the table's rescales it, as the ceiling path
+                // does. The tail is a key at the superfile's own average.
                 let n = scored_docs[slot];
                 let local_idf = bm25_idf(n, p.df.min(n));
                 let ratio = if local_idf > 0.0 {
@@ -287,38 +281,30 @@ pub(crate) async fn select_with_tiers(
                 } else {
                     1.0
                 };
-                let entry = TermInFile {
-                    scale_ub: idf_table * scale_up[slot],
-                    tail: tail_of(p) * idf_table * scale_up[slot],
-                    ceiling: p.bound * ratio * scale_up[slot],
+                let up = scale_up[slot];
+                let ceiling = p.bound * ratio * up;
+                // A tail is a key at the superfile's own average; a build
+                // that recorded none leaves the ceiling as the bound.
+                let tail = if p.tail.is_finite() {
+                    (p.tail * idf_table * up).min(ceiling)
+                } else {
+                    ceiling
                 };
-                scale_up_max = scale_up_max.max(entry.scale_ub);
-                per_term[ti][slot] = entry;
+                heads[slot][ti] = HeadState {
+                    docs: Vec::new(),
+                    tail,
+                    ceiling,
+                    blocks: 0,
+                    done: !chunked,
+                    source,
+                };
             }
-            if tier.chunks.is_empty() {
+            if !chunked {
                 inline.extend(tier.inline.iter().map(|e| (ti, *e)));
-                continue;
             }
-            let Some(object) = *tier_object else {
-                return Ok(None);
-            };
-            streams.push(Stream {
-                term: ti,
-                object,
-                chunks: tier.chunks.clone(),
-                chunk: 0,
-                block: 0,
-                dir: None,
-                scale_up: scale_up_max,
-            });
-        }
-        // Every stream of a term bounds with the term's largest scale.
-        for s in streams.iter_mut().filter(|s| s.term == ti) {
-            s.scale_up = scale_up_max;
         }
     }
 
-    let n_masks = 1usize << nt;
     // A contribution is the kernel's own arithmetic, so a one- or two-term
     // sum is the score bit for bit (addition commutes); a longer sum can
     // land an ulp from the kernel's, which adds in its own order, so its
@@ -334,185 +320,146 @@ pub(crate) async fn select_with_tiers(
         params,
         avgdl: table_avgdl,
     };
-    let mut cands = Candidates {
-        acc: FxHashMap::default(),
-        best_lb: vec![f32::NEG_INFINITY; n_sf * n_masks],
-        best_ub: vec![f32::NEG_INFINITY; n_sf * n_masks],
-        topk: BinaryHeap::with_capacity(k + 1),
-        n_masks,
-        required,
-        k,
-        exact,
-        lb_slack,
-        ub_slack,
-    };
-    let mut theta_lb = f32::NEG_INFINITY;
-    let mut tier_bytes = 0u64;
     let mut entries_read = 0u64;
-    let mut decoded: Vec<TierEntry> = Vec::new();
-    // Frontier per term: the largest rescaled impact any unread block can
-    // hold, `None` once every stream of the term is exhausted.
-    let mut frontier: Vec<Option<f32>> = vec![Some(f32::INFINITY); nt];
-    let mut excluded = vec![false; n_sf];
-    // What the last round left behind, to tell a round that moved nothing.
-    let mut prev_frontier = frontier.clone();
-    let mut prev_candidates = 0usize;
-    let mut prev_excluded = 0usize;
-    let mut stale_rounds = 0u32;
-
-    // The inline entries are in hand before any chunk is read; they take
-    // part in the first round's threshold and exclusion like a read block.
-    entries_read += inline.len() as u64;
+    let mut tier_bytes = 0u64;
+    // Inline heads are whole: their entries are in hand before any read.
     for (ti, e) in &inline {
-        cands.absorb(*ti, e, index, &slot_of, &scoring);
+        let Some(id) = index.superfile_id(e.superfile) else {
+            continue;
+        };
+        let Some(&slot) = slot_of.get(&id) else {
+            continue;
+        };
+        heads[slot][*ti]
+            .docs
+            .push((e.doc_id, scoring.contribution(*ti, e)));
+        entries_read += 1;
+    }
+    for slot in heads.iter_mut() {
+        for h in slot.iter_mut() {
+            h.docs.sort_unstable_by_key(|d| d.0);
+        }
     }
 
-    // Each round settles what is known — threshold, frontiers, exclusions
-    // — then reads the block most likely to move them.
-    loop {
-        if let Some(min) = cands.threshold() {
-            theta_lb = min;
-        }
-        // Frontiers over the unread blocks.
-        for (ti, slot) in frontier.iter_mut().enumerate() {
-            let mut f: Option<f32> = None;
-            for s in streams.iter_mut().filter(|s| s.term == ti) {
-                if let Some(max) = next_block_max(index, s, &mut tier_bytes).await? {
-                    let scaled = max * s.scale_up;
-                    f = Some(f.map_or(scaled, |cur: f32| cur.max(scaled)));
-                }
+    let mut live: Vec<bool> = vec![true; n_sf];
+    let mut theta_lb = f32::NEG_INFINITY;
+    let mut decoded: Vec<TierEntry> = Vec::new();
+    let mut joined: Vec<(u32, u8, f32)> = Vec::new();
+    for round in 0.. {
+        // Read: the next block of every live superfile whose head goes on.
+        let mut read_any = false;
+        for slot in 0..n_sf {
+            if !live[slot] {
+                continue;
             }
-            *slot = f;
-        }
-        // Exclude what cannot compete, and test whether reading on could
-        // exclude anything more.
-        let mut can_still_shrink = false;
-        if theta_lb.is_finite() {
-            for (slot, out) in excluded.iter_mut().enumerate() {
-                if *out {
+            for ti in 0..nt {
+                let state = &heads[slot][ti];
+                if state.done {
                     continue;
                 }
-                let (ub_now, ub_floor) = bounds_of(
-                    slot,
-                    n_masks,
-                    &cands.best_ub,
-                    &per_term,
-                    &frontier,
-                    required,
+                let Some(si) = state.source else {
+                    continue;
+                };
+                let source = &mut sources[ti][si];
+                let Some(chunk) = source.chunks.get(round) else {
+                    heads[slot][ti].done = true;
+                    continue;
+                };
+                if source.dirs[round].is_none() {
+                    let dir = index.tier_directory(&source.object, chunk).await?;
+                    tier_bytes += TierDirectory::len_for(chunk.n_blocks) as u64;
+                    source.dirs[round] = Some(dir);
+                }
+                let dir = source.dirs[round].as_ref().expect("read above");
+                let Some(block) = dir.block_of(ordinal_of[slot]) else {
+                    heads[slot][ti].done = true;
+                    continue;
+                };
+                let body = index.tier_block(&source.object, chunk, dir, block).await?;
+                tier_bytes += body.len() as u64;
+                dir.decode_block(block, &body, &mut decoded)?;
+                entries_read += decoded.len() as u64;
+                let state = &mut heads[slot][ti];
+                state.docs.extend(
+                    decoded
+                        .iter()
+                        .map(|e| (e.doc_id, scoring.contribution(ti, e))),
                 );
-                if ub_now * BOUND_SLACK < theta_lb {
-                    *out = true;
-                } else if ub_floor * BOUND_SLACK < theta_lb {
-                    can_still_shrink = true;
+                state.docs.sort_unstable_by_key(|d| d.0);
+                state.blocks += 1;
+                let tail_key = dir.block_tail(block);
+                state.tail = (tail_key * scoring.idf[ti] * scale_up[slot]).min(state.ceiling);
+                if tail_key <= 0.0 || decoded.len() < BLOCK_ENTRIES {
+                    state.done = true;
+                }
+                read_any = true;
+            }
+        }
+        if round > 0 && !read_any {
+            break;
+        }
+        // Threshold: the k-th best sum over documents the query returns,
+        // across every superfile read, in play or not.
+        let mut topk: BinaryHeap<Reverse<OrdF32>> = BinaryHeap::with_capacity(k + 1);
+        for slot_heads in &heads {
+            join(slot_heads, &mut joined);
+            for &(_, mask, sum) in &joined {
+                if mask & required == required {
+                    topk.push(Reverse(OrdF32(sum * lb_slack)));
+                    if topk.len() > k {
+                        topk.pop();
+                    }
                 }
             }
-            if !can_still_shrink {
-                break;
+        }
+        if topk.len() >= k
+            && let Some(Reverse(OrdF32(min))) = topk.peek()
+        {
+            theta_lb = theta_lb.max(*min);
+        }
+        // Rule out what cannot compete.
+        if theta_lb.is_finite() {
+            for slot in 0..n_sf {
+                if !live[slot] {
+                    continue;
+                }
+                let (ub, _) = bounds_of(&heads[slot], required, ub_slack, &mut joined);
+                if ub * BOUND_SLACK < theta_lb {
+                    live[slot] = false;
+                }
             }
         }
-        let n_excluded = excluded.iter().filter(|e| **e).count();
-        let moved = frontier != prev_frontier
-            || cands.acc.len() != prev_candidates
-            || n_excluded != prev_excluded;
-        prev_frontier.clone_from(&frontier);
-        prev_candidates = cands.acc.len();
-        prev_excluded = n_excluded;
-        stale_rounds = if moved { 0 } else { stale_rounds + 1 };
-        if stale_rounds >= STALE_ROUNDS_BEFORE_STOP {
+        if !read_any || entries_read >= MAX_ENTRIES_PER_QUERY {
             break;
         }
-        let cap = if exact {
-            MAX_ENTRIES_PER_QUERY
-        } else {
-            INEXACT_ENTRIES_PER_QUERY
-        };
-        if entries_read >= cap {
-            break;
-        }
-        let probe = (THRESHOLD_PROBE_BLOCKS_PER_TERM * BLOCK_ENTRIES * nt) as u64;
-        if !theta_lb.is_finite() && entries_read >= probe {
-            break;
-        }
-        let probe = (EXCLUSION_PROBE_BLOCKS * BLOCK_ENTRIES) as u64;
-        if n_excluded == 0 && entries_read >= probe {
-            break;
-        }
-        // The stream whose next block has the highest (scaled) maximum.
-        let mut pick: Option<(usize, f32)> = None;
-        for (si, s) in streams.iter_mut().enumerate() {
-            let Some(max) = next_block_max(index, s, &mut tier_bytes).await? else {
-                continue;
-            };
-            let scaled = max * s.scale_up;
-            if pick.is_none_or(|(_, m)| scaled > m) {
-                pick = Some((si, scaled));
-            }
-        }
-        let Some((si, _)) = pick else {
-            break;
-        };
-        let s = &mut streams[si];
-        let dir = s
-            .dir
-            .as_ref()
-            .expect("a stream with a next block has its directory");
-        let body = index
-            .tier_block(&s.object, &s.chunks[s.chunk], dir, s.block)
-            .await?;
-        tier_bytes += body.len() as u64;
-        dir.decode_block(s.block, &body, &mut decoded)?;
-        entries_read += decoded.len() as u64;
-        for e in &decoded {
-            cands.absorb(s.term, e, index, &slot_of, &scoring);
-        }
-        s.block += 1;
     }
 
     let mut bounds = HashMap::with_capacity(n_sf);
-    for (slot, e) in kept.iter().enumerate() {
-        let (ub_now, _) = bounds_of(
-            slot,
-            n_masks,
-            &cands.best_ub,
-            &per_term,
-            &frontier,
-            required,
-        );
-        let ub = if excluded[slot] {
-            f32::NEG_INFINITY
-        } else {
-            ub_now
-        };
-        let mut lb = f32::NEG_INFINITY;
-        for m in 1..n_masks {
-            if m as u8 & required != required {
-                continue;
-            }
-            lb = lb.max(cands.best_lb[slot * n_masks + m]);
-        }
-        bounds.insert(e.superfile_id, SuperfileBounds { lb, ub });
-    }
-    // With every term's whole list read and every score exact, the index
-    // knows each superfile's matching documents and their scores: the
-    // candidates carrying the required terms, as the kernel would find and
-    // score them.
     let mut resolved: HashMap<Uuid, Vec<(u32, f32)>> = HashMap::new();
-    let all_read = complete.iter().all(|c| *c) && frontier.iter().all(Option::is_none);
-    if exact_scores && all_read {
-        for (&(ordinal, doc_id), &(mask, sum)) in &cands.acc {
-            if mask & required != required {
-                continue;
-            }
-            let Some(id) = index.superfile_id(ordinal) else {
-                continue;
-            };
-            if slot_of.contains_key(&id) {
-                resolved.entry(id).or_default().push((doc_id, sum));
-            }
-        }
-        // A kept superfile no candidate names holds no match at all.
-        for e in kept {
-            resolved.entry(e.superfile_id).or_default();
+    for (slot, e) in kept.iter().enumerate() {
+        let (ub, lb) = bounds_of(&heads[slot], required, ub_slack, &mut joined);
+        let ub = if live[slot] { ub } else { f32::NEG_INFINITY };
+        bounds.insert(
+            e.superfile_id,
+            SuperfileBounds {
+                lb: lb * lb_slack,
+                ub,
+            },
+        );
+        // Every head read to its end, and the sums exact: the superfile's
+        // matching documents are its candidates carrying the required
+        // terms, scored as the kernel would score them.
+        let whole = heads[slot].iter().all(|h| h.done && h.tail <= 0.0);
+        if exact_scores && whole {
+            join(&heads[slot], &mut joined);
+            resolved.insert(
+                e.superfile_id,
+                joined
+                    .iter()
+                    .filter(|(_, mask, _)| mask & required == required)
+                    .map(|&(doc, _, sum)| (doc, sum))
+                    .collect(),
+            );
         }
     }
     Ok(Some(TierSelection {
@@ -522,6 +469,69 @@ pub(crate) async fn select_with_tiers(
         tier_bytes,
         entries_read,
     }))
+}
+
+/// Join one superfile's heads across the terms: per document read under
+/// any term, the terms it was read under and its summed contributions, in
+/// ascending row.
+fn join(heads: &[HeadState], out: &mut Vec<(u32, u8, f32)>) {
+    out.clear();
+    let mut at: Vec<usize> = vec![0; heads.len()];
+    loop {
+        let mut next: Option<u32> = None;
+        for (ti, h) in heads.iter().enumerate() {
+            if let Some(&(doc, _)) = h.docs.get(at[ti]) {
+                next = Some(next.map_or(doc, |n: u32| n.min(doc)));
+            }
+        }
+        let Some(doc) = next else { break };
+        let mut mask = 0u8;
+        let mut sum = 0.0f32;
+        for (ti, h) in heads.iter().enumerate() {
+            if let Some(&(d, c)) = h.docs.get(at[ti])
+                && d == doc
+            {
+                mask |= 1 << ti;
+                sum += c;
+                at[ti] += 1;
+            }
+        }
+        out.push((doc, mask, sum));
+    }
+}
+
+/// `(upper bound, lower bound)` on the score of a document of one
+/// superfile, from what has been read of it: a document read under some
+/// terms scores at most its known sum plus the tails of the terms it has
+/// not been read under; one read under none at most the sum of the tails.
+/// A superfile that lacks a required term holds no match at all. The lower
+/// bound is the best known sum of a document carrying every required term.
+fn bounds_of(
+    heads: &[HeadState],
+    required: u8,
+    ub_slack: f32,
+    joined: &mut Vec<(u32, u8, f32)>,
+) -> (f32, f32) {
+    for (ti, h) in heads.iter().enumerate() {
+        if required & (1 << ti) != 0 && h.ceiling <= 0.0 && h.docs.is_empty() {
+            return (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        }
+    }
+    let tails: Vec<f32> = heads.iter().map(|h| h.tail).collect();
+    let mut ub: f32 = tails.iter().sum();
+    let mut lb = f32::NEG_INFINITY;
+    join(heads, joined);
+    for &(_, mask, sum) in joined.iter() {
+        let missing: f32 = (0..heads.len())
+            .filter(|t| mask & (1 << t) == 0)
+            .map(|t| tails[t])
+            .sum();
+        ub = ub.max(sum * ub_slack + missing);
+        if mask & required == required {
+            lb = lb.max(sum);
+        }
+    }
+    (ub, lb)
 }
 
 /// How a tier entry's contribution to a query is computed: the kernel's
@@ -551,174 +561,6 @@ fn baked_avgdl_of(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
         .get(&column)
         .and_then(|s| s.baked_avgdl)
         .filter(|b| *b > 0.0)
-}
-
-/// What the merge knows of the documents the tiers have shown it.
-struct Candidates {
-    /// Per (superfile ordinal, row): the terms seen and their summed
-    /// contributions.
-    acc: FxHashMap<(u32, u32), (u8, f32)>,
-    /// Per superfile, per term mask: best known lower-bound sum.
-    best_lb: Vec<f32>,
-    /// Per superfile, per term mask: best known upper-bound sum.
-    best_ub: Vec<f32>,
-    /// The `k` best lower bounds among documents carrying every term.
-    topk: BinaryHeap<Reverse<OrdF32>>,
-    n_masks: usize,
-    /// The mask of the terms a matching document must carry.
-    required: u8,
-    k: usize,
-    /// Whether a candidate's sum is a score the query gives.
-    exact: bool,
-    /// What a sum is narrowed and widened by for its lower and upper bound:
-    /// one when the sum is the kernel's bit for bit.
-    lb_slack: f32,
-    ub_slack: f32,
-}
-
-impl Candidates {
-    /// Fold one tier entry of term `ti` in.
-    fn absorb(
-        &mut self,
-        ti: usize,
-        e: &TierEntry,
-        index: &TermIndex,
-        slot_of: &HashMap<Uuid, usize>,
-        scoring: &Scoring,
-    ) {
-        let Some(id) = index.superfile_id(e.superfile) else {
-            return;
-        };
-        let Some(&slot) = slot_of.get(&id) else {
-            return;
-        };
-        let mut fresh = false;
-        let cand = self.acc.entry((e.superfile, e.doc_id)).or_insert_with(|| {
-            fresh = true;
-            (0, 0.0)
-        });
-        let before = cand.0;
-        cand.0 |= 1 << ti;
-        cand.1 += scoring.contribution(ti, e);
-        let (lb, ub) = (cand.1 * self.lb_slack, cand.1 * self.ub_slack);
-        let at = slot * self.n_masks + cand.0 as usize;
-        if lb > self.best_lb[at] {
-            self.best_lb[at] = lb;
-        }
-        if ub > self.best_ub[at] {
-            self.best_ub[at] = ub;
-        }
-        // A candidate carrying every required term is a document the query
-        // returns, and its contributions so far are a lower bound on its
-        // score: for a disjunction any candidate, for a conjunction one
-        // with every term, for a mix one with every must. It enters the
-        // threshold heap once, when it first qualifies — the heap counts
-        // documents, and a document that grew later would otherwise hold
-        // two of the `k` places and raise the threshold past the k-th.
-        let qualifies = |mask: u8| mask & self.required == self.required;
-        if self.exact && (fresh || !qualifies(before)) && qualifies(cand.0) {
-            self.topk.push(Reverse(OrdF32(lb)));
-            if self.topk.len() > self.k {
-                self.topk.pop();
-            }
-        }
-    }
-
-    /// The k-th best lower bound among candidates carrying the required
-    /// terms, once `k` have been seen.
-    fn threshold(&self) -> Option<f32> {
-        if self.topk.len() < self.k {
-            return None;
-        }
-        self.topk.peek().map(|Reverse(OrdF32(min))| *min)
-    }
-}
-
-/// The upper bound on a document a posting's tier does not hold: the
-/// stored tail, or the bound when the build recorded no tail.
-fn tail_of(p: &Posting) -> f32 {
-    if p.tail.is_finite() { p.tail } else { p.bound }
-}
-
-/// `(bound now, bound with every frontier lowered to the tails)` for one
-/// superfile: the best over masks of a known partial plus what the missing
-/// terms can still add, and the sum over all terms for a document outside
-/// every tier.
-/// A superfile's upper bounds: `now`, with every unread block still able
-/// to hold a term's best document, and `floor`, as if every stream were
-/// exhausted and only the tails remained — what further reading can at
-/// best bring the bound down to.
-///
-/// A candidate missing a required term only exists if that term still has
-/// documents in the superfile the merge has not seen: unread blocks, or a
-/// tail above zero. A term whose streams are exhausted with a zero tail
-/// has shown every document it has there, so a candidate without it is no
-/// candidate at all.
-fn bounds_of(
-    slot: usize,
-    n_masks: usize,
-    best_ub: &[f32],
-    per_term: &[Vec<TermInFile>],
-    frontier: &[Option<f32>],
-    required: u8,
-) -> (f32, f32) {
-    let add = |mask: usize, at_tails: bool| -> f32 {
-        let mut sum = 0.0f32;
-        for (ti, pt) in per_term.iter().enumerate() {
-            if mask & (1 << ti) != 0 {
-                continue;
-            }
-            let TermInFile { tail, ceiling, .. } = pt[slot];
-            // The frontier bounds every unread entry anywhere; the
-            // superfile's own ceiling bounds its documents, so the lesser
-            // holds. A superfile without the term has a ceiling of zero.
-            let unread = match (at_tails, frontier[ti]) {
-                (false, Some(f)) => f.max(tail).min(ceiling),
-                _ => tail,
-            };
-            let needed = required & (1 << ti) != 0;
-            if needed && unread <= 0.0 && (at_tails || frontier[ti].is_none() || ceiling <= 0.0) {
-                return f32::NEG_INFINITY;
-            }
-            sum += unread;
-        }
-        sum
-    };
-    let mut now = add(0, false);
-    let mut floor = add(0, true);
-    for m in 1..n_masks {
-        let v = best_ub[slot * n_masks + m];
-        if v > f32::NEG_INFINITY {
-            now = now.max(v + add(m, false));
-            floor = floor.max(v + add(m, true));
-        }
-    }
-    (now, floor)
-}
-
-/// The next unread block's maximum impact in `s`, reading the directory
-/// of the chunk that holds it; `None` once the stream is exhausted.
-async fn next_block_max(
-    index: &TermIndex,
-    s: &mut Stream,
-    tier_bytes: &mut u64,
-) -> Result<Option<f32>, TermIndexError> {
-    loop {
-        let Some(chunk_ref) = s.chunks.get(s.chunk) else {
-            return Ok(None);
-        };
-        if s.dir.is_none() {
-            s.dir = Some(index.tier_directory(&s.object, chunk_ref).await?);
-            *tier_bytes += TierDirectory::len_for(chunk_ref.n_entries) as u64;
-        }
-        let dir = s.dir.as_ref().expect("read above");
-        if s.block < dir.n_blocks() {
-            return Ok(Some(dir.block_max(s.block)));
-        }
-        s.chunk += 1;
-        s.block = 0;
-        s.dir = None;
-    }
 }
 
 /// Total-order wrapper for the threshold heap.

@@ -2840,7 +2840,6 @@ impl SupertableWriter {
         // superfiles, and pre-drain queries fall back to them.
         // The shard build is the append's own CPU — measured on the pool
         // threads that run it, folded into the op's collector.
-        let superfiles_after = manifest.superfiles.len() + shards.len();
         let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
             build_one_shard_with_layout(
                 slice.as_slice(),
@@ -2848,7 +2847,6 @@ impl SupertableWriter {
                 &manifest,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
-                superfiles_after,
             )
         })?;
         let superfiles = outputs.len();
@@ -2941,7 +2939,6 @@ impl SupertableWriter {
                                 contributions,
                                 &self.inner.options.term_index_build_policy(
                                     self.inner.manifest.load().n_docs_total(),
-                                    self.inner.manifest.load().superfiles.len() as u64,
                                 ),
                                 base,
                                 true,
@@ -3090,16 +3087,12 @@ fn reserve_build_scratch(
 /// vector layout override. Runs on a rayon worker thread inside the writer
 /// pool's `install`. The commit path always passes an explicit layout +
 /// optional global centroids.
-/// `superfiles_after` is how many superfiles the table holds once the
-/// commit this shard belongs to lands; it sizes the head each term
-/// contributes to the term index (see [`build_term_contribution`]).
 fn build_one_shard_with_layout(
     slice: &[BufferedBatch],
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
     vector_layout: crate::superfile::vector::layout::VectorLayout,
     provided_centroids: Option<std::sync::Arc<[f32]>>,
-    superfiles_after: usize,
 ) -> Result<ShardOutput, BuildError> {
     let options = &inner.options;
     let mut builder = SuperfileBuilder::new(
@@ -3110,7 +3103,7 @@ fn build_one_shard_with_layout(
     // The term-index contribution is gathered as the postings are written
     // rather than read back from the finished superfile.
     let superfile_id = Uuid::new_v4();
-    let head_sink = term_head_sink_for(manifest, superfiles_after)?;
+    let head_sink = term_head_sink_for(manifest)?;
     if let Some((sink, depth)) = &head_sink {
         builder.set_term_head_sink(Box::new(sink.clone()), *depth);
     }
@@ -3208,7 +3201,6 @@ fn build_one_shard_with_layout(
 /// column the table does not have contributes nothing.
 pub(in crate::supertable) fn term_head_sink_for(
     manifest: &ManifestSnapshot,
-    superfiles_after: usize,
 ) -> Result<Option<(term_index::HeadSink, usize)>, BuildError> {
     if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
         return Ok(None);
@@ -3220,7 +3212,7 @@ pub(in crate::supertable) fn term_head_sink_for(
         .collect();
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total(), superfiles_after as u64);
+        .term_index_build_policy(manifest.n_docs_total());
     let sink = term_index::HeadSink::new(columns).map_err(|e| BuildError::Store(e.to_string()))?;
     Ok(Some((sink, policy.head_depth_per_superfile)))
 }
@@ -3755,17 +3747,13 @@ pub(crate) fn build_fts_summary(
 /// `df` and where its postings sit. The reader's source is the bytes just
 /// built, so the awaited calls resolve without I/O; the bridge only lends
 /// them an executor from this synchronous prepare path. Every term carries
-/// its score ceiling in this superfile, at the superfile's own statistics.
-/// `superfiles_after` is how many superfiles the table holds once this
-/// commit lands: the head depth each superfile contributes per term is its
-/// share of the tier budget, and a first commit of many superfiles would
-/// otherwise contribute as if each were the whole table.
+/// its score ceiling in this superfile, at the superfile's own statistics,
+/// and its head to the policy's depth.
 pub(in crate::supertable) fn build_term_contribution(
     reader: &SuperfileReader,
     manifest: &ManifestSnapshot,
     superfile_id: Uuid,
     id_min: i128,
-    superfiles_after: usize,
 ) -> Result<Option<TermContribution>, BuildError> {
     // No storage, or no text columns: no term index to publish into.
     if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
@@ -3779,7 +3767,7 @@ pub(in crate::supertable) fn build_term_contribution(
         &mut writer,
         &manifest
             .options
-            .term_index_build_policy(manifest.n_docs_total(), superfiles_after as u64),
+            .term_index_build_policy(manifest.n_docs_total()),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -3916,8 +3904,7 @@ pub(super) fn prepare_superfile(
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     let manifest = inner.manifest.load();
-    let after = manifest.superfiles.len() + 1;
-    prepare_superfile_named(inner, &manifest, shard, None, after)
+    prepare_superfile_named(inner, &manifest, shard, None)
 }
 
 /// [`prepare_superfile`] with the source stem the entry carries: `Some`
@@ -3929,7 +3916,6 @@ pub(super) fn prepare_superfile_named(
     manifest: &ManifestSnapshot,
     shard: ShardOutput,
     stem: Option<&str>,
-    superfiles_after: usize,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
     if shard.n_docs == 0 {
         return Ok(None);
@@ -4020,13 +4006,7 @@ pub(super) fn prepare_superfile_named(
     // one that did not has it read from the finished bytes.
     let term_contribution = match shard.term_contribution {
         Some(contribution) => Some(contribution),
-        None => build_term_contribution(
-            &reader,
-            manifest,
-            entry.superfile_id,
-            entry.id_min,
-            superfiles_after,
-        )?,
+        None => build_term_contribution(&reader, manifest, entry.superfile_id, entry.id_min)?,
     };
     Ok(Some(PreparedSuperfile {
         entry,
@@ -4265,8 +4245,7 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
     let scalar_stats = ScalarStatsAgg::from_batches(&batch.schema(), &[&batch]);
     let shard = ShardOutput::new_with_params(bytes, reader.n_docs(), id_min, id_max, scalar_stats);
     let manifest = inner.manifest.load();
-    let after = manifest.superfiles.len() + 1;
-    let prepared = prepare_superfile_named(inner, &manifest, shard, None, after)?
+    let prepared = prepare_superfile_named(inner, &manifest, shard, None)?
         .ok_or_else(|| BuildError::Store("built superfile holds no rows".into()))?;
     let publish = collect_prepared_superfiles(inner, vec![prepared])?;
     st.block_on_query(persist_superfile_publish_batch_async(
@@ -4319,12 +4298,11 @@ fn prepare_user_superfile_batch_in_scope(
             hints.len()
         )));
     }
-    let after = manifest.superfiles.len() + outputs.len();
     let prepared: Vec<PreparedSuperfile> = outputs
         .into_par_iter()
         .zip(hints.into_par_iter())
-        .filter_map(|(shard, hint)| {
-            match prepare_superfile_named(inner, manifest, shard, stem, after) {
+        .filter_map(
+            |(shard, hint)| match prepare_superfile_named(inner, manifest, shard, stem) {
                 Ok(Some(p)) => {
                     Some(
                         finish_superfile_entry(p.entry, hint).map(|entry| PreparedSuperfile {
@@ -4338,8 +4316,8 @@ fn prepare_user_superfile_batch_in_scope(
                 }
                 Ok(None) => None,
                 Err(e) => Some(Err(e)),
-            }
-        })
+            },
+        )
         .collect::<Result<Vec<_>, _>>()?;
     collect_prepared_superfiles(inner, prepared)
 }
@@ -7717,9 +7695,7 @@ fn commit_shards_via_drain(
             let Some(output) = output else {
                 return Ok(None);
             };
-            let after = manifest.superfiles.len() + n_packed_shards;
-            let Some(prepared) = prepare_superfile_named(inner, manifest, output, stem, after)?
-            else {
+            let Some(prepared) = prepare_superfile_named(inner, manifest, output, stem)? else {
                 return Ok(None);
             };
             let PreparedSuperfile {
@@ -11190,7 +11166,7 @@ async fn merge_term_index(
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
+        .term_index_build_policy(manifest.n_docs_total());
     let scratch = term_index_scratch()?;
     // Superfiles no segment lists get one segment of their own, numbered
     // past the ones `current` lists, and merge like the rest.
@@ -11333,7 +11309,7 @@ async fn fold_term_index(
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
+        .term_index_build_policy(manifest.n_docs_total());
     let policy = term_index::BuildPolicy {
         scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
         ..policy
@@ -11377,7 +11353,7 @@ async fn collect_and_build_term_index(
         &contributions,
         &manifest
             .options
-            .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64),
+            .term_index_build_policy(manifest.n_docs_total()),
     )
 }
 
@@ -11450,7 +11426,7 @@ async fn collect_contributions(
     let legacy = manifest.options.legacy_names();
     let policy = manifest
         .options
-        .term_index_build_policy(manifest.n_docs_total(), manifest.superfiles.len() as u64);
+        .term_index_build_policy(manifest.n_docs_total());
     let width = available_memory_bytes().map_or(CONTRIBUTION_WALKS_FALLBACK, |bytes| {
         ((bytes / CONTRIBUTION_WALK_BYTES) as usize).clamp(1, CONTRIBUTION_WALKS_MAX)
     });
@@ -12558,10 +12534,9 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let policy = current_manifest.options.term_index_build_policy(
-            current_manifest.n_docs_total(),
-            (current_manifest.superfiles.len() + new_entries.len()) as u64,
-        );
+        let policy = current_manifest
+            .options
+            .term_index_build_policy(current_manifest.n_docs_total());
         let store = storage.as_ref();
         let reference = async move {
             match reserved_segment {

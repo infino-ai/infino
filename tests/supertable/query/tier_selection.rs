@@ -82,6 +82,13 @@ fn document(global: usize) -> String {
 }
 
 fn table(dir: &TempDir, tiers: bool) -> Supertable {
+    table_with(dir, tiers, None)
+}
+
+/// A table with or without tiers, and with each superfile's head per term
+/// cut to `depth` when given: at 64 a common term's heads are read block by
+/// block and bounded by their tails rather than read whole.
+fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     // Positions, so a phrase query is among the shapes compared.
@@ -92,6 +99,9 @@ fn table(dir: &TempDir, tiers: bool) -> Supertable {
         .with_storage(storage);
     if !tiers {
         options = options.with_term_tier_entries_per_term(0);
+    }
+    if let Some(depth) = depth {
+        options = options.with_term_head_depth(depth);
     }
     let st = Supertable::create(options).expect("create");
     let mut w = st.writer().expect("writer");
@@ -278,6 +288,54 @@ fn a_resolved_superfile_respects_tombstones() {
         );
         assert_eq!(opened, 0, "k={k}: still answered from the index");
     }
+}
+
+/// With every superfile's head cut to 64 documents, a common term's head
+/// is read a block at a time and the superfiles it cannot rule out are
+/// opened — and the answer is still hit for hit the ceiling path's, at
+/// every k, for every shape. The heads of rare terms stay whole, so their
+/// conjunction is still answered in the index.
+#[test]
+fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
+    const DEPTH: usize = 64;
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table_with(&with_dir, true, Some(DEPTH));
+    let without = table(&without_dir, false);
+    for (query, mode) in queries() {
+        for k in KS {
+            let (a, opened_with, _) = run(&with, &query, mode, k);
+            let (b, opened_without, _) = run(&without, &query, mode, k);
+            assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer at depth 64");
+            assert!(
+                opened_with <= opened_without,
+                "{query:?} {mode:?} k={k}: opened {opened_with} with heads, {opened_without} without"
+            );
+        }
+    }
+    let (hits, opened, _) = run(&with, "quokka tensor", BoolMode::And, 10);
+    assert!(!hits.is_empty());
+    assert_eq!(
+        opened, 0,
+        "the rare conjunction is still answered in the index"
+    );
+    let (_, stats) = with_op_stats(|| {
+        with.reader()
+            .expect("reader")
+            .bm25_hits(
+                "body",
+                "the data",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
+            )
+            .expect("search")
+    });
+    let held = (2 * SUPERFILES * DEPTH) as u64;
+    assert!(
+        stats.tier_entries <= held,
+        "a common pair reads at most the cut heads: {} entries",
+        stats.tier_entries
+    );
 }
 
 /// A conjunction of two complete-tier terms that never share a document

@@ -1,28 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! A term's *tier*: its best documents table-wide, by impact, so a ranked
-//! query can find the documents that hold several of its terms — and
-//! bound every superfile — before opening any superfile.
-//!
-//! A tier is a sequence of entries `(superfile ordinal, local doc id,
-//! term frequency, quantized length)` in descending *key* — the length-
+//! A term's *tier*: per superfile, the term's best documents there — its
+//! *head* — as `(local doc id, term frequency, quantized length)`, the
+//! facts a score is computed from, in descending *key* (the length-
 //! normalized term frequency `tf / (tf + k1·(1 − b + b·dl/avgdl))`, the
-//! factor a BM25 score multiplies the term's idf by — cut into blocks of
-//! [`BLOCK_ENTRIES`]
-//! and the blocks into *chunks* of at most [`CHUNK_TARGET_BYTES`], read
-//! in order and usually only in part: a query stops once the blocks it
-//! has read bound everything it has not. The chunks of every term in a
-//! slice sit back to back in that slice's tier object, so a run names its
-//! chunks by offset. A query reads a chunk's directory with one ranged
-//! fetch — sized from the entry count the run records, every block but
-//! the last being full — and then only the blocks it consumes, each with
-//! its own fetch; the directory and each block carry their own CRC, so a
-//! read of either verifies on its own.
+//! factor a BM25 score multiplies the term's idf by). A head is cut into
+//! blocks of [`BLOCK_ENTRIES`]; the chunks of a term's tier are *regions*:
+//! region `r` holds block `r` of every superfile whose head reaches that
+//! deep, in ascending superfile ordinal, so a query reads the first block
+//! of every superfile with one ranged fetch, and deepens one superfile at a
+//! time with a fetch of its next block alone. Each block's directory entry
+//! carries the superfile's ordinal, the block's largest key and its *tail*:
+//! the key of the first entry past the block (or, past the head, the key
+//! of the best document the head left out), so what a superfile can still
+//! hold beyond what was read is bounded from the directory alone.
+//!
+//! The chunks of every term in a slice sit back to back in that slice's
+//! tier object, so a run names its chunks by offset. A query reads a
+//! chunk's directory with one ranged fetch — sized from the block count the
+//! run records — and then only the blocks it consumes; the directory and
+//! each block carry their own CRC, so a read of either verifies on its own.
 //!
 //! ```text
 //! chunk: n_blocks u32 | directory crc32c u32
-//!        | per block: max_impact f32 | n_entries u16 | byte_len u32 | crc32c u32
+//!        | per block: ordinal u32 | max_key f32 | tail f32 | n_entries u16 | byte_len u32 | crc32c u32
 //!        | block bodies back to back
 //! block: ordinal_bits u8 | lid_bits u8 | tf_bits u8 | len_bits u8
 //!        | ordinals, bit-packed sorted deltas | local ids, bit-packed
@@ -32,25 +34,22 @@
 //! A chunk's layout is versioned by the slice that names it, so it carries
 //! no magic of its own. Each stream is packed in lanes of [`LANE`] values
 //! by the SIMD packer, and the block's final partial lane densely at the
-//! same width: most terms' tiers are a handful of entries, and a lane
-//! padded to full width would cost them a hundred times their size.
+//! same width: most heads are a handful of entries, and a lane padded to
+//! full width would cost them a hundred times their size. A block holds
+//! one superfile's entries, so its ordinal stream packs to nothing.
 //!
-//! Inside a block the entries are stored sorted by `(ordinal, local id)`
-//! — the block is always consumed whole, so its internal order carries
-//! no information and the sorted ordinals pack to a few bits.
+//! Inside a block the entries are stored sorted by local id — the block is
+//! always consumed whole, and a sorted block merges with another term's by
+//! a linear walk.
 //!
-//! An entry stores the facts a score is computed from, not a score: a
-//! term frequency and the one-byte length bucket the superfile itself
-//! scores the document at. A reader then computes the document's score
-//! for a query exactly as the superfile's kernel would — the table's idf
-//! times `tf / (tf + norm)` with the same quantized length and average —
-//! so a candidate the tier names needs no opening to be scored, and a
+//! An entry stores facts, not a score: a reader computes the document's
+//! score for a query exactly as the superfile's kernel would — the table's
+//! idf times `tf / (tf + norm)` with the same quantized length and average
+//! — so a candidate the tier names needs no opening to be scored, and a
 //! merge re-cuts tiers at any average length without loosening a bound.
-//! The ordering key, and the directory's per-block maximum that bounds
-//! every entry of its block and of the blocks after it, are computed at
-//! the average length and parameters the slice records for the column
-//! ([`ColumnScoring`]); a reader scales a maximum to the table's average
-//! as it scales any stored ceiling.
+//! Keys, maxima and tails are at the entry's superfile's own average length
+//! and the column's parameters ([`ColumnScoring`]); a reader scales them to
+//! the table's average as it scales any stored ceiling.
 
 use std::ops::Range;
 
@@ -74,18 +73,17 @@ use crate::{
 /// table's average, so a build is expected to pass the real one.
 const DEFAULT_KEY_AVGDL: f32 = 1.0;
 
-/// Entries per block, the unit a reader consumes at a time. A multiple of
-/// the bit-packer's lane width.
-pub(crate) const BLOCK_ENTRIES: usize = 4096;
-/// Bytes a chunk grows to before the next block starts a new one. A query
-/// at small `k` reads one or two chunks per term.
-pub(crate) const CHUNK_TARGET_BYTES: usize = 4 * 1024 * 1024;
+/// Entries per block: one superfile's slice of its head, the unit a reader
+/// consumes at a time. A query's first round reads one block per superfile
+/// per term, so this sets that round's cost; its later rounds deepen one
+/// block at a time.
+pub(crate) const BLOCK_ENTRIES: usize = 64;
 const LANE: usize = BitPacker4x::BLOCK_LEN;
 const CHUNK_HEADER_LEN: usize = 4 + 4;
 /// Where the directory's CRC sits in the header: over the directory
 /// entries that follow it.
 const CRC_AT: usize = 4;
-const DIRECTORY_ENTRY_LEN: usize = 4 + 2 + 4 + 4;
+const DIRECTORY_ENTRY_LEN: usize = 4 + 4 + 4 + 2 + 4 + 4;
 const BLOCK_HEADER_LEN: usize = 4;
 
 /// One tier entry.
@@ -128,20 +126,32 @@ impl ColumnScoring {
     }
 }
 
-/// Where one chunk of a term's tier sits in its slice's tier object and
-/// how much of the tier it holds, so a prefix read fetches only the chunks
-/// it needs.
+/// Where one chunk — one region — of a term's tier sits in its slice's
+/// tier object, how many entries and blocks it holds, so a read of its
+/// directory is sized before a byte of it is fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TierChunkRef {
     pub(crate) offset: u64,
     pub(crate) len: u64,
     pub(crate) n_entries: u64,
+    pub(crate) n_blocks: u32,
 }
 
 /// One encoded chunk before it is placed in a tier object.
 pub(crate) struct EncodedChunk {
     pub(crate) n_entries: u64,
+    pub(crate) n_blocks: u32,
     pub(crate) bytes: Vec<u8>,
+}
+
+/// One superfile's head of a term, as the build hands it to the encoder:
+/// entries in descending key with their keys, and the tail — the key of the
+/// best document of the superfile the head leaves out, zero when none.
+pub(crate) struct HeadGroup {
+    pub(crate) ordinal: u32,
+    pub(crate) entries: Vec<TierEntry>,
+    pub(crate) keys: Vec<f32>,
+    pub(crate) tail: f32,
 }
 
 /// A chunk's block directory: where each block sits in the chunk, its
@@ -161,7 +171,11 @@ pub(crate) struct TierChunk<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct BlockDir {
+    /// The superfile whose head the block is a slice of.
+    ordinal: u32,
     max_key: f32,
+    /// Bound on every entry of the superfile past this block.
+    tail: f32,
     n_entries: u32,
     /// Byte offset of the body from the chunk's start.
     offset: usize,
@@ -173,60 +187,69 @@ fn malformed(what: &str) -> TermIndexError {
     TermIndexError::Malformed(format!("tier chunk: {what}"))
 }
 
-/// Cut `entries` — in descending key, `keys` alongside — into blocks and
-/// chunks. Returns each chunk's bytes with its entry count, in tier order.
-pub(crate) fn encode_tier(entries: &[TierEntry], keys: &[f32]) -> Vec<EncodedChunk> {
-    debug_assert_eq!(entries.len(), keys.len());
+/// Cut each superfile's head into blocks and lay the blocks out in regions:
+/// region `r` holds block `r` of every group that reaches that deep, in
+/// ascending ordinal. `groups` must be in ascending ordinal, each in
+/// descending key. Returns one encoded chunk per region, in order.
+pub(crate) fn encode_tier(groups: &[HeadGroup]) -> Vec<EncodedChunk> {
     debug_assert!(
-        keys.windows(2).all(|w| w[0] >= w[1]),
-        "tier entries must be in descending key"
+        groups.windows(2).all(|w| w[0].ordinal < w[1].ordinal),
+        "head groups must be in ascending ordinal"
+    );
+    debug_assert!(
+        groups
+            .iter()
+            .all(|g| g.keys.len() == g.entries.len() && g.keys.windows(2).all(|w| w[0] >= w[1])),
+        "a head is in descending key"
     );
     let mut chunks = Vec::new();
-    let mut blocks: Vec<(BlockDir, Vec<u8>)> = Vec::new();
-    let mut chunk_bytes = 0usize;
     let mut scratch = vec![0u8; LANE * 4];
-    let flush = |blocks: &mut Vec<(BlockDir, Vec<u8>)>, chunks: &mut Vec<EncodedChunk>| {
-        if blocks.is_empty() {
-            return;
+    let deepest = groups.iter().map(|g| g.entries.len()).max().unwrap_or(0);
+    for r in 0..deepest.div_ceil(BLOCK_ENTRIES) {
+        let from = r * BLOCK_ENTRIES;
+        let mut blocks: Vec<(BlockDir, Vec<u8>)> = Vec::new();
+        for g in groups.iter().filter(|g| g.entries.len() > from) {
+            let to = (from + BLOCK_ENTRIES).min(g.entries.len());
+            let (mut dir, body) =
+                encode_block(&g.entries[from..to], &g.keys[from..to], &mut scratch);
+            dir.ordinal = g.ordinal;
+            dir.tail = g.keys.get(to).copied().unwrap_or(g.tail);
+            blocks.push((dir, body));
         }
-        let n_entries: u64 = blocks.iter().map(|(d, _)| d.n_entries as u64).sum();
-        let mut out = Vec::with_capacity(
-            CHUNK_HEADER_LEN
-                + blocks.len() * DIRECTORY_ENTRY_LEN
-                + blocks.iter().map(|(_, b)| b.len()).sum::<usize>(),
-        );
-        out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
-        out.extend_from_slice(&0u32.to_le_bytes());
-        for (d, body) in blocks.iter() {
-            out.extend_from_slice(&d.max_key.to_le_bytes());
-            out.extend_from_slice(&(d.n_entries as u16).to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&crc32c(body).to_le_bytes());
-        }
-        let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
-        out[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
-        for (_, body) in blocks.drain(..) {
-            out.extend_from_slice(&body);
-        }
-        chunks.push(EncodedChunk {
-            n_entries,
-            bytes: out,
-        });
-    };
-    for (block, block_keys) in entries
-        .chunks(BLOCK_ENTRIES)
-        .zip(keys.chunks(BLOCK_ENTRIES))
-    {
-        let (dir, body) = encode_block(block, block_keys, &mut scratch);
-        if chunk_bytes > 0 && chunk_bytes + body.len() > CHUNK_TARGET_BYTES {
-            flush(&mut blocks, &mut chunks);
-            chunk_bytes = 0;
-        }
-        chunk_bytes += body.len() + DIRECTORY_ENTRY_LEN;
-        blocks.push((dir, body));
+        chunks.push(encode_chunk(blocks));
     }
-    flush(&mut blocks, &mut chunks);
     chunks
+}
+
+/// One region: its directory, then its bodies.
+fn encode_chunk(mut blocks: Vec<(BlockDir, Vec<u8>)>) -> EncodedChunk {
+    let n_entries: u64 = blocks.iter().map(|(d, _)| d.n_entries as u64).sum();
+    let mut out = Vec::with_capacity(
+        CHUNK_HEADER_LEN
+            + blocks.len() * DIRECTORY_ENTRY_LEN
+            + blocks.iter().map(|(_, b)| b.len()).sum::<usize>(),
+    );
+    out.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    for (d, body) in blocks.iter() {
+        out.extend_from_slice(&d.ordinal.to_le_bytes());
+        out.extend_from_slice(&d.max_key.to_le_bytes());
+        out.extend_from_slice(&d.tail.to_le_bytes());
+        out.extend_from_slice(&(d.n_entries as u16).to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(&crc32c(body).to_le_bytes());
+    }
+    let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
+    out[CRC_AT..CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+    let n_blocks = blocks.len() as u32;
+    for (_, body) in blocks.drain(..) {
+        out.extend_from_slice(&body);
+    }
+    EncodedChunk {
+        n_entries,
+        n_blocks,
+        bytes: out,
+    }
 }
 
 fn encode_block(block: &[TierEntry], keys: &[f32], scratch: &mut [u8]) -> (BlockDir, Vec<u8>) {
@@ -314,7 +337,9 @@ fn encode_block(block: &[TierEntry], keys: &[f32], scratch: &mut [u8]) -> (Block
     pack_dense(&lens[full..], len_bits, &mut body);
     (
         BlockDir {
+            ordinal: 0,
             max_key,
+            tail: 0.0,
             n_entries: n as u32,
             offset: 0,
             len: body.len(),
@@ -366,12 +391,10 @@ fn unpack_dense(bytes: &[u8], n: usize, bits: u8, out: &mut [u32]) {
 }
 
 impl TierDirectory {
-    /// Bytes the directory of a chunk holding `n_entries` takes, header
-    /// included: every block but the last is full, so the block count
-    /// follows from the entry count the run records, and a reader sizes
-    /// the directory fetch before it has read a byte of the chunk.
-    pub(crate) fn len_for(n_entries: u64) -> usize {
-        CHUNK_HEADER_LEN + (n_entries as usize).div_ceil(BLOCK_ENTRIES) * DIRECTORY_ENTRY_LEN
+    /// Bytes the directory of a chunk of `n_blocks` takes, header included:
+    /// what a reader fetches before it has read a byte of the chunk.
+    pub(crate) fn len_for(n_blocks: u32) -> usize {
+        CHUNK_HEADER_LEN + n_blocks as usize * DIRECTORY_ENTRY_LEN
     }
 
     /// Parse a directory from the start of a chunk; `bytes` may be the
@@ -397,23 +420,29 @@ impl TierDirectory {
         }
         let mut blocks = Vec::with_capacity(n_blocks);
         let mut offset = dir_end;
+        let mut prev_ordinal: Option<u32> = None;
         for i in 0..n_blocks {
             let at = CHUNK_HEADER_LEN + i * DIRECTORY_ENTRY_LEN;
             let f = |o: usize| u32_le_at(bytes, at + o).ok_or_else(|| malformed("directory entry"));
-            let max_key = f32::from_bits(f(0)?);
-            let n_entries = u16_le_at(bytes, at + 4).ok_or_else(|| malformed("directory entry"))?;
-            let len = f(6)? as usize;
-            let crc = f(10)?;
+            let ordinal = f(0)?;
+            let max_key = f32::from_bits(f(4)?);
+            let tail = f32::from_bits(f(8)?);
+            let n_entries =
+                u16_le_at(bytes, at + 12).ok_or_else(|| malformed("directory entry"))?;
+            let len = f(14)? as usize;
+            let crc = f(18)?;
             if n_entries == 0 || n_entries as usize > BLOCK_ENTRIES || len < BLOCK_HEADER_LEN {
                 return Err(malformed("directory entry out of range"));
             }
-            // Every block but the last is full, which is what lets a reader
-            // size the directory from the entry count alone.
-            if i + 1 < n_blocks && n_entries as usize != BLOCK_ENTRIES {
-                return Err(malformed("a block before the last is not full"));
+            // Ascending ordinals, so a superfile's block is found by search.
+            if prev_ordinal.is_some_and(|p| p >= ordinal) {
+                return Err(malformed("directory ordinals out of order"));
             }
+            prev_ordinal = Some(ordinal);
             blocks.push(BlockDir {
+                ordinal,
                 max_key,
+                tail,
                 n_entries: u32::from(n_entries),
                 offset,
                 len,
@@ -430,14 +459,28 @@ impl TierDirectory {
         self.blocks.len()
     }
 
-    /// Exact largest key in block `i`, at the slice's [`ColumnScoring`].
+    /// Exact largest key in block `i`, at its superfile's [`ColumnScoring`].
+    #[cfg(test)]
     pub(crate) fn block_max(&self, i: usize) -> f32 {
         self.blocks[i].max_key
     }
 
+    /// The superfile ordinal block `i` belongs to.
     #[cfg(test)]
-    pub(crate) fn block_entries(&self, i: usize) -> usize {
-        self.blocks[i].n_entries as usize
+    pub(crate) fn block_ordinal(&self, i: usize) -> u32 {
+        self.blocks[i].ordinal
+    }
+
+    /// Bound on every entry of block `i`'s superfile past the block.
+    pub(crate) fn block_tail(&self, i: usize) -> f32 {
+        self.blocks[i].tail
+    }
+
+    /// The block of superfile `ordinal` in this chunk, if it has one.
+    pub(crate) fn block_of(&self, ordinal: u32) -> Option<usize> {
+        self.blocks
+            .binary_search_by_key(&ordinal, |b| b.ordinal)
+            .ok()
     }
 
     /// Where block `i`'s body sits, as byte offsets from the chunk's start.
@@ -570,17 +613,6 @@ impl<'a> TierChunk<'a> {
         self.directory.n_blocks()
     }
 
-    /// Exact largest impact in block `i`.
-    #[cfg(test)]
-    pub(crate) fn block_max(&self, i: usize) -> f32 {
-        self.directory.block_max(i)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn block_entries(&self, i: usize) -> usize {
-        self.directory.block_entries(i)
-    }
-
     /// Decode block `i` into `out` (cleared first).
     pub(crate) fn decode_block(
         &self,
@@ -602,6 +634,7 @@ pub(crate) fn push_chunk_refs(out: &mut Vec<u8>, chunks: &[TierChunkRef]) {
         push_u64_varint(out, c.offset);
         push_u64_varint(out, c.len);
         push_u64_varint(out, c.n_entries);
+        push_varint(out, c.n_blocks);
     }
 }
 
@@ -616,10 +649,12 @@ pub(crate) fn read_chunk_refs(
         let offset = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk offset"))?;
         let len = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk len"))?;
         let n_entries = read_u64_varint(bytes, at).ok_or_else(|| malformed("chunk entries"))?;
+        let n_blocks = read_varint(bytes, at).ok_or_else(|| malformed("chunk blocks"))?;
         out.push(TierChunkRef {
             offset,
             len,
             n_entries,
+            n_blocks,
         });
     }
     Ok(out)
@@ -641,23 +676,11 @@ mod tests {
         scoring().key(e.tf, e.len)
     }
 
-    fn descending(entries: &mut [TierEntry]) {
-        entries.sort_by(|a, b| {
-            key_of(b)
-                .total_cmp(&key_of(a))
-                .then(a.superfile.cmp(&b.superfile))
-                .then(a.doc_id.cmp(&b.doc_id))
-        });
-    }
-
-    fn keys(entries: &[TierEntry]) -> Vec<f32> {
-        entries.iter().map(key_of).collect()
-    }
-
-    /// A deterministic sample: `n` entries over `superfiles` superfiles of
-    /// `docs` documents each, small term frequencies and lengths across the
-    /// whole bucket range.
-    fn sample(n: usize, superfiles: u32, docs: u32, seed: u64) -> Vec<TierEntry> {
+    /// A deterministic sample: heads of `per_sf` entries for each of
+    /// `superfiles` superfiles of `docs` documents, small term frequencies
+    /// and lengths across the whole bucket range, each head in descending
+    /// key with a tail below its last key.
+    fn sample(per_sf: usize, superfiles: u32, docs: u32, seed: u64) -> Vec<HeadGroup> {
         let mut x = seed;
         let mut next = || {
             x ^= x << 13;
@@ -665,16 +688,32 @@ mod tests {
             x ^= x << 17;
             x
         };
-        let mut out: Vec<TierEntry> = (0..n)
-            .map(|_| TierEntry {
-                superfile: (next() % superfiles as u64) as u32,
-                doc_id: (next() % docs as u64) as u32,
-                tf: 1 + (next() % 4) as u32,
-                len: (next() % 256) as u8,
+        (0..superfiles)
+            .map(|sf| {
+                let mut entries: Vec<TierEntry> = (0..per_sf)
+                    .map(|_| TierEntry {
+                        superfile: sf,
+                        doc_id: (next() % docs as u64) as u32,
+                        tf: 1 + (next() % 4) as u32,
+                        len: (next() % 256) as u8,
+                    })
+                    .collect();
+                entries.sort_by(|a, b| {
+                    key_of(b)
+                        .total_cmp(&key_of(a))
+                        .then(a.doc_id.cmp(&b.doc_id))
+                });
+                entries.dedup_by_key(|e| e.doc_id);
+                let keys: Vec<f32> = entries.iter().map(key_of).collect();
+                let tail = keys.last().map_or(0.0, |k| k * 0.5);
+                HeadGroup {
+                    ordinal: sf,
+                    entries,
+                    keys,
+                    tail,
+                }
             })
-            .collect();
-        descending(&mut out);
-        out
+            .collect()
     }
 
     fn decode_all(chunks: &[EncodedChunk]) -> Vec<TierEntry> {
@@ -700,77 +739,111 @@ mod tests {
         v
     }
 
-    #[test]
-    fn round_trips_every_entry_exactly() {
-        let entries = sample(10_000, 37, 1_000_000, 7);
-        let chunks = encode_tier(&entries, &keys(&entries));
-        let decoded = decode_all(&chunks);
-        assert_eq!(decoded.len(), entries.len());
-        assert_eq!(sorted(&entries), sorted(&decoded), "entries are exact");
+    fn all_entries(groups: &[HeadGroup]) -> Vec<TierEntry> {
+        groups
+            .iter()
+            .flat_map(|g| g.entries.iter().copied())
+            .collect()
     }
 
     #[test]
-    fn directory_bounds_are_exact_and_monotone() {
-        let entries = sample(20_000, 100, 500_000, 11);
-        let chunks = encode_tier(&entries, &keys(&entries));
-        let mut prev_min = f32::INFINITY;
-        let mut at = 0usize;
-        for c in &chunks {
-            let chunk = TierChunk::open(&c.bytes).expect("open");
-            for i in 0..chunk.n_blocks() {
-                let n = chunk.block_entries(i);
-                let block = &entries[at..at + n];
-                assert_eq!(chunk.block_max(i), key_of(&block[0]));
-                assert!(
-                    chunk.block_max(i) <= prev_min,
-                    "blocks are in descending key"
+    fn round_trips_every_entry_exactly() {
+        let groups = sample(200, 37, 1_000_000, 7);
+        let chunks = encode_tier(&groups);
+        let decoded = decode_all(&chunks);
+        assert_eq!(
+            sorted(&all_entries(&groups)),
+            sorted(&decoded),
+            "entries are exact"
+        );
+    }
+
+    /// Region `r` holds block `r` of every superfile deep enough, in
+    /// ascending ordinal; a block's maximum is its first key and its tail
+    /// the key after it, or the head's own tail past the last block.
+    #[test]
+    fn regions_hold_one_block_per_superfile_with_exact_maxima_and_tails() {
+        let groups = sample(150, 20, 500_000, 11);
+        let chunks = encode_tier(&groups);
+        assert_eq!(
+            chunks.len(),
+            150usize.div_ceil(BLOCK_ENTRIES),
+            "one region per block depth"
+        );
+        for (r, c) in chunks.iter().enumerate() {
+            let dir = TierDirectory::parse(&c.bytes).expect("directory");
+            let from = r * BLOCK_ENTRIES;
+            let deep: Vec<&HeadGroup> = groups.iter().filter(|g| g.entries.len() > from).collect();
+            assert_eq!(dir.n_blocks(), deep.len(), "region {r}");
+            for (i, g) in deep.iter().enumerate() {
+                assert_eq!(dir.block_ordinal(i), g.ordinal);
+                assert_eq!(dir.block_of(g.ordinal), Some(i));
+                assert_eq!(
+                    dir.block_max(i),
+                    g.keys[from],
+                    "region {r} ordinal {}",
+                    g.ordinal
                 );
-                prev_min = key_of(&block[n - 1]);
-                at += n;
+                let to = (from + BLOCK_ENTRIES).min(g.entries.len());
+                let want_tail = g.keys.get(to).copied().unwrap_or(g.tail);
+                assert_eq!(
+                    dir.block_tail(i),
+                    want_tail,
+                    "region {r} ordinal {}",
+                    g.ordinal
+                );
+                assert!(
+                    dir.block_tail(i) <= dir.block_max(i),
+                    "a tail never exceeds its block's maximum"
+                );
             }
+            assert_eq!(dir.block_of(u32::MAX), None, "an ordinal with no block");
         }
-        assert_eq!(at, entries.len());
     }
 
     #[test]
     fn a_constant_key_block_round_trips_exactly() {
-        let mut entries: Vec<TierEntry> = (0..300)
+        let entries: Vec<TierEntry> = (0..300)
             .map(|i| TierEntry {
-                superfile: i % 3,
+                superfile: 3,
                 doc_id: i * 7,
                 tf: 2,
                 len: 9,
             })
             .collect();
-        descending(&mut entries);
-        let chunks = encode_tier(&entries, &keys(&entries));
-        assert_eq!(chunks.len(), 1);
+        let keys = vec![key_of(&entries[0]); entries.len()];
+        let groups = vec![HeadGroup {
+            ordinal: 3,
+            entries,
+            keys,
+            tail: 0.0,
+        }];
+        let chunks = encode_tier(&groups);
+        assert_eq!(chunks.len(), 300usize.div_ceil(BLOCK_ENTRIES));
         let decoded = decode_all(&chunks);
-        assert!(decoded.iter().all(|e| e.tf == 2 && e.len == 9));
+        assert!(
+            decoded
+                .iter()
+                .all(|e| e.tf == 2 && e.len == 9 && e.superfile == 3)
+        );
         assert_eq!(decoded.len(), 300);
     }
 
+    /// Bytes per entry on a billion-document shape: a head block of one
+    /// superfile packs its ordinal to nothing and its rows and facts to a
+    /// few bits each.
     #[test]
-    fn chunks_cut_at_the_target_and_count_their_entries() {
-        let entries = sample(2_000_000, 1_080, 1_000_000, 3);
-        let chunks = encode_tier(&entries, &keys(&entries));
-        assert!(chunks.len() > 1, "2M entries exceed one 4 MiB chunk");
-        let total: u64 = chunks.iter().map(|c| c.n_entries).sum();
-        assert_eq!(total, entries.len() as u64);
-        for c in &chunks {
-            assert!(
-                c.bytes.len() <= CHUNK_TARGET_BYTES + 64 * 1024,
-                "chunk {} over target",
-                c.bytes.len()
-            );
-        }
+    fn heads_cost_a_few_bytes_per_entry() {
+        let groups = sample(512, 1_080, 1_000_000, 3);
+        let chunks = encode_tier(&groups);
+        let entries: usize = groups.iter().map(|g| g.entries.len()).sum();
         let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
-        let per_entry = bytes as f64 / entries.len() as f64;
+        let per_entry = bytes as f64 / entries as f64;
         assert!(
-            per_entry <= 5.8,
-            "{per_entry:.2} bytes per entry at 1,080 superfiles x 1M docs"
+            per_entry <= 5.5,
+            "{per_entry:.2} bytes per entry at 1,080 superfiles x 512 deep"
         );
-        eprintln!("tier: {per_entry:.2} bytes per entry at 1,080 superfiles x 1M docs");
+        eprintln!("heads: {per_entry:.2} bytes per entry at 1,080 superfiles x 512 deep");
     }
 
     #[test]
@@ -780,6 +853,7 @@ mod tests {
                 offset: i * 1_000,
                 len: 1_000 + i,
                 n_entries: 40_000 * (i + 1),
+                n_blocks: 1_078 - i as u32,
             })
             .collect();
         let mut out = Vec::new();
@@ -792,8 +866,7 @@ mod tests {
 
     #[test]
     fn rejects_a_bad_crc_and_truncation() {
-        let entries = sample(5_000, 10, 1_000, 5);
-        let chunks = encode_tier(&entries, &keys(&entries));
+        let chunks = encode_tier(&sample(80, 10, 1_000, 5));
         let bytes = &chunks[0].bytes;
         let mut flipped = bytes.clone();
         let last = flipped.len() - 1;
@@ -828,23 +901,20 @@ mod tests {
         dir.verify_block(0, body).expect("intact body");
     }
 
-    /// A reader sizes a chunk's directory from the entry count its run
+    /// A reader sizes a region's directory from the block count its run
     /// records and parses it from that prefix alone; the blocks it then
-    /// fetches by the directory's ranges decode to the chunk's entries.
+    /// fetches by the directory's ranges decode to the region's entries.
     #[test]
-    fn a_directory_prefix_sized_from_the_entry_count_reads_the_blocks() {
-        let entries = sample(30_000, 50, 100_000, 9);
-        let chunks = encode_tier(&entries, &keys(&entries));
+    fn a_directory_prefix_sized_from_the_block_count_reads_the_blocks() {
+        let groups = sample(130, 50, 100_000, 9);
+        let chunks = encode_tier(&groups);
         let mut all = Vec::new();
         let mut buf = Vec::new();
         for c in &chunks {
-            let dir_len = TierDirectory::len_for(c.n_entries);
+            let dir_len = TierDirectory::len_for(c.n_blocks);
             let dir = TierDirectory::parse(&c.bytes[..dir_len]).expect("directory from the prefix");
             assert_eq!(dir.chunk_len(), c.bytes.len());
-            assert_eq!(
-                dir.n_blocks(),
-                (c.n_entries as usize).div_ceil(BLOCK_ENTRIES)
-            );
+            assert_eq!(dir.n_blocks(), c.n_blocks as usize);
             for i in 0..dir.n_blocks() {
                 let body = &c.bytes[dir.block_range(i)];
                 dir.verify_block(i, body).expect("crc");
@@ -852,26 +922,29 @@ mod tests {
                 all.extend_from_slice(&buf);
             }
         }
-        assert_eq!(all.len(), entries.len());
+        assert_eq!(sorted(&all), sorted(&all_entries(&groups)));
     }
 
-    /// Most terms' tiers are a handful of entries; they must cost a handful
-    /// of bytes, not a padded lane of each stream, and round-trip exactly.
+    /// Most heads are a handful of entries; they must cost a handful of
+    /// bytes, not a padded lane of each stream, and round-trip exactly.
     #[test]
-    fn small_tiers_are_small_and_exact() {
-        for n in [1usize, 2, 3, 7, 127, 129, 4095, 4097] {
-            let entries = sample(n, 1_080, 1_000_000, n as u64);
-            let chunks = encode_tier(&entries, &keys(&entries));
+    fn small_heads_are_small_and_exact() {
+        for n in [1usize, 2, 3, 7, 63, 64, 65, 127] {
+            let groups = sample(n, 3, 1_000_000, n as u64);
+            let chunks = encode_tier(&groups);
+            let entries: usize = groups.iter().map(|g| g.entries.len()).sum();
             let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
-            let fixed = CHUNK_HEADER_LEN + DIRECTORY_ENTRY_LEN * chunks.len() + BLOCK_HEADER_LEN;
+            let blocks: usize = chunks.iter().map(|c| c.n_blocks as usize).sum();
+            let fixed =
+                CHUNK_HEADER_LEN * chunks.len() + (DIRECTORY_ENTRY_LEN + BLOCK_HEADER_LEN) * blocks;
             assert!(
-                bytes <= fixed * entries.len().div_ceil(BLOCK_ENTRIES) + 8 * n,
-                "{n} entries took {bytes} bytes"
+                bytes <= fixed + 8 * entries,
+                "{n} entries per head took {bytes} bytes"
             );
             assert_eq!(
-                sorted(&entries),
+                sorted(&all_entries(&groups)),
                 sorted(&decode_all(&chunks)),
-                "{n} entries round-trip"
+                "{n} round-trip"
             );
         }
     }

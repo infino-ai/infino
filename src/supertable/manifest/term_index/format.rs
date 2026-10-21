@@ -90,14 +90,17 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// Layout version of the root. `2` added each superfile's smallest doc id;
 /// `3` keys terms by the column's field id instead of its name; `4` is
 /// the root whose slices carry tails and tiers (slice version 2); `5` is
-/// the root whose slices are at version 3. A root at an older version
-/// does not decode: the index is rebuilt, not translated.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 5;
+/// the root whose slices are at version 3; `6` the root whose slices are at
+/// version 4. A root at an older version does not decode: the index is
+/// rebuilt, not translated.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 6;
 /// Layout version of a slice. `2` added the per-posting tail and the
 /// run's tier reference; `3` keeps a small tier in the run and gives a
 /// tier chunk a directory CRC and a CRC per block, so a block is read on
-/// its own.
-pub(crate) const SLICE_FORMAT_VERSION: u32 = 3;
+/// its own; `4` lays a tier out per superfile, in regions of one block per
+/// superfile, with the superfile and its tail in each block's directory
+/// entry.
+pub(crate) const SLICE_FORMAT_VERSION: u32 = 4;
 /// Run header tag: the term has no tier.
 const TIER_ABSENT: u8 = 0;
 /// Run header tag: a tier reference follows.
@@ -865,6 +868,7 @@ mod tests {
                     offset: i * 4_000_000,
                     len: 4_000_000 - i,
                     n_entries: 600_000 + i,
+                    n_blocks: 1_078,
                 })
                 .collect(),
             inline: Vec::new(),

@@ -47,9 +47,8 @@ use build::build_segment;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, Head, HeadSink,
-    TIER_ENTRIES_MAX, TIER_SHARE_OF_POSTINGS, build_onto, head_depth_for, merge_segments,
-    tier_entries_for, tier_path,
+    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, Head, HeadSink,
+    build_onto, merge_segments, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
@@ -1230,7 +1229,7 @@ impl TermIndex {
         if let Some(d) = self.tier_dirs.lock().await.get(&key) {
             return Ok(d);
         }
-        let len = (TierDirectory::len_for(chunk.n_entries) as u64).min(chunk.len);
+        let len = (TierDirectory::len_for(chunk.n_blocks) as u64).min(chunk.len);
         let end = chunk
             .offset
             .checked_add(len)
@@ -1542,16 +1541,16 @@ mod tests {
             .expect("run")
             .expect("alpha is indexed");
         let tier = alpha.tier.expect("alpha has a tier");
-        assert_eq!(tier.n_entries, 4, "truncated to the budget");
+        // Nine entries over three superfiles against a budget of four: the
+        // depth drops to one for every superfile alike, so each keeps its
+        // best document and the tier holds three.
+        assert_eq!(tier.n_entries, 3, "one per superfile under the budget");
         assert!(!tier.complete, "a truncated tier is not complete");
         let entries = tier_entries_of(&built.root.segments[0], &built.tiers, &tier);
         let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
         ids.sort_unstable();
-        // The four best impacts table-wide: superfile 2's three docs and
-        // superfile 1's best.
-        assert_eq!(ids, vec![(1, 1), (2, 1), (2, 5), (2, 9)]);
-        // Superfile 1 lost its 2.2 and 2.1 docs: its tail rises to 2.2.
-        // Superfile 0 lost everything: its tail is its own best, 1.3.
+        assert_eq!(ids, vec![(0, 1), (1, 1), (2, 1)], "each superfile's best");
+        // Each superfile's tail is the key of the best document it dropped.
         let tail = |sf: u32| {
             alpha
                 .postings
@@ -1560,9 +1559,9 @@ mod tests {
                 .expect("posting")
                 .tail
         };
-        assert_eq!(tail(0), key_of(1.3));
+        assert_eq!(tail(0), key_of(1.2));
         assert_eq!(tail(1), key_of(2.2));
-        assert_eq!(tail(2), 0.0, "nothing of superfile 2 was dropped");
+        assert_eq!(tail(2), key_of(3.2));
         let beta = slice
             .run(&fid("body").term_key("beta"))
             .expect("run")
