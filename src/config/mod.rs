@@ -1095,6 +1095,10 @@ pub struct DiagnosticsSettings {
     /// Skip the disk cache's lazy background fill so foreground-only
     /// read behavior can be measured (A/B measurement).
     pub disable_background_fill: bool,
+    /// Choose a ranked query's superfiles by their stored ceilings alone,
+    /// never from the term index's tiers, so the tiers' effect on the same
+    /// index can be measured (A/B measurement).
+    pub disable_tier_selection: bool,
 }
 
 /// Gc settings used by `optimize()`'s bundled gc sweep.

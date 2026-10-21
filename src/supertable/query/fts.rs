@@ -109,7 +109,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    InfinoError,
+    InfinoError, config,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats,
     superfile::{
@@ -459,12 +459,17 @@ impl SharedTopK {
     /// Sound only when superfile `_id` ranges are disjoint, which the
     /// caller checks. A seed placeholder carries `i128::MAX` and so never
     /// justifies a skip.
+    ///
+    /// Of the entries at the floor the heap's top is the one from the
+    /// highest range (equal scores order by range descending), so one look
+    /// settles it. A floor the live walks have raised above the heap's top
+    /// has no entry to compare against here and keeps the superfile open.
     fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
         let heap = self.heap.lock().expect("SharedTopK mutex poisoned");
         heap.len() >= self.k
             && heap
-                .iter()
-                .all(|Reverse(e)| e.score != floor || e.id_max < id_min)
+                .peek()
+                .is_some_and(|Reverse(top)| top.score == floor && top.id_max < id_min)
     }
 }
 
@@ -1088,11 +1093,19 @@ impl SupertableReader {
         // scoped search opens as before.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
-        if let (Some(index), None, Some(column_id), true) = (
+        // A phrase scores only where its words are adjacent and a negation
+        // removes documents, so neither takes a threshold from the tiers,
+        // and a superfile's bound from them is its ceiling: the merge would
+        // read for nothing. Such a query keeps the ceilings.
+        let tiers_serve = !has_phrases
+            && negatives.is_empty()
+            && !config::global().diagnostics.disable_tier_selection;
+        if let (Some(index), None, Some(column_id), true, true) = (
             &term_index,
             bm25_params,
             manifest.field_id(column),
             manifest.term_index_complete(),
+            tiers_serve,
         ) {
             let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
             // Terms a matching document must carry: bare musts and the words

@@ -71,11 +71,13 @@ use crate::{
 /// on costs more than the opens it might save. The bounds read so far stay
 /// sound and order the opens; nothing is excluded without a threshold.
 const THRESHOLD_PROBE_BLOCKS_PER_TERM: usize = 1;
-/// Blocks per term a merge reads with a threshold but without having ruled
+/// Blocks in all a merge reads with a threshold but without having ruled
 /// any superfile out before it stops: on a table where every superfile
 /// holds competitive documents the bounds never fall below the threshold,
-/// and the opens then follow the bounds as they would the ceilings.
-const EXCLUSION_PROBE_BLOCKS_PER_TERM: usize = 4;
+/// and the opens then follow the bounds as they would the ceilings. A
+/// total rather than a per-term count, so a query of many terms does not
+/// read many times more before giving up.
+const EXCLUSION_PROBE_BLOCKS: usize = 8;
 /// Terms up to which a candidate's summed contributions equal the kernel's
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
@@ -431,7 +433,7 @@ pub(crate) async fn select_with_tiers(
         if !theta_lb.is_finite() && entries_read >= probe {
             break;
         }
-        let probe = (EXCLUSION_PROBE_BLOCKS_PER_TERM * BLOCK_ENTRIES * nt) as u64;
+        let probe = (EXCLUSION_PROBE_BLOCKS * BLOCK_ENTRIES) as u64;
         if n_excluded == 0 && entries_read >= probe {
             break;
         }
