@@ -334,6 +334,10 @@ pub infino::SchemaError::FieldCapExceeded::current: u32
 pub infino::SchemaError::FieldCapExceeded::fields: alloc::vec::Vec<alloc::string::String>
 pub infino::SchemaError::IdentityChange
 pub infino::SchemaError::IdentityChange::attribute: alloc::string::String
+pub infino::SchemaError::IdentityMismatch
+pub infino::SchemaError::IdentityMismatch::column: alloc::string::String
+pub infino::SchemaError::IdentityMismatch::held: alloc::string::String
+pub infino::SchemaError::IdentityMismatch::offered: alloc::string::String
 pub infino::SchemaError::IntegerNotExactInFloat
 pub infino::SchemaError::IntegerNotExactInFloat::column: alloc::string::String
 pub infino::SchemaError::IntegerNotExactInFloat::stored: f64

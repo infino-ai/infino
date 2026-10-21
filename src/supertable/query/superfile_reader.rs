@@ -17,10 +17,11 @@
 //!      `DiskCacheStore::open_for_query(uri, ...)` (`await`ed directly).
 //!      The cache itself handles cold-fetch from object
 //!      storage, pwrite to the local cache directory, and
-//!      mmap, and degrades to an uncached range-only reader
-//!      when the superfile cannot be admitted (larger than
-//!      the whole budget), so a budget miss never fails the
-//!      query.
+//!      mmap. A lazy open past the budget is kept as a lazy
+//!      entry that charges only the blocks it reads; a
+//!      whole-file fetch that cannot be admitted (larger than
+//!      the whole budget) degrades to an uncached range-only
+//!      reader, so a budget miss never fails the query.
 //!   3. **No cache.** Miss in the in-memory tier and no
 //!      cache attached → surface the in-memory tier's
 //!      `ReaderCacheError::NotFound`. The in-process-only
@@ -275,8 +276,7 @@ mod tests {
     const N_DOCS: u64 = 3;
 
     /// A `disk_budget_bytes` smaller than any real superfile, so the
-    /// disk cache rejects admission with `BudgetExceeded` and
-    /// `open_for_query` degrades to its range-only fallback.
+    /// disk cache cannot hold one whole and a Warm open stays lazy.
     const TINY_BUDGET_BYTES: u64 = 4;
 
     /// Build minimal valid superfile bytes (parquet body + KV metadata
@@ -471,19 +471,20 @@ mod tests {
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
+    /// A budget too small to hold the superfile whole still serves it: the
+    /// Warm open stays a lazy cache entry, and the next open of the file
+    /// rides it instead of opening the file again.
     #[tokio::test]
-    async fn disk_cache_budget_exceeded_falls_back_to_range_only() {
+    async fn disk_cache_budget_too_small_for_the_file_keeps_a_lazy_entry() {
         let dir = TempDir::new().expect("tempdir");
         let storage = local_storage(&dir);
         let uri = SuperfileUri::new_v4();
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
-        // Budget too small to admit the superfile → BudgetExceeded →
-        // the accessor streams it via range GETs instead of failing.
         let cache = disk_cache(&dir, &storage, |cfg| {
             cfg.disk_budget_bytes = TINY_BUDGET_BYTES;
         });
 
-        let reader = superfile_reader(
+        let (reader, tier) = superfile_reader_tiered(
             &empty_store(),
             Some(&cache),
             None,
@@ -493,8 +494,24 @@ mod tests {
             ReadIntent::Warm,
         )
         .await
-        .expect("range-only fallback on budget exceeded");
+        .expect("served past the budget");
         assert_eq!(reader.n_docs(), N_DOCS);
+        assert_eq!(tier, OpenTier::Source);
+        assert!(cache.is_cached(&uri), "kept as a lazy entry");
+
+        let (again, tier) = superfile_reader_tiered(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("served again");
+        assert_eq!(tier, OpenTier::Lazy, "the next open rides the entry");
+        assert!(Arc::ptr_eq(&reader, &again), "the same reader");
     }
 
     #[tokio::test]

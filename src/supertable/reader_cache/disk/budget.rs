@@ -338,6 +338,13 @@ impl DiskCacheStore {
         }
     }
 
+    /// Reserve a whole file for a Warm open's background download, or say the budget cannot hold
+    /// it: eviction ran out of victims, the one error it raises (`BudgetExceeded`). A caller that
+    /// cannot reserve opens the file lazily and charges only the blocks it reads.
+    pub(crate) async fn reserve_whole_file(&self, bytes: u64) -> bool {
+        self.reserve_manual(bytes).await.is_ok()
+    }
+
     /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
     /// wait, such as an install under a shard lock.
     pub(crate) fn try_reserve_without_evicting(&self, bytes: u64) -> bool {
