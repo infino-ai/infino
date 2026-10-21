@@ -116,6 +116,9 @@ pub(crate) enum TableRole {
     /// The derived, cell-ordered vector index that accelerates vector
     /// search over [`Self::User`].
     VectorIndex,
+    /// The hidden list of the source files a [`Self::User`] table was
+    /// loaded from, present only on a table created with one.
+    SourceFiles,
 }
 
 impl TableRole {
@@ -126,6 +129,7 @@ impl TableRole {
         match self {
             Self::User => "user",
             Self::VectorIndex => "vector_index",
+            Self::SourceFiles => "source_files",
         }
     }
 }
@@ -449,5 +453,6 @@ mod tests {
         assert_eq!(OpOrigin::Open.as_str(), "open");
         assert_eq!(TableRole::User.as_str(), "user");
         assert_eq!(TableRole::VectorIndex.as_str(), "vector_index");
+        assert_eq!(TableRole::SourceFiles.as_str(), "source_files");
     }
 }

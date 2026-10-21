@@ -634,6 +634,12 @@ pub struct SupertableOptions {
     /// Per-table override for the **hidden** vector-index grid's cell
     /// count. `None` → `vector.hidden_cell_count` from the YAML config.
     pub hidden_cell_count: Option<usize>,
+    /// Create a hidden source-file list beside the table: a second table
+    /// under this one's storage, recorded on its manifest and reopened from
+    /// there, that a loader keeps one row per source file in. Read at
+    /// create only; on open the manifest says whether the list exists.
+    /// Requires storage. Default `false`.
+    pub source_file_list: bool,
 }
 
 impl SupertableOptions {
@@ -805,6 +811,7 @@ impl SupertableOptions {
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
             hidden_cell_count: None,
+            source_file_list: false,
         })
     }
 
@@ -852,6 +859,13 @@ impl SupertableOptions {
     /// Override the writer thread pool.
     pub fn with_writer_pool(mut self, pool: Arc<ThreadPool>) -> Self {
         self.writer_pool = pool;
+        self
+    }
+
+    /// Create the table with a hidden source-file list beside it. See
+    /// [`Self::source_file_list`].
+    pub fn with_source_file_list(mut self, source_file_list: bool) -> Self {
+        self.source_file_list = source_file_list;
         self
     }
 

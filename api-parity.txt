@@ -37,5 +37,6 @@ Connection::update_storage_credentials	exempt	Rotates an object-store credential
 Supertable::append_rows	exempt	the bindings' append(rows) routes record input through it; their public shape is the one append
 Supertable::append_rows_named	exempt	the bindings' append_named(rows, source) routes record input through it; one public method per binding
 Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
+Supertable::source_file_list	exempt	the hidden source-file list is for a Rust loader that keeps a table matching its source files; the bindings create no such tables, so there is no list to reach
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
 Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update

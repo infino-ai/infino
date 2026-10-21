@@ -98,6 +98,7 @@ pub(crate) trait Table: Send + Sync {
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
+    fn source_file_list(&self) -> Option<Supertable>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -223,6 +224,10 @@ impl Table for SupertableHandle {
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
+    }
+    fn source_file_list(&self) -> Option<Supertable> {
+        SupertableHandle::source_file_list(self)
+            .map(|list| Supertable::from_local(SupertableHandle::clone(list)))
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -607,6 +612,35 @@ impl Supertable {
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         self.inner.gc(safety_gap)
+    }
+
+    /// The hidden source-file list beside this table, or `None` when the
+    /// table was not created with one ([`IndexSpec::source_file_list`]).
+    ///
+    /// The list is a table like any other — append, delete, search and
+    /// optimize it through the handle returned here — with a fixed schema,
+    /// one row per source file or per source folder:
+    ///
+    /// | column | type | |
+    /// |---|---|---|
+    /// | `kind` | `LargeUtf8` | `file` or `folder`; full-text indexed |
+    /// | `file_no` | `UInt32` | the file's number |
+    /// | `key` | `LargeUtf8` | the object key; full-text indexed |
+    /// | `marker` | `LargeUtf8` | the version marker the file was read at |
+    /// | `size` | `UInt64` | bytes, as listed |
+    /// | `mtime_ms` | `Int64` | modification time, as listed |
+    /// | `rows` | `UInt64` | rows the file yielded |
+    /// | `loaded_ms` | `Int64` | when its rows landed |
+    /// | `listed_ms` | `Int64` | when the folder was last listed |
+    /// | `changed` | `Boolean` | whether that listing found a change |
+    ///
+    /// A column that does not apply to a row's kind is null. The list is
+    /// never in [`Connection::list_tables`](crate::Connection::list_tables)
+    /// and is purged with the table.
+    ///
+    /// [`IndexSpec::source_file_list`]: crate::IndexSpec::source_file_list
+    pub fn source_file_list(&self) -> Option<Supertable> {
+        self.inner.source_file_list()
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted
