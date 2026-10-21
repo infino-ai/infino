@@ -1746,14 +1746,25 @@ fn assert_expected_cold_reads(
 pub mod fts {
     use std::hint::black_box;
 
+    use infino::{BoolMode, storage::io_counters};
+
     use super::*;
     use crate::{
         executors::{
-            fts as exec_fts,
+            ColdSamples, fts as exec_fts,
             fts::{FTS_BATTERY, FtsRead},
+            sample_batched, summarize,
         },
         harness::driver::FtsQuery,
     };
+
+    /// Keys the many-key `token_match` asks for: a batched id lookup large
+    /// enough to need many term-index slices.
+    const TOKEN_MATCH_KEYS: usize = 300;
+    /// Seed choosing whose record keys the many-key lookup asks for.
+    const TOKEN_MATCH_SEED: u64 = 0x5EED;
+    /// Untimed warm lookups before sampling.
+    const TOKEN_MATCH_WARMUP_ITERS: usize = 3;
 
     /// Large top-k for the serving-scale query-phase scaling gate —
     /// mirrors the superfile tier. Query phase only, over a small subset
@@ -1905,6 +1916,14 @@ pub mod fts {
                 cold_pre.as_ref(),
                 None,
             );
+            emit_token_match(
+                &mut report,
+                &built,
+                n_docs,
+                &format!("{anchor}/token-match"),
+                phases.warm,
+                phases.cold,
+            );
         }
 
         if let Some(large_k) = &large_k {
@@ -1998,6 +2017,14 @@ pub mod fts {
                             warm.as_deref(),
                             cold.as_ref(),
                             None,
+                        );
+                        emit_token_match(
+                            &mut report,
+                            &built,
+                            n_docs,
+                            "bench/fts/supertable/search/post-compact/token-match",
+                            phases.warm,
+                            phases.cold,
                         );
                     }
                     warm_post = warm;
@@ -2448,6 +2475,127 @@ pub mod fts {
     /// window as cost-model cold (`measure_cold_store`) and SQL cold —
     /// no `open_all_superfiles`. Timed search is the first
     /// `bm25_search`, which opens prune survivors itself.
+    /// [`TOKEN_MATCH_KEYS`] record keys of distinct random rows, space
+    /// separated.
+    fn token_match_query(n_docs: usize) -> String {
+        let mut state = TOKEN_MATCH_SEED;
+        let mut rows = HashSet::new();
+        while rows.len() < TOKEN_MATCH_KEYS.min(n_docs) {
+            rows.insert(supertable::splitmix64(&mut state) as usize % n_docs);
+        }
+        let mut rows: Vec<usize> = rows.into_iter().collect();
+        rows.sort_unstable();
+        rows.into_iter()
+            .map(supertable::record_key)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Rows an OR `token_match` of `query` over the record keys returns.
+    fn token_match_rows(consumer: &Supertable, query: &str) -> usize {
+        consumer
+            .token_match(supertable::RECORD_KEY_COLUMN, query, BoolMode::Or, None)
+            .expect("token_match")
+            .iter()
+            .map(|b| b.num_rows())
+            .sum()
+    }
+
+    /// Times the many-key `token_match` warm and cold and emits it as its
+    /// own table under `anchor`.
+    fn emit_token_match(
+        report: &mut Report,
+        built: &supertable::IngestResult,
+        n_docs: usize,
+        anchor: &str,
+        warm: bool,
+        cold: bool,
+    ) {
+        let query = token_match_query(n_docs);
+        let expected = TOKEN_MATCH_KEYS.min(n_docs);
+        let warm = warm.then(|| {
+            let (cache_dir, consumer) = open_consumer(Modality::Fts, built);
+            assert_eq!(
+                token_match_rows(&consumer, &query),
+                expected,
+                "one row per key"
+            );
+            consumer
+                .wait_until_warm(Duration::from_secs(600))
+                .expect("supertable warm promotion");
+            for _ in 0..TOKEN_MATCH_WARMUP_ITERS {
+                black_box(token_match_rows(&consumer, &query));
+            }
+            let mut samples = sample_batched(WARM_ITERS, || token_match_rows(&consumer, &query));
+            drop(consumer);
+            drop(cache_dir);
+            summarize(&mut samples)
+        });
+        let cold = cold.then(|| {
+            let mut samples = ColdSamples::with_capacity(COLD_ITERS);
+            for _ in 0..COLD_ITERS {
+                let (guard, open_wall, open_cpu) = cpu::timed(|| SupertableColdGuard::open(built));
+                samples.push_open(open_wall, open_cpu);
+                let io_before = io_counters::snapshot();
+                let (rows, wall, search_cpu) =
+                    cpu::timed(|| token_match_rows(&guard.consumer, &query));
+                let io = io_counters::snapshot().since(&io_before);
+                samples.push_search(wall, search_cpu);
+                samples.push_search_io(io.get_count, io.get_bytes);
+                assert_eq!(rows, expected, "one row per key");
+                drop(guard);
+            }
+            samples.finish()
+        });
+        let time = |d: Duration| {
+            let ns = d.as_nanos() as f64;
+            metric(ns, fmt_time(ns), Better::Lower)
+        };
+        let mut row = vec![text(format!("token_match_{TOKEN_MATCH_KEYS}_keys_or"))];
+        match &warm {
+            Some(s) => row.extend([time(s.p50), time(s.p90), time(s.p99)]),
+            None => row.extend([text("—"), text("—"), text("—")]),
+        }
+        match &cold {
+            Some(c) => row.extend([
+                time(c.open),
+                time(c.search),
+                text(format!(
+                    "{} / {}",
+                    c.search_get_count,
+                    rss::fmt_bytes(c.search_get_bytes)
+                )),
+            ]),
+            None => row.extend([text("—"), text("—"), text("—")]),
+        }
+        let headers = [
+            "Query",
+            "warm p50",
+            "warm p90",
+            "warm p99",
+            "cold open (median)",
+            "cold 1st query (median)",
+            "cold GET/bytes",
+        ];
+        report.emit(&Section {
+            anchor: anchor.into(),
+            title: format!(
+                "Supertable FTS — many-key token_match ({} docs)",
+                fmt_count(n_docs)
+            ),
+            note: format!(
+                "One unranked token_match OR over {TOKEN_MATCH_KEYS} random 64-hex record keys, \
+                 each matching one row. Warm = shared consumer + disk cache after \
+                 wait_until_warm; cold = fresh cache + consumer per iteration."
+            ),
+            blocks: vec![Block {
+                subtitle: "Token match (unranked)".into(),
+                headers: headers.iter().map(|h| h.to_string()).collect(),
+                rows: vec![row],
+            }],
+        });
+    }
+
     struct SupertableColdGuard {
         // Declared before the cache dir so the consumer (and its disk
         // cache) shuts down before removal starts — see `RetryingTempDir`.
