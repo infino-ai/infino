@@ -474,9 +474,13 @@ pub(crate) async fn select_with_tiers(
     // reader pool: a round is the next block of every live superfile whose
     // head goes on, and the merge stops when a round moves nothing.
     let required = query.required;
+    let max_rounds = match crate::config::global().diagnostics.tier_rounds {
+        0 => usize::MAX,
+        n => n as usize,
+    };
     let merge = run_on_pool(Some(pool), "tier merge", move || {
         let mut merge = merge;
-        for round in 0.. {
+        for round in 0..max_rounds {
             let mut reads: Vec<Vec<BlockRead<'_>>> =
                 (0..merge.slots.len()).map(|_| Vec::new()).collect();
             let mut read_any = false;
@@ -516,6 +520,15 @@ pub(crate) async fn select_with_tiers(
             let stalled = merge.theta_lb.is_finite()
                 && excluded == 0
                 && merge.theta_lb <= theta_before * (1.0 + THRESHOLD_RISE_MIN);
+            tracing::debug!(
+                round,
+                excluded,
+                live = merge.slots.iter().filter(|s| s.live).count(),
+                theta = merge.theta_lb,
+                entries = merge.entries_read,
+                stalled,
+                "tier merge round"
+            );
             if stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
                 break;
             }

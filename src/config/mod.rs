@@ -1099,6 +1099,11 @@ pub struct DiagnosticsSettings {
     /// never from the term index's tiers, so the tiers' effect on the same
     /// index can be measured (A/B measurement).
     pub disable_tier_selection: bool,
+    /// Most rounds a tier merge reads — a round is a block per term per
+    /// superfile in play — so the opens saved by further rounds can be
+    /// measured against their cost; `0` leaves the merge to its own stop
+    /// rule (A/B measurement).
+    pub tier_rounds: u32,
 }
 
 /// Gc settings used by `optimize()`'s bundled gc sweep.

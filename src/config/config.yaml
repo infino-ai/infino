@@ -548,6 +548,10 @@ diagnostics:
   # from the term index's tiers, so the tiers' effect can be measured.
   disable_tier_selection: false
 
+  # Cap the rounds a tier merge reads (a round is a block per term per
+  # superfile in play), to measure what further rounds buy; 0 = no cap.
+  tier_rounds: 0
+
 # Per-connection memory budget: a ceiling on the anonymous heap the query
 # and ingest paths allocate (result batches, the vector shortlist, ingest
 # buffers), so one connection can't grow memory until the process is OOM-
