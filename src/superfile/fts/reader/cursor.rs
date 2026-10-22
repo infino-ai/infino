@@ -1115,6 +1115,79 @@ impl TermCursor {
         block_tfs[rank]
     }
 
+    /// [`Self::bitset_probe_tf`] over an ascending batch: `out[i]` is the tf
+    /// of `docs[i]` in this term, or `0` when the term does not hold it. The
+    /// block covering the next doc is found from the skip table without a
+    /// decode; a dense block answers each doc by rank, and a packed block is
+    /// decoded once and walked with one forward pointer for every doc of
+    /// the batch it covers. Same contract as the single probe: docs only
+    /// ascend across calls, and a cursor probed this way is not iterated.
+    pub(super) fn probe_tfs(&mut self, docs: &[u32], out: &mut [u32]) {
+        debug_assert_eq!(docs.len(), out.len());
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            for (o, d) in out.iter_mut().zip(docs) {
+                *o = ids.binary_search(d).map_or(0, |i| self.block_tfs[i]);
+            }
+            return;
+        }
+        let n_docs = docs.len();
+        let mut k = 0usize;
+        while k < n_docs {
+            let d = docs[k];
+            while self.current_block < self.blocks.len()
+                && self.blocks[self.current_block].last_doc_id < d
+            {
+                self.current_block += 1;
+            }
+            if self.current_block >= self.blocks.len() {
+                out[k..].fill(0);
+                return;
+            }
+            let block = self.blocks[self.current_block];
+            let last = block.last_doc_id;
+            let hdr = self.current_header();
+            if is_dense_encoding(hdr.encoding) {
+                let lazy = self.lazy_bit != u32::MAX;
+                let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                while k < n_docs && docs[k] <= last {
+                    out[k] = match Self::dense_rank(raw, &hdr, docs[k]) {
+                        Some(rank) => Self::bitset_tf_for_probe(
+                            lazy,
+                            self.current_block,
+                            &mut self.tf_decoded_block,
+                            &mut self.block_tfs,
+                            raw,
+                            &hdr,
+                            rank,
+                        ),
+                        None => 0,
+                    };
+                    k += 1;
+                }
+                continue;
+            }
+            if self.decoded_block != self.current_block || self.lazy_bit != u32::MAX {
+                self.decode_current_block();
+            }
+            let n = self.block_n;
+            let ids = &self.block_doc_ids[..n];
+            let mut p = self.pos.min(n);
+            while k < n_docs && docs[k] <= last {
+                let t = docs[k];
+                while p < n && ids[p] < t {
+                    p += 1;
+                }
+                out[k] = match p < n && ids[p] == t {
+                    true => self.block_tfs[p],
+                    false => 0,
+                };
+                k += 1;
+            }
+            self.pos = p.min(n.saturating_sub(1));
+        }
+    }
+
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
         while self.current_block < self.blocks.len()
             && self.blocks[self.current_block].last_doc_id < doc

@@ -177,8 +177,11 @@ fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl
     let mut bidx = [0usize; L];
     let mut btf = [0u32; L];
     let mut bnorm = [0f32; L];
+    let mut tfs = vec![0u32; docs.len()];
+    c.probe_tfs(docs, &mut tfs);
     for (i, &doc) in docs.iter().enumerate() {
-        if let Some(tf) = c.bitset_probe_tf(doc) {
+        let tf = tfs[i];
+        if tf != 0 {
             bidx[n] = i;
             btf[n] = tf;
             bnorm[n] = dl_norm.get(doc);
@@ -679,6 +682,7 @@ fn and_membership_scored_batched<S: AndSink>(
     let mut suffix = vec![0.0_f32; m + 1];
     let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     while !driver.is_exhausted() {
         let bar = sink.bar();
         let pruning = bar > f32::NEG_INFINITY;
@@ -723,10 +727,12 @@ fn and_membership_scored_batched<S: AndSink>(
             if docs.is_empty() {
                 break;
             }
+            tfs.resize(docs.len(), 0);
+            o.probe_tfs(&docs, &mut tfs);
             let mut w = 0usize;
             for r in 0..docs.len() {
-                let d = docs[r];
-                if let Some(tf) = o.bitset_probe_tf(d) {
+                let (d, tf) = (docs[r], tfs[r]);
+                if tf != 0 {
                     docs[w] = d;
                     scores[w] = scores[r]
                         + bm25::score_with_dl_norm_k1(o.idf_weight, tf, dl_norm_k1.get(d));
