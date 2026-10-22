@@ -398,12 +398,13 @@ pub struct SupertableOptions {
     /// — sits well below its best, which is what lets a query rule the
     /// superfile out without opening it.
     pub term_head_depth: Option<usize>,
-    /// Whether a ranked query merges its terms' tiers only when the merge
-    /// can pay for itself: its first round — a block per term per
-    /// superfile, at the per-entry cost measured on this table — against
-    /// the most it could save, every open at the open cost measured here.
-    /// Off, the merge runs for every query the tiers can serve (what a test
-    /// of the merge wants).
+    /// Whether a ranked query merges its terms' tiers only when that is
+    /// measured to pay on this table: a running cost per tier entry
+    /// against the opens the merge could save, and per class of query the
+    /// wall of the search with the merge against without it, the cheaper
+    /// taken and the other tried one query in thirty-two. Off, the merge
+    /// runs for every query the tiers can serve (what a test of the merge
+    /// wants).
     pub tier_merge_gate: bool,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with

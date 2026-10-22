@@ -1113,12 +1113,24 @@ impl SupertableReader {
         // before any open.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
-        let tiers_serve = all_terms.len() <= tier::MAX_TIER_TERMS
+        let tiers_serve = index_column.is_some()
+            && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
+        // Whether to merge at all is the table's learned call per class of
+        // query; the search is timed from here so the call can be judged.
+        let policy_class = tier::TierPolicy::class(
+            shoulds.is_empty() && should_phrases.is_empty(),
+            musts.is_empty() && must_phrases.is_empty(),
+            k,
+            all_terms.len(),
+        );
+        let ranked_started = Instant::now();
+        let learned = manifest.options.tier_merge_gate;
+        let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
         let mut selected = false;
         if let Some((index, column_id)) = index_column
-            && tiers_serve
+            && merge_now
         {
             // Bits over the distinct terms: the bare terms score on their
             // own; a match must carry the musts and every member of a
@@ -1258,6 +1270,12 @@ impl SupertableReader {
                     tier_seed = Some(selection.theta_lb);
                 }
             }
+        }
+        // The index served but no merge ran: it answered for nothing and
+        // ruled nothing out, and the span says so.
+        if tiers_serve && !selected {
+            term_span.record("resolved", 0u64);
+            term_span.record("ruled_out", 0u64);
         }
         if !selected && let Some((index, column_id)) = index_column {
             // Ceilings rescale by each term's table idf, so they order and
@@ -1773,6 +1791,13 @@ impl SupertableReader {
         let mut per_unit = per_unit;
         per_unit.extend(resolved_units);
         let hits = select_top_k_stable(self, per_unit, k).await?;
+        if tiers_serve && learned {
+            self.tier_policy().note(
+                policy_class,
+                selected,
+                ranked_started.elapsed().as_nanos() as u64,
+            );
+        }
         Ok((hits, count_handle.load(AtomicOrdering::Relaxed)))
     }
 

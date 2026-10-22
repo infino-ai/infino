@@ -150,6 +150,9 @@ pub(super) struct SupertableInner {
     /// query wall: a running average over merges of their rounds' wall
     /// divided by the entries decoded. Zero until a merge has run.
     pub(super) tier_entry_cost_ns: AtomicU64,
+    /// Whether a ranked query merges its tiers, learned per class of query
+    /// from the cost of both ways on this table.
+    pub(super) tier_policy: crate::supertable::query::tier::TierPolicy,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
     /// `batch.num_rows()` ids, and unlocks. The mutex is
@@ -1845,6 +1848,7 @@ async fn build_handle(
         compaction_outstanding: AtomicBool::new(false),
         open_cost_ns: AtomicU64::new(0),
         tier_entry_cost_ns: AtomicU64::new(0),
+        tier_policy: crate::supertable::query::tier::TierPolicy::new(),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
@@ -2148,6 +2152,11 @@ impl SupertableReader {
     /// a cold outlier neither sets nor erases it.
     pub(crate) fn note_open_cost(&self, sample_ns: u64) {
         Self::fold(&self.inner.open_cost_ns, sample_ns);
+    }
+
+    /// The table's learned merge policy (see `SupertableInner::tier_policy`).
+    pub(crate) fn tier_policy(&self) -> &crate::supertable::query::tier::TierPolicy {
+        &self.inner.tier_policy
     }
 
     /// The running cost of one tier entry to a merge on this table (see

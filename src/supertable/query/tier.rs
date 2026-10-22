@@ -49,9 +49,12 @@
 //! are scaled to the table's as the ceilings are.
 
 use std::{
-    cmp::Ordering,
+    cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -68,7 +71,7 @@ use super::fts::baked_avgdl;
 use crate::{
     runtime_bridge::run_on_pool,
     superfile::fts::{
-        bm25::{Bm25Params, dequantize_len, score},
+        bm25::{Bm25Params, dequantize_len},
         reader::GlobalTermIdf,
     },
     supertable::{
@@ -108,6 +111,97 @@ pub(crate) const MAX_TIER_TERMS: usize = 64;
 
 /// A set of query terms, a bit per term in query order.
 pub(crate) type TermMask = u64;
+
+/// Whether a ranked query merges its tiers at all, learned per table from
+/// what the two ways cost: per class of query — conjunction, disjunction
+/// or a mix; a bucket of `k`; a bucket of term count — a running average
+/// of the ranked search's wall with the merge and without it. The cheaper
+/// way is taken, and one query in [`TierPolicy::EXPLORE_EVERY`] takes the
+/// other so both averages stay current as the table and its cache change.
+/// A class merges until both ways have been measured. What the merge
+/// buys — opens it rules out, the threshold it seeds the kernels with — is
+/// thereby measured as what it is worth here, on this table, rather than
+/// modelled.
+pub(crate) struct TierPolicy {
+    /// Per class, the wall of the ranked search without the merge (`[0]`)
+    /// and with it (`[1]`), in nanoseconds; zero until measured.
+    walls: Vec<[AtomicU64; 2]>,
+    trials: Vec<AtomicU32>,
+}
+
+impl TierPolicy {
+    const SHAPES: usize = 3;
+    const K_BUCKETS: usize = 4;
+    const TERM_BUCKETS: usize = 5;
+    const CLASSES: usize = Self::SHAPES * Self::K_BUCKETS * Self::TERM_BUCKETS;
+    /// One query in this many takes the way the averages do not favour.
+    const EXPLORE_EVERY: u32 = 32;
+
+    pub(crate) fn new() -> Self {
+        Self {
+            walls: (0..Self::CLASSES)
+                .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
+                .collect(),
+            trials: (0..Self::CLASSES).map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
+
+    /// The class of a query: whether its terms are all required, none, or
+    /// some; its `k`; its distinct term count.
+    pub(crate) fn class(all_required: bool, none_required: bool, k: usize, terms: usize) -> usize {
+        let shape = match (all_required, none_required) {
+            (true, _) => 0,
+            (false, true) => 1,
+            _ => 2,
+        };
+        let kb = match k {
+            0..=10 => 0,
+            11..=100 => 1,
+            101..=1000 => 2,
+            _ => 3,
+        };
+        let tb = match terms {
+            0..=1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            _ => 4,
+        };
+        (shape * Self::K_BUCKETS + kb) * Self::TERM_BUCKETS + tb
+    }
+
+    /// Whether a query of `class` merges its tiers this time.
+    pub(crate) fn merge(&self, class: usize) -> bool {
+        let trial = self.trials[class].fetch_add(1, Ordering::Relaxed);
+        let without = self.walls[class][0].load(Ordering::Relaxed);
+        let with = self.walls[class][1].load(Ordering::Relaxed);
+        if with == 0 {
+            return true;
+        }
+        if without == 0 {
+            return false;
+        }
+        let favoured = with <= without;
+        if trial.is_multiple_of(Self::EXPLORE_EVERY) {
+            !favoured
+        } else {
+            favoured
+        }
+    }
+
+    /// Fold a ranked search's wall into its class's average for the way
+    /// it went: a quarter of the way from the old value to the sample.
+    pub(crate) fn note(&self, class: usize, merged: bool, wall_ns: u64) {
+        let cell = &self.walls[class][usize::from(merged)];
+        let old = cell.load(Ordering::Relaxed);
+        let new = if old == 0 {
+            wall_ns
+        } else {
+            old - old / 4 + wall_ns / 4
+        };
+        cell.store(new, Ordering::Relaxed);
+    }
+}
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
@@ -511,11 +605,7 @@ pub(crate) async fn select_with_tiers(
     } else {
         (LOWER_SLACK, BOUND_SLACK)
     };
-    let scoring = Scoring {
-        idf,
-        params: query.params,
-        avgdl: query.table_avgdl,
-    };
+    let scoring = Scoring::new(idf, query.params, query.table_avgdl);
     // Inline heads are whole: their entries are in hand before any read.
     let mut entries_read = 0u64;
     for (ti, e) in &inline {
@@ -964,22 +1054,30 @@ fn bounds_of(
 struct Scoring {
     /// Per term, the table-wide idf the kernel weights it with.
     idf: Vec<f32>,
-    params: Bm25Params,
-    /// The average length every kept superfile scores at.
-    avgdl: f32,
+    /// Per length bucket, the length norm the kernel adds to `tf`, at the
+    /// column's parameters and the average every kept superfile scores
+    /// at: the part of a contribution that does not depend on the entry.
+    norm: Vec<f32>,
 }
 
 impl Scoring {
+    fn new(idf: Vec<f32>, params: Bm25Params, avgdl: f32) -> Self {
+        let norm = (0..=u8::MAX)
+            .map(|b| params.dl_norm_k1(dequantize_len(b), avgdl))
+            .collect();
+        Self { idf, norm }
+    }
+
     /// What term `ti` contributes to the score of a document of `e.tf`
-    /// occurrences and length bucket `e.len`: the kernel's own expression.
+    /// occurrences and length bucket `e.len`: the kernel's own expression
+    /// (`score`), with its length norm looked up.
     fn contribution(&self, ti: usize, e: &TierEntry) -> f32 {
-        score(
-            self.idf[ti],
-            e.tf,
-            dequantize_len(e.len),
-            self.avgdl,
-            self.params,
-        )
+        let tf = e.tf as f32;
+        let denom = tf + self.norm[usize::from(e.len)];
+        if denom == 0.0 {
+            return 0.0;
+        }
+        self.idf[ti] * tf / denom
     }
 }
 
@@ -988,12 +1086,12 @@ impl Scoring {
 struct OrdF32(f32);
 impl Eq for OrdF32 {}
 impl PartialOrd for OrdF32 {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
         Some(self.cmp(other))
     }
 }
 impl Ord for OrdF32 {
-    fn cmp(&self, other: &Self) -> Ordering {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
         self.0.total_cmp(&other.0)
     }
 }
