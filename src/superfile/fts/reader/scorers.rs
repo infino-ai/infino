@@ -16,7 +16,7 @@ use super::{
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
-        AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink, TopK,
+        AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink,
         TopKEntry, and_heap_push, drain_top_k_desc, replace_worst,
     },
 };
@@ -533,18 +533,17 @@ fn and_prefer_membership(cursors: &[TermCursor]) -> bool {
 ///
 /// A required block is skipped whole when its own block maximum plus each
 /// optional term's maximum **over that block's doc range** cannot beat the
-/// k-th best: bounding the optional terms by their maxima over the range
+/// k-th best. Bounding the optional terms by their maxima over the range
 /// rather than over their whole lists is what lets a common optional term
-/// stop holding every block open. A block that survives is scored in one
-/// batch, filtered against the bar less what the optional terms could add,
-/// and then completed one optional term at a time over the survivors, each
-/// pass re-filtering against what the terms still to come could add.
+/// stop holding every block open. Inside a block, each candidate is
+/// rejected before any probe when its required score plus the optional
+/// terms' block maxima at that doc cannot beat the bar, and abandoned
+/// part-way through the probes once what is still unprobed cannot close the
+/// gap, strongest optional term first.
 ///
-/// Optional terms are added in query order, as the general must+should walk
-/// adds them, so a score is the same bits on either path. Docs arrive in
-/// ascending order and a tie keeps the smaller doc, so a candidate whose
-/// bound only equals the k-th best can never enter the heap: pruning on
-/// `<=` drops nothing that would have been kept.
+/// Docs arrive in ascending order and a tie keeps the smaller doc, so a
+/// candidate whose bound only equals the k-th best can never enter the heap:
+/// pruning on `<=` drops nothing that would have been kept.
 fn must_lead_should_walk(
     mut lead: TermCursor,
     mut shoulds: Vec<TermCursor>,
@@ -554,11 +553,25 @@ fn must_lead_should_walk(
     dl_norm_k1: &NormTable,
     heap: &mut BinaryHeap<TopKEntry>,
 ) {
+    // Probe the optional terms strongest first (the bound on what is still
+    // unprobed then falls fastest), but add their scores in query order, as
+    // the general must+should walk does, so a score is the same bits on
+    // either path.
     let m = shoulds.len();
-    let mut window = vec![0.0_f32; m];
-    let mut suffix = vec![0.0_f32; m + 1];
-    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
-    let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_unstable_by(|&a, &b| {
+        shoulds[b]
+            .term_max_bm25
+            .partial_cmp(&shoulds[a].term_max_bm25)
+            .unwrap_or(Ordering::Equal)
+    });
+    debug_assert!(
+        m <= MAX_SHOULDS_LED,
+        "caller routes wider should lists elsewhere"
+    );
+    let mut contrib = [0.0_f32; MAX_SHOULDS_LED];
+    let mut doc_ub = vec![0.0_f32; m];
+    let mut doc_suffix = vec![0.0_f32; m + 1];
     // The bar a doc must beat: the k-th best once the heap is full, else the
     // floor (`NEG_INFINITY` when there is none, which prunes nothing).
     let bar = |heap: &BinaryHeap<TopKEntry>| -> f32 {
@@ -567,71 +580,81 @@ fn must_lead_should_walk(
             false => floor_eff,
         }
     };
+    let mut threshold = bar(heap);
     while !lead.is_exhausted() {
-        let threshold = bar(heap);
-        let pruning = threshold > f32::NEG_INFINITY;
         let start = lead.current_doc_id();
         let block_end = lead.current_block_last_doc_id();
-        if pruning {
-            for (w, c) in window.iter_mut().zip(shoulds.iter_mut()) {
-                *w = c.block_max_in_range(start, block_end);
-            }
-            suffix[m] = 0.0;
-            for i in (0..m).rev() {
-                suffix[i] = suffix[i + 1] + window[i];
-            }
-            if lead.current_block_max_bm25() + suffix[0] <= threshold {
+        if threshold > f32::NEG_INFINITY {
+            let window: f32 = shoulds
+                .iter_mut()
+                .map(|c| c.block_max_in_range(start, block_end))
+                .sum();
+            if lead.current_block_max_bm25() + window <= threshold {
                 lead.skip_to(block_end.saturating_add(1));
                 continue;
             }
         }
-        // The batch needs the whole block: a skip into a dense block may
-        // hold only the one doc it landed on.
-        if lead.decoded_block != lead.current_block {
-            lead.decode_current_block();
-            lead.materialize_at(start);
-        }
-        let (from, to) = (lead.pos, lead.block_n);
-        docs.clear();
-        scores.clear();
-        let mut j = from;
-        while j < to {
-            let d = lead.block_doc_ids[j];
-            let admitted = match filter.as_deref_mut() {
-                Some(f) => f.admits(d),
-                None => true,
-            };
-            if admitted {
-                docs.push(d);
-                scores.push(bm25::score_with_dl_norm_k1(
-                    lead.idf_weight,
-                    lead.block_tfs[j],
-                    dl_norm_k1.get(d),
-                ));
+        let mut have_bound = false;
+        let mut bound_holds_to = 0u32;
+        let mut others_ub = 0.0_f32;
+        while !lead.is_exhausted() && lead.current_doc_id() <= block_end {
+            let candidate = lead.current_doc_id();
+            if let Some(f) = filter.as_deref_mut()
+                && !f.admits(candidate)
+            {
+                lead.next();
+                continue;
             }
-            j += 1;
-        }
-        lead.advance_by(to - from);
-        if pruning {
-            let n = filter_survivors(&mut docs, &mut scores, threshold - suffix[0]);
-            docs.truncate(n);
-            scores.truncate(n);
-        }
-        for (i, c) in shoulds.iter_mut().enumerate() {
-            if docs.is_empty() {
-                break;
+            let norm = dl_norm_k1.get(candidate);
+            let lead_score = bm25::score_with_dl_norm_k1(lead.idf_weight, lead.current_tf(), norm);
+            let pruning = threshold > f32::NEG_INFINITY;
+            if pruning {
+                if !have_bound || candidate > bound_holds_to {
+                    others_ub = 0.0;
+                    bound_holds_to = u32::MAX;
+                    for (rank, &si) in order.iter().enumerate() {
+                        let c = &mut shoulds[si];
+                        c.shallow_advance_block_to(candidate);
+                        doc_ub[rank] = c.inspect_block_max_bm25();
+                        others_ub += doc_ub[rank];
+                        bound_holds_to = bound_holds_to.min(c.inspect_block_last_doc_id());
+                    }
+                    doc_suffix[m] = 0.0;
+                    for i in (0..m).rev() {
+                        doc_suffix[i] = doc_suffix[i + 1] + doc_ub[i];
+                    }
+                    have_bound = true;
+                }
+                if lead_score + others_ub <= threshold {
+                    lead.next();
+                    continue;
+                }
             }
-            score_noness_batched(c, &docs, &mut scores, dl_norm_k1);
-            if pruning && i + 1 < m {
-                let n = filter_survivors(&mut docs, &mut scores, threshold - suffix[i + 1]);
-                docs.truncate(n);
-                scores.truncate(n);
+            let mut partial = lead_score;
+            let mut abandoned = false;
+            for (rank, &si) in order.iter().enumerate() {
+                let c = &mut shoulds[si];
+                // Every probed slot is written, hit or miss, so no clear is
+                // needed; a doc's slots are read only when none was skipped.
+                contrib[si] = match c.bitset_probe_tf(candidate) {
+                    Some(tf) => bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm),
+                    None => 0.0,
+                };
+                partial += contrib[si];
+                if pruning && partial + doc_suffix[rank + 1] <= threshold {
+                    abandoned = true;
+                    break;
+                }
             }
-        }
-        for (&d, &s) in docs.iter().zip(scores.iter()) {
-            if s > floor_eff {
-                and_heap_push(heap, k, None, s, d);
+            let mut score = lead_score;
+            for &x in &contrib[..m] {
+                score += x;
             }
+            if !abandoned && score > floor_eff {
+                and_heap_push(heap, k, None, score, candidate);
+                threshold = bar(heap);
+            }
+            lead.next();
         }
     }
 }
@@ -753,6 +776,10 @@ fn mark_four(
         }
     }
 }
+
+/// Most optional terms the required-term walk takes; a wider list keeps
+/// the general must+should walk.
+const MAX_SHOULDS_LED: usize = 16;
 
 /// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
 /// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
@@ -1366,7 +1393,7 @@ impl FtsReader {
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
-        if must_cursors.len() == 1 {
+        if must_cursors.len() == 1 && should_cursors.len() <= MAX_SHOULDS_LED {
             let lead = must_cursors.pop().expect("one must cursor");
             let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
                 must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
@@ -2598,8 +2625,7 @@ impl FtsReader {
 
         let initial_cap =
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
-        let _ = initial_cap;
-        let mut topk = TopK::new(k);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
@@ -2637,7 +2663,7 @@ impl FtsReader {
                     break;
                 }
                 // Skip the whole block if it cannot beat threshold.
-                if topk.is_full() {
+                if heap.len() >= k {
                     // The other terms bounded over this block's own range,
                     // not their whole lists: a mid-frequency term's best
                     // document elsewhere must not hold this block open.
@@ -2738,8 +2764,15 @@ impl FtsReader {
                         continue;
                     }
                     let mut raised = false;
-                    if let Some(kth) = topk.offer(score, candidate, threshold) {
-                        threshold = kth.max(threshold);
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
+                        if heap.len() == k {
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                            raised = true;
+                        }
+                    } else if score > threshold {
+                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
                         raised = true;
                     }
                     c0.next();
@@ -2807,7 +2840,7 @@ impl FtsReader {
             // restricted to essentials.
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
-            let prune = topk.is_full();
+            let prune = heap.len() >= k;
             // Block-level partition for this window. A term whose block
             // maxima over the window cannot lift the weaker terms past the
             // threshold is non-essential *here*, even if its term max keeps
@@ -2986,7 +3019,7 @@ impl FtsReader {
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
             let (_, non_ess) = cursors.split_at_mut(f_win);
-            let heap_full = topk.is_full();
+            let heap_full = heap.len() >= k;
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
@@ -3003,7 +3036,7 @@ impl FtsReader {
                     }
                     // A word whose best score cannot beat the k-th best holds no
                     // hit: clear its slots without visiting a document.
-                    if topk.is_full() {
+                    if heap.len() >= k {
                         let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
                         if slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
                             slots.fill(0.0);
@@ -3021,8 +3054,14 @@ impl FtsReader {
                         {
                             continue;
                         }
-                        if let Some(kth) = topk.offer(score, doc, threshold) {
-                            threshold = kth.max(threshold);
+                        if heap.len() < k {
+                            heap.push(TopKEntry(score, FtsDocId::new(doc)));
+                            if heap.len() == k {
+                                threshold = heap.peek().expect("non-empty").0.max(threshold);
+                            }
+                        } else if score > threshold {
+                            replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
+                            threshold = heap.peek().expect("non-empty").0.max(threshold);
                         }
                     }
                 }
@@ -3084,13 +3123,19 @@ impl FtsReader {
             // Collect the fully-scored candidates (ascending doc order).
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
-                if let Some(kth) = topk.offer(score, doc, threshold) {
-                    threshold = kth.max(threshold);
+                if heap.len() < k {
+                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
+                    if heap.len() == k {
+                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    }
+                } else if score > threshold {
+                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
+                    threshold = heap.peek().expect("non-empty").0.max(threshold);
                 }
             }
         }
 
-        Ok(topk.into_sorted())
+        Ok(drain_top_k_desc(heap))
     }
 
     /// Exhaustive union walk for multi-term OR. No threshold-driven
