@@ -1660,6 +1660,7 @@ impl SupertableReader {
                                 floor,
                                 &scoring,
                             )
+                            .instrument(detail_span!("fts.prepare"))
                             .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
