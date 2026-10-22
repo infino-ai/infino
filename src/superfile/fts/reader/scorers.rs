@@ -2498,7 +2498,6 @@ impl FtsReader {
         }
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
-        let mut win_max = vec![0.0f32; cursors.len()];
         loop {
             let mut min_doc = u32::MAX;
             for c in &cursors {
@@ -2513,13 +2512,12 @@ impl FtsReader {
             let window_end = base.saturating_add(OR_WINDOW);
             // A window whose terms together cannot beat the k-th best holds no
             // hit: mark presence for the count, score nothing.
-            let prune = filter.is_none() && k > 0 && heap.len() >= k;
-            if prune {
+            if filter.is_none() && k > 0 && heap.len() >= k {
                 let last = window_end - 1;
-                for (m, c) in win_max.iter_mut().zip(cursors.iter_mut()) {
-                    *m = c.block_max_in_range(base, last);
-                }
-                let bound: f32 = win_max.iter().sum();
+                let bound: f32 = cursors
+                    .iter_mut()
+                    .map(|c| c.block_max_in_range(base, last))
+                    .sum();
                 if bound <= threshold {
                     for c in &mut cursors {
                         mark_window(c, base, window_end, &mut present);
@@ -2530,37 +2528,11 @@ impl FtsReader {
                     continue;
                 }
             }
-            for (ci, c) in cursors.iter_mut().enumerate() {
-                // The other terms' maxima over this window: a block of this
-                // term that cannot beat the k-th best even with them is only
-                // marked. Its docs' window scores then stay partial, but a
-                // partial score is below the full one, which is itself under
-                // the bar, so no such doc is admitted either way.
-                let others: f32 = match prune {
-                    true => win_max
-                        .iter()
-                        .enumerate()
-                        .filter(|&(j, _)| j != ci)
-                        .map(|(_, &m)| m)
-                        .sum(),
-                    false => f32::INFINITY,
-                };
-                let mut checked_block = usize::MAX;
+            for c in &mut cursors {
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
                     if d >= window_end {
                         break;
-                    }
-                    if prune && c.current_block != checked_block {
-                        checked_block = c.current_block;
-                        if c.current_block_max_bm25() + others <= threshold {
-                            let block_end = c
-                                .current_block_last_doc_id()
-                                .saturating_add(1)
-                                .min(window_end);
-                            mark_window(c, base, block_end, &mut present);
-                            continue;
-                        }
                     }
                     let pos = c.pos;
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
