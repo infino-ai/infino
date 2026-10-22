@@ -196,7 +196,7 @@ use crate::{
             resolve::{resolve_batch, try_conform, union_schema},
         },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
-        utils::vector_split::split_vectors,
+        utils::{idgen::flatten_spans, vector_split::split_vectors},
         wal::{
             Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
@@ -1559,11 +1559,7 @@ impl SupertableWriter {
             .lock()
             .expect("id_generator mutex poisoned")
             .reserve_range(n_rows);
-        let mut ids: Vec<i128> = Vec::with_capacity(n_rows);
-        for (first, last) in id_spans {
-            let len = (last - first) as usize + 1;
-            ids.extend((0..len).map(|i| first + i as i128));
-        }
+        let ids = flatten_spans(&id_spans);
 
         let scalar = with_id_column(&scalar_no_id, ids, &options.id_column);
 

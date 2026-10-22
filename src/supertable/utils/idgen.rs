@@ -202,6 +202,23 @@ impl IdGenerator {
     }
 }
 
+/// Expand `(first, last)` spans, as [`IdGenerator::reserve_range`]
+/// returns them, into the ids they hold, in order.
+///
+/// `extend` over an inclusive range is one bulk fill, since the range is
+/// a `TrustedLen` iterator, rather than a bounds-checked push per id.
+pub(crate) fn flatten_spans(spans: &[(i128, i128)]) -> Vec<i128> {
+    let total: usize = spans
+        .iter()
+        .map(|&(first, last)| (last - first) as usize + 1)
+        .sum();
+    let mut out = Vec::with_capacity(total);
+    for &(first, last) in spans {
+        out.extend(first..=last);
+    }
+    out
+}
+
 impl Default for IdGenerator {
     fn default() -> Self {
         Self::new()
@@ -381,19 +398,6 @@ mod tests {
     }
 
     // ---- reserve_range ------------------------------------------------
-
-    /// Flatten a span list to the implied sequence of ids. Used
-    /// by the tests below to assert the per-span shape produces
-    /// the right total count + ordering.
-    fn flatten_spans(spans: &[(i128, i128)]) -> Vec<i128> {
-        let mut out = Vec::new();
-        for (first, last) in spans {
-            for v in *first..=*last {
-                out.push(v);
-            }
-        }
-        out
-    }
 
     #[test]
     fn reserve_range_zero_returns_empty() {

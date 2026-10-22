@@ -88,7 +88,7 @@ use crate::{
             error::SchemaError,
             resolve::{conform, resolve_batch, union_schema},
         },
-        utils::vector_split::split_vectors,
+        utils::{idgen, vector_split::split_vectors},
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
             state_doc::{
@@ -437,21 +437,11 @@ async fn do_apply(
     advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
 }
 
-/// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
-/// ids in order. Total cost is O(n) in the flattened count;
-/// allocated once per append-phase invocation.
-///
-/// Uses `extend(Range)` rather than a `push` loop: `Vec::extend`
-/// specializes on `TrustedLen` iterators (which `Range<i128>` is),
-/// emitting one bulk copy instead of N bounds-checked pushes —
-/// ~6× faster at the 1M-id scale a delete/update batch can hit.
+/// Flatten the WAL's persisted `IdSpan`s into the implied sequence of
+/// `i128` ids in order, with the same expansion an append uses.
 fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
-    let total: usize = spans.iter().map(|s| s.len() as usize).sum();
-    let mut out = Vec::with_capacity(total);
-    for span in spans {
-        out.extend(span.first.0..=span.last.0);
-    }
-    out
+    let spans: Vec<(i128, i128)> = spans.iter().map(|s| (s.first.0, s.last.0)).collect();
+    idgen::flatten_spans(&spans)
 }
 
 /// Decode the WAL's IPC sidecar back to the user-shape
