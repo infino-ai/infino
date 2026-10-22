@@ -16,7 +16,7 @@ use super::{
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
-        AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink,
+        AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink, TopK,
         TopKEntry, and_heap_push, drain_top_k_desc, replace_worst,
     },
 };
@@ -2544,7 +2544,8 @@ impl FtsReader {
 
         let initial_cap =
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let _ = initial_cap;
+        let mut topk = TopK::new(k);
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
@@ -2582,7 +2583,7 @@ impl FtsReader {
                     break;
                 }
                 // Skip the whole block if it cannot beat threshold.
-                if heap.len() >= k {
+                if topk.is_full() {
                     // The other terms bounded over this block's own range,
                     // not their whole lists: a mid-frequency term's best
                     // document elsewhere must not hold this block open.
@@ -2683,15 +2684,8 @@ impl FtsReader {
                         continue;
                     }
                     let mut raised = false;
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
-                        if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                            raised = true;
-                        }
-                    } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    if let Some(kth) = topk.offer(score, candidate, threshold) {
+                        threshold = kth.max(threshold);
                         raised = true;
                     }
                     c0.next();
@@ -2759,7 +2753,7 @@ impl FtsReader {
             // restricted to essentials.
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
-            let prune = heap.len() >= k;
+            let prune = topk.is_full();
             // Block-level partition for this window. A term whose block
             // maxima over the window cannot lift the weaker terms past the
             // threshold is non-essential *here*, even if its term max keeps
@@ -2938,7 +2932,7 @@ impl FtsReader {
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
             let (_, non_ess) = cursors.split_at_mut(f_win);
-            let heap_full = heap.len() >= k;
+            let heap_full = topk.is_full();
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
@@ -2955,7 +2949,7 @@ impl FtsReader {
                     }
                     // A word whose best score cannot beat the k-th best holds no
                     // hit: clear its slots without visiting a document.
-                    if heap.len() >= k {
+                    if topk.is_full() {
                         let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
                         if slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
                             slots.fill(0.0);
@@ -2973,14 +2967,8 @@ impl FtsReader {
                         {
                             continue;
                         }
-                        if heap.len() < k {
-                            heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                            if heap.len() == k {
-                                threshold = heap.peek().expect("non-empty").0.max(threshold);
-                            }
-                        } else if score > threshold {
-                            replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
+                        if let Some(kth) = topk.offer(score, doc, threshold) {
+                            threshold = kth.max(threshold);
                         }
                     }
                 }
@@ -3042,19 +3030,13 @@ impl FtsReader {
             // Collect the fully-scored candidates (ascending doc order).
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                    if heap.len() == k {
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
-                    }
-                } else if score > threshold {
-                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
-                    threshold = heap.peek().expect("non-empty").0.max(threshold);
+                if let Some(kth) = topk.offer(score, doc, threshold) {
+                    threshold = kth.max(threshold);
                 }
             }
         }
 
-        Ok(drain_top_k_desc(heap))
+        Ok(topk.into_sorted())
     }
 
     /// Exhaustive union walk for multi-term OR. No threshold-driven
