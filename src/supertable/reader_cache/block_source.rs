@@ -25,20 +25,30 @@
 //!   where the missing run lies         what its GET covers
 //!   ──────────────────────────         ──────────────────────────────────────────────
 //!   wholly inside the FTS hole         the read's exact bytes; no blocks are filled
-//!   in a 512 KiB group touching the    that whole group, aligned to file offset 0
-//!   aligned region (vector
-//!   subsection, or a file of
+//!   in a 512 KiB group touching the    that whole group, aligned to file offset 0,
+//!   aligned region (vector             less the group's leading blocks already
+//!   subsection, or a file of           cached
 //!   unknown layout)
 //!   elsewhere, 512 KiB or longer       its own blocks
-//!   elsewhere, shorter                 its blocks, then the blocks after it, up to
-//!                                      512 KiB in all; it stops early at a filled or
-//!                                      pending block, the aligned region, or the end
-//!                                      of the file
+//!   elsewhere, shorter, at or past     a window of 512 KiB starting at it: the reads
+//!   where one of the last 16 reads     are moving forwards
+//!   ended (or the file's first read)
+//!   elsewhere, shorter, before all     a window of 512 KiB around it: up to half the
+//!   of them                            spare room behind it (more when the end of the
+//!                                      file or the aligned region leaves less ahead)
+//!                                      over blocks not cached yet, none just before
+//!                                      the FTS hole; the rest ahead
 //! ```
 //!
+//! A window fetches through cached stretches of up to 128 KiB and never passes the
+//! end of the file. It stops before the aligned region's first block, so it can
+//! fill the head of a group touching the region; that group's GET later skips
+//! those blocks.
+//!
 //! Blocks stay small so a large read fetches at most a partial block more at each
-//! end; a short read still asks for enough that the reads after it are local. A
-//! read in the FTS hole is served from blocks that are already there.
+//! end; a short read still asks for enough that the reads around it are local,
+//! whichever order they come in. A read in the FTS hole is served from blocks that
+//! are already there.
 //!
 //! # A read never waits on the cache disk
 //!
@@ -84,6 +94,7 @@
 #[cfg(test)]
 use std::sync::Condvar;
 use std::{
+    array,
     collections::{BTreeMap, btree_map::Entry},
     fs,
     os::unix::fs::FileExt,
@@ -91,7 +102,7 @@ use std::{
     process,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
@@ -120,15 +131,29 @@ pub(super) const CACHE_BLOCK_BYTES: u64 = 64 * 1024;
 
 /// What a GET for a short missing run grows to. Blocks are what the cache
 /// tracks; this is what one GET asks for, so the two differ on purpose. A run
-/// shorter than this also takes the blocks after it, up to this length in all,
-/// stopping at the first filled or pending block, the aligned region, or the end
-/// of the file: small reads come in sequences (a column's pages, one after
-/// another), and the next ones are then local. A run at least this long takes
-/// only its own blocks, so a large read pays nothing extra.
+/// shorter than this grows to a window of this length around it (see
+/// [`BlockCachedSource::get_run`]): small reads come in sequences (a column's
+/// pages one after another, point lookups near each other in any order), and the
+/// next ones are then local. A run at least this long takes only its own blocks,
+/// so a large read pays nothing extra.
 const MIN_GET_BYTES: u64 = 512 * 1024;
 
 /// [`MIN_GET_BYTES`] in blocks.
 const MIN_GET_BLOCKS: u32 = (MIN_GET_BYTES / CACHE_BLOCK_BYTES) as u32;
+
+/// The longest cached stretch, in blocks, a short miss's GET fetches through to
+/// reach missing blocks after it inside its window: downloading up to 128 KiB
+/// again is cheaper than another GET, while a longer stretch is mostly bytes
+/// the cache already holds.
+const FETCH_THROUGH_BLOCKS: u32 = 2;
+
+/// How many recent read ends a source keeps to tell a forward scan from a jump
+/// back. Each reader of a file (a query's partitions scan their own byte ranges
+/// of it, and queries run at once) needs one. With more readers than this, the
+/// oldest ends are overwritten, and a reader whose end is gone has its next
+/// forward miss taken for a jump back: its window then also covers blocks behind
+/// it.
+const READ_ENDS: usize = 16;
 
 /// Near the aligned region (see [`SourceLayout::aligned_region`]) a GET covers
 /// whole groups of this many bytes, aligned to file offset 0. Vector reads are
@@ -215,6 +240,13 @@ pub(crate) struct BlockCachedSource {
     owns_accounting: bool,
     /// Where this file's FTS hole and aligned region lie.
     layout: SourceLayout,
+    /// Where the last [`READ_ENDS`] reads ended, `u64::MAX` in unused slots,
+    /// written round robin from `next_read_end`. Several readers share one
+    /// source (a query's partitions each scan a byte range of the file, and
+    /// queries run at once), so a miss continues a scan when it starts at or
+    /// past any of them.
+    read_ends: [AtomicU64; READ_ENDS],
+    next_read_end: AtomicUsize,
     state: OnceLock<Option<BlockFile>>,
     /// Filled-block set. Guarded by a sync mutex; never held across await.
     filled: Mutex<RoaringBitmap>,
@@ -414,7 +446,13 @@ impl BlockCachedSource {
             path,
             entry_token: Arc::new(()),
             owns_accounting,
-            layout,
+            // An empty section is no section: nothing can be read in it.
+            layout: SourceLayout {
+                fts_hole: layout.fts_hole.filter(|&(_, len)| len > 0),
+                aligned_region: layout.aligned_region.filter(|&(_, len)| len > 0),
+            },
+            read_ends: array::from_fn(|_| AtomicU64::new(u64::MAX)),
+            next_read_end: AtomicUsize::new(0),
             state: OnceLock::new(),
             filled: Mutex::new(RoaringBitmap::new()),
             filled_bytes: Arc::new(AtomicU64::new(0)),
@@ -467,14 +505,27 @@ impl BlockCachedSource {
         }
         let (b0, b1) = Self::block_span(start, end - start);
         let (b0, b1) = self.aligned_run(bf.size, b0, b1);
-        // Chunks are cut on a grid from file offset 0, so with a chunk of whole
-        // aligned groups, as the configured size is, no two chunks share a group,
-        // and a prefetch that stops early leaves none half filled.
         let per_chunk = (chunk_bytes / CACHE_BLOCK_BYTES).max(1) as u32;
-        let chunks = (b0 / per_chunk..=b1 / per_chunk).map(|k| {
-            let c0 = k * per_chunk;
-            (c0.max(b0), c0.saturating_add(per_chunk - 1).min(b1))
-        });
+        let near_region = self
+            .aligned_blocks()
+            .is_some_and(|(region_first, region_last)| b0 <= region_last && b1 >= region_first);
+        // Near the aligned region, chunks of whole groups from the group holding
+        // the range's first block, so no two chunks share a group, a prefetch that
+        // stops early leaves none half filled, and a range takes as many chunks as
+        // it did with 512 KiB blocks. Elsewhere, chunks from the range's start, so
+        // a range no bigger than a chunk is one GET.
+        let chunks: Vec<(u32, u32)> = if near_region {
+            let per_chunk = per_chunk.div_ceil(ALIGNED_GET_BLOCKS) * ALIGNED_GET_BLOCKS;
+            (b0 - b0 % ALIGNED_GET_BLOCKS..=b1)
+                .step_by(per_chunk as usize)
+                .map(|c0| (c0.max(b0), c0.saturating_add(per_chunk - 1).min(b1)))
+                .collect()
+        } else {
+            (b0..=b1)
+                .step_by(per_chunk as usize)
+                .map(|c0| (c0, c0.saturating_add(per_chunk - 1).min(b1)))
+                .collect()
+        };
         // On a stop, chunks not started yet are skipped. Chunks already running
         // finish, so the prefetch returns only after every write it started.
         let stop = AtomicBool::new(false);
@@ -589,10 +640,6 @@ impl BlockCachedSource {
         }
         self.filled_bytes.store(adopted_bytes, Ordering::Release);
         *self.filled.lock().expect("filled bitmap mutex poisoned") = bitmap;
-        if !idx_bytes.starts_with(&IDX_HEADER) {
-            // Written with larger blocks: the next flush rewrites it in ours.
-            self.dirty.store(true, Ordering::SeqCst);
-        }
         Some(BlockFile {
             file,
             size,
@@ -662,29 +709,142 @@ impl BlockCachedSource {
         Self::block_span(0, size.max(1)).1
     }
 
-    /// The blocks one GET for a read's missing run `[first, last]` covers: the
-    /// run after [`Self::aligned_run`], then, while shorter than
-    /// [`MIN_GET_BYTES`], the blocks after it up to the first filled or pending
-    /// block, the aligned region, or the end of the file. A GET still in flight
-    /// is not pending yet, so two reads at once can cover the same blocks; the
-    /// later write finds them filled and gives their budget back.
-    fn get_run(&self, size: u64, first: u32, last: u32) -> (u32, u32) {
-        let (first, last) = self.aligned_run(size, first, last);
-        let mut min_last = first
-            .saturating_add(MIN_GET_BLOCKS - 1)
-            .min(Self::last_block(size));
-        if let Some(region) = self.first_aligned_block()
-            && last < region
-        {
-            min_last = min_last.min(region - 1);
-        }
-        if last >= min_last {
+    /// The blocks one GET for a read's missing run `[first, last]` covers, never
+    /// starting before `floor` (blocks this read already fetched). The run after
+    /// [`Self::aligned_run`], less the group's leading blocks already cached, is
+    /// kept as is when it is at least [`MIN_GET_BYTES`] long or lies in the
+    /// aligned region; a shorter one grows to a window of that length:
+    ///
+    /// ```text
+    ///   at or past the block where one of the last READ_ENDS reads ended (or the
+    ///   file's first read):
+    ///           all of the window ahead. The reads are moving forwards, so blocks
+    ///           behind are either cached or skipped (a column the scan does not
+    ///           read). Each of a query's partitions scans its own byte range, so
+    ///           one end per file would make one partition's forward read look
+    ///           like a jump back
+    ///   before all of them:
+    ///     spare = MIN_GET_BLOCKS - run length
+    ///     behind: up to spare / 2 blocks (more when less room is left ahead), over
+    ///             blocks not cached yet, stopping at the first cached one, so reads
+    ///             arriving in reverse or random order still find their neighbours
+    ///             local; none when the FTS hole starts within the window ahead,
+    ///             whose term dictionary is read forwards
+    ///     ahead:  the rest of the window
+    /// ```
+    ///
+    /// Ahead, a cached stretch of up to FETCH_THROUGH_BLOCKS is fetched through, a
+    /// longer one ends the window, and the window ends on the last block not cached
+    /// yet. It stops before the aligned region's first block, not before that
+    /// block's group, so a short read just before the FTS hole still covers the
+    /// postings that the group's head holds. It never passes the end of the file.
+    /// A GET still in flight is not pending yet, so two reads at once can cover
+    /// the same blocks; the later write finds them filled and gives their budget
+    /// back.
+    fn get_run(&self, size: u64, first: u32, last: u32, floor: u32) -> (u32, u32) {
+        let (grown, last) = self.aligned_run(size, first, last);
+        // A group's leading blocks a window before the region already fetched
+        // are not fetched again.
+        let first = if grown < first {
+            self.segments(grown, first - 1)
+                .iter()
+                .find_map(|segment| match segment {
+                    Segment::Missing { first, .. } => Some(*first),
+                    _ => None,
+                })
+                .unwrap_or(first)
+        } else {
+            grown
+        };
+        let first = first.max(floor);
+        let run = last - first + 1;
+        if run >= MIN_GET_BLOCKS {
             return (first, last);
         }
-        match self.segments(last + 1, min_last).first() {
-            Some(&Segment::Missing { last: end, .. }) => (first, end),
-            _ => (first, last),
+        let (mut lo, mut hi) = (floor, Self::last_block(size));
+        if let Some((region_first, region_last)) = self.aligned_blocks() {
+            let region_block = self.first_region_block().unwrap_or(region_first);
+            if last < region_block {
+                // A run before the region: its window stops before the region's
+                // first block, which can be inside a group touching the region.
+                hi = hi.min(region_block - 1);
+            } else if first > region_last {
+                lo = lo.max(region_last + 1);
+            } else {
+                // In the aligned region: whole groups already.
+                return (first, last);
+            }
         }
+        let behind = if self.reads_forward(first) {
+            0
+        } else {
+            // When the FTS hole starts inside the window, after the start of the
+            // read's first block (the read ends before it or runs into it), all of the window
+            // goes ahead: the term dictionary at the hole's start is read
+            // forwards, one lookup after another, so blocks behind the read would
+            // only take its place.
+            let hole_ahead = self.layout.fts_hole.is_some_and(|(off, _)| {
+                let window_end = u64::from(first) + u64::from(MIN_GET_BLOCKS);
+                u64::from(first) * CACHE_BLOCK_BYTES < off && off < window_end * CACHE_BLOCK_BYTES
+            });
+            // Half the spare room behind, more when the end of the file or the
+            // aligned region leaves less than that ahead.
+            let spare = MIN_GET_BLOCKS - run;
+            if hole_ahead {
+                0
+            } else {
+                (spare / 2).max(spare.saturating_sub(hi.saturating_sub(last)))
+            }
+        };
+        let start = match first.checked_sub(1) {
+            Some(before) if before >= lo && behind > 0 => {
+                match self
+                    .segments(first.saturating_sub(behind).max(lo), before)
+                    .last()
+                {
+                    Some(&Segment::Missing { first: from, .. }) => from,
+                    _ => first,
+                }
+            }
+            _ => first,
+        };
+        let window_last = start.saturating_add(MIN_GET_BLOCKS - 1).min(hi);
+        let mut end = last;
+        if last < window_last {
+            for segment in self.segments(last + 1, window_last) {
+                let (from, to) = segment.blocks();
+                match segment {
+                    Segment::Missing { .. } => end = to,
+                    _ if to - from < FETCH_THROUGH_BLOCKS => {}
+                    _ => break,
+                }
+            }
+        }
+        (start, end)
+    }
+
+    /// Records where a read ended, over the oldest of the recent ends.
+    fn note_read_end(&self, end: u64) {
+        let slot = self.next_read_end.fetch_add(1, Ordering::Relaxed) % READ_ENDS;
+        self.read_ends[slot].store(end, Ordering::Relaxed);
+    }
+
+    /// Whether a miss starting at block `first` continues the reads before it:
+    /// it starts at or past the block where one of the recent reads ended, or
+    /// it is the file's first read.
+    fn reads_forward(&self, first: u32) -> bool {
+        let mut seen = false;
+        for end in &self.read_ends {
+            let end = end.load(Ordering::Relaxed);
+            if end == u64::MAX {
+                continue;
+            }
+            seen = true;
+            if u64::from(first) >= end.saturating_sub(1) / CACHE_BLOCK_BYTES {
+                return true;
+            }
+        }
+        !seen
     }
 
     /// Run `[first, last]` with each end whose group of [`ALIGNED_GET_BYTES`]
@@ -712,11 +872,25 @@ impl BlockCachedSource {
         (first, last)
     }
 
-    /// The first block of the first group touching the aligned region, where a
-    /// short run's extension stops.
-    fn first_aligned_block(&self) -> Option<u32> {
+    /// The first and last block of the groups touching the aligned region. A
+    /// short run's window enters them only before the region's first block.
+    fn aligned_blocks(&self) -> Option<(u32, u32)> {
+        let (off, len) = self.layout.aligned_region?;
+        let group_blocks = u64::from(ALIGNED_GET_BLOCKS);
+        // First block of the group holding `byte`, saturating at the largest
+        // block index for a region that runs to the end of any file.
+        let group_first =
+            |byte: u64| u32::try_from(byte / CACHE_BLOCK_BYTES / group_blocks * group_blocks);
+        let first = group_first(off).unwrap_or(u32::MAX);
+        let last = group_first(off.saturating_add(len.max(1) - 1))
+            .map_or(u32::MAX, |b| b.saturating_add(ALIGNED_GET_BLOCKS - 1));
+        Some((first, last))
+    }
+
+    /// The block holding the aligned region's first byte.
+    fn first_region_block(&self) -> Option<u32> {
         let (off, _) = self.layout.aligned_region?;
-        Some((off / CACHE_BLOCK_BYTES) as u32 / ALIGNED_GET_BLOCKS * ALIGNED_GET_BLOCKS)
+        u32::try_from(off / CACHE_BLOCK_BYTES).ok()
     }
 
     /// Byte start and length of blocks `[first, last]` in a file of `size` bytes.
@@ -939,31 +1113,39 @@ impl BlockCachedSource {
     ) -> Result<Option<Bytes>, LazyByteSourceError> {
         let (b0, b1) = Self::block_span(start, len);
 
-        let mut segments = self.segments(b0, b1);
-        // The run this read fetched last. An aligned group with a filled block in
-        // the middle splits into two missing stretches that both round to the
-        // group, so the second is served from the first's bytes.
+        let segments = self.segments(b0, b1);
+        let mut served = Vec::with_capacity(segments.len());
+        // The run this read fetched last. A GET can cover a later missing stretch
+        // of the same read, wholly or in part (an aligned group with a filled
+        // block in the middle, or a window fetched through a cached stretch):
+        // that part is served from its bytes, and the next GET starts after it.
         let mut fetched: Option<(u32, u32, Bytes)> = None;
 
-        for segment in &mut segments {
-            let Segment::Missing { first, last } = *segment else {
+        for segment in segments {
+            let Segment::Missing { mut first, last } = segment else {
+                served.push(segment);
                 continue;
             };
 
             if let Some((run_first, run_last, bytes)) = &fetched
                 && *run_first <= first
-                && last <= *run_last
+                && first <= *run_last
             {
-                *segment = Segment::Pending {
+                let covered = last.min(*run_last);
+                served.push(Segment::Pending {
                     first,
-                    last,
+                    last: covered,
                     run_first: *run_first,
                     bytes: bytes.clone(),
-                };
-                continue;
+                });
+                if covered == last {
+                    continue;
+                }
+                first = covered + 1;
             }
 
-            let (run_first, run_last) = self.get_run(bf.size, first, last);
+            let floor = fetched.as_ref().map_or(0, |(_, run_last, _)| run_last + 1);
+            let (run_first, run_last) = self.get_run(bf.size, first, last, floor);
             let Some((bytes, run)) = self
                 .fetch_missing(bf, run_first, run_last, Fill::Read)
                 .await?
@@ -976,16 +1158,16 @@ impl BlockCachedSource {
                 drop(run.spawn_write());
             }
 
-            *segment = Segment::Pending {
+            served.push(Segment::Pending {
                 first,
                 last,
                 run_first,
                 bytes: bytes.clone(),
-            };
+            });
             fetched = Some((run_first, run_last, bytes));
         }
 
-        Ok(self.assemble(bf, start, len, &segments))
+        Ok(self.assemble(bf, start, len, &served))
     }
 
     /// Fetches blocks `[first, last]` with one GET, reserving their budget
@@ -1282,6 +1464,33 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        let bytes = self.read(start, len).await;
+        if len > 0 {
+            self.note_read_end(start.saturating_add(len));
+        }
+        bytes
+    }
+
+    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+        let bytes = self.read_sync(start, len)?;
+        if len > 0 {
+            self.note_read_end(start.saturating_add(len));
+        }
+        Some(bytes)
+    }
+
+    async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
+        // Pass through: `tail` both fetches and (on unknown-size sources)
+        // discovers the object size, which the inner source caches. Tail
+        // bytes are open-time metadata already retained by the open-blob /
+        // prefetch overlay above this source, so caching them here as
+        // (mostly partial) blocks buys nothing.
+        self.inner.tail(len).await
+    }
+}
+
+impl BlockCachedSource {
+    async fn read(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
         if len == 0 {
             return Ok(Bytes::new());
         }
@@ -1308,7 +1517,7 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     // No whole-file fallback here: a caller that gets `None` takes the async `range`, which has it.
-    fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
+    fn read_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());
         }
@@ -1327,20 +1536,12 @@ impl LazyByteSource for BlockCachedSource {
         self.assemble(bf, start, len, &self.segments(b0, b1))
             .or_else(|| self.inner.try_get_range_sync(start, len))
     }
-
-    async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
-        // Pass through: `tail` both fetches and (on unknown-size sources)
-        // discovers the object size, which the inner source caches. Tail
-        // bytes are open-time metadata already retained by the open-blob /
-        // prefetch overlay above this source, so caching them here as
-        // (mostly partial) blocks buys nothing.
-        self.inner.tail(len).await
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeSet,
         future::pending,
         path::Path,
         sync::{atomic::AtomicUsize, mpsc},
@@ -2186,8 +2387,8 @@ mod tests {
         (uri, inner, src)
     }
 
-    /// What one GET for a small read covers, eight blocks: the unit the tests
-    /// that count fills count in.
+    /// The bytes one GET for a short read covers: tests that count fills count
+    /// in this unit.
     const UNIT: u64 = MIN_GET_BYTES;
 
     /// Bytes in one aligned group.
@@ -2219,73 +2420,115 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A GET for a short missing run covers `MIN_GET_BYTES` from its first block
-    /// on, so the reads after it cost no GET.
+    /// A GET for a short miss before where the recent reads ended covers a window
+    /// of `MIN_GET_BYTES` around it, so the reads near it cost no GET, before it
+    /// or after it.
     #[tokio::test]
-    async fn a_short_miss_gets_the_blocks_after_it_too() {
+    async fn a_short_miss_behind_the_recent_reads_gets_the_blocks_around_it() {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
 
-        let _ = src.range(b + 10, 100).await.expect("read");
-        assert_eq!(inner.fetched_bytes(), MIN_GET_BYTES, "from block 1 on");
-        for page in 1..8 {
-            let start = b + page * b / 2;
-            let got = src.range(start, 100).await.expect("a later page");
+        let _ = src.range(20 * b + 10, 100).await.expect("read block 20");
+        let before = inner.fetched_bytes();
+        let _ = src.range(4 * b + 10, 100).await.expect("read block 4");
+        assert_eq!(inner.fetched_bytes() - before, MIN_GET_BYTES, "one window");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(1, 8), "three blocks behind it, four ahead");
+        for block in 1..=8 {
+            let start = block * b + 10;
+            let got = src.range(start, 100).await.expect("a nearby page");
             assert_eq!(
                 got,
                 inner.blob.slice(start as usize..(start + 100) as usize)
             );
         }
-        assert_eq!(inner.calls(), 1, "the GET covered every later page");
-        let _ = src.range(10, 100).await.expect("the block before it");
-        assert_eq!(inner.calls(), 2, "and nothing before it");
+        assert_eq!(inner.calls(), 2, "the GET covered every nearby page");
+        let _ = src.range(10, 100).await.expect("past the window");
+        assert_eq!(inner.calls(), 3, "and nothing past it");
 
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A GET stops at the first filled block, so nothing is fetched twice.
+    /// The first read on a file, and a miss at or past where a recent read
+    /// ended, put the whole window ahead: the reads are moving forwards.
     #[tokio::test]
-    async fn a_get_stops_at_a_filled_block() {
+    async fn a_forward_miss_puts_the_window_ahead() {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
 
-        let _ = src.range(3 * b + 10, 100).await.expect("fetch blocks 3 on");
+        let _ = src.range(4 * b + 10, 100).await.expect("first read");
         store.block_writes_settled().await;
-        let before = inner.fetched_bytes();
-        let _ = src.range(10, 100).await.expect("read block 0");
-        assert_eq!(inner.fetched_bytes() - before, 3 * b, "blocks 0 to 2 only");
+        assert!(
+            src.all_filled(4, 11),
+            "the first read's window starts at it"
+        );
+        assert!(!src.all_filled(3, 3), "nothing behind it");
+        let _ = src
+            .range(14 * b + 10, 100)
+            .await
+            .expect("a read further on");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(14, 21), "a later miss ahead, the same");
+        assert!(!src.all_filled(12, 13), "nothing behind it either");
+        assert_eq!(inner.fetched_bytes(), 2 * MIN_GET_BYTES);
 
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A GET also stops at the first pending block, one fetched but not written
-    /// yet.
+    /// A GET stops at a filled stretch longer than `FETCH_THROUGH_BLOCKS`,
+    /// rather than downloading it again.
     #[tokio::test]
-    async fn a_get_stops_at_a_pending_block() {
+    async fn a_get_stops_at_a_long_filled_stretch() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        let _ = src
+            .range(5 * b + 10, 100)
+            .await
+            .expect("fetch blocks 5 to 12");
+        store.block_writes_settled().await;
+        let before = inner.fetched_bytes();
+        let _ = src.range(10, 100).await.expect("read block 0");
+        assert_eq!(inner.fetched_bytes() - before, 5 * b, "blocks 0 to 4 only");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A GET also stops at a long pending stretch, blocks fetched but not
+    /// written yet.
+    #[tokio::test]
+    async fn a_get_stops_at_a_long_pending_stretch() {
         let b = CACHE_BLOCK_BYTES;
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
 
         let stall = src.stall_writes();
-        let _ = src.range(3 * b + 10, 100).await.expect("fetch blocks 3 on");
+        let _ = src
+            .range(5 * b + 10, 100)
+            .await
+            .expect("fetch blocks 5 to 12");
         let before = inner.fetched_bytes();
         let _ = src.range(10, 100).await.expect("read block 0");
-        assert_eq!(inner.fetched_bytes() - before, 3 * b, "blocks 0 to 2 only");
+        assert_eq!(inner.fetched_bytes() - before, 5 * b, "blocks 0 to 4 only");
 
         drop(stall);
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A short run near the end of the file extends only to its last, partial
-    /// block, and is charged for the bytes it holds.
+    /// A forward read near the end of the file stops at its last, partial block,
+    /// and is charged for the bytes it holds. A miss behind it then takes the
+    /// room it cannot use ahead from behind.
     #[tokio::test]
     async fn a_short_run_extends_to_the_partial_last_block() {
         let b = CACHE_BLOCK_BYTES;
@@ -2294,11 +2537,19 @@ mod tests {
         let store = test_store(dir.path(), u64::MAX);
         let (uri, inner, src) = layout_source(dir.path(), &store, size as usize, None);
 
-        let _ = src.range(b + 10, 100).await.expect("read block 1");
-        assert_eq!(inner.fetched_bytes(), size - b, "blocks 1 to the end");
+        let _ = src.range(2 * b + 10, 100).await.expect("read block 2");
+        assert_eq!(
+            inner.fetched_bytes(),
+            b + 100,
+            "block 2 to the end, nothing behind"
+        );
         store.block_writes_settled().await;
-        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), size - b);
-        assert_eq!(store.stats().current_bytes, size - b);
+        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), b + 100);
+        assert_eq!(store.stats().current_bytes, b + 100);
+        let _ = src.range(b + 10, 100).await.expect("read block 1");
+        assert_eq!(inner.fetched_bytes(), size, "then blocks 0 and 1");
+        store.block_writes_settled().await;
+        assert_eq!(store.stats().current_bytes, size);
 
         store.remove_block_entry_for_test(&uri);
     }
@@ -2380,7 +2631,7 @@ mod tests {
 
     /// Only the aligned region rounds to aligned groups: a small read at the end
     /// of a group gets that whole group inside the region, and outside it gets
-    /// 512 KiB from its own block on.
+    /// a 512 KiB window from its own block.
     #[tokio::test]
     async fn only_the_aligned_region_gets_whole_groups() {
         let per_group = (GROUP / CACHE_BLOCK_BYTES) as u32;
@@ -2398,8 +2649,8 @@ mod tests {
         store.block_writes_settled().await;
         let last_of = |group: u32| (group + 1) * per_group - 1;
         assert!(
-            src.all_filled(last_of(0), last_of(0) + per_group - 1),
-            "from its own block on"
+            src.all_filled(last_of(0), last_of(0) + MIN_GET_BLOCKS - 1),
+            "a window from its block, not its aligned group"
         );
         assert!(!src.all_filled(0, 0), "not the rest of its group");
         assert!(
@@ -2443,8 +2694,8 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A short run's GET stops before the first group touching the aligned
-    /// region, whose groups are only ever fetched whole.
+    /// A short run's window stops before the aligned region, whose groups are
+    /// only ever fetched whole.
     #[tokio::test]
     async fn a_short_run_stops_before_the_aligned_region() {
         let b = CACHE_BLOCK_BYTES;
@@ -2461,12 +2712,68 @@ mod tests {
             .range(2 * GROUP - 2 * b + 10, 100)
             .await
             .expect("read before");
-        assert_eq!(inner.fetched_bytes(), 2 * b, "its blocks up to the region");
+        assert_eq!(inner.fetched_bytes(), 2 * b, "up to the region");
+        store.block_writes_settled().await;
+        let region_first = (2 * GROUP / b) as u32;
+        assert!(
+            !src.all_filled(region_first, region_first),
+            "nothing in the region"
+        );
         let _ = src
             .range(2 * GROUP + 10, 100)
             .await
             .expect("read the region");
         assert_eq!(inner.fetched_bytes(), 2 * b + GROUP, "then a whole group");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// When the aligned region starts inside a group, a short read before it
+    /// fetches up to the region's own first block, the head of that group, so
+    /// the FTS postings that sit there are local. A read in the region later
+    /// fetches the rest of the group, not those blocks again.
+    #[tokio::test]
+    async fn a_window_reaches_the_head_of_the_regions_first_group() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = Arc::new(CountingSource::new(4 * GROUP as usize));
+        let uri = SuperfileUri::new_v4();
+        let region = (2 * GROUP + 3 * b + 100, GROUP);
+        let src = BlockCachedSource::new_with_accounting(
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            dir.path().join("head.blocks"),
+            true,
+            SourceLayout {
+                fts_hole: Some((13 * b + 500, region.0 - (13 * b + 500))),
+                aligned_region: Some(region),
+            },
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+
+        let _ = src
+            .range(13 * b + 10, 100)
+            .await
+            .expect("read before the hole");
+        assert_eq!(inner.fetched_bytes(), 6 * b, "blocks 13 to 18");
+        store.block_writes_settled().await;
+        let _ = src
+            .range(17 * b + 10, 600)
+            .await
+            .expect("a posting read in the group's head");
+        assert_eq!(inner.calls(), 1, "local");
+        let _ = src
+            .range(region.0 + 10, 100)
+            .await
+            .expect("read the region");
+        assert_eq!(
+            inner.fetched_bytes(),
+            6 * b + 5 * b,
+            "the group's other five blocks"
+        );
 
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
@@ -2488,6 +2795,15 @@ mod tests {
             .await
             .expect("read before the hole");
         store.block_writes_settled().await;
+        let read_block = (GROUP / b) as u32 - 1;
+        assert!(
+            src.all_filled(read_block, read_block + MIN_GET_BLOCKS - 1),
+            "all of the window ahead, into the hole"
+        );
+        assert!(
+            !src.all_filled(read_block - 1, read_block - 1),
+            "nothing behind"
+        );
         let calls = inner.calls();
         let start = GROUP + 10;
         let got = src.range(start, 100).await.expect("read the hole's start");
@@ -2565,6 +2881,418 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
+    /// Random reads, the shape of point lookups landing on one superfile over
+    /// time, cost at most 1.75x one GET per 512 KiB window of the file they
+    /// touch. A random read past any recent one looks like a forward scan, so its
+    /// window goes ahead only; that is the price of scans, partitioned ones
+    /// included, not fetching the columns they skip.
+    #[tokio::test]
+    async fn random_reads_cost_at_most_1_75x_whole_windows() {
+        const READS: u64 = 1000;
+        const READ_LEN: u64 = 1000;
+        let size = 64 * GROUP;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, size as usize, None);
+
+        // A fixed xorshift sequence, so the test reads the same offsets every run.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut windows = BTreeSet::new();
+        for _ in 0..READS {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let start = x % (size - READ_LEN);
+            windows.insert(start / MIN_GET_BYTES);
+            windows.insert((start + READ_LEN - 1) / MIN_GET_BYTES);
+            let _ = src.range(start, READ_LEN).await.expect("read");
+        }
+        let whole_windows = windows.len();
+        assert!(
+            inner.calls() * 4 <= whole_windows * 7,
+            "{} GETs for reads touching {whole_windows} windows",
+            inner.calls()
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Reads walking backwards find their neighbours local: after the first
+    /// read, whose window goes ahead, each miss is behind every read before it,
+    /// so its window reaches behind it, up to the blocks already cached ahead.
+    #[tokio::test]
+    async fn reads_walking_backwards_cost_a_get_per_half_window() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        for block in (8..16).rev() {
+            let start = block * b + 10;
+            let got = src.range(start, 1000).await.expect("read");
+            assert_eq!(
+                got,
+                inner.blob.slice(start as usize..(start + 1000) as usize)
+            );
+        }
+        assert_eq!(
+            inner.calls(),
+            3,
+            "eight reads in reverse: the first read's GET, then two"
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// One sparse read, then a forward scan over the same area from before it:
+    /// the scan's first read reaches back over the blocks before it, and the
+    /// scan then costs one GET per window.
+    #[tokio::test]
+    async fn a_sparse_read_then_a_forward_scan_costs_one_get_per_window() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        let _ = src.range(GROUP + 3 * b, 100).await.expect("sparse read");
+        store.block_writes_settled().await;
+        for block in 8..24 {
+            let _ = src.range(block * b + 10, 1000).await.expect("scan");
+        }
+        assert_eq!(
+            inner.calls(),
+            3,
+            "the sparse read's window, the blocks before it, then one more"
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A forward scan reading two columns of each row group and skipping the one
+    /// between them never fetches the skipped column behind a read: each GET goes
+    /// ahead, over the next row group's first column.
+    #[tokio::test]
+    async fn a_scan_skipping_a_column_fetches_ahead_only() {
+        let b = CACHE_BLOCK_BYTES;
+        // Each row group: column a (3 blocks), b (16 blocks, never read), c (3).
+        let (a, skipped, c) = (3, 16, 3);
+        let row_group = a + skipped + c;
+        let row_groups = 4;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let size = (row_groups * row_group + 8) * b;
+        let (uri, inner, src) = layout_source(dir.path(), &store, size as usize, None);
+
+        for k in 0..row_groups {
+            let base = k * row_group * b;
+            let _ = src.range(base, a * b).await.expect("column a");
+            let _ = src
+                .range(base + (a + skipped) * b, c * b)
+                .await
+                .expect("column c");
+        }
+        assert_eq!(
+            inner.calls() as u64,
+            1 + row_groups,
+            "the first column a, then one per column c"
+        );
+        assert_eq!(inner.fetched_bytes(), (1 + row_groups) * MIN_GET_BYTES);
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A short cached stretch inside the window is fetched through, so the
+    /// missing blocks after it come in the same GET.
+    #[tokio::test]
+    async fn a_window_is_fetched_through_a_short_cached_stretch() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+        let bf = src.block_file().expect("block file");
+        bf.file
+            .write_all_at(&inner.blob[3 * b as usize..5 * b as usize], 3 * b)
+            .expect("write blocks 3 and 4");
+        src.mark_filled(bf.size, 3, 4);
+
+        let _ = src.range(10, 100).await.expect("read block 0");
+        assert_eq!(
+            inner.fetched_bytes(),
+            MIN_GET_BYTES,
+            "blocks 0 to 7 in one GET"
+        );
+        let _ = src
+            .range(6 * b + 10, 100)
+            .await
+            .expect("read past the stretch");
+        assert_eq!(inner.calls(), 1, "already local");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A cached stretch longer than `FETCH_THROUGH_BLOCKS` ends the window
+    /// instead of being fetched through, so a GET never re-downloads much of what
+    /// is already local.
+    #[tokio::test]
+    async fn a_long_cached_stretch_ends_the_window() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+        let bf = src.block_file().expect("block file");
+        bf.file
+            .write_all_at(&inner.blob[b as usize..7 * b as usize], b)
+            .expect("write blocks 1 to 6");
+        src.mark_filled(bf.size, 1, 6);
+
+        let _ = src.range(10, 100).await.expect("read block 0");
+        assert_eq!(
+            inner.fetched_bytes(),
+            b,
+            "block 0 only, not through six cached"
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Two partitions scanning their own halves of one file, their reads
+    /// interleaved, each still fetch ahead only: a read past where its own
+    /// partition last read is forward, wherever the other partition is.
+    #[tokio::test]
+    async fn interleaved_partitions_skipping_a_column_fetch_ahead_only() {
+        let b = CACHE_BLOCK_BYTES;
+        // Each row group: column a (3 blocks), b (16 blocks, never read), c (3).
+        let (a, skipped, c) = (3, 16, 3);
+        let row_group = a + skipped + c;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let size = (4 * row_group + 8) * b;
+        let (uri, inner, src) = layout_source(dir.path(), &store, size as usize, None);
+
+        // Partition 1 scans row groups 0 and 1, partition 2 row groups 2 and 3.
+        let reads = |k: u64| {
+            [
+                (k * row_group * b, a * b),
+                ((k * row_group + a + skipped) * b, c * b),
+            ]
+        };
+        for (first, second) in [(0, 2), (1, 3)] {
+            for (one, two) in reads(first).into_iter().zip(reads(second)) {
+                let _ = src.range(one.0, one.1).await.expect("partition 1");
+                let _ = src.range(two.0, two.1).await.expect("partition 2");
+            }
+        }
+        assert_eq!(
+            inner.calls(),
+            6,
+            "each partition's first column a, then one per column c"
+        );
+        assert_eq!(
+            inner.fetched_bytes(),
+            5 * MIN_GET_BYTES + 3 * b,
+            "nothing behind any read: partition 1's second column c stops at partition 2's window"
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Near the end of the file a miss behind the reads before it shifts its window
+    /// back by the room it cannot use ahead, so its GET still covers
+    /// `MIN_GET_BYTES` less what is cached.
+    #[tokio::test]
+    async fn at_the_end_of_the_file_the_window_shifts_back() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 2 * GROUP as usize, None);
+
+        let _ = src
+            .range(2 * GROUP - b + 10, 100)
+            .await
+            .expect("read the last block");
+        assert_eq!(
+            inner.fetched_bytes(),
+            b,
+            "a forward read: just the last block"
+        );
+        store.block_writes_settled().await;
+        let _ = src
+            .range(2 * GROUP - 3 * b + 10, 100)
+            .await
+            .expect("read two blocks back");
+        assert_eq!(
+            inner.fetched_bytes(),
+            b + 7 * b,
+            "a window behind, ending at the cached last block"
+        );
+        let _ = src.range(GROUP + 10, 100).await.expect("read its start");
+        assert_eq!(inner.calls(), 2, "already local");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A missing stretch that starts inside the run this read just fetched and
+    /// ends past it gets only its own remainder: nothing is fetched twice, and
+    /// both runs are cached.
+    #[tokio::test]
+    async fn a_stretch_partly_inside_the_last_run_fetches_only_the_rest() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(
+            dir.path(),
+            &store,
+            4 * GROUP as usize,
+            SourceLayout::ALL_ALIGNED.aligned_region,
+        );
+        let bf = src.block_file().expect("block file");
+        bf.file
+            .write_all_at(&inner.blob[3 * b as usize..4 * b as usize], 3 * b)
+            .expect("write block 3");
+        src.mark_filled(bf.size, 3, 3);
+
+        let got = src.range(0, 2 * GROUP).await.expect("read two groups");
+        assert_eq!(got, inner.blob.slice(0..2 * GROUP as usize));
+        assert_eq!(inner.calls(), 2, "one GET per group");
+        assert_eq!(inner.fetched_bytes(), 2 * GROUP, "no group fetched twice");
+        store.block_writes_settled().await;
+        assert!(
+            src.all_filled(0, 2 * ALIGNED_GET_BLOCKS - 1),
+            "both groups cached"
+        );
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Away from the aligned region a prefetch cuts chunks from the range's
+    /// start, so a range no bigger than a chunk is one GET wherever it lies.
+    #[tokio::test]
+    async fn a_prefetch_no_bigger_than_a_chunk_is_one_get() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = holed_source(
+            dir.path(),
+            &store,
+            8 * GROUP as usize,
+            (3 * GROUP, 2 * GROUP),
+        );
+
+        src.prefetch(3 * GROUP, 2 * GROUP, 4 * GROUP, 2)
+            .await
+            .expect("prefetch");
+        assert_eq!(
+            inner.calls(),
+            1,
+            "a range across a chunk-size line, one GET"
+        );
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Near the aligned region a prefetch's chunks start at the group holding the
+    /// range's first block, so an FTS range ending in the region's first group
+    /// takes as many GETs as with 512 KiB blocks.
+    #[tokio::test]
+    async fn a_prefetch_near_the_region_takes_the_chunks_512_kib_blocks_did() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(
+            dir.path(),
+            &store,
+            12 * GROUP as usize,
+            Some((66 * b + 100, 2 * GROUP)),
+        );
+
+        // Blocks 60 to 66: across the 64-block line a grid from offset 0 would
+        // cut at, inside one 4 MiB chunk from block 56.
+        src.prefetch(60 * b, 6 * b + 200, 8 * GROUP, 2)
+            .await
+            .expect("prefetch");
+        assert_eq!(inner.calls(), 1, "one chunk, as with 512 KiB blocks");
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Just before the aligned region a miss behind the reads before it shifts
+    /// its window back by the room the region leaves ahead.
+    #[tokio::test]
+    async fn before_the_aligned_region_the_window_shifts_back() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(
+            dir.path(),
+            &store,
+            4 * GROUP as usize,
+            Some((2 * GROUP, GROUP)),
+        );
+
+        let _ = src
+            .range(2 * GROUP + 10, 100)
+            .await
+            .expect("a read in the region");
+        let before = inner.fetched_bytes();
+        let _ = src
+            .range(2 * GROUP - 2 * b + 10, 100)
+            .await
+            .expect("a read two blocks before the region");
+        assert_eq!(
+            inner.fetched_bytes() - before,
+            MIN_GET_BYTES,
+            "a whole window, shifted back from the region"
+        );
+        store.block_writes_settled().await;
+        let region_first = (2 * GROUP / b) as u32;
+        assert!(src.all_filled(region_first - MIN_GET_BLOCKS, region_first - 1));
+
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A read that runs into the FTS hole puts its whole window ahead, over the
+    /// term dictionary, even when it is behind the reads before it.
+    #[tokio::test]
+    async fn a_read_running_into_the_hole_puts_its_window_ahead() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) =
+            holed_source(dir.path(), &store, 4 * GROUP as usize, (GROUP, 2 * GROUP));
+
+        let _ = src
+            .range(3 * GROUP + 10, 100)
+            .await
+            .expect("a read after the hole, so the next is behind it");
+        let _ = src
+            .range(GROUP - b + 10, 2 * b)
+            .await
+            .expect("read across the hole's start");
+        store.block_writes_settled().await;
+        let read_block = (GROUP / b) as u32 - 1;
+        assert!(
+            src.all_filled(read_block, read_block + MIN_GET_BLOCKS - 1),
+            "all of the window ahead, into the hole"
+        );
+        assert!(
+            !src.all_filled(read_block - 1, read_block - 1),
+            "nothing behind"
+        );
+        assert_eq!(inner.calls(), 2);
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
     /// An aligned group at the end of the file stops at the file's end.
     #[tokio::test]
     async fn an_aligned_group_stops_at_the_end_of_the_file() {
@@ -2634,7 +3362,9 @@ mod tests {
     }
 
     /// A block file indexed with larger blocks by an older build is adopted with
-    /// no refetch, and its index is rewritten in our block size.
+    /// no refetch. Its index stays as the older build wrote it until this build
+    /// fills a block, so an older process sharing the cache can still adopt it;
+    /// the next fill rewrites it in our block size.
     #[tokio::test]
     async fn a_block_file_indexed_with_larger_blocks_is_adopted() {
         let dir = tempdir().expect("tempdir");
@@ -2656,7 +3386,7 @@ mod tests {
         let idx = gen1.idx_path();
         store.remove_block_entry_for_test(&uri);
         drop(gen1);
-        fs::write(&idx, index_with_block_size(GROUP, &[1])).expect("an older index");
+        fs::write(&idx, index_with_block_size(LEGACY_BLOCK_BYTES, &[1])).expect("an older index");
 
         let inner2 = Arc::new(CountingSource::new(size as usize));
         let gen2 = BlockCachedSource::new(
@@ -2666,27 +3396,43 @@ mod tests {
             path,
         );
         store.install_block_entry_for_test(uri, Arc::clone(&gen2));
-        let start = GROUP + 10;
+        let start = LEGACY_BLOCK_BYTES + 10;
         let got = gen2.range(start, 100).await.expect("read the old block");
         assert_eq!(
             got,
             inner2.blob.slice(start as usize..(start + 100) as usize)
         );
         assert_eq!(inner2.calls(), 0, "adopted, no refetch");
-        assert_eq!(store.stats().current_bytes, GROUP);
+        assert_eq!(store.stats().current_bytes, LEGACY_BLOCK_BYTES);
 
         store.remove_block_entry_for_test(&uri);
         drop(gen2);
+        let kept = fs::read(&idx).expect("index");
+        assert!(
+            !kept.starts_with(&IDX_HEADER),
+            "an open that fills nothing leaves the older index as it was"
+        );
+
+        let inner3 = Arc::new(CountingSource::new(size as usize));
+        let gen3 = BlockCachedSource::new(
+            Arc::clone(&inner3) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(&store),
+            uri,
+            dir.path().join("old.blocks"),
+        );
+        store.install_block_entry_for_test(uri, Arc::clone(&gen3));
+        let _ = gen3.range(10, 100).await.expect("fill a block");
+        assert_eq!(inner3.calls(), 1, "a block the older index did not hold");
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+        drop(gen3);
         let rewritten = fs::read(&idx).expect("index");
         assert!(
             rewritten.starts_with(&IDX_HEADER),
             "rewritten in our block size"
         );
         let (bitmap, _) = indexed_filled_bytes(size, &rewritten).expect("valid");
-        assert_eq!(
-            bitmap,
-            RoaringBitmap::from_iter(ALIGNED_GET_BLOCKS..2 * ALIGNED_GET_BLOCKS)
-        );
+        assert_eq!(bitmap, RoaringBitmap::from_iter(0..2 * ALIGNED_GET_BLOCKS));
     }
 
     /// A source over `inner`, installed as current for a fresh uri.
@@ -2875,7 +3621,8 @@ mod tests {
         let _ = src.range(3 * b, 10).await.expect("pend unit 3");
         assert_eq!(inner.calls(), 2);
 
-        // Units 0..=4: 0, 2 and 4 are missing, so three GETs.
+        // Units 0..=4: three missing stretches between the filled and the
+        // pending window, so three GETs.
         let start = 100;
         let end = 4 * b + 200;
         let got = src.range(start, end - start).await.expect("mixed read");
@@ -2884,7 +3631,13 @@ mod tests {
 
         drop(stall);
         store.block_writes_settled().await;
-        assert_eq!(src.filled_bytes_handle().load(Ordering::Acquire), 5 * b);
+        let (b0, b1) = BlockCachedSource::block_span(start, end - start);
+        assert!(src.all_filled(b0, b1), "every block of the read is cached");
+        assert_eq!(
+            src.filled_bytes_handle().load(Ordering::Acquire),
+            5 * b,
+            "and charged once"
+        );
         store.remove_block_entry_for_test(&uri);
     }
 
