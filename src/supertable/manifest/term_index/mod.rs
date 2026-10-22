@@ -86,12 +86,10 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 /// it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
-/// Bytes a miss on a tier block fetches at once: the block and the ones
-/// after it up to this many bytes, in one ranged read. A merge consumes a
-/// stream's blocks in order, so the window turns a round trip per block
-/// into one per several, while a query that stops after a block or two
-/// has not paid for a whole chunk.
-const TIER_READ_WINDOW_BYTES: usize = 256 * 1024;
+/// Most bytes one ranged read of a tier takes: a term's chunks lie back to
+/// back in the tier object and a merge wants them all, so a miss reads a
+/// run of them at once; a longer run is read in pieces this big.
+const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Parsed tier chunk directories kept per loaded index, by `(tier object,
 /// chunk offset)`: a few bytes per block, so a count bound.
@@ -268,6 +266,14 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
 }
 
 /// Storage URI of a slice's tier object with this content hash.
+/// One chunk of a tier as a merge reads it: its directory and every
+/// block's body, in block order.
+#[derive(Clone)]
+pub(crate) struct TierChunkData {
+    pub(crate) dir: Arc<TierDirectory>,
+    pub(crate) bodies: Vec<Bytes>,
+}
+
 pub(crate) fn tier_uri(hash: &ContentHash) -> String {
     object_uri("tier", hash)
 }
@@ -1161,158 +1167,105 @@ impl TermIndex {
     ) -> Result<Vec<TierEntry>, TermIndexError> {
         let mut out = tier.inline.clone();
         let mut block = Vec::new();
-        for chunk in &tier.chunks {
-            let (dir, _) = self.tier_directory(object, chunk).await?;
-            let all: Vec<usize> = (0..dir.n_blocks()).collect();
-            let (bodies, _) = self.tier_blocks(object, chunk, &dir, &all).await?;
-            for (i, body) in bodies.iter().enumerate() {
-                dir.decode_block(i, body, &mut block)?;
+        let (chunks, _) = self.tier_chunks(object, &tier.chunks).await?;
+        for chunk in &chunks {
+            for (i, body) in chunk.bodies.iter().enumerate() {
+                chunk.dir.decode_block(i, body, &mut block)?;
                 out.extend_from_slice(&block);
             }
         }
         Ok(out)
     }
 
-    /// One chunk's block directory, with the bytes the call fetched: a
-    /// ranged read of the chunk's head covering the directory and the
-    /// blocks after it up to [`TIER_READ_WINDOW_BYTES`] — the first region
-    /// of every superfile, which the first round of a merge reads anyway —
-    /// verified by the directory's own CRC and each block's, all resident
-    /// afterwards.
-    pub(crate) async fn tier_directory(
+    /// The chunks of one term's tier — each its parsed directory and every
+    /// block's body — with the bytes the call fetched. Chunks not resident
+    /// are read in as few ranged reads as their layout allows: the chunks
+    /// of a term lie back to back, so a whole tier is one read of up to
+    /// [`TIER_READ_MAX_BYTES`]. Every directory is verified by its own CRC
+    /// and every block by its own, and all of it is resident afterwards.
+    pub(crate) async fn tier_chunks(
         &self,
         object: &ContentHash,
-        chunk: &TierChunkRef,
-    ) -> Result<(Arc<TierDirectory>, u64), TermIndexError> {
-        let key = (*object, chunk.offset);
-        if let Some(d) = self.tier_dirs.lock().await.get(&key) {
-            return Ok((d, 0));
-        }
-        let dir_len = TierDirectory::len_for(chunk.n_blocks) as u64;
-        let len = dir_len
-            .saturating_add(TIER_READ_WINDOW_BYTES as u64)
-            .min(chunk.len);
-        let end = chunk
-            .offset
-            .checked_add(len)
-            .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
-        let bytes = self
-            .storage
-            .get_range(&tier_uri(object), chunk.offset..end)
-            .await?;
-        let fetched = bytes.len() as u64;
-        let dir = TierDirectory::parse(&bytes, chunk.n_blocks)?;
-        if dir.chunk_len() as u64 != chunk.len {
-            return Err(TermIndexError::Malformed(
-                "tier chunk directory does not match the run's chunk length".into(),
-            ));
-        }
-        let dir = Arc::new(dir);
-        self.tier_dirs.lock().await.insert(key, Arc::clone(&dir));
-        let mut resident = self.tier_blocks.lock().await;
-        for b in 0..dir.n_blocks() {
-            let r = dir.block_range(b);
-            if r.end > bytes.len() {
-                break;
-            }
-            let body = bytes.slice(r);
-            dir.verify_block(b, &body)?;
-            resident.insert(
-                (*object, chunk.offset + dir.block_range(b).start as u64),
-                body,
-            );
-        }
-        Ok((dir, fetched))
-    }
-
-    /// The bodies of `blocks` of a chunk, by the directory's ranges, with
-    /// the bytes the call fetched. Blocks not resident are read in windows
-    /// of up to [`TIER_READ_WINDOW_BYTES`] — a window starts at a missing
-    /// block and takes the blocks after it while they fit, so the regions
-    /// of neighbouring superfiles come in one read — issued together; every
-    /// block read is verified by its own CRC and resident afterwards.
-    pub(crate) async fn tier_blocks(
-        &self,
-        object: &ContentHash,
-        chunk: &TierChunkRef,
-        dir: &TierDirectory,
-        blocks: &[usize],
-    ) -> Result<(Vec<Bytes>, u64), TermIndexError> {
-        let mut out: Vec<Option<Bytes>> = vec![None; blocks.len()];
-        let mut missing: Vec<usize> = Vec::new();
+        chunks: &[TierChunkRef],
+    ) -> Result<(Vec<TierChunkData>, u64), TermIndexError> {
+        let mut out: Vec<Option<TierChunkData>> = Vec::with_capacity(chunks.len());
         {
-            let mut resident = self.tier_blocks.lock().await;
-            for (slot, &i) in blocks.iter().enumerate() {
-                if i >= dir.n_blocks() {
-                    return Err(TermIndexError::Malformed("tier block index".into()));
-                }
-                let key = (*object, chunk.offset + dir.block_range(i).start as u64);
-                match resident.get(&key) {
-                    Some(b) => out[slot] = Some(b),
-                    None => missing.push(i),
-                }
+            let mut dirs = self.tier_dirs.lock().await;
+            let mut bodies = self.tier_blocks.lock().await;
+            for chunk in chunks {
+                let found = dirs.get(&(*object, chunk.offset)).and_then(|dir| {
+                    let mut all = Vec::with_capacity(dir.n_blocks());
+                    for b in 0..dir.n_blocks() {
+                        let key = (*object, chunk.offset + dir.block_range(b).start as u64);
+                        all.push(bodies.get(&key)?);
+                    }
+                    Some(TierChunkData { dir, bodies: all })
+                });
+                out.push(found);
             }
         }
-        if missing.is_empty() {
+        if out.iter().all(Option::is_some) {
             return Ok((out.into_iter().flatten().collect(), 0));
         }
-        missing.sort_unstable();
-        missing.dedup();
-        // Windows: each starts at a missing block and spans the blocks after
-        // it that fit; the next window starts at the first missing block
-        // beyond.
-        let mut windows: Vec<(usize, usize)> = Vec::new();
-        let mut at = 0usize;
-        while at < missing.len() {
-            let first = missing[at];
-            let start = dir.block_range(first).start;
-            let mut last = first;
-            while last + 1 < dir.n_blocks()
-                && dir.block_range(last + 1).end - start <= TIER_READ_WINDOW_BYTES
-            {
-                last += 1;
+        // Spans of missing chunks that are contiguous in the object.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
             }
-            windows.push((first, last));
-            while at < missing.len() && missing[at] <= last {
-                at += 1;
+            match spans.last_mut() {
+                Some((first, last))
+                    if *last + 1 == i
+                        && chunks[*last].offset + chunks[*last].len == chunk.offset
+                        && chunk.offset + chunk.len - chunks[*first].offset
+                            <= TIER_READ_MAX_BYTES =>
+                {
+                    *last = i;
+                }
+                _ => spans.push((i, i)),
             }
         }
         let uri = tier_uri(object);
-        let fetches = try_join_all(windows.iter().map(|&(first, last)| {
-            let span = dir.block_range(first).start..dir.block_range(last).end;
+        let fetches = try_join_all(spans.iter().map(|&(first, last)| {
             let uri = uri.clone();
+            let start = chunks[first].offset;
+            let end = chunks[last].offset.checked_add(chunks[last].len);
             async move {
-                let start = chunk
-                    .offset
-                    .checked_add(span.start as u64)
-                    .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
-                let end = chunk
-                    .offset
-                    .checked_add(span.end as u64)
-                    .filter(|e| *e <= chunk.offset + chunk.len)
-                    .ok_or_else(|| TermIndexError::Malformed("tier block range".into()))?;
+                let end =
+                    end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
                 let bytes = self.storage.get_range(&uri, start..end).await?;
-                if bytes.len() != span.len() {
-                    return Err(TermIndexError::Malformed("short tier block read".into()));
+                if bytes.len() as u64 != end - start {
+                    return Err(TermIndexError::Malformed("short tier read".into()));
                 }
-                Ok::<_, TermIndexError>((span.start, bytes))
+                Ok::<_, TermIndexError>(bytes)
             }
         }))
         .await?;
         let mut fetched = 0u64;
+        let mut dirs = self.tier_dirs.lock().await;
         let mut resident = self.tier_blocks.lock().await;
-        for (&(first, last), (span_start, bytes)) in windows.iter().zip(fetches) {
+        for (&(first, last), bytes) in spans.iter().zip(fetches) {
             fetched += bytes.len() as u64;
-            for b in first..=last {
-                let r = dir.block_range(b);
-                let body = bytes.slice(r.start - span_start..r.end - span_start);
-                dir.verify_block(b, &body)?;
-                for (slot, &i) in blocks.iter().enumerate() {
-                    if i == b {
-                        out[slot] = Some(body.clone());
-                    }
+            let span_start = chunks[first].offset;
+            for (i, chunk) in chunks.iter().enumerate().take(last + 1).skip(first) {
+                let at = (chunk.offset - span_start) as usize;
+                let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
+                let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
+                if dir.chunk_len() as u64 != chunk.len {
+                    return Err(TermIndexError::Malformed(
+                        "tier chunk directory does not match the run's chunk length".into(),
+                    ));
                 }
-                resident.insert((*object, chunk.offset + r.start as u64), body);
+                let mut all = Vec::with_capacity(dir.n_blocks());
+                for b in 0..dir.n_blocks() {
+                    let r = dir.block_range(b);
+                    let body = chunk_bytes.slice(r.clone());
+                    dir.verify_block(b, &body)?;
+                    resident.insert((*object, chunk.offset + r.start as u64), body.clone());
+                    all.push(body);
+                }
+                dirs.insert((*object, chunk.offset), Arc::clone(&dir));
+                out[i] = Some(TierChunkData { dir, bodies: all });
             }
         }
         Ok((out.into_iter().flatten().collect(), fetched))

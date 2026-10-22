@@ -54,7 +54,6 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
 use futures::future::try_join_all;
 use rayon::{
     ThreadPool,
@@ -76,8 +75,8 @@ use crate::{
             SuperfileEntry,
             part::ContentHash,
             term_index::{
-                BLOCK_ENTRIES, SliceRun, TermIndex, TermIndexError, TierChunkRef, TierDirectory,
-                TierEntry,
+                BLOCK_ENTRIES, SliceRun, TermIndex, TermIndexError, TierChunkData, TierChunkRef,
+                TierDirectory, TierEntry,
             },
         },
         schema::FieldId,
@@ -170,11 +169,11 @@ pub(crate) struct TierSelection {
 }
 
 /// One term's chunked tier in one segment: where its regions sit, and
-/// their directories once read.
+/// the regions once read.
 struct Source {
     object: ContentHash,
     chunks: Vec<TierChunkRef>,
-    dirs: Vec<Option<Arc<TierDirectory>>>,
+    data: Vec<TierChunkData>,
 }
 
 /// What the merge knows of one term in one kept superfile.
@@ -257,12 +256,12 @@ struct Slot {
     scale_up: f32,
 }
 
-/// One block read for one superfile and term in a round.
-struct BlockRead {
+/// One block decoded for one superfile and term in a round.
+struct BlockRead<'a> {
     ti: usize,
-    dir: Arc<TierDirectory>,
+    dir: &'a TierDirectory,
     block: usize,
-    body: Bytes,
+    body: &'a [u8],
 }
 
 /// The merge's state across rounds, moved to the reader pool for each
@@ -366,8 +365,8 @@ pub(crate) async fn select_with_tiers(
                 };
                 sources[ti].push(Source {
                     object,
-                    dirs: vec![None; tier.chunks.len()],
                     chunks: tier.chunks.clone(),
+                    data: Vec::new(),
                 });
                 Some(sources[ti].len() - 1)
             } else {
@@ -452,99 +451,80 @@ pub(crate) async fn select_with_tiers(
         }
     }
 
+    // Read: every term's whole tier, one wave of ranged reads. A term's
+    // chunks lie back to back, so this is a read per term in the common
+    // case, and the rounds then run without a storage round trip between
+    // them.
     let mut tier_bytes = 0u64;
-    for round in 0.. {
-        // Read: the next block of every live superfile whose head goes on.
-        // Directories first, then the blocks, each wave issued together.
-        let mut need_dir: Vec<(usize, usize)> = Vec::new();
-        for (ti, term_sources) in sources.iter().enumerate() {
-            for (si, source) in term_sources.iter().enumerate() {
-                if round < source.chunks.len() && source.dirs[round].is_none() {
-                    need_dir.push((ti, si));
-                }
-            }
-        }
-        let dirs = try_join_all(need_dir.iter().map(|&(ti, si)| {
-            let source = &sources[ti][si];
-            index.tier_directory(&source.object, &source.chunks[round])
-        }))
-        .await?;
-        for (&(ti, si), (dir, fetched)) in need_dir.iter().zip(dirs) {
-            sources[ti][si].dirs[round] = Some(dir);
-            tier_bytes += fetched;
-        }
-        // Per (term, source): the blocks the live superfiles need.
-        let mut wanted: HashMap<(usize, usize), Vec<(usize, usize)>> = HashMap::new();
-        for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
-            if !slot.live {
-                continue;
-            }
-            for (ti, state) in slot.heads.iter_mut().enumerate() {
-                if state.done {
-                    continue;
-                }
-                let Some(si) = state.source else {
-                    continue;
-                };
-                let Some(dir) = sources[ti][si].dirs.get(round).and_then(Option::as_ref) else {
-                    state.done = true;
-                    continue;
-                };
-                let Some(block) = dir.block_of(slot.ordinal) else {
-                    state.done = true;
-                    continue;
-                };
-                wanted.entry((ti, si)).or_default().push((slot_i, block));
-            }
-        }
-        let groups: Vec<((usize, usize), Vec<(usize, usize)>)> = wanted.into_iter().collect();
-        let bodies = try_join_all(groups.iter().map(|((ti, si), needs)| {
-            let source = &sources[*ti][*si];
-            let dir = source.dirs[round].as_ref().expect("read above");
-            let blocks: Vec<usize> = needs.iter().map(|n| n.1).collect();
-            async move {
-                index
-                    .tier_blocks(&source.object, &source.chunks[round], dir, &blocks)
-                    .await
-            }
-        }))
-        .await?;
-        let mut reads: Vec<Vec<BlockRead>> = (0..merge.slots.len()).map(|_| Vec::new()).collect();
-        let mut read_any = false;
-        for (((ti, si), needs), (bodies, fetched)) in groups.iter().zip(bodies) {
-            tier_bytes += fetched;
-            let dir = sources[*ti][*si].dirs[round].as_ref().expect("read above");
-            for (&(slot_i, block), body) in needs.iter().zip(bodies) {
-                reads[slot_i].push(BlockRead {
-                    ti: *ti,
-                    dir: Arc::clone(dir),
-                    block,
-                    body,
-                });
-                read_any = true;
-            }
-        }
-        if round > 0 && !read_any {
-            break;
-        }
-        // Decode, score, join and bound, as one wave on the reader pool.
-        let theta_before = merge.theta_lb;
-        let (next, excluded) = run_on_pool(Some(pool), "tier merge", move || {
-            let excluded = merge.round(reads);
-            (merge, excluded)
-        })
-        .await
-        .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
-        merge = next;
-        let stalled = merge.theta_lb.is_finite()
-            && excluded == 0
-            && merge.theta_lb <= theta_before * (1.0 + THRESHOLD_RISE_MIN);
-        if !read_any || stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
-            break;
-        }
+    let reads: Vec<(usize, usize)> = sources
+        .iter()
+        .enumerate()
+        .flat_map(|(ti, term_sources)| (0..term_sources.len()).map(move |si| (ti, si)))
+        .collect();
+    let fetched = try_join_all(reads.iter().map(|&(ti, si)| {
+        let source = &sources[ti][si];
+        index.tier_chunks(&source.object, &source.chunks)
+    }))
+    .await?;
+    for (&(ti, si), (data, bytes)) in reads.iter().zip(fetched) {
+        sources[ti][si].data = data;
+        tier_bytes += bytes;
     }
-
+    // Decode, score, join and bound, round by round, as one job on the
+    // reader pool: a round is the next block of every live superfile whose
+    // head goes on, and the merge stops when a round moves nothing.
     let required = query.required;
+    let merge = run_on_pool(Some(pool), "tier merge", move || {
+        let mut merge = merge;
+        for round in 0.. {
+            let mut reads: Vec<Vec<BlockRead<'_>>> =
+                (0..merge.slots.len()).map(|_| Vec::new()).collect();
+            let mut read_any = false;
+            for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
+                if !slot.live {
+                    continue;
+                }
+                for (ti, state) in slot.heads.iter_mut().enumerate() {
+                    if state.done {
+                        continue;
+                    }
+                    let Some(si) = state.source else {
+                        continue;
+                    };
+                    let Some(chunk) = sources[ti][si].data.get(round) else {
+                        state.done = true;
+                        continue;
+                    };
+                    let Some(block) = chunk.dir.block_of(slot.ordinal) else {
+                        state.done = true;
+                        continue;
+                    };
+                    reads[slot_i].push(BlockRead {
+                        ti,
+                        dir: &chunk.dir,
+                        block,
+                        body: &chunk.bodies[block],
+                    });
+                    read_any = true;
+                }
+            }
+            if !read_any {
+                break;
+            }
+            let theta_before = merge.theta_lb;
+            let excluded = merge.round(&reads);
+            let stalled = merge.theta_lb.is_finite()
+                && excluded == 0
+                && merge.theta_lb <= theta_before * (1.0 + THRESHOLD_RISE_MIN);
+            if stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
+                break;
+            }
+        }
+        merge
+    })
+    .await
+    .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
+
     let bounds: Vec<SuperfileBounds> = merge
         .slots
         .iter()
@@ -589,7 +569,7 @@ impl Merge {
     /// superfiles on the pool; then the threshold over every superfile's
     /// candidates, and the exclusion of what cannot reach it. Returns how
     /// many superfiles the round ruled out.
-    fn round(&mut self, reads: Vec<Vec<BlockRead>>) -> usize {
+    fn round(&mut self, reads: &[Vec<BlockRead<'_>>]) -> usize {
         let required = self.required;
         let (k, lb_slack, ub_slack) = (self.k, self.lb_slack, self.ub_slack);
         let scoring = &self.scoring;
@@ -605,7 +585,7 @@ impl Merge {
                         let state = &mut slot.heads[read.ti];
                         if read
                             .dir
-                            .decode_block(read.block, &read.body, &mut decoded)
+                            .decode_block(read.block, read.body, &mut decoded)
                             .is_err()
                         {
                             // A block that does not decode leaves the head
