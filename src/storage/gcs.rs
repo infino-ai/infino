@@ -26,8 +26,8 @@ use object_store::{
 };
 
 use super::{
-    ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
+    io_counters, logical_list_key, options::apply, retry,
 };
 use crate::runtime_metrics::io::UsageMeter;
 
@@ -518,6 +518,14 @@ impl StorageProvider for GcsStorageProvider {
             ));
         }
         Ok(out)
+    }
+
+    async fn list_child_prefixes(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = self.path(prefix)?;
+        self.meter.record_list();
+        child_prefix_names(self.store.as_ref(), &path)
+            .await
+            .map_err(|e| translate(prefix, e))
     }
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {

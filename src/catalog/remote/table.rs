@@ -21,12 +21,12 @@ use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
     OptimizeOptions, ReindexError, ReindexOptions, Supertable, VectorFilter,
-    catalog::table::Table,
+    catalog::{remote_schema_unsupported, table::Table},
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
-        schema::TableSchema,
+        schema::{TableSchema, change::SchemaPatch},
     },
 };
 
@@ -357,10 +357,18 @@ impl Table for RemoteTable {
         Err(GcError::NoStorage)
     }
 
-    fn source_file_list(&self) -> Option<Supertable> {
+    fn companion(&self, _purpose: &str) -> Result<Option<Supertable>, InfinoError> {
         // A hosted table is never created with one: `create_table` refuses
-        // the flag on a hosted connection.
-        None
+        // companions on a hosted connection.
+        Ok(None)
+    }
+
+    fn apply_schema(
+        &self,
+        _patch: &SchemaPatch,
+        _expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        Err(remote_schema_unsupported("apply_schema", &self.table_name))
     }
 
     #[cfg(any(test, feature = "test-helpers"))]

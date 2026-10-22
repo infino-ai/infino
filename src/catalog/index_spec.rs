@@ -6,8 +6,13 @@
 //! [`Connection::create_table`](crate::Connection::create_table) alongside
 //! the Arrow schema.
 
+use std::{collections::HashSet, sync::Arc};
+
+use arrow_schema::SchemaRef;
+
 use crate::{
     InfinoError,
+    catalog::validate_schema,
     superfile::{
         builder::FtsConfig,
         fts::{
@@ -17,6 +22,7 @@ use crate::{
         },
         vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
+    supertable::companion::{CompanionSpec, check_purpose},
 };
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
@@ -228,7 +234,16 @@ impl From<String> for FtsField {
 pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
-    source_file_list: bool,
+    companions: Vec<Companion>,
+}
+
+/// A hidden companion table declared on a table: its purpose, its Arrow
+/// schema and the indexes over it. See [`IndexSpec::companion`].
+#[derive(Debug, Clone)]
+struct Companion {
+    purpose: String,
+    schema: SchemaRef,
+    indexes: IndexSpec,
 }
 
 impl IndexSpec {
@@ -268,30 +283,112 @@ impl IndexSpec {
         self
     }
 
-    /// Create the table with a hidden source-file list beside it: a second
-    /// table, stored under this one's location and never listed in the
-    /// catalog, for a loader that keeps the table matching a set of source
-    /// files to record one row per file (its key, version marker, size,
-    /// modification time, rows and load time) and per folder it lists.
-    /// Reach it with [`Supertable::source_file_list`]; dropping the table
-    /// with purge removes it.
+    /// Create the table with a hidden companion table beside it: a second
+    /// table with its own Arrow `schema` and its own full-text and vector
+    /// `indexes`, for state the caller keeps about the table — a ledger of
+    /// what has been loaded into it, say — that should live and die with
+    /// the table but never be mistaken for one of the catalog's tables.
     ///
-    /// A table created without this has no list, and this cannot be added
-    /// later. Needs a storage-backed connection; a `memory://` or hosted
-    /// connection refuses it at `create_table`. The table's manifest names
-    /// the list, so every engine that writes the table must be at least the
-    /// version that created it: an older one would drop the name on its
-    /// next commit.
+    /// `purpose` names the companion: reach it with
+    /// [`Supertable::companion`] by the same name. It must be non-empty, at
+    /// most 64 characters of `[a-z0-9_]`, unique on the table, and not
+    /// `vector_index`, which the table's own hidden vector index uses.
+    /// `indexes` may not declare companions of its own. Declare several
+    /// companions with several calls.
     ///
-    /// [`Supertable::source_file_list`]: crate::Supertable::source_file_list
-    pub fn source_file_list(mut self) -> Self {
-        self.source_file_list = true;
+    /// The companion is stored under the table's location and recorded on
+    /// its manifest, is never listed by
+    /// [`Connection::list_tables`](crate::Connection::list_tables), and is
+    /// removed with the table by
+    /// [`Connection::drop_table`](crate::Connection::drop_table) with
+    /// `purge`. It is an ordinary table otherwise: append, update, delete,
+    /// search and optimize it through the handle, and change its schema
+    /// with [`Supertable::apply_schema`]. Companions are declared at
+    /// `create_table` only; one cannot be added to an existing table.
+    /// A `memory://` or hosted connection refuses a spec with companions.
+    ///
+    /// Every engine that writes the table must be at least the version
+    /// that created it. An older one does not know the manifest field
+    /// naming the companions and drops it on its next commit; the
+    /// companion's data is untouched, and [`Supertable::companion`]
+    /// re-attaches it from its storage location.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// use infino::IndexSpec;
+    ///
+    /// let ledger = Arc::new(Schema::new(vec![
+    ///     Field::new("key", DataType::LargeUtf8, false),
+    ///     Field::new("rows", DataType::UInt64, true),
+    /// ]));
+    /// let spec = IndexSpec::new()
+    ///     .fts("body")
+    ///     .companion("ledger", ledger, IndexSpec::new().fts("key"));
+    /// # let _ = spec;
+    /// ```
+    ///
+    /// [`Supertable::companion`]: crate::Supertable::companion
+    /// [`Supertable::apply_schema`]: crate::Supertable::apply_schema
+    pub fn companion(
+        mut self,
+        purpose: impl Into<String>,
+        schema: SchemaRef,
+        indexes: IndexSpec,
+    ) -> Self {
+        self.companions.push(Companion {
+            purpose: purpose.into(),
+            schema,
+            indexes,
+        });
         self
     }
 
-    /// Whether the table is created with a source-file list.
-    pub(crate) fn has_source_file_list(&self) -> bool {
-        self.source_file_list
+    /// Whether the spec declares any companion.
+    pub(crate) fn has_companions(&self) -> bool {
+        !self.companions.is_empty()
+    }
+
+    /// Refuses companions a table cannot be created with: a purpose
+    /// [`check_purpose`] refuses, a purpose declared twice, a companion
+    /// declaring companions of its own, or a companion whose schema or
+    /// analyzers a table would be refused for.
+    pub(crate) fn check_companions(&self) -> Result<(), InfinoError> {
+        let mut purposes = HashSet::new();
+        for companion in &self.companions {
+            check_purpose(&companion.purpose).map_err(InfinoError::Config)?;
+            if !purposes.insert(companion.purpose.as_str()) {
+                return Err(InfinoError::Config(format!(
+                    "companion purpose {:?} is declared twice",
+                    companion.purpose
+                )));
+            }
+            if companion.indexes.has_companions() {
+                return Err(InfinoError::Config(format!(
+                    "companion {:?} declares companions of its own; a companion cannot have any",
+                    companion.purpose
+                )));
+            }
+            validate_schema(&companion.schema)?;
+            companion.indexes.check_analyzers()?;
+        }
+        Ok(())
+    }
+
+    /// The declared companions, lowered to what the table options carry.
+    pub(crate) fn companion_specs(&self) -> Vec<CompanionSpec> {
+        self.companions
+            .iter()
+            .map(|companion| {
+                let (fts_columns, vector_columns) = companion.indexes.to_configs();
+                CompanionSpec {
+                    purpose: companion.purpose.clone(),
+                    schema: Arc::clone(&companion.schema),
+                    fts_columns,
+                    vector_columns,
+                }
+            })
+            .collect()
     }
 
     /// The same declaration, carrying a seed and codec a schema document

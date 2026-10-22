@@ -81,6 +81,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
+        companion::CompanionSpec,
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -635,12 +636,11 @@ pub struct SupertableOptions {
     /// Per-table override for the **hidden** vector-index grid's cell
     /// count. `None` → `vector.hidden_cell_count` from the YAML config.
     pub hidden_cell_count: Option<usize>,
-    /// Create a hidden source-file list beside the table: a second table
-    /// under this one's storage, recorded on its manifest and reopened from
-    /// there, that a loader keeps one row per source file in. Read at
-    /// create only; on open the manifest says whether the list exists.
-    /// Requires storage. Default `false`.
-    pub source_file_list: bool,
+    /// Hidden companion tables to create beside the table, each under this
+    /// one's storage at its own prefix, recorded on its manifest and
+    /// reopened from there. Read at create only; on open the manifest says
+    /// which companions exist. Requires storage. Default empty.
+    pub(crate) companions: Vec<CompanionSpec>,
 }
 
 impl SupertableOptions {
@@ -812,7 +812,7 @@ impl SupertableOptions {
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
             hidden_cell_count: None,
-            source_file_list: false,
+            companions: Vec::new(),
         })
     }
 
@@ -863,10 +863,10 @@ impl SupertableOptions {
         self
     }
 
-    /// Create the table with a hidden source-file list beside it. See
-    /// [`Self::source_file_list`].
-    pub fn with_source_file_list(mut self, source_file_list: bool) -> Self {
-        self.source_file_list = source_file_list;
+    /// Create the table with `companions` beside it. See
+    /// [`Self::companions`].
+    pub(crate) fn with_companions(mut self, companions: Vec<CompanionSpec>) -> Self {
+        self.companions = companions;
         self
     }
 
