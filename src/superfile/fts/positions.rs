@@ -387,7 +387,7 @@ impl GroupIndex {
         self.served = 0;
         let header = *bytes.get(*at)?;
         *at += 1;
-        let lanes_per_pair: fn(u32) -> u32 = match header {
+        match header {
             GROUP_LEB128 => {
                 self.kind = GroupKind::Leb128;
                 self.values.clear();
@@ -395,23 +395,35 @@ impl GroupIndex {
                 for _ in 0..n {
                     self.values.push(read_varint(bytes, at)?);
                 }
-                |tf| tf
             }
             GROUP_PACKED => {
                 self.kind = GroupKind::Packed;
                 self.first.parse_into(bytes, at, tfs.len())?;
                 self.gap.parse_into(bytes, at, n - tfs.len())?;
-                |tf| tf.saturating_sub(1)
             }
             _ => return None,
-        };
+        }
+        // Every partial sum is at most `n`, so one check that `n` fits makes
+        // the prefix sum overflow-free; the per-encoding lane rule is chosen
+        // once, not called per pair.
+        u32::try_from(n).ok()?;
         self.starts.clear();
         self.starts.reserve(tfs.len() + 1);
+        self.starts.push(0);
         let mut acc = 0u32;
-        self.starts.push(acc);
-        for &tf in tfs {
-            acc = acc.checked_add(lanes_per_pair(tf))?;
-            self.starts.push(acc);
+        match self.kind {
+            GroupKind::Packed => {
+                for &tf in tfs {
+                    acc += tf.saturating_sub(1);
+                    self.starts.push(acc);
+                }
+            }
+            _ => {
+                for &tf in tfs {
+                    acc += tf;
+                    self.starts.push(acc);
+                }
+            }
         }
         Some(())
     }
