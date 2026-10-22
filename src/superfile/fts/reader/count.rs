@@ -21,7 +21,9 @@ use super::{
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
 #[cfg(any(test, feature = "test-helpers"))]
-use crate::superfile::fts::posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED};
+use crate::superfile::fts::posting::{
+    ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, ENCODING_RUN,
+};
 use crate::{
     runtime_metrics::op_stats::timed_section,
     superfile::{
@@ -772,6 +774,7 @@ impl FtsReader {
                 ENCODING_PACKED => layout.packed_blocks += 1,
                 ENCODING_PATCHED => layout.patched_blocks += 1,
                 ENCODING_BITSET => layout.bitset_blocks += 1,
+                ENCODING_RUN => layout.run_blocks += 1,
                 other => {
                     return Err(FtsError::Read(ReadError::Malformed(format!(
                         "term_layout: block {b} carries unknown encoding {other}"
@@ -802,6 +805,8 @@ pub struct TermLayout {
     pub packed_blocks: usize,
     pub patched_blocks: usize,
     pub bitset_blocks: usize,
+    /// Blocks of consecutive doc ids, stored with no doc payload.
+    pub run_blocks: usize,
 }
 
 #[cfg(test)]
@@ -1037,15 +1042,16 @@ mod tests {
 
     #[tokio::test]
     async fn count_kernels_handle_a_mixed_encoding_term() {
-        // A term that is dense early (near-consecutive doc ids ⇒ BITSET blocks)
-        // and sparse later (strided ⇒ PACKED blocks) has *both* block encodings
-        // in one posting list. The per-block encoding dispatch in the union
+        // A term held by every early doc (a RUN block), then by most docs with
+        // gaps (BITSET blocks), then sparsely (strided ⇒ PACKED blocks) has
+        // all three block encodings in one posting list. The per-block encoding dispatch in the union
         // (`or_cursor_into_bitset`), the membership probe (`TermCursor::contains`
         // advancing across a bitset→packed boundary), and the doc-id decode must
         // each pick the right branch block by block. Uniform-stride corpora
         // never produce this, so drive it explicitly and cross-check every count
         // kernel against `token_match`'s independent flat-merge length.
-        const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
+        const RUN_END: u32 = 128; // docs 0..128 all hold `mix` → one RUN block
+        const DENSE_END: u32 = 512; // then all but every 11th → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
         let mut b = FtsBuilder::new();
@@ -1055,7 +1061,9 @@ mod tests {
             if i % 2 == 0 {
                 text.push_str("even "); // every other doc → dense, non-dominant
             }
-            let mix = i < DENSE_END || (i - DENSE_END).is_multiple_of(SPARSE_STRIDE);
+            let mix = i < RUN_END
+                || (i < DENSE_END && i % 11 != 5)
+                || (i >= DENSE_END && (i - DENSE_END).is_multiple_of(SPARSE_STRIDE));
             if mix {
                 text.push_str("mix ");
             }
@@ -1083,19 +1091,21 @@ mod tests {
             .await
             .expect("build cursors");
         let mix = &cursors[0];
-        let (mut saw_bitset, mut saw_packed) = (false, false);
+        let (mut saw_bitset, mut saw_packed, mut saw_run) = (false, false, false);
         for blk in mix.blocks.iter() {
             match posting::block_encoding(
                 &mix.bytes.as_ref()[blk.block_byte_offset..blk.block_byte_end],
             ) {
                 ENCODING_BITSET => saw_bitset = true,
+                ENCODING_RUN => saw_run = true,
                 ENCODING_PACKED | ENCODING_PATCHED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),
             }
         }
         assert!(
-            saw_bitset && saw_packed,
-            "`mix` must carry both BITSET and PACKED blocks (bitset={saw_bitset}, packed={saw_packed})"
+            saw_bitset && saw_packed && saw_run,
+            "`mix` must carry RUN, BITSET and PACKED blocks \
+             (run={saw_run}, bitset={saw_bitset}, packed={saw_packed})"
         );
 
         // Every count kernel over the mixed term must agree with the flat-merge.

@@ -33,61 +33,71 @@ struct Policy {
     /// A block of consecutive doc ids carries no doc payload.
     run: bool,
     /// Take the bitset whenever it is at most `bitset_bias` times the
-    /// tight packed delta size (1.0 is today's rule).
+    /// tight packed delta size (1.0 is the size-only rule)...
     bitset_bias: f32,
+    /// ...for terms with at least this many documents; 1.0 below it.
+    bias_min_df: u64,
+}
+
+const fn policy(
+    name: &'static str,
+    run: bool,
+    tf_minus_one: bool,
+    bias: f32,
+    min_df: u64,
+) -> Policy {
+    Policy {
+        name,
+        n: BLOCK_LEN,
+        tf_minus_one,
+        run,
+        bitset_bias: bias,
+        bias_min_df: min_df,
+    }
 }
 
 const POLICIES: &[Policy] = &[
-    Policy {
-        name: "today (128)",
-        n: 128,
-        tf_minus_one: false,
-        run: false,
-        bitset_bias: 1.0,
-    },
-    Policy {
-        name: "tf-1",
-        n: 128,
-        tf_minus_one: true,
-        run: false,
-        bitset_bias: 1.0,
-    },
-    Policy {
-        name: "tf-1 + run",
-        n: 128,
-        tf_minus_one: true,
-        run: true,
-        bitset_bias: 1.0,
-    },
-    Policy {
-        name: "tf-1 + run + bitset 1.6x",
-        n: 128,
-        tf_minus_one: true,
-        run: true,
-        bitset_bias: 1.6,
-    },
-    Policy {
-        name: "256",
-        n: 256,
-        tf_minus_one: false,
-        run: false,
-        bitset_bias: 1.0,
-    },
-    Policy {
-        name: "256 + tf-1 + run",
-        n: 256,
-        tf_minus_one: true,
-        run: true,
-        bitset_bias: 1.0,
-    },
-    Policy {
-        name: "256 + tf-1 + run + bitset 1.6x",
-        n: 256,
-        tf_minus_one: true,
-        run: true,
-        bitset_bias: 1.6,
-    },
+    policy(
+        "before (size-only bitset, tf stored as is)",
+        false,
+        false,
+        1.0,
+        0,
+    ),
+    policy("tf-1 + run (the encoder)", true, true, 1.0, 0),
+    policy(
+        "tf-1 + run + bitset 1.6x at df>=256K",
+        true,
+        true,
+        1.6,
+        262_144,
+    ),
+    policy(
+        "tf-1 + run + bitset 2x at df>=256K",
+        true,
+        true,
+        2.0,
+        262_144,
+    ),
+    policy(
+        "tf-1 + run + bitset 3x at df>=256K",
+        true,
+        true,
+        3.0,
+        262_144,
+    ),
+    policy(
+        "tf-1 + run + bitset 1.6x at df>=16K",
+        true,
+        true,
+        1.6,
+        16_384,
+    ),
+    policy("tf-1 + run + bitset 2x at df>=16K", true, true, 2.0, 16_384),
 ];
+
+/// The policy [`encode_block`] implements, checked block by block.
+const VALIDATED: usize = 1;
 
 /// Document-frequency buckets the report splits by.
 const BUCKETS: &[(u64, u64, &str)] = &[
@@ -149,6 +159,7 @@ fn patched_size(lanes: &[u32], plan: &mut ExceptionPlan, cand: &mut Vec<(u32, u3
 /// `kind`: 0 packed, 1 bitset, 2 patched, 3 run.
 fn model_block(
     p: &Policy,
+    df: u64,
     docs: &[u32],
     tfs: &[u32],
     prev: Option<u32>,
@@ -181,7 +192,11 @@ fn model_block(
         // Header plus the first doc's offset from the previous block.
         return (COMPACT_HEADER_SIZE + ORIGIN_BYTES, 0, tfs_size, 3);
     }
-    let use_bitset = bitset_size as f32 <= packed(n, tight) as f32 * p.bitset_bias;
+    let bias = match df >= p.bias_min_df {
+        true => p.bitset_bias,
+        false => 1.0,
+    };
+    let use_bitset = bitset_size as f32 <= packed(n, tight) as f32 * bias;
     if patchable && !use_bitset {
         let mut explicit = deltas.clone();
         explicit[count..].fill(0);
@@ -248,7 +263,7 @@ fn posting_census() {
             let mut span = 0u64;
             for (dc, tc) in docs.chunks(BLOCK_LEN).zip(tfs.chunks(BLOCK_LEN)) {
                 let (_, _, _, kind) =
-                    model_block(&POLICIES[0], dc, tc, prev, patchable, &mut scratch);
+                    model_block(&POLICIES[0], df, dc, tc, prev, patchable, &mut scratch);
                 kinds[kind as usize] += 1;
                 span += u64::from(dc[dc.len() - 1] - dc[0] + 1);
                 prev = Some(dc[dc.len() - 1]);
@@ -270,8 +285,8 @@ fn posting_census() {
             let mut prev = None;
             let mut nblocks = 0usize;
             for (dc, tc) in docs.chunks(p.n).zip(tfs.chunks(p.n)) {
-                let (h, d, f, kind) = model_block(p, dc, tc, prev, patchable, &mut scratch);
-                if pi == 0 {
+                let (h, d, f, kind) = model_block(p, df, dc, tc, prev, patchable, &mut scratch);
+                if pi == VALIDATED {
                     let real = encode_block(
                         &Block {
                             doc_ids: dc.to_vec(),

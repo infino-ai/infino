@@ -51,7 +51,7 @@ use crate::{
             bm25,
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
-            posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
+            posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
         },
@@ -2195,6 +2195,8 @@ pub(super) fn or_cursor_into_bitset(
             for (i, chunk) in presence.chunks_exact(8).enumerate() {
                 dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
             }
+        } else if hdr.encoding == ENCODING_RUN {
+            set_bit_range(dest, hdr.base, hdr.base + hdr.count() as u32);
         } else {
             let n = decode_block_doc_ids(bytes, &hdr, scratch);
             for &d in &scratch[..n] {
@@ -2202,6 +2204,24 @@ pub(super) fn or_cursor_into_bitset(
             }
         }
     }
+}
+
+/// Set bits `[from, to)` of a doc-space bitset: the edge words masked, the
+/// words between filled whole.
+pub(super) fn set_bit_range(dest: &mut [u64], from: u32, to: u32) {
+    if from >= to {
+        return;
+    }
+    let (first, last) = ((from / 64) as usize, ((to - 1) / 64) as usize);
+    let lo = u64::MAX << (from % 64);
+    let hi = u64::MAX >> (63 - (to - 1) % 64);
+    if first == last {
+        dest[first] |= lo & hi;
+        return;
+    }
+    dest[first] |= lo;
+    dest[first + 1..last].fill(u64::MAX);
+    dest[last] |= hi;
 }
 
 /// Pick the cursor whose df dominates the union, or `None` if no term is
@@ -2293,7 +2313,10 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
 /// unknown as unsupported.
 fn check_version(version: u32) -> Result<(), FtsError> {
     match version {
-        format::fts::VERSION_V7 | format::fts::VERSION_V8 | format::fts::VERSION_V9 => Ok(()),
+        format::fts::VERSION_V7
+        | format::fts::VERSION_V8
+        | format::fts::VERSION_V9
+        | format::fts::VERSION_V10 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -2491,7 +2514,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V9 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V10 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"

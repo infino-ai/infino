@@ -77,14 +77,14 @@
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    fs,
+    env, fs,
     fs::File,
     hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
     vec::IntoIter,
 };
@@ -110,7 +110,7 @@ use crate::{
             analysis::ChainTokenizer,
             bm25,
             positions::{TermRuns, encode_group, encode_run, skip_run},
-            posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
+            posting::{BLOCK_LEN, Block, EncodedBlock, encode_block_with},
             reader::ColumnLengthStats,
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
@@ -273,6 +273,36 @@ const HEADER_POSITIONS_OFFSET: Range<usize> = 20..28;
 /// most. On a Zipfian corpus the bands below the bar hold ~60% of what
 /// the patched form saves, the bands above it the rest.
 const PATCHED_MAX_DF: usize = 16 * 1024;
+
+/// Smallest document frequency whose dense blocks are stored as bitsets
+/// past the size-only break-even, by [`DENSE_BITSET_BIAS`].
+const DENSE_BITSET_MIN_DF: usize = 256 * 1024;
+
+/// How much larger than its packed deltas a dense term's block may be and
+/// still be stored as a presence bitset.
+const DENSE_BITSET_BIAS: f32 = 2.0;
+
+/// The bitset bias a term with `df` documents is written with. The
+/// prototype reads both knobs from the environment so a measurement box can
+/// sweep them without a rebuild.
+fn dense_bitset_bias(df: usize) -> f32 {
+    static KNOBS: OnceLock<(usize, f32)> = OnceLock::new();
+    let (min_df, bias) = *KNOBS.get_or_init(|| {
+        let min_df = env::var("INFINO_PROTO_BITSET_MIN_DF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DENSE_BITSET_MIN_DF);
+        let bias = env::var("INFINO_PROTO_BITSET_BIAS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DENSE_BITSET_BIAS);
+        (min_df, bias)
+    });
+    match df >= min_df {
+        true => bias,
+        false => 1.0,
+    }
+}
 
 /// Doc-lengths directory entry size in bytes (per column).
 ///
@@ -4229,10 +4259,11 @@ fn encode_term(
                 tfs: mem::take(&mut block_tfs),
             };
             let prev_last_doc_id = encoded_blocks.last().map(|b: &EncodedBlock| b.last_doc_id);
-            encoded_blocks.push(encode_block(
+            encoded_blocks.push(encode_block_with(
                 &block,
                 prev_last_doc_id,
                 pairs.len() <= PATCHED_MAX_DF,
+                dense_bitset_bias(pairs.len()),
                 &mut scratch.pack,
             ));
             // Reclaim the underlying allocations for the next chunk.

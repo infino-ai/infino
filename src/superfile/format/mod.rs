@@ -143,6 +143,18 @@ pub mod fts {
     /// sits immediately after this trailer, so reading it costs nothing.
     pub const VERSION_V9: u32 = 9;
 
+    /// The version written once posting blocks may be **runs** (consecutive
+    /// doc ids stored as an origin and a count, encoding 3) and store their
+    /// tfs minus one (flagged per block by header bit 31).
+    ///
+    /// Both changes live inside the blocks and each block says which form
+    /// it takes, so a `V10` reader decodes a `V9` file's blocks unchanged,
+    /// and a postings copy from an older container is already correct; the
+    /// smaller forms arrive as a merge re-encodes the blocks. The version
+    /// moves because a `V9` reader would reject a run block, and should
+    /// refuse the file whole rather than fail mid-query.
+    pub const VERSION_V10: u32 = 10;
+
     /// Whether `version` stores the scorer's length buckets and the widened
     /// doc-lengths directory entry that describes them.
     pub const fn has_stored_buckets(version: u32) -> bool {
@@ -173,7 +185,7 @@ pub mod fts {
     /// from the highest known version would mark every plain file stale and
     /// have a reindex re-emit the same version forever. It is the version a
     /// plain build writes, which is what the builder's own test asserts.
-    pub const VERSION_CURRENT: u32 = VERSION_V9;
+    pub const VERSION_CURRENT: u32 = VERSION_V10;
 
     /// Bytes per stored document length: a `u16`, saturating at
     /// [`DOC_LENGTH_STORED_MAX`]. The scorer reads a one-byte bucket of
@@ -751,7 +763,7 @@ mod tests {
     fn the_current_version_is_readable_and_below_the_newest() {
         const {
             assert!(fts::VERSION_MIN <= fts::VERSION_CURRENT);
-            assert!(fts::VERSION_CURRENT <= fts::VERSION_V9);
+            assert!(fts::VERSION_CURRENT <= fts::VERSION_V10);
         }
     }
 

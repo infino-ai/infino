@@ -26,8 +26,9 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_BITSET, bitset_next_doc, bitset_tf_at, block_encoding,
-            decode_block, decode_block_doc_ids, decode_block_tfs,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, ENCODING_RUN, bitset_next_doc, bitset_tf_at,
+            block_encoding, decode_block, decode_block_doc_ids, decode_block_tfs,
+            is_dense_encoding,
         },
         short::decode_short,
     },
@@ -801,7 +802,10 @@ impl TermCursor {
         // only reads the encoding byte before falling to the decode cache).
         let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if hdr.encoding == ENCODING_BITSET {
+        if hdr.encoding == ENCODING_RUN {
+            // The block selection already put `doc` at or below its last.
+            doc >= hdr.base
+        } else if hdr.encoding == ENCODING_BITSET {
             match Self::bitset_word(raw, &hdr, doc) {
                 Some((bit, word, _)) => (word >> (bit % 64)) & 1 == 1,
                 None => false,
@@ -862,7 +866,16 @@ impl TermCursor {
             let block = self.blocks[self.current_block];
             let block_last = block.last_doc_id;
             let hdr = self.current_header();
-            if hdr.encoding == ENCODING_BITSET {
+            if hdr.encoding == ENCODING_RUN {
+                while r < n && docs[r] <= block_last {
+                    let d = docs[r];
+                    r += 1;
+                    if d >= hdr.base {
+                        docs[w] = d;
+                        w += 1;
+                    }
+                }
+            } else if hdr.encoding == ENCODING_BITSET {
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 let words = &raw[hdr.payload()..raw.len() - hdr.tfs_size()];
                 while r < n && docs[r] <= block_last {
@@ -974,6 +987,20 @@ impl TermCursor {
         Some((bit, word, bitset_end))
     }
 
+    /// Rank of `doc` among a dense (bitset or run) block's docs, which is
+    /// its index into the block's tf array, or `None` when the block does
+    /// not hold it.
+    #[inline]
+    fn dense_rank(raw: &[u8], hdr: &BlockHeader, doc: u32) -> Option<usize> {
+        if hdr.encoding == ENCODING_RUN {
+            let rank = doc.checked_sub(hdr.base)? as usize;
+            return (rank < hdr.count()).then_some(rank);
+        }
+        let (bit, word, bitset_end) = Self::bitset_word(raw, hdr, doc)?;
+        ((word >> (bit % 64)) & 1 == 1)
+            .then(|| Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end) as usize)
+    }
+
     #[inline]
     fn bitset_tf_rank(raw: &[u8], payload: usize, bit: usize, word: u64, bitset_end: usize) -> u32 {
         let word_idx = bit / 64;
@@ -1038,7 +1065,7 @@ impl TermCursor {
         }
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
-        if hdr.encoding != ENCODING_BITSET {
+        if !is_dense_encoding(hdr.encoding) {
             // PACKED: no rank shortcut — decode + locate like a skip. The
             // in-block step is a linear scan from the cursor's position on
             // purpose: a completion pass probes a block a few docs apart,
@@ -1054,12 +1081,8 @@ impl TermCursor {
             };
         }
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        let (bit, word, bitset_end) = Self::bitset_word(raw, &hdr, doc)?;
-        if (word >> (bit % 64)) & 1 == 0 {
-            return None; // doc not present in this block
-        }
-        // Present: the r-th set bit (doc) maps to the r-th tf in doc order.
-        let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
+        // Present: the r-th doc maps to the r-th tf in doc order.
+        let rank = Self::dense_rank(raw, &hdr, doc)?;
         Some(Self::bitset_tf_for_probe(
             self.lazy_bit != u32::MAX,
             self.current_block,
@@ -1067,7 +1090,7 @@ impl TermCursor {
             &mut self.block_tfs,
             raw,
             &hdr,
-            rank as usize,
+            rank,
         ))
     }
 
@@ -1422,7 +1445,7 @@ impl TermCursor {
         }
         if !self.predecoded
             && self.dense_streak < 2
-            && self.current_header().encoding == ENCODING_BITSET
+            && is_dense_encoding(self.current_header().encoding)
         {
             // A skip into a bitset block is a probe: publish the one doc
             // the caller asked for instead of expanding all 128. A rare
@@ -1484,10 +1507,8 @@ impl TermCursor {
         let block = self.blocks[self.current_block];
         let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if hdr.encoding == ENCODING_BITSET {
-            let (bit, word, bitset_end) =
-                Self::bitset_word(raw, &hdr, doc).expect("contains(doc) confirmed presence");
-            let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
+        if is_dense_encoding(hdr.encoding) {
+            let rank = Self::dense_rank(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             Self::bitset_tf_for_probe(
                 self.lazy_bit != u32::MAX,
                 self.current_block,
@@ -1495,7 +1516,7 @@ impl TermCursor {
                 &mut self.block_tfs,
                 raw,
                 &hdr,
-                rank as usize,
+                rank,
             )
         } else {
             // PACKED: `contains` or a bare `seek_block` put the block cursor
@@ -1524,10 +1545,9 @@ impl TermCursor {
             return false; // inline / short-form cursor: no block bytes
         }
         match self.blocks.first() {
-            Some(block) => {
-                block_encoding(&self.bytes[block.block_byte_offset..block.block_byte_end])
-                    == ENCODING_BITSET
-            }
+            Some(block) => is_dense_encoding(block_encoding(
+                &self.bytes[block.block_byte_offset..block.block_byte_end],
+            )),
             None => false,
         }
     }
