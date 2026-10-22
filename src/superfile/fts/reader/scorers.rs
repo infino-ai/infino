@@ -2374,8 +2374,19 @@ impl FtsReader {
             }
             for (word_idx, word) in present.iter_mut().enumerate() {
                 let mut bits = std::mem::take(word);
+                if bits == 0 {
+                    continue;
+                }
                 if filter.is_none() {
                     count += u64::from(bits.count_ones());
+                    // A word whose best score cannot beat the k-th best holds
+                    // no hit: count it (done above) and clear its slots
+                    // without visiting a document.
+                    let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
+                    if heap.len() >= k && slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
+                        slots.fill(0.0);
+                        continue;
+                    }
                 }
                 while bits != 0 {
                     let local = (word_idx << 6) | bits.trailing_zeros() as usize;
