@@ -2385,7 +2385,8 @@ mod tests {
             writer::persist_commit_async,
         },
         test_helpers::{
-            build_title_batch, default_supertable_options, default_vector_config,
+            build_title_batch, copy_dir_recursive, default_supertable_options,
+            default_vector_config,
             fault_storage::{FaultKind, FaultOp, FaultStorage},
             schema_id_title,
         },
@@ -3899,11 +3900,19 @@ mod tests {
         HashMap::new()
     }
 
+    fn local_storage(dir: &TempDir) -> Arc<dyn StorageProvider> {
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"))
+    }
+
     fn make_st(dir: &TempDir) -> Supertable {
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        Supertable::create(default_supertable_options().with_storage(local_storage(dir)))
             .expect("create supertable")
+    }
+
+    /// Open the table already written at `dir`.
+    fn open_st(dir: &TempDir) -> Supertable {
+        Supertable::open(default_supertable_options().with_storage(local_storage(dir)))
+            .expect("open supertable")
     }
 
     /// Compact config designed to trigger on tiny test superfiles.
@@ -6393,13 +6402,16 @@ mod tests {
     /// enough to hold several at once without needing a large fixture.
     const TEST_CONCURRENT_JOBS: usize = 4;
 
-    /// Build a table whose superfiles the selector packs into several jobs,
-    /// then compact it at `concurrency` and report what the pass produced:
-    /// total docs, the per-superfile doc counts, and how many manifest
-    /// generations the pass burned.
-    async fn compact_a_fragmented_table(concurrency: usize) -> (u64, Vec<u64>, u64) {
-        let dir = TempDir::new().expect("tempdir");
-        let st = make_st(&dir);
+    /// Write a table at `dir` whose superfiles the selector packs into several
+    /// jobs.
+    ///
+    /// Two calls never write the same bytes. Every row's `_id` carries the
+    /// millisecond it was minted, so each superfile's compressed size moves
+    /// with how fast the appends ran, and a few hundred bytes per superfile is
+    /// enough to move a job boundary under the 1 MiB target. A test comparing
+    /// two passes runs them over copies of one table, not two separate writes.
+    fn write_a_fragmented_table(dir: &TempDir) -> Supertable {
+        let st = make_st(dir);
 
         // Each superfile must be big enough that a handful overflow the 1 MiB
         // target, so the selector emits more than one job and the concurrent
@@ -6424,7 +6436,29 @@ mod tests {
                 ]);
             }
         }
+        st
+    }
 
+    /// Each superfile's id and byte size: what the packer plans jobs from.
+    fn planner_inputs(st: &Supertable) -> Vec<(Uuid, u64)> {
+        let reader = st.reader().expect("reader");
+        let mut inputs: Vec<(Uuid, u64)> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| {
+                let size = e.subsection_offsets.as_ref().map_or(0, |o| o.total_size);
+                (e.superfile_id, size)
+            })
+            .collect();
+        inputs.sort_unstable();
+        inputs
+    }
+
+    /// Compact `st` at `concurrency` and report what the pass produced: total
+    /// docs, the per-superfile doc counts, and how many manifest generations
+    /// the pass burned.
+    async fn compact_and_measure(st: &Supertable, concurrency: usize) -> (u64, Vec<u64>, u64) {
         let cfg = CompactionSettings {
             max_concurrent_jobs: Some(concurrency),
             ..small_compact_cfg()
@@ -6449,14 +6483,29 @@ mod tests {
     /// table. Same doc count, same superfile shape — the plan is identical, so
     /// only the order the merges run in changed.
     ///
+    /// Both passes run over copies of one written table, so they plan from
+    /// the same bytes; see [`write_a_fragmented_table`] for why two separate
+    /// writes would not.
+    ///
     /// Commit count is bounded rather than pinned. A merge commits as soon as
     /// it is ready and takes along whatever else has finished, so how many
     /// CASes a pass spends depends on how its merges interleave.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_jobs_land_the_same_table_as_a_serial_pass() {
-        let (serial_docs, serial_shape, serial_generations) = compact_a_fragmented_table(1).await;
+        let serial_dir = TempDir::new().expect("tempdir");
+        let serial = write_a_fragmented_table(&serial_dir);
+        let concurrent_dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(serial_dir.path(), concurrent_dir.path());
+        let concurrent = open_st(&concurrent_dir);
+        assert_eq!(
+            planner_inputs(&serial),
+            planner_inputs(&concurrent),
+            "both passes must plan from the same superfiles"
+        );
+
+        let (serial_docs, serial_shape, serial_generations) = compact_and_measure(&serial, 1).await;
         let (concurrent_docs, concurrent_shape, concurrent_generations) =
-            compact_a_fragmented_table(TEST_CONCURRENT_JOBS).await;
+            compact_and_measure(&concurrent, TEST_CONCURRENT_JOBS).await;
 
         assert!(
             serial_generations >= 2,
