@@ -1758,6 +1758,7 @@ impl SupertableReader {
                 // so the bitmap lookup is an in-memory hit; on a cache
                 // miss/error we simply don't merge (a lower floor is
                 // always safe).
+                let _merge = detail_span!("fts.unit_merge").entered();
                 match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
                     Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
                         id_max,

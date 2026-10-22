@@ -51,6 +51,7 @@ use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, trace};
 use uuid::Uuid;
 
+use crate::utils::trace::detail_span;
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::StorageProvider,
@@ -584,7 +585,9 @@ impl FanoutContext {
         }
         verify_superfile_vector_codecs(&r, &self.vector_columns)?;
         note_superfile_opened(self.op_stats.as_ref());
-        body(r, entry, self.tombstone_cache.clone(), self.now, params).await
+        body(r, entry, self.tombstone_cache.clone(), self.now, params)
+            .instrument(detail_span!("fts.unit_body"))
+            .await
     }
 
     /// [`Self::run`] on its own task on the shared query runtime, so the
@@ -892,6 +895,7 @@ where
         let kernel = kernel.clone();
         Box::pin(async move {
             let hits = kernel(r, params).await?;
+            let _tag = detail_span!("fts.unit_tag").entered();
             let mut tagged = tag_hits(&entry, hits);
             apply_tombstone_filter(tombstone_cache.as_ref(), &entry, &mut tagged, now)?;
             Ok::<Vec<SuperfileHit>, QueryError>(tagged)
