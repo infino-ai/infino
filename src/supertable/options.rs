@@ -398,6 +398,13 @@ pub struct SupertableOptions {
     /// — sits well below its best, which is what lets a query rule the
     /// superfile out without opening it.
     pub term_head_depth: Option<usize>,
+    /// Whether a ranked query merges its terms' tiers only when the merge
+    /// can pay for itself: its first round — a block per term per
+    /// superfile, at the per-entry cost measured on this table — against
+    /// the most it could save, every open at the open cost measured here.
+    /// Off, the merge runs for every query the tiers can serve (what a test
+    /// of the merge wants).
+    pub tier_merge_gate: bool,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -795,6 +802,7 @@ impl SupertableOptions {
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
+            tier_merge_gate: true,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -945,6 +953,13 @@ impl SupertableOptions {
     /// [`Self::term_tier_entries_per_term`]); `0` keeps no tiers.
     pub fn with_term_tier_entries_per_term(mut self, entries: u64) -> Self {
         self.term_tier_entries_per_term = Some(entries);
+        self
+    }
+
+    /// Whether the tier merge is skipped where it cannot pay for itself
+    /// (see [`Self::tier_merge_gate`]).
+    pub fn with_tier_merge_gate(mut self, gate: bool) -> Self {
+        self.tier_merge_gate = gate;
         self
     }
 

@@ -98,12 +98,16 @@ const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
 /// for the same document, and a threshold an ulp above a real k-th score
 /// would prune a document tied with it. The mirror of [`BOUND_SLACK`].
 const LOWER_SLACK: f32 = 1.0 - 8.0 * f32::EPSILON;
-/// Most query terms the merge serves. One term is one product and two
-/// commute, so a candidate's sum is the kernel's score bit for bit and the
-/// bounds are tight; past two the bounds carry slack and the sum of tails
-/// grows with the terms, so the merge rarely rules a superfile out and
-/// costs every round for nothing — such queries keep the ceilings.
-pub(crate) const MAX_TIER_TERMS: usize = 2;
+/// Most distinct terms, phrase members included, the merge serves: a
+/// document's terms are a bit mask. Past two bare terms a candidate's sum
+/// carries slack (see [`EXACT_SUM_TERMS`]); the bounds hold for any
+/// number, and the gate on the merge (see `SupertableOptions::
+/// tier_merge_gate`) is what keeps a many-term query from paying for a
+/// first round that cannot pay back.
+pub(crate) const MAX_TIER_TERMS: usize = 64;
+
+/// A set of query terms, a bit per term in query order.
+pub(crate) type TermMask = u64;
 /// Entries the merge reads per query before it stops regardless of what is
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
@@ -129,11 +133,22 @@ pub(crate) struct SuperfileBounds {
 /// the column's statistics they score at, and how many documents it wants.
 pub(crate) struct TierQuery<'a> {
     pub(crate) column: FieldId,
+    /// Every distinct term the query scores, phrase members included.
     pub(crate) terms: &'a [&'a str],
     /// A bit per term (in `terms` order) a matching document must carry:
-    /// every bit for a conjunction, none for a disjunction, the musts' for
-    /// a mix.
-    pub(crate) required: u8,
+    /// the musts and the members of must-phrases.
+    pub(crate) required: TermMask,
+    /// A bit per term that scores on its own (a bare term); a term that is
+    /// only a phrase member scores through the phrase.
+    pub(crate) scoring: TermMask,
+    /// Each phrase as its members' bits and whether a match must carry it.
+    /// A phrase scores at most its members' idf sum times the smallest
+    /// member key of the document, the bound the ceiling path uses.
+    pub(crate) phrases: Vec<(TermMask, bool)>,
+    /// Whether the query negates terms: a document the heads show cannot
+    /// then be taken as a match, so the merge bounds and orders but seeds
+    /// no threshold and answers for nothing.
+    pub(crate) negated: bool,
     pub(crate) k: usize,
     /// The average length every kept superfile scores at.
     pub(crate) table_avgdl: f32,
@@ -149,6 +164,12 @@ pub(crate) struct TierQuery<'a> {
     /// took — the trade that differs between a table whose opens are a
     /// few microseconds of warm memory and one whose opens are reads.
     pub(crate) open_cost_ns: u64,
+    /// What one tier entry costs a merge on this table, in nanoseconds of
+    /// query wall; zero when not yet known.
+    pub(crate) entry_cost_ns: u64,
+    /// Whether to skip the merge where its first round, at that per-entry
+    /// cost, costs more than every open it could save at the open cost.
+    pub(crate) merge_gate: bool,
 }
 
 /// The merge's outcome for one query.
@@ -169,6 +190,8 @@ pub(crate) struct TierSelection {
     pub(crate) tier_bytes: u64,
     /// Tier entries decoded.
     pub(crate) entries_read: u64,
+    /// Wall the merge's rounds took, decoding included.
+    pub(crate) merge_ns: u64,
 }
 
 /// One term's chunked tier in one segment: where its regions sit, and
@@ -222,28 +245,41 @@ impl HeadState {
 /// (`NOT_A_CANDIDATE` until it carries every required term).
 #[derive(Clone, Copy)]
 struct Joined {
-    mask: u8,
-    sum: f32,
+    mask: TermMask,
+    /// Where the document's per-term contributions sit in the superfile's
+    /// `contrib`: `at * nt ..`.
+    at: u32,
     candidate: u32,
+}
+
+/// The shape of the query the merge bounds: which terms a match must
+/// carry, which score on their own, the phrases, and whether a document
+/// the heads show can be trusted to match (no must-phrase to verify, no
+/// negated term to check).
+#[derive(Clone)]
+struct Shape {
+    required: TermMask,
+    scoring: TermMask,
+    phrases: Vec<(TermMask, bool)>,
+    trusted: bool,
 }
 
 const NOT_A_CANDIDATE: u32 = u32::MAX;
 
 /// What the merge knows of one kept superfile, and what it derives from
-/// it. Every entry read updates the join, the best sum of its mask and
-/// the candidates in place; the bounds and the top candidates are
-/// recomputed only in a round that read something for the superfile.
+/// it. Every entry read updates the join and the candidates in place; the
+/// bounds and the top candidates are recomputed only in a round that read
+/// something for the superfile.
 struct Slot {
     heads: Vec<HeadState>,
     /// The heads joined, by row.
     joined: FxHashMap<u32, Joined>,
-    /// Per set of terms, the best sum of a document read under exactly
-    /// those terms at the time (`NEG_INFINITY` when none): what the upper
-    /// bound is assembled from.
-    best: [f32; 1 << MAX_TIER_TERMS],
-    /// The sums (narrowed by the lower slack) of documents carrying every
-    /// required term, in no order, updated in place as a document's sum
-    /// grows.
+    /// Per joined document, its contribution per term (zero until read),
+    /// `nt` to a document.
+    contrib: Vec<f32>,
+    /// The bare-term sums (narrowed by the lower slack) of documents
+    /// carrying every required term, in no order, updated in place as a
+    /// document's sum grows.
     candidates: Vec<f32>,
     /// The best `k` of `candidates`, descending: what the superfile offers
     /// the threshold.
@@ -277,7 +313,7 @@ struct BlockRead<'a> {
 struct Merge {
     slots: Vec<Slot>,
     scoring: Scoring,
-    required: u8,
+    shape: Shape,
     k: usize,
     lb_slack: f32,
     ub_slack: f32,
@@ -300,6 +336,20 @@ pub(crate) async fn select_with_tiers(
     let nt = terms.len();
     let k = query.k;
     if nt == 0 || nt > MAX_TIER_TERMS || k == 0 || kept.is_empty() {
+        return Ok(None);
+    }
+    // The gate: the merge's first round decodes a block per term per
+    // superfile; where that, at the per-entry cost measured here, costs
+    // more than every open it could save at the open cost measured here,
+    // it cannot pay back and the ceilings serve instead.
+    if query.merge_gate
+        && query.open_cost_ns > 0
+        && query.entry_cost_ns > 0
+        && (nt as u64)
+            .saturating_mul(BLOCK_ENTRIES as u64)
+            .saturating_mul(query.entry_cost_ns)
+            > query.open_cost_ns
+    {
         return Ok(None);
     }
     // A superfile the root does not list has postings the merge would never
@@ -342,7 +392,7 @@ pub(crate) async fn select_with_tiers(
             heads: vec![HeadState::absent(); nt],
             // Room for a block of every term before the map has to grow.
             joined: FxHashMap::with_capacity_and_hasher(2 * BLOCK_ENTRIES * nt, Default::default()),
-            best: [f32::NEG_INFINITY; 1 << MAX_TIER_TERMS],
+            contrib: Vec::with_capacity(2 * BLOCK_ENTRIES * nt * nt),
             candidates: Vec::new(),
             top: Vec::new(),
             touched: false,
@@ -421,7 +471,16 @@ pub(crate) async fn select_with_tiers(
     // sum is the score bit for bit (addition commutes); a longer sum can
     // land an ulp from the kernel's, which adds in its own order, so its
     // bounds take the slack a product of roundings needs.
-    let exact_scores = nt <= EXACT_SUM_TERMS;
+    let exact_scores = nt <= EXACT_SUM_TERMS && query.phrases.is_empty() && !query.negated;
+    let shape = Shape {
+        required: query.required,
+        scoring: query.scoring,
+        phrases: query.phrases.clone(),
+        // A document the heads show matches only if nothing unseen can
+        // unmake it: no must-phrase whose adjacency the heads cannot
+        // verify, no negated term the heads do not read.
+        trusted: !query.negated && query.phrases.iter().all(|p| !p.1),
+    };
     let (lb_slack, ub_slack) = if exact_scores {
         (1.0, 1.0)
     } else {
@@ -442,13 +501,13 @@ pub(crate) async fn select_with_tiers(
             continue;
         };
         let c = scoring.contribution(*ti, e);
-        slots[si].absorb(*ti, e.doc_id, c, query.required, lb_slack);
+        slots[si].absorb(*ti, e.doc_id, c, &shape, lb_slack);
         entries_read += 1;
     }
     let mut merge = Merge {
         slots,
         scoring,
-        required: query.required,
+        shape,
         k,
         lb_slack,
         ub_slack,
@@ -457,7 +516,7 @@ pub(crate) async fn select_with_tiers(
     };
     for slot in merge.slots.iter_mut() {
         if slot.touched {
-            slot.refresh(query.required, k, ub_slack);
+            slot.refresh(&merge.shape, &merge.scoring.idf, k, ub_slack);
         }
     }
 
@@ -489,8 +548,9 @@ pub(crate) async fn select_with_tiers(
         n => n as usize,
     };
     let open_cost_ns = query.open_cost_ns;
-    let merge = run_on_pool(Some(pool), "tier merge", move || {
+    let (merge, merge_ns) = run_on_pool(Some(pool), "tier merge", move || {
         let mut merge = merge;
+        let mut merge_ns = 0u64;
         for round in 0..max_rounds {
             let mut reads: Vec<Vec<BlockRead<'_>>> =
                 (0..merge.slots.len()).map(|_| Vec::new()).collect();
@@ -529,6 +589,7 @@ pub(crate) async fn select_with_tiers(
             let started = Instant::now();
             let excluded = merge.round(&reads);
             let round_ns = started.elapsed().as_nanos() as u64;
+            merge_ns += round_ns;
             // Worth reading on: the opens this round saved, at what an open
             // costs here, cover what the round cost. With the open cost
             // unknown, any exclusion is taken as worth it. A round that
@@ -570,7 +631,7 @@ pub(crate) async fn select_with_tiers(
                 break;
             }
         }
-        merge
+        (merge, merge_ns)
     })
     .await
     .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
@@ -596,7 +657,7 @@ pub(crate) async fn select_with_tiers(
                     .joined
                     .iter()
                     .filter(|(_, j)| j.mask & required == required)
-                    .map(|(&doc, j)| (doc, j.sum))
+                    .map(|(&doc, j)| (doc, slot.contrib_of(j).iter().sum()))
                     .collect();
                 docs.sort_unstable_by_key(|d| d.0);
                 resolved.push((si, docs));
@@ -609,6 +670,7 @@ pub(crate) async fn select_with_tiers(
         resolved,
         tier_bytes,
         entries_read: merge.entries_read,
+        merge_ns,
     }))
 }
 
@@ -620,7 +682,7 @@ impl Merge {
     /// candidates, and the exclusion of what cannot reach it. Returns how
     /// many superfiles the round ruled out.
     fn round(&mut self, reads: &[Vec<BlockRead<'_>>]) -> usize {
-        let required = self.required;
+        let shape = &self.shape;
         let (k, lb_slack, ub_slack) = (self.k, self.lb_slack, self.ub_slack);
         let scoring = &self.scoring;
         let entries: u64 = self
@@ -654,11 +716,11 @@ impl Merge {
                         }
                         for e in &decoded {
                             let c = scoring.contribution(read.ti, e);
-                            slot.absorb(read.ti, e.doc_id, c, required, lb_slack);
+                            slot.absorb(read.ti, e.doc_id, c, shape, lb_slack);
                         }
                     }
                     if slot.touched {
-                        slot.refresh(required, k, ub_slack);
+                        slot.refresh(shape, &scoring.idf, k, ub_slack);
                     }
                 }
                 n
@@ -704,28 +766,41 @@ impl Merge {
 }
 
 impl Slot {
+    /// A document's contributions, one per term.
+    fn contrib_of(&self, j: &Joined) -> &[f32] {
+        let nt = self.heads.len();
+        let at = j.at as usize * nt;
+        &self.contrib[at..at + nt]
+    }
+
     /// Take in one entry: document `row` read under term `ti` with
-    /// contribution `c`. Its join grows by the term, the best sum of its
-    /// new mask takes it in, and it enters the candidates — or its
-    /// candidate grows — once it carries every required term.
-    fn absorb(&mut self, ti: usize, row: u32, c: f32, required: u8, lb_slack: f32) {
-        let bit = 1u8 << ti;
+    /// contribution `c`. Its join grows by the term, and it enters the
+    /// candidates — or its candidate grows — once it carries every
+    /// required term, where a candidate can be trusted at all.
+    fn absorb(&mut self, ti: usize, row: u32, c: f32, shape: &Shape, lb_slack: f32) {
+        let nt = self.heads.len();
+        let bit = (1 as TermMask) << ti;
         self.heads[ti].seen = true;
         self.touched = true;
+        let next = (self.contrib.len() / nt) as u32;
         let j = self.joined.entry(row).or_insert(Joined {
             mask: 0,
-            sum: 0.0,
+            at: next,
             candidate: NOT_A_CANDIDATE,
         });
+        if j.at == next {
+            self.contrib.resize(self.contrib.len() + nt, 0.0);
+        }
         if j.mask & bit != 0 {
             return;
         }
         j.mask |= bit;
-        j.sum += c;
-        let m = j.mask as usize;
-        self.best[m] = self.best[m].max(j.sum);
-        if j.mask & required == required {
-            let v = j.sum * lb_slack;
+        let at = j.at as usize * nt;
+        self.contrib[at + ti] = c;
+        if shape.trusted && j.mask & shape.required == shape.required {
+            // What the document scores for sure: its bare terms read so
+            // far; a phrase it may carry adds to that, never takes away.
+            let v = bare_sum(&self.contrib[at..at + nt], shape.scoring) * lb_slack;
             if j.candidate == NOT_A_CANDIDATE {
                 j.candidate = self.candidates.len() as u32;
                 self.candidates.push(v);
@@ -736,7 +811,7 @@ impl Slot {
     }
 
     /// Recompute the bounds and the top candidates from what was absorbed.
-    fn refresh(&mut self, required: u8, k: usize, ub_slack: f32) {
+    fn refresh(&mut self, shape: &Shape, idf: &[f32], k: usize, ub_slack: f32) {
         self.touched = false;
         self.top.clear();
         self.top.extend_from_slice(&self.candidates);
@@ -745,39 +820,53 @@ impl Slot {
             self.top.truncate(k);
         }
         self.top.sort_unstable_by(|a, b| b.total_cmp(a));
-        let (ub, lb) = bounds_of(&self.heads, &self.best, required, ub_slack);
+        let (ub, lb) = bounds_of(
+            &self.heads,
+            &self.joined,
+            &self.contrib,
+            shape,
+            idf,
+            ub_slack,
+        );
         self.ub = ub;
         self.lb = lb;
     }
 }
 
+/// The sum of a document's bare-term contributions.
+fn bare_sum(contrib: &[f32], scoring: TermMask) -> f32 {
+    contrib
+        .iter()
+        .enumerate()
+        .filter(|(t, _)| scoring & (1 << t) != 0)
+        .map(|(_, c)| c)
+        .sum()
+}
+
 /// `(upper bound, lower bound)` on the score of a document of one
-/// superfile, from what has been read of it: a document read under some
-/// terms scores at most its known sum plus the tails of the terms it has
-/// not been read under; one read under none at most the sum of the tails.
-/// A required term's head read to its end holds every document of the
-/// term there, so a document outside it carries no such term and is no
-/// candidate; a superfile that lacks a required term holds no match at
-/// all. The lower bound is the best known sum of a document carrying every
-/// required term.
-///
-/// `best` holds, per mask, the best sum of a document while it was read
-/// under exactly that mask. A document since read under more terms is
-/// also in a larger mask, where its bound is tighter; what stays in the
-/// smaller mask bounds it from above still, since every contribution it
-/// gained is at least the tail of its term.
+/// superfile, from what has been read of it. A document scores at most
+/// its bare terms — each its contribution if read under it, else the
+/// term's tail — plus, per phrase, the members' idf sum times the smallest
+/// member key, a read member's own or the tail's; a document read under no
+/// term takes every tail. A required term's head read to its end holds
+/// every document of the term there, so a document outside it carries no
+/// such term and is no candidate; a superfile that lacks a required term
+/// holds no match at all. The lower bound is the best bare sum of a
+/// document carrying every required term, where such a document can be
+/// trusted to match.
 fn bounds_of(
     heads: &[HeadState],
-    best: &[f32; 1 << MAX_TIER_TERMS],
-    required: u8,
+    joined: &FxHashMap<u32, Joined>,
+    contrib: &[f32],
+    shape: &Shape,
+    idf: &[f32],
     ub_slack: f32,
 ) -> (f32, f32) {
     let nt = heads.len();
-    let mut tails = [0.0f32; MAX_TIER_TERMS];
     // Required terms whose heads are whole: a candidate must be in them.
-    let mut settled = 0u8;
+    let mut settled: TermMask = 0;
     for (ti, h) in heads.iter().enumerate() {
-        if required & (1 << ti) != 0 {
+        if shape.required & (1 << ti) != 0 {
             if h.ceiling <= 0.0 && !h.seen {
                 return (f32::NEG_INFINITY, f32::NEG_INFINITY);
             }
@@ -785,29 +874,55 @@ fn bounds_of(
                 settled |= 1 << ti;
             }
         }
-        tails[ti] = h.tail;
     }
+    // The bound for a document read under `mask` with contributions `c`
+    // (`None` for one read under no term).
+    let doc_ub = |mask: TermMask, c: Option<&[f32]>| -> f32 {
+        let mut ub = 0.0f32;
+        for (t, h) in heads.iter().enumerate() {
+            if shape.scoring & (1 << t) != 0 {
+                ub += match c {
+                    Some(c) if mask & (1 << t) != 0 => c[t],
+                    _ => h.tail,
+                };
+            }
+        }
+        for &(members, _) in &shape.phrases {
+            let mut idf_sum = 0.0f32;
+            let mut min_key = f32::INFINITY;
+            for (t, h) in heads.iter().enumerate() {
+                if members & (1 << t) == 0 {
+                    continue;
+                }
+                idf_sum += idf[t];
+                let key = match c {
+                    Some(c) if mask & (1 << t) != 0 => c[t] / idf[t],
+                    _ => h.tail / idf[t],
+                };
+                min_key = min_key.min(key);
+            }
+            ub += idf_sum * min_key;
+        }
+        ub
+    };
     let mut ub = if settled == 0 {
-        tails[..nt].iter().sum()
+        doc_ub(0, None)
     } else {
         f32::NEG_INFINITY
     };
     let mut lb = f32::NEG_INFINITY;
-    for (m, &sum) in best.iter().enumerate().take(1 << nt) {
-        let mask = m as u8;
-        if sum == f32::NEG_INFINITY || mask & settled != settled {
+    for j in joined.values() {
+        if j.mask & settled != settled {
             continue;
         }
-        let missing: f32 = (0..nt)
-            .filter(|t| mask & (1 << t) == 0)
-            .map(|t| tails[t])
-            .sum();
-        ub = ub.max(sum * ub_slack + missing);
-        if mask & required == required {
-            lb = lb.max(sum);
+        let at = j.at as usize * nt;
+        let c = &contrib[at..at + nt];
+        ub = ub.max(doc_ub(j.mask, Some(c)));
+        if shape.trusted && j.mask & shape.required == shape.required {
+            lb = lb.max(bare_sum(c, shape.scoring));
         }
     }
-    (ub, lb)
+    (ub * ub_slack, lb)
 }
 
 /// How a tier entry's contribution to a query is computed: the kernel's
@@ -857,14 +972,20 @@ mod tests {
     const BOUND_CASES: u64 = 4_000;
     /// Documents in the oracle's universe per case.
     const UNIVERSE: u32 = 48;
-    /// Most terms the oracle joins: what the merge serves.
-    const TERMS: usize = MAX_TIER_TERMS;
+    /// Most terms the oracle joins: enough for phrases of three over bare
+    /// terms, few enough that a universe of 48 documents exercises every
+    /// mask.
+    const TERMS: usize = 5;
 
     /// The bounds hold against every corpus the read heads could have come
     /// from: documents outside a term's head carry at most that term's tail
-    /// (nothing when the head was read to its end), and the true best
-    /// candidate's score sits between the lower and the upper bound.
+    /// (nothing when the head was read to its end), a phrase scores its
+    /// members' idf sum times its smallest member key and is present
+    /// wherever its members all are (the worst case for a bound), and the
+    /// true best candidate's score sits between the lower and the upper
+    /// bound.
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn bounds_hold_against_every_corpus_the_heads_allow() {
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
         let mut next = move || {
@@ -875,14 +996,46 @@ mod tests {
         };
         for case in 0..BOUND_CASES {
             let nt = 1 + (next() % TERMS as u64) as usize;
-            let required = (next() % (1u64 << nt)) as u8;
-            // Per term: a head of documents with contributions, and a tail
-            // (zero means the head is whole); every document outside the
-            // head takes a hidden contribution within the tail.
+            let all: TermMask = (1u64 << nt) - 1;
+            // Bare terms, and up to two phrases over the rest, each of two
+            // or three members; a phrase may be required.
+            let mut scoring: TermMask = next() % (1u64 << nt);
+            let mut phrases: Vec<(TermMask, bool)> = Vec::new();
+            if nt >= 2 {
+                for _ in 0..(next() % 3) {
+                    let mut members: TermMask = 0;
+                    while members.count_ones() < 2 {
+                        members |= 1 << (next() % nt as u64);
+                    }
+                    if next() % 2 == 0 && nt >= 3 {
+                        members |= 1 << (next() % nt as u64);
+                    }
+                    phrases.push((members, next() % 2 == 0));
+                }
+            }
+            if phrases.is_empty() && scoring == 0 {
+                scoring = all;
+            }
+            let mut required: TermMask = (next() % (1u64 << nt)) & scoring;
+            for &(members, must) in &phrases {
+                if must {
+                    required |= members;
+                }
+            }
+            let negated = next() % 4 == 0;
+            let shape = Shape {
+                required,
+                scoring,
+                phrases: phrases.clone(),
+                trusted: !negated && phrases.iter().all(|p| !p.1),
+            };
+            let idf: Vec<f32> = (0..nt)
+                .map(|_| 0.5 + (next() % 1000) as f32 / 500.0)
+                .collect();
             let mut slot = Slot {
                 heads: vec![HeadState::absent(); nt],
                 joined: FxHashMap::default(),
-                best: [f32::NEG_INFINITY; 1 << MAX_TIER_TERMS],
+                contrib: Vec::new(),
                 candidates: Vec::new(),
                 top: Vec::new(),
                 touched: false,
@@ -892,6 +1045,9 @@ mod tests {
                 ordinal: 0,
                 scale_up: 1.0,
             };
+            // Per term: a head of documents with contributions, and a tail
+            // (zero means the head is whole); every document outside the
+            // head takes a hidden contribution within the tail.
             let mut truth: Vec<Vec<f32>> = Vec::with_capacity(nt);
             for ti in 0..nt {
                 let whole = next() % 3 == 0;
@@ -899,7 +1055,7 @@ mod tests {
                 let tail = if whole {
                     0.0
                 } else {
-                    (next() % 1000) as f32 / 1000.0
+                    idf[ti] * (next() % 1000) as f32 / 1000.0
                 };
                 let mut contribution = vec![0.0f32; UNIVERSE as usize];
                 let mut ceiling = tail;
@@ -907,8 +1063,8 @@ mod tests {
                     if next() % u64::from(UNIVERSE) < u64::from(in_head) {
                         // A head entry contributes at least the tail: the
                         // head is the term's best documents.
-                        let c = tail + (next() % 1000) as f32 / 1000.0;
-                        slot.absorb(ti, doc, c, required, 1.0);
+                        let c = tail + idf[ti] * (next() % 1000) as f32 / 1000.0;
+                        slot.absorb(ti, doc, c, &shape, 1.0);
                         contribution[doc as usize] = c;
                         ceiling = ceiling.max(c);
                     } else if !whole && next() % 2 == 0 {
@@ -920,19 +1076,35 @@ mod tests {
                 slot.heads[ti].done = whole;
                 truth.push(contribution);
             }
-            slot.refresh(required, 10, 1.0);
+            slot.refresh(&shape, &idf, 10, 1.0);
             let (ub, lb) = (slot.ub, slot.lb);
-            // The truth: the best document carrying every required term.
+            // The truth: the best document carrying every required term,
+            // scored as the kernel would at worst for the bound — every
+            // phrase present wherever its members all are.
             let mut best = f32::NEG_INFINITY;
             for doc in 0..UNIVERSE as usize {
-                let contributions = truth.iter().map(|t| t[doc]);
-                let carries_required = contributions
-                    .clone()
-                    .enumerate()
-                    .all(|(t, c)| required & (1 << t) == 0 || c > 0.0);
-                if carries_required {
-                    best = best.max(contributions.sum());
+                let carries = |t: usize| truth[t][doc] > 0.0;
+                if (0..nt).any(|t| required & (1 << t) != 0 && !carries(t)) {
+                    continue;
                 }
+                let mut score = 0.0f32;
+                for t in 0..nt {
+                    if scoring & (1 << t) != 0 {
+                        score += truth[t][doc];
+                    }
+                }
+                for &(members, _) in &phrases {
+                    let mut idf_sum = 0.0f32;
+                    let mut min_key = f32::INFINITY;
+                    for t in 0..nt {
+                        if members & (1 << t) != 0 {
+                            idf_sum += idf[t];
+                            min_key = min_key.min(truth[t][doc] / idf[t]);
+                        }
+                    }
+                    score += idf_sum * min_key;
+                }
+                best = best.max(score);
             }
             assert!(
                 best <= ub * BOUND_SLACK,

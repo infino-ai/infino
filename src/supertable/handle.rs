@@ -146,6 +146,10 @@ pub(super) struct SupertableInner {
     /// merge reads on while a round's exclusions are worth more than the
     /// round itself at this price.
     pub(super) open_cost_ns: AtomicU64,
+    /// What one tier entry costs a merge on this table, in nanoseconds of
+    /// query wall: a running average over merges of their rounds' wall
+    /// divided by the entries decoded. Zero until a merge has run.
+    pub(super) tier_entry_cost_ns: AtomicU64,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, mints
     /// `batch.num_rows()` ids, and unlocks. The mutex is
@@ -1840,6 +1844,7 @@ async fn build_handle(
         append_queue: AppendQueue::default(),
         compaction_outstanding: AtomicBool::new(false),
         open_cost_ns: AtomicU64::new(0),
+        tier_entry_cost_ns: AtomicU64::new(0),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
@@ -2142,8 +2147,25 @@ impl SupertableReader {
     /// average: a quarter of the way from the old value to the sample, so
     /// a cold outlier neither sets nor erases it.
     pub(crate) fn note_open_cost(&self, sample_ns: u64) {
+        Self::fold(&self.inner.open_cost_ns, sample_ns);
+    }
+
+    /// The running cost of one tier entry to a merge on this table (see
+    /// `SupertableInner::tier_entry_cost_ns`); zero until a merge has run.
+    pub(crate) fn tier_entry_cost_ns(&self) -> u64 {
+        self.inner
+            .tier_entry_cost_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fold one merge's cost per entry into the running average, as
+    /// [`Self::note_open_cost`] folds an open's.
+    pub(crate) fn note_tier_entry_cost(&self, sample_ns: u64) {
+        Self::fold(&self.inner.tier_entry_cost_ns, sample_ns);
+    }
+
+    fn fold(cell: &AtomicU64, sample_ns: u64) {
         use std::sync::atomic::Ordering;
-        let cell = &self.inner.open_cost_ns;
         let old = cell.load(Ordering::Relaxed);
         let new = if old == 0 {
             sample_ns

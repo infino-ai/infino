@@ -100,7 +100,9 @@ fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
     let mut options = SupertableOptions::new(schema(), vec![fts], vec![])
         .expect("options")
         .with_storage(storage)
-        .with_bound_ordered_open_window(1);
+        .with_bound_ordered_open_window(1)
+        // The merge under test, for every query the tiers can serve.
+        .with_tier_merge_gate(false);
     if !tiers {
         options = options.with_term_tier_entries_per_term(0);
     }
@@ -372,7 +374,8 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
         let mut options = SupertableOptions::new(schema(), vec![FtsConfig::new("body")], vec![])
             .expect("options")
             .with_storage(storage)
-            .with_bound_ordered_open_window(1);
+            .with_bound_ordered_open_window(1)
+            .with_tier_merge_gate(false);
         if !tiers {
             options = options.with_term_tier_entries_per_term(0);
         }

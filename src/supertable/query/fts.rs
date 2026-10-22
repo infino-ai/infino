@@ -1077,32 +1077,43 @@ impl SupertableReader {
         // before any open.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
-        let tiers_serve = !has_phrases
-            && negatives.is_empty()
-            && scored.len() <= tier::MAX_TIER_TERMS
+        let tiers_serve = all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
         let mut selected = false;
         if let Some((index, column_id)) = index_column
             && tiers_serve
         {
-            let scored_terms: Vec<&str> = scored.iter().map(String::as_str).collect();
-            // Terms a matching document must carry: the musts.
-            let required: u8 = scored_terms
+            // Bits over the distinct terms: the bare terms score on their
+            // own; a match must carry the musts and every member of a
+            // must-phrase.
+            let bits = |names: &[String]| -> tier::TermMask {
+                names
+                    .iter()
+                    .filter_map(|n| all_terms.iter().position(|t| *t == n.as_str()))
+                    .fold(0, |m, i| m | (1 << i))
+            };
+            let scoring = bits(&musts) | bits(&shoulds);
+            let tier_phrases: Vec<(tier::TermMask, bool)> = must_phrases
                 .iter()
-                .enumerate()
-                .filter(|(_, t)| musts.iter().any(|m| m == *t))
-                .fold(0u8, |m, (i, _)| m | (1u8 << i));
-            // A term repeated in the query is weighted by its count in the
-            // kernels; the tiers score each term once, so such a query is
-            // not served.
-            let repeated = musts.len() + shoulds.len() != scored_terms.len();
+                .map(|p| (bits(p), true))
+                .chain(should_phrases.iter().map(|p| (bits(p), false)))
+                .collect();
+            let required =
+                bits(&musts) | tier_phrases.iter().filter(|p| p.1).fold(0, |m, p| m | p.0);
+            // A bare term repeated in the query is weighted by its count in
+            // the kernels; the tiers score each term once, so such a query
+            // is not served.
+            let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
             let selection = match column_params(manifest, column) {
                 Some(params) if !repeated => {
                     let query = tier::TierQuery {
                         column: column_id,
-                        terms: &scored_terms,
+                        terms: &all_terms,
                         required,
+                        scoring,
+                        phrases: tier_phrases,
+                        negated: !negatives.is_empty(),
                         k,
                         table_avgdl,
                         params,
@@ -1110,6 +1121,8 @@ impl SupertableReader {
                         // scoped search opens as before.
                         want_resolved: scope.is_none(),
                         open_cost_ns: self.open_cost_ns(),
+                        entry_cost_ns: self.tier_entry_cost_ns(),
+                        merge_gate: manifest.options.tier_merge_gate,
                     };
                     tier::select_with_tiers(
                         index,
@@ -1127,6 +1140,9 @@ impl SupertableReader {
                 selected = true;
                 if let Some(stats) = &self.op_stats {
                     stats.add_tier_read(selection.tier_bytes, selection.entries_read);
+                }
+                if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
+                    self.note_tier_entry_cost(per_entry);
                 }
                 let mut answered: Vec<bool> = vec![false; kept.len()];
                 if !selection.resolved.is_empty() {

@@ -1051,6 +1051,8 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
         o.with_storage(storage_in(&with_dir))
             .with_term_head_depth(TIER_HEAD_DEPTH)
             .with_bound_ordered_open_window(1)
+            // The merge under test, for every query the tiers can serve.
+            .with_tier_merge_gate(false)
     });
     let without_tiers = build_supertable_with(&corp, TIER_SUPERFILES, params, |o| {
         o.with_storage(storage_in(&without_dir))
@@ -1095,13 +1097,11 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
                 tiered, plain,
                 "{label} k={k}: the tiers' merge must return what the ceiling path returns"
             );
-            // The merge serves one- and two-term queries; the rest keep the
-            // ceiling path, where the same answer costs no tier read.
+            // Every query here is served by the merge, which reads tiers.
             let mut terms: Vec<String> = Vec::new();
             default_tokenizer().tokenize_each(q, &mut |t| terms.push(t.to_owned()));
-            assert_eq!(
+            assert!(
                 stats.tier_entries > 0,
-                terms.len() <= 2,
                 "{label} k={k}: {} tier entries read",
                 stats.tier_entries
             );
