@@ -1161,11 +1161,16 @@ impl SupertableReader {
             && !config::global().diagnostics.disable_tier_selection;
         // Whether to merge at all is the table's learned call per class of
         // query; the search is timed from here so the call can be judged.
+        let rarest_idf = all_terms
+            .iter()
+            .filter_map(|t| global_idf.get(*t))
+            .fold(0.0f32, |m, &idf| m.max(idf));
         let policy_class = tier::TierPolicy::class(
             shoulds.is_empty() && should_phrases.is_empty(),
             musts.is_empty() && must_phrases.is_empty(),
             k,
             all_terms.len(),
+            rarest_idf,
         );
         let ranked_started = Instant::now();
         let learned = manifest.options.tier_merge_gate;

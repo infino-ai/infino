@@ -113,8 +113,9 @@ pub(crate) type TermMask = u64;
 
 /// Whether a ranked query merges its tiers at all, learned per table from
 /// what the two ways cost: per class of query — conjunction, disjunction
-/// or a mix; a bucket of `k`; a bucket of term count — a running average
-/// of the ranked search's wall with the merge and without it. The two
+/// or a mix; a bucket of `k`; a bucket of term count; a bucket of how rare
+/// the rarest term is — a running average of the ranked search's wall
+/// with the merge and without it. The two
 /// ways alternate until each has [`TierPolicy::MIN_SAMPLES`] queries, so
 /// both averages are taken over the same mix of queries; then the cheaper
 /// way is taken and one query in [`TierPolicy::EXPLORE_EVERY`] takes the
@@ -135,7 +136,9 @@ impl TierPolicy {
     const SHAPES: usize = 3;
     const K_BUCKETS: usize = 4;
     const TERM_BUCKETS: usize = 5;
-    const CLASSES: usize = Self::SHAPES * Self::K_BUCKETS * Self::TERM_BUCKETS;
+    const RARITY_BUCKETS: usize = 4;
+    const CLASSES: usize =
+        Self::SHAPES * Self::K_BUCKETS * Self::TERM_BUCKETS * Self::RARITY_BUCKETS;
     /// One query in this many takes the way the averages do not favour.
     const EXPLORE_EVERY: u32 = 16;
     /// Queries each way is measured over, alternating, before the averages
@@ -158,8 +161,23 @@ impl TierPolicy {
     }
 
     /// The class of a query: whether its terms are all required, none, or
-    /// some; its `k`; its distinct term count.
-    pub(crate) fn class(all_required: bool, none_required: bool, k: usize, terms: usize) -> usize {
+    /// some; its `k`; its distinct term count; how rare its rarest term
+    /// is, as that term's table-wide idf. The kernels' work and what the
+    /// merge can rule out both follow the rarest term far more than the
+    /// term count: a conjunction anchored on a term in one document in
+    /// ten thousand is a different query from one over three common
+    /// words, and the two ways cost differently on each. Idf is a function
+    /// of the term's share of the corpus alone (ln(1 + (N − df + ½)/(df +
+    /// ½)), close to ln(N/df)), so the buckets mean the same on any table:
+    /// a share of at most one in ten thousand, in a thousand, in a
+    /// hundred, or more.
+    pub(crate) fn class(
+        all_required: bool,
+        none_required: bool,
+        k: usize,
+        terms: usize,
+        rarest_idf: f32,
+    ) -> usize {
         let shape = match (all_required, none_required) {
             (true, _) => 0,
             (false, true) => 1,
@@ -178,7 +196,14 @@ impl TierPolicy {
             5..=8 => 3,
             _ => 4,
         };
-        (shape * Self::K_BUCKETS + kb) * Self::TERM_BUCKETS + tb
+        // ln(10⁴), ln(10³), ln(10²).
+        let rb = match rarest_idf {
+            r if r >= 9.21 => 0,
+            r if r >= 6.9 => 1,
+            r if r >= 4.6 => 2,
+            _ => 3,
+        };
+        ((shape * Self::K_BUCKETS + kb) * Self::TERM_BUCKETS + tb) * Self::RARITY_BUCKETS + rb
     }
 
     /// Whether a query of `class` merges its tiers this time.
