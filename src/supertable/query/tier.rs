@@ -51,7 +51,6 @@
 use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
-    mem,
     sync::Arc,
 };
 
@@ -59,10 +58,10 @@ use bytes::Bytes;
 use futures::future::try_join_all;
 use rayon::{
     ThreadPool,
-    iter::{
-        IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
-    },
+    iter::{IndexedParallelIterator, ParallelIterator},
+    slice::{ParallelSlice, ParallelSliceMut},
 };
+use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use super::fts::baked_avgdl;
@@ -109,6 +108,15 @@ pub(crate) const MAX_TIER_TERMS: usize = 2;
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
+/// Superfiles one pool job decodes in a round. A superfile's share of a
+/// round is a few microseconds, so jobs this size keep the pool's
+/// scheduling a small fraction of the work.
+const SLOTS_PER_JOB: usize = 16;
+/// The least a round must raise the threshold, as a fraction, for the
+/// merge to read on when the round ruled nothing out: a threshold that
+/// barely moves will not reach any surviving bound soon, and every further
+/// round costs a block per term per superfile in play.
+const THRESHOLD_RISE_MIN: f32 = 0.01;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -172,8 +180,8 @@ struct Source {
 /// What the merge knows of one term in one kept superfile.
 #[derive(Clone)]
 struct HeadState {
-    /// Documents read so far as `(row, contribution)`, in ascending row.
-    docs: Vec<(u32, f32)>,
+    /// Whether any document of the term was read for the superfile.
+    seen: bool,
     /// Upper bound, at the table's stats, on the contribution of any
     /// document of the superfile not in `docs`. Zero once every document
     /// is in `docs`.
@@ -193,7 +201,7 @@ struct HeadState {
 impl HeadState {
     fn absent() -> Self {
         Self {
-            docs: Vec::new(),
+            seen: false,
             tail: 0.0,
             ceiling: 0.0,
             done: true,
@@ -202,17 +210,40 @@ impl HeadState {
     }
 }
 
+/// One document as the merge has read it: the terms it was read under,
+/// its summed contributions, and its place in the superfile's candidates
+/// (`NOT_A_CANDIDATE` until it carries every required term).
+#[derive(Clone, Copy)]
+struct Joined {
+    mask: u8,
+    sum: f32,
+    candidate: u32,
+}
+
+const NOT_A_CANDIDATE: u32 = u32::MAX;
+
 /// What the merge knows of one kept superfile, and what it derives from
-/// it: recomputed only in a round that read something for the superfile.
+/// it. Every entry read updates the join, the best sum of its mask and
+/// the candidates in place; the bounds and the top candidates are
+/// recomputed only in a round that read something for the superfile.
 struct Slot {
     heads: Vec<HeadState>,
-    /// The heads joined: per document read under any term, the terms it
-    /// was read under and its summed contributions, in ascending row.
-    joined: Vec<(u32, u8, f32)>,
-    /// The best sums (narrowed by the lower slack) of documents carrying
-    /// every required term, descending, at most `k` of them: what the
-    /// superfile offers the threshold.
+    /// The heads joined, by row.
+    joined: FxHashMap<u32, Joined>,
+    /// Per set of terms, the best sum of a document read under exactly
+    /// those terms at the time (`NEG_INFINITY` when none): what the upper
+    /// bound is assembled from.
+    best: [f32; 1 << MAX_TIER_TERMS],
+    /// The sums (narrowed by the lower slack) of documents carrying every
+    /// required term, in no order, updated in place as a document's sum
+    /// grows.
     candidates: Vec<f32>,
+    /// The best `k` of `candidates`, descending: what the superfile offers
+    /// the threshold.
+    top: Vec<f32>,
+    /// Whether a round read something for the superfile since its bounds
+    /// and `top` were last computed.
+    touched: bool,
     /// Upper bound on any of the superfile's documents, lower bound on its
     /// best candidate (see [`bounds_of`]).
     ub: f32,
@@ -302,8 +333,11 @@ pub(crate) async fn select_with_tiers(
         };
         slots.push(Slot {
             heads: vec![HeadState::absent(); nt],
-            joined: Vec::new(),
+            joined: FxHashMap::default(),
+            best: [f32::NEG_INFINITY; 1 << MAX_TIER_TERMS],
             candidates: Vec::new(),
+            top: Vec::new(),
+            touched: false,
             ub: f32::INFINITY,
             lb: f32::NEG_INFINITY,
             live: true,
@@ -361,7 +395,7 @@ pub(crate) async fn select_with_tiers(
                     ceiling
                 };
                 slot.heads[ti] = HeadState {
-                    docs: Vec::new(),
+                    seen: false,
                     tail,
                     ceiling,
                     done: !chunked,
@@ -391,7 +425,6 @@ pub(crate) async fn select_with_tiers(
     };
     // Inline heads are whole: their entries are in hand before any read.
     let mut entries_read = 0u64;
-    let mut touched: Vec<bool> = vec![false; slots.len()];
     for (ti, e) in &inline {
         let Some(id) = index.superfile_id(e.superfile) else {
             continue;
@@ -399,10 +432,8 @@ pub(crate) async fn select_with_tiers(
         let Some(&si) = slot_of.get(&id) else {
             continue;
         };
-        slots[si].heads[*ti]
-            .docs
-            .push((e.doc_id, scoring.contribution(*ti, e)));
-        touched[si] = true;
+        let c = scoring.contribution(*ti, e);
+        slots[si].absorb(*ti, e.doc_id, c, query.required, lb_slack);
         entries_read += 1;
     }
     let mut merge = Merge {
@@ -415,12 +446,9 @@ pub(crate) async fn select_with_tiers(
         theta_lb: f32::NEG_INFINITY,
         entries_read,
     };
-    for (si, t) in touched.iter().enumerate() {
-        if *t {
-            for h in merge.slots[si].heads.iter_mut() {
-                h.docs.sort_unstable_by_key(|d| d.0);
-            }
-            merge.slots[si].refresh(query.required, k, lb_slack, ub_slack);
+    for slot in merge.slots.iter_mut() {
+        if slot.touched {
+            slot.refresh(query.required, k, ub_slack);
         }
     }
 
@@ -508,7 +536,9 @@ pub(crate) async fn select_with_tiers(
         .await
         .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
         merge = next;
-        let stalled = merge.theta_lb.is_finite() && excluded == 0 && merge.theta_lb <= theta_before;
+        let stalled = merge.theta_lb.is_finite()
+            && excluded == 0
+            && merge.theta_lb <= theta_before * (1.0 + THRESHOLD_RISE_MIN);
         if !read_any || stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
             break;
         }
@@ -532,14 +562,14 @@ pub(crate) async fn select_with_tiers(
             // ruled out holds none that place.
             let whole = slot.live && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
             if whole {
-                resolved.push((
-                    si,
-                    slot.joined
-                        .iter()
-                        .filter(|(_, mask, _)| mask & required == required)
-                        .map(|&(doc, _, sum)| (doc, sum))
-                        .collect(),
-                ));
+                let mut docs: Vec<(u32, f32)> = slot
+                    .joined
+                    .iter()
+                    .filter(|(_, j)| j.mask & required == required)
+                    .map(|(&doc, j)| (doc, j.sum))
+                    .collect();
+                docs.sort_unstable_by_key(|d| d.0);
+                resolved.push((si, docs));
             }
         }
     }
@@ -553,64 +583,64 @@ pub(crate) async fn select_with_tiers(
 }
 
 impl Merge {
-    /// One round's decoding: per superfile that read a block, its heads
-    /// grow and its join and bounds are recomputed, in parallel; then the
-    /// threshold over every superfile's candidates, and the exclusion of
-    /// what cannot reach it. Returns how many superfiles the round ruled
-    /// out.
+    /// One round's decoding: per superfile that read a block, its join,
+    /// best sums and candidates grow entry by entry, and its bounds and
+    /// top candidates are recomputed, in jobs of [`SLOTS_PER_JOB`]
+    /// superfiles on the pool; then the threshold over every superfile's
+    /// candidates, and the exclusion of what cannot reach it. Returns how
+    /// many superfiles the round ruled out.
     fn round(&mut self, reads: Vec<Vec<BlockRead>>) -> usize {
         let required = self.required;
         let (k, lb_slack, ub_slack) = (self.k, self.lb_slack, self.ub_slack);
         let scoring = &self.scoring;
         let entries: u64 = self
             .slots
-            .par_iter_mut()
-            .zip(reads.into_par_iter())
-            .map_init(Scratch::default, |scratch, (slot, reads)| {
-                if reads.is_empty() {
-                    return 0;
-                }
+            .par_chunks_mut(SLOTS_PER_JOB)
+            .zip(reads.par_chunks(SLOTS_PER_JOB))
+            .map(|(slots, reads)| {
+                let mut decoded: Vec<TierEntry> = Vec::new();
                 let mut n = 0u64;
-                for read in reads {
-                    let state = &mut slot.heads[read.ti];
-                    if read
-                        .dir
-                        .decode_block(read.block, &read.body, &mut scratch.decoded)
-                        .is_err()
-                    {
-                        // A block that does not decode leaves the head where
-                        // it was: the bound stays its tail, which is sound,
-                        // and the superfile opens as it would have.
-                        state.done = true;
-                        continue;
+                for (slot, reads) in slots.iter_mut().zip(reads) {
+                    for read in reads {
+                        let state = &mut slot.heads[read.ti];
+                        if read
+                            .dir
+                            .decode_block(read.block, &read.body, &mut decoded)
+                            .is_err()
+                        {
+                            // A block that does not decode leaves the head
+                            // where it was: the bound stays its tail, which
+                            // is sound, and the superfile opens as it would
+                            // have.
+                            state.done = true;
+                            continue;
+                        }
+                        n += decoded.len() as u64;
+                        let tail_key = read.dir.block_tail(read.block);
+                        state.tail =
+                            (tail_key * scoring.idf[read.ti] * slot.scale_up).min(state.ceiling);
+                        if tail_key <= 0.0 || decoded.len() < BLOCK_ENTRIES {
+                            state.done = true;
+                        }
+                        for e in &decoded {
+                            let c = scoring.contribution(read.ti, e);
+                            slot.absorb(read.ti, e.doc_id, c, required, lb_slack);
+                        }
                     }
-                    n += scratch.decoded.len() as u64;
-                    merge_sorted(
-                        &mut state.docs,
-                        scratch
-                            .decoded
-                            .iter()
-                            .map(|e| (e.doc_id, scoring.contribution(read.ti, e))),
-                        &mut scratch.merged,
-                    );
-                    let tail_key = read.dir.block_tail(read.block);
-                    state.tail =
-                        (tail_key * scoring.idf[read.ti] * slot.scale_up).min(state.ceiling);
-                    if tail_key <= 0.0 || scratch.decoded.len() < BLOCK_ENTRIES {
-                        state.done = true;
+                    if slot.touched {
+                        slot.refresh(required, k, ub_slack);
                     }
                 }
-                slot.refresh(required, k, lb_slack, ub_slack);
                 n
             })
             .sum();
         self.entries_read += entries;
         // Threshold: the k-th best sum over documents the query returns,
         // across every superfile read, in play or not. Each superfile's
-        // candidates are sorted, so a k-way walk finds it in k steps.
+        // top candidates are sorted, so a k-way walk finds it in k steps.
         let mut heap: BinaryHeap<(OrdF32, usize, usize)> = BinaryHeap::new();
         for (si, slot) in self.slots.iter().enumerate() {
-            if let Some(&best) = slot.candidates.first() {
+            if let Some(&best) = slot.top.first() {
                 heap.push((OrdF32(best), si, 0));
             }
         }
@@ -621,7 +651,7 @@ impl Merge {
                 break;
             };
             kth = Some(value);
-            if let Some(&next) = self.slots[si].candidates.get(at + 1) {
+            if let Some(&next) = self.slots[si].top.get(at + 1) {
                 heap.push((OrdF32(next), si, at + 1));
             }
         }
@@ -644,76 +674,50 @@ impl Merge {
 }
 
 impl Slot {
-    /// Recompute the join, the candidates and the bounds from the heads.
-    fn refresh(&mut self, required: u8, k: usize, lb_slack: f32, ub_slack: f32) {
-        join(&self.heads, &mut self.joined);
-        self.candidates.clear();
-        for &(_, mask, sum) in &self.joined {
-            if mask & required == required {
-                self.candidates.push(sum * lb_slack);
+    /// Take in one entry: document `row` read under term `ti` with
+    /// contribution `c`. Its join grows by the term, the best sum of its
+    /// new mask takes it in, and it enters the candidates — or its
+    /// candidate grows — once it carries every required term.
+    fn absorb(&mut self, ti: usize, row: u32, c: f32, required: u8, lb_slack: f32) {
+        let bit = 1u8 << ti;
+        self.heads[ti].seen = true;
+        self.touched = true;
+        let j = self.joined.entry(row).or_insert(Joined {
+            mask: 0,
+            sum: 0.0,
+            candidate: NOT_A_CANDIDATE,
+        });
+        if j.mask & bit != 0 {
+            return;
+        }
+        j.mask |= bit;
+        j.sum += c;
+        let m = j.mask as usize;
+        self.best[m] = self.best[m].max(j.sum);
+        if j.mask & required == required {
+            let v = j.sum * lb_slack;
+            if j.candidate == NOT_A_CANDIDATE {
+                j.candidate = self.candidates.len() as u32;
+                self.candidates.push(v);
+            } else {
+                self.candidates[j.candidate as usize] = v;
             }
         }
-        self.candidates.sort_unstable_by(|a, b| b.total_cmp(a));
-        self.candidates.truncate(k);
-        let (ub, lb) = bounds_of(&self.heads, &self.joined, required, ub_slack);
+    }
+
+    /// Recompute the bounds and the top candidates from what was absorbed.
+    fn refresh(&mut self, required: u8, k: usize, ub_slack: f32) {
+        self.touched = false;
+        self.top.clear();
+        self.top.extend_from_slice(&self.candidates);
+        if self.top.len() > k {
+            self.top.select_nth_unstable_by(k, |a, b| b.total_cmp(a));
+            self.top.truncate(k);
+        }
+        self.top.sort_unstable_by(|a, b| b.total_cmp(a));
+        let (ub, lb) = bounds_of(&self.heads, &self.best, required, ub_slack);
         self.ub = ub;
         self.lb = lb;
-    }
-}
-
-/// Per-task buffers for a round's decoding.
-#[derive(Default)]
-struct Scratch {
-    decoded: Vec<TierEntry>,
-    merged: Vec<(u32, f32)>,
-}
-
-/// Merge `incoming`, in ascending row, into `docs`, also ascending, through
-/// `scratch`.
-fn merge_sorted(
-    docs: &mut Vec<(u32, f32)>,
-    incoming: impl Iterator<Item = (u32, f32)>,
-    scratch: &mut Vec<(u32, f32)>,
-) {
-    scratch.clear();
-    let mut at = 0usize;
-    for item in incoming {
-        while at < docs.len() && docs[at].0 < item.0 {
-            scratch.push(docs[at]);
-            at += 1;
-        }
-        scratch.push(item);
-    }
-    scratch.extend_from_slice(&docs[at..]);
-    mem::swap(docs, scratch);
-}
-
-/// Join one superfile's heads across the terms: per document read under
-/// any term, the terms it was read under and its summed contributions, in
-/// ascending row.
-fn join(heads: &[HeadState], out: &mut Vec<(u32, u8, f32)>) {
-    out.clear();
-    let mut at = [0usize; MAX_TIER_TERMS];
-    loop {
-        let mut next: Option<u32> = None;
-        for (ti, h) in heads.iter().enumerate() {
-            if let Some(&(doc, _)) = h.docs.get(at[ti]) {
-                next = Some(next.map_or(doc, |n: u32| n.min(doc)));
-            }
-        }
-        let Some(doc) = next else { break };
-        let mut mask = 0u8;
-        let mut sum = 0.0f32;
-        for (ti, h) in heads.iter().enumerate() {
-            if let Some(&(d, c)) = h.docs.get(at[ti])
-                && d == doc
-            {
-                mask |= 1 << ti;
-                sum += c;
-                at[ti] += 1;
-            }
-        }
-        out.push((doc, mask, sum));
     }
 }
 
@@ -726,18 +730,25 @@ fn join(heads: &[HeadState], out: &mut Vec<(u32, u8, f32)>) {
 /// candidate; a superfile that lacks a required term holds no match at
 /// all. The lower bound is the best known sum of a document carrying every
 /// required term.
+///
+/// `best` holds, per mask, the best sum of a document while it was read
+/// under exactly that mask. A document since read under more terms is
+/// also in a larger mask, where its bound is tighter; what stays in the
+/// smaller mask bounds it from above still, since every contribution it
+/// gained is at least the tail of its term.
 fn bounds_of(
     heads: &[HeadState],
-    joined: &[(u32, u8, f32)],
+    best: &[f32; 1 << MAX_TIER_TERMS],
     required: u8,
     ub_slack: f32,
 ) -> (f32, f32) {
+    let nt = heads.len();
     let mut tails = [0.0f32; MAX_TIER_TERMS];
     // Required terms whose heads are whole: a candidate must be in them.
     let mut settled = 0u8;
     for (ti, h) in heads.iter().enumerate() {
         if required & (1 << ti) != 0 {
-            if h.ceiling <= 0.0 && h.docs.is_empty() {
+            if h.ceiling <= 0.0 && !h.seen {
                 return (f32::NEG_INFINITY, f32::NEG_INFINITY);
             }
             if h.tail <= 0.0 {
@@ -747,16 +758,17 @@ fn bounds_of(
         tails[ti] = h.tail;
     }
     let mut ub = if settled == 0 {
-        tails[..heads.len()].iter().sum()
+        tails[..nt].iter().sum()
     } else {
         f32::NEG_INFINITY
     };
     let mut lb = f32::NEG_INFINITY;
-    for &(_, mask, sum) in joined {
-        if mask & settled != settled {
+    for (m, &sum) in best.iter().enumerate().take(1 << nt) {
+        let mask = m as u8;
+        if sum == f32::NEG_INFINITY || mask & settled != settled {
             continue;
         }
-        let missing: f32 = (0..heads.len())
+        let missing: f32 = (0..nt)
             .filter(|t| mask & (1 << t) == 0)
             .map(|t| tails[t])
             .sum();
@@ -837,9 +849,21 @@ mod tests {
             // Per term: a head of documents with contributions, and a tail
             // (zero means the head is whole); every document outside the
             // head takes a hidden contribution within the tail.
-            let mut heads: Vec<HeadState> = Vec::with_capacity(nt);
+            let mut slot = Slot {
+                heads: vec![HeadState::absent(); nt],
+                joined: FxHashMap::default(),
+                best: [f32::NEG_INFINITY; 1 << MAX_TIER_TERMS],
+                candidates: Vec::new(),
+                top: Vec::new(),
+                touched: false,
+                ub: f32::INFINITY,
+                lb: f32::NEG_INFINITY,
+                live: true,
+                ordinal: 0,
+                scale_up: 1.0,
+            };
             let mut truth: Vec<Vec<f32>> = Vec::with_capacity(nt);
-            for _ in 0..nt {
+            for ti in 0..nt {
                 let whole = next() % 3 == 0;
                 let in_head = (next() % u64::from(UNIVERSE)) as u32;
                 let tail = if whole {
@@ -847,32 +871,27 @@ mod tests {
                 } else {
                     (next() % 1000) as f32 / 1000.0
                 };
-                let mut docs: Vec<(u32, f32)> = Vec::new();
                 let mut contribution = vec![0.0f32; UNIVERSE as usize];
+                let mut ceiling = tail;
                 for doc in 0..UNIVERSE {
                     if next() % u64::from(UNIVERSE) < u64::from(in_head) {
                         // A head entry contributes at least the tail: the
                         // head is the term's best documents.
                         let c = tail + (next() % 1000) as f32 / 1000.0;
-                        docs.push((doc, c));
+                        slot.absorb(ti, doc, c, required, 1.0);
                         contribution[doc as usize] = c;
+                        ceiling = ceiling.max(c);
                     } else if !whole && next() % 2 == 0 {
                         contribution[doc as usize] = tail * (next() % 1000) as f32 / 1000.0;
                     }
                 }
-                let ceiling = docs.iter().map(|d| d.1).fold(tail, f32::max);
-                heads.push(HeadState {
-                    docs,
-                    tail,
-                    ceiling,
-                    done: whole,
-                    source: None,
-                });
+                slot.heads[ti].tail = tail;
+                slot.heads[ti].ceiling = ceiling;
+                slot.heads[ti].done = whole;
                 truth.push(contribution);
             }
-            let mut joined = Vec::new();
-            join(&heads, &mut joined);
-            let (ub, lb) = bounds_of(&heads, &joined, required, 1.0);
+            slot.refresh(required, 10, 1.0);
+            let (ub, lb) = (slot.ub, slot.lb);
             // The truth: the best document carrying every required term.
             let mut best = f32::NEG_INFINITY;
             for doc in 0..UNIVERSE as usize {
@@ -894,18 +913,5 @@ mod tests {
                 "case {case}: the lower bound {lb} exceeds the best candidate {best}"
             );
         }
-    }
-
-    #[test]
-    fn merge_sorted_keeps_rows_ascending() {
-        let mut docs = vec![(1, 0.5), (4, 0.25), (9, 0.125)];
-        let mut scratch = Vec::new();
-        merge_sorted(
-            &mut docs,
-            [(0, 1.0), (4, 0.75), (10, 0.5)].into_iter(),
-            &mut scratch,
-        );
-        let rows: Vec<u32> = docs.iter().map(|d| d.0).collect();
-        assert_eq!(rows, [0, 1, 4, 4, 9, 10]);
     }
 }
