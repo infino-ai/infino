@@ -458,14 +458,26 @@ impl SharedTopK {
             entering.sort_unstable_by(|a, b| b.cmp(a));
         }
         let k = self.k;
+        let brought = entering.len();
+        let waited = Instant::now();
         let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
+        let wait_us = waited.elapsed().as_micros() as u64;
+        let held = Instant::now();
         if top.len() >= k {
             let min = top[k - 1];
             entering.retain(|e| *e > min);
             if entering.is_empty() {
+                tracing::trace!(
+                    brought,
+                    entered = 0u64,
+                    wait_us,
+                    hold_us = held.elapsed().as_micros() as u64,
+                    "floor merge"
+                );
                 return;
             }
         }
+        let entered = entering.len();
         if entering.len() <= FEW {
             for e in entering {
                 let at = top.partition_point(|t| *t >= e);
@@ -500,6 +512,13 @@ impl SharedTopK {
             // floor must never move down.
             self.floor.raise(top[k - 1].score);
         }
+        tracing::trace!(
+            brought,
+            entered,
+            wait_us,
+            hold_us = held.elapsed().as_micros() as u64,
+            "floor merge"
+        );
     }
 
     /// Whether a superfile whose `_id`s start at `id_min` and whose
@@ -1778,7 +1797,13 @@ impl SupertableReader {
                 // miss/error we simply don't merge (a lower floor is
                 // always safe).
                 let _merge = trace::phase(phases, || detail_span!("fts.unit_merge")).entered();
-                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                let bitmap_at = Instant::now();
+                let bitmap = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
+                tracing::trace!(
+                    bitmap_us = bitmap_at.elapsed().as_micros() as u64,
+                    "tombstone bitmap"
+                );
+                match bitmap {
                     Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
                         id_max,
                         hits.iter()
