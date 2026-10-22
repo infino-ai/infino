@@ -112,25 +112,9 @@ impl IdGenerator {
     /// that mutex is required.
     #[inline]
     pub fn next_id(&self) -> i128 {
-        // `claim(1)`, without the run-length arithmetic a single id
-        // does not need: this is the hot path when ids are minted one
-        // at a time.
-        loop {
-            let now: u64 = self.clock.current_millis();
-            let last = self.last.get();
-            let next = if now > (last >> TIMESTAMP_SHIFT) as u64 {
-                (u128::from(now) << TIMESTAMP_SHIFT) | self.worker_bits
-            } else if last & SEQUENCE_MASK < SEQUENCE_MASK {
-                last + 1
-            } else {
-                // This millisecond's sequence is used up; wait for the
-                // ticker to publish the next one.
-                hint::spin_loop();
-                continue;
-            };
-            self.last.set(next);
-            return next as i128;
-        }
+        let (first, _room) = self.next_run();
+        self.last.set(first);
+        first as i128
     }
 
     /// Reserve `n` ids in advance and return them as an ordered
@@ -173,40 +157,47 @@ impl IdGenerator {
         spans
     }
 
-    /// Take up to `max` (> 0) consecutive ids from one millisecond:
-    /// the rest of the current millisecond's sequence if the clock has
-    /// not moved, else a fresh millisecond starting at sequence 0.
-    /// Returns the first id and how many were taken (at least 1). Waits
-    /// for the next tick when the current millisecond is used up.
+    /// Take up to `max` (> 0) consecutive ids from one millisecond.
+    /// Returns the first id and how many were taken (at least 1).
     #[inline]
     fn claim(&self, max: usize) -> (i128, usize) {
         debug_assert!(max > 0, "a claim takes at least one id");
+        let (first, room) = self.next_run();
+        let count = room.min(max as u128);
+        self.last.set(first + (count - 1));
+        (first as i128, count as usize)
+    }
+
+    /// Where the next id goes, and how many ids its millisecond has left
+    /// from there (at least 1): the rest of the current millisecond's
+    /// sequence if the clock has not moved, else a fresh millisecond
+    /// starting at sequence 0. Waits for the next tick while the current
+    /// millisecond is used up. Does not advance the generator; the caller
+    /// records the last id it takes.
+    ///
+    /// The returned id fits `i128` losslessly: its high bit is 0 for
+    /// current-era Unix-ms timestamps (today ≈ 1.7×10¹² ms = 41 bits;
+    /// the high bit is bit 127, ~86 bits past the timestamp field).
+    #[inline(always)]
+    fn next_run(&self) -> (u128, u128) {
         loop {
             let now: u64 = self.clock.current_millis();
             let last = self.last.get();
-            let last_ms = (last >> TIMESTAMP_SHIFT) as u64;
-            let (first, room) = if now > last_ms {
-                (
+            if now > (last >> TIMESTAMP_SHIFT) as u64 {
+                return (
                     (u128::from(now) << TIMESTAMP_SHIFT) | self.worker_bits,
                     SEQUENCE_MASK + 1,
-                )
-            } else if last & SEQUENCE_MASK < SEQUENCE_MASK {
+                );
+            }
+            let sequence = last & SEQUENCE_MASK;
+            if sequence < SEQUENCE_MASK {
                 // Same millisecond (the clock never reads behind the
                 // last id): continue its sequence.
-                (last + 1, SEQUENCE_MASK - (last & SEQUENCE_MASK))
-            } else {
-                // This millisecond's sequence is used up; wait for the
-                // ticker to publish the next one.
-                hint::spin_loop();
-                continue;
-            };
-            let count = room.min(max as u128);
-            self.last.set(first + (count - 1));
-            // High bit is 0 for current-era Unix-ms timestamps
-            // (today ≈ 1.7×10¹² ms = 41 bits; the high bit is bit
-            // 127, ~86 bits past the timestamp field). The `as
-            // i128` cast is lossless under that invariant.
-            return (first as i128, count as usize);
+                return (last + 1, SEQUENCE_MASK - sequence);
+            }
+            // This millisecond's sequence is used up; wait for the
+            // ticker to publish the next one.
+            hint::spin_loop();
         }
     }
 }
