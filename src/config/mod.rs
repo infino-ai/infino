@@ -438,6 +438,10 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 /// Default modality-split threshold; `0.0` = off. Must equal config.yaml
 /// `cell_split_modality_d` (see there for the working value and why it ships on).
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
+/// Default [`VectorSettings::recal_growth_fraction`]: recalibrate after the
+/// corpus grows 50% since the last one, so a long build recalibrates a few
+/// times instead of on every drain.
+const DEFAULT_VECTOR_RECAL_GROWTH_FRACTION: f64 = 0.5;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// Default fine-cluster fanout for `ivf_router = centroid_graph`. The default
@@ -954,6 +958,11 @@ pub struct VectorSettings {
     /// tentative two-means partition is bimodal by at least this D (with
     /// `cell_split_doc_cap` demoted to a hard ceiling).
     pub cell_split_modality_d: f64,
+    /// How much the corpus must grow since the last full recalibration before
+    /// `optimize` runs another one. A split or a lagging rerank law also
+    /// trigger it; a drain that only appended rows does not. `0.0`
+    /// recalibrates on any growth.
+    pub recal_growth_fraction: f64,
     /// How user-superfile clusters align to the global cell grid.
     pub user_centroids: CentroidAlignment,
     /// User superfiles the hidden-index drain materializes per batch
@@ -1052,6 +1061,7 @@ impl Default for VectorSettings {
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
+            recal_growth_fraction: DEFAULT_VECTOR_RECAL_GROWTH_FRACTION,
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,

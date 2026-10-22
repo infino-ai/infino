@@ -9886,6 +9886,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // this scan measures. A drain that commits between the scan and the
     // stamp adds rows this evidence never saw.
     let scan_ids: HashSet<Uuid> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
+    // Rows this recalibration measured, stamped below as the new growth
+    // baseline for the optimize trigger.
+    let scan_rows: u64 = manifest.n_docs_total();
     let mut cal =
         opann::WidthLawCalibration::new(clusters.dim as usize, metric, inner.options.target_recall);
     // Query-sample pass: exactly `min(total_docs, WIDTH_LAW_QUERY_SAMPLE)`
@@ -10381,6 +10384,11 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             &mut routing.rerank_for_k,
             &routing.rerank_pool_cells,
         );
+        // Reset the growth baseline to what this scan measured, even when the
+        // laws did not change, so a grown-but-stable table does not
+        // recalibrate again next optimize. Set before the no-op check so it
+        // counts as a change to commit.
+        routing.last_recal_rows = scan_rows;
         if routing == fresh_routing {
             // The live stamp already carries everything this pass measured
             // (e.g. a concurrent drain max-merged past us) — nothing to

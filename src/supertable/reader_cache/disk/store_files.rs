@@ -828,6 +828,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
     use tempfile::TempDir;
 
     use crate::{
@@ -1173,6 +1174,39 @@ mod tests {
             reopened.stats().current_bytes,
             filled,
             "scan counts the retained block bytes against the budget"
+        );
+    }
+
+    /// The block size older builds indexed block files with.
+    const OLDER_BLOCK_BYTES: u64 = 512 * 1024;
+
+    /// A block file an older build indexed with larger blocks is kept by the
+    /// restart scan and counted at the bytes it holds, its last block clipped to
+    /// the file.
+    #[tokio::test]
+    async fn restart_scan_counts_a_block_file_indexed_with_larger_blocks() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let size = OLDER_BLOCK_BYTES + 1000;
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(store.blocks_path(&uri))
+            .expect("blocks");
+        f.set_len(size).expect("set_len");
+        let mut idx = OLDER_BLOCK_BYTES.to_le_bytes().to_vec();
+        RoaringBitmap::from_iter([0u32, 1])
+            .serialize_into(&mut idx)
+            .expect("serialize");
+        fs::write(store.blocks_idx_path(&uri), idx).expect("idx");
+
+        let reopened = reopen_store(&store, |_| {});
+        assert!(reopened.blocks_path(&uri).exists(), "kept for adoption");
+        assert_eq!(
+            reopened.stats().current_bytes,
+            size,
+            "both older blocks, the second clipped to the file"
         );
     }
 

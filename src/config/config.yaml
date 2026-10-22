@@ -424,6 +424,13 @@ vector:
   # Set 0.0 to fall back to the fixed-grid path (cap trigger only).
   cell_split_modality_d: 8.0
 
+  # How much the corpus must grow since the last full recalibration before
+  # optimize runs another one. A split or a lagging rerank law also trigger
+  # it; a drain that only appended rows does not. 0.0 recalibrates on any
+  # growth. Recalibration scans the whole index, so a larger value means
+  # fewer scans on a long incremental build.
+  recal_growth_fraction: 0.5
+
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
   #   global — cluster c == cell c, so the drain routes cluster → cell

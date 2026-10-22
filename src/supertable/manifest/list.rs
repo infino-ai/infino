@@ -492,6 +492,12 @@ pub struct CellRoutingParams {
     /// partial centroid set can't measure a global fanout, carries it forward.
     /// The router derives its graph `ef` from a positive fanout (×2).
     pub fanout_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Row count at the last full recalibration. `optimize` uses it to
+    /// recalibrate only after the corpus grows by a set fraction, not on
+    /// every drain. Set by recalibration; the drain's incremental widen
+    /// leaves it alone. `0` on a fresh table or an older manifest, which
+    /// recalibrates once on the next optimize.
+    pub last_recal_rows: u64,
 }
 
 impl Default for CellRoutingParams {
@@ -506,6 +512,7 @@ impl Default for CellRoutingParams {
             rerank_for_k: [0; WIDTH_LAW_KS.len()],
             rerank_pool_cells: [RERANK_LAW_POOL_CELLS as u32; WIDTH_LAW_KS.len()],
             fanout_for_k: [0; WIDTH_LAW_KS.len()],
+            last_recal_rows: 0,
         }
     }
 }
@@ -1588,6 +1595,9 @@ struct CellRoutingParamsDto {
     /// it existed (all-zero = no stamp, reader falls back to the constant).
     #[serde(default)]
     fanout_for_k: [u32; WIDTH_LAW_KS.len()],
+    /// Row count at the last full recalibration; `0` on older manifests.
+    #[serde(default)]
+    last_recal_rows: u64,
 }
 
 /// Serde default for [`CellRoutingParamsDto::rerank_pool_cells`]: every
@@ -1608,6 +1618,7 @@ impl From<CellRoutingParams> for CellRoutingParamsDto {
             rerank_for_k: r.rerank_for_k,
             rerank_pool_cells: r.rerank_pool_cells,
             fanout_for_k: r.fanout_for_k,
+            last_recal_rows: r.last_recal_rows,
         }
     }
 }
@@ -1632,6 +1643,7 @@ impl From<CellRoutingParamsDto> for CellRoutingParams {
         r.rerank_for_k = d.rerank_for_k;
         r.rerank_pool_cells = d.rerank_pool_cells.map(|p| p.max(1));
         r.fanout_for_k = d.fanout_for_k;
+        r.last_recal_rows = d.last_recal_rows;
         r.nprobe_max = r.nprobe_max.max(r.nprobe_min);
         r
     }
@@ -3475,6 +3487,47 @@ mod tests {
             routing.fanout_for_k_at(100),
             None,
             "no fanout law resolves None (reader falls back to the constant)"
+        );
+    }
+
+    #[test]
+    fn cell_routing_last_recal_rows_roundtrip_and_legacy_default() {
+        let mut list = empty_list();
+        list.partition_strategy = PartitionStrategy::VectorCell {
+            column: "emb".into(),
+            clusters: ClusterCentroids::from_fp32(1, 4, &[0.5, 0.5, 0.5, 0.5], vec![1]),
+            routing: CellRoutingParams {
+                last_recal_rows: 12_345_678,
+                ..CellRoutingParams::default()
+            },
+        };
+        let bytes = encode(&list).expect("encode");
+        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
+        let PartitionStrategy::VectorCell { routing, .. } = &decoded.partition_strategy else {
+            panic!("VectorCell strategy must survive the round-trip");
+        };
+        assert_eq!(
+            routing.last_recal_rows, 12_345_678,
+            "the recalibration watermark round-trips"
+        );
+
+        // An older manifest without the field: strip it and confirm it
+        // decodes to zero.
+        let mut stripped = from_utf8(&bytes).expect("utf8").to_string();
+        let key = stripped
+            .find("\"last_recal_rows\"")
+            .expect("field present in encoding");
+        let comma = stripped[..key].rfind(',').expect("preceding member comma");
+        let end = key + stripped[key..].find('\n').expect("member end");
+        stripped = format!("{}{}", &stripped[..comma], &stripped[end..]);
+        let legacy =
+            decode(stripped.as_bytes(), &LegacyNames::none()).expect("decode without the field");
+        let PartitionStrategy::VectorCell { routing, .. } = &legacy.partition_strategy else {
+            panic!("VectorCell strategy must survive the stripped decode");
+        };
+        assert_eq!(
+            routing.last_recal_rows, 0,
+            "absent watermark decodes to zero (grown-from-zero: recalibrate once)"
         );
     }
 
