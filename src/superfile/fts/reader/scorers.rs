@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
+use std::{cmp::Ordering, collections::BinaryHeap, env, slice::from_mut, sync::OnceLock};
 
 use super::{
     core::*,
@@ -183,6 +183,171 @@ fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl
     for l in 0..n {
         scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_weight, btf[l], bnorm[l]);
     }
+}
+
+/// The largest doc id any of `cursors` holds.
+pub(super) fn cursors_max_doc(cursors: &[TermCursor]) -> u32 {
+    cursors
+        .iter()
+        .filter_map(|c| match c.predecoded {
+            true => c.block_doc_ids[..c.block_n].last().copied(),
+            false => c.blocks.last().map(|b| b.last_doc_id),
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// What probing costs, in postings read: the rarest term's every document,
+/// times each other term it is tested against, at
+/// [`count_probe_postings`] a test.
+pub(super) fn probe_cost(driver_df: u64, probes: usize) -> u64 {
+    driver_df
+        .saturating_mul(probes as u64)
+        .saturating_mul(count_probe_postings())
+}
+
+/// What folding costs, in postings read: every term read once into a
+/// doc-space bitset, plus each bitset's words written and combined.
+pub(super) fn fold_cost(cursors: &[TermCursor], max_doc: u32) -> u64 {
+    let words = u64::from(max_doc) / 64 + 1;
+    let reads: u64 = cursors.iter().map(|c| c.df).sum();
+    words.saturating_mul(cursors.len() as u64) + reads
+}
+
+/// Postings-equivalent cost of testing one document against one term: a
+/// block locate and, on a packed block, a decode.
+pub(super) fn count_probe_postings() -> u64 {
+    static COST: OnceLock<u64> = OnceLock::new();
+    *COST.get_or_init(|| {
+        env::var("INFINO_PROTO_PROBE_POSTINGS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(COUNT_PROBE_POSTINGS)
+    })
+}
+
+/// Intersection cardinality by whichever plan reads less: probe the other
+/// terms at each document of the rarest, or fold every term into a bitset
+/// and AND them.
+pub(super) fn count_and_planned(cursors: Vec<TermCursor>) -> u64 {
+    if cursors.len() < 2 {
+        return cursors.first().map_or(0, |c| c.df);
+    }
+    let max_doc = cursors_max_doc(&cursors);
+    let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
+    match fold_cost(&cursors, max_doc) < probe_cost(min_df, cursors.len() - 1) {
+        true => count_and_intersect_bitset(cursors, max_doc),
+        false => count_and_intersect_membership(cursors),
+    }
+}
+
+/// How many documents match the plain terms `pos` (all of them when `all`,
+/// any of them otherwise) and none of `neg`, by whichever plan reads less:
+/// walk the positive side and test each of its documents against the
+/// excluded terms, or fold both sides into doc-space bitsets and count
+/// `positive & !excluded` a word at a time.
+pub(super) fn count_excluding(pos: Vec<TermCursor>, all: bool, neg: Vec<TermCursor>) -> u64 {
+    if pos.is_empty() {
+        return 0;
+    }
+    if neg.is_empty() {
+        return match all {
+            true => count_and_planned(pos),
+            false => or_count_unranked(pos),
+        };
+    }
+    let max_doc = cursors_max_doc(&pos).max(cursors_max_doc(&neg));
+    let (candidates, probes) = match all {
+        true => (
+            pos.iter().map(|c| c.df).min().unwrap_or(0),
+            pos.len() - 1 + neg.len(),
+        ),
+        false => (pos.iter().map(|c| c.df).sum(), neg.len()),
+    };
+    let fold = fold_cost(&pos, max_doc) + fold_cost(&neg, max_doc);
+    match fold < probe_cost(candidates, probes) {
+        true => count_excluding_fold(pos, all, neg, max_doc),
+        false => count_excluding_probe(pos, all, neg),
+    }
+}
+
+/// [`count_excluding`] by folding: positive and excluded sides each become
+/// a doc-space bitset, then `popcount(positive & !excluded)`.
+fn count_excluding_fold(
+    pos: Vec<TermCursor>,
+    all: bool,
+    neg: Vec<TermCursor>,
+    max_doc: u32,
+) -> u64 {
+    let words = max_doc as usize / 64 + 1;
+    let mut scratch = [0u32; BLOCK_LEN];
+    let mut positive = vec![0u64; words];
+    let mut term = vec![0u64; words];
+    for (i, c) in pos.iter().enumerate() {
+        match (all, i) {
+            (false, _) | (true, 0) => or_cursor_into_bitset(&mut positive, c, &mut scratch),
+            (true, _) => {
+                term.fill(0);
+                or_cursor_into_bitset(&mut term, c, &mut scratch);
+                for (p, t) in positive.iter_mut().zip(&term) {
+                    *p &= *t;
+                }
+            }
+        }
+    }
+    term.fill(0);
+    for c in &neg {
+        or_cursor_into_bitset(&mut term, c, &mut scratch);
+    }
+    positive
+        .iter()
+        .zip(&term)
+        .map(|(p, n)| u64::from((p & !n).count_ones()))
+        .sum()
+}
+
+/// [`count_excluding`] by probing: walk the positive side's documents (the
+/// rarest term's, tested against the other positive terms, under `all`;
+/// the union's frontier otherwise) and test each against the excluded
+/// terms, which only ever move forward.
+fn count_excluding_probe(mut pos: Vec<TermCursor>, all: bool, mut neg: Vec<TermCursor>) -> u64 {
+    let mut n = 0u64;
+    if all {
+        let lead = pos
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| c.df)
+            .map_or(0, |(i, _)| i);
+        let mut driver = pos.swap_remove(lead);
+        pos.sort_by_key(|c| c.df);
+        while !driver.is_exhausted() {
+            let doc = driver.current_doc_id();
+            if pos.iter_mut().all(|c| c.contains(doc)) && !neg.iter_mut().any(|c| c.contains(doc)) {
+                n += 1;
+            }
+            driver.next();
+        }
+        return n;
+    }
+    loop {
+        let Some(doc) = pos
+            .iter()
+            .filter(|c| !c.is_exhausted())
+            .map(TermCursor::current_doc_id)
+            .min()
+        else {
+            break;
+        };
+        if !neg.iter_mut().any(|c| c.contains(doc)) {
+            n += 1;
+        }
+        for c in pos.iter_mut() {
+            if !c.is_exhausted() && c.current_doc_id() == doc {
+                c.next();
+            }
+        }
+    }
+    n
 }
 
 /// Intersection cardinality by a rarest-driven membership walk: iterate the
@@ -1147,31 +1312,7 @@ impl FtsReader {
     /// [`collect_and_intersect`](Self::collect_and_intersect) uses is not
     /// the shape here.
     pub(super) fn count_and_intersect(&self, cursors: Vec<TermCursor>) -> u64 {
-        if cursors.is_empty() {
-            return 0;
-        }
-        // When even the *rarest* term is dense (covers ≥ 1/DIVISOR of the
-        // corpus), the rarest-driven membership walk still iterates a long
-        // list. AND the terms' presence bitsets word-at-a-time instead —
-        // cost is independent of the terms' lengths. The two full-width
-        // bitsets it allocates only pay off at this density, so a sparser
-        // intersection keeps the membership probe.
-        if cursors.len() >= 2 {
-            let max_doc = cursors
-                .iter()
-                .filter_map(|c| c.blocks.last())
-                .map(|b| b.last_doc_id)
-                .max()
-                .unwrap_or(0);
-            let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
-            if min_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
-                return count_and_intersect_bitset(cursors, max_doc);
-            }
-        }
-        // Rarest term is sparse: drive by it and probe the rest by
-        // membership — a bitset block answers with an O(1) bit-test, no
-        // decode. See `count_and_intersect_membership`.
-        count_and_intersect_membership(cursors)
+        count_and_planned(cursors)
     }
 
     /// Dispatch to the 2-term specialization or the general `n >= 3`
@@ -4683,5 +4824,133 @@ mod tests {
                 Ok(())
             })
             .expect("tail property holds");
+    }
+
+    /// Every count plan against set arithmetic on the corpus: both ways of
+    /// counting an intersection, both ways of counting with exclusions (all
+    /// and any), the planned choice between them, and the two-term union by
+    /// subtraction. Corpora mix a near-every-doc term (bitset blocks), mid and
+    /// rare terms (packed, patched, short form) and single-doc terms (inline),
+    /// so each kernel meets each block form.
+    #[tokio::test]
+    async fn count_plans_agree_with_set_arithmetic() {
+        let mut rng = StdRng::seed_from_u64(0xC0_FFEE);
+        let vocab = ["t0", "t1", "t2", "t3", "t4", "t5", "t6"];
+        for trial in 0..8 {
+            let n_docs = 300 + rng.random_range(0..6_000usize);
+            let odds: Vec<u32> = vocab
+                .iter()
+                .enumerate()
+                .map(|(t, _)| match t {
+                    0 => 950,
+                    1 => 500,
+                    _ => rng.random_range(1..300),
+                })
+                .collect();
+            let docs: Vec<String> = (0..n_docs)
+                .map(|d| {
+                    let mut text = format!("doc{d}");
+                    for (t, term) in vocab.iter().enumerate() {
+                        if rng.random_range(0..1000) < odds[t] {
+                            text.push(' ');
+                            text.push_str(term);
+                        }
+                    }
+                    text
+                })
+                .collect();
+            let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+            let (blob, json) = build_standard_blob(&refs);
+            let r = FtsReader::open(blob, &json).expect("open");
+            let holds = |term: &str| -> Vec<bool> {
+                docs.iter()
+                    .map(|d| d.split(' ').any(|w| w == term))
+                    .collect()
+            };
+            let cursors = |terms: Vec<&'static str>| {
+                let r = &r;
+                async move {
+                    r.build_term_cursors(
+                        0,
+                        &terms,
+                        QueryIdf::ThisFile,
+                        CursorUse::Count,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("cursors")
+                }
+            };
+            for _ in 0..12 {
+                let n_pos = rng.random_range(1..4usize);
+                let n_neg = rng.random_range(0..3usize);
+                let mut picked: Vec<&'static str> = Vec::new();
+                while picked.len() < n_pos + n_neg {
+                    let t = vocab[rng.random_range(0..vocab.len())];
+                    if !picked.contains(&t) {
+                        picked.push(t);
+                    }
+                }
+                let (pos, neg) = picked.split_at(n_pos);
+                let (pos, neg) = (pos.to_vec(), neg.to_vec());
+                let pos_sets: Vec<Vec<bool>> = pos.iter().map(|t| holds(t)).collect();
+                let neg_sets: Vec<Vec<bool>> = neg.iter().map(|t| holds(t)).collect();
+                for all in [true, false] {
+                    let want = (0..n_docs)
+                        .filter(|&d| {
+                            let p = match all {
+                                true => pos_sets.iter().all(|s| s[d]),
+                                false => pos_sets.iter().any(|s| s[d]),
+                            };
+                            p && !neg_sets.iter().any(|s| s[d])
+                        })
+                        .count() as u64;
+                    let what = format!("trial {trial} pos {pos:?} neg {neg:?} all={all}");
+                    let max_doc = n_docs as u32;
+                    let fold = count_excluding_fold(
+                        cursors(pos.clone()).await,
+                        all,
+                        cursors(neg.clone()).await,
+                        max_doc,
+                    );
+                    assert_eq!(fold, want, "fold: {what}");
+                    let probe = count_excluding_probe(
+                        cursors(pos.clone()).await,
+                        all,
+                        cursors(neg.clone()).await,
+                    );
+                    assert_eq!(probe, want, "probe: {what}");
+                    let planned = count_excluding(
+                        cursors(pos.clone()).await,
+                        all,
+                        cursors(neg.clone()).await,
+                    );
+                    assert_eq!(planned, want, "planned: {what}");
+                    if neg.is_empty() && pos.len() >= 2 {
+                        match all {
+                            true => {
+                                let max_doc = cursors_max_doc(&cursors(pos.clone()).await);
+                                assert_eq!(
+                                    count_and_intersect_bitset(cursors(pos.clone()).await, max_doc),
+                                    want,
+                                    "and fold: {what}"
+                                );
+                                assert_eq!(
+                                    count_and_intersect_membership(cursors(pos.clone()).await),
+                                    want,
+                                    "and probe: {what}"
+                                );
+                            }
+                            false => assert_eq!(
+                                or_count_unranked(cursors(pos.clone()).await),
+                                want,
+                                "or: {what}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
     }
 }

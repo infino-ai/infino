@@ -16,6 +16,7 @@ use super::{
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
+    scorers::count_excluding,
     search::FetchedTermMemo,
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
@@ -203,6 +204,38 @@ impl FtsReader {
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
+        // Plain terms on both sides: count by probing or folding, whichever
+        // reads less, instead of walking the atoms a document at a time.
+        if phrases.is_empty() && neg_phrases.is_empty() && !neg_terms.is_empty() {
+            let pos = self
+                .build_term_cursors(
+                    column_id,
+                    terms,
+                    QueryIdf::ThisFile,
+                    CursorUse::Count,
+                    None,
+                    None,
+                )
+                .await?;
+            let mut work = MatchWork::for_cursors(&pos);
+            if mode == BoolMode::And && pos.len() != terms.len() {
+                return Ok((0, work));
+            }
+            let neg = self
+                .build_term_cursors(
+                    column_id,
+                    neg_terms,
+                    QueryIdf::ThisFile,
+                    CursorUse::Count,
+                    None,
+                    None,
+                )
+                .await?;
+            work.postings_bytes += MatchWork::for_cursors(&neg).postings_bytes;
+            let (n, walk_ns) = timed_section(|| count_excluding(pos, mode == BoolMode::And, neg));
+            work.kernel_cpu_ns = walk_ns;
+            return Ok((n, work));
+        }
         // Unranked: built to match, so no global idf and no norms; the
         // column's length array is never read.
         let (built, dict_ranges) = self

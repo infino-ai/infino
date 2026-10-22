@@ -32,6 +32,7 @@ use super::{
         ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
     },
     phrase::{AnyCursor, PhraseCursor},
+    scorers::count_and_planned,
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
@@ -515,6 +516,11 @@ pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
 /// fall back; the cap bounds that waste for a "rare" term that is merely
 /// less common.
 pub(super) const RARE_LED_MAX_DF: u64 = 1 << 17;
+
+/// Postings-equivalent cost of testing one document against one term in a
+/// count: a block locate and, on a packed block, a decode. Weighs probing a
+/// rare term's documents against folding every term into a bitset.
+pub(super) const COUNT_PROBE_POSTINGS: u64 = 20;
 
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
@@ -2067,6 +2073,13 @@ pub(super) fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
 /// drops scoring and the top-k heap, since a count needs neither order
 /// nor scores. No doc-id list is materialized.
 pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
+    // Two terms: `|a ∪ b| = df(a) + df(b) − |a ∩ b|`, and the intersection
+    // runs whichever of probing and folding reads less, so the union never
+    // pays for a walk of its own.
+    if cursors.len() == 2 {
+        let both = cursors[0].df + cursors[1].df;
+        return both - count_and_planned(cursors);
+    }
     // Fast path: when one term's list dwarfs the rest, count it as
     // `df(dominant) + |others \ dominant|` instead of walking the
     // dominant term's whole posting list. See `or_count_anchored`.
