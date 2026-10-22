@@ -433,6 +433,15 @@ impl SharedTopK {
     fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
         let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
         for score in scores {
+            // Once k scores are known, most of a unit's scores fall below
+            // the k-th and can never enter: one comparison settles them
+            // before any heap work.
+            if heap.len() >= self.k
+                && let Some(Reverse(min)) = heap.peek()
+                && score < min.score
+            {
+                continue;
+            }
             let entry = FloorEntry { score, id_max };
             if heap.len() < self.k {
                 heap.push(Reverse(entry));
