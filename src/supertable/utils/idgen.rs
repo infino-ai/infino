@@ -112,7 +112,25 @@ impl IdGenerator {
     /// that mutex is required.
     #[inline]
     pub fn next_id(&self) -> i128 {
-        self.claim(1).0
+        // `claim(1)`, without the run-length arithmetic a single id
+        // does not need: this is the hot path when ids are minted one
+        // at a time.
+        loop {
+            let now: u64 = self.clock.current_millis();
+            let last = self.last.get();
+            let next = if now > (last >> TIMESTAMP_SHIFT) as u64 {
+                (u128::from(now) << TIMESTAMP_SHIFT) | self.worker_bits
+            } else if last & SEQUENCE_MASK < SEQUENCE_MASK {
+                last + 1
+            } else {
+                // This millisecond's sequence is used up; wait for the
+                // ticker to publish the next one.
+                hint::spin_loop();
+                continue;
+            };
+            self.last.set(next);
+            return next as i128;
+        }
     }
 
     /// Reserve `n` ids in advance and return them as an ordered
@@ -172,12 +190,13 @@ impl IdGenerator {
                     (u128::from(now) << TIMESTAMP_SHIFT) | self.worker_bits,
                     SEQUENCE_MASK + 1,
                 )
-            } else if now == last_ms && last & SEQUENCE_MASK < SEQUENCE_MASK {
+            } else if last & SEQUENCE_MASK < SEQUENCE_MASK {
+                // Same millisecond (the clock never reads behind the
+                // last id): continue its sequence.
                 (last + 1, SEQUENCE_MASK - (last & SEQUENCE_MASK))
             } else {
-                // This millisecond's sequence is used up (or, never
-                // in practice, the clock reads behind the last id).
-                // The ticker publishes the next millisecond shortly.
+                // This millisecond's sequence is used up; wait for the
+                // ticker to publish the next one.
                 hint::spin_loop();
                 continue;
             };
