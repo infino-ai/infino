@@ -463,6 +463,14 @@ const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 12;
 /// default. `false` restores the legacy per-cell budget + global 1-bit
 /// shortlist cut (then raise `global_fine_rerank_mult` back toward ~128).
 const DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET: bool = true;
+/// Default rerank-pool floor for `ivf_router = centroid_graph` with
+/// `global_fine_per_cluster_budget` on: the per-cluster budget is boosted so
+/// the pooled — and fully reranked — candidate count never drops below this.
+/// It binds only at small N (where `fanout ≈ √fine-clusters` is tiny); large
+/// tables already pool above it, so it is a no-op there. A candidate count,
+/// so the bytes reranked scale with it times the vector width — on high-dim
+/// data a given floor costs proportionally more latency than on low-dim.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR: usize = 30_000;
 /// Default `ivf_router = auto` concentration threshold: `centroid_graph` only
 /// when the calibrated fanout selects under half the fine clusters (a real
 /// subset to concentrate on). A documented starting point, tuned per corpus.
@@ -842,6 +850,13 @@ pub struct VectorSettings {
     /// a per-cell budget cut down by a global 1-bit shortlist. On by
     /// default; `false` restores the legacy per-cell + global-cut path.
     pub global_fine_per_cluster_budget: bool,
+    /// For `ivf_router = centroid_graph` with `global_fine_per_cluster_budget`
+    /// on: the minimum pooled (and fully reranked) candidate count. Boosts the
+    /// per-cluster budget at small N so recall does not turn depth-limited;
+    /// a no-op at large N, where the pool already exceeds it. Higher trades
+    /// latency for recall, and the cost scales with the vector width (it is a
+    /// candidate count, not a byte budget). Ignored otherwise.
+    pub global_fine_rerank_pool_floor: usize,
     /// For `ivf_router = centroid_graph`: coalesce the selected clusters
     /// within each cell into contiguous reads. Ignored otherwise.
     pub global_fine_coalesce: bool,
@@ -1062,6 +1077,7 @@ impl Default for VectorSettings {
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
             global_fine_per_cluster_budget: DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET,
+            global_fine_rerank_pool_floor: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,

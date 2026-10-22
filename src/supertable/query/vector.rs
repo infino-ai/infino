@@ -1122,13 +1122,6 @@ const CENTROID_GRAPH_FANOUT_SQRT_COEFF: f64 = 3.0;
 /// Minimum deterministic graph fanout, so small tables still scan enough fine
 /// clusters for coverage (clamped to the cluster count for tiny tables).
 const CENTROID_GRAPH_FANOUT_FLOOR: usize = 32;
-/// Minimum number of candidates the centroid-graph path pools and exact-
-/// reranks per query. At small N the fine-cluster count (and thus `fanout`) is
-/// tiny, so `fanout·k·rerank_mult` under-reranks and recall turns
-/// depth-limited (deep1b 1M caps ~0.94 even at full coverage). This floors the
-/// pool by boosting the per-cluster budget; it binds only at small N — large
-/// tables already pool well above it. PROVISIONAL (finalizing from the sweep).
-const GRAPH_RERANK_POOL_FLOOR: usize = 30_000;
 
 /// Deterministic coverage fanout for the centroid-graph path: scan about
 /// `CENTROID_GRAPH_FANOUT_SQRT_COEFF · √n_fine` fine clusters, clamped to
@@ -4475,11 +4468,11 @@ impl SupertableReader {
         // Pool floor: at small N, `fanout` (≈√fine-clusters) is tiny, so
         // `fanout·k·rerank_mult` under-reranks and recall turns depth-limited.
         // Boost the per-cluster budget so the pooled — and fully reranked —
-        // count stays ≥ `GRAPH_RERANK_POOL_FLOOR`. The floor binds only at
-        // small N; large tables already pool above it, so it's a no-op there.
+        // count stays ≥ the configured floor. The floor binds only at small N;
+        // large tables already pool above it, so it's a no-op there.
+        let pool_floor = config::global().vector.global_fine_rerank_pool_floor;
         let effective_rerank_mult = if per_cluster {
-            rerank_mult
-                .max(GRAPH_RERANK_POOL_FLOOR.div_ceil(k.max(1).saturating_mul(fanout.max(1))))
+            rerank_mult.max(pool_floor.div_ceil(k.max(1).saturating_mul(fanout.max(1))))
         } else {
             rerank_mult
         };
