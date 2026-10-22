@@ -109,9 +109,10 @@ pub(crate) const MAX_TIER_TERMS: usize = 2;
 /// soundly; the merge just stops refining.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
-/// round is a few microseconds, so jobs this size keep the pool's
-/// scheduling a small fraction of the work.
-const SLOTS_PER_JOB: usize = 16;
+/// round is several microseconds, so jobs this size still dwarf the
+/// pool's scheduling while a round of a hundred superfiles spreads over
+/// a few dozen threads.
+const SLOTS_PER_JOB: usize = 4;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +184,10 @@ struct Source {
 struct HeadState {
     /// Whether any document of the term was read for the superfile.
     seen: bool,
+    /// Whether the index holds the term's every document of the superfile
+    /// in the head, so reading it to its end settles which documents
+    /// carry the term.
+    whole: bool,
     /// Upper bound, at the table's stats, on the contribution of any
     /// document of the superfile not in `docs`. Zero once every document
     /// is in `docs`.
@@ -203,6 +208,7 @@ impl HeadState {
     fn absent() -> Self {
         Self {
             seen: false,
+            whole: true,
             tail: 0.0,
             ceiling: 0.0,
             done: true,
@@ -334,7 +340,8 @@ pub(crate) async fn select_with_tiers(
         };
         slots.push(Slot {
             heads: vec![HeadState::absent(); nt],
-            joined: FxHashMap::default(),
+            // Room for a block of every term before the map has to grow.
+            joined: FxHashMap::with_capacity_and_hasher(2 * BLOCK_ENTRIES * nt, Default::default()),
             best: [f32::NEG_INFINITY; 1 << MAX_TIER_TERMS],
             candidates: Vec::new(),
             top: Vec::new(),
@@ -397,6 +404,7 @@ pub(crate) async fn select_with_tiers(
                 };
                 slot.heads[ti] = HeadState {
                     seen: false,
+                    whole: p.tail.is_finite() && p.tail <= 0.0,
                     tail,
                     ceiling,
                     done: !chunked,
@@ -522,16 +530,30 @@ pub(crate) async fn select_with_tiers(
             let excluded = merge.round(&reads);
             let round_ns = started.elapsed().as_nanos() as u64;
             // Worth reading on: the opens this round saved, at what an open
-            // costs here, cover what the round cost — or no threshold exists
-            // yet, so nothing could have been saved and the next round may
-            // be the one that finds it. With the open cost unknown, any
-            // exclusion is taken as worth it.
+            // costs here, cover what the round cost. With the open cost
+            // unknown, any exclusion is taken as worth it. A round that
+            // found no threshold saved nothing and is not read past: the
+            // joint documents a conjunction needs for one sit deeper than
+            // the heads' top blocks, and reading on for them has bought
+            // nothing where it was measured.
             let worth = if open_cost_ns == 0 {
                 excluded > 0
             } else {
                 u128::from(excluded as u64) * u128::from(open_cost_ns) >= u128::from(round_ns)
             };
-            let read_on = !merge.theta_lb.is_finite() || worth;
+            // A required term whose head the index holds whole is read to
+            // its end regardless: such a head is small (that is what made
+            // it whole), and read whole it settles which documents carry
+            // the term, which rules out — or answers for — every live
+            // superfile the conjunction has no joint document in.
+            let settling = merge.slots.iter().any(|s| {
+                s.live
+                    && s.heads
+                        .iter()
+                        .enumerate()
+                        .any(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
+            });
+            let read_on = worth || settling;
             tracing::debug!(
                 round,
                 excluded,
@@ -540,6 +562,7 @@ pub(crate) async fn select_with_tiers(
                 entries = merge.entries_read,
                 round_us = round_ns / 1000,
                 open_cost_us = open_cost_ns / 1000,
+                settling,
                 read_on,
                 "tier merge round"
             );
