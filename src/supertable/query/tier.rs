@@ -114,17 +114,20 @@ pub(crate) type TermMask = u64;
 /// Whether a ranked query merges its tiers at all, learned per table from
 /// what the two ways cost: per class of query — conjunction, disjunction
 /// or a mix; a bucket of `k`; a bucket of term count — a running average
-/// of the ranked search's wall with the merge and without it. The cheaper
-/// way is taken, and one query in [`TierPolicy::EXPLORE_EVERY`] takes the
-/// other so both averages stay current as the table and its cache change.
-/// A class merges until both ways have been measured. What the merge
-/// buys — opens it rules out, the threshold it seeds the kernels with — is
-/// thereby measured as what it is worth here, on this table, rather than
-/// modelled.
+/// of the ranked search's wall with the merge and without it. The two
+/// ways alternate until each has [`TierPolicy::MIN_SAMPLES`] queries, so
+/// both averages are taken over the same mix of queries; then the cheaper
+/// way is taken and one query in [`TierPolicy::EXPLORE_EVERY`] takes the
+/// other, so both stay current as the table and its cache change. What
+/// the merge buys — opens it rules out, the threshold it seeds the kernels
+/// with — is thereby measured as what it is worth here, on this table,
+/// rather than modelled.
 pub(crate) struct TierPolicy {
     /// Per class, the wall of the ranked search without the merge (`[0]`)
     /// and with it (`[1]`), in nanoseconds; zero until measured.
     walls: Vec<[AtomicU64; 2]>,
+    /// Per class, how many queries each way has been measured over.
+    samples: Vec<[AtomicU32; 2]>,
     trials: Vec<AtomicU32>,
 }
 
@@ -134,12 +137,21 @@ impl TierPolicy {
     const TERM_BUCKETS: usize = 5;
     const CLASSES: usize = Self::SHAPES * Self::K_BUCKETS * Self::TERM_BUCKETS;
     /// One query in this many takes the way the averages do not favour.
-    const EXPLORE_EVERY: u32 = 32;
+    const EXPLORE_EVERY: u32 = 16;
+    /// Queries each way is measured over, alternating, before the averages
+    /// are compared: queries of a class differ in cost several-fold, so an
+    /// average over one query does not compare with one over the mix.
+    const MIN_SAMPLES: u32 = 8;
+    /// The average's reach: each sample moves it an eighth of the way.
+    const SMOOTHING: u64 = 8;
 
     pub(crate) fn new() -> Self {
         Self {
             walls: (0..Self::CLASSES)
                 .map(|_| [AtomicU64::new(0), AtomicU64::new(0)])
+                .collect(),
+            samples: (0..Self::CLASSES)
+                .map(|_| [AtomicU32::new(0), AtomicU32::new(0)])
                 .collect(),
             trials: (0..Self::CLASSES).map(|_| AtomicU32::new(0)).collect(),
         }
@@ -172,14 +184,14 @@ impl TierPolicy {
     /// Whether a query of `class` merges its tiers this time.
     pub(crate) fn merge(&self, class: usize) -> bool {
         let trial = self.trials[class].fetch_add(1, Ordering::Relaxed);
+        let n_without = self.samples[class][0].load(Ordering::Relaxed);
+        let n_with = self.samples[class][1].load(Ordering::Relaxed);
+        if n_without < Self::MIN_SAMPLES || n_with < Self::MIN_SAMPLES {
+            // Alternate, the less-measured way first on a tie.
+            return n_with <= n_without;
+        }
         let without = self.walls[class][0].load(Ordering::Relaxed);
         let with = self.walls[class][1].load(Ordering::Relaxed);
-        if with == 0 {
-            return true;
-        }
-        if without == 0 {
-            return false;
-        }
         let favoured = with <= without;
         if trial.is_multiple_of(Self::EXPLORE_EVERY) {
             !favoured
@@ -189,14 +201,16 @@ impl TierPolicy {
     }
 
     /// Fold a ranked search's wall into its class's average for the way
-    /// it went: a quarter of the way from the old value to the sample.
+    /// it went: an eighth of the way from the old value to the sample.
     pub(crate) fn note(&self, class: usize, merged: bool, wall_ns: u64) {
-        let cell = &self.walls[class][usize::from(merged)];
+        let arm = usize::from(merged);
+        self.samples[class][arm].fetch_add(1, Ordering::Relaxed);
+        let cell = &self.walls[class][arm];
         let old = cell.load(Ordering::Relaxed);
         let new = if old == 0 {
             wall_ns
         } else {
-            old - old / 4 + wall_ns / 4
+            old - old / Self::SMOOTHING + wall_ns / Self::SMOOTHING
         };
         cell.store(new, Ordering::Relaxed);
     }
