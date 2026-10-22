@@ -2368,6 +2368,26 @@ impl FtsReader {
         if let [c] = cursors.as_mut_slice() {
             let mut lane_scores = [0.0f32; BLOCK_LEN];
             while !c.is_exhausted() {
+                // A block that cannot beat the k-th best is only counted.
+                if filter.is_none()
+                    && k > 0
+                    && heap.len() >= k
+                    && c.current_block_max_bm25() <= threshold
+                {
+                    if c.decoded_block != c.current_block {
+                        let start = c.current_doc_id();
+                        c.decode_current_block();
+                        c.materialize_at(start);
+                    }
+                    count += (c.block_n - c.pos) as u64;
+                    c.advance_by(c.block_n - c.pos);
+                    continue;
+                }
+                if c.decoded_block != c.current_block {
+                    let start = c.current_doc_id();
+                    c.decode_current_block();
+                    c.materialize_at(start);
+                }
                 let (from, to) = (c.pos, c.block_n);
                 let mut i = from;
                 while i + bm25::SCORE_SIMD_LANES <= to {
@@ -2422,6 +2442,28 @@ impl FtsReader {
             }
             let base = min_doc & !(OR_WINDOW - 1);
             let window_end = base.saturating_add(OR_WINDOW);
+            // A window whose terms together cannot beat the k-th best holds no
+            // hit: mark presence for the count, score nothing.
+            if filter.is_none() && k > 0 && heap.len() >= k {
+                let last = window_end - 1;
+                let bound: f32 = cursors
+                    .iter_mut()
+                    .map(|c| c.block_max_in_range(base, last))
+                    .sum();
+                if bound <= threshold {
+                    for c in &mut cursors {
+                        while !c.is_exhausted() && c.current_doc_id() < window_end {
+                            let local = (c.current_doc_id() - base) as usize;
+                            present[local >> 6] |= 1u64 << (local & 63);
+                            c.next();
+                        }
+                    }
+                    for word in present.iter_mut() {
+                        count += u64::from(std::mem::take(word).count_ones());
+                    }
+                    continue;
+                }
+            }
             for c in &mut cursors {
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
