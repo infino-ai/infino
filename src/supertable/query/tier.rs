@@ -211,6 +211,9 @@ struct HeadState {
     /// in the head, so reading it to its end settles which documents
     /// carry the term.
     whole: bool,
+    /// Blocks the head spans when whole (its documents over a block's
+    /// entries, rounded up): what finishing it costs.
+    blocks: u32,
     /// Upper bound, at the table's stats, on the contribution of any
     /// document of the superfile not in `docs`. Zero once every document
     /// is in `docs`.
@@ -232,6 +235,7 @@ impl HeadState {
         Self {
             seen: false,
             whole: true,
+            blocks: 0,
             tail: 0.0,
             ceiling: 0.0,
             done: true,
@@ -455,6 +459,7 @@ pub(crate) async fn select_with_tiers(
                 slot.heads[ti] = HeadState {
                     seen: false,
                     whole: p.tail.is_finite() && p.tail <= 0.0,
+                    blocks: p.df.div_ceil(BLOCK_ENTRIES as u64) as u32,
                     tail,
                     ceiling,
                     done: !chunked,
@@ -478,8 +483,10 @@ pub(crate) async fn select_with_tiers(
         phrases: query.phrases.clone(),
         // A document the heads show matches only if nothing unseen can
         // unmake it: no must-phrase whose adjacency the heads cannot
-        // verify, no negated term the heads do not read.
-        trusted: !query.negated && query.phrases.iter().all(|p| !p.1),
+        // verify, no negated term the heads do not read — and only
+        // through a bare term it scores on, since a phrase alone may not
+        // match at all.
+        trusted: !query.negated && query.phrases.iter().all(|p| !p.1) && query.scoring != 0,
     };
     // A shape whose candidates cannot be trusted yields no threshold, so
     // before any open it can rule a superfile out only through a required
@@ -618,18 +625,30 @@ pub(crate) async fn select_with_tiers(
             } else {
                 u128::from(excluded as u64) * u128::from(open_cost_ns) >= u128::from(round_ns)
             };
-            // A required term whose head the index holds whole is read to
-            // its end regardless: such a head is small (that is what made
-            // it whole), and read whole it settles which documents carry
-            // the term, which rules out — or answers for — every live
-            // superfile the conjunction has no joint document in.
-            let settling = merge.slots.iter().any(|s| {
-                s.live
-                    && s.heads
-                        .iter()
-                        .enumerate()
-                        .any(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
-            });
+            // A required term whose head the index holds whole settles,
+            // read to its end, which documents carry the term — ruling
+            // out, or answering for, every live superfile the conjunction
+            // has no joint document in. Finishing it is worth the rounds
+            // it still needs while the live opens at stake cover them at
+            // this round's cost; with the open cost unknown it is finished
+            // regardless.
+            let rounds_to_settle = merge
+                .slots
+                .iter()
+                .filter(|s| s.live)
+                .flat_map(|s| s.heads.iter().enumerate())
+                .filter(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
+                .map(|(_, h)| h.blocks.saturating_sub(round as u32 + 1).max(1))
+                .max();
+            let settling = match rounds_to_settle {
+                None => false,
+                Some(_) if open_cost_ns == 0 => true,
+                Some(rounds) => {
+                    let live = merge.slots.iter().filter(|s| s.live).count() as u64;
+                    u128::from(live) * u128::from(open_cost_ns)
+                        >= u128::from(rounds) * u128::from(round_ns)
+                }
+            };
             let read_on = worth || settling;
             tracing::debug!(
                 round,
