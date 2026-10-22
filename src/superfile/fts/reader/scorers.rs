@@ -2277,6 +2277,7 @@ impl FtsReader {
         let mut noness_suffix = vec![0.0_f32; n + 1];
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
+        let mut win_all = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
@@ -2298,11 +2299,18 @@ impl FtsReader {
                 }
                 // Skip the whole block if it cannot beat threshold.
                 if heap.len() >= k {
-                    let block_ub = cursors[0].current_block_max_bm25()
-                        + (total_term_ub - cursors[0].term_max_bm25);
-                    if block_ub <= threshold {
-                        let end = cursors[0].current_block_last_doc_id();
-                        cursors[0].skip_to(end.saturating_add(1));
+                    // The other terms bounded over this block's own range,
+                    // not their whole lists: a mid-frequency term's best
+                    // document elsewhere must not hold this block open.
+                    let start = cursors[0].current_doc_id();
+                    let end = cursors[0].current_block_last_doc_id();
+                    let (lead, others) = cursors.split_at_mut(1);
+                    let others_ub: f32 = others
+                        .iter_mut()
+                        .map(|c| c.block_max_in_range(start, end))
+                        .sum();
+                    if lead[0].current_block_max_bm25() + others_ub <= threshold {
+                        lead[0].skip_to(end.saturating_add(1));
                         continue;
                     }
                 }
@@ -2492,6 +2500,19 @@ impl FtsReader {
             // term's block: the estimate is by doc share, not block count.)
             // A window whose total bound is under the threshold holds no
             // competitive doc and is skipped whole regardless.
+            // Every term's maximum over this window, for the essential
+            // block skip below: a block that ends inside the window is
+            // bounded by the others' window maxima rather than their term
+            // maxima. Measured once per window, before any cursor moves.
+            let windowed = prune && !sole;
+            let mut win_all_sum = 0.0_f32;
+            if windowed {
+                let win_last = window_end.saturating_sub(1);
+                for (i, c) in cursors.iter_mut().enumerate() {
+                    win_all[i] = c.block_max_in_range(base, win_last);
+                    win_all_sum += win_all[i];
+                }
+            }
             let f_win = if sole {
                 partial_win.copy_from_slice(&partial_max);
                 f_essential
@@ -2537,7 +2558,7 @@ impl FtsReader {
                 }
                 continue;
             }
-            for c in cursors.iter_mut().take(f_win) {
+            for (ci, c) in cursors.iter_mut().enumerate().take(f_win) {
                 let mut checked_block = usize::MAX;
                 while !c.is_exhausted() {
                     let d = c.current_doc_id();
@@ -2557,28 +2578,33 @@ impl FtsReader {
                     // is scored up to it rather than skipped.
                     if prune && c.current_block != checked_block {
                         checked_block = c.current_block;
-                        let others_ub = if sole {
-                            partial_max[f_essential]
-                        } else {
-                            total_term_ub - c.term_max_bm25
+                        // The tightest bound valid for the whole block: the
+                        // non-essentials alone in a sole-essential window, the
+                        // others' window maxima when the block ends inside the
+                        // window, else every other term at its term max.
+                        let global_ub = total_term_ub - c.term_max_bm25;
+                        let inside = c.current_block_last_doc_id() < window_end;
+                        let others_ub = match (sole, windowed && inside) {
+                            (true, _) => partial_max[f_essential],
+                            (false, true) => (win_all_sum - win_all[ci]).min(global_ub),
+                            (false, false) => global_ub,
                         };
                         #[cfg(test)]
                         BOUND_CLAIMS.with(|v| {
-                            // Past the window a sole-essential bound claims
-                            // nothing, because it counts no other essential
-                            // term and those do have postings out there.
+                            // Past the window a sole-essential or windowed
+                            // bound claims nothing: it counts no other term's
+                            // postings out there.
                             let block_end = c.current_block_last_doc_id().saturating_add(1);
                             v.borrow_mut().push(BoundClaim {
                                 from: c.current_doc_id(),
-                                to: match sole {
+                                to: match sole || windowed {
                                     true => block_end.min(window_end),
                                     false => block_end,
                                 },
                                 bound: c.current_block_max_bm25() + others_ub,
                             })
                         });
-                        if c.current_block_max_bm25() + others_ub <= threshold
-                            && (!sole || c.current_block_last_doc_id() < window_end)
+                        if c.current_block_max_bm25() + others_ub <= threshold && (!sole || inside)
                         {
                             c.skip_blocks_under(others_ub, threshold, window_end);
                             continue;
@@ -4951,6 +4977,46 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// What opening one cursor on a stopword-sized term costs: a 4M-doc
+    /// column where the term is in ~84% of documents (~26K blocks).
+    /// Timing only; run in release with `--ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "timing probe"]
+    async fn stopword_cursor_open_cost() {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..4_000_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let text = match x % 100 < 84 {
+                true => "the w",
+                false => "w",
+            };
+            b.add_doc(0, i, text).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        for purpose in [CursorUse::Score, CursorUse::Count] {
+            let runs = 200u32;
+            let t = std::time::Instant::now();
+            let mut blocks = 0usize;
+            for _ in 0..runs {
+                let c = r
+                    .build_term_cursors(0, &["the"], QueryIdf::ThisFile, purpose, None, None)
+                    .await
+                    .expect("cursor");
+                blocks += c[0].block_count();
+            }
+            println!(
+                "{purpose:?}: {:.1} us per open, {} blocks",
+                t.elapsed().as_secs_f64() * 1e6 / f64::from(runs),
+                blocks / runs as usize
+            );
         }
     }
 }
