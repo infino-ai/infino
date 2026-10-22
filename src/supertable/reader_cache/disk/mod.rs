@@ -727,7 +727,9 @@ pub(crate) mod test_support {
         supertable::{
             manifest::SuperfileUri,
             reader_cache::{
-                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES, serialize_index},
+                block_source::{
+                    BlockCachedSource, CACHE_BLOCK_BYTES, SourceLayout, serialize_index,
+                },
                 config::DiskCacheConfig,
                 disk::*,
             },
@@ -834,7 +836,7 @@ pub(crate) mod test_support {
             Arc::downgrade(store),
             uri,
             store.blocks_path(&uri),
-            None,
+            SourceLayout::default(),
         )
     }
 

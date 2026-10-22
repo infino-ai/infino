@@ -75,7 +75,10 @@ use std::{
     cmp::{Ordering, Reverse},
     collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
     slice,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
     time::Instant,
 };
 
@@ -714,8 +717,26 @@ impl SupertableReader {
         opts: Bm25SearchOptions,
         scope: Option<&CandidateScope>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let (hits, _) = self
+            .bm25_scored_async(column, query, k, opts, scope, false)
+            .await?;
+        Ok(hits)
+    }
+
+    /// The shared body of the ranked searches. With `exact_count` every
+    /// match is scored in one pass and the exact match count comes back
+    /// with the hits; otherwise the kernels prune and the count is 0.
+    async fn bm25_scored_async(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: Bm25SearchOptions,
+        scope: Option<&CandidateScope>,
+        exact_count: bool,
+    ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         if k == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         // Destructured once here: `mode` shapes the clause split, and
         // `bm25` — when set — overrides what each column declared, which
@@ -773,7 +794,7 @@ impl SupertableReader {
             // unranked count / token_match path surfaces the identical
             // error (see `parse_and_prune`).
             if negatives.is_empty() && negative_phrases.is_empty() {
-                return Ok(Vec::new());
+                return Ok((Vec::new(), 0));
             }
             return Err(QueryError::InvalidQuery(NEGATION_ONLY_QUERY_MSG.to_owned()));
         }
@@ -807,6 +828,7 @@ impl SupertableReader {
             bm25_params,
             score_tolerance,
             scope,
+            exact_count,
         )
         .await
     }
@@ -847,7 +869,10 @@ impl SupertableReader {
     }
 
     /// Ranks `clauses` over the superfiles in `kept`, with idf from the
-    /// whole table: the shared core of term and prefix search.
+    /// whole table: the shared core of term and prefix search. With
+    /// `exact_count` nothing is pruned and no superfile is skipped, and
+    /// the exact match count (deleted rows excluded) comes back with the
+    /// hits; otherwise the count is 0.
     async fn bm25_search_clauses(
         &self,
         column: &str,
@@ -857,7 +882,8 @@ impl SupertableReader {
         bm25_params: Option<Bm25Params>,
         score_tolerance: f32,
         scope: Option<&CandidateScope>,
-    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        exact_count: bool,
+    ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
         let ScoredClauses {
             musts,
             shoulds,
@@ -882,7 +908,7 @@ impl SupertableReader {
         // No document in the table has a token in this column, so nothing
         // can match and no term has an idf to score with.
         if corpus.n_scored_docs == 0 {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         // Every superfile scores at the table's average length, in the
         // fixed point a file stores it in, so a file built at exactly this
@@ -891,7 +917,7 @@ impl SupertableReader {
 
         let phases = self.phase_spans();
         if kept.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
 
         // Corpus-wide idf per scored term comes from an
@@ -965,8 +991,9 @@ impl SupertableReader {
             match (&term_index, bm25_params, manifest.field_id(column)) {
                 // Ceilings rescale by each term's table idf, so they order and
                 // skip only when the map holds every scored term.
+                // An exact count opens every superfile, so it skips the read.
                 (Some(index), None, Some(column_id))
-                    if all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
+                    if !exact_count && all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
                 {
                     let terms: Vec<&str> = musts
                         .iter()
@@ -1018,7 +1045,9 @@ impl SupertableReader {
             .filter(|s| s.bounds_rows(&kept))
             .and_then(|s| s.allow.clone())
             .map(Arc::new);
-        let fanout = match has_phrases || per_row_scope.is_some() {
+        // An exact count walks each superfile whole: the ranged union
+        // kernel prunes and does not count.
+        let fanout = match exact_count || has_phrases || per_row_scope.is_some() {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
@@ -1047,6 +1076,14 @@ impl SupertableReader {
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column_owned);
+        // Exact count only: each superfile's row count, to turn its
+        // tombstones into an allow-set, and the running total.
+        let row_counts: Arc<HashMap<Uuid, u64>> = Arc::new(match exact_count {
+            true => kept.iter().map(|e| (e.superfile_id, e.n_docs)).collect(),
+            false => HashMap::new(),
+        });
+        let total = Arc::new(AtomicU64::new(0));
+        let count_handle = Arc::clone(&total);
 
         // Cross-segment threshold sharing: each unit reads the global
         // kth-best floor before searching and merges its surviving
@@ -1116,6 +1153,8 @@ impl SupertableReader {
             let prefetch_memos = prefetch_memos.clone();
             let index_locations = Arc::clone(&index_locations);
             let op_stats = op_stats.clone();
+            let row_counts = Arc::clone(&row_counts);
+            let total = Arc::clone(&total);
             // This superfile's admitted rows under a bounded scope. `kept`
             // holds only superfiles the scope admits, so the lookup
             // succeeds; an absent entry would mean no row and is treated
@@ -1154,19 +1193,58 @@ impl SupertableReader {
                 // `floor.next_down()`), so the merged top-k — score ties
                 // included — matches an uncoordinated run; only the amount
                 // of skipped work depends on segment completion order.
-                let floor = shared.floor();
-                // The atom walks may also read the floor LIVE mid-walk and
-                // publish their own local kth into it — but a kernel heap
-                // is pre-tombstone-filter, so only a superfile with no
-                // tombstoned rows may participate: its local kth is a
-                // floor the merge (which sees only surviving scores) can
-                // never contradict. The sidecars were warmed by the
-                // dispatcher, so this lookup is an in-memory hit; on a
-                // miss/error the unit just keeps the snapshot floor.
-                let live_floor = match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => None,
-                    Some(Err(_)) => None,
-                    _ => Some(shared.live_floor()),
+                // An exact count prunes nothing, so it takes no floor.
+                let floor = match exact_count {
+                    true => f32::NEG_INFINITY,
+                    false => shared.floor(),
+                };
+                let (live_floor, allow) = {
+                    let tomb = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
+                    // The atom walks may also read the floor LIVE mid-walk and
+                    // publish their own local kth into it — but a kernel heap
+                    // is pre-tombstone-filter, so only a superfile with no
+                    // tombstoned rows may participate: its local kth is a
+                    // floor the merge (which sees only surviving scores) can
+                    // never contradict. The sidecars were warmed by the
+                    // dispatcher, so this lookup is an in-memory hit; on a
+                    // miss/error the unit just keeps the snapshot floor.
+                    let live_floor = if exact_count {
+                        None
+                    } else {
+                        match &tomb {
+                            Some(Ok(bitmap)) if !bitmap.is_empty() => None,
+                            Some(Err(_)) => None,
+                            _ => Some(shared.live_floor()),
+                        }
+                    };
+                    // An exact count leaves deleted rows out, as `count` does:
+                    // on a superfile with tombstones, allow only the live rows.
+                    let allow = match (&tomb, exact_count) {
+                        (Some(Ok(deleted)), true) if !deleted.is_empty() => {
+                            let rows = row_counts.get(&suid).copied().ok_or_else(|| {
+                                QueryError::Internal(format!(
+                                    "superfile {suid} missing from the kept set"
+                                ))
+                            })?;
+                            let rows = u32::try_from(rows).map_err(|_| {
+                                QueryError::Internal(format!(
+                                    "superfile {suid} row count exceeds a local id"
+                                ))
+                            })?;
+                            let mut live = match &allow {
+                                Some(set) => set.as_ref().clone(),
+                                None => {
+                                    let mut all = RoaringBitmap::new();
+                                    all.insert_range(0..rows);
+                                    all
+                                }
+                            };
+                            live -= deleted.as_ref();
+                            Some(Arc::new(live))
+                        }
+                        _ => allow,
+                    };
+                    (live_floor, allow)
                 };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
@@ -1256,6 +1334,7 @@ impl SupertableReader {
                                     prefetched: memo.as_deref(),
                                     live_floor,
                                     allow,
+                                    exact_count,
                                 },
                                 k,
                                 floor,
@@ -1271,45 +1350,85 @@ impl SupertableReader {
                             // kernels are bracketed below).
                             stats.add_kernel_cpu_ns(prep.inline_kernel_cpu_ns());
                         }
-                        match prep {
-                            // Already-final shapes: the walk (and its
-                            // kernel time) happened inside
-                            // `prepare_clauses`. It still goes through
-                            // `run_prepared`, which is where a blob
-                            // storing its documents in an order of its
-                            // own turns them back into rows; taking the
-                            // hits directly would hand the caller blob
-                            // ids, and everything downstream reads them
-                            // as rows.
-                            prep @ PreparedClauses::Done { .. } => {
-                                r.run_prepared(prep, &scoring)?
+                        if exact_count {
+                            // Every match is scored, so the scan is the heavy
+                            // case by definition: a pool job unless the walk
+                            // already finished inside `prepare_clauses`.
+                            let (hits, count) = match prep {
+                                prep @ PreparedClauses::Done { .. } => {
+                                    r.run_prepared_with_count(prep, &scoring)?
+                                }
+                                prep => {
+                                    let kernel_reader = Arc::clone(&r);
+                                    let kernel_stats = op_stats.clone();
+                                    let kernel_column = column_arc.clone();
+                                    run_on_pool(
+                                        Some(&reader_pool),
+                                        "exact-count fts kernel: reader pool dropped result",
+                                        move || {
+                                            op_stats::timed_kernel(&kernel_stats, || {
+                                                kernel_reader.run_prepared_with_count(
+                                                    prep,
+                                                    &table_scoring(
+                                                        &kernel_column,
+                                                        bm25_params,
+                                                        avgdl,
+                                                    ),
+                                                )
+                                            })
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| QueryError::Internal(e.to_string()))??
+                                }
+                            };
+                            total.fetch_add(count, AtomicOrdering::Relaxed);
+                            hits
+                        } else {
+                            match prep {
+                                // Already-final shapes: the walk (and its
+                                // kernel time) happened inside
+                                // `prepare_clauses`. It still goes through
+                                // `run_prepared`, which is where a blob
+                                // storing its documents in an order of its
+                                // own turns them back into rows; taking the
+                                // hits directly would hand the caller blob
+                                // ids, and everything downstream reads them
+                                // as rows.
+                                prep @ PreparedClauses::Done { .. } => {
+                                    r.run_prepared(prep, &scoring)?
+                                }
+                                // Gate on posting mass, not term count: this
+                                // scan isn't sliced, so a rare-term query
+                                // with many terms can be cheaper than a
+                                // common-term pair.
+                                prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
+                                    let kernel_reader = Arc::clone(&r);
+                                    let kernel_stats = op_stats.clone();
+                                    let kernel_column = column_arc.clone();
+                                    run_on_pool(
+                                        Some(&reader_pool),
+                                        "un-ranged fts kernel: reader pool dropped result",
+                                        move || {
+                                            op_stats::timed_kernel(&kernel_stats, || {
+                                                kernel_reader.run_prepared(
+                                                    prep,
+                                                    &table_scoring(
+                                                        &kernel_column,
+                                                        bm25_params,
+                                                        avgdl,
+                                                    ),
+                                                )
+                                            })
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| QueryError::Internal(e.to_string()))??
+                                }
+                                prep => op_stats::timed_kernel(&op_stats, || {
+                                    r.run_prepared(prep, &scoring)
+                                })?,
                             }
-                            // Gate on posting mass, not term count: this
-                            // scan isn't sliced, so a rare-term query
-                            // with many terms can be cheaper than a
-                            // common-term pair.
-                            prep if prep.posting_mass() >= UNRANGED_KERNEL_POOL_MIN_MASS => {
-                                let kernel_reader = Arc::clone(&r);
-                                let kernel_stats = op_stats.clone();
-                                let kernel_column = column_arc.clone();
-                                run_on_pool(
-                                    Some(&reader_pool),
-                                    "un-ranged fts kernel: reader pool dropped result",
-                                    move || {
-                                        op_stats::timed_kernel(&kernel_stats, || {
-                                            kernel_reader.run_prepared(
-                                                prep,
-                                                &table_scoring(&kernel_column, bm25_params, avgdl),
-                                            )
-                                        })
-                                    },
-                                )
-                                .await
-                                .map_err(|e| QueryError::Internal(e.to_string()))??
-                            }
-                            prep => op_stats::timed_kernel(&op_stats, || {
-                                r.run_prepared(prep, &scoring)
-                            })?,
                         }
                     }
                 };
@@ -1331,7 +1450,9 @@ impl SupertableReader {
             }
         };
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = match ceilings.is_some() {
+        // An exact count opens every unit: a skipped superfile's matches
+        // would go uncounted.
+        let per_unit = match !exact_count && ceilings.is_some() {
             // Units are in descending ceiling order. A unit whose ceiling is
             // strictly below the running k-th score cannot place a document
             // in the top k — not even a tie the stable `_id` order could
@@ -1360,7 +1481,7 @@ impl SupertableReader {
             }
         };
         let hits = select_top_k_stable(self, per_unit, k).await?;
-        Ok(hits)
+        Ok((hits, count_handle.load(AtomicOrdering::Relaxed)))
     }
 
     /// Global BM25 idf per scored term, via the
@@ -1598,8 +1719,10 @@ impl SupertableReader {
         };
         // Prefix search takes no search options, so columns score with the
         // parameters they declared.
-        self.bm25_search_clauses(column, clauses, kept, k, None, 0.0, None)
-            .await
+        let (hits, _) = self
+            .bm25_search_clauses(column, clauses, kept, k, None, 0.0, None, false)
+            .await?;
+        Ok(hits)
     }
 
     /// Every term in `column` starting with `prefix_leaf`'s prefix, across
@@ -2443,6 +2566,50 @@ impl SupertableReader {
         self.block_on(self.bm25_search_async(column, query, k, opts))
     }
 
+    /// [`Self::bm25_hits`] scoring every match in one pass: the top-k
+    /// hits and the exact match count, deleted rows excluded. Nothing is
+    /// pruned, so this costs more than `bm25_hits` plus `count`; it is for
+    /// a harness that needs both from one walk, and like the rest of this
+    /// reader it is reachable only under `test-helpers`.
+    ///
+    /// The top-k is `bm25_hits`'s up to float summation order: the two
+    /// paths add a doc's term scores in different orders, so a score can
+    /// differ in its last bits and two docs tied at the k-th score within
+    /// that error may swap. Takes the same [`Bm25SearchOptions`];
+    /// `score_tolerance` has no effect here.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn bm25_hits_with_count(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: Bm25SearchOptions,
+    ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
+        self.block_on(self.bm25_hits_with_count_async(column, query, k, opts))
+    }
+
+    /// The async kernel behind [`Self::bm25_hits_with_count`]. With
+    /// `k == 0` there is nothing to rank, so the count comes from the
+    /// unranked count path.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) async fn bm25_hits_with_count_async(
+        &self,
+        column: &str,
+        query: &str,
+        k: usize,
+        opts: Bm25SearchOptions,
+    ) -> Result<(Vec<SuperfileHit>, u64), QueryError> {
+        if k == 0 {
+            let count = self
+                .token_match_count_async(column, query, opts.mode)
+                .await?;
+            return Ok((Vec::new(), count));
+        }
+        self.bm25_scored_async(column, query, k, opts, None, true)
+            .await
+    }
+
     /// Prefix-expanded BM25 search — see [`SupertableReader::bm25_search`]
     /// for the bridge semantics.
     pub fn bm25_search_prefix(
@@ -2974,6 +3141,7 @@ mod tests {
             Arc,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Instant,
     };
 
     use crate::supertable::manifest::ScalarStats;
@@ -4174,6 +4342,268 @@ mod tests {
             )
             .expect("or search");
         assert_eq!(by_location(prefix), by_location(expansion));
+    }
+
+    /// Score slack between the ranked and the exact-count paths: the
+    /// kernels add a doc's term scores in different orders.
+    const SUM_ORDER_EPS: f32 = 1e-4;
+
+    /// The two paths return the same top-k up to float summation order:
+    /// every doc's score agrees within `SUM_ORDER_EPS`, and a doc may be
+    /// on one side only when it ties the k-th score within that slack.
+    fn assert_same_top_k(counted: &[SuperfileHit], pruned: &[SuperfileHit], label: &str) {
+        assert_eq!(counted.len(), pruned.len(), "len for {label}");
+        let kth = pruned.last().map_or(f32::NEG_INFINITY, |h| h.score);
+        let scores = |hits: &[SuperfileHit]| {
+            hits.iter()
+                .map(|h| ((h.superfile.0, h.local_doc_id), h.score))
+                .collect::<HashMap<_, f32>>()
+        };
+        let (a, b) = (scores(counted), scores(pruned));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            for (doc, s) in x {
+                match y.get(doc) {
+                    Some(t) => assert!(
+                        (s - t).abs() < SUM_ORDER_EPS,
+                        "score of {doc:?} for {label}: {s} vs {t}"
+                    ),
+                    None => assert!(
+                        (s - kth).abs() < SUM_ORDER_EPS,
+                        "{doc:?} on one side only and not a k-th tie for {label}: {s} vs {kth}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A small deterministic generator for the random-corpus tests.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// Terms `w0..` in the random corpus; early ones are common, late ones rare.
+    const RANDOM_VOCAB: u64 = 24;
+
+    fn random_title(rng: &mut Lcg) -> String {
+        let mut text = String::new();
+        for t in 0..RANDOM_VOCAB {
+            if rng.next().is_multiple_of(3 + t) {
+                for _ in 0..1 + rng.next() % 3 {
+                    text.push_str(&format!("w{t} "));
+                }
+            }
+        }
+        if text.is_empty() {
+            text.push_str("w0");
+        }
+        text.trim().to_string()
+    }
+
+    /// `commits` superfiles of `docs_each` random titles.
+    fn random_table(rng: &mut Lcg, commits: usize, docs_each: usize) -> Supertable {
+        let st = Supertable::create(options_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for _ in 0..commits {
+            let titles: Vec<String> = (0..docs_each).map(|_| random_title(rng)).collect();
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            w.append(&build_batch(0, &refs)).expect("append");
+            w.commit().expect("commit");
+        }
+        st
+    }
+
+    /// An OR of `n_terms` random terms (repeats allowed), with one negated
+    /// term when `negated`.
+    fn random_or_query(rng: &mut Lcg, n_terms: usize, negated: bool) -> String {
+        let mut q: Vec<String> = (0..n_terms)
+            .map(|_| format!("w{}", rng.next() % RANDOM_VOCAB))
+            .collect();
+        if negated {
+            q.push(format!("-w{}", rng.next() % RANDOM_VOCAB));
+        }
+        q.join(" ")
+    }
+
+    /// Many-term ORs over several superfiles: the ranked and exact-count
+    /// paths add a doc's term scores in different orders, so the top-k
+    /// must agree up to that order, and the count must be exact.
+    #[test]
+    fn hits_with_count_matches_ranked_on_random_many_term_ors() {
+        let mut rng = Lcg(11);
+        let reader = random_table(&mut rng, 4, 1500).reader().expect("reader");
+        for q in 0..40u32 {
+            let n_terms = 2 + (rng.next() % 19) as usize;
+            let negated = rng.next().is_multiple_of(3);
+            let query = random_or_query(&mut rng, n_terms, negated);
+            let expected = reader.count("title", &query, BoolMode::Or).expect("count");
+            for k in [1usize, 10, 100] {
+                let opts = Bm25SearchOptions::new();
+                let pruned = reader
+                    .bm25_hits("title", &query, k, opts)
+                    .expect("bm25_hits");
+                let (hits, count) = reader
+                    .bm25_hits_with_count("title", &query, k, opts)
+                    .expect("bm25_hits_with_count");
+                assert_same_top_k(&hits, &pruned, &format!("q {q} {query:?} k={k}"));
+                assert_eq!(count, expected, "q {q} {query:?} k={k}");
+            }
+        }
+    }
+
+    /// Cost of the exact-count mode against ranked plus count at OR widths
+    /// 2, 8 and 20 over a 4-superfile table. Not a correctness test; run
+    /// it by hand for the numbers:
+    /// `cargo test --release --lib --features test-helpers -- --ignored --nocapture exact_count_cost`
+    #[test]
+    #[ignore]
+    fn exact_count_cost_by_or_width() {
+        const K: usize = 100;
+        const QUERIES: usize = 50;
+        let mut rng = Lcg(23);
+        let reader = random_table(&mut rng, 4, 10_000).reader().expect("reader");
+        for width in [2usize, 8, 20] {
+            let queries: Vec<String> = (0..QUERIES)
+                .map(|_| random_or_query(&mut rng, width, false))
+                .collect();
+            for q in &queries {
+                reader
+                    .bm25_hits("title", q, K, Bm25SearchOptions::new())
+                    .expect("warm");
+                reader
+                    .bm25_hits_with_count("title", q, K, Bm25SearchOptions::new())
+                    .expect("warm");
+            }
+            let ranked = Instant::now();
+            for q in &queries {
+                reader
+                    .bm25_hits("title", q, K, Bm25SearchOptions::new())
+                    .expect("ranked");
+                reader.count("title", q, BoolMode::Or).expect("count");
+            }
+            let ranked = ranked.elapsed().as_secs_f64();
+            let exact = Instant::now();
+            for q in &queries {
+                reader
+                    .bm25_hits_with_count("title", q, K, Bm25SearchOptions::new())
+                    .expect("exact");
+            }
+            let exact = exact.elapsed().as_secs_f64();
+            println!(
+                "or width {width:>2}: ranked+count {:>8.1} us/query, exact-count {:>8.1} us/query, {:.2}x",
+                ranked * 1e6 / QUERIES as f64,
+                exact * 1e6 / QUERIES as f64,
+                exact / ranked
+            );
+        }
+    }
+
+    /// Over a table of several superfiles, the exact-count search returns
+    /// the pruned search's top-k and the unranked count's total, for every
+    /// clause shape, with `k` at zero, below and above the match count.
+    #[test]
+    fn hits_with_count_matches_bm25_hits_and_count() {
+        let reader = skewed_in_memory_table().reader().expect("reader");
+        let queries = [
+            "alpha",
+            "zebra one",
+            "+alpha +zebra",
+            "+alpha one",
+            "alpha -zebra",
+            "+zebra -one",
+            "nothere",
+        ];
+        for query in queries {
+            let expected = reader.count("title", query, BoolMode::Or).expect("count");
+            for k in [0usize, 1, 2, K_EVERY_MATCH] {
+                let opts = Bm25SearchOptions::new();
+                let pruned = reader
+                    .bm25_hits("title", query, k, opts)
+                    .expect("bm25_hits");
+                let (hits, count) = reader
+                    .bm25_hits_with_count("title", query, k, opts)
+                    .expect("bm25_hits_with_count");
+                assert_same_top_k(&hits, &pruned, &format!("{query:?} k={k}"));
+                assert_eq!(count, expected, "{query:?} k={k}");
+            }
+        }
+    }
+
+    /// Phrase queries go through the atom walk; the exact-count search
+    /// must agree with the pruned search and the count there too.
+    #[test]
+    fn hits_with_count_matches_on_phrases() {
+        let st = Supertable::create(options_positions_one_superfile_per_commit()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["new york city", "york new haven"]))
+            .expect("append");
+        w.commit().expect("commit");
+        w.append(&build_batch(
+            2,
+            &["the new york times", "new haven york", "new york new york"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        let queries = [
+            "\"new york\"",
+            "+\"new york\" +city",
+            "\"new york\" haven",
+            "\"new york\" -\"new haven\"",
+            "+york -\"new york\"",
+        ];
+        for query in queries {
+            let expected = reader.count("title", query, BoolMode::Or).expect("count");
+            for k in [1usize, 2, K_EVERY_MATCH] {
+                let opts = Bm25SearchOptions::new();
+                let pruned = reader
+                    .bm25_hits("title", query, k, opts)
+                    .expect("bm25_hits");
+                let (hits, count) = reader
+                    .bm25_hits_with_count("title", query, k, opts)
+                    .expect("bm25_hits_with_count");
+                assert_same_top_k(&hits, &pruned, &format!("{query:?} k={k}"));
+                assert_eq!(count, expected, "{query:?} k={k}");
+            }
+        }
+    }
+
+    /// A deleted row is neither a hit nor counted, matching `count`.
+    #[test]
+    fn hits_with_count_excludes_tombstoned_docs() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(0, &["alpha one", "alpha two", "alpha three"]))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.delete(col("title").eq(lit("alpha two")))
+            .expect("delete");
+        let reader = st.reader().expect("reader");
+        let expected = reader.count("title", "alpha", BoolMode::Or).expect("count");
+        assert_eq!(expected, 2);
+        for k in [1usize, K_EVERY_MATCH] {
+            let (hits, count) = reader
+                .bm25_hits_with_count("title", "alpha", k, Bm25SearchOptions::new())
+                .expect("bm25_hits_with_count");
+            assert_eq!(count, expected, "k={k}");
+            assert_eq!(hits.len(), k.min(2), "k={k}");
+            assert!(
+                hits.iter().all(|h| h.local_doc_id != 1),
+                "the deleted row is not a hit"
+            );
+        }
     }
 
     /// Like [`options_one_superfile_per_commit`] but with the `title`
