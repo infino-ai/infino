@@ -1547,19 +1547,22 @@ impl SupertableWriter {
         // are tied to `batch`, which the caller reclaims after this returns.
         let vectors = owned_vector_arrays(batch, &manifest)?;
 
-        // Mint one id per row and prepend the id column. The lock
-        // is held only long enough to drain N ids into the Vec.
+        // Reserve one id per row and prepend the id column. The lock is
+        // held only to reserve the ids as spans (one clock read per ms of
+        // sequence, so almost always one); they are expanded after it is
+        // released, so concurrent appends on this handle wait on the
+        // reservation, not on the batch's length.
         let n_rows = scalar_no_id.num_rows();
+        let id_spans = self
+            .inner
+            .id_generator
+            .lock()
+            .expect("id_generator mutex poisoned")
+            .reserve_range(n_rows);
         let mut ids: Vec<i128> = Vec::with_capacity(n_rows);
-        {
-            let generator = self
-                .inner
-                .id_generator
-                .lock()
-                .expect("id_generator mutex poisoned");
-            for _ in 0..n_rows {
-                ids.push(generator.next_id());
-            }
+        for (first, last) in id_spans {
+            let len = (last - first) as usize + 1;
+            ids.extend((0..len).map(|i| first + i as i128));
         }
 
         let scalar = with_id_column(&scalar_no_id, ids, &options.id_column);
@@ -1821,7 +1824,7 @@ impl SupertableWriter {
         let (wal_id_value, minted_id_spans, preallocated_superfile_id) = {
             let idgen = self.inner.id_generator.lock().expect("idgen mutex");
             let spans = idgen
-                .reserve_range(matched as u32)
+                .reserve_range(matched)
                 .into_iter()
                 .map(|(first, last)| IdSpan {
                     first: RowId(first),

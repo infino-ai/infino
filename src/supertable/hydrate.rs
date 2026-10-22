@@ -279,10 +279,12 @@ fn build_hydrate_shard(
 ) -> Result<ShardOutput, BuildError> {
     // `target_rows` is clamped to this, so only a single oversized input batch
     // can get here.
-    let n_ids = u32::try_from(chunk.rows).map_err(|_| BuildError::HydrateChunkTooLarge {
-        rows: chunk.rows,
-        max: MAX_SUPERFILE_ROWS,
-    })?;
+    if chunk.rows > MAX_SUPERFILE_ROWS as usize {
+        return Err(BuildError::HydrateChunkTooLarge {
+            rows: chunk.rows,
+            max: MAX_SUPERFILE_ROWS,
+        });
+    }
 
     // Reserve all ids for the chunk under one short lock. Ids are monotonic, so
     // the min/max are just the first and last of the reserved spans.
@@ -291,7 +293,7 @@ fn build_hydrate_shard(
             .id_generator
             .lock()
             .expect("id_generator mutex poisoned");
-        generator.reserve_range(n_ids)
+        generator.reserve_range(chunk.rows)
     };
     let id_min = id_spans.first().map_or(0, |&(first, _)| first);
     let id_max = id_spans.last().map_or(0, |&(_, last)| last);

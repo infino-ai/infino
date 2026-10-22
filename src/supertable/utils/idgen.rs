@@ -20,47 +20,48 @@
 //! `i128` comparison matches time order, giving cheap
 //! skip-pruning by id range at the manifest layer.
 //!
-//! The generator is single-threaded by construction
-//! (ferroid's `BasicSnowflakeGenerator` is interior-mutable
-//! via `Cell`, so it's `!Sync`). One generator per supertable
-//! handle is the intended usage; the supertable's writer-slot
-//! lock already serializes `append()` per handle, so no
-//! cross-thread sharing is needed.
+//! Ids are handed out in claims: one clock read takes as many
+//! sequence numbers as the caller needs, up to what is left in
+//! the current millisecond. A single id is a claim of one; a
+//! batch of `n` rows ([`IdGenerator::reserve_range`]) is one
+//! claim per millisecond of sequence it needs, so the caller
+//! holds the generator for a handful of clock reads rather than
+//! for `n` of them and expands the spans after letting go.
+//!
+//! The generator is single-threaded by construction (its state
+//! is a `Cell`, so it's `!Sync`). One generator per supertable
+//! handle is the intended usage; the handle keeps it behind a
+//! mutex, which concurrent appends on that handle take.
 
-use std::{fmt, hint};
+use std::{cell::Cell, fmt, hint};
 
-use ferroid::{
-    generator::BasicSnowflakeGenerator,
-    time::{MonotonicClock, UNIX_EPOCH},
-};
+use ferroid::time::{MonotonicClock, TimeSource, UNIX_EPOCH};
 use rand::random;
-
-// 64-bit timestamp + 40-bit machine + 24-bit sequence, packed
-// in a u128. The macro generates constructors, accessors, and
-// the `SnowflakeId` + `Id` trait impls ferroid's generator
-// needs. `reserved: 0` leaves all 128 bits as live payload —
-// our high bit stays 0 by virtue of the timestamp magnitude,
-// not by reservation.
-ferroid::define_snowflake_id!(
-    InfinoId128, u128,
-    reserved: 0,
-    timestamp: 64,
-    machine_id: 40,
-    sequence: 24
-);
 
 const WORKER_BITS: u32 = 40;
 const WORKER_MASK: u64 = (1u64 << WORKER_BITS) - 1;
+const SEQUENCE_BITS: u32 = 24;
+const SEQUENCE_MASK: u128 = (1u128 << SEQUENCE_BITS) - 1;
+const TIMESTAMP_SHIFT: u32 = WORKER_BITS + SEQUENCE_BITS;
 
 /// Single-threaded id generator. One per supertable handle.
 ///
 /// Construction is cheap: one `rand::random::<u64>()` call for
 /// [`Self::new`], zero for [`Self::with_worker_id`].
 /// [`Self::next_id`] is `&self` (interior-mutable) and runs
-/// at ~2 ns/id single-threaded.
+/// at ~3 ns/id single-threaded; [`Self::reserve_range`] costs
+/// one clock read per millisecond of sequence it spans.
 pub struct IdGenerator {
     worker_id: u64,
-    inner: BasicSnowflakeGenerator<InfinoId128, MonotonicClock>,
+    /// `worker_id` in its place in the id, below the timestamp.
+    worker_bits: u128,
+    /// Milliseconds since the Unix epoch, published by a shared
+    /// ticker thread, so reading it is a load rather than a syscall
+    /// and it never steps backwards.
+    clock: MonotonicClock<1>,
+    /// The last id handed out, or 0 before the first. Its timestamp
+    /// and sequence fields are where the next claim continues from.
+    last: Cell<u128>,
 }
 
 impl IdGenerator {
@@ -82,10 +83,11 @@ impl IdGenerator {
     /// known-disjoint worker_ids in a single process.
     pub fn with_worker_id(worker_id: u64) -> Self {
         let worker40 = worker_id & WORKER_MASK;
-        let clock = MonotonicClock::<1>::with_epoch(UNIX_EPOCH);
         Self {
             worker_id: worker40,
-            inner: BasicSnowflakeGenerator::new(worker40 as u128, clock),
+            worker_bits: u128::from(worker40) << SEQUENCE_BITS,
+            clock: MonotonicClock::<1>::with_epoch(UNIX_EPOCH),
+            last: Cell::new(0),
         }
     }
 
@@ -104,23 +106,13 @@ impl IdGenerator {
     ///
     /// **Single-threaded contract.** Calling this from
     /// multiple threads concurrently is a logic error — the
-    /// underlying ferroid generator is `!Sync` and the
-    /// borrow checker will refuse. Appends on one handle
-    /// run concurrently, so the supertable keeps its
-    /// generator behind a mutex; that mutex is required.
-    ///
-    /// **Clock skew.** On a backward wall-clock step, ferroid
-    /// spins via the closure passed to `next_id` until the
-    /// clock catches up. In practice unreachable; included
-    /// for correctness.
+    /// generator is `!Sync` and the borrow checker will
+    /// refuse. Appends on one handle run concurrently, so
+    /// the supertable keeps its generator behind a mutex;
+    /// that mutex is required.
     #[inline]
     pub fn next_id(&self) -> i128 {
-        let id: InfinoId128 = self.inner.next_id(|_| hint::spin_loop());
-        // High bit is 0 for current-era Unix-ms timestamps
-        // (today ≈ 1.7×10¹² ms = 41 bits; the high bit is bit
-        // 127, ~86 bits past the timestamp field). The `as
-        // i128` cast is lossless under that invariant.
-        id.to_raw() as i128
+        self.claim(1).0
     }
 
     /// Reserve `n` ids in advance and return them as an ordered
@@ -129,19 +121,22 @@ impl IdGenerator {
     /// distinct, monotonically-increasing ids.
     ///
     /// **Why spans and not a single `(first, last)`:** the
-    /// underlying ferroid generator's per-ms sequence field is
-    /// 24 bits wide. Once the sequence is exhausted within a
-    /// millisecond, the generator blocks for the next ms tick
-    /// before minting again. Two ids straddling a ms boundary
-    /// are not numerically contiguous (the timestamp field
-    /// changes), so a single-range return type can't describe
-    /// the reservation honestly under contention. The spans
-    /// shape makes that boundary visible: under typical use
-    /// the result is a `Vec` of length 1; under contention it
-    /// grows by one per ms boundary crossed mid-call.
+    /// sequence field is 24 bits wide, so one millisecond holds
+    /// at most 2^24 ids. A reservation that needs more than the
+    /// current millisecond has left continues in the next one,
+    /// and two ids straddling a ms boundary are not numerically
+    /// contiguous (the timestamp field changes). The spans shape
+    /// makes that boundary visible: under typical use the result
+    /// is a `Vec` of length 1; it grows by one per ms boundary
+    /// the reservation crosses.
     ///
-    /// **Caller contract:** persist the full `Vec` into a
-    /// durable artifact (the WAL state doc) BEFORE doing any
+    /// Each span is one claim on the generator, so the cost is
+    /// one clock read per span, not one per id. Callers hold the
+    /// generator's lock only for this call and expand the spans
+    /// after releasing it.
+    ///
+    /// **Caller contract (update):** persist the full `Vec` into
+    /// a durable artifact (the WAL state doc) BEFORE doing any
     /// work that depends on the ids. Recovery reads the spans
     /// verbatim and never re-runs `reserve_range` — a recovering
     /// process has a different `worker_id` and would mint
@@ -149,30 +144,51 @@ impl IdGenerator {
     /// replay-safe append phase needs.
     ///
     /// `n == 0` returns an empty `Vec` without any minting.
-    pub fn reserve_range(&self, n: u32) -> Vec<(i128, i128)> {
-        if n == 0 {
-            return Vec::new();
-        }
+    pub fn reserve_range(&self, n: usize) -> Vec<(i128, i128)> {
         let mut spans: Vec<(i128, i128)> = Vec::with_capacity(1);
-        let first = self.next_id();
-        let mut span_first = first;
-        let mut span_last = first;
-        // We've already minted one id; mint `n - 1` more,
-        // extending the current span when the next id is
-        // numerically adjacent and starting a new span at any
-        // discontinuity (which signals a ms boundary).
-        for _ in 1..n {
-            let id = self.next_id();
-            if id == span_last + 1 {
-                span_last = id;
-            } else {
-                spans.push((span_first, span_last));
-                span_first = id;
-                span_last = id;
-            }
+        let mut left = n;
+        while left > 0 {
+            let (first, count) = self.claim(left);
+            spans.push((first, first + (count as i128 - 1)));
+            left -= count;
         }
-        spans.push((span_first, span_last));
         spans
+    }
+
+    /// Take up to `max` (> 0) consecutive ids from one millisecond:
+    /// the rest of the current millisecond's sequence if the clock has
+    /// not moved, else a fresh millisecond starting at sequence 0.
+    /// Returns the first id and how many were taken (at least 1). Waits
+    /// for the next tick when the current millisecond is used up.
+    #[inline]
+    fn claim(&self, max: usize) -> (i128, usize) {
+        debug_assert!(max > 0, "a claim takes at least one id");
+        loop {
+            let now: u64 = self.clock.current_millis();
+            let last = self.last.get();
+            let last_ms = (last >> TIMESTAMP_SHIFT) as u64;
+            let (first, room) = if now > last_ms {
+                (
+                    (u128::from(now) << TIMESTAMP_SHIFT) | self.worker_bits,
+                    SEQUENCE_MASK + 1,
+                )
+            } else if now == last_ms && last & SEQUENCE_MASK < SEQUENCE_MASK {
+                (last + 1, SEQUENCE_MASK - (last & SEQUENCE_MASK))
+            } else {
+                // This millisecond's sequence is used up (or, never
+                // in practice, the clock reads behind the last id).
+                // The ticker publishes the next millisecond shortly.
+                hint::spin_loop();
+                continue;
+            };
+            let count = room.min(max as u128);
+            self.last.set(first + (count - 1));
+            // High bit is 0 for current-era Unix-ms timestamps
+            // (today ≈ 1.7×10¹² ms = 41 bits; the high bit is bit
+            // 127, ~86 bits past the timestamp field). The `as
+            // i128` cast is lossless under that invariant.
+            return (first as i128, count as usize);
+        }
     }
 }
 
@@ -408,11 +424,11 @@ mod tests {
         // span boundaries. We assert flat.len() == n and no
         // duplicates regardless of whether we span 1 or N ms.
         let g = IdGenerator::with_worker_id(0xCAFE);
-        let n = 10_000u32;
+        let n = 10_000;
         let spans = g.reserve_range(n);
         let flat = flatten_spans(&spans);
-        assert_eq!(flat.len(), n as usize);
-        let mut seen = HashSet::with_capacity(n as usize);
+        assert_eq!(flat.len(), n);
+        let mut seen = HashSet::with_capacity(n);
         for id in &flat {
             assert!(
                 seen.insert(*id),
@@ -485,6 +501,55 @@ mod tests {
             );
             sleep(time::Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn reserve_range_past_one_ms_of_sequence_splits_at_the_ms_boundary() {
+        // One millisecond holds 2^24 ids, so a reservation of more
+        // than that must take the rest of the current millisecond and
+        // continue in a later one. Check the boundary exactly: the
+        // first span runs to the last sequence number, every later
+        // span starts a later millisecond at sequence 0, no span
+        // straddles a millisecond, and the spans add up to `n`.
+        let worker = 0x00AB_CDEF_0123;
+        let g = IdGenerator::with_worker_id(worker);
+        let before = g.next_id();
+        let n = (1usize << SEQUENCE_BITS) + 1_000;
+        let spans = g.reserve_range(n);
+
+        assert!(spans.len() >= 2, "{n} ids cannot fit one ms: {spans:?}");
+        let total: usize = spans.iter().map(|&(f, l)| (l - f + 1) as usize).sum();
+        assert_eq!(total, n);
+        assert!(
+            spans[0].0 > before,
+            "a reservation continues after the last id"
+        );
+        assert_eq!(
+            sequence_of(spans[0].1),
+            SEQUENCE_MASK as u32,
+            "the first span takes the rest of its millisecond"
+        );
+        for &(first, last) in &spans {
+            assert!(last >= first, "span ({first}, {last}) is inverted");
+            assert_eq!(timestamp_of(first), timestamp_of(last), "a span is one ms");
+            assert_eq!(worker_id_of(first), worker);
+            assert_eq!(worker_id_of(last), worker);
+        }
+        for pair in spans.windows(2) {
+            let ((_, prev_last), (next_first, _)) = (pair[0], pair[1]);
+            assert!(timestamp_of(next_first) > timestamp_of(prev_last));
+            assert_eq!(sequence_of(next_first), 0, "a new ms starts at sequence 0");
+        }
+    }
+
+    #[test]
+    fn next_id_after_reserve_range_continues_past_it() {
+        // A reservation advances the generator to its last id, so the
+        // next single id cannot land inside any reserved span.
+        let g = IdGenerator::with_worker_id(0x77);
+        let spans = g.reserve_range(1_000);
+        let reserved_last = spans.last().expect("non-empty").1;
+        assert!(g.next_id() > reserved_last);
     }
 
     // ---- cross-worker isolation ----------------------------------------
