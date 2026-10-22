@@ -482,7 +482,12 @@ async fn intersection_pruned_matches_unpruned() {
         let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
         for d in 0..n_docs {
             let mut text = String::new();
-            for (term, odds) in [("common", 600u64), ("mid", 150), ("mida", 300), ("midb", 400)] {
+            for (term, odds) in [
+                ("common", 600u64),
+                ("mid", 150),
+                ("mida", 300),
+                ("midb", 400),
+            ] {
                 if rng() % 1000 < odds {
                     for _ in 0..1 + rng() % 4 {
                         text.push_str(term);

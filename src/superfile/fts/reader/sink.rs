@@ -117,11 +117,9 @@ impl<I: Ord> Ord for TopKEntry<I> {
 /// sort has no observable reorderings.
 pub(super) fn drain_top_k_desc<I: Ord + Copy>(heap: BinaryHeap<TopKEntry<I>>) -> Vec<(I, f32)> {
     let mut out: Vec<(I, f32)> = heap.into_iter().map(|TopKEntry(s, d)| (d, s)).collect();
-    out.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    // `total_cmp` orders a score that is never NaN exactly as `partial_cmp`
+    // does, with an integer compare instead of an `Option` per step.
+    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     out
 }
 
