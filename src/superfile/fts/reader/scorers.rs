@@ -706,19 +706,16 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok(Vec::new());
         }
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
-
-        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let mut sink = ScoreSink {
-            heap: &mut heap,
-            k,
-            filter,
-            floor_eff,
-        };
-        self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
-        Ok(drain_top_k_desc(heap))
+        let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            let mut sink = ScoreSink {
+                heap,
+                k,
+                filter,
+                floor_eff,
+            };
+            self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
+        });
+        Ok(hits)
     }
 
     /// [`Self::run_and_intersect`] with pruning off: every intersection
@@ -733,20 +730,31 @@ impl FtsReader {
         if cursors.is_empty() {
             return Ok((Vec::new(), 0));
         }
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
+        Ok(self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            let mut sink = ScoreCountSink {
+                heap,
+                k,
+                filter,
+                count: 0,
+            };
+            self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
+            sink.count
+        }))
+    }
 
+    /// The heap, norms and drain shared by the ranked AND walks. `walk`
+    /// fills the heap and returns whatever else it tallied.
+    fn scored_top_k<R>(
+        &self,
+        column_id: u32,
+        k: usize,
+        walk: impl FnOnce(&NormTable, &mut BinaryHeap<TopKEntry>) -> R,
+    ) -> (Vec<(FtsDocId, f32)>, R) {
+        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let mut sink = ScoreCountSink {
-            heap: &mut heap,
-            k,
-            filter,
-            count: 0,
-        };
-        self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
-        let count = sink.count;
-        Ok((drain_top_k_desc(heap), count))
+        let extra = walk(dl_norm_k1, &mut heap);
+        (drain_top_k_desc(heap), extra)
     }
 
     /// The ranked AND walk for `cursors`, feeding every intersection doc
@@ -951,24 +959,21 @@ impl FtsReader {
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
-        must_cursors.sort_by_key(|c| c.block_count());
-
-        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
-        let mut sink = MustShouldSink {
-            heap: &mut heap,
-            k,
-            filter,
-            floor_eff,
-            shoulds: should_cursors,
-            should_ub,
-            dl_norm_k1,
-        };
-        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
-        Ok(drain_top_k_desc(heap))
+        let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            must_cursors.sort_by_key(|c| c.block_count());
+            let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
+            let mut sink = MustShouldSink {
+                heap,
+                k,
+                filter,
+                floor_eff,
+                shoulds: should_cursors,
+                should_ub,
+                dl_norm_k1,
+            };
+            self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+        });
+        Ok(hits)
     }
 
     /// [`Self::run_must_should`] with pruning off: every must-intersection
@@ -985,23 +990,19 @@ impl FtsReader {
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
-        let col_meta = &self.columns[column_id as usize];
-        let dl_norm_k1 = col_meta.dl_norm_k1();
-        must_cursors.sort_by_key(|c| c.block_count());
-
-        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
-        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
-        let mut sink = MustShouldCountSink {
-            heap: &mut heap,
-            k,
-            filter,
-            shoulds: should_cursors,
-            dl_norm_k1,
-            count: 0,
-        };
-        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
-        let count = sink.count;
-        Ok((drain_top_k_desc(heap), count))
+        Ok(self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            must_cursors.sort_by_key(|c| c.block_count());
+            let mut sink = MustShouldCountSink {
+                heap,
+                k,
+                filter,
+                shoulds: should_cursors,
+                dl_norm_k1,
+                count: 0,
+            };
+            self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+            sink.count
+        }))
     }
 
     /// Unranked multi-term AND: the matching doc ids in ascending order

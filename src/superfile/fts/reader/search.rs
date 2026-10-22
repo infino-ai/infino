@@ -505,6 +505,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
                 count: 0,
+                exact_count: lists.exact_count,
                 postings_bytes: 0,
                 planned_ranges: 0,
                 kernel_cpu_ns: 0,
@@ -515,6 +516,7 @@ impl FtsReader {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes: 0,
                     planned_ranges: 0,
                     kernel_cpu_ns: 0,
@@ -543,6 +545,7 @@ impl FtsReader {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes: atom_cursor_bytes(&built),
                     planned_ranges: atom_planned_ranges(&built) + must_dict,
                     kernel_cpu_ns: 0,
@@ -610,6 +613,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits,
                 count,
+                exact_count: lists.exact_count,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: thread_cpu_delta_ns(kernel_start),
@@ -693,6 +697,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits: result,
                 count: 0,
+                exact_count: false,
                 postings_bytes: term_work.postings_bytes + filter_postings_bytes,
                 planned_ranges: term_work.planned_ranges + filter_ranges + dict_ranges,
                 kernel_cpu_ns,
@@ -718,6 +723,7 @@ impl FtsReader {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
                     count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes,
                     planned_ranges,
                     kernel_cpu_ns: 0,
@@ -730,6 +736,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         // Build must cursors; if any must is missing, the
@@ -754,6 +761,7 @@ impl FtsReader {
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
                 count: 0,
+                exact_count: lists.exact_count,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: 0,
@@ -767,6 +775,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         // Shoulds absent from this superfile contribute nothing;
@@ -790,6 +799,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         Ok(PreparedClauses::MustShould {
@@ -800,6 +810,7 @@ impl FtsReader {
             k,
             floor_eff,
             dict_ranges,
+            exact_count: lists.exact_count,
         })
     }
 
@@ -875,10 +886,19 @@ impl FtsReader {
     /// [`Self::run_prepared`] for clauses prepared with
     /// `ClauseLists::exact_count`: scores every match and returns the
     /// top-k with the exact match count.
+    ///
+    /// The top-k is the ranked search's up to float summation order: the
+    /// exhaustive walks add a doc's term scores in a different order than
+    /// the pruned kernels, so a total can differ in its last bits, and two
+    /// docs tied at the k-th score within that error may swap.
     pub(crate) fn run_prepared_with_count(
         &self,
         prep: PreparedClauses,
     ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        debug_assert!(
+            prep.exact_count(),
+            "run_prepared_with_count takes clauses prepared with exact_count"
+        );
         let (hits, count) = match prep {
             PreparedClauses::Done { hits, count, .. } => (hits, count),
             PreparedClauses::Must {
@@ -926,6 +946,7 @@ impl FtsReader {
                 must_cursors,
                 mut filter,
                 dict_ranges: _,
+                exact_count: _,
                 k,
                 floor_eff,
             } => self.run_and_intersect(column_id, must_cursors, k, filter.as_mut(), floor_eff),
@@ -937,6 +958,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges: _,
+                exact_count: _,
             } => self.run_must_should(
                 column_id,
                 must_cursors,
@@ -952,6 +974,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges: _,
+                exact_count: _,
             } => self.dispatch_or_algo(column_id, cursors, k, filter.as_mut(), floor_eff),
         }
     }
@@ -1782,7 +1805,10 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use bytes::Bytes;
     use roaring::RoaringBitmap;
@@ -1794,6 +1820,105 @@ mod tests {
     const TABLE_IDF_K: usize = 10;
     /// An arbitrary table-wide idf to score with.
     const TABLE_IDF: f32 = 1.5;
+    /// Score slack between the ranked and the exact-count walks: they add
+    /// a doc's term scores in different orders.
+    const SUM_ORDER_EPS: f32 = 1e-4;
+
+    /// The two walks return the same top-k up to float summation order:
+    /// every doc's score agrees within `SUM_ORDER_EPS`, and a doc may be
+    /// on one side only when it ties the k-th score within that slack.
+    fn assert_same_top_k(counted: &[(RowId, f32)], pruned: &[(RowId, f32)], label: &str) {
+        assert_eq!(counted.len(), pruned.len(), "len for {label}");
+        let kth = pruned.last().map_or(f32::NEG_INFINITY, |h| h.1);
+        let scores = |hits: &[(RowId, f32)]| hits.iter().copied().collect::<HashMap<RowId, f32>>();
+        let (a, b) = (scores(counted), scores(pruned));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            for (doc, s) in x {
+                match y.get(doc) {
+                    Some(t) => assert!(
+                        (s - t).abs() < SUM_ORDER_EPS,
+                        "score of {doc:?} for {label}: {s} vs {t}"
+                    ),
+                    None => assert!(
+                        (s - kth).abs() < SUM_ORDER_EPS,
+                        "{doc:?} on one side only and not a k-th tie for {label}: {s} vs {kth}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Many-term ORs, where the ranked and exact-count walks add a doc's
+    /// term scores in different orders: the top-k must agree up to that
+    /// order, and the count must be exact.
+    #[tokio::test]
+    async fn exact_count_matches_ranked_on_random_many_term_ors() {
+        let mut seed = 7u64;
+        let mut rng = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let vocab: Vec<String> = (0..24).map(|i| format!("w{i}")).collect();
+        for trial in 0..6u32 {
+            let n_docs = 1500 + (rng() % 2000) as u32;
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..n_docs {
+                let mut text = String::new();
+                // Early terms are common, late ones rare.
+                for (t, term) in vocab.iter().enumerate() {
+                    if rng().is_multiple_of(3 + t as u64) {
+                        for _ in 0..1 + rng() % 3 {
+                            text.push_str(term);
+                            text.push(' ');
+                        }
+                    }
+                }
+                if text.is_empty() {
+                    text.push_str(&vocab[0]);
+                }
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
+            for q in 0..25u32 {
+                let n_terms = 2 + (rng() % 19) as usize;
+                let shoulds: Vec<&str> = (0..n_terms)
+                    .map(|_| vocab[(rng() % 24) as usize].as_str())
+                    .collect();
+                let negatives: Vec<&str> = match rng() % 3 {
+                    0 => vec![vocab[(rng() % 24) as usize].as_str()],
+                    _ => Vec::new(),
+                };
+                let lists = || ClauseLists {
+                    shoulds: &shoulds,
+                    negatives: &negatives,
+                    ..ClauseLists::default()
+                };
+                let label = format!("trial {trial} q {q} {shoulds:?} -{negatives:?}");
+                let matches = r
+                    .search_excluding("body", lists(), n_docs as usize, f32::NEG_INFINITY)
+                    .await
+                    .expect("every match")
+                    .len() as u64;
+                for k in [1usize, 10, 100] {
+                    let pruned = r
+                        .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                        .await
+                        .expect("pruned search");
+                    let (hits, count) = r
+                        .search_excluding_with_count("body", lists(), k)
+                        .await
+                        .expect("counted search");
+                    assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
+                    assert_eq!(count, matches, "count for {label} k={k}");
+                }
+            }
+        }
+    }
 
     /// For every term clause shape, the exact-count walk returns the
     /// pruned search's top-k, and a count equal both to the number of
@@ -1845,7 +1970,7 @@ mod tests {
                     .search_excluding_with_count("body", lists(), k)
                     .await
                     .expect("counted search");
-                assert_eq!(hits, pruned, "hits for {label} k={k}");
+                assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
                 assert_eq!(count, matches, "count for {label} k={k}");
                 assert_eq!(count, unranked, "unranked count for {label} k={k}");
             }
@@ -1908,7 +2033,7 @@ mod tests {
                     .search_excluding_with_count("title", lists(), k)
                     .await
                     .expect("counted search");
-                assert_eq!(hits, pruned, "hits for {label} k={k}");
+                assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
                 assert_eq!(count, matches, "count for {label} k={k}");
                 assert_eq!(count, unranked, "unranked count for {label} k={k}");
             }
@@ -1934,7 +2059,7 @@ mod tests {
             .search_excluding_with_count("body", lists(), 1)
             .await
             .expect("counted search");
-        assert_eq!(hits, pruned);
+        assert_same_top_k(&hits, &pruned, "allow-set");
         assert_eq!(count, 2, "docs 0 and 2 are allowed and match");
     }
 

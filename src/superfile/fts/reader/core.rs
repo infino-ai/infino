@@ -204,6 +204,8 @@ pub(crate) enum PreparedClauses {
         /// Exact match count when the inline walk ran under
         /// `ClauseLists::exact_count`; 0 otherwise.
         count: u64,
+        /// Whether the clauses were prepared for the exact-count walk.
+        exact_count: bool,
         postings_bytes: u64,
         /// Byte-source ranges the inline walk requested (0 for the df=1
         /// inline-entry and empty-resolution paths).
@@ -224,6 +226,8 @@ pub(crate) enum PreparedClauses {
         /// term-dictionary ranges the builds requested (one per
         /// `build_term_cursors` call — must / should / negation lists).
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
     /// AND with should-boosted scoring.
     MustShould {
@@ -235,6 +239,8 @@ pub(crate) enum PreparedClauses {
         floor_eff: f32,
         /// See [`PreparedClauses::Must::dict_ranges`].
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
     /// Plain multi-term OR (no musts) — algorithm choice resolved in
     /// `run_prepared`.
@@ -246,10 +252,22 @@ pub(crate) enum PreparedClauses {
         floor_eff: f32,
         /// See [`PreparedClauses::Must::dict_ranges`].
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
 }
 
 impl PreparedClauses {
+    /// Whether the clauses were prepared for the exact-count walk.
+    pub(crate) fn exact_count(&self) -> bool {
+        match self {
+            PreparedClauses::Done { exact_count, .. }
+            | PreparedClauses::Must { exact_count, .. }
+            | PreparedClauses::MustShould { exact_count, .. }
+            | PreparedClauses::Or { exact_count, .. } => *exact_count,
+        }
+    }
+
     /// Scan-cost proxy callers gate reader-pool dispatch on: the driving
     /// (smallest) posting list for the AND-intersect shapes, the full
     /// union for OR. `Done` has nothing left to scan, so it's zero.
