@@ -434,47 +434,66 @@ impl SharedTopK {
     /// Merge one finished segment's (tombstone-surviving) scores, from a
     /// superfile whose `_id`s reach `id_max`, and publish the new kth-best
     /// as the floor once k scores are known.
+    ///
+    /// A unit's scores are first held against the live floor outside the
+    /// lock — the floor only rises, so a score below it can never enter —
+    /// which leaves nothing for most units once `k` scores are known. What
+    /// remains enters under the lock: a few entries by binary search and
+    /// insertion, a first-wave unit's many by one sorted linear merge. A
+    /// unit's hits arrive in document order, so nothing here relies on
+    /// theirs.
     fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
-        // Order the unit's scores outside the lock; a kernel's hits usually
-        // arrive in score order already.
-        let mut incoming: Vec<FloorEntry> = scores
+        /// Entries up to which insertion beats a sort and a merge.
+        const FEW: usize = 32;
+        let floor = self.floor.load();
+        let mut entering: Vec<FloorEntry> = scores
             .into_iter()
+            .filter(|&score| score >= floor)
             .map(|score| FloorEntry { score, id_max })
             .collect();
-        if incoming.is_empty() {
+        if entering.is_empty() {
             return;
         }
-        if !incoming.windows(2).all(|w| w[0] >= w[1]) {
-            incoming.sort_unstable_by(|a, b| b.cmp(a));
+        if entering.len() > FEW {
+            entering.sort_unstable_by(|a, b| b.cmp(a));
         }
-        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
         let k = self.k;
+        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
         if top.len() >= k {
-            // Only what beats the k-th can enter.
             let min = top[k - 1];
-            let keep = incoming.partition_point(|e| *e > min);
-            incoming.truncate(keep);
-            if incoming.is_empty() {
+            entering.retain(|e| *e > min);
+            if entering.is_empty() {
                 return;
             }
         }
-        let mut merged: Vec<FloorEntry> = Vec::with_capacity((top.len() + incoming.len()).min(k));
-        let (mut i, mut j) = (0, 0);
-        while merged.len() < k && (i < top.len() || j < incoming.len()) {
-            let take_top = match (top.get(i), incoming.get(j)) {
-                (Some(a), Some(b)) => a >= b,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if take_top {
-                merged.push(top[i]);
-                i += 1;
-            } else {
-                merged.push(incoming[j]);
-                j += 1;
+        if entering.len() <= FEW {
+            for e in entering {
+                let at = top.partition_point(|t| *t >= e);
+                if at < k {
+                    top.insert(at, e);
+                    top.truncate(k);
+                }
             }
+        } else {
+            let mut merged: Vec<FloorEntry> =
+                Vec::with_capacity((top.len() + entering.len()).min(k));
+            let (mut i, mut j) = (0, 0);
+            while merged.len() < k && (i < top.len() || j < entering.len()) {
+                let take_top = match (top.get(i), entering.get(j)) {
+                    (Some(a), Some(b)) => a >= b,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if take_top {
+                    merged.push(top[i]);
+                    i += 1;
+                } else {
+                    merged.push(entering[j]);
+                    j += 1;
+                }
+            }
+            *top = merged;
         }
-        *top = merged;
         if top.len() == k {
             // `raise` rather than a plain store: running walks may have
             // published a higher local kth than this merge's k-th, and the
@@ -1660,7 +1679,7 @@ impl SupertableReader {
                                 floor,
                                 &scoring,
                             )
-                            .instrument(detail_span!("fts.prepare"))
+                            .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
                             .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
@@ -1758,7 +1777,7 @@ impl SupertableReader {
                 // so the bitmap lookup is an in-memory hit; on a cache
                 // miss/error we simply don't merge (a lower floor is
                 // always safe).
-                let _merge = detail_span!("fts.unit_merge").entered();
+                let _merge = trace::phase(phases, || detail_span!("fts.unit_merge")).entered();
                 match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
                     Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
                         id_max,
