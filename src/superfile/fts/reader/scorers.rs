@@ -2197,6 +2197,167 @@ impl FtsReader {
         Ok(drain_top_k_desc(heap))
     }
 
+    /// Every match of a union scored and counted in one pass, for the
+    /// exact-count search: the top `k` and the number of matching documents
+    /// left after `filter`. Nothing is pruned.
+    ///
+    /// A window of [`OR_WINDOW`] documents at a time: each term adds its
+    /// scores into the window four postings per SIMD call and marks
+    /// presence, then the window is drained in ascending document order,
+    /// counted a word at a time and offered to the heap only where a score
+    /// beats the k-th best. A single term needs no window: each block is
+    /// scored in place and its docs offered in order. Same admission rule and
+    /// tie-break as [`Self::run_exhaustive_union`] (`score > threshold`,
+    /// ascending docs), so the hits differ from it at most in summation order.
+    pub(super) fn run_windowed_union_counted(
+        &self,
+        column_id: u32,
+        mut cursors: Vec<TermCursor>,
+        k: usize,
+        mut filter: Option<&mut ExcludeFilter>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
+        let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut threshold: f32 = 0.0;
+        let mut count = 0u64;
+        let offer =
+            |heap: &mut BinaryHeap<TopKEntry>, threshold: &mut f32, doc: u32, score: f32| {
+                if k == 0 {
+                    return;
+                }
+                if heap.len() < k {
+                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
+                    if heap.len() == k {
+                        *threshold = heap.peek().expect("non-empty").0;
+                    }
+                } else if score > *threshold {
+                    replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
+                    *threshold = heap.peek().expect("non-empty").0;
+                }
+            };
+        cursors.retain(|c| !c.is_exhausted());
+        if let [c] = cursors.as_mut_slice() {
+            let mut lane_scores = [0.0f32; BLOCK_LEN];
+            while !c.is_exhausted() {
+                let (from, to) = (c.pos, c.block_n);
+                let mut i = from;
+                while i + bm25::SCORE_SIMD_LANES <= to {
+                    let d = &c.block_doc_ids[i..i + bm25::SCORE_SIMD_LANES];
+                    let t = &c.block_tfs[i..i + bm25::SCORE_SIMD_LANES];
+                    let s = bm25::score_one_term_x4(
+                        c.idf_weight,
+                        [t[0], t[1], t[2], t[3]],
+                        [
+                            dl_norm_k1.get(d[0]),
+                            dl_norm_k1.get(d[1]),
+                            dl_norm_k1.get(d[2]),
+                            dl_norm_k1.get(d[3]),
+                        ],
+                    );
+                    lane_scores[i..i + bm25::SCORE_SIMD_LANES].copy_from_slice(&s);
+                    i += bm25::SCORE_SIMD_LANES;
+                }
+                for j in i..to {
+                    let d = c.block_doc_ids[j];
+                    lane_scores[j] = bm25::score_with_dl_norm_k1(
+                        c.idf_weight,
+                        c.block_tfs[j],
+                        dl_norm_k1.get(d),
+                    );
+                }
+                for j in from..to {
+                    let doc = c.block_doc_ids[j];
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(doc)
+                    {
+                        continue;
+                    }
+                    count += 1;
+                    offer(&mut heap, &mut threshold, doc, lane_scores[j]);
+                }
+                c.advance_by(to - from);
+            }
+            return Ok((drain_top_k_desc(heap), count));
+        }
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
+        let mut present = [0u64; OR_WINDOW_WORDS];
+        loop {
+            let mut min_doc = u32::MAX;
+            for c in &cursors {
+                if !c.is_exhausted() {
+                    min_doc = min_doc.min(c.current_doc_id());
+                }
+            }
+            if min_doc == u32::MAX {
+                break;
+            }
+            let base = min_doc & !(OR_WINDOW - 1);
+            let window_end = base.saturating_add(OR_WINDOW);
+            for c in &mut cursors {
+                while !c.is_exhausted() {
+                    let d = c.current_doc_id();
+                    if d >= window_end {
+                        break;
+                    }
+                    let pos = c.pos;
+                    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
+                        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
+                        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
+                        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
+                            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
+                            let contributions = bm25::score_one_term_x4(
+                                c.idf_weight,
+                                [tfs[0], tfs[1], tfs[2], tfs[3]],
+                                [
+                                    dl_norm_k1.get(doc_ids[0]),
+                                    dl_norm_k1.get(doc_ids[1]),
+                                    dl_norm_k1.get(doc_ids[2]),
+                                    dl_norm_k1.get(doc_ids[3]),
+                                ],
+                            );
+                            for lane in 0..bm25::SCORE_SIMD_LANES {
+                                let local = (doc_ids[lane] - base) as usize;
+                                scores[local] += contributions[lane];
+                                present[local >> 6] |= 1u64 << (local & 63);
+                            }
+                            c.advance_by(bm25::SCORE_SIMD_LANES);
+                            continue;
+                        }
+                    }
+                    let local = (d - base) as usize;
+                    scores[local] += bm25::score_with_dl_norm_k1(
+                        c.idf_weight,
+                        c.current_tf(),
+                        dl_norm_k1.get(d),
+                    );
+                    present[local >> 6] |= 1u64 << (local & 63);
+                    c.next();
+                }
+            }
+            for (word_idx, word) in present.iter_mut().enumerate() {
+                let mut bits = std::mem::take(word);
+                if filter.is_none() {
+                    count += u64::from(bits.count_ones());
+                }
+                while bits != 0 {
+                    let local = (word_idx << 6) | bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    let score = std::mem::take(&mut scores[local]);
+                    let doc = base + local as u32;
+                    if let Some(f) = filter.as_deref_mut() {
+                        if !f.admits(doc) {
+                            continue;
+                        }
+                        count += 1;
+                    }
+                    offer(&mut heap, &mut threshold, doc, score);
+                }
+            }
+        }
+        Ok((drain_top_k_desc(heap), count))
+    }
+
     /// Windowed MaxScore: one kernel that adapts to the running k-th
     /// threshold per window, so a query needs no a-priori choice between the
     /// windowed OR-sum and per-candidate pruning. Each window recomputes the

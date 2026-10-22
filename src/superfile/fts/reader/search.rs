@@ -940,7 +940,7 @@ impl FtsReader {
                 mut filter,
                 k,
                 ..
-            } => self.run_exhaustive_union(column_id, cursors, k, filter.as_mut())?,
+            } => self.run_windowed_union_counted(column_id, cursors, k, filter.as_mut())?,
         };
         Ok((self.hits_to_rows(hits), count))
     }
