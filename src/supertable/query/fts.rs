@@ -420,20 +420,6 @@ impl SharedTopK {
         })
     }
 
-    /// The top-k under its lock. A unit holds the lock for microseconds and
-    /// a conjunction's units all finish together, so a waiter spins briefly
-    /// before it parks: parking costs a wake-up per handoff, and a queue of
-    /// forty units paid that forty times over.
-    fn lock_top(&self) -> std::sync::MutexGuard<'_, Vec<FloorEntry>> {
-        for _ in 0..2_000 {
-            if let Ok(guard) = self.top.try_lock() {
-                return guard;
-            }
-            std::hint::spin_loop();
-        }
-        self.top.lock().expect("SharedTopK mutex poisoned")
-    }
-
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
         self.floor.load()
@@ -449,13 +435,15 @@ impl SharedTopK {
     /// superfile whose `_id`s reach `id_max`, and publish the new kth-best
     /// as the floor once k scores are known.
     ///
-    /// A unit's scores are first held against the live floor outside the
-    /// lock — the floor only rises, so a score below it can never enter —
-    /// which leaves nothing for most units once `k` scores are known. What
-    /// remains enters under the lock: a few entries by binary search and
-    /// insertion, a first-wave unit's many by one sorted linear merge. A
-    /// unit's hits arrive in document order, so nothing here relies on
-    /// theirs.
+    /// A unit's scores are first held against the live floor — the floor
+    /// only rises, so a score below it can never enter — which leaves
+    /// nothing for most units once `k` scores are known. What remains
+    /// enters the top: a few entries by binary search and insertion, a
+    /// first-wave unit's many by one sorted linear merge. A unit's hits
+    /// arrive in document order, so nothing here relies on theirs. The
+    /// ceiling-ordered fan-out calls this from the one task that drives
+    /// it, as each unit finishes; only the unordered fan-out's units call
+    /// it themselves, and those all run at once.
     fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
         /// Entries up to which insertion beats a sort and a merge.
         const FEW: usize = 32;
@@ -472,26 +460,14 @@ impl SharedTopK {
             entering.sort_unstable_by(|a, b| b.cmp(a));
         }
         let k = self.k;
-        let brought = entering.len();
-        let waited = Instant::now();
-        let mut top = self.lock_top();
-        let wait_us = waited.elapsed().as_micros() as u64;
-        let held = Instant::now();
+        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
         if top.len() >= k {
             let min = top[k - 1];
             entering.retain(|e| *e > min);
             if entering.is_empty() {
-                tracing::trace!(
-                    brought,
-                    entered = 0u64,
-                    wait_us,
-                    hold_us = held.elapsed().as_micros() as u64,
-                    "floor merge"
-                );
                 return;
             }
         }
-        let entered = entering.len();
         if entering.len() <= FEW {
             for e in entering {
                 let at = top.partition_point(|t| *t >= e);
@@ -526,13 +502,6 @@ impl SharedTopK {
             // floor must never move down.
             self.floor.raise(top[k - 1].score);
         }
-        tracing::trace!(
-            brought,
-            entered,
-            wait_us,
-            hold_us = held.elapsed().as_micros() as u64,
-            "floor merge"
-        );
     }
 
     /// Whether a superfile whose `_id`s start at `id_min` and whose
@@ -550,7 +519,7 @@ impl SharedTopK {
     /// it. A floor the live walks have raised above the k-th entry has no
     /// entry to compare against here and keeps the superfile open.
     fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
-        let top = self.lock_top();
+        let top = self.top.lock().expect("SharedTopK mutex poisoned");
         top.len() >= self.k && {
             let last = top[self.k - 1];
             last.score == floor && last.id_max < id_min
@@ -1463,6 +1432,7 @@ impl SupertableReader {
             shared.merge(id_max, scores);
         }
         let floor_handle = Arc::clone(&shared);
+        let merger = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
         let op_stats = self.op_stats.clone();
         let now = Instant::now();
@@ -1501,6 +1471,7 @@ impl SupertableReader {
                 .collect(),
             None => HashSet::new(),
         });
+        let merge_in_unit = exact_count || ceilings.is_none();
         let kernel = move |r: Arc<SuperfileReader>, params: UnitParams| {
             let UnitParams {
                 range,
@@ -1810,22 +1781,21 @@ impl SupertableReader {
                 // so the bitmap lookup is an in-memory hit; on a cache
                 // miss/error we simply don't merge (a lower floor is
                 // always safe).
-                let _merge = trace::phase(phases, || detail_span!("fts.unit_merge")).entered();
-                let bitmap_at = Instant::now();
-                let bitmap = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
-                tracing::trace!(
-                    bitmap_us = bitmap_at.elapsed().as_micros() as u64,
-                    "tombstone bitmap"
-                );
-                match bitmap {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                        id_max,
-                        hits.iter()
-                            .filter(|(d, _)| !bitmap.contains(d.get()))
-                            .map(|(_, s)| *s),
-                    ),
-                    Some(Err(_)) => {}
-                    _ => shared.merge(id_max, hits.iter().map(|(_, s)| *s)),
+                // Under the ceiling-ordered fan-out the driver merges a
+                // unit's surviving scores as the unit finishes; the
+                // unordered fan-out's units, all running at once, merge
+                // their own here.
+                if merge_in_unit {
+                    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                            id_max,
+                            hits.iter()
+                                .filter(|(d, _)| !bitmap.contains(d.get()))
+                                .map(|(_, s)| *s),
+                        ),
+                        Some(Err(_)) => {}
+                        _ => shared.merge(id_max, hits.iter().map(|(_, s)| *s)),
+                    }
                 }
                 Ok(rows_as_local_ids(hits))
             }
@@ -1847,6 +1817,10 @@ impl SupertableReader {
                 // needs the superfiles' `_id` ranges disjoint and an exact
                 // comparison: no tolerance widening the floor.
                 let tie_walk = score_tolerance <= 0.0 && id_ranges_disjoint(&kept);
+                // The driver folds each finished unit's surviving scores
+                // (tombstoned ones are already gone) into the floor.
+                let id_max_of: HashMap<SuperfileUri, i128> =
+                    units.iter().map(|(_, p)| (p.uri, p.id_max)).collect();
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
@@ -1859,6 +1833,13 @@ impl SupertableReader {
                                 && floor_handle.tie_skippable(floor, params.id_min))
                     },
                     kernel,
+                    move |hits: &Vec<SuperfileHit>| {
+                        if let Some(first) = hits.first()
+                            && let Some(&id_max) = id_max_of.get(&first.superfile)
+                        {
+                            merger.merge(id_max, hits.iter().map(|h| h.score));
+                        }
+                    },
                 )
                 .instrument(fanout_span)
                 .await?

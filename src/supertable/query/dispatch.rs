@@ -750,6 +750,7 @@ pub(crate) async fn fanout_with_ordered<P, R, B, Fut, S>(
     window: usize,
     skip_before_open: S,
     body: B,
+    mut on_result: impl FnMut(&R),
 ) -> Result<Vec<R>, QueryError>
 where
     P: Send + 'static,
@@ -783,7 +784,8 @@ where
             true => Vec::new(),
             false => vec![ctx.run(body, entry, params).await?],
         };
-        if !out.is_empty() {
+        if let Some(r) = out.first() {
+            on_result(r);
             reader.note_open_cost(started.elapsed().as_nanos() as u64);
         }
         if let Some(tiers) = &tiers {
@@ -805,8 +807,16 @@ where
             }
             in_flight.push(ctx.spawn(&body, entry, params));
         }
+        // A finished unit is seen here, on the one task that drives the
+        // fan-out, before the next unit starts: what the caller folds from
+        // it (a floor from its scores) needs no lock the units would queue
+        // on.
         match in_flight.next().await {
-            Some(result) => out.push(result?),
+            Some(result) => {
+                let r = result?;
+                on_result(&r);
+                out.push(r);
+            }
             None => break,
         }
     }
@@ -854,6 +864,7 @@ pub(crate) async fn fanout_local_hits_ordered<P, K, Fut, S>(
     window: usize,
     skip_before_open: S,
     kernel: K,
+    on_result: impl FnMut(&Vec<SuperfileHit>),
 ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
 where
     P: Send + 'static,
@@ -867,6 +878,7 @@ where
         window,
         skip_before_open,
         local_hits_body(kernel),
+        on_result,
     )
     .await
 }
