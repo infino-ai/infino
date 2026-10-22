@@ -641,6 +641,36 @@ fn must_lead_should_walk(
     }
 }
 
+/// Add four ascending documents' contributions into a window and mark them
+/// present. Consecutive documents of a block usually share a presence word,
+/// and four read-modify-writes of one word wait on each other's stores; when
+/// the first and last share it, one combined write replaces the four.
+#[inline(always)]
+fn mark_four(
+    scores: &mut [f32],
+    present: &mut [u64],
+    base: u32,
+    doc_ids: [u32; bm25::SCORE_SIMD_LANES],
+    contributions: [f32; bm25::SCORE_SIMD_LANES],
+) {
+    let local = doc_ids.map(|d| (d - base) as usize);
+    for lane in 0..bm25::SCORE_SIMD_LANES {
+        scores[local[lane]] += contributions[lane];
+    }
+    let (first, last) = (local[0] >> 6, local[bm25::SCORE_SIMD_LANES - 1] >> 6);
+    if first == last {
+        let mut bits = 0u64;
+        for l in local {
+            bits |= 1u64 << (l & 63);
+        }
+        present[first] |= bits;
+    } else {
+        for l in local {
+            present[l >> 6] |= 1u64 << (l & 63);
+        }
+    }
+}
+
 /// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
 /// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
 /// when the block bound allows and `weak` holds the doc. `weak` is only
@@ -2159,11 +2189,7 @@ impl FtsReader {
                                     dl_norm_k1.get(doc_ids[3]),
                                 ],
                             );
-                            for lane in 0..bm25::SCORE_SIMD_LANES {
-                                let local = (doc_ids[lane] - base) as usize;
-                                scores[local] += contributions[lane];
-                                present[local >> 6] |= 1u64 << (local & 63);
-                            }
+                            mark_four(&mut scores, &mut present, base, doc_ids, contributions);
                             c.advance_by(bm25::SCORE_SIMD_LANES);
                             continue;
                         }
@@ -2331,11 +2357,7 @@ impl FtsReader {
                                     dl_norm_k1.get(doc_ids[3]),
                                 ],
                             );
-                            for lane in 0..bm25::SCORE_SIMD_LANES {
-                                let local = (doc_ids[lane] - base) as usize;
-                                scores[local] += contributions[lane];
-                                present[local >> 6] |= 1u64 << (local & 63);
-                            }
+                            mark_four(&mut scores, &mut present, base, doc_ids, contributions);
                             c.advance_by(bm25::SCORE_SIMD_LANES);
                             continue;
                         }
@@ -2809,11 +2831,7 @@ impl FtsReader {
                                     dl_norm_k1.get(doc_ids[3]),
                                 ],
                             );
-                            for lane in 0..bm25::SCORE_SIMD_LANES {
-                                let local = (doc_ids[lane] - base) as usize;
-                                scores[local] += contributions[lane];
-                                present[local >> 6] |= 1u64 << (local & 63);
-                            }
+                            mark_four(&mut scores, &mut present, base, doc_ids, contributions);
                             c.advance_by(bm25::SCORE_SIMD_LANES);
                             continue;
                         }
