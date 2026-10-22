@@ -4602,3 +4602,16 @@ mod tests {
         assert!(ids.contains(&0) && ids.contains(&1));
     }
 }
+
+#[cfg(test)]
+impl FtsReader {
+    /// Byte lengths of the dictionary, postings and positions regions, for
+    /// the postings census.
+    pub(crate) fn region_lens_for_census(&self) -> (usize, usize, usize) {
+        (
+            self.dict_range.len(),
+            self.postings_range.len(),
+            self.positions_range.len(),
+        )
+    }
+}
