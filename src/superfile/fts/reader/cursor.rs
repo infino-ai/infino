@@ -511,6 +511,11 @@ pub(crate) struct TermCursor {
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
+/// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
+/// packed block rather than stepping: past this many docs behind the
+/// target, a bisection's ~7 steps beat the walk.
+const PROBE_GALLOP: usize = 16;
+
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
     /// byte range and decode its first block. `term_bytes` starts at
@@ -1175,6 +1180,12 @@ impl TermCursor {
             let mut p = self.pos.min(n);
             while k < n_docs && docs[k] <= last {
                 let t = docs[k];
+                // Far behind the target (a probed term much denser than the
+                // probing one): bisect the rest of the block instead of
+                // stepping through it.
+                if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
+                    p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);
+                }
                 while p < n && ids[p] < t {
                     p += 1;
                 }
