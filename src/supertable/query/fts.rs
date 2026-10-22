@@ -1109,6 +1109,7 @@ impl SupertableReader {
                         // A scope admits rows the index cannot see, so a
                         // scoped search opens as before.
                         want_resolved: scope.is_none(),
+                        open_cost_ns: self.open_cost_ns(),
                     };
                     tier::select_with_tiers(
                         index,
@@ -1160,9 +1161,11 @@ impl SupertableReader {
                 // A superfile the index answered for, or one the merge ruled
                 // out — every candidate it could hold is below the threshold,
                 // or a conjunction's term has shown it holds none — is not
-                // opened. The rest open by their best known candidate; equal
-                // bounds open in `_id` order, so a run of superfiles that can
-                // only tie is settled by the first of them.
+                // opened. The rest open by their upper bound, as the ceiling
+                // path opens by ceiling (the bound the skip decision reads),
+                // then by their best known candidate; equal bounds open in
+                // `_id` order, so a run of superfiles that can only tie is
+                // settled by the first of them.
                 let mut ordered: Vec<(Arc<SuperfileEntry>, tier::SuperfileBounds)> = kept
                     .drain(..)
                     .zip(selection.bounds)
@@ -1171,8 +1174,8 @@ impl SupertableReader {
                     .map(|(_, pair)| pair)
                     .collect();
                 ordered.sort_by(|(a, x), (b, y)| {
-                    y.lb.total_cmp(&x.lb)
-                        .then(y.ub.total_cmp(&x.ub))
+                    y.ub.total_cmp(&x.ub)
+                        .then(y.lb.total_cmp(&x.lb))
                         .then(a.id_min.cmp(&b.id_min))
                 });
                 ceilings = Some(

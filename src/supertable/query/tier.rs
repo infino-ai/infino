@@ -52,6 +52,7 @@ use std::{
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
+    time::Instant,
 };
 
 use futures::future::try_join_all;
@@ -111,11 +112,6 @@ const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
 /// round is a few microseconds, so jobs this size keep the pool's
 /// scheduling a small fraction of the work.
 const SLOTS_PER_JOB: usize = 16;
-/// The least a round must raise the threshold, as a fraction, for the
-/// merge to read on when the round ruled nothing out: a threshold that
-/// barely moves will not reach any surviving bound soon, and every further
-/// round costs a block per term per superfile in play.
-const THRESHOLD_RISE_MIN: f32 = 0.01;
 
 /// What the merge decided for one kept superfile.
 #[derive(Debug, Clone, Copy)]
@@ -146,6 +142,12 @@ pub(crate) struct TierQuery<'a> {
     /// Whether the caller can use documents the index settles outright
     /// (it cannot when a scope admits rows the index does not see).
     pub(crate) want_resolved: bool,
+    /// What one superfile open costs on this table, in nanoseconds of
+    /// query wall; zero when not yet known. A round of the merge is read
+    /// while the opens the last round saved are worth more than the round
+    /// took — the trade that differs between a table whose opens are a
+    /// few microseconds of warm memory and one whose opens are reads.
+    pub(crate) open_cost_ns: u64,
 }
 
 /// The merge's outcome for one query.
@@ -478,6 +480,7 @@ pub(crate) async fn select_with_tiers(
         0 => usize::MAX,
         n => n as usize,
     };
+    let open_cost_ns = query.open_cost_ns;
     let merge = run_on_pool(Some(pool), "tier merge", move || {
         let mut merge = merge;
         for round in 0..max_rounds {
@@ -515,21 +518,32 @@ pub(crate) async fn select_with_tiers(
             if !read_any {
                 break;
             }
-            let theta_before = merge.theta_lb;
+            let started = Instant::now();
             let excluded = merge.round(&reads);
-            let stalled = merge.theta_lb.is_finite()
-                && excluded == 0
-                && merge.theta_lb <= theta_before * (1.0 + THRESHOLD_RISE_MIN);
+            let round_ns = started.elapsed().as_nanos() as u64;
+            // Worth reading on: the opens this round saved, at what an open
+            // costs here, cover what the round cost — or no threshold exists
+            // yet, so nothing could have been saved and the next round may
+            // be the one that finds it. With the open cost unknown, any
+            // exclusion is taken as worth it.
+            let worth = if open_cost_ns == 0 {
+                excluded > 0
+            } else {
+                u128::from(excluded as u64) * u128::from(open_cost_ns) >= u128::from(round_ns)
+            };
+            let read_on = !merge.theta_lb.is_finite() || worth;
             tracing::debug!(
                 round,
                 excluded,
                 live = merge.slots.iter().filter(|s| s.live).count(),
                 theta = merge.theta_lb,
                 entries = merge.entries_read,
-                stalled,
+                round_us = round_ns / 1000,
+                open_cost_us = open_cost_ns / 1000,
+                read_on,
                 "tier merge round"
             );
-            if stalled || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
+            if !read_on || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
                 break;
             }
         }

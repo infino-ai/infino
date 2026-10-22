@@ -91,10 +91,6 @@ const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 /// run of them at once; a longer run is read in pieces this big.
 const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Parsed tier chunk directories kept per loaded index, by `(tier object,
-/// chunk offset)`: a few bytes per block, so a count bound.
-const RESIDENT_TIER_DIRECTORIES: usize = 16 * 1024;
-
 /// A stored bound is exact, but a ceiling reaches the query through a
 /// handful of roundings — the idf ratio, its product with the bound, a
 /// phrase's idf recovery — that the score itself does not go through, so
@@ -272,6 +268,14 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
 pub(crate) struct TierChunkData {
     pub(crate) dir: Arc<TierDirectory>,
     pub(crate) bodies: Vec<Bytes>,
+}
+
+impl TierChunkData {
+    /// Bytes the chunk holds resident: its bodies (the directory is small
+    /// beside them).
+    fn weight(&self) -> usize {
+        self.bodies.iter().map(Bytes::len).sum()
+    }
 }
 
 pub(crate) fn tier_uri(hash: &ContentHash) -> String {
@@ -667,12 +671,11 @@ pub(crate) struct TermIndex {
     disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
-    /// Fetched tier block bodies by `(tier object, body offset)`, under the
-    /// same byte budget as the slices.
-    tier_blocks: tokio::sync::Mutex<Resident<(ContentHash, u64), Bytes>>,
-    /// Parsed tier chunk directories by `(tier object, chunk offset)`; see
-    /// [`RESIDENT_TIER_DIRECTORIES`].
-    tier_dirs: tokio::sync::Mutex<Resident<(ContentHash, u64), Arc<TierDirectory>>>,
+    /// Fetched tier chunks — directory and bodies — by `(tier object, chunk
+    /// offset)`, under the same byte budget as the slices. A chunk is the
+    /// unit so a merge's reads cost the set a lookup per region, not per
+    /// block.
+    tier_chunks: tokio::sync::Mutex<Resident<(ContentHash, u64), TierChunkData>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
     runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
@@ -757,11 +760,10 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
-            tier_blocks: tokio::sync::Mutex::new(Resident::new(
+            tier_chunks: tokio::sync::Mutex::new(Resident::new(
                 RESIDENT_SLICE_BUDGET_BYTES,
-                Bytes::len,
+                TierChunkData::weight,
             )),
-            tier_dirs: tokio::sync::Mutex::new(Resident::new(RESIDENT_TIER_DIRECTORIES, |_| 1)),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
             tier_runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
@@ -1190,18 +1192,9 @@ impl TermIndex {
     ) -> Result<(Vec<TierChunkData>, u64), TermIndexError> {
         let mut out: Vec<Option<TierChunkData>> = Vec::with_capacity(chunks.len());
         {
-            let mut dirs = self.tier_dirs.lock().await;
-            let mut bodies = self.tier_blocks.lock().await;
+            let mut resident = self.tier_chunks.lock().await;
             for chunk in chunks {
-                let found = dirs.get(&(*object, chunk.offset)).and_then(|dir| {
-                    let mut all = Vec::with_capacity(dir.n_blocks());
-                    for b in 0..dir.n_blocks() {
-                        let key = (*object, chunk.offset + dir.block_range(b).start as u64);
-                        all.push(bodies.get(&key)?);
-                    }
-                    Some(TierChunkData { dir, bodies: all })
-                });
-                out.push(found);
+                out.push(resident.get(&(*object, chunk.offset)));
             }
         }
         if out.iter().all(Option::is_some) {
@@ -1242,8 +1235,7 @@ impl TermIndex {
         }))
         .await?;
         let mut fetched = 0u64;
-        let mut dirs = self.tier_dirs.lock().await;
-        let mut resident = self.tier_blocks.lock().await;
+        let mut resident = self.tier_chunks.lock().await;
         for (&(first, last), bytes) in spans.iter().zip(fetches) {
             fetched += bytes.len() as u64;
             let span_start = chunks[first].offset;
@@ -1258,14 +1250,13 @@ impl TermIndex {
                 }
                 let mut all = Vec::with_capacity(dir.n_blocks());
                 for b in 0..dir.n_blocks() {
-                    let r = dir.block_range(b);
-                    let body = chunk_bytes.slice(r.clone());
+                    let body = chunk_bytes.slice(dir.block_range(b));
                     dir.verify_block(b, &body)?;
-                    resident.insert((*object, chunk.offset + r.start as u64), body.clone());
                     all.push(body);
                 }
-                dirs.insert((*object, chunk.offset), Arc::clone(&dir));
-                out[i] = Some(TierChunkData { dir, bodies: all });
+                let data = TierChunkData { dir, bodies: all };
+                resident.insert((*object, chunk.offset), data.clone());
+                out[i] = Some(data);
             }
         }
         Ok((out.into_iter().flatten().collect(), fetched))

@@ -775,6 +775,7 @@ where
         window, "fanning query out across superfiles in ceiling order"
     );
     let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm, tiers.clone()).await;
+    let started = Instant::now();
     // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
     if units.len() == 1 {
         let (entry, params) = units.into_iter().next().expect("len == 1");
@@ -782,6 +783,9 @@ where
             true => Vec::new(),
             false => vec![ctx.run(body, entry, params).await?],
         };
+        if !out.is_empty() {
+            reader.note_open_cost(started.elapsed().as_nanos() as u64);
+        }
         if let Some(tiers) = &tiers {
             tiers.record_on(&Span::current());
         }
@@ -805,6 +809,11 @@ where
             Some(result) => out.push(result?),
             None => break,
         }
+    }
+    // What an open cost this query: the fan-out's wall over the opens it
+    // made, the saving a tier merge can weigh a round's exclusions at.
+    if !out.is_empty() {
+        reader.note_open_cost(started.elapsed().as_nanos() as u64 / out.len() as u64);
     }
     if let Some(tiers) = &tiers {
         tiers.record_on(&Span::current());
