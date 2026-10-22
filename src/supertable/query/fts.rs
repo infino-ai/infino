@@ -72,8 +72,8 @@
 
 use std::{
     borrow::Cow,
-    cmp::{Ordering, Reverse},
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, HashSet},
     iter::repeat_n,
     slice,
     sync::{
@@ -370,9 +370,13 @@ fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
 /// the amount of *skipped work* depends on segment completion order.
 struct SharedTopK {
     k: usize,
-    /// Min-heap (via `Reverse`) of the best `k` scores seen so far, each
-    /// with the largest `_id` its superfile holds.
-    heap: Mutex<BinaryHeap<Reverse<FloorEntry>>>,
+    /// The best `k` scores seen so far, descending, each with the largest
+    /// `_id` its superfile holds. A finished unit's scores merge in by one
+    /// linear pass, so a unit costs its own length plus `k` whatever the
+    /// heap of the moment holds — not a heap operation per score, which
+    /// the first wave of units, all finishing against an empty heap under
+    /// one lock, paid in full.
+    top: Mutex<Vec<FloorEntry>>,
     /// The current floor — `NEG_INFINITY` until `k` scores have been
     /// seen, monotone after. Shared with the atom walks as their live
     /// mid-walk bar (see [`LiveFloor`]), so it rises both from finished
@@ -388,7 +392,7 @@ struct SharedTopK {
 /// does the heap — a seed placeholder (`i128::MAX`) in particular gives
 /// way to a real score equal to it. BM25 scores are finite, but `f32`
 /// still needs an `Ord` shim.
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 struct FloorEntry {
     score: f32,
     id_max: i128,
@@ -411,7 +415,7 @@ impl SharedTopK {
     fn new(k: usize) -> Arc<Self> {
         Arc::new(Self {
             k,
-            heap: Mutex::new(BinaryHeap::new()),
+            top: Mutex::new(Vec::new()),
             floor: LiveFloor::new(),
         })
     }
@@ -431,34 +435,51 @@ impl SharedTopK {
     /// superfile whose `_id`s reach `id_max`, and publish the new kth-best
     /// as the floor once k scores are known.
     fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
-        let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
-        for score in scores {
-            // Once k scores are known, most of a unit's scores fall below
-            // the k-th and can never enter: one comparison settles them
-            // before any heap work.
-            if heap.len() >= self.k
-                && let Some(Reverse(min)) = heap.peek()
-                && score < min.score
-            {
-                continue;
-            }
-            let entry = FloorEntry { score, id_max };
-            if heap.len() < self.k {
-                heap.push(Reverse(entry));
-            } else if let Some(Reverse(min)) = heap.peek()
-                && entry > *min
-            {
-                heap.pop();
-                heap.push(Reverse(entry));
+        // Order the unit's scores outside the lock; a kernel's hits usually
+        // arrive in score order already.
+        let mut incoming: Vec<FloorEntry> = scores
+            .into_iter()
+            .map(|score| FloorEntry { score, id_max })
+            .collect();
+        if incoming.is_empty() {
+            return;
+        }
+        if !incoming.windows(2).all(|w| w[0] >= w[1]) {
+            incoming.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
+        let k = self.k;
+        if top.len() >= k {
+            // Only what beats the k-th can enter.
+            let min = top[k - 1];
+            let keep = incoming.partition_point(|e| *e > min);
+            incoming.truncate(keep);
+            if incoming.is_empty() {
+                return;
             }
         }
-        if heap.len() == self.k
-            && let Some(Reverse(FloorEntry { score: min, .. })) = heap.peek()
-        {
+        let mut merged: Vec<FloorEntry> = Vec::with_capacity((top.len() + incoming.len()).min(k));
+        let (mut i, mut j) = (0, 0);
+        while merged.len() < k && (i < top.len() || j < incoming.len()) {
+            let take_top = match (top.get(i), incoming.get(j)) {
+                (Some(a), Some(b)) => a >= b,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if take_top {
+                merged.push(top[i]);
+                i += 1;
+            } else {
+                merged.push(incoming[j]);
+                j += 1;
+            }
+        }
+        *top = merged;
+        if top.len() == k {
             // `raise` rather than a plain store: running walks may have
-            // published a higher local kth than this merge's heap min,
-            // and the floor must never move down.
-            self.floor.raise(*min);
+            // published a higher local kth than this merge's k-th, and the
+            // floor must never move down.
+            self.floor.raise(top[k - 1].score);
         }
     }
 
@@ -472,16 +493,16 @@ impl SharedTopK {
     /// caller checks. A seed placeholder carries `i128::MAX` and so never
     /// justifies a skip.
     ///
-    /// Of the entries at the floor the heap's top is the one from the
-    /// highest range (equal scores order by range descending), so one look
-    /// settles it. A floor the live walks have raised above the heap's top
-    /// has no entry to compare against here and keeps the superfile open.
+    /// Of the entries at the floor the last is the one from the highest
+    /// range (equal scores order by range descending), so one look settles
+    /// it. A floor the live walks have raised above the k-th entry has no
+    /// entry to compare against here and keeps the superfile open.
     fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
-        let heap = self.heap.lock().expect("SharedTopK mutex poisoned");
-        heap.len() >= self.k
-            && heap
-                .peek()
-                .is_some_and(|Reverse(top)| top.score == floor && top.id_max < id_min)
+        let top = self.top.lock().expect("SharedTopK mutex poisoned");
+        top.len() >= self.k && {
+            let last = top[self.k - 1];
+            last.score == floor && last.id_max < id_min
+        }
     }
 }
 
