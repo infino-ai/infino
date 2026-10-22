@@ -785,7 +785,12 @@ fn mark_four(
     doc_ids: [u32; bm25::SCORE_SIMD_LANES],
     contributions: [f32; bm25::SCORE_SIMD_LANES],
 ) {
-    let local = doc_ids.map(|d| (d - base) as usize);
+    debug_assert!(doc_ids.iter().all(|&d| d - base < OR_WINDOW));
+    // Sized views and in-window masks let the compiler drop the per-lane
+    // bounds checks; the mask is a no-op for a doc inside the window.
+    let scores = &mut scores[..OR_WINDOW as usize];
+    let present = &mut present[..OR_WINDOW_WORDS];
+    let local = doc_ids.map(|d| (d - base) as usize & (OR_WINDOW as usize - 1));
     for lane in 0..bm25::SCORE_SIMD_LANES {
         scores[local[lane]] += contributions[lane];
     }
@@ -801,6 +806,25 @@ fn mark_four(
             present[l >> 6] |= 1u64 << (l & 63);
         }
     }
+}
+
+/// Whether any of one presence word's 64 window slots scores above
+/// `threshold`. Compared lane-wise eight at a time so it vectorizes; a
+/// running `max` over floats does not, as `f32::max` cannot be reassociated.
+/// Slots hold non-negative scores and the bar is never negative, so this is
+/// exactly "the word's best slot beats the bar".
+#[inline(always)]
+fn word_beats(slots: &[f32], threshold: f32) -> bool {
+    let slots: &[f32; 64] = slots
+        .try_into()
+        .expect("invariant: a presence word spans 64 slots");
+    let mut hit = [false; 8];
+    for chunk in slots.chunks_exact(8) {
+        for (h, &x) in hit.iter_mut().zip(chunk) {
+            *h |= x > threshold;
+        }
+    }
+    hit.iter().any(|&h| h)
 }
 
 /// Most optional terms the required-term walk takes; a wider list keeps
@@ -2576,7 +2600,7 @@ impl FtsReader {
                     // no hit: count it (done above) and clear its slots
                     // without visiting a document.
                     let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
-                    if heap.len() >= k && slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
+                    if heap.len() >= k && !word_beats(slots, threshold) {
                         slots.fill(0.0);
                         continue;
                     }
@@ -3075,7 +3099,7 @@ impl FtsReader {
                     // hit: clear its slots without visiting a document.
                     if heap.len() >= k {
                         let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
-                        if slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
+                        if !word_beats(slots, threshold) {
                             slots.fill(0.0);
                             continue;
                         }
