@@ -137,12 +137,12 @@ pub(super) struct SupertableInner {
     /// level.
     pub(super) compaction_outstanding: AtomicBool,
     /// Generator for the supertable-injected `_id` column.
-    /// Each `append()` locks the mutex once, mints
-    /// `batch.num_rows()` ids, and unlocks. The mutex is
-    /// required: shared append writers mint concurrently, and
-    /// ferroid's `BasicSnowflakeGenerator` is `!Sync` by design (it
-    /// uses interior-mutable `Cell`). One generator per
-    /// supertable, constructed fresh on `create()` /
+    /// Each `append()` locks the mutex once, reserves
+    /// `batch.num_rows()` ids as spans, and unlocks before
+    /// expanding them. The mutex is required: shared append
+    /// writers reserve concurrently, and `IdGenerator` is `!Sync`
+    /// (its state is an interior-mutable `Cell`). One generator
+    /// per supertable, constructed fresh on `create()` /
     /// `open()` with a 40-bit random worker_id.
     pub(super) id_generator: Mutex<IdGenerator>,
     /// Cached `SessionContext` for `query_sql`, keyed on the

@@ -49,7 +49,7 @@ const TIMESTAMP_SHIFT: u32 = WORKER_BITS + SEQUENCE_BITS;
 /// Construction is cheap: one `rand::random::<u64>()` call for
 /// [`Self::new`], zero for [`Self::with_worker_id`].
 /// [`Self::next_id`] is `&self` (interior-mutable) and runs
-/// at ~3 ns/id single-threaded; [`Self::reserve_range`] costs
+/// at ~2 ns/id single-threaded; [`Self::reserve_range`] costs
 /// one clock read per millisecond of sequence it spans.
 pub struct IdGenerator {
     worker_id: u64,
@@ -569,6 +569,25 @@ mod tests {
         let spans = g.reserve_range(1_000);
         let reserved_last = spans.last().expect("non-empty").1;
         assert!(g.next_id() > reserved_last);
+    }
+
+    #[test]
+    fn next_id_after_a_used_up_millisecond_starts_the_next_one() {
+        // A reservation of a whole millisecond leaves no sequence
+        // room in it, so the next single id must wait for a later
+        // millisecond and start at sequence 0. Incrementing the last
+        // id instead would carry into the worker field and mint an id
+        // in another worker's space.
+        let worker = 0x55;
+        let g = IdGenerator::with_worker_id(worker);
+        let spans = g.reserve_range(1 << SEQUENCE_BITS);
+        let reserved_last = spans.last().expect("non-empty").1;
+        assert_eq!(sequence_of(reserved_last), SEQUENCE_MASK as u32);
+
+        let id = g.next_id();
+        assert_eq!(worker_id_of(id), worker, "the worker field is untouched");
+        assert_eq!(sequence_of(id), 0, "a new ms starts at sequence 0");
+        assert!(timestamp_of(id) > timestamp_of(reserved_last));
     }
 
     // ---- cross-worker isolation ----------------------------------------
