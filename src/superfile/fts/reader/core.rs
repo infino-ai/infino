@@ -509,6 +509,13 @@ pub(super) const WAND_BMW_2TERM_MAX_K: usize = 128;
 /// (long list), which WAND can't skip — only df separates the cases.
 pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
 
+/// Largest rare-term document frequency the rare-led pair pass ranks in
+/// full before falling back. Ranking those documents is the walk the
+/// two-term WAND ends in anyway, so the pass costs extra only when it has to
+/// fall back; the cap bounds that waste for a "rare" term that is merely
+/// less common.
+pub(super) const RARE_LED_MAX_DF: u64 = 1 << 17;
+
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
 /// `docs_in_scope` bounds the distinct doc_ids that can ever enter the

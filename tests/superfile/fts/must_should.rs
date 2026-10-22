@@ -383,3 +383,82 @@ async fn one_must_with_shoulds_pruned_matches_unpruned() {
         }
     }
 }
+
+/// A two-term OR of a rare term and a near-every-doc term at the small `k`
+/// that routes it to the rare-term-first pass, against the same query at a
+/// `k` past the match count, which prunes nothing. Rare terms range from a
+/// handful of documents (fewer than `k`, so the pass must fall back) to a
+/// few percent of the corpus.
+#[tokio::test]
+async fn rare_and_common_pair_matches_unpruned() {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for trial in 0..10u32 {
+        let n_docs = 3_000 + (rng() % 12_000) as u64;
+        // Odd trials: the common term covers a fifth of the corpus, so its idf
+        // and its best score are real, and reaches that score in short
+        // documents that repeat it, while rare-term documents are long. The
+        // rare-term pass must then often fall back rather than finish.
+        let contested = trial % 2 == 1;
+        let common_odds: u64 = if contested { 200 } else { 920 };
+        let rare_odds: Vec<u64> = (0..4)
+            .map(|_| {
+                if contested {
+                    1 + rng() % 12
+                } else {
+                    1 + rng() % 40
+                }
+            })
+            .collect();
+        let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
+        for d in 0..n_docs {
+            let mut text = String::new();
+            let short = contested && rng() % 50 == 0;
+            if rng() % 1000 < common_odds {
+                let reps = if short { 4 + rng() % 8 } else { 1 + rng() % 6 };
+                for _ in 0..reps {
+                    text.push_str("the ");
+                }
+            }
+            let mut has_rare = false;
+            for (r, odds) in rare_odds.iter().enumerate() {
+                if !short && rng() % 1000 < *odds {
+                    has_rare = true;
+                    for _ in 0..1 + rng() % 3 {
+                        text.push_str(&format!("rare{r} "));
+                    }
+                }
+            }
+            let filler = match (contested, short, has_rare) {
+                (_, true, _) => 0,
+                (true, _, true) => 60 + rng() % 60,
+                _ => rng() % 40,
+            };
+            for _ in 0..filler {
+                text.push_str("filler ");
+            }
+            text.push_str("doc");
+            owned.push((d, text));
+        }
+        let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        let reader = build_infino_superfile(&refs);
+        for r in 0..4 {
+            for query in [format!("the rare{r}"), format!("rare{r} the")] {
+                let full = search_hits(&reader, &query, n_docs as usize + 1, BoolMode::Or).await;
+                for k in [1usize, 10, 100, 128] {
+                    let got = search_hits(&reader, &query, k, BoolMode::Or).await;
+                    assert_eq!(
+                        got,
+                        &full[..k.min(full.len())],
+                        "trial {trial} query {query:?} k={k}"
+                    );
+                }
+            }
+        }
+    }
+}

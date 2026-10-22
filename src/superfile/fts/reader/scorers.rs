@@ -2787,10 +2787,55 @@ impl FtsReader {
             && no_floor
             && two_term_has_rare_anchor(&cursors)
         {
+            if let Some(hits) = self.rare_led_pair(column_id, &cursors, k) {
+                return Ok(hits);
+            }
             self.run_wand_bmw(column_id, cursors, k)
         } else {
             self.run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         }
+    }
+
+    /// A two-term OR of a rare term and a much commoner one, answered from
+    /// the rare term's documents alone when that is provably the answer.
+    ///
+    /// Every document holding the rare term is ranked first, the rare term
+    /// leading and the common one probed ([`must_lead_should_walk`]). A
+    /// document without the rare term scores at most the common term's
+    /// maximum, an upper bound strictly above any score it stands for, so
+    /// once the k-th best reaches it no such document can enter the top k,
+    /// not even on a tie, and the ranked rare-term documents are the answer.
+    /// Otherwise `None`, and the caller runs the general walk from the start.
+    /// This skips the general walk's opening stretch, where the threshold is
+    /// still below the common term's maximum and its documents are scored
+    /// one by one until `k` rare-term documents have been seen.
+    fn rare_led_pair(
+        &self,
+        column_id: u32,
+        cursors: &[TermCursor],
+        k: usize,
+    ) -> Option<Vec<(FtsDocId, f32)>> {
+        let (rare, common) = match cursors[0].df <= cursors[1].df {
+            true => (&cursors[0], &cursors[1]),
+            false => (&cursors[1], &cursors[0]),
+        };
+        if rare.df > RARE_LED_MAX_DF {
+            return None;
+        }
+        let common_max = common.term_max_bm25;
+        let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            must_lead_should_walk(
+                rare.clone(),
+                vec![common.clone()],
+                k,
+                None,
+                f32::NEG_INFINITY,
+                dl_norm_k1,
+                heap,
+            );
+            heap.len() >= k && heap.peek().expect("full heap").0 >= common_max
+        });
+        complete.then_some(hits)
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
