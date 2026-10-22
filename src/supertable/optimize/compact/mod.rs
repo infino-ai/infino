@@ -392,6 +392,19 @@ impl Supertable {
             inner.manifest.load().partition_strategy(),
             Some(PartitionStrategy::VectorCell { .. })
         );
+        // Skip split + recalibration when this table is served by the
+        // centroid-graph router: that path walks fine centroids, not the
+        // coarse grid, so growing or recalibrating the grid is dead-weight
+        // optimize work — the grid is frozen at its create-time size.
+        let graph_served = hidden_ivf && {
+            let snap = inner.manifest.load();
+            match snap.partition_strategy() {
+                Some(PartitionStrategy::VectorCell { column, .. }) => {
+                    crate::supertable::query::vector::serves_via_graph(&snap, column)
+                }
+                _ => false,
+            }
+        };
         // Grid size before the split phase. A split grows `n_cent` (a merge
         // never does), so comparing it to the post-pass count tells the
         // recalibration trigger whether the grid actually changed.
@@ -409,7 +422,7 @@ impl Supertable {
         // are planned from one snapshot, so the width must not drift mid-pass.
         let concurrency = global().compaction_concurrency(cfg);
         let mut __pt = Instant::now();
-        if hidden_ivf {
+        if hidden_ivf && !graph_served {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
@@ -571,6 +584,7 @@ impl Supertable {
         // Auto runs it only on a grid or growth change, or a lagging rerank
         // law. Storage work above already ran regardless of the policy.
         let run_recalibrate = hidden_ivf
+            && !graph_served
             && match recalibrate {
                 RecalibratePolicy::Skip => false,
                 RecalibratePolicy::Force => true,
