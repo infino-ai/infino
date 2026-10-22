@@ -420,6 +420,20 @@ impl SharedTopK {
         })
     }
 
+    /// The top-k under its lock. A unit holds the lock for microseconds and
+    /// a conjunction's units all finish together, so a waiter spins briefly
+    /// before it parks: parking costs a wake-up per handoff, and a queue of
+    /// forty units paid that forty times over.
+    fn lock_top(&self) -> std::sync::MutexGuard<'_, Vec<FloorEntry>> {
+        for _ in 0..2_000 {
+            if let Ok(guard) = self.top.try_lock() {
+                return guard;
+            }
+            std::hint::spin_loop();
+        }
+        self.top.lock().expect("SharedTopK mutex poisoned")
+    }
+
     /// The current global floor — `NEG_INFINITY` until k scores merged.
     fn floor(&self) -> f32 {
         self.floor.load()
@@ -460,7 +474,7 @@ impl SharedTopK {
         let k = self.k;
         let brought = entering.len();
         let waited = Instant::now();
-        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
+        let mut top = self.lock_top();
         let wait_us = waited.elapsed().as_micros() as u64;
         let held = Instant::now();
         if top.len() >= k {
@@ -536,7 +550,7 @@ impl SharedTopK {
     /// it. A floor the live walks have raised above the k-th entry has no
     /// entry to compare against here and keeps the superfile open.
     fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
-        let top = self.top.lock().expect("SharedTopK mutex poisoned");
+        let top = self.lock_top();
         top.len() >= self.k && {
             let last = top[self.k - 1];
             last.score == floor && last.id_max < id_min
