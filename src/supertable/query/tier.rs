@@ -481,6 +481,22 @@ pub(crate) async fn select_with_tiers(
         // verify, no negated term the heads do not read.
         trusted: !query.negated && query.phrases.iter().all(|p| !p.1),
     };
+    // A shape whose candidates cannot be trusted yields no threshold, so
+    // before any open it can rule a superfile out only through a required
+    // head the index holds whole — read to its end, that head settles
+    // which documents carry the term. With no such head among the kept
+    // superfiles the merge could exclude nothing and would only cost a
+    // round: the ceilings serve instead.
+    if !shape.trusted
+        && !slots.iter().any(|s| {
+            s.heads
+                .iter()
+                .enumerate()
+                .any(|(ti, h)| shape.required & (1 << ti) != 0 && h.whole && h.ceiling > 0.0)
+        })
+    {
+        return Ok(None);
+    }
     let (lb_slack, ub_slack) = if exact_scores {
         (1.0, 1.0)
     } else {
