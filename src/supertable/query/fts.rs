@@ -1130,13 +1130,24 @@ impl SupertableReader {
                     .fold(0, |m, i| m | (1 << i))
             };
             let scoring = bits(&musts) | bits(&shoulds);
-            let tier_phrases: Vec<(tier::TermMask, bool)> = must_phrases
+            // A phrase's members in order, a repeated word repeated: the
+            // kernel weights every occurrence.
+            let members = |p: &[String]| -> Vec<usize> {
+                p.iter()
+                    .filter_map(|n| all_terms.iter().position(|t| *t == n.as_str()))
+                    .collect()
+            };
+            let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
                 .iter()
-                .map(|p| (bits(p), true))
-                .chain(should_phrases.iter().map(|p| (bits(p), false)))
+                .map(|p| (members(p), true))
+                .chain(should_phrases.iter().map(|p| (members(p), false)))
                 .collect();
-            let required =
-                bits(&musts) | tier_phrases.iter().filter(|p| p.1).fold(0, |m, p| m | p.0);
+            let required = bits(&musts)
+                | tier_phrases
+                    .iter()
+                    .filter(|p| p.1)
+                    .flat_map(|p| p.0.iter())
+                    .fold(0, |m, &i| m | (1 << i));
             // A bare term repeated in the query is weighted by its count in
             // the kernels; the tiers score each term once, so such a query
             // is not served.

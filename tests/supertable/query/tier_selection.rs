@@ -153,9 +153,17 @@ fn queries() -> Vec<(String, BoolMode)> {
         out.push((q.to_owned(), BoolMode::Or));
         out.push((q.to_owned(), BoolMode::And));
     }
-    // Shapes the tiers do not serve take the ceiling path; they must still
-    // agree, and must not open more than before.
-    for q in ["\"quokka tensor\"", "the -data", "+quokka tensor"] {
+    // Shapes the tiers serve only through a whole required head, or not at
+    // all, must still agree and must not open more than before — among
+    // them a phrase with a repeated word, whose bound weights every
+    // occurrence as the kernel does.
+    for q in [
+        "\"quokka tensor\"",
+        "the -data",
+        "+quokka tensor",
+        "\"the data the\"",
+        "+alpha \"data the data\"",
+    ] {
         out.push((q.to_owned(), BoolMode::Or));
     }
     out

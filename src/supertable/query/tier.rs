@@ -141,10 +141,12 @@ pub(crate) struct TierQuery<'a> {
     /// A bit per term that scores on its own (a bare term); a term that is
     /// only a phrase member scores through the phrase.
     pub(crate) scoring: TermMask,
-    /// Each phrase as its members' bits and whether a match must carry it.
-    /// A phrase scores at most its members' idf sum times the smallest
-    /// member key of the document, the bound the ceiling path uses.
-    pub(crate) phrases: Vec<(TermMask, bool)>,
+    /// Each phrase as its members (indices into `terms`, in phrase order,
+    /// a repeated word repeated) and whether a match must carry it. A
+    /// phrase scores at most its members' idf sum — every occurrence
+    /// counted, as the kernel weights it — times the smallest member key
+    /// of the document, the bound the ceiling path uses.
+    pub(crate) phrases: Vec<(Vec<usize>, bool)>,
     /// Whether the query negates terms: a document the heads show cannot
     /// then be taken as a match, so the merge bounds and orders but seeds
     /// no threshold and answers for nothing.
@@ -264,7 +266,7 @@ struct Joined {
 struct Shape {
     required: TermMask,
     scoring: TermMask,
-    phrases: Vec<(TermMask, bool)>,
+    phrases: Vec<(Vec<usize>, bool)>,
     trusted: bool,
 }
 
@@ -922,17 +924,14 @@ fn bounds_of(
                 };
             }
         }
-        for &(members, _) in &shape.phrases {
+        for (members, _) in &shape.phrases {
             let mut idf_sum = 0.0f32;
             let mut min_key = f32::INFINITY;
-            for (t, h) in heads.iter().enumerate() {
-                if members & (1 << t) == 0 {
-                    continue;
-                }
+            for &t in members {
                 idf_sum += idf[t];
                 let key = match c {
                     Some(c) if mask & (1 << t) != 0 => c[t] / idf[t],
-                    _ => h.tail / idf[t],
+                    _ => heads[t].tail / idf[t],
                 };
                 min_key = min_key.min(key);
             }
@@ -1033,18 +1032,15 @@ mod tests {
             let nt = 1 + (next() % TERMS as u64) as usize;
             let all: TermMask = (1u64 << nt) - 1;
             // Bare terms, and up to two phrases over the rest, each of two
-            // or three members; a phrase may be required.
+            // to four members, a word possibly repeated; a phrase may be
+            // required.
             let mut scoring: TermMask = next() % (1u64 << nt);
-            let mut phrases: Vec<(TermMask, bool)> = Vec::new();
+            let mut phrases: Vec<(Vec<usize>, bool)> = Vec::new();
             if nt >= 2 {
                 for _ in 0..(next() % 3) {
-                    let mut members: TermMask = 0;
-                    while members.count_ones() < 2 {
-                        members |= 1 << (next() % nt as u64);
-                    }
-                    if next() % 2 == 0 && nt >= 3 {
-                        members |= 1 << (next() % nt as u64);
-                    }
+                    let len = 2 + (next() % 3) as usize;
+                    let members: Vec<usize> =
+                        (0..len).map(|_| (next() % nt as u64) as usize).collect();
                     phrases.push((members, next() % 2 == 0));
                 }
             }
@@ -1052,9 +1048,11 @@ mod tests {
                 scoring = all;
             }
             let mut required: TermMask = (next() % (1u64 << nt)) & scoring;
-            for &(members, must) in &phrases {
-                if must {
-                    required |= members;
+            for (members, must) in &phrases {
+                if *must {
+                    for &t in members {
+                        required |= 1 << t;
+                    }
                 }
             }
             let negated = next() % 4 == 0;
@@ -1128,14 +1126,12 @@ mod tests {
                         score += truth[t][doc];
                     }
                 }
-                for &(members, _) in &phrases {
+                for (members, _) in &phrases {
                     let mut idf_sum = 0.0f32;
                     let mut min_key = f32::INFINITY;
-                    for t in 0..nt {
-                        if members & (1 << t) != 0 {
-                            idf_sum += idf[t];
-                            min_key = min_key.min(truth[t][doc] / idf[t]);
-                        }
+                    for &t in members {
+                        idf_sum += idf[t];
+                        min_key = min_key.min(truth[t][doc] / idf[t]);
                     }
                     score += idf_sum * min_key;
                 }
