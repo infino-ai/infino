@@ -46,6 +46,44 @@ use futures::future::try_join_all;
 
 use crate::runtime_bridge::bridge_sync_to_async_send;
 
+/// How a cache sizes its download for a miss: whole `block_bytes` blocks, and
+/// at least `min_get_bytes`. A shorter miss grows to a window around it, which
+/// can reach behind the miss as well as ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheBlocks {
+    pub block_bytes: u64,
+    pub min_get_bytes: u64,
+}
+
+impl CacheBlocks {
+    /// Every byte a cold miss of `range` could download: its blocks, plus the
+    /// spare room of a short miss's window on both sides, wherever the cache
+    /// places it.
+    ///
+    /// ```text
+    ///   spare = min_get_bytes - the miss's blocks
+    ///   |<-- spare -->[ miss's blocks ]<-- spare -->|
+    /// ```
+    pub fn reach(&self, range: &Range<u64>) -> Range<u64> {
+        let start = range.start / self.block_bytes * self.block_bytes;
+        let end = range.end.div_ceil(self.block_bytes) * self.block_bytes;
+        let spare = self.min_get_bytes.saturating_sub(end - start);
+        start.saturating_sub(spare)..end + spare
+    }
+
+    /// The most bytes one cold miss of `range` downloads: its blocks, or one
+    /// `min_get_bytes` window if that's more.
+    pub fn download_len(&self, range: &Range<u64>) -> u64 {
+        let start = range.start / self.block_bytes * self.block_bytes;
+        let end = range.end.div_ceil(self.block_bytes) * self.block_bytes;
+        (end - start).max(self.min_get_bytes)
+    }
+}
+
+/// Room a cache reserved for a download ahead of reads, given back on drop
+/// (see [`LazyByteSource::cache_room_ahead`]).
+pub type CacheRoom = Box<dyn Send + Sync>;
+
 /// Source of byte ranges from an arbitrary backing.
 ///
 /// Async because the non-trivial impls (object-store
@@ -87,6 +125,35 @@ pub trait LazyByteSource: Send + Sync {
     /// cache sources override.
     fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
         None
+    }
+
+    /// Whether `[start, start + len)` can be read without a download (in
+    /// memory, mapped, or held by a cache). It's only a question, so a cache
+    /// doesn't count it as a read. Defaults to [`Self::try_get_range_sync`].
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        self.try_get_range_sync(start, len).is_some()
+    }
+
+    /// [`Self::range`] for bytes downloaded ahead of the reader. A cache that
+    /// tracks which way reads move doesn't count it, since the reader's next
+    /// reads come from behind it. Defaults to [`Self::range`].
+    async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.range(start, len).await
+    }
+
+    /// How the cache in front of the object sizes a miss's download, so a
+    /// caller reading ahead can keep clear of other reads' downloads. `None`
+    /// (the default) when nothing caches the object.
+    fn cache_blocks(&self) -> Option<CacheBlocks> {
+        None
+    }
+
+    /// Reserve room in the cache for `bytes` downloaded ahead of reads, held
+    /// until the download ends. `None` when there's no room now: the cache
+    /// would drop the download, and a later read would download it again.
+    /// Always room (the default) when nothing caches the object.
+    fn cache_room_ahead(&self, _bytes: u64) -> Option<CacheRoom> {
+        Some(Box::new(()))
     }
 
     /// Tail-fetch path: — fetch the last `len` bytes of the
@@ -539,6 +606,10 @@ impl LazyByteSource for LazySubSource {
         }
         self.inner.try_get_range_sync(self.offset + start, len)
     }
+
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        start.saturating_add(len) <= self.len && self.inner.is_local(self.offset + start, len)
+    }
 }
 
 /// Prefetched overlay: — overlay that serves pre-fetched byte ranges
@@ -633,6 +704,25 @@ impl LazyByteSource for PrefetchedSource {
             return Some(b);
         }
         self.inner.try_get_range_sync(start, len)
+    }
+
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        self.lookup(start, len).is_some() || self.inner.is_local(start, len)
+    }
+
+    async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(b) = self.lookup(start, len) {
+            return Ok(b);
+        }
+        self.inner.range_ahead(start, len).await
+    }
+
+    fn cache_blocks(&self) -> Option<CacheBlocks> {
+        self.inner.cache_blocks()
+    }
+
+    fn cache_room_ahead(&self, bytes: u64) -> Option<CacheRoom> {
+        self.inner.cache_room_ahead(bytes)
     }
 }
 

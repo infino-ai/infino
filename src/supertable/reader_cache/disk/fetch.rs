@@ -1648,6 +1648,19 @@ impl LazyByteSource for HoleFallbackSource {
         Ok(Bytes::from(out))
     }
 
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = start.saturating_add(len);
+        let hole_start = self.hole_start.clamp(start, end);
+        let hole_end = self.hole_end().clamp(start, end);
+        // The parts before and after the hole come from the local copy.
+        (hole_start == start || self.local.is_local(start, hole_start - start))
+            && (hole_end == hole_start || self.fallback.is_local(hole_start, hole_end - hole_start))
+            && (hole_end == end || self.local.is_local(hole_end, end - hole_end))
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());

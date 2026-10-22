@@ -46,8 +46,8 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
-        sorted_root::KeepSortedRoot, topk_row_filter::RowFilterUnderTopK,
-        values_subquery::ValuesSubqueryRewrite,
+        read_ahead_rule::ReadAheadOff, sorted_root::KeepSortedRoot,
+        topk_row_filter::RowFilterUnderTopK, values_subquery::ValuesSubqueryRewrite,
     },
 };
 
@@ -158,12 +158,15 @@ pub(crate) fn budgeted_session_context(
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.
-    //  - `KeepSortedRoot` last, to remove the round-robin repartition that
-    //    `EnforceDistribution` adds above a sorted result, which would return
-    //    an `ORDER BY` out of order.
+    //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
+    //    repartition that `EnforceDistribution` adds above a sorted result,
+    //    which would return an `ORDER BY` out of order.
+    //  - `ReadAheadOff` last, once DataFusion has placed every limit, to turn
+    //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(budgeted_runtime(budget)?)

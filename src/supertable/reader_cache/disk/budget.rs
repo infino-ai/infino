@@ -30,6 +30,21 @@ use crate::supertable::{
 #[cfg(test)]
 const BLOCK_WRITES_SETTLE_DEADLINE: Duration = Duration::from_secs(10);
 
+/// Room [`DiskCacheStore::try_reserve_ahead`] reserved for a download ahead of reads, given back
+/// on drop once the download ends.
+pub(crate) struct AheadRoom {
+    store: Arc<DiskCacheStore>,
+    bytes: u64,
+}
+
+impl Drop for AheadRoom {
+    fn drop(&mut self) {
+        self.store
+            .ahead_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// Whether dropping this entry would actually release memory: it must be a
 /// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
 /// reclaim) and the cache must be its last holder (a reader a query still
@@ -361,6 +376,25 @@ impl DiskCacheStore {
         self.current_bytes.fetch_sub(bytes, Ordering::Release);
     }
 
+    /// Reserve room for `bytes` downloaded ahead of reads, held until the download ends. `None`
+    /// when the unwritten runs plus the downloads ahead still in flight would pass
+    /// [`AHEAD_WRITE_BEHIND_PERCENT`] of [`WRITE_BEHIND_CAP_BYTES`]. Counting the ones in flight
+    /// stops many downloads, each checked alone, from overrunning the cap when they all land.
+    pub(crate) fn try_reserve_ahead(self: &Arc<Self>, bytes: u64) -> Option<AheadRoom> {
+        let share = WRITE_BEHIND_CAP_BYTES * AHEAD_WRITE_BEHIND_PERCENT / 100;
+        let queued = self.write_behind_bytes.load(Ordering::Acquire);
+        self.ahead_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |ahead| {
+                let next = ahead.checked_add(bytes)?;
+                (queued.saturating_add(next) <= share).then_some(next)
+            })
+            .ok()?;
+        Some(AheadRoom {
+            store: Arc::clone(self),
+            bytes,
+        })
+    }
+
     /// Takes `bytes` of the cap on unwritten runs, or `false` if that would go over
     /// [`WRITE_BEHIND_CAP_BYTES`]. A run bigger than the whole cap is still let in when nothing else
     /// is waiting, so a big read can be cached at all.
@@ -668,6 +702,27 @@ mod tests {
             },
         },
     };
+
+    #[tokio::test]
+    async fn downloads_ahead_of_reads_get_half_the_unwritten_runs_cap() {
+        // Downloads ahead may fill half the write queue's cap, counting the ones
+        // still downloading; the other half is left for reads' own downloads.
+        let (_dir, store) = test_store_with(|_| {});
+        let half = WRITE_BEHIND_CAP_BYTES * AHEAD_WRITE_BEHIND_PERCENT / 100;
+        assert!(store.try_reserve_ahead(half + 1).is_none());
+        // Queued runs and downloads in flight both count.
+        store.admit_write_behind(half / 2);
+        let first = store.try_reserve_ahead(half / 4).expect("room");
+        assert!(store.try_reserve_ahead(half / 4 + 1).is_none());
+        let second = store.try_reserve_ahead(half / 4).expect("the last of it");
+        assert!(store.try_reserve_ahead(1).is_none());
+        // A download that ends gives its room back.
+        drop(first);
+        assert!(store.try_reserve_ahead(half / 4).is_some());
+        drop(second);
+        store.release_write_behind(half / 2);
+        assert!(store.try_reserve_ahead(half).is_some());
+    }
 
     /// A lazy reader's cost is anonymous heap, which `madvise` cannot
     /// reclaim, so the idle sweep drops the entry instead. Only when the

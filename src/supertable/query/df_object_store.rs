@@ -34,16 +34,17 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use object_store::{
     Attributes, CopyOptions, Error as OsError, GetOptions, GetRange, GetResult, GetResultPayload,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
-    PutPayload, PutResult, Result as OsResult, path::Path as ObjPath,
+    ListResult, MultipartUpload, OBJECT_STORE_COALESCE_DEFAULT, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result as OsResult, coalesce_ranges,
+    path::Path as ObjPath,
 };
 
 use crate::{
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    superfile::{LazyByteSource, lazy_source::Source},
+    superfile::{CacheBlocks, CacheRoom, LazyByteSource, lazy_source::Source},
     supertable::error::QueryError,
 };
 
@@ -53,6 +54,10 @@ use crate::{
 /// would defeat any downstream cache keyed on `(path, last_modified)`
 /// and make responses non-deterministic.
 const SUPERFILE_LAST_MODIFIED: DateTime<Utc> = DateTime::UNIX_EPOCH;
+
+/// Reads [`SuperfileObjectStore::get_spans_ahead`] keeps in flight at once,
+/// the same as object_store's own `get_ranges` (which keeps it private).
+const FETCH_PARALLELISM: usize = 10;
 
 /// Read-only [`ObjectStore`] backed by per-superfile [`LazyByteSource`]s.
 ///
@@ -124,6 +129,111 @@ impl SuperfileObjectStore {
         self.sources.insert(location, source);
     }
 
+    /// How the cache in front of `location` sizes a miss's download (see
+    /// [`LazyByteSource::cache_blocks`]). `None` if nothing caches it.
+    pub(crate) fn cache_blocks(&self, location: &ObjPath) -> Option<CacheBlocks> {
+        self.source(location).ok()?.cache_blocks()
+    }
+
+    /// Reserve room in the cache in front of `location` for `bytes` downloaded
+    /// ahead (see [`LazyByteSource::cache_room_ahead`]).
+    pub(crate) fn cache_room_ahead(&self, location: &ObjPath, bytes: u64) -> Option<CacheRoom> {
+        self.source(location).ok()?.cache_room_ahead(bytes)
+    }
+
+    /// Whether all of `range` in `location` can be read without a download.
+    /// See [`LazyByteSource::is_local`]: it copies nothing and isn't counted
+    /// as a read.
+    pub(crate) fn is_local(&self, location: &ObjPath, range: &Range<u64>) -> bool {
+        range.is_empty()
+            || self
+                .source(location)
+                .is_ok_and(|source| source.is_local(range.start, range.end - range.start))
+    }
+
+    /// Fetch `ranges` the way object_store's own `get_ranges` does
+    /// ([`coalesce_ranges`]), without counting them as page reads. Callers
+    /// count first: [`ObjectStore::get_ranges`], and read-ahead for the part
+    /// of a request a batch didn't cover.
+    pub(crate) async fn get_ranges_uncounted(
+        &self,
+        location: &ObjPath,
+        ranges: &[Range<u64>],
+    ) -> OsResult<Vec<Bytes>> {
+        let source = self.source(location)?;
+        coalesce_ranges(
+            ranges,
+            |range| read_range(Arc::clone(&source), range),
+            OBJECT_STORE_COALESCE_DEFAULT,
+        )
+        .await
+    }
+
+    /// Download `clusters` of spans ahead of the scan, through
+    /// [`LazyByteSource::range_ahead`], and return every span's bytes in
+    /// order. Not counted as page reads.
+    /// - Clusters download [`FETCH_PARALLELISM`] at a time.
+    /// - A cluster's spans download one after another, so a cache block they
+    ///   share is downloaded once.
+    pub(crate) async fn get_spans_ahead(
+        &self,
+        location: &ObjPath,
+        clusters: &[Vec<Range<u64>>],
+    ) -> OsResult<Vec<Bytes>> {
+        let source = self.source(location)?;
+        let per_cluster: Vec<Vec<Bytes>> = stream::iter(clusters.iter().cloned())
+            .map(|cluster| {
+                let source = Arc::clone(&source);
+                async move {
+                    let mut bytes = Vec::with_capacity(cluster.len());
+                    for span in cluster {
+                        bytes.push(read_range_ahead(&source, span).await?);
+                    }
+                    Ok::<_, OsError>(bytes)
+                }
+            })
+            .buffered(FETCH_PARALLELISM)
+            .try_collect()
+            .await?;
+        Ok(per_cluster.into_iter().flatten().collect())
+    }
+
+    /// `ranges` clamped to the object at `location`, as object_store's
+    /// default path clamps each range in `get_opts`: a range past the end
+    /// reads short, not fails.
+    pub(crate) fn clamped(
+        &self,
+        location: &ObjPath,
+        ranges: &[Range<u64>],
+    ) -> OsResult<Vec<Range<u64>>> {
+        let size = self.source(location)?.size();
+        Ok(ranges
+            .iter()
+            .map(|r| r.start.min(size)..r.end.min(size))
+            .collect())
+    }
+
+    /// Count `ranges` as page reads: one per merged range, gaps included, as
+    /// object_store's default `get_ranges` counted them through `get_opts`.
+    /// [`ObjectStore::get_ranges`] counts through here, so a request served
+    /// from bytes read ahead counts the same as one fetched.
+    pub(crate) fn count_page_reads(&self, ranges: &[Range<u64>]) {
+        for range in merged_ranges(ranges) {
+            self.count_page_read(range.end - range.start);
+        }
+    }
+
+    fn count_page_read(&self, len: u64) {
+        if let Some(stats) = &self.op_stats
+            && len > 0
+        {
+            // Parquet-driven plan reads: page/footer ranges the scan needs,
+            // counted before the byte source decides resident vs fetch.
+            stats.add_sql_page_bytes(len);
+            stats.add_planned_read_ranges(1);
+        }
+    }
+
     fn source(&self, location: &ObjPath) -> OsResult<Arc<dyn LazyByteSource>> {
         self.sources
             .get(location)
@@ -138,6 +248,62 @@ impl SuperfileObjectStore {
                 ))),
             })
     }
+}
+
+/// `range` of `source`, downloaded ahead of the scan (see
+/// [`LazyByteSource::range_ahead`]).
+async fn read_range_ahead(source: &Arc<dyn LazyByteSource>, range: Range<u64>) -> OsResult<Bytes> {
+    if range.is_empty() {
+        return Ok(Bytes::new());
+    }
+    source
+        .range_ahead(range.start, range.end - range.start)
+        .await
+        .map_err(|e| OsError::Generic {
+            store: "SuperfileObjectStore",
+            source: Box::new(e),
+        })
+}
+
+/// `range` of `source`. Goes through `range_async` so a warm, mmap/block-
+/// resident scan serves its bytes synchronously (zero-copy, no I/O) instead
+/// of awaiting a range fetch; a cold miss still `await`s the GET.
+async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsResult<Bytes> {
+    if range.is_empty() {
+        return Ok(Bytes::new());
+    }
+    Source::Lazy(source)
+        .range_async(range.start as usize..range.end as usize)
+        .await
+        .map_err(|e| OsError::Generic {
+            store: "SuperfileObjectStore",
+            source: Box::new(e),
+        })
+}
+
+/// How the store merges `ranges` into reads: sorted, and merged where the
+/// gap between two is at most object_store's default coalesce distance. The
+/// one merge rule for fetching, counting and charging; it matches
+/// object_store's own `coalesce_ranges` (pinned by a test), so a scan reads
+/// what it read before this store owned its `get_ranges`.
+pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|range| range.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match merged.last_mut() {
+            Some(last)
+                if range
+                    .start
+                    .checked_sub(last.end)
+                    .is_none_or(|gap| gap <= OBJECT_STORE_COALESCE_DEFAULT) =>
+            {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
 }
 
 /// Resolve a [`GetRange`] (or its absence) into a concrete, clamped
@@ -182,29 +348,8 @@ impl ObjectStore for SuperfileObjectStore {
         }
 
         let range = resolve_range(options.range, size);
-        let len = range.end.saturating_sub(range.start);
-        if let Some(stats) = &self.op_stats
-            && len > 0
-        {
-            // Parquet-driven plan reads: page/footer ranges the scan needs,
-            // counted before the byte source decides resident vs fetch.
-            stats.add_sql_page_bytes(len);
-            stats.add_planned_read_ranges(1);
-        }
-        let bytes = if len == 0 {
-            Bytes::new()
-        } else {
-            // Route through `range_async` so a warm, mmap/block-resident scan
-            // serves its bytes synchronously (zero-copy, no I/O) instead of
-            // awaiting a range fetch; a cold miss still `await`s the GET.
-            Source::Lazy(source)
-                .range_async(range.start as usize..range.end as usize)
-                .await
-                .map_err(|e| OsError::Generic {
-                    store: "SuperfileObjectStore",
-                    source: Box::new(e),
-                })?
-        };
+        self.count_page_read(range.end.saturating_sub(range.start));
+        let bytes = read_range(source, range.clone()).await?;
 
         Ok(GetResult {
             payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
@@ -212,6 +357,12 @@ impl ObjectStore for SuperfileObjectStore {
             range,
             attributes: Attributes::default(),
         })
+    }
+
+    async fn get_ranges(&self, location: &ObjPath, ranges: &[Range<u64>]) -> OsResult<Vec<Bytes>> {
+        let ranges = self.clamped(location, ranges)?;
+        self.count_page_reads(&ranges);
+        self.get_ranges_uncounted(location, &ranges).await
     }
 
     async fn put_opts(
@@ -263,10 +414,12 @@ impl ObjectStore for SuperfileObjectStore {
 
 #[cfg(test)]
 mod tests {
+    use std::{slice, sync::Mutex};
+
     use object_store::ObjectStoreExt;
 
     use super::*;
-    use crate::superfile::BytesLazyByteSource;
+    use crate::superfile::{BytesLazyByteSource, LazyByteSourceError};
 
     fn store_with(path: &str, body: &'static [u8]) -> (SuperfileObjectStore, ObjPath) {
         let p = ObjPath::from(path);
@@ -276,6 +429,45 @@ mod tests {
             Arc::new(BytesLazyByteSource::new(Bytes::from_static(body))),
         );
         (SuperfileObjectStore::from_sources(sources), p)
+    }
+
+    /// Returns half of every range it's asked for, like an object replaced by
+    /// a shorter one.
+    #[derive(Debug)]
+    struct ShortSource;
+
+    #[async_trait]
+    impl LazyByteSource for ShortSource {
+        fn size(&self) -> u64 {
+            SHORT_SOURCE_SIZE
+        }
+
+        async fn range(&self, _start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            Ok(Bytes::from(vec![0u8; (len / 2) as usize]))
+        }
+    }
+
+    /// The size [`ShortSource`] claims.
+    const SHORT_SOURCE_SIZE: u64 = 100;
+
+    #[tokio::test]
+    async fn a_short_read_comes_back_short() {
+        // A source that returns fewer bytes than asked:
+        //  - the store hands the short bytes on, as object_store's `get_ranges` does;
+        //  - the Parquet decoder then reports it, instead of the store panicking.
+        // This test pins the short read reaching the caller.
+        let p = ObjPath::from("short.parquet");
+        let mut sources: HashMap<ObjPath, Arc<dyn LazyByteSource>> = HashMap::new();
+        sources.insert(p.clone(), Arc::new(ShortSource));
+        let store = SuperfileObjectStore::from_sources(sources);
+
+        let wanted: Range<u64> = 10..40;
+        let got = store
+            .get_ranges(&p, slice::from_ref(&wanted))
+            .await
+            .expect("ranges");
+        let asked = wanted.end - wanted.start;
+        assert_eq!(got[0].len() as u64, asked / 2, "half of what was asked");
     }
 
     #[tokio::test]
@@ -445,5 +637,40 @@ mod tests {
         assert_eq!(resolve_range(Some(GetRange::Offset(99)), 10), 10..10);
         assert_eq!(resolve_range(Some(GetRange::Suffix(4)), 10), 6..10);
         assert_eq!(resolve_range(Some(GetRange::Suffix(99)), 10), 0..10);
+    }
+
+    #[tokio::test]
+    async fn merged_ranges_are_what_a_fetch_fetches() {
+        const GAP: u64 = OBJECT_STORE_COALESCE_DEFAULT;
+        let cases: [&[Range<u64>]; 7] = [
+            &[],
+            &[0..10, 5..20],
+            &[0..10, 10..20],
+            &[0..10, 10 + GAP..20 + GAP],
+            &[0..10, 11 + GAP..20 + GAP],
+            &[100..200, 0..10, 50..60],
+            &[0..10, 0..0, 3..4],
+        ];
+        for ranges in cases {
+            let fetched = Mutex::new(Vec::new());
+            coalesce_ranges(
+                ranges,
+                |range: Range<u64>| {
+                    fetched.lock().expect("fetched").push(range.clone());
+                    async move {
+                        Ok::<_, OsError>(Bytes::from(vec![0; (range.end - range.start) as usize]))
+                    }
+                },
+                GAP,
+            )
+            .await
+            .expect("coalesce");
+            let mut fetched = fetched.into_inner().expect("fetched");
+            fetched.sort_unstable_by_key(|range| range.start);
+            fetched.retain(|range| !range.is_empty());
+            let mut merged = merged_ranges(ranges);
+            merged.retain(|range| !range.is_empty());
+            assert_eq!(merged, fetched, "{ranges:?}");
+        }
     }
 }
