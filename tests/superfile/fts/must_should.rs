@@ -482,7 +482,7 @@ async fn intersection_pruned_matches_unpruned() {
         let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
         for d in 0..n_docs {
             let mut text = String::new();
-            for (term, odds) in [("common", 600u64), ("mid", 150)] {
+            for (term, odds) in [("common", 600u64), ("mid", 150), ("mida", 300), ("midb", 400)] {
                 if rng() % 1000 < odds {
                     for _ in 0..1 + rng() % 4 {
                         text.push_str(term);
@@ -512,6 +512,11 @@ async fn intersection_pruned_matches_unpruned() {
             queries.push(format!("+rare{r} +mid +common"));
         }
         queries.push("+mid +common".into());
+        // Two mid-density terms, neither rare nor dense enough for presence
+        // bits: the ranked walk that replaced the flat merge.
+        queries.push("+mida +midb".into());
+        queries.push("+mid +mida".into());
+        queries.push("+mid +mida +midb".into());
         for query in &queries {
             let full = search_hits(&reader, query, n_docs as usize + 1, BoolMode::Or).await;
             for k in [1usize, 10, 100] {

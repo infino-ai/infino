@@ -1206,6 +1206,15 @@ impl FtsReader {
             // Bit-test the common terms instead of decoding their blocks to
             // align them. See `and_membership_scored`.
             self.and_membership_scored(cursors, dl_norm_k1, sink);
+        } else if sink.needs_score() {
+            // A ranked walk drives the term with the fewest blocks a block at a
+            // time and probes the rest over each block's survivors, adding the
+            // terms in the flat merge's order (fewest blocks first) so a score
+            // is the same bits either way.
+            cursors.sort_by_key(|c| c.block_count());
+            let mut others = cursors;
+            let driver = others.remove(0);
+            and_membership_scored_batched(driver, others, dl_norm_k1, sink);
         } else {
             // Smallest-df cursor leads; ascending-df order reduces the
             // expected leapfrog bumps per candidate.
