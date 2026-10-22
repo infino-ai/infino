@@ -500,6 +500,30 @@ pub enum OpenError {
     /// path.
     #[error("commit error during open")]
     Commit(#[from] CommitError),
+
+    /// The hidden companion table of `purpose` beside the table did not
+    /// open. The table itself is open; only this companion is unreachable.
+    #[error("companion table {purpose:?} did not open: {source}")]
+    Companion {
+        purpose: String,
+        #[source]
+        source: Box<OpenError>,
+    },
+
+    /// The table's manifest records no companion of `purpose`, and more
+    /// than one companion table of that purpose is stored under the table
+    /// (`candidates`, by prefix). Re-attaching one would be a guess, so
+    /// none is attached.
+    #[error(
+        "the manifest records no companion table {purpose:?}, and {} of that purpose are stored \
+         under the table ({}); none is attached",
+        candidates.len(),
+        candidates.join(", ")
+    )]
+    CompanionAmbiguous {
+        purpose: String,
+        candidates: Vec<String>,
+    },
 }
 
 impl OpenError {
@@ -511,6 +535,7 @@ impl OpenError {
             OpenError::PointerUnreadable(e) | OpenError::Storage(e) => e.is_conflict(),
             OpenError::Build(b) => b.is_conflict(),
             OpenError::Commit(c) => c.is_conflict(),
+            OpenError::Companion { source, .. } => source.is_conflict(),
             _ => false,
         }
     }
@@ -526,6 +551,7 @@ impl OpenError {
             OpenError::ManifestPartLoad { source, .. } => {
                 permission_denied_in_chain(source.as_ref())
             }
+            OpenError::Companion { source, .. } => source.is_permission_denied(),
             _ => false,
         }
     }

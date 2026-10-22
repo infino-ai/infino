@@ -26,8 +26,10 @@ use crate::{
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
+        companion::check_purpose,
         hydrate::hydrate_from_reader,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
+        schema::{TableSchema, change::SchemaPatch},
     },
 };
 
@@ -98,7 +100,12 @@ pub(crate) trait Table: Send + Sync {
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
-    fn source_file_list(&self) -> Option<Supertable>;
+    fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError>;
+    fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -225,9 +232,17 @@ impl Table for SupertableHandle {
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
     }
-    fn source_file_list(&self) -> Option<Supertable> {
-        SupertableHandle::source_file_list(self)
-            .map(|list| Supertable::from_local(SupertableHandle::clone(list)))
+    fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError> {
+        SupertableHandle::companion(self, purpose)
+            .map(|found| found.map(Supertable::from_local))
+            .map_err(|e| InfinoError::from(e).with_context("companion", None))
+    }
+    fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        Ok((*SupertableHandle::apply_schema(self, patch, expected)?).clone())
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -614,33 +629,51 @@ impl Supertable {
         self.inner.gc(safety_gap)
     }
 
-    /// The hidden source-file list beside this table, or `None` when the
-    /// table was not created with one ([`IndexSpec::source_file_list`]).
+    /// The hidden companion table of `purpose` beside this table, as
+    /// declared with [`IndexSpec::companion`] when the table was created.
     ///
-    /// The list is a table like any other — append, delete, search and
-    /// optimize it through the handle returned here — with a fixed schema,
-    /// one row per source file or per source folder:
+    /// - `Ok(None)` when the table has no companion of that purpose.
+    /// - `Err` when it has one that does not open. The table itself stays
+    ///   usable: a companion that fails to open never fails the table's
+    ///   open, and its error is reported here, to the caller that asks for
+    ///   it. Each ask tries the open again, so a transient failure clears
+    ///   without reopening the table.
+    /// - `Ok(Some(handle))` otherwise: a table like any other, with the
+    ///   schema and indexes the companion was declared with.
     ///
-    /// | column | type | |
-    /// |---|---|---|
-    /// | `kind` | `LargeUtf8` | `file` or `folder`; full-text indexed |
-    /// | `file_no` | `UInt32` | the file's number |
-    /// | `key` | `LargeUtf8` | the object key; full-text indexed |
-    /// | `marker` | `LargeUtf8` | the version marker the file was read at |
-    /// | `size` | `UInt64` | bytes, as listed |
-    /// | `mtime_ms` | `Int64` | modification time, as listed |
-    /// | `rows` | `UInt64` | rows the file yielded |
-    /// | `loaded_ms` | `Int64` | when its rows landed |
-    /// | `listed_ms` | `Int64` | when the folder was last listed |
-    /// | `changed` | `Boolean` | whether that listing found a change |
+    /// An engine older than companions that commits the table drops the
+    /// manifest's record of them; this finds a companion whose record was
+    /// lost by its storage location, attaches it, and has the table's next
+    /// commit record it again. It attaches none, and returns `Err`, when
+    /// more than one companion of the purpose is stored there.
     ///
-    /// A column that does not apply to a row's kind is null. The list is
-    /// never in [`Connection::list_tables`](crate::Connection::list_tables)
-    /// and is purged with the table.
+    /// A purpose that cannot name a companion (see
+    /// [`IndexSpec::companion`]) is refused with [`InfinoError::Config`].
     ///
-    /// [`IndexSpec::source_file_list`]: crate::IndexSpec::source_file_list
-    pub fn source_file_list(&self) -> Option<Supertable> {
-        self.inner.source_file_list()
+    /// [`IndexSpec::companion`]: crate::IndexSpec::companion
+    pub fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError> {
+        check_purpose(purpose).map_err(InfinoError::Config)?;
+        self.inner.companion(purpose)
+    }
+
+    /// Change this table's schema by merging `patch` into it, as
+    /// [`Connection::apply_schema`](crate::Connection::apply_schema) does
+    /// for a table it names; returns the document the table holds
+    /// afterwards. This is how a companion's schema evolves, since a
+    /// companion has no name in the catalog: add, rename, retype or retire
+    /// its columns through its handle. A patch that changes nothing
+    /// commits nothing and reads the current document back. `expected` is
+    /// an optional compare-and-set against the current `schema_id`; it
+    /// fails with [`InfinoError::Conflict`] when the schema has moved.
+    ///
+    /// Hosted tables do not carry the schema document yet and return an
+    /// error.
+    pub fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        self.inner.apply_schema(patch, expected)
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted
