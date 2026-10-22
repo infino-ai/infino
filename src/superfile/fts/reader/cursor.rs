@@ -20,7 +20,7 @@ use bytes::Bytes;
 use super::{
     bounds::BoundDecoder,
     core::{TermIdf, read_u32_le, read_u64_le},
-    metadata::{ColumnMeta, NormTable},
+    metadata::ColumnMeta,
 };
 use crate::superfile::{
     ReadError,
@@ -1244,48 +1244,6 @@ impl TermCursor {
             &hdr,
             rank,
         ))
-    }
-
-    /// How many postings, from the current one on, would fail the leader
-    /// walk's bar: each scores at most `threshold` with `others_ub` added,
-    /// tested exactly as the walk tests one candidate. Counts up to the
-    /// first posting that clears the bar or lies past `last_doc`, within the
-    /// decoded block only, four postings per step. The walk advances past
-    /// them at once instead of paying its per-candidate bookkeeping on each.
-    pub(super) fn leading_rejects(
-        &self,
-        norms: &NormTable,
-        others_ub: f32,
-        threshold: f32,
-        last_doc: u32,
-    ) -> usize {
-        let docs = &self.block_doc_ids[self.pos..self.block_n];
-        let tfs = &self.block_tfs[self.pos..self.block_n];
-        let end = docs.partition_point(|&d| d <= last_doc);
-        let clears = |score: f32| score + others_ub > threshold;
-        let mut i = 0;
-        while i + bm25::SCORE_SIMD_LANES <= end {
-            let lane_docs: [u32; bm25::SCORE_SIMD_LANES] =
-                std::array::from_fn(|l| docs[i + l]);
-            let lane_tfs: [u32; bm25::SCORE_SIMD_LANES] = std::array::from_fn(|l| tfs[i + l]);
-            let scores =
-                bm25::score_one_term_x4(self.idf_weight, lane_tfs, lane_docs.map(|d| norms.get(d)));
-            let mut mask = 0u32;
-            for (l, &score) in scores.iter().enumerate() {
-                mask |= u32::from(clears(score)) << l;
-            }
-            if mask != 0 {
-                return i + mask.trailing_zeros() as usize;
-            }
-            i += bm25::SCORE_SIMD_LANES;
-        }
-        while i < end {
-            if clears(bm25::score_with_dl_norm_k1(self.idf_weight, tfs[i], norms.get(docs[i]))) {
-                return i;
-            }
-            i += 1;
-        }
-        end
     }
 
     pub(super) fn is_exhausted(&self) -> bool {

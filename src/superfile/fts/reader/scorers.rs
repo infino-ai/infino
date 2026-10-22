@@ -2773,17 +2773,6 @@ impl FtsReader {
                         }
                         have_bound = true;
                     }
-                    // Unfiltered, reject the leader's postings that cannot
-                    // clear the bar four at a time, up to the first that can,
-                    // while the bound just measured still holds.
-                    if filter.is_none() {
-                        let last = bound_holds_to.min(block_end).min(doc_id_end - 1);
-                        let run = c0.leading_rejects(dl_norm_k1, others_ub, threshold, last);
-                        if run > 0 {
-                            c0.advance_by(run);
-                            continue;
-                        }
-                    }
                     if essential_score + others_ub <= threshold {
                         c0.next();
                         continue;
