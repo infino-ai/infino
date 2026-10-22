@@ -2875,6 +2875,18 @@ impl FtsReader {
                 for (word_idx, word) in present[..words].iter_mut().enumerate() {
                     let mut bits = *word;
                     *word = 0;
+                    if bits == 0 {
+                        continue;
+                    }
+                    // A word whose best score cannot beat the k-th best holds no
+                    // hit: clear its slots without visiting a document.
+                    if heap.len() >= k {
+                        let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
+                        if slots.iter().fold(0.0f32, |m, &x| m.max(x)) <= threshold {
+                            slots.fill(0.0);
+                            continue;
+                        }
+                    }
                     while bits != 0 {
                         let b = bits.trailing_zeros() as usize;
                         bits &= bits - 1;
