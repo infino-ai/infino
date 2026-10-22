@@ -1974,7 +1974,10 @@ mod tests {
     /// windows fall under the k-th best, where it counts without scoring:
     /// a single near-every-doc term, and unions of it with mid and rare
     /// terms. The top-k must agree with the pruned search and the count must
-    /// be exact.
+    /// be exact. Run over two corpora: one uniform, and one front-loaded,
+    /// whose strong documents all sit in its first windows, so the later
+    /// windows' block maxima together stay under the k-th best and are
+    /// counted unscored.
     #[tokio::test]
     async fn exact_count_counts_unscored_blocks_and_windows_exactly() {
         let mut x: u64 = 0xA076_1D64_78BD_642F;
@@ -1985,58 +1988,65 @@ mod tests {
             x
         };
         let n_docs = 40_000u32;
-        let mut b = FtsBuilder::new();
-        b.register_column("body".into(), false).expect("register");
-        for i in 0..n_docs {
-            let mut text = String::from("doc");
-            if rng() % 100 < 90 {
-                for _ in 0..1 + rng() % 4 {
-                    text.push_str(" common");
+        for front_loaded in [false, true] {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..n_docs {
+                // Front-loaded: past the first quarter every document is weak,
+                // one occurrence of each term in a long body.
+                let weak = front_loaded && i >= n_docs / 4;
+                let mut text = String::from("doc");
+                if rng() % 100 < 90 {
+                    let reps = if weak { 1 } else { 1 + rng() % 4 };
+                    for _ in 0..reps {
+                        text.push_str(" common");
+                    }
                 }
+                if rng() % 100 < 12 {
+                    text.push_str(" mid");
+                }
+                if rng() % 1000 < 7 {
+                    text.push_str(if weak { " rare" } else { " rare rare" });
+                }
+                let filler = if weak { 40 + rng() % 30 } else { rng() % 30 };
+                for _ in 0..filler {
+                    text.push_str(" filler");
+                }
+                b.add_doc(0, i, &text).expect("add doc");
             }
-            if rng() % 100 < 12 {
-                text.push_str(" mid");
-            }
-            if rng() % 1000 < 7 {
-                text.push_str(" rare rare");
-            }
-            for _ in 0..rng() % 30 {
-                text.push_str(" filler");
-            }
-            b.add_doc(0, i, &text).expect("add doc");
-        }
-        let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(blob, json).expect("open");
-        let queries: [&[&str]; 5] = [
-            &["common"],
-            &["mid"],
-            &["common", "mid"],
-            &["common", "mid", "rare"],
-            &["mid", "rare"],
-        ];
-        for shoulds in queries {
-            let lists = || ClauseLists {
-                shoulds,
-                ..ClauseLists::default()
-            };
-            let matches = r
-                .search_excluding("body", lists(), n_docs as usize, f32::NEG_INFINITY)
-                .await
-                .expect("every match")
-                .len() as u64;
-            for k in [1usize, 10, 100] {
-                let pruned = r
-                    .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
+            let queries: [&[&str]; 5] = [
+                &["common"],
+                &["mid"],
+                &["common", "mid"],
+                &["common", "mid", "rare"],
+                &["mid", "rare"],
+            ];
+            for shoulds in queries {
+                let lists = || ClauseLists {
+                    shoulds,
+                    ..ClauseLists::default()
+                };
+                let matches = r
+                    .search_excluding("body", lists(), n_docs as usize, f32::NEG_INFINITY)
                     .await
-                    .expect("pruned search");
-                let (hits, count) = r
-                    .search_excluding_with_count("body", lists(), k)
-                    .await
-                    .expect("counted search");
-                let label = format!("{shoulds:?} k={k}");
-                assert_same_top_k(&hits, &pruned, &label);
-                assert_eq!(count, matches, "count for {label}");
+                    .expect("every match")
+                    .len() as u64;
+                for k in [1usize, 10, 100] {
+                    let pruned = r
+                        .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                        .await
+                        .expect("pruned search");
+                    let (hits, count) = r
+                        .search_excluding_with_count("body", lists(), k)
+                        .await
+                        .expect("counted search");
+                    let label = format!("{shoulds:?} k={k} front_loaded={front_loaded}");
+                    assert_same_top_k(&hits, &pruned, &label);
+                    assert_eq!(count, matches, "count for {label}");
+                }
             }
         }
     }

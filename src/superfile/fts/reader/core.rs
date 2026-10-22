@@ -2128,15 +2128,7 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         // Mark each cursor's docs in [base, window_end). `d - base` is in
         // range because every live cursor sits at >= min_doc >= base.
         for c in &mut cursors {
-            while !c.is_exhausted() {
-                let d = c.current_doc_id();
-                if d >= window_end {
-                    break;
-                }
-                let local = (d - base) as usize;
-                present[local >> 6] |= 1u64 << (local & 63);
-                c.next();
-            }
+            mark_window(c, base, window_end, &mut present);
         }
         // Count distinct docs in this window and clear for reuse.
         for word in present.iter_mut() {
@@ -2145,6 +2137,31 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         }
     }
     n
+}
+
+/// Mark `c`'s docs below `window_end` into `present`, a window bitmap whose
+/// bit 0 is doc `base`, and leave the cursor on its first doc at or past
+/// `window_end`. Reads each decoded block as a slice, so a dense term costs
+/// a store per doc and a cursor move per block, not a cursor step per doc.
+/// Every doc the cursor sits on must be at or past `base`.
+#[inline]
+pub(super) fn mark_window(c: &mut TermCursor, base: u32, window_end: u32, present: &mut [u64]) {
+    while !c.is_exhausted() {
+        let docs = &c.block_doc_ids[c.pos..c.block_n];
+        let take = docs.partition_point(|&d| d < window_end);
+        for &d in &docs[..take] {
+            let local = d - base;
+            present[(local >> 6) as usize] |= 1u64 << (local & 63);
+        }
+        if take == 0 {
+            break;
+        }
+        let rest = docs.len() - take;
+        c.advance_by(take);
+        if rest > 0 {
+            break;
+        }
+    }
 }
 
 /// Disjunction cardinality via a full doc-space bitset: OR every term's
@@ -2277,9 +2294,10 @@ fn dominant_anchor_of_dfs(dfs: impl IntoIterator<Item = u64>) -> Option<usize> {
 fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
     let mut anchor = cursors.swap_remove(anchor_idx);
     let mut n = anchor.df;
-    // Frontier merge over the remaining (rarer) cursors: smallest current
-    // doc, membership-test the anchor, then advance every other cursor
-    // sitting on that doc so each distinct doc is visited once.
+    // The rarer cursors' docs, one window at a time, deduplicated by the
+    // window bitmap; each distinct doc then costs one membership test of the
+    // anchor, in ascending order.
+    let mut present = [0u64; OR_WINDOW_WORDS];
     loop {
         let mut min_doc = u32::MAX;
         for c in &cursors {
@@ -2290,16 +2308,23 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         if min_doc == u32::MAX {
             break;
         }
+        let base = min_doc & !(OR_WINDOW - 1);
+        let window_end = base.saturating_add(OR_WINDOW);
+        for c in &mut cursors {
+            mark_window(c, base, window_end, &mut present);
+        }
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
         // in one word-load; `skip_to` would decode each block — expanding its
         // ~128 doc ids — as the frontier drags the anchor across its whole list.
-        if !anchor.contains(min_doc) {
-            n += 1;
-        }
-        for c in cursors.iter_mut() {
-            if !c.is_exhausted() && c.current_doc_id() == min_doc {
-                c.next();
+        for (word_idx, word) in present.iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                let doc = base + ((word_idx as u32) << 6) + bits.trailing_zeros();
+                bits &= bits - 1;
+                if !anchor.contains(doc) {
+                    n += 1;
+                }
             }
         }
     }

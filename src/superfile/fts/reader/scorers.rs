@@ -2520,11 +2520,7 @@ impl FtsReader {
                     .sum();
                 if bound <= threshold {
                     for c in &mut cursors {
-                        while !c.is_exhausted() && c.current_doc_id() < window_end {
-                            let local = (c.current_doc_id() - base) as usize;
-                            present[local >> 6] |= 1u64 << (local & 63);
-                            c.next();
-                        }
+                        mark_window(c, base, window_end, &mut present);
                     }
                     for word in present.iter_mut() {
                         count += u64::from(std::mem::take(word).count_ones());
