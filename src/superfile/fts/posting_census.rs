@@ -225,7 +225,7 @@ fn posting_census() {
     let mut term: Vec<u8> = Vec::new();
     let mut docs: Vec<u32> = Vec::new();
     let mut tfs: Vec<u32> = Vec::new();
-    let mut flush = |docs: &mut Vec<u32>, tfs: &mut Vec<u32>| {
+    let mut flush = |term_for_report: &[u8], docs: &mut Vec<u32>, tfs: &mut Vec<u32>| {
         let df = docs.len() as u64;
         match df {
             0 => return,
@@ -239,6 +239,30 @@ fn posting_census() {
             return;
         };
         let patchable = docs.len() <= 16 * 1024;
+        if df > 1_000_000 {
+            // How today's rule stores the biggest terms, block by block: the
+            // dense-union count folds bitset blocks as words but decodes and
+            // scatters packed ones.
+            let mut kinds = [0u64; 4];
+            let mut prev = None;
+            let mut span = 0u64;
+            for (dc, tc) in docs.chunks(BLOCK_LEN).zip(tfs.chunks(BLOCK_LEN)) {
+                let (_, _, _, kind) =
+                    model_block(&POLICIES[0], dc, tc, prev, patchable, &mut scratch);
+                kinds[kind as usize] += 1;
+                span += u64::from(dc[dc.len() - 1] - dc[0] + 1);
+                prev = Some(dc[dc.len() - 1]);
+            }
+            let blocks = kinds.iter().sum::<u64>().max(1);
+            println!(
+                "big term {:?}: df {df}, blocks {blocks}, packed {:.1}% bitset {:.1}% patched {:.1}%, mean span {:.0} ids",
+                String::from_utf8_lossy(term_for_report),
+                100.0 * kinds[0] as f64 / blocks as f64,
+                100.0 * kinds[1] as f64 / blocks as f64,
+                100.0 * kinds[2] as f64 / blocks as f64,
+                span as f64 / blocks as f64,
+            );
+        }
         for (pi, p) in POLICIES.iter().enumerate() {
             let t = &mut tallies[pi][b];
             t.terms += 1;
@@ -286,7 +310,7 @@ fn posting_census() {
 
     fts.for_each_term_posting(0, |t, doc, tf, _positions| {
         if t != term.as_slice() {
-            flush(&mut docs, &mut tfs);
+            flush(&term, &mut docs, &mut tfs);
             term.clear();
             term.extend_from_slice(t);
         }
@@ -295,7 +319,7 @@ fn posting_census() {
         Ok(())
     })
     .expect("walk postings");
-    flush(&mut docs, &mut tfs);
+    flush(&term, &mut docs, &mut tfs);
 
     println!("inline terms {inline_terms}, short-form terms {short_terms}");
     println!("baseline model vs encode_block mismatches: {mismatches}");
