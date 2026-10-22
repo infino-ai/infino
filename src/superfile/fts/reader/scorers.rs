@@ -541,12 +541,19 @@ fn must_lead_should_walk(
     dl_norm_k1: &NormTable,
     heap: &mut BinaryHeap<TopKEntry>,
 ) {
-    shoulds.sort_unstable_by(|a, b| {
-        b.term_max_bm25
-            .partial_cmp(&a.term_max_bm25)
+    // Probe the optional terms strongest first (the bound on what is still
+    // unprobed then falls fastest), but add their scores in query order, as
+    // the general must+should walk does, so a score is the same bits on
+    // either path.
+    let m = shoulds.len();
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_unstable_by(|&a, &b| {
+        shoulds[b]
+            .term_max_bm25
+            .partial_cmp(&shoulds[a].term_max_bm25)
             .unwrap_or(Ordering::Equal)
     });
-    let m = shoulds.len();
+    let mut contrib = vec![0.0_f32; m];
     let mut doc_ub = vec![0.0_f32; m];
     let mut doc_suffix = vec![0.0_f32; m + 1];
     // The bar a doc must beat: the k-th best once the heap is full, else the
@@ -589,10 +596,11 @@ fn must_lead_should_walk(
                 if !have_bound || candidate > bound_holds_to {
                     others_ub = 0.0;
                     bound_holds_to = u32::MAX;
-                    for (i, c) in shoulds.iter_mut().enumerate() {
+                    for (rank, &si) in order.iter().enumerate() {
+                        let c = &mut shoulds[si];
                         c.shallow_advance_block_to(candidate);
-                        doc_ub[i] = c.inspect_block_max_bm25();
-                        others_ub += doc_ub[i];
+                        doc_ub[rank] = c.inspect_block_max_bm25();
+                        others_ub += doc_ub[rank];
                         bound_holds_to = bound_holds_to.min(c.inspect_block_last_doc_id());
                     }
                     doc_suffix[m] = 0.0;
@@ -606,16 +614,23 @@ fn must_lead_should_walk(
                     continue;
                 }
             }
-            let mut score = lead_score;
+            let mut partial = lead_score;
             let mut abandoned = false;
-            for (i, c) in shoulds.iter_mut().enumerate() {
+            contrib.fill(0.0);
+            for (rank, &si) in order.iter().enumerate() {
+                let c = &mut shoulds[si];
                 if let Some(tf) = c.bitset_probe_tf(candidate) {
-                    score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
+                    contrib[si] = bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
+                    partial += contrib[si];
                 }
-                if pruning && score + doc_suffix[i + 1] <= threshold {
+                if pruning && partial + doc_suffix[rank + 1] <= threshold {
                     abandoned = true;
                     break;
                 }
+            }
+            let mut score = lead_score;
+            for &x in &contrib {
+                score += x;
             }
             if !abandoned && score > floor_eff {
                 and_heap_push(heap, k, None, score, candidate);
