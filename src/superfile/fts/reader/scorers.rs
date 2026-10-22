@@ -155,6 +155,18 @@ pub(super) struct BoundClaim {
 /// accumulation to probing.
 const DEMOTE_DENSITY: f32 = 8.0;
 
+/// [`DEMOTE_DENSITY`], overridable from the environment so a measurement
+/// box can sweep it without a rebuild.
+fn demote_density() -> f32 {
+    static D: OnceLock<f32> = OnceLock::new();
+    *D.get_or_init(|| {
+        env::var("INFINO_PROTO_DEMOTE_DENSITY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEMOTE_DENSITY)
+    })
+}
+
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
 /// `docs[i]` the term contains, scoring matches in SIMD batches rather than one
 /// at a time. `docs` must be ascending — `bitset_probe_tf` advances the cursor
@@ -2820,7 +2832,7 @@ impl FtsReader {
                     let f = recompute_f(&partial_win, threshold);
                     let kept: f32 = win_docs_est[..f].iter().sum();
                     let demoted: f32 = win_docs_est[f..f_essential].iter().sum();
-                    if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1.0) {
+                    if f == 0 || demoted >= demote_density() * kept.max(1.0) {
                         f
                     } else {
                         partial_win.copy_from_slice(&partial_max);
