@@ -306,3 +306,80 @@ async fn negation_only_still_errors() {
         "unexpected error: {msg}"
     );
 }
+
+/// One required term with optional terms, pruned, against the same query
+/// unpruned: a `k` larger than the match count never fills the heap, so it
+/// prunes nothing, and its top `k` must be the pruned answer exactly (same
+/// docs, same scores, same order). Corpora span many posting blocks, mix a
+/// near-every-doc term with mid and rare ones, and vary document length so
+/// block bounds differ from block to block.
+#[tokio::test]
+async fn one_must_with_shoulds_pruned_matches_unpruned() {
+    let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let vocab = ["t0", "t1", "t2", "t3", "t4", "t5"];
+    for trial in 0..10u32 {
+        let n_docs = 2_000 + (rng() % 10_000) as u64;
+        // Inclusion odds out of 1000: one stopword-like, the rest varied.
+        let odds: Vec<u64> = (0..vocab.len())
+            .map(|t| match t {
+                0 => 900,
+                _ => 5 + rng() % 400,
+            })
+            .collect();
+        let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
+        for d in 0..n_docs {
+            let mut text = String::new();
+            for (t, term) in vocab.iter().enumerate() {
+                if rng() % 1000 < odds[t] {
+                    for _ in 0..1 + rng() % 4 {
+                        text.push_str(term);
+                        text.push(' ');
+                    }
+                }
+            }
+            for _ in 0..rng() % 30 {
+                text.push_str("filler ");
+            }
+            text.push_str("doc");
+            owned.push((d, text));
+        }
+        let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        let reader = build_infino_superfile(&refs);
+        for _ in 0..8 {
+            let must = vocab[(rng() % vocab.len() as u64) as usize];
+            let mut shoulds: Vec<&str> = Vec::new();
+            for _ in 0..1 + rng() % 3 {
+                let s = vocab[(rng() % vocab.len() as u64) as usize];
+                if s != must && !shoulds.contains(&s) {
+                    shoulds.push(s);
+                }
+            }
+            if shoulds.is_empty() {
+                continue;
+            }
+            let mut query = format!("+{must}");
+            for s in &shoulds {
+                query.push(' ');
+                query.push_str(s);
+            }
+            if rng() % 4 == 0 {
+                query.push_str(" -filler");
+            }
+            let full = search_hits(&reader, &query, n_docs as usize + 1, BoolMode::Or).await;
+            for k in [1usize, 5, 10, 100] {
+                let pruned = search_hits(&reader, &query, k, BoolMode::Or).await;
+                let want = &full[..k.min(full.len())];
+                assert_eq!(
+                    pruned, want,
+                    "trial {trial} query {query:?} k={k}: pruned top-k differs from unpruned"
+                );
+            }
+        }
+    }
+}
