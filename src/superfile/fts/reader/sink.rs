@@ -72,9 +72,22 @@ impl LiveFloor {
 /// smaller doc_id survives in the heap.
 #[derive(Debug, Copy, Clone)]
 pub(super) struct TopKEntry<I = FtsDocId>(pub(super) f32, pub(super) I);
+/// An integer that orders as the score does: the sign bit flipped for a
+/// non-negative score, every bit for a negative one. The top-k heaps compare
+/// these rather than floats, a single integer compare per heap step; a
+/// score is never NaN.
+#[inline(always)]
+fn score_key(score: f32) -> u32 {
+    let bits = score.to_bits();
+    match bits >> 31 {
+        0 => bits | 0x8000_0000,
+        _ => !bits,
+    }
+}
+
 impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0 && self.1 == other.1
+        score_key(self.0) == score_key(other.0) && self.1 == other.1
     }
 }
 impl<I: Eq> Eq for TopKEntry<I> {}
@@ -90,10 +103,8 @@ impl<I: Ord> Ord for TopKEntry<I> {
         // inverted, so that among score-tied entries the LARGER doc id
         // is greater — i.e. peek — and is the one evicted when a
         // better doc arrives, keeping the smaller id.
-        other
-            .0
-            .partial_cmp(&self.0)
-            .unwrap_or(Ordering::Equal)
+        score_key(other.0)
+            .cmp(&score_key(self.0))
             .then_with(|| self.1.cmp(&other.1))
     }
 }
