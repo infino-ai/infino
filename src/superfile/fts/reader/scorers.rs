@@ -624,6 +624,94 @@ fn must_lead_should_walk(
     }
 }
 
+/// The scored rarest-driven intersection, a driver block at a time: skip a
+/// block whose driver maximum plus the other terms' maxima over its range
+/// cannot beat the bar; otherwise score the block's docs in one batch, drop
+/// those that cannot reach the bar with every other term at its window
+/// maximum, and complete the others one term at a time over the survivors,
+/// rarest first, a doc leaving at the first term it lacks and the survivors
+/// re-filtered against what the terms still to come could add. Terms are
+/// added driver first and then rarest first, the order the per-document walk
+/// adds them in, so scores are the same bits.
+fn and_membership_scored_batched<S: AndSink>(
+    mut driver: TermCursor,
+    mut others: Vec<TermCursor>,
+    dl_norm_k1: &NormTable,
+    sink: &mut S,
+) {
+    let m = others.len();
+    let mut window = vec![0.0_f32; m];
+    let mut suffix = vec![0.0_f32; m + 1];
+    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    while !driver.is_exhausted() {
+        let bar = sink.bar();
+        let pruning = bar > f32::NEG_INFINITY;
+        let start = driver.current_doc_id();
+        let block_end = driver.current_block_last_doc_id();
+        if pruning {
+            for (w, c) in window.iter_mut().zip(others.iter_mut()) {
+                *w = c.block_max_in_range(start, block_end);
+            }
+            suffix[m] = 0.0;
+            for i in (0..m).rev() {
+                suffix[i] = suffix[i + 1] + window[i];
+            }
+            if driver.current_block_max_bm25() + suffix[0] <= bar {
+                driver.skip_to(block_end.saturating_add(1));
+                continue;
+            }
+        }
+        if driver.decoded_block != driver.current_block {
+            driver.decode_current_block();
+            driver.materialize_at(start);
+        }
+        let (from, to) = (driver.pos, driver.block_n);
+        docs.clear();
+        scores.clear();
+        for j in from..to {
+            let d = driver.block_doc_ids[j];
+            docs.push(d);
+            scores.push(bm25::score_with_dl_norm_k1(
+                driver.idf_weight,
+                driver.block_tfs[j],
+                dl_norm_k1.get(d),
+            ));
+        }
+        driver.advance_by(to - from);
+        if pruning {
+            let n = filter_survivors(&mut docs, &mut scores, bar - suffix[0]);
+            docs.truncate(n);
+            scores.truncate(n);
+        }
+        for (i, o) in others.iter_mut().enumerate() {
+            if docs.is_empty() {
+                break;
+            }
+            let mut w = 0usize;
+            for r in 0..docs.len() {
+                let d = docs[r];
+                if let Some(tf) = o.bitset_probe_tf(d) {
+                    docs[w] = d;
+                    scores[w] = scores[r]
+                        + bm25::score_with_dl_norm_k1(o.idf_weight, tf, dl_norm_k1.get(d));
+                    w += 1;
+                }
+            }
+            docs.truncate(w);
+            scores.truncate(w);
+            if pruning && i + 1 < m {
+                let n = filter_survivors(&mut docs, &mut scores, bar - suffix[i + 1]);
+                docs.truncate(n);
+                scores.truncate(n);
+            }
+        }
+        for (&d, &s) in docs.iter().zip(scores.iter()) {
+            sink.emit(d, s);
+        }
+    }
+}
+
 /// Add four ascending documents' contributions into a window and mark them
 /// present. Consecutive documents of a block usually share a presence word,
 /// and four read-modify-writes of one word wait on each other's stores; when
@@ -1130,6 +1218,10 @@ impl FtsReader {
         // already excludes. Order is irrelevant to the score (Σ is commutative).
         others.sort_by_key(|c| c.df);
         let need_score = sink.needs_score();
+        if need_score {
+            and_membership_scored_batched(driver, others, dl_norm_k1, sink);
+            return;
+        }
         // Scratch for the per-window suffix bounds; one slot per other term
         // plus the zero terminator.
         let mut suffix = vec![0.0f32; others.len() + 1];

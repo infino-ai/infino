@@ -462,3 +462,66 @@ async fn rare_and_common_pair_matches_unpruned() {
         }
     }
 }
+
+/// Intersections of a rare term (under a sixty-fourth of the corpus, so the
+/// rarest-driven membership walk takes them) with mid and common terms,
+/// pruned, against the same query at a `k` past the match count, which
+/// prunes nothing: the pruned top `k` must be the unpruned one exactly.
+#[tokio::test]
+async fn intersection_pruned_matches_unpruned() {
+    let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+    let mut rng = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for trial in 0..8u32 {
+        let n_docs = 20_000 + (rng() % 20_000) as u64;
+        let rare_odds: Vec<u64> = (0..3).map(|_| 3 + rng() % 12).collect();
+        let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
+        for d in 0..n_docs {
+            let mut text = String::new();
+            for (term, odds) in [("common", 600u64), ("mid", 150)] {
+                if rng() % 1000 < odds {
+                    for _ in 0..1 + rng() % 4 {
+                        text.push_str(term);
+                        text.push(' ');
+                    }
+                }
+            }
+            for (r, odds) in rare_odds.iter().enumerate() {
+                if rng() % 1000 < *odds {
+                    for _ in 0..1 + rng() % 3 {
+                        text.push_str(&format!("rare{r} "));
+                    }
+                }
+            }
+            for _ in 0..rng() % 40 {
+                text.push_str("filler ");
+            }
+            text.push_str("doc");
+            owned.push((d, text));
+        }
+        let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
+        let reader = build_infino_superfile(&refs);
+        let mut queries: Vec<String> = Vec::new();
+        for r in 0..3 {
+            queries.push(format!("+rare{r} +common"));
+            queries.push(format!("+rare{r} +mid"));
+            queries.push(format!("+rare{r} +mid +common"));
+        }
+        queries.push("+mid +common".into());
+        for query in &queries {
+            let full = search_hits(&reader, query, n_docs as usize + 1, BoolMode::Or).await;
+            for k in [1usize, 10, 100] {
+                let got = search_hits(&reader, query, k, BoolMode::Or).await;
+                assert_eq!(
+                    got,
+                    &full[..k.min(full.len())],
+                    "trial {trial} query {query:?} k={k}"
+                );
+            }
+        }
+    }
+}
