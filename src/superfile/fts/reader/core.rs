@@ -520,7 +520,7 @@ pub(super) const RARE_LED_MAX_DF: u64 = 1 << 17;
 /// Postings-equivalent cost of testing one document against one term in a
 /// count: a block locate and, on a packed block, a decode. Weighs probing a
 /// rare term's documents against folding every term into a bitset.
-pub(super) const COUNT_PROBE_POSTINGS: u64 = 20;
+pub(super) const COUNT_PROBE_POSTINGS: u64 = 40;
 
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///

@@ -521,17 +521,18 @@ fn and_prefer_membership(cursors: &[TermCursor]) -> bool {
 ///
 /// A required block is skipped whole when its own block maximum plus each
 /// optional term's maximum **over that block's doc range** cannot beat the
-/// k-th best. Bounding the optional terms by their maxima over the range
+/// k-th best: bounding the optional terms by their maxima over the range
 /// rather than over their whole lists is what lets a common optional term
-/// stop holding every block open. Inside a block, each candidate is
-/// rejected before any probe when its required score plus the optional
-/// terms' block maxima at that doc cannot beat the bar, and abandoned
-/// part-way through the probes once what is still unprobed cannot close the
-/// gap, strongest optional term first.
+/// stop holding every block open. A block that survives is scored in one
+/// batch, filtered against the bar less what the optional terms could add,
+/// and then completed one optional term at a time over the survivors, each
+/// pass re-filtering against what the terms still to come could add.
 ///
-/// Docs arrive in ascending order and a tie keeps the smaller doc, so a
-/// candidate whose bound only equals the k-th best can never enter the heap:
-/// pruning on `<=` drops nothing that would have been kept.
+/// Optional terms are added in query order, as the general must+should walk
+/// adds them, so a score is the same bits on either path. Docs arrive in
+/// ascending order and a tie keeps the smaller doc, so a candidate whose
+/// bound only equals the k-th best can never enter the heap: pruning on
+/// `<=` drops nothing that would have been kept.
 fn must_lead_should_walk(
     mut lead: TermCursor,
     mut shoulds: Vec<TermCursor>,
@@ -541,21 +542,11 @@ fn must_lead_should_walk(
     dl_norm_k1: &NormTable,
     heap: &mut BinaryHeap<TopKEntry>,
 ) {
-    // Probe the optional terms strongest first (the bound on what is still
-    // unprobed then falls fastest), but add their scores in query order, as
-    // the general must+should walk does, so a score is the same bits on
-    // either path.
     let m = shoulds.len();
-    let mut order: Vec<usize> = (0..m).collect();
-    order.sort_unstable_by(|&a, &b| {
-        shoulds[b]
-            .term_max_bm25
-            .partial_cmp(&shoulds[a].term_max_bm25)
-            .unwrap_or(Ordering::Equal)
-    });
-    let mut contrib = vec![0.0_f32; m];
-    let mut doc_ub = vec![0.0_f32; m];
-    let mut doc_suffix = vec![0.0_f32; m + 1];
+    let mut window = vec![0.0_f32; m];
+    let mut suffix = vec![0.0_f32; m + 1];
+    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     // The bar a doc must beat: the k-th best once the heap is full, else the
     // floor (`NEG_INFINITY` when there is none, which prunes nothing).
     let bar = |heap: &BinaryHeap<TopKEntry>| -> f32 {
@@ -564,79 +555,71 @@ fn must_lead_should_walk(
             false => floor_eff,
         }
     };
-    let mut threshold = bar(heap);
     while !lead.is_exhausted() {
+        let threshold = bar(heap);
+        let pruning = threshold > f32::NEG_INFINITY;
         let start = lead.current_doc_id();
         let block_end = lead.current_block_last_doc_id();
-        if threshold > f32::NEG_INFINITY {
-            let window: f32 = shoulds
-                .iter_mut()
-                .map(|c| c.block_max_in_range(start, block_end))
-                .sum();
-            if lead.current_block_max_bm25() + window <= threshold {
+        if pruning {
+            for (w, c) in window.iter_mut().zip(shoulds.iter_mut()) {
+                *w = c.block_max_in_range(start, block_end);
+            }
+            suffix[m] = 0.0;
+            for i in (0..m).rev() {
+                suffix[i] = suffix[i + 1] + window[i];
+            }
+            if lead.current_block_max_bm25() + suffix[0] <= threshold {
                 lead.skip_to(block_end.saturating_add(1));
                 continue;
             }
         }
-        let mut have_bound = false;
-        let mut bound_holds_to = 0u32;
-        let mut others_ub = 0.0_f32;
-        while !lead.is_exhausted() && lead.current_doc_id() <= block_end {
-            let candidate = lead.current_doc_id();
-            if let Some(f) = filter.as_deref_mut()
-                && !f.admits(candidate)
-            {
-                lead.next();
-                continue;
+        // The batch needs the whole block: a skip into a dense block may
+        // hold only the one doc it landed on.
+        if lead.decoded_block != lead.current_block {
+            lead.decode_current_block();
+            lead.materialize_at(start);
+        }
+        let (from, to) = (lead.pos, lead.block_n);
+        docs.clear();
+        scores.clear();
+        let mut j = from;
+        while j < to {
+            let d = lead.block_doc_ids[j];
+            let admitted = match filter.as_deref_mut() {
+                Some(f) => f.admits(d),
+                None => true,
+            };
+            if admitted {
+                docs.push(d);
+                scores.push(bm25::score_with_dl_norm_k1(
+                    lead.idf_weight,
+                    lead.block_tfs[j],
+                    dl_norm_k1.get(d),
+                ));
             }
-            let norm = dl_norm_k1.get(candidate);
-            let lead_score = bm25::score_with_dl_norm_k1(lead.idf_weight, lead.current_tf(), norm);
-            let pruning = threshold > f32::NEG_INFINITY;
-            if pruning {
-                if !have_bound || candidate > bound_holds_to {
-                    others_ub = 0.0;
-                    bound_holds_to = u32::MAX;
-                    for (rank, &si) in order.iter().enumerate() {
-                        let c = &mut shoulds[si];
-                        c.shallow_advance_block_to(candidate);
-                        doc_ub[rank] = c.inspect_block_max_bm25();
-                        others_ub += doc_ub[rank];
-                        bound_holds_to = bound_holds_to.min(c.inspect_block_last_doc_id());
-                    }
-                    doc_suffix[m] = 0.0;
-                    for i in (0..m).rev() {
-                        doc_suffix[i] = doc_suffix[i + 1] + doc_ub[i];
-                    }
-                    have_bound = true;
-                }
-                if lead_score + others_ub <= threshold {
-                    lead.next();
-                    continue;
-                }
+            j += 1;
+        }
+        lead.advance_by(to - from);
+        if pruning {
+            let n = filter_survivors(&mut docs, &mut scores, threshold - suffix[0]);
+            docs.truncate(n);
+            scores.truncate(n);
+        }
+        for (i, c) in shoulds.iter_mut().enumerate() {
+            if docs.is_empty() {
+                break;
             }
-            let mut partial = lead_score;
-            let mut abandoned = false;
-            contrib.fill(0.0);
-            for (rank, &si) in order.iter().enumerate() {
-                let c = &mut shoulds[si];
-                if let Some(tf) = c.bitset_probe_tf(candidate) {
-                    contrib[si] = bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
-                    partial += contrib[si];
-                }
-                if pruning && partial + doc_suffix[rank + 1] <= threshold {
-                    abandoned = true;
-                    break;
-                }
+            score_noness_batched(c, &docs, &mut scores, dl_norm_k1);
+            if pruning && i + 1 < m {
+                let n = filter_survivors(&mut docs, &mut scores, threshold - suffix[i + 1]);
+                docs.truncate(n);
+                scores.truncate(n);
             }
-            let mut score = lead_score;
-            for &x in &contrib {
-                score += x;
+        }
+        for (&d, &s) in docs.iter().zip(scores.iter()) {
+            if s > floor_eff {
+                and_heap_push(heap, k, None, s, d);
             }
-            if !abandoned && score > floor_eff {
-                and_heap_push(heap, k, None, score, candidate);
-                threshold = bar(heap);
-            }
-            lead.next();
         }
     }
 }
