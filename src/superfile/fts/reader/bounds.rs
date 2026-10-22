@@ -52,6 +52,12 @@ impl BoundDecoder {
         Self { scale: 1.0 }
     }
 
+    /// The decoder's scale as bits: two decoders with the same bits turn
+    /// every slot into the same bound.
+    pub(super) fn scale_bits(&self) -> u32 {
+        self.scale.to_bits()
+    }
+
     /// The upper bound a raw slot stands for.
     #[inline]
     pub(super) fn bound(&self, raw: u32) -> f32 {

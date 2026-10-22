@@ -6,7 +6,14 @@
 //! the scorers, phrase walk, and count kernels drive. Scoped `pub(super)`
 //! to the `reader/` module — never referenced outside the FTS layer.
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
+};
 
 use bytes::Bytes;
 
@@ -292,6 +299,54 @@ impl TermMeta {
     }
 }
 
+/// Long terms' decoded block tables, kept for the life of a reader so a
+/// term every query names (a stopword) builds its table once rather than
+/// on each query. Keyed by the term's offset in the postings region and the
+/// bound scale its slots were decoded at; only terms of at least
+/// [`BLOCK_TABLE_CACHE_MIN_BLOCKS`] blocks are kept, up to
+/// [`BLOCK_TABLE_CACHE_MAX_BLOCKS`] in all.
+#[derive(Debug, Default)]
+pub(crate) struct BlockTableCache {
+    tables: Mutex<HashMap<(u64, u32), (Arc<[BlockMeta]>, f32)>>,
+    blocks: AtomicUsize,
+}
+
+/// Shortest table worth caching: below it the build costs well under a
+/// microsecond (about a nanosecond a block).
+const BLOCK_TABLE_CACHE_MIN_BLOCKS: usize = 256;
+
+/// Most blocks the cache holds across all terms (24 bytes each).
+const BLOCK_TABLE_CACHE_MAX_BLOCKS: usize = 1 << 20;
+
+impl BlockTableCache {
+    /// Blocks held across all cached tables.
+    #[cfg(test)]
+    pub(super) fn cached_blocks(&self) -> usize {
+        self.blocks.load(AtomicOrdering::Relaxed)
+    }
+
+    fn get(&self, key: (u64, u32)) -> Option<(Arc<[BlockMeta]>, f32)> {
+        self.tables
+            .lock()
+            .expect("block table cache lock")
+            .get(&key)
+            .cloned()
+    }
+
+    fn put(&self, key: (u64, u32), table: &Arc<[BlockMeta]>, term_max: f32) {
+        let n = table.len();
+        if n < BLOCK_TABLE_CACHE_MIN_BLOCKS
+            || self.blocks.load(AtomicOrdering::Relaxed) + n > BLOCK_TABLE_CACHE_MAX_BLOCKS
+        {
+            return;
+        }
+        let mut tables = self.tables.lock().expect("block table cache lock");
+        if tables.insert(key, (Arc::clone(table), term_max)).is_none() {
+            self.blocks.fetch_add(n, AtomicOrdering::Relaxed);
+        }
+    }
+}
+
 /// Per-term per-block metadata, parsed once at `TermCursor` construction.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct BlockMeta {
@@ -468,6 +523,7 @@ impl TermCursor {
         idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
+        cached: Option<(&BlockTableCache, u64)>,
     ) -> Result<Self, FtsError> {
         let postings: &[u8] = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -494,24 +550,35 @@ impl TermCursor {
         // is ~a quarter of a long term's cursor-build bytes (one 32-byte
         // entry per 128-doc block), so the doubled write showed up on
         // common-term queries.
-        let mut term_max_bm25: f32 = 0.0;
-        let mut prev_end: Option<usize> = None;
-        let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
-            .map(|i| {
-                let (last_doc_id, raw) = term_meta.skip_entry(postings, i);
-                let block_max_bm25 = bounds.bound(raw);
-                term_max_bm25 = term_max_bm25.max(block_max_bm25);
-                let range = term_meta.block_range_in_term(postings, i, prev_end);
-                prev_end = Some(range.end);
+        let key = cached.map(|(_, offset)| (offset, bounds.scale_bits()));
+        let hit = cached.zip(key).and_then(|((cache, _), key)| cache.get(key));
+        let (blocks, term_max_bm25) = match hit {
+            Some(hit) => hit,
+            None => {
+                let mut term_max_bm25: f32 = 0.0;
+                let mut prev_end: Option<usize> = None;
+                let blocks: Arc<[BlockMeta]> = (0..term_meta.num_blocks)
+                    .map(|i| {
+                        let (last_doc_id, raw) = term_meta.skip_entry(postings, i);
+                        let block_max_bm25 = bounds.bound(raw);
+                        term_max_bm25 = term_max_bm25.max(block_max_bm25);
+                        let range = term_meta.block_range_in_term(postings, i, prev_end);
+                        prev_end = Some(range.end);
 
-                BlockMeta {
-                    last_doc_id,
-                    block_byte_offset: metadata_offset + range.start,
-                    block_byte_end: metadata_offset + range.end,
-                    block_max_bm25,
+                        BlockMeta {
+                            last_doc_id,
+                            block_byte_offset: metadata_offset + range.start,
+                            block_byte_end: metadata_offset + range.end,
+                            block_max_bm25,
+                        }
+                    })
+                    .collect();
+                if let (Some((cache, _)), Some(key)) = (cached, key) {
+                    cache.put(key, &blocks, term_max_bm25);
                 }
-            })
-            .collect();
+                (blocks, term_max_bm25)
+            }
+        };
 
         let mut cursor = Self {
             idf_weight: idf,
@@ -552,10 +619,11 @@ impl TermCursor {
         idf: TermIdf,
         weight: u32,
         purpose: CursorUse,
+        cached: Option<(&BlockTableCache, u64)>,
     ) -> Result<Self, FtsError> {
         match short {
             true => Self::new_short(bytes, col, idf, weight, purpose),
-            false => Self::new(bytes, col, idf, weight, purpose),
+            false => Self::new(bytes, col, idf, weight, purpose, cached),
         }
     }
 

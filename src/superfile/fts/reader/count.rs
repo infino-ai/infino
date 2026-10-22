@@ -762,7 +762,7 @@ impl FtsReader {
             }));
         }
         let meta = TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?;
-        let cursor = TermCursor::new(bytes, col_meta, TermIdf::Absent, 1, CursorUse::Count)?;
+        let cursor = TermCursor::new(bytes, col_meta, TermIdf::Absent, 1, CursorUse::Count, None)?;
         let mut layout = TermLayout {
             df: meta.df,
             num_blocks: meta.num_blocks,

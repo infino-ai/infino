@@ -5019,4 +5019,71 @@ mod tests {
             );
         }
     }
+
+    /// A reader keeps long terms' block tables for reuse. A reused reader
+    /// must answer exactly as a fresh one, including through a view with
+    /// other BM25 parameters, whose bounds decode at another scale from the
+    /// same term offsets. 40K documents put the common term past the
+    /// cache's minimum table length.
+    #[tokio::test]
+    async fn reused_block_tables_answer_as_fresh_ones() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let docs: Vec<String> = (0..40_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let mut t = String::from("doc");
+                if x % 100 < 90 {
+                    t.push_str(" common");
+                }
+                if x % 100 < 6 {
+                    t.push_str(" rare");
+                }
+                if (x >> 8) % 7 == 0 {
+                    t.push_str(" common common filler");
+                }
+                t
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let (blob, json) = build_standard_blob(&refs);
+        let open = || FtsReader::open(blob.clone(), &json).expect("open");
+        let reused = open();
+        let params = bm25::Bm25Params::new(0.9, 0.4);
+        for k in [1usize, 10, 100] {
+            for terms in [
+                vec!["common", "rare"],
+                vec!["common", "doc"],
+                vec!["common"],
+            ] {
+                for _ in 0..2 {
+                    let got = reused
+                        .search("body", &terms, k, BoolMode::Or)
+                        .await
+                        .expect("reused");
+                    let want = open()
+                        .search("body", &terms, k, BoolMode::Or)
+                        .await
+                        .expect("fresh");
+                    assert_eq!(got, want, "{terms:?} k={k}");
+                    let got = reused
+                        .with_bm25_override(params)
+                        .search("body", &terms, k, BoolMode::Or)
+                        .await
+                        .expect("reused override");
+                    let want = open()
+                        .with_bm25_override(params)
+                        .search("body", &terms, k, BoolMode::Or)
+                        .await
+                        .expect("fresh override");
+                    assert_eq!(got, want, "override {terms:?} k={k}");
+                }
+            }
+        }
+        assert!(
+            reused.block_tables.cached_blocks() > 0,
+            "the common term's table was cached"
+        );
+    }
 }

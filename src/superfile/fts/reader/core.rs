@@ -26,7 +26,7 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
-    cursor::{CursorUse, TermCursor, TermMeta},
+    cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{
         ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
@@ -582,6 +582,9 @@ pub struct FtsReader {
     /// decode alike, but a migration reports and plans on which one a file
     /// actually is.
     pub(super) version: u32,
+    /// Long terms' decoded block tables, shared by every clone of this
+    /// reader (see [`BlockTableCache`]).
+    pub(super) block_tables: Arc<BlockTableCache>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
     /// The Parquet row each doc id in this blob stands for. The
@@ -1128,6 +1131,7 @@ impl FtsReader {
         };
 
         Ok(FtsReader {
+            block_tables: Arc::default(),
             source,
             n_docs,
             n_terms_total,
@@ -1718,6 +1722,7 @@ impl FtsReader {
                         TermIdf::Absent,
                         1,
                         CursorUse::Match,
+                        None,
                     )?;
                     // Each block's runs are one group, decoded whole at the
                     // block's start and sliced per pair.
@@ -1830,6 +1835,7 @@ impl FtsReader {
                                 TermIdf::Absent,
                                 1,
                                 CursorUse::Count,
+                                None,
                             )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {

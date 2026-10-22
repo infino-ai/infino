@@ -53,7 +53,14 @@ pub(crate) enum FetchedTermSlot {
     /// Postings-form term: the fetched range and its df. `short` says
     /// whether the range is a short-form body or the long form's
     /// metadata + skip table + blocks.
-    Pfor { bytes: Bytes, df: u64, short: bool },
+    Pfor {
+        bytes: Bytes,
+        df: u64,
+        short: bool,
+        /// The term's offset in the postings region: its identity in this
+        /// file, which keys the reader's block-table cache.
+        metadata_offset: u64,
+    },
 }
 
 /// One superfile's open-wave fetches for a global-stats query's scored
@@ -152,7 +159,7 @@ impl FtsReader {
         terms: &[(&str, u64, DictEntry)],
     ) -> Result<FetchedTermMemo, FtsError> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
-        let mut order: Vec<(usize, u64, bool)> = Vec::new();
+        let mut order: Vec<(usize, u64, bool, u64)> = Vec::new();
         let mut slots: Vec<(Box<str>, Option<FetchedTermSlot>)> = Vec::with_capacity(terms.len());
         for (i, (term, df, value)) in terms.iter().enumerate() {
             match value {
@@ -169,15 +176,20 @@ impl FtsReader {
                     short,
                 } => {
                     ranges.push((*metadata_offset as usize, *postings_length as usize));
-                    order.push((i, *df, *short));
+                    order.push((i, *df, *short, *metadata_offset));
                 }
             }
         }
         let fetched = self.fetch_term_postings(&ranges).await?;
-        for ((i, df, short), bytes) in order.into_iter().zip(fetched) {
+        for ((i, df, short, metadata_offset), bytes) in order.into_iter().zip(fetched) {
             slots.push((
                 Box::from(terms[i].0),
-                Some(FetchedTermSlot::Pfor { bytes, df, short }),
+                Some(FetchedTermSlot::Pfor {
+                    bytes,
+                    df,
+                    short,
+                    metadata_offset,
+                }),
             ));
         }
         Ok(FetchedTermMemo::from_slots(slots))
@@ -1607,7 +1619,7 @@ impl FtsReader {
         // coalesced fetch (mirrors `build_term_cursors_opt`).
         enum Pre {
             Inline { doc_id: u32, tf: u32 },
-            Pfor { short: bool },
+            Pfor { short: bool, metadata_offset: u64 },
         }
         let mut resolved: Vec<(Box<str>, Option<Pre>)> = Vec::with_capacity(terms.len());
         let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
@@ -1621,7 +1633,10 @@ impl FtsReader {
                     short,
                 } => {
                     pfor_offsets.push((metadata_offset as usize, postings_length as usize));
-                    Pre::Pfor { short }
+                    Pre::Pfor {
+                        short,
+                        metadata_offset,
+                    }
                 }
             });
             resolved.push((Box::from(*term), pre));
@@ -1635,7 +1650,10 @@ impl FtsReader {
             let slot = match pre {
                 None => None,
                 Some(Pre::Inline { doc_id, tf }) => Some(FetchedTermSlot::Inline { doc_id, tf }),
-                Some(Pre::Pfor { short }) => {
+                Some(Pre::Pfor {
+                    short,
+                    metadata_offset,
+                }) => {
                     let bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     // df heads the fetched range in either form — the long
                     // form's metadata header, the short body's leading
@@ -1648,7 +1666,12 @@ impl FtsReader {
                         })?),
                         false => TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?.df,
                     };
-                    Some(FetchedTermSlot::Pfor { bytes, df, short })
+                    Some(FetchedTermSlot::Pfor {
+                        bytes,
+                        df,
+                        short,
+                        metadata_offset,
+                    })
                 }
             };
             map.insert(term, slot);
@@ -1708,6 +1731,7 @@ impl FtsReader {
             Pfor {
                 gidf: TermIdf,
                 short: bool,
+                metadata_offset: u64,
             },
         }
         let all_prefetched = prefetched.is_some_and(|m| terms.iter().all(|t| m.contains(t)));
@@ -1746,7 +1770,11 @@ impl FtsReader {
                     short,
                 } => {
                     pfor_offsets.push((metadata_offset as usize, postings_length as usize));
-                    resolved.push(Some(Resolved::Pfor { gidf, short }));
+                    resolved.push(Some(Resolved::Pfor {
+                        gidf,
+                        short,
+                        metadata_offset,
+                    }));
                 }
             }
         }
@@ -1775,11 +1803,23 @@ impl FtsReader {
                     )?));
                 }
                 Some(Resolved::Memo {
-                    slot: FetchedTermSlot::Pfor { bytes, short, .. },
+                    slot:
+                        FetchedTermSlot::Pfor {
+                            bytes,
+                            short,
+                            metadata_offset,
+                            ..
+                        },
                     gidf,
                 }) => {
                     cursors.push(Some(TermCursor::for_body(
-                        bytes, short, col_meta, gidf, weight, purpose,
+                        bytes,
+                        short,
+                        col_meta,
+                        gidf,
+                        weight,
+                        purpose,
+                        Some((&self.block_tables, metadata_offset)),
                     )?));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
@@ -1791,10 +1831,20 @@ impl FtsReader {
                         TermCursor::new_inline(doc_id, tf, col_meta, gidf, weight, purpose)?;
                     cursors.push(Some(cursor));
                 }
-                Some(Resolved::Pfor { gidf, short }) => {
+                Some(Resolved::Pfor {
+                    gidf,
+                    short,
+                    metadata_offset,
+                }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
                     cursors.push(Some(TermCursor::for_body(
-                        term_bytes, short, col_meta, gidf, weight, purpose,
+                        term_bytes,
+                        short,
+                        col_meta,
+                        gidf,
+                        weight,
+                        purpose,
+                        Some((&self.block_tables, metadata_offset)),
                     )?));
                 }
             }
