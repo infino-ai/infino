@@ -748,7 +748,7 @@ fn and_membership_scored_batched<S: AndSink>(
                 break;
             }
             tfs.resize(docs.len(), 0);
-            o.probe_tfs(&docs, &mut tfs);
+            o.probe_tfs_on_hit(&docs, &mut tfs);
             let mut w = 0usize;
             for r in 0..docs.len() {
                 let (d, tf) = (docs[r], tfs[r]);
