@@ -93,6 +93,36 @@ pub const VECTOR_FILTER_BUCKET_TERMS: usize = 499;
 pub fn vector_filter_bucket_term(doc_id: usize) -> String {
     format!("bucket{:03}", doc_id % VECTOR_FILTER_BUCKET_TERMS)
 }
+/// FTS-indexed column of the FTS table holding one unique 64-hex-digit key
+/// per row, so the bench can time a many-key `token_match` over a column
+/// of content-hash-like ids.
+pub const RECORD_KEY_COLUMN: &str = "record_key";
+/// Hex digits in a record key.
+const RECORD_KEY_HEX_DIGITS: usize = 64;
+/// Hex digits one `u64` renders as.
+const U64_HEX_DIGITS: usize = 16;
+/// splitmix64 increment and multipliers (Steele, Lea and Flood).
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+const SPLITMIX_MUL_1: u64 = 0xBF58_476D_1CE4_E5B9;
+const SPLITMIX_MUL_2: u64 = 0x94D0_49BB_1331_11EB;
+
+/// The next splitmix64 value from `state`.
+pub fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(SPLITMIX_GAMMA);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MUL_1);
+    z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MUL_2);
+    z ^ (z >> 31)
+}
+
+/// The record key stored for `doc_id`: lowercase hex, unique per row and
+/// unrelated to row order.
+pub fn record_key(doc_id: usize) -> String {
+    let mut state = doc_id as u64;
+    (0..RECORD_KEY_HEX_DIGITS / U64_HEX_DIGITS)
+        .map(|_| format!("{:016x}", splitmix64(&mut state)))
+        .collect()
+}
 pub const VEC_COLUMN: &str = "emb";
 pub const SQL_CATEGORY_COLUMN: &str = "category";
 pub const SQL_RATING_COLUMN: &str = "rating";
@@ -230,6 +260,10 @@ impl Modality {
     pub fn has_vector_filter_bucket(self) -> bool {
         matches!(self, Modality::Vector)
     }
+    /// Whether the table carries [`RECORD_KEY_COLUMN`]: the FTS table only.
+    pub fn has_record_key(self) -> bool {
+        matches!(self, Modality::Fts)
+    }
     /// Path token namespacing a prepared dataset by modality.
     pub fn dataset_dir(self) -> &'static str {
         match self {
@@ -245,6 +279,9 @@ pub(crate) fn schema_for(modality: Modality) -> Arc<Schema> {
     let mut fields = Vec::with_capacity(3);
     if modality.has_text() {
         fields.push(Field::new(TEXT_COLUMN, DataType::LargeUtf8, false));
+    }
+    if modality.has_record_key() {
+        fields.push(Field::new(RECORD_KEY_COLUMN, DataType::LargeUtf8, false));
     }
     if modality.has_sql() {
         fields.push(Field::new(SQL_CATEGORY_COLUMN, DataType::LargeUtf8, false));
@@ -307,6 +344,9 @@ pub fn options_for(
     let mut fts = Vec::new();
     if modality.has_fts() {
         fts.push(FtsConfig::new(TEXT_COLUMN).positions(true));
+    }
+    if modality.has_record_key() {
+        fts.push(FtsConfig::new(RECORD_KEY_COLUMN));
     }
     if modality.has_vector_filter_bucket() {
         // Single token per row, equality-only predicates — positions buy
@@ -935,6 +975,12 @@ fn chunk_batch(
     let mut columns: Vec<Arc<dyn Array>> = Vec::with_capacity(schema.fields().len());
     if let Some(titles) = &titles {
         columns.push(Arc::new(LargeStringArray::from(titles.clone())));
+    }
+    if modality.has_record_key() {
+        let keys: Vec<String> = (start..end).map(record_key).collect();
+        columns.push(Arc::new(LargeStringArray::from(
+            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+        )));
     }
     if modality.has_sql() {
         let _ = titles.as_ref().expect("sql modality has text");
