@@ -747,17 +747,17 @@ fn and_membership_scored_batched<S: AndSink>(
     }
 }
 
-/// Add four ascending documents' contributions into a window and mark them
+/// Add `N` ascending documents' contributions into a window and mark them
 /// present. Consecutive documents of a block usually share a presence word,
-/// and four read-modify-writes of one word wait on each other's stores; when
-/// the first and last share it, one combined write replaces the four.
+/// and `N` read-modify-writes of one word wait on each other's stores; when
+/// the first and last share it, one combined write replaces them.
 #[inline(always)]
-fn mark_four(
+fn mark_lanes<const N: usize>(
     scores: &mut [f32],
     present: &mut [u64],
     base: u32,
-    doc_ids: [u32; bm25::SCORE_SIMD_LANES],
-    contributions: [f32; bm25::SCORE_SIMD_LANES],
+    doc_ids: [u32; N],
+    contributions: [f32; N],
 ) {
     debug_assert!(doc_ids.iter().all(|&d| d - base < OR_WINDOW));
     // Sized views and in-window masks let the compiler drop the per-lane
@@ -765,10 +765,10 @@ fn mark_four(
     let scores = &mut scores[..OR_WINDOW as usize];
     let present = &mut present[..OR_WINDOW_WORDS];
     let local = doc_ids.map(|d| (d - base) as usize & (OR_WINDOW as usize - 1));
-    for lane in 0..bm25::SCORE_SIMD_LANES {
+    for lane in 0..N {
         scores[local[lane]] += contributions[lane];
     }
-    let (first, last) = (local[0] >> 6, local[bm25::SCORE_SIMD_LANES - 1] >> 6);
+    let (first, last) = (local[0] >> 6, local[N - 1] >> 6);
     if first == last {
         let mut bits = 0u64;
         for l in local {
@@ -801,12 +801,6 @@ fn word_beats(slots: &[f32], threshold: f32) -> bool {
     hit.iter().fold(0, |a, &h| a | h) != 0
 }
 
-/// Four consecutive lanes of an eight-lane array, from `at`.
-#[inline(always)]
-fn lane_half<T: Copy>(lanes: &[T; 8], at: usize) -> [T; bm25::SCORE_SIMD_LANES] {
-    std::array::from_fn(|l| lanes[at + l])
-}
-
 /// Add `c`'s next postings into a union window whose slot 0 is doc `base`:
 /// eight per SIMD call where the block and the window both allow, else
 /// four, else one, then move the cursor past them. One step; the caller
@@ -836,9 +830,7 @@ fn accumulate_step(
                 .expect("invariant: an 8-wide slice");
             let contributions =
                 bm25::score_one_term_x8(c.idf_weight, tfs, dids.map(|d| dl_norm_k1.get(d)));
-            let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
-            mark_four(scores, present, base, lo, lane_half(&contributions, 0));
-            mark_four(scores, present, base, hi, lane_half(&contributions, 4));
+            mark_lanes(scores, present, base, dids, contributions);
             c.advance_by(8);
             return;
         }
@@ -865,7 +857,7 @@ fn accumulate_step(
                     dl_norm_k1.get(doc_ids[3]),
                 ],
             );
-            mark_four(scores, present, base, doc_ids, contributions);
+            mark_lanes(scores, present, base, doc_ids, contributions);
             c.advance_by(bm25::SCORE_SIMD_LANES);
             return;
         }
