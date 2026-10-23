@@ -914,6 +914,20 @@ impl FtsReader {
         );
         let (hits, count) = match prep {
             PreparedClauses::Done { hits, count, .. } => (hits, count),
+            // Likewise for an intersection with nothing to exclude: its count
+            // never scores, and its top-k prunes.
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                filter: None,
+                k,
+                floor_eff,
+                ..
+            } => {
+                let count = self.count_and_intersect(must_cursors.clone());
+                let hits = self.run_and_intersect(column_id, must_cursors, k, None, floor_eff)?;
+                (hits, count)
+            }
             PreparedClauses::Must {
                 column_id,
                 must_cursors,
