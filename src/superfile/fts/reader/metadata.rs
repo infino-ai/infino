@@ -292,15 +292,6 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
-    /// The smallest `dl_norm_k1` any doc of the column has: the norm at which
-    /// a term's score for a given tf is highest.
-    pub(super) fn min_norm(&self) -> f32 {
-        let (lo, hi) = self.occupied;
-        self.lut[lo as usize..=hi as usize]
-            .iter()
-            .fold(f32::INFINITY, |m, &x| m.min(x))
-    }
-
     /// The buckets this table scores by. Test-only: the query path indexes
     /// them and never needs the slice.
     #[cfg(test)]
