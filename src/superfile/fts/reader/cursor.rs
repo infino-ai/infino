@@ -509,6 +509,11 @@ pub(crate) struct TermCursor {
     eager_blocks: u8,
     /// Scratch for the phrase filter's bitmap ranks, reused across blocks.
     rank_scratch: Vec<u32>,
+    /// Set bits before each presence word of bitset block
+    /// `bitset_prefix_block`, so a probe ranks a doc with one lookup and one
+    /// popcount instead of counting every word before it.
+    bitset_prefix: Vec<u32>,
+    bitset_prefix_block: usize,
 }
 
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
@@ -727,6 +732,8 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             rank_scratch: Vec::new(),
+            bitset_prefix: Vec::new(),
+            bitset_prefix_block: usize::MAX,
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -825,6 +832,8 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             rank_scratch: Vec::new(),
+            bitset_prefix: Vec::new(),
+            bitset_prefix_block: usize::MAX,
         })
     }
 
@@ -899,6 +908,8 @@ impl TermCursor {
             dense_streak: 0,
             eager_blocks: 0,
             rank_scratch: Vec::new(),
+            bitset_prefix: Vec::new(),
+            bitset_prefix_block: usize::MAX,
         })
     }
 
@@ -1313,6 +1324,45 @@ impl TermCursor {
             if is_dense_encoding(hdr.encoding) {
                 let lazy = self.lazy_bit != u32::MAX;
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+                if hdr.encoding != ENCODING_RUN {
+                    if self.bitset_prefix_block != self.current_block {
+                        let bitset_end = raw.len() - hdr.tfs_size();
+                        let presence = &raw[hdr.payload()..bitset_end];
+                        self.bitset_prefix.clear();
+                        self.bitset_prefix.resize(presence.len() / 8, 0);
+                        let mut acc = 0u32;
+                        for (slot, w) in self.bitset_prefix.iter_mut().zip(presence.chunks_exact(8))
+                        {
+                            *slot = acc;
+                            acc += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
+                        }
+                        self.bitset_prefix_block = self.current_block;
+                    }
+                    while k < n_docs && docs[k] <= last {
+                        let rank =
+                            Self::bitset_word(raw, &hdr, docs[k]).and_then(|(bit, word, _)| {
+                                let below = (1u64 << (bit % 64)).wrapping_sub(1);
+                                ((word >> (bit % 64)) & 1 == 1).then(|| {
+                                    (self.bitset_prefix[bit / 64] + (word & below).count_ones())
+                                        as usize
+                                })
+                            });
+                        out[k] = match rank {
+                            Some(rank) => Self::bitset_tf_for_probe(
+                                lazy,
+                                self.current_block,
+                                &mut self.tf_decoded_block,
+                                &mut self.block_tfs,
+                                raw,
+                                &hdr,
+                                rank,
+                            ),
+                            None => 0,
+                        };
+                        k += 1;
+                    }
+                    continue;
+                }
                 while k < n_docs && docs[k] <= last {
                     out[k] = match Self::dense_rank(raw, &hdr, docs[k]) {
                         Some(rank) => Self::bitset_tf_for_probe(
