@@ -79,22 +79,7 @@ impl PhraseMember {
         let pair = self.cursor.pos;
         let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
 
-        // The block's runs are one group. It is located once per block and
-        // each pair's run read on its own — no run walk, and no decode of
-        // the runs a phrase never visits.
-        if self.group_block != block {
-            let mut at =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
-            self.group_index
-                .locate(&self.positions, &mut at, tfs)
-                .ok_or_else(|| {
-                    FtsError::Read(ReadError::Malformed(
-                        "position group truncated or undecodable".into(),
-                    ))
-                })?;
-            self.group_block = block;
-        }
+        self.locate_block(block, &term_meta)?;
         self.group_index
             .run_positions(
                 &self.positions,
@@ -109,7 +94,113 @@ impl PhraseMember {
             })?;
         Ok(())
     }
+
+    /// Locate block `block`'s position group, unless it is the one already
+    /// located. The block's runs are one group: it is located once per
+    /// block and each pair's run read on its own — no run walk, and no
+    /// decode of the runs a phrase never visits.
+    fn locate_block(&mut self, block: usize, term_meta: &TermMeta) -> Result<(), FtsError> {
+        if self.group_block != block {
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
+            self.group_index
+                .locate(&self.positions, &mut at, tfs)
+                .ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(
+                        "position group truncated or undecodable".into(),
+                    ))
+                })?;
+            self.group_block = block;
+        }
+        Ok(())
+    }
+
+    /// Keep, in place, the candidate phrase starts `s` (ascending) for which
+    /// this member holds position `s + off` at its cursor's current doc, and
+    /// say whether any is kept. The member's run is read in chunks and merged
+    /// against the wanted positions, so reading stops as soon as every start
+    /// is settled: a common member with hundreds of positions in the doc is
+    /// read only as far as the last start it must confirm. With `first_hit`
+    /// it stops at the first confirmed start (the phrase only has to exist).
+    /// Same preconditions as [`Self::decode_current_positions`].
+    pub(super) fn filter_starts(
+        &mut self,
+        starts: &mut Vec<u32>,
+        off: u32,
+        first_hit: bool,
+    ) -> Result<bool, FtsError> {
+        let malformed = || {
+            FtsError::Read(ReadError::Malformed(
+                "position run truncated or overflowing".into(),
+            ))
+        };
+        let want = |s: u32| u64::from(s) + u64::from(off);
+        if let Some(p) = self.inline_position {
+            starts.retain(|&s| want(s) == u64::from(p));
+            if first_hit {
+                starts.truncate(1);
+            }
+            return Ok(!starts.is_empty());
+        }
+        debug_assert_eq!(
+            self.cursor.decoded_block, self.cursor.current_block,
+            "positions need the whole block decoded; call materialize_at first"
+        );
+        let block = self.cursor.current_block;
+        let pair = self.cursor.pos;
+        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
+        self.locate_block(block, &term_meta)?;
+        let tf = self.cursor.block_tfs[pair] as usize;
+        let lane_start = self
+            .group_index
+            .begin_run(&self.positions, pair)
+            .ok_or_else(malformed)?;
+        let n = starts.len();
+        let (mut r, mut w, mut k, mut prev) = (0usize, 0usize, 0usize, 0u32);
+        'chunks: while r < n && k < tf {
+            let m = (tf - k).min(RUN_CHUNK);
+            self.pos_scratch.clear();
+            self.group_index
+                .run_chunk(
+                    &self.positions,
+                    pair,
+                    lane_start,
+                    k,
+                    m,
+                    prev,
+                    &mut self.pos_scratch,
+                )
+                .ok_or_else(malformed)?;
+            k += m;
+            prev = *self.pos_scratch.last().expect("non-empty chunk");
+            for &p in &self.pos_scratch {
+                let p = u64::from(p);
+                while r < n && want(starts[r]) < p {
+                    r += 1;
+                }
+                if r == n {
+                    break 'chunks;
+                }
+                if want(starts[r]) == p {
+                    starts[w] = starts[r];
+                    w += 1;
+                    r += 1;
+                    if first_hit {
+                        break 'chunks;
+                    }
+                }
+            }
+        }
+        starts.truncate(w);
+        Ok(w > 0)
+    }
 }
+
+/// Positions read per step when a member's run is merged against the
+/// candidate starts: enough to amortize the lane reader's setup, few
+/// enough that a run settled early stops close to where it settled.
+const RUN_CHUNK: usize = 8;
 
 /// Doc-at-a-time cursor over an exact phrase: the members'
 /// intersection drives doc alignment, and a doc matches only when the
@@ -154,7 +245,9 @@ pub(super) struct PhraseCursor {
     pub(super) term_max_bm25: f32,
     /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
     pub(super) current_doc: u32,
-    /// Number of verified anchors at `current_doc`.
+    /// Number of verified anchors at `current_doc`. An unscored phrase
+    /// (no idf) stops verifying at its first anchor, so its tf is 1 at a
+    /// match: only the score reads it, and an unscored phrase has none.
     pub(super) current_tf: u32,
     /// Reused across `verify_at_aligned` calls to hold the candidate
     /// phrase-start positions as they are filtered member by member —
@@ -484,31 +577,25 @@ impl PhraseCursor {
                 self.verify_scratch.push(start);
             }
         }
+        // An unscored phrase is only ever asked whether it matches, so the
+        // last member stops at the first start it confirms.
+        let exists_only = self.idf_weight == 0.0;
+        let last = self.align_order.len() - 1;
+        let mut starts = std::mem::take(&mut self.verify_scratch);
         for oi in 1..self.align_order.len() {
-            if self.verify_scratch.is_empty() {
+            if starts.is_empty() {
                 break;
             }
             let j = self.align_order[oi];
             self.members[j].cursor.materialize_at(aligned);
-            self.members[j].decode_current_positions()?;
-            let plist = &self.members[j].pos_scratch;
             let off = self.position_offsets[j];
             // Compact the survivors in place: keep a start iff member `j`
             // holds `start + position_offsets[j]`.
-            let mut w = 0usize;
-            for r in 0..self.verify_scratch.len() {
-                let start = self.verify_scratch[r];
-                let keep = start
-                    .checked_add(off)
-                    .is_some_and(|want| plist.binary_search(&want).is_ok());
-                if keep {
-                    self.verify_scratch[w] = start;
-                    w += 1;
-                }
-            }
-            self.verify_scratch.truncate(w);
+            self.members[j].filter_starts(&mut starts, off, exists_only && oi == last)?;
         }
-        // The surviving starts are this doc's phrase occurrences — its tf.
+        self.verify_scratch = starts;
+        // The surviving starts are this doc's phrase occurrences — its tf
+        // (at most one for an unscored phrase, which stops at the first).
         // Store it so `score_current` scores the phrase after a two-phase
         // `verify_at` (the single-phase `skip_to_pruned` sets it itself).
         self.current_tf = self.verify_scratch.len() as u32;
@@ -1248,6 +1335,82 @@ mod tests {
 
     /// A phrase built to match, not rank, carries no idf and a 0 bound:
     /// dividing its members' bounds by their 0 idf would make the bound NaN.
+    /// Phrases whose matching occurrence lies deep in a common member's run:
+    /// the member's run is read in chunks and stopped once every candidate
+    /// start is settled, so a match past the first chunk must still be found.
+    /// Docs repeat a common word up to ~60 times and hold a rarer word once
+    /// or twice at a random depth. Every phrase's (doc, tf) pairs, scored,
+    /// must equal a brute-force scan of the text, and the unscored walk must
+    /// match the same docs (its tf is only an existence flag).
+    #[tokio::test]
+    async fn phrases_deep_in_long_member_runs_match_a_text_scan() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let docs: Vec<Vec<&str>> = (0..700)
+            .map(|_| {
+                let len = 1 + rng(70) as usize;
+                let mut d: Vec<&str> = (0..len)
+                    .map(|_| if rng(10) < 7 { "w" } else { "z" })
+                    .collect();
+                if rng(5) == 0 {
+                    for _ in 0..1 + rng(2) {
+                        let at = rng(d.len() as u64 + 1) as usize;
+                        d.insert(at, "m");
+                    }
+                }
+                d
+            })
+            .collect();
+        let r = open_positional(docs.iter().map(|d| d.join(" ")));
+        let norms = r.columns[0].dl_norm_k1();
+        let phrases: [&[&str]; 5] = [
+            &["w", "m"],
+            &["m", "w"],
+            &["w", "w", "m"],
+            &["m", "w", "w"],
+            &["w", "m", "w"],
+        ];
+        for terms in phrases {
+            let expected: Vec<(u32, u32)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let tf = d.windows(terms.len()).filter(|w| *w == terms).count() as u32;
+                    (tf > 0).then_some((i as u32, tf))
+                })
+                .collect();
+            assert!(!expected.is_empty(), "{terms:?} occurs");
+            let mut scored = phrase_cursor(&r, terms, CursorUse::Score).await;
+            let mut seen = Vec::new();
+            while !scored.is_exhausted() {
+                seen.push((scored.current_doc_id(), scored.current_tf));
+                let next = scored.current_doc_id() + 1;
+                scored
+                    .seek_match(next, f32::NEG_INFINITY, Some(norms))
+                    .expect("seek");
+            }
+            assert_eq!(seen, expected, "scored {terms:?}");
+            let mut matched = phrase_cursor(&r, terms, CursorUse::Match).await;
+            let mut docs_seen = Vec::new();
+            while !matched.is_exhausted() {
+                assert_eq!(
+                    matched.current_tf, 1,
+                    "an unscored match is an existence flag"
+                );
+                docs_seen.push(matched.current_doc_id());
+                let next = matched.current_doc_id() + 1;
+                matched.skip_to(next).expect("skip");
+            }
+            let expected_docs: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
+            assert_eq!(docs_seen, expected_docs, "unscored {terms:?}");
+        }
+    }
+
     #[tokio::test]
     async fn an_unscored_phrase_has_no_idf_and_a_zero_bound() {
         let r = open_positional(["x y", "y x", "x y z"].into_iter().map(String::from));

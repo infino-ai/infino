@@ -428,15 +428,10 @@ impl GroupIndex {
         Some(())
     }
 
-    /// The absolute positions of pair `pair` (whose term frequency is
-    /// `tf`), appended to `out`. `None` on an overflowing gap.
-    pub(crate) fn run_positions(
-        &mut self,
-        bytes: &[u8],
-        pair: usize,
-        tf: u32,
-        out: &mut Vec<u32>,
-    ) -> Option<()> {
+    /// Start reading pair `pair`'s run: count it towards the density that
+    /// switches the block to the bulk decode (and switch, once dense), and
+    /// return where its lanes begin. Pairs with [`Self::run_chunk`].
+    pub(crate) fn begin_run(&mut self, bytes: &[u8], pair: usize) -> Option<usize> {
         let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
@@ -451,6 +446,80 @@ impl GroupIndex {
             self.kind = GroupKind::Bulk;
         }
         self.served += 1;
+        Some(start)
+    }
+
+    /// Positions `k..k + n` of pair `pair`'s run, whose lanes begin at
+    /// `start` (from [`Self::begin_run`]), appended to `out`. `prev` is the
+    /// position at `k - 1` (unused when `k == 0`). A run read this way can
+    /// stop part-way, so a caller that needs only its positions up to some
+    /// point never decodes the rest. `None` on an overflowing gap.
+    pub(crate) fn run_chunk(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        start: usize,
+        k: usize,
+        n: usize,
+        prev: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        debug_assert!(n > 0);
+        self.run.clear();
+        // Raw values: the run's first absolute position at k == 0, gaps after.
+        match self.kind {
+            GroupKind::Leb128 => {
+                self.run
+                    .extend_from_slice(self.values.get(start + k..start + k + n)?);
+            }
+            GroupKind::Packed => {
+                let gaps_from = match k {
+                    0 => {
+                        self.run.push(self.first.lane(bytes, pair)?);
+                        start
+                    }
+                    _ => start + k - 1,
+                };
+                let n_gaps = n - self.run.len();
+                if n_gaps > 0 {
+                    self.gap
+                        .read_lanes(bytes, gaps_from, n_gaps, &mut self.run)?;
+                }
+            }
+            GroupKind::Bulk => {
+                let gaps_from = match k {
+                    0 => {
+                        self.run.push(*self.firsts.get(pair)?);
+                        start
+                    }
+                    _ => start + k - 1,
+                };
+                let n_gaps = n - self.run.len();
+                self.run
+                    .extend_from_slice(self.gaps.get(gaps_from..gaps_from + n_gaps)?);
+            }
+        }
+        let mut p = prev;
+        for (i, &v) in self.run.iter().enumerate() {
+            p = match (k, i) {
+                (0, 0) => v,
+                _ => p.checked_add(v)?,
+            };
+            out.push(p);
+        }
+        Some(())
+    }
+
+    /// The absolute positions of pair `pair` (whose term frequency is
+    /// `tf`), appended to `out`. `None` on an overflowing gap.
+    pub(crate) fn run_positions(
+        &mut self,
+        bytes: &[u8],
+        pair: usize,
+        tf: u32,
+        out: &mut Vec<u32>,
+    ) -> Option<()> {
+        let start = self.begin_run(bytes, pair)?;
         self.run.clear();
         match self.kind {
             GroupKind::Leb128 => {
