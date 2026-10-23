@@ -1398,6 +1398,16 @@ impl TermCursor {
         ))
     }
 
+    /// Whether the current block's doc ids and tfs are all decoded in the
+    /// buffers (not a lazily held bitset block showing one doc).
+    #[inline]
+    pub(super) fn holds_whole_block(&self) -> bool {
+        !self.is_exhausted()
+            && self.lazy_bit == u32::MAX
+            && self.decoded_block == self.current_block
+            && self.purpose.decodes_tfs()
+    }
+
     pub(super) fn is_exhausted(&self) -> bool {
         self.current_block >= self.blocks.len()
     }

@@ -2688,6 +2688,8 @@ impl FtsReader {
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
+        // Leader-block positions that survive the batch bar, reused per block.
+        let mut survivors: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
@@ -2722,6 +2724,7 @@ impl FtsReader {
                     break;
                 }
                 // Skip the whole block if it cannot beat threshold.
+                let mut block_others_ub = f32::INFINITY;
                 if heap.is_full(k) {
                     // The other terms bounded over this block's own range,
                     // not their whole lists: a mid-frequency term's best
@@ -2737,7 +2740,55 @@ impl FtsReader {
                         lead[0].skip_to(end.saturating_add(1));
                         continue;
                     }
+                    block_others_ub = others_ub;
                 }
+                // Score the rest of the leader block at once, eight postings per
+                // SIMD call, and keep the positions that can clear the bar with
+                // the other terms at their bound over the whole block. That
+                // bound is never tighter than the walk's per-candidate one and
+                // the test is the walk's own expression, so every position
+                // dropped here the walk would drop too; the walk then jumps from
+                // survivor to survivor instead of scoring each posting behind a
+                // branch.
+                survivors.clear();
+                let batched = block_others_ub.is_finite()
+                    && filter.is_none()
+                    && cursors[0].holds_whole_block();
+                if batched {
+                    let c = &cursors[0];
+                    let (from, to) = (c.pos, c.block_n);
+                    let mut i = from;
+                    while i + 8 <= to {
+                        let dids: [u32; 8] = c.block_doc_ids[i..i + 8]
+                            .try_into()
+                            .expect("invariant: an 8-wide slice");
+                        let tfs: [u32; 8] = c.block_tfs[i..i + 8]
+                            .try_into()
+                            .expect("invariant: an 8-wide slice");
+                        let lanes = bm25::score_one_term_x8(
+                            c.idf_weight,
+                            tfs,
+                            dids.map(|d| dl_norm_k1.get(d)),
+                        );
+                        for (l, &score) in lanes.iter().enumerate() {
+                            survivors.push((i + l) as u16);
+                            let keep = score + block_others_ub > threshold;
+                            survivors.truncate(survivors.len() - usize::from(!keep));
+                        }
+                        i += 8;
+                    }
+                    for j in i..to {
+                        let score = bm25::score_with_dl_norm_k1(
+                            c.idf_weight,
+                            c.block_tfs[j],
+                            dl_norm_k1.get(c.block_doc_ids[j]),
+                        );
+                        if score + block_others_ub > threshold {
+                            survivors.push(j as u16);
+                        }
+                    }
+                }
+                let mut next_survivor = 0usize;
                 let block_end = cursors[0].current_block_last_doc_id();
                 let (ess, non_ess) = cursors.split_at_mut(1);
                 let c0 = &mut ess[0];
@@ -2754,6 +2805,28 @@ impl FtsReader {
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
                 {
+                    if batched {
+                        // Jump to the next survivor, or past the block.
+                        match survivors.get(next_survivor) {
+                            Some(&at) => {
+                                next_survivor += 1;
+                                let at = usize::from(at);
+                                if at > c0.pos {
+                                    c0.advance_by(at - c0.pos);
+                                }
+                            }
+                            None => {
+                                c0.advance_by(c0.block_n - c0.pos);
+                                break;
+                            }
+                        }
+                        if c0.is_exhausted()
+                            || c0.current_doc_id() > block_end
+                            || c0.current_doc_id() >= doc_id_end
+                        {
+                            break;
+                        }
+                    }
                     let candidate = c0.current_doc_id();
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(candidate)
