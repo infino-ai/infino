@@ -493,13 +493,18 @@ impl GroupIndex {
 #[inline]
 fn prefix_sum_in_place(run: &mut [u32]) -> Option<()> {
     // The running sum stays in a register: reading back the slot just
-    // written would put a store-to-load round trip on every position.
+    // written would put a store-to-load round trip on every position. The
+    // values are non-negative, so the run overflows exactly when its total
+    // does: one widened sum, which vectorizes, checks that up front and the
+    // running sum then wraps freely instead of branching per position.
     let Some((first, rest)) = run.split_first_mut() else {
         return Some(());
     };
+    let total = u64::from(*first) + rest.iter().map(|&g| u64::from(g)).sum::<u64>();
+    u32::try_from(total).ok()?;
     let mut acc = *first;
     for slot in rest {
-        acc = acc.checked_add(*slot)?;
+        acc = acc.wrapping_add(*slot);
         *slot = acc;
     }
     Some(())
@@ -828,6 +833,41 @@ mod tests {
         let mut index = GroupIndex::default();
         index.locate(&out, &mut 0, &[2]).expect("parses");
         assert!(index.run_positions(&out, 0, 2, &mut Vec::new()).is_none());
+    }
+
+    #[test]
+    fn a_long_or_bulk_run_that_overflows_is_refused() {
+        // Runs longer than the small-run path, read one at a time and then
+        // in bulk once the reads prove dense. The last run overflows; in the
+        // middle one a huge gap wraps the sum back to a plausible position,
+        // which a check per step or on the total must both refuse.
+        let tfs = [6u32, 6, 6, 6, 6];
+        let mut vals = Vec::new();
+        for d in 0..4u32 {
+            vals.push(100 * d);
+            vals.extend([1, 2, 3, 4, 5]);
+        }
+        vals.push(u32::MAX - 10);
+        vals.extend([2, 2, 2, 2, 10]);
+        vals[2 * 6 + 3] = u32::MAX;
+        for allow in [false, true] {
+            let mut out = Vec::new();
+            group(&mut out, &tfs, &vals, allow);
+            let mut index = GroupIndex::default();
+            index.locate(&out, &mut 0, &tfs).expect("parses");
+            for pair in 0..tfs.len() {
+                let mut got = Vec::new();
+                let read = index.run_positions(&out, pair, tfs[pair], &mut got);
+                match pair {
+                    2 | 4 => assert!(read.is_none(), "pair {pair} allow {allow}"),
+                    _ => {
+                        read.expect("run decodes");
+                        let p = 100 * pair as u32;
+                        assert_eq!(got, [p, p + 1, p + 3, p + 6, p + 10, p + 15]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
