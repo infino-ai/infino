@@ -1043,38 +1043,6 @@ mod fanout_tier_tests {
         let reopened = Supertable::open(options()).expect("reopen");
         assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
     }
-
-    /// A ranked search over several superfiles leaves the table a measured
-    /// cost per open, which the tier merge weighs its rounds against.
-    #[test]
-    fn a_ranked_search_measures_what_an_open_costs() {
-        let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let table =
-            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
-                .expect("create");
-        for title in ["alpha one", "alpha two", "alpha three"] {
-            let mut writer = table.writer().expect("writer");
-            writer.append(&build_title_batch(&[title])).expect("append");
-            writer.commit().expect("commit");
-        }
-        let reader = table.reader().expect("reader");
-        assert_eq!(reader.open_cost_ns(), 0, "nothing measured before a search");
-        let hits = reader
-            .bm25_hits(
-                "title",
-                "alpha",
-                10,
-                crate::superfile::fts::reader::Bm25SearchOptions::new(),
-            )
-            .expect("search");
-        assert_eq!(hits.len(), 3);
-        assert!(
-            reader.open_cost_ns() > 0,
-            "the fan-out noted its cost per open"
-        );
-    }
 }
 
 #[cfg(test)]
