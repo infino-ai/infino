@@ -58,7 +58,7 @@ use std::{
     time::Instant,
 };
 
-use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream};
 use rayon::{
     ThreadPool,
     iter::{IndexedParallelIterator, ParallelIterator},
@@ -75,6 +75,7 @@ use crate::{
         reader::{GlobalTermIdf, norm_table},
     },
     supertable::{
+        error::QueryError,
         manifest::{
             SuperfileEntry,
             part::ContentHash,
@@ -231,6 +232,10 @@ impl TierPolicy {
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
+/// Tier fetches in flight at once for one query: a term's tier is one
+/// ranged read of up to a few megabytes, and a query of many terms must
+/// not flood the store.
+const TIER_FETCH_CONCURRENCY: usize = 8;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
 /// pool's scheduling while a round of a hundred superfiles spreads over
@@ -321,7 +326,7 @@ pub(crate) struct TierSelection {
 struct Source {
     object: ContentHash,
     chunks: Vec<TierChunkRef>,
-    data: Vec<TierChunkData>,
+    data: Vec<Arc<TierChunkData>>,
 }
 
 /// What the merge knows of one term in one kept superfile.
@@ -511,6 +516,15 @@ pub(crate) async fn select_with_tiers(
             .saturating_mul(BLOCK_ENTRIES as u64)
             .saturating_mul(query.entry_cost_ns)
             > query.open_cost_ns
+    {
+        return Ok(None);
+    }
+    // The first round decodes a block per term per kept superfile: a query
+    // whose first round alone would pass the entry cap is not merged.
+    if (nt as u64)
+        .saturating_mul(kept.len() as u64)
+        .saturating_mul(BLOCK_ENTRIES as u64)
+        > MAX_ENTRIES_PER_QUERY
     {
         return Ok(None);
     }
@@ -717,11 +731,17 @@ pub(crate) async fn select_with_tiers(
         .enumerate()
         .flat_map(|(ti, term_sources)| (0..term_sources.len()).map(move |si| (ti, si)))
         .collect();
-    let fetched = try_join_all(reads.iter().map(|&(ti, si)| {
-        let source = &sources[ti][si];
-        index.tier_chunks(&source.object, &source.chunks)
-    }))
-    .await?;
+    let fetches: Vec<_> = reads
+        .iter()
+        .map(|&(ti, si)| {
+            let source = &sources[ti][si];
+            index.tier_chunks(&source.object, &source.chunks)
+        })
+        .collect();
+    let fetched: Vec<(Vec<Arc<TierChunkData>>, u64)> = stream::iter(fetches)
+        .buffered(TIER_FETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
     for (&(ti, si), (data, bytes)) in reads.iter().zip(fetched) {
         sources[ti][si].data = data;
         tier_bytes += bytes;
@@ -734,7 +754,14 @@ pub(crate) async fn select_with_tiers(
         0 => usize::MAX,
         n => n as usize,
     };
-    let open_cost_ns = query.open_cost_ns;
+    // With the gate off the merge is under test and reads on while a round
+    // excludes anything, whatever the opens were measured to cost: the
+    // rounds it takes then depend on the table alone.
+    let open_cost_ns = if query.merge_gate {
+        query.open_cost_ns
+    } else {
+        0
+    };
     let (merge, merge_ns) = run_on_pool(Some(pool), "tier merge", move || {
         let mut merge = merge;
         let mut merge_ns = 0u64;
@@ -824,7 +851,7 @@ pub(crate) async fn select_with_tiers(
         (merge, merge_ns)
     })
     .await
-    .map_err(|e| TermIndexError::Malformed(e.to_string()))?;
+    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))?;
 
     let bounds: Vec<SuperfileBounds> = merge
         .slots

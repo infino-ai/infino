@@ -96,6 +96,11 @@ pub(crate) struct BuildPolicy {
     /// cut rather than keep its bytes: a table-wide rebuild produces more
     /// index than a host holds in memory.
     pub(crate) spill_to_disk: bool,
+    /// Where scratch goes — contributions, spilled slices, a merge's
+    /// downloads — when set: the table's disk, not the system temporary
+    /// directory, which on a host sized for a large table may be small or
+    /// in memory.
+    pub(crate) scratch_root: Option<PathBuf>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
     /// superfile's own, as the manifest records them. A build takes these
@@ -159,6 +164,7 @@ impl Default for BuildPolicy {
             head_depth_per_superfile: HEAD_DEPTH_MAX,
             pool: None,
             spill_to_disk: false,
+            scratch_root: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
         }
     }
@@ -183,10 +189,29 @@ struct TermInput {
     sources: Vec<TierSource>,
 }
 
-/// One source run's tier in a merge: its chunks and the slice's tier
-/// object they sit in.
+/// A scratch directory for a build, removed when dropped: under `root`
+/// when one is set, else in the system temporary directory.
+pub(crate) fn scratch_dir(root: Option<&Path>) -> io::Result<TempDir> {
+    let builder = {
+        let mut b = tempfile::Builder::new();
+        b.prefix("infino-term-index-");
+        b
+    };
+    match root {
+        Some(root) => {
+            fs::create_dir_all(root)?;
+            builder.tempdir_in(root)
+        }
+        None => builder.tempdir(),
+    }
+}
+
+/// One source run's tier in a merge: its chunks, and the bytes of the
+/// tier object from `base` through the last of them — the span the chunks
+/// lie in, read from the object rather than the object whole.
 struct TierSource {
-    object: Arc<Vec<u8>>,
+    bytes: Vec<u8>,
+    base: u64,
     chunks: Vec<TierChunkRef>,
 }
 
@@ -218,7 +243,13 @@ fn encode_term(
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
 ) -> Result<EncodedTerm, TermIndexError> {
     for source in &term.sources {
-        tier_entries(&source.chunks, &source.object, ordinals, &mut term.entries)?;
+        tier_entries(
+            &source.chunks,
+            &source.bytes,
+            source.base,
+            ordinals,
+            &mut term.entries,
+        )?;
     }
     if budget == 0 || depth == 0 || term.entries.is_empty() {
         return Ok(EncodedTerm {
@@ -363,15 +394,14 @@ impl ContributionWriter {
     }
 
     /// Like [`Self::create`], spilling into a scratch directory of its own
-    /// under the system temporary directory; the directory lives as long as
+    /// under `root` (see [`scratch_dir`]); the directory lives as long as
     /// the finished contribution does.
     pub(crate) fn create_in_scratch(
         superfile_id: Uuid,
         id_min: i128,
+        root: Option<&Path>,
     ) -> Result<Self, TermIndexError> {
-        let scratch = tempfile::Builder::new()
-            .prefix("infino-term-index-")
-            .tempdir()?;
+        let scratch = scratch_dir(root)?;
         let mut writer = Self::create(scratch.path(), superfile_id, id_min)?;
         writer.scratch = Some(scratch);
         Ok(writer)
@@ -467,10 +497,12 @@ struct HeadSinkState {
 }
 
 impl HeadSink {
-    pub(crate) fn new(columns: HashMap<String, FieldId>) -> Result<Self, TermIndexError> {
-        let scratch = tempfile::Builder::new()
-            .prefix("infino-term-index-")
-            .tempdir()?;
+    /// A sink for `columns`, spilling under `root` (see [`scratch_dir`]).
+    pub(crate) fn new(
+        columns: HashMap<String, FieldId>,
+        root: Option<&Path>,
+    ) -> Result<Self, TermIndexError> {
+        let scratch = scratch_dir(root)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(HeadSinkState {
                 scratch,
@@ -898,11 +930,7 @@ struct SegmentWriter {
 impl SegmentWriter {
     fn new(policy: &BuildPolicy, scoring: ScoringOf) -> Result<Self, TermIndexError> {
         let spill = match policy.spill_to_disk {
-            true => Some(Arc::new(
-                tempfile::Builder::new()
-                    .prefix("infino-term-index-")
-                    .tempdir()?,
-            )),
+            true => Some(Arc::new(scratch_dir(policy.scratch_root.as_deref())?)),
             false => None,
         };
         Ok(Self {
@@ -1301,9 +1329,9 @@ struct SegmentCursor {
     files: VecDeque<PathBuf>,
     /// The open slice's bytes; empty before the first file.
     bytes: Vec<u8>,
-    /// The open slice's tier object, read on the first tier the slice
+    /// The open slice's tier object, opened on the first tier the slice
     /// yields; `None` until then and after every slice change.
-    tier: Option<Arc<Vec<u8>>>,
+    tier: Option<File>,
     /// Where the open slice's tier object sits (see [`tier_path`]).
     tier_file: Option<PathBuf>,
     /// Decoded terms not handed out yet.
@@ -1353,15 +1381,29 @@ impl SegmentCursor {
     /// The open slice's tier object, read on first use. A run with a tier
     /// always comes from a slice that has one, so a missing file is an
     /// error, not an empty tier.
-    fn tier_bytes(&mut self) -> Result<Arc<Vec<u8>>, TermIndexError> {
+    /// The bytes of the open slice's tier object that `chunks` lie in,
+    /// and where they start: one read of the span, not of the object.
+    fn tier_span(&mut self, chunks: &[TierChunkRef]) -> Result<(Vec<u8>, u64), TermIndexError> {
+        use std::io::{Read, Seek, SeekFrom};
         if self.tier.is_none() {
             let path = self
                 .tier_file
                 .as_ref()
                 .ok_or_else(|| TermIndexError::Build("tier read before any slice".into()))?;
-            self.tier = Some(Arc::new(fs::read(path)?));
+            self.tier = Some(File::open(path)?);
         }
-        Ok(Arc::clone(self.tier.as_ref().expect("read above")))
+        let file = self.tier.as_mut().expect("opened above");
+        let base = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
+        let end = chunks
+            .iter()
+            .map(|c| c.offset.checked_add(c.len))
+            .max()
+            .flatten()
+            .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+        let mut bytes = vec![0u8; (end - base) as usize];
+        file.seek(SeekFrom::Start(base))?;
+        file.read_exact(&mut bytes)?;
+        Ok((bytes, base))
     }
 }
 
@@ -1398,17 +1440,21 @@ fn scoring_lookup(table: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>, base: u32) 
 fn tier_entries(
     chunks: &[TierChunkRef],
     object: &[u8],
+    base: u64,
     ordinals: &[Option<u32>],
     out: &mut Vec<TierEntry>,
 ) -> Result<(), TermIndexError> {
     let mut block = Vec::new();
     for chunk in chunks {
-        let end = chunk
+        let start = chunk
             .offset
+            .checked_sub(base)
+            .ok_or_else(|| TermIndexError::Malformed("tier chunk before its span".into()))?;
+        let end = start
             .checked_add(chunk.len)
             .filter(|end| *end <= object.len() as u64)
             .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
-        let bytes = &object[chunk.offset as usize..end as usize];
+        let bytes = &object[start as usize..end as usize];
         block.clear();
         TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
         out.extend(block.iter().filter_map(|e| {
@@ -1479,8 +1525,10 @@ pub(crate) fn merge_segments(
                         })
                     }));
                 } else {
+                    let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
                     sources.push(TierSource {
-                        object: cursors[source as usize].tier_bytes()?,
+                        bytes,
+                        base,
                         chunks: tier.chunks.clone(),
                     });
                 }

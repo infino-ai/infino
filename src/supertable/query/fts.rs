@@ -1139,13 +1139,36 @@ impl SupertableReader {
         // before any open.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
-        // A scope admits rows the index cannot see, and the merge's
-        // threshold is the k-th score over every row: seeding the floor
-        // with it, or ruling a superfile out under it, would prune the
-        // admitted rows that score below it. A scoped search keeps its
-        // ceilings.
+        // Rows deleted from each kept superfile: the tiers still hold them,
+        // so the merge reads past them, and a kernel admits only the live
+        // rows, so its k best are live. A sidecar that cannot be read
+        // leaves the query to its ceilings and the kernel's own filter.
+        let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
+        let mut deny_known = true;
+        if let Some(cache) = &self.tombstone_cache {
+            let now = Instant::now();
+            let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+            for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
+                match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
+                    Ok(set) => *slot = set,
+                    Err(_) => {
+                        deny_known = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let tombstoned = deny.iter().any(Option::is_some);
+        // A scope that admits only some rows of a superfile is one the
+        // index cannot see, and the merge's threshold is the k-th score
+        // over every row: seeding the floor with it, or ruling a superfile
+        // out under it, would prune the admitted rows that score below it.
+        // Such a search keeps its ceilings; a scope that only chooses
+        // superfiles leaves the merge sound, since it works over the kept
+        // set.
         let tiers_serve = index_column.is_some()
-            && scope.is_none()
+            && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
@@ -1198,25 +1221,6 @@ impl SupertableReader {
             // the kernels; the tiers score each term once, so such a query
             // is not served.
             let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
-            // Rows deleted from each kept superfile, which the tiers still
-            // hold: the merge reads past them. A sidecar that cannot be
-            // read leaves the query to its ceilings.
-            let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
-            let mut deny_known = true;
-            if let Some(cache) = &self.tombstone_cache {
-                let now = Instant::now();
-                let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
-                cache.prefetch(&ids, now).await;
-                for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
-                    match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
-                        Ok(set) => *slot = set,
-                        Err(_) => {
-                            deny_known = false;
-                            break;
-                        }
-                    }
-                }
-            }
             let selection = match column_params(manifest, column) {
                 Some(params) if !repeated && deny_known => {
                     let query = tier::TierQuery {
@@ -1364,8 +1368,10 @@ impl SupertableReader {
             .and_then(|s| s.allow.clone())
             .map(Arc::new);
         // An exact count walks each superfile whole: the ranged union
-        // kernel prunes and does not count.
-        let fanout = match exact_count || has_phrases || per_row_scope.is_some() {
+        // kernel prunes and does not count. A superfile with deleted rows
+        // is walked by the clause kernels, which admit only its live rows;
+        // the ranged union kernel has no such gate.
+        let fanout = match exact_count || has_phrases || per_row_scope.is_some() || tombstoned {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
@@ -1400,7 +1406,9 @@ impl SupertableReader {
         let column_arc = Arc::new(column_owned);
         // Exact count only: each superfile's row count, to turn its
         // tombstones into an allow-set, and the running total.
-        let row_counts: Arc<HashMap<Uuid, u64>> = Arc::new(match exact_count {
+        // What a live-row set is built against: every kept superfile's
+        // row count, when an exact count or a deleted row needs one.
+        let row_counts: Arc<HashMap<Uuid, u64>> = Arc::new(match exact_count || tombstoned {
             true => kept.iter().map(|e| (e.superfile_id, e.n_docs)).collect(),
             false => HashMap::new(),
         });
@@ -1534,18 +1542,8 @@ impl SupertableReader {
                     true => f32::NEG_INFINITY,
                     false => shared.floor(),
                 };
-                let (live_floor, allow, k_unit) = {
+                let (live_floor, allow) = {
                     let tomb = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
-                    // A kernel's heap holds the k best before the tombstone
-                    // filter drops the deleted among them: a superfile with
-                    // deleted rows is asked for that many more, so its k
-                    // best live rows are in the heap when they are dropped.
-                    let k_unit = match &tomb {
-                        Some(Ok(deleted)) if !deleted.is_empty() => {
-                            k.saturating_add(usize::try_from(deleted.len()).unwrap_or(usize::MAX))
-                        }
-                        _ => k,
-                    };
                     // The atom walks may also read the floor LIVE mid-walk and
                     // publish their own local kth into it — but a kernel heap
                     // is pre-tombstone-filter, so only a superfile with no
@@ -1563,10 +1561,14 @@ impl SupertableReader {
                             _ => Some(shared.live_floor()),
                         }
                     };
-                    // An exact count leaves deleted rows out, as `count` does:
-                    // on a superfile with tombstones, allow only the live rows.
-                    let allow = match (&tomb, exact_count) {
-                        (Some(Ok(deleted)), true) if !deleted.is_empty() => {
+                    // A superfile with deleted rows admits only its live
+                    // rows: a kernel's heap then holds the k best live
+                    // documents, where the filter after the walk would have
+                    // dropped the deleted among the k best of all (and an
+                    // exact count counts the live rows alone, as `count`
+                    // does).
+                    let allow = match &tomb {
+                        Some(Ok(deleted)) if !deleted.is_empty() => {
                             let rows = row_counts.get(&suid).copied().ok_or_else(|| {
                                 QueryError::Internal(format!(
                                     "superfile {suid} missing from the kept set"
@@ -1590,7 +1592,7 @@ impl SupertableReader {
                         }
                         _ => allow,
                     };
-                    (live_floor, allow, k_unit)
+                    (live_floor, allow)
                 };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
@@ -1644,7 +1646,7 @@ impl SupertableReader {
                                     op_stats::timed_kernel(&kernel_stats, || {
                                         kernel_reader.bm25_search_or_range_prebuilt(
                                             &kernel_set,
-                                            k_unit,
+                                            k,
                                             start,
                                             end,
                                             floor,
@@ -1657,9 +1659,7 @@ impl SupertableReader {
                             .map_err(|e| QueryError::Internal(e.to_string()))??
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(
-                                    set, k_unit, start, end, floor, &scoring,
-                                )
+                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor, &scoring)
                             })?
                         }
                     }
@@ -1684,7 +1684,7 @@ impl SupertableReader {
                                     allow,
                                     exact_count,
                                 },
-                                k_unit,
+                                k,
                                 floor,
                                 &scoring,
                             )

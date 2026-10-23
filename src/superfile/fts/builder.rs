@@ -4261,19 +4261,23 @@ fn encode_term(
 
     let df = pairs.len() as u64;
     // Every posting's score, as a reader scores it: the heads rank by it
-    // and each block's maximum is read from it.
+    // and a long list's blocks take their maxima from it. A short list
+    // without a head to gather is not scored.
     let idf_t = bm25::idf(n_scored_docs as u64, df);
-    scratch.scores.clear();
-    scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
-        bm25::score(
-            idf_t,
-            tf,
-            bm25::stored_len(col_doc_lengths[doc as usize]),
-            avgdl,
-            params,
-        )
-    }));
+    let score_all = |scratch: &mut TermScratch| {
+        scratch.scores.clear();
+        scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
+            bm25::score(
+                idf_t,
+                tf,
+                bm25::stored_len(col_doc_lengths[doc as usize]),
+                avgdl,
+                params,
+            )
+        }));
+    };
     if enc.heads {
+        score_all(scratch);
         term_head(
             pairs,
             &scratch.scores,
@@ -4341,6 +4345,9 @@ fn encode_term(
         EncodedTerm::Short
     } else {
         profile.encode_pfor += 1;
+        if !enc.heads {
+            score_all(scratch);
+        }
         // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).

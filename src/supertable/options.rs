@@ -984,6 +984,7 @@ impl SupertableOptions {
                 .clamp(1, HEAD_DEPTH_MAX),
             pool: Some(Arc::clone(&self.writer_pool)),
             spill_to_disk: true,
+            scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
             ..BuildPolicy::default()
         }
     }

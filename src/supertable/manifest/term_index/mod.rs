@@ -47,20 +47,21 @@ use build::build_segment;
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
     BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, build, build_onto, merge_segments, tier_path,
+    HeadSink, build, build_onto, merge_segments, scratch_dir, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
 #[cfg(test)]
 pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
-use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::fs as async_fs;
 use uuid::Uuid;
 
 use crate::{
+    runtime_bridge::run_on_pool,
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
     superfile::{FtsError, fts::reader::BoolMode},
     supertable::{
@@ -264,7 +265,6 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
 /// Storage URI of a slice's tier object with this content hash.
 /// One chunk of a tier as a merge reads it: its directory and every
 /// block's body, in block order.
-#[derive(Clone)]
 pub(crate) struct TierChunkData {
     pub(crate) dir: Arc<TierDirectory>,
     pub(crate) bodies: Vec<Bytes>,
@@ -273,9 +273,24 @@ pub(crate) struct TierChunkData {
 impl TierChunkData {
     /// Bytes the chunk holds resident: its bodies (the directory is small
     /// beside them).
-    fn weight(&self) -> usize {
-        self.bodies.iter().map(Bytes::len).sum()
+    fn weight(data: &Arc<Self>) -> usize {
+        data.bodies.iter().map(Bytes::len).sum()
     }
+}
+
+/// The resident tier chunks, keyed by tier object and offset. Tier objects
+/// are content-addressed, so the cache is shared across the roots a table
+/// goes through: a delta commit replaces the root, not the tiers already
+/// read.
+pub(crate) type TierChunkCache =
+    Arc<tokio::sync::Mutex<Resident<(ContentHash, u64), Arc<TierChunkData>>>>;
+
+/// A tier chunk cache of the resident byte budget.
+pub(crate) fn new_tier_chunk_cache() -> TierChunkCache {
+    Arc::new(tokio::sync::Mutex::new(Resident::new(
+        RESIDENT_SLICE_BUDGET_BYTES,
+        TierChunkData::weight,
+    )))
 }
 
 pub(crate) fn tier_uri(hash: &ContentHash) -> String {
@@ -680,7 +695,7 @@ pub(crate) struct TermIndex {
     /// offset)`, under the same byte budget as the slices. A chunk is the
     /// unit so a merge's reads cost the set a lookup per region, not per
     /// block.
-    tier_chunks: tokio::sync::Mutex<Resident<(ContentHash, u64), TierChunkData>>,
+    tier_chunks: TierChunkCache,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
     runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<SliceRun>>>>,
@@ -689,7 +704,7 @@ pub(crate) struct TermIndex {
 /// A bounded resident set, least recently used first out: `weigh` gives
 /// each value's cost against `budget`, and a read refreshes recency, so a
 /// burst that cycles through more than fits keeps what it keeps touching.
-struct Resident<K, V> {
+pub(crate) struct Resident<K, V> {
     map: HashMap<K, (V, u64)>,
     by_use: std::collections::BTreeMap<u64, K>,
     tick: u64,
@@ -759,12 +774,16 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
-            tier_chunks: tokio::sync::Mutex::new(Resident::new(
-                RESIDENT_SLICE_BUDGET_BYTES,
-                TierChunkData::weight,
-            )),
+            tier_chunks: new_tier_chunk_cache(),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
+    }
+
+    /// This index reading tier chunks through `cache`, shared with the
+    /// indexes of the roots before and after it.
+    pub(crate) fn with_tier_chunk_cache(mut self, cache: TierChunkCache) -> Self {
+        self.tier_chunks = cache;
+        self
     }
 
     /// Fetch, verify and parse the root a manifest references, through the
@@ -1172,8 +1191,8 @@ impl TermIndex {
         &self,
         object: &ContentHash,
         chunks: &[TierChunkRef],
-    ) -> Result<(Vec<TierChunkData>, u64), TermIndexError> {
-        let mut out: Vec<Option<TierChunkData>> = Vec::with_capacity(chunks.len());
+    ) -> Result<(Vec<Arc<TierChunkData>>, u64), TermIndexError> {
+        let mut out: Vec<Option<Arc<TierChunkData>>> = Vec::with_capacity(chunks.len());
         {
             let mut resident = self.tier_chunks.lock().await;
             for chunk in chunks {
@@ -1205,44 +1224,68 @@ impl TermIndex {
                 _ => spans.push((i, i)),
             }
         }
+        // Each span: one ranged read, then its chunks parsed and every
+        // block verified on the pool, off this task and off the lock.
         let uri = tier_uri(object);
-        let fetches = try_join_all(spans.iter().map(|&(first, last)| {
-            let uri = uri.clone();
-            let start = chunks[first].offset;
-            let end = chunks[last].offset.checked_add(chunks[last].len);
-            async move {
-                let end =
-                    end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
-                let bytes = self.storage.get_range(&uri, start..end).await?;
-                if bytes.len() as u64 != end - start {
-                    return Err(TermIndexError::Malformed("short tier read".into()));
+        let fetches: Vec<_> = spans
+            .into_iter()
+            .map(|(first, last)| {
+                let uri = uri.clone();
+                let refs: Vec<(usize, TierChunkRef)> = chunks
+                    .iter()
+                    .enumerate()
+                    .take(last + 1)
+                    .skip(first)
+                    .map(|(i, c)| (i, c.clone()))
+                    .collect();
+                let start = chunks[first].offset;
+                let end = chunks[last].offset.checked_add(chunks[last].len);
+                async move {
+                    let end =
+                        end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+                    let bytes = self.storage.get_range(&uri, start..end).await?;
+                    if bytes.len() as u64 != end - start {
+                        return Err(TermIndexError::Malformed("short tier read".into()));
+                    }
+                    let fetched = bytes.len() as u64;
+                    let chunks = run_on_pool(None, "tier chunk verify", move || {
+                        let mut out = Vec::with_capacity(refs.len());
+                        for (i, chunk) in refs {
+                            let at = (chunk.offset - start) as usize;
+                            let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
+                            let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
+                            if dir.chunk_len() as u64 != chunk.len {
+                                return Err(TermIndexError::Malformed(
+                                    "tier chunk directory does not match the run's chunk length"
+                                        .into(),
+                                ));
+                            }
+                            let mut bodies = Vec::with_capacity(dir.n_blocks());
+                            for b in 0..dir.n_blocks() {
+                                let body = chunk_bytes.slice(dir.block_range(b));
+                                dir.verify_block(b, &body)?;
+                                bodies.push(body);
+                            }
+                            out.push((i, Arc::new(TierChunkData { dir, bodies })));
+                        }
+                        Ok::<_, TermIndexError>(out)
+                    })
+                    .await
+                    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+                    Ok::<_, TermIndexError>((fetched, chunks))
                 }
-                Ok::<_, TermIndexError>(bytes)
-            }
-        }))
-        .await?;
+            })
+            .collect();
+        let parsed: Vec<(u64, Vec<(usize, Arc<TierChunkData>)>)> = stream::iter(fetches)
+            .buffered(SLICE_FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
         let mut fetched = 0u64;
         let mut resident = self.tier_chunks.lock().await;
-        for (&(first, last), bytes) in spans.iter().zip(fetches) {
-            fetched += bytes.len() as u64;
-            let span_start = chunks[first].offset;
-            for (i, chunk) in chunks.iter().enumerate().take(last + 1).skip(first) {
-                let at = (chunk.offset - span_start) as usize;
-                let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
-                let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
-                if dir.chunk_len() as u64 != chunk.len {
-                    return Err(TermIndexError::Malformed(
-                        "tier chunk directory does not match the run's chunk length".into(),
-                    ));
-                }
-                let mut all = Vec::with_capacity(dir.n_blocks());
-                for b in 0..dir.n_blocks() {
-                    let body = chunk_bytes.slice(dir.block_range(b));
-                    dir.verify_block(b, &body)?;
-                    all.push(body);
-                }
-                let data = TierChunkData { dir, bodies: all };
-                resident.insert((*object, chunk.offset), data.clone());
+        for (bytes, span_chunks) in parsed {
+            fetched += bytes;
+            for (i, data) in span_chunks {
+                resident.insert((*object, chunks[i].offset), Arc::clone(&data));
                 out[i] = Some(data);
             }
         }

@@ -3243,6 +3243,9 @@ pub struct ManifestPartLoader {
     /// new root and loads that instead. A root that can never load is kept
     /// as its failure.
     term_index: tokio::sync::Mutex<Option<TermIndexSlot>>,
+    /// The tier chunks read so far, shared by every root this loader goes
+    /// through: a delta commit replaces the root, not the tiers.
+    tier_chunks: term_index::TierChunkCache,
     /// Resolves the column names a part written before field ids used as
     /// summary keys.
     legacy: Arc<LegacyNames>,
@@ -3309,6 +3312,7 @@ impl ManifestPartLoader {
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
+            tier_chunks: term_index::new_tier_chunk_cache(),
             legacy: Arc::new(legacy),
         }
     }
@@ -3338,7 +3342,7 @@ impl ManifestPartLoader {
         .await
         {
             Ok(index) => {
-                let index = Arc::new(index);
+                let index = Arc::new(index.with_tier_chunk_cache(Arc::clone(&self.tier_chunks)));
                 *slot = Some(TermIndexSlot::Loaded(Arc::clone(&index)));
                 Ok(index)
             }

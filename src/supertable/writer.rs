@@ -87,7 +87,7 @@ use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tempfile::{Builder as TempDirBuilder, NamedTempFile, TempDir};
+use tempfile::{NamedTempFile, TempDir};
 use tokio::{
     sync::{
         Semaphore,
@@ -3211,7 +3211,8 @@ pub(in crate::supertable) fn term_head_sink_for(
         .filter_map(|c| Some((c.column.clone(), manifest.field_id(&c.column)?)))
         .collect();
     let policy = manifest.options.term_index_build_policy();
-    let sink = term_index::HeadSink::new(columns).map_err(|e| BuildError::Store(e.to_string()))?;
+    let sink = term_index::HeadSink::new(columns, policy.scratch_root.as_deref())
+        .map_err(|e| BuildError::Store(e.to_string()))?;
     Ok(Some((sink, policy.head_depth_per_superfile)))
 }
 
@@ -3757,8 +3758,13 @@ pub(in crate::supertable) fn build_term_contribution(
     if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
         return Ok(None);
     }
-    let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, id_min)
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let policy = manifest.options.term_index_build_policy();
+    let mut writer = term_index::ContributionWriter::create_in_scratch(
+        superfile_id,
+        id_min,
+        policy.scratch_root.as_deref(),
+    )
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     bridge_sync_to_async(write_superfile_terms(
         reader,
         &manifest.options.legacy_names(),
@@ -11173,7 +11179,7 @@ async fn merge_term_index(
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
     let policy = manifest.options.term_index_build_policy();
-    let scratch = term_index_scratch()?;
+    let scratch = term_index_scratch(&policy)?;
     // Superfiles no segment lists get one segment of their own, numbered
     // past the ones `current` lists, and merge like the rest.
     let missing = unlisted(current, entries);
@@ -11318,7 +11324,7 @@ async fn fold_term_index(
         scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
         ..policy
     };
-    let scratch = term_index_scratch()?;
+    let scratch = term_index_scratch(&policy)?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
@@ -11336,9 +11342,10 @@ async fn fold_term_index(
     }))
 }
 
-/// A scratch directory for one term-index build, removed when dropped.
-fn term_index_scratch() -> io::Result<TempDir> {
-    TempDirBuilder::new().prefix("infino-term-index-").tempdir()
+/// A scratch directory for one term-index build, removed when dropped:
+/// on the table's disk when it has one (see `BuildPolicy::scratch_root`).
+fn term_index_scratch(policy: &term_index::BuildPolicy) -> io::Result<TempDir> {
+    term_index::scratch_dir(policy.scratch_root.as_deref())
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
@@ -11350,13 +11357,10 @@ async fn collect_and_build_term_index(
     entries: &[Arc<SuperfileEntry>],
     onto: Root,
 ) -> Result<term_index::Built, TermIndexError> {
-    let scratch = term_index_scratch()?;
+    let policy = manifest.options.term_index_build_policy();
+    let scratch = term_index_scratch(&policy)?;
     let contributions = collect_contributions(manifest, entries, scratch.path()).await?;
-    term_index::build_onto(
-        onto,
-        &contributions,
-        &manifest.options.term_index_build_policy(),
-    )
+    term_index::build_onto(onto, &contributions, &policy)
 }
 
 /// Walk each of `entries`' dictionaries, one superfile at a time, spilling
@@ -11390,7 +11394,12 @@ fn scoring_by_ordinal(
                 .iter()
                 .filter_map(|(column, params)| {
                     let summary = entry.fts_summary.get(column)?;
-                    let avgdl = summary.baked_avgdl?;
+                    // A summary written before the average was baked keys
+                    // its entries at the default; its document count still
+                    // turns a legacy bound into a key.
+                    let avgdl = summary
+                        .baked_avgdl
+                        .unwrap_or(term_index::ColumnScoring::default().avgdl);
                     let scored_docs = summary
                         .length_stats
                         .as_ref()
@@ -11450,30 +11459,37 @@ async fn collect_contributions(
         let policy = policy.clone();
         let dir = dir.to_path_buf();
         let entry = Arc::clone(entry);
-        tasks.push(tokio::spawn(async move {
-            let _walking = permit;
-            let reader = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                storage.as_ref(),
-                &entry,
-                ReadIntent::Stream,
-            )
-            .await
-            .map_err(TermIndexError::Open)?;
-            // The walk reads most of the FTS section, whose reads skip the
-            // block cache, so each would be its own GET. Fetch the section in
-            // bulk first. On failure the walk still works, read by read.
-            if let Some(cache) = disk_cache.as_ref()
-                && let Some((start, len)) = entry.subsection_offsets.as_ref().and_then(|o| o.fts)
-                && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
-            {
-                warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
-            }
-            let mut writer =
-                term_index::ContributionWriter::create(&dir, entry.superfile_id, entry.id_min)?;
-            write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
-            writer.finish()
+        // The walk is minutes of decoding per superfile between its reads:
+        // it runs on a blocking thread, driving its reads through the
+        // runtime, so the workers stay free for queries.
+        let runtime = tokio::runtime::Handle::current();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                let _walking = permit;
+                let reader = open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry,
+                    ReadIntent::Stream,
+                )
+                .await
+                .map_err(TermIndexError::Open)?;
+                // The walk reads most of the FTS section, whose reads skip the
+                // block cache, so each would be its own GET. Fetch the section in
+                // bulk first. On failure the walk still works, read by read.
+                if let Some(cache) = disk_cache.as_ref()
+                    && let Some((start, len)) =
+                        entry.subsection_offsets.as_ref().and_then(|o| o.fts)
+                    && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
+                {
+                    warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
+                }
+                let mut writer =
+                    term_index::ContributionWriter::create(&dir, entry.superfile_id, entry.id_min)?;
+                write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
+                writer.finish()
+            })
         }));
     }
     let mut contributions = Vec::with_capacity(entries.len());
@@ -16047,7 +16063,7 @@ supertable:
             "title".to_owned(),
             manifest.field_id("title").expect("title id"),
         )]);
-        let sink = term_index::HeadSink::new(columns).expect("sink");
+        let sink = term_index::HeadSink::new(columns, None).expect("sink");
         let mut builder = SuperfileBuilder::new(builder_options_of(&manifest)).expect("builder");
         builder.set_term_head_sink(Box::new(sink.clone()), HEAD_DEPTH);
         builder.add_batch(&batch, &[]).expect("add_batch");
@@ -16060,8 +16076,8 @@ supertable:
 
         let reader = SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
             .expect("open");
-        let mut writer =
-            term_index::ContributionWriter::create_in_scratch(superfile_id, 1).expect("writer");
+        let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, 1, None)
+            .expect("writer");
         let policy = term_index::BuildPolicy {
             head_depth_per_superfile: HEAD_DEPTH,
             ..term_index::BuildPolicy::default()
@@ -16149,7 +16165,7 @@ supertable:
             "title".to_owned(),
             manifest.field_id("title").expect("title id"),
         )]);
-        let sink = term_index::HeadSink::new(columns).expect("sink");
+        let sink = term_index::HeadSink::new(columns, None).expect("sink");
         let mut merged = Vec::new();
         SuperfileBuilder::build_from_readers_fts_merge_with_heads(
             &inputs,
@@ -16170,8 +16186,8 @@ supertable:
         )
         .expect("open merged");
         assert_eq!(reader.n_docs(), 120 + 90 - 4 + 150, "the survivors");
-        let mut writer =
-            term_index::ContributionWriter::create_in_scratch(superfile_id, 1).expect("writer");
+        let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, 1, None)
+            .expect("writer");
         let policy = term_index::BuildPolicy {
             head_depth_per_superfile: HEAD_DEPTH,
             ..term_index::BuildPolicy::default()
