@@ -1313,4 +1313,200 @@ mod tests {
             );
         }
     }
+
+    /// The policy alternates until each way has its samples, then takes
+    /// the cheaper way and tries the other one query in sixteen.
+    #[test]
+    fn the_policy_measures_both_ways_before_it_chooses() {
+        let policy = TierPolicy::new();
+        let class = TierPolicy::class(true, false, 10, 2, 5.0);
+        let mut ways = Vec::new();
+        for _ in 0..(2 * TierPolicy::MIN_SAMPLES) {
+            let with = policy.merge(class);
+            ways.push(with);
+            // Merging costs ten times what not merging costs.
+            policy.note(class, with, if with { 10_000 } else { 1_000 });
+        }
+        assert_eq!(
+            ways,
+            (0..2 * TierPolicy::MIN_SAMPLES)
+                .map(|i| i % 2 == 0)
+                .collect::<Vec<_>>(),
+            "the two ways alternate, the unmeasured one first"
+        );
+        let later: Vec<bool> = (0..2 * TierPolicy::EXPLORE_EVERY)
+            .map(|_| policy.merge(class))
+            .collect();
+        let explored = later.iter().filter(|w| **w).count();
+        assert_eq!(explored, 2, "one query in sixteen tries the dearer way");
+        assert!(
+            later[0] && !later[1] && later[TierPolicy::EXPLORE_EVERY as usize],
+            "the trials divisible by sixteen explore: {later:?}"
+        );
+        let other = TierPolicy::class(false, true, 10, 2, 5.0);
+        assert!(
+            policy.merge(other),
+            "another class starts its own measurement"
+        );
+    }
+
+    /// Classes split at the bucket edges of `k`, the term count and the
+    /// rarest term's idf, and every class fits the tables.
+    #[test]
+    fn the_policy_class_splits_at_its_bucket_edges() {
+        let class = |k, terms, idf| TierPolicy::class(true, false, k, terms, idf);
+        for (a, b) in [(10, 11), (100, 101), (1000, 1001)] {
+            assert_ne!(class(a, 2, 5.0), class(b, 2, 5.0), "k {a} and {b}");
+            assert_eq!(class(a, 2, 5.0), class(a - 1, 2, 5.0), "k {a} and one less");
+        }
+        for (a, b) in [(1, 2), (2, 3), (4, 5), (8, 9)] {
+            assert_ne!(class(10, a, 5.0), class(10, b, 5.0), "terms {a} and {b}");
+        }
+        for (a, b) in [(9.3, 9.1), (7.0, 6.8), (4.7, 4.5)] {
+            assert_ne!(class(10, 2, a), class(10, 2, b), "idf {a} and {b}");
+        }
+        assert_eq!(class(10, 2, 1e4f32.ln()), class(10, 2, 12.0));
+        assert_ne!(
+            TierPolicy::class(true, false, 10, 2, 5.0),
+            TierPolicy::class(false, false, 10, 2, 5.0),
+            "a conjunction and a mix differ"
+        );
+        for shape in [(true, false), (false, true), (false, false)] {
+            for k in [1, 50, 500, 5000] {
+                for terms in [1, 2, 3, 6, 40] {
+                    for idf in [0.1, 5.0, 8.0, 12.0] {
+                        let c = TierPolicy::class(shape.0, shape.1, k, terms, idf);
+                        assert!(
+                            c < TierPolicy::CLASSES,
+                            "class {c} of {}",
+                            TierPolicy::CLASSES
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first sample sets a running mean; each later one moves it a
+    /// power-of-two fraction of the way.
+    #[test]
+    fn a_running_mean_is_set_by_its_first_sample_then_moves_a_fraction() {
+        let cell = AtomicU64::new(0);
+        fold_mean(&cell, 800, 3);
+        assert_eq!(cell.load(Ordering::Relaxed), 800);
+        fold_mean(&cell, 0, 3);
+        assert_eq!(
+            cell.load(Ordering::Relaxed),
+            700,
+            "an eighth of the way to zero"
+        );
+        fold_mean(&cell, 0, 2);
+        assert_eq!(
+            cell.load(Ordering::Relaxed),
+            525,
+            "a quarter of the way to zero"
+        );
+        fold_mean(&cell, 525, 2);
+        assert_eq!(
+            cell.load(Ordering::Relaxed),
+            525,
+            "a sample at the mean leaves it"
+        );
+    }
+
+    /// Opens pay for rounds at the measured costs; with no open cost
+    /// measured, any open does.
+    #[test]
+    fn opens_pay_for_rounds_at_the_measured_costs() {
+        assert!(
+            pays(1, 1, 0, 1_000),
+            "unmeasured: one open is worth a round"
+        );
+        assert!(!pays(0, 1, 0, 1_000), "unmeasured: no open is not");
+        assert!(
+            pays(10, 1, 100, 1_000),
+            "ten opens at 100 ns pay a 1 µs round"
+        );
+        assert!(!pays(9, 1, 100, 1_000));
+        assert!(!pays(10, 2, 100, 1_000), "but not two rounds");
+        assert!(
+            pays(u64::MAX, 1, u64::MAX, u64::MAX),
+            "no overflow at the extremes"
+        );
+    }
+
+    /// A head read a block at a time: each block read lowers the tail,
+    /// so the superfile's upper bound never rises, and the top candidates
+    /// are the read documents' exact sums.
+    #[test]
+    fn a_head_read_in_blocks_bounds_what_it_has_not_read() {
+        let shape = Shape {
+            required: 0,
+            scoring: 0b11,
+            phrases: Vec::new(),
+            trusted: true,
+        };
+        let idf = vec![1.0f32, 1.0];
+        let mut slot = Slot::new(2, 1.0, None);
+        let mut scratch = Scratch::default();
+        // Term 1 is read whole at once; term 0 comes in two blocks with
+        // tails 0.5 then 0.2.
+        for (doc, c) in [(1u32, 0.9f32), (4, 0.7), (9, 0.6)] {
+            slot.absorb(1, doc, c);
+        }
+        slot.heads[1].tail = 0.0;
+        slot.heads[1].ceiling = 0.9;
+        slot.heads[1].done = true;
+        for (doc, c) in [(4u32, 0.8f32), (2, 0.6), (7, 0.55)] {
+            slot.absorb(0, doc, c);
+        }
+        slot.heads[0].tail = 0.5;
+        slot.heads[0].ceiling = 0.8;
+        slot.refresh(&shape, &idf, 3, 1.0, 1.0, &mut scratch);
+        let first = slot.ub;
+        // Document 4 carries both terms: 0.8 + 0.7. Document 1 is read under
+        // term 1 only, so it may still carry term 0 up to the tail: 0.9 + 0.5.
+        let close = |got: &[f32], want: &[f32]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-6)
+        };
+        assert!(close(&slot.top, &[1.5, 0.9, 0.6]), "top {:?}", slot.top);
+        assert!(
+            (first - 1.5).abs() < 1e-6,
+            "ub {first}: 0.8 + 0.7 and 0.9 + 0.5 tie"
+        );
+        for (doc, c) in [(1u32, 0.45f32), (9, 0.3)] {
+            slot.absorb(0, doc, c);
+        }
+        slot.heads[0].tail = 0.2;
+        slot.refresh(&shape, &idf, 3, 1.0, 1.0, &mut scratch);
+        assert!(slot.ub <= first, "ub rose from {first} to {}", slot.ub);
+        assert!(close(&slot.top, &[1.5, 1.35, 0.9]), "top {:?}", slot.top);
+        assert!(
+            (slot.ub - 1.5).abs() < 1e-6,
+            "ub {}: document 4 is the best",
+            slot.ub
+        );
+    }
+
+    /// A deleted row is read past: it is neither a candidate nor a bound.
+    #[test]
+    fn a_denied_row_is_read_past() {
+        let shape = Shape {
+            required: 0,
+            scoring: 0b1,
+            phrases: Vec::new(),
+            trusted: true,
+        };
+        let deny: RoaringBitmap = [4u32].into_iter().collect();
+        let mut slot = Slot::new(1, 1.0, Some(Arc::new(deny)));
+        for (doc, c) in [(4u32, 0.8f32), (2, 0.6)] {
+            slot.absorb(0, doc, c);
+        }
+        slot.heads[0].tail = 0.0;
+        slot.heads[0].ceiling = 0.8;
+        slot.heads[0].done = true;
+        slot.refresh(&shape, &[1.0], 2, 1.0, 1.0, &mut Scratch::default());
+        assert_eq!(slot.top, vec![0.6], "row 4 is deleted");
+        assert!((slot.ub - 0.6).abs() < 1e-6);
+    }
 }

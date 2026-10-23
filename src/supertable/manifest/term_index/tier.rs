@@ -744,6 +744,52 @@ mod tests {
         assert!(read_chunk_refs(&out[..out.len() - 1], &mut 0).is_err());
     }
 
+    /// A directory whose checksum holds but whose entries lie — no
+    /// entries, or ordinals out of order — is refused as malformed.
+    #[test]
+    fn a_directory_entry_out_of_range_is_refused_behind_a_valid_crc() {
+        let chunks = encode_tier(&sample(80, 10, 1_000, 5));
+        let (bytes, n_blocks) = (&chunks[0].bytes, chunks[0].n_blocks);
+        assert!(n_blocks >= 2, "two blocks to disorder");
+        let dir_end = TierDirectory::len_for(n_blocks);
+        let reseal = |mut bytes: Vec<u8>| {
+            let crc = crc32c(&bytes[CHUNK_HEADER_LEN..dir_end]);
+            bytes[..CHUNK_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+            bytes
+        };
+        let mut empty = bytes.clone();
+        empty[CHUNK_HEADER_LEN + 8] = 0;
+        assert!(
+            matches!(
+                TierDirectory::parse(&reseal(empty), n_blocks),
+                Err(TermIndexError::Malformed(m)) if m.contains("out of range")
+            ),
+            "a block of no entries"
+        );
+        let mut over = bytes.clone();
+        over[CHUNK_HEADER_LEN + 8] = BLOCK_ENTRIES as u8 + 1;
+        assert!(
+            matches!(
+                TierDirectory::parse(&reseal(over), n_blocks),
+                Err(TermIndexError::Malformed(m)) if m.contains("out of range")
+            ),
+            "a block of too many entries"
+        );
+        let mut disordered = bytes.clone();
+        let (a, b) = (CHUNK_HEADER_LEN, CHUNK_HEADER_LEN + DIRECTORY_ENTRY_LEN);
+        let second = disordered[b..b + 4].to_vec();
+        disordered.copy_within(a..a + 4, b);
+        disordered[a..a + 4].copy_from_slice(&second);
+        assert!(
+            matches!(
+                TierDirectory::parse(&reseal(disordered), n_blocks),
+                Err(TermIndexError::Malformed(m)) if m.contains("out of order")
+            ),
+            "ordinals out of order"
+        );
+        TierDirectory::parse(&reseal(bytes.clone()), n_blocks).expect("the reseal is a no-op");
+    }
+
     #[test]
     fn rejects_a_bad_crc_and_truncation() {
         let chunks = encode_tier(&sample(80, 10, 1_000, 5));

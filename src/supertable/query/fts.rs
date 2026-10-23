@@ -3675,6 +3675,67 @@ mod tests {
     /// scores are known and every one at the floor came from superfiles
     /// below its `_id` range; a seed placeholder, or a floor score from a
     /// superfile at or above that range, keeps it open.
+    /// Merging many scores at once (a sorted merge) keeps the same top-k
+    /// as inserting a few at a time, and a floor the walks have raised
+    /// drops what it already excludes.
+    #[test]
+    fn the_shared_floor_merges_many_scores_as_it_inserts_few() {
+        let k = 40;
+        let mut next = crate::test_helpers::xorshift(7);
+        let mut draw =
+            |n: usize| -> Vec<f32> { (0..n).map(|_| (next() % 10_000) as f32 / 100.0).collect() };
+        let (many, few) = (SharedTopK::new(k), SharedTopK::new(k));
+        let mut reference: Vec<f32> = Vec::new();
+        for (id_max, batch) in [(100i128, 200usize), (200, 7), (300, 150), (400, 3)] {
+            let scores = draw(batch);
+            reference.extend(&scores);
+            many.merge(id_max, scores.iter().copied());
+            for s in &scores {
+                few.merge(id_max, [*s]);
+            }
+            reference.sort_by(|a, b| b.total_cmp(a));
+            reference.truncate(k);
+            for (label, shared) in [("many", &many), ("few", &few)] {
+                let top: Vec<f32> = shared
+                    .top
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .map(|e| e.score)
+                    .collect();
+                assert_eq!(top, reference, "{label} after id_max {id_max}");
+                assert_eq!(shared.floor(), reference[k - 1], "{label} floor");
+            }
+        }
+        // A walk raised the live floor past the k-th: a score under it is
+        // dropped before the lock, one equal to it still enters.
+        let raised = reference[k / 2];
+        let scores_of = |shared: &SharedTopK| -> Vec<f32> {
+            shared
+                .top
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|e| e.score)
+                .collect()
+        };
+        let at_raised = scores_of(&many).iter().filter(|s| **s == raised).count();
+        many.live_floor().raise(raised);
+        many.merge(500, [raised - 0.005, raised, raised + 0.005]);
+        let top = scores_of(&many);
+        assert_eq!(top.len(), k);
+        assert!(
+            top.contains(&(raised + 0.005)),
+            "above the raised floor enters"
+        );
+        assert_eq!(
+            top.iter().filter(|s| **s == raised).count(),
+            at_raised + 1,
+            "equal to the raised floor enters"
+        );
+        assert!(!top.contains(&(raised - 0.005)), "under it is dropped");
+    }
+
     #[test]
     fn a_tie_at_the_floor_is_skipped_only_behind_lower_ids() {
         let shared = SharedTopK::new(3);

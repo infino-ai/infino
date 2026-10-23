@@ -38,7 +38,7 @@ fn schema() -> Arc<arrow_schema::Schema> {
     Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
         "body",
         arrow_schema::DataType::LargeUtf8,
-        false,
+        true,
     )]))
 }
 
@@ -77,13 +77,35 @@ fn document(global: usize) -> String {
 }
 
 fn table(dir: &TempDir, tiers: bool) -> Supertable {
-    table_with(dir, tiers, None)
+    table_with(
+        dir,
+        Build {
+            tiers,
+            ..Build::default()
+        },
+    )
+}
+
+/// How a test table is built.
+#[derive(Clone, Copy, Default)]
+struct Build {
+    /// Whether the term index keeps tiers.
+    tiers: bool,
+    /// Each superfile's head per term cut to this depth, when given.
+    depth: Option<usize>,
+    /// A cap on a term's entries across superfiles, when given.
+    budget: Option<u64>,
+    /// Whether the merge is the table's learned call (on) or runs for every
+    /// query the tiers can serve (off, what a test of the merge wants).
+    gate: bool,
+    /// Whether every third document's body is null.
+    nulls: bool,
 }
 
 /// A table with or without tiers, and with each superfile's head per term
 /// cut to `depth` when given: at 64 a common term's heads are read block by
 /// block and bounded by their tails rather than read whole.
-fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
+fn table_with(dir: &TempDir, build: Build) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     // Positions, so a phrase query is among the shapes compared.
@@ -96,12 +118,13 @@ fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
         .expect("options")
         .with_storage(storage)
         .with_bound_ordered_open_window(1)
-        // The merge under test, for every query the tiers can serve.
-        .with_tier_merge_gate(false);
-    if !tiers {
+        .with_tier_merge_gate(build.gate);
+    if !build.tiers {
         options = options.with_term_tier_entries_per_term(0);
+    } else if let Some(budget) = build.budget {
+        options = options.with_term_tier_entries_per_term(budget);
     }
-    if let Some(depth) = depth {
+    if let Some(depth) = build.depth {
         options = options.with_term_head_depth(depth);
     }
     let st = Supertable::create(options).expect("create");
@@ -111,7 +134,10 @@ fn table_with(dir: &TempDir, tiers: bool, depth: Option<usize>) -> Supertable {
             .map(|i| document(s * DOCS_PER_SUPERFILE + i))
             .collect();
         let col: ArrayRef = Arc::new(LargeStringArray::from(
-            docs.iter().map(String::as_str).collect::<Vec<_>>(),
+            docs.iter()
+                .enumerate()
+                .map(|(i, d)| (!build.nulls || i % 3 != 2).then_some(d.as_str()))
+                .collect::<Vec<_>>(),
         ));
         w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
             .expect("append");
@@ -158,8 +184,18 @@ fn queries() -> Vec<(String, BoolMode)> {
         "+quokka tensor",
         "\"the data the\"",
         "+alpha \"data the data\"",
+        "+the \"quokka tensor\"",
+        "\"the data\" +search",
+        "data \"data the\"",
+        "the the",
+        "+data data",
     ] {
         out.push((q.to_owned(), BoolMode::Or));
+    }
+    // Negations beside a required term, in both modes.
+    for q in ["+quokka -tensor", "+zebra -yak", "-the +quokka tensor"] {
+        out.push((q.to_owned(), BoolMode::Or));
+        out.push((q.to_owned(), BoolMode::And));
     }
     out
 }
@@ -258,6 +294,10 @@ fn a_rare_conjunction_opens_only_its_holders() {
     let st = table(&dir, true);
     let (hits, stats, holders) = run(&st, "quokka tensor", BoolMode::And, 10);
     assert!(!hits.is_empty(), "the planted pair matches");
+    assert!(stats.tier_bytes > 0, "the first ask reads the tiers");
+    let (again, resident, _) = run(&st, "quokka tensor", BoolMode::And, 10);
+    assert_eq!(again, hits);
+    assert_eq!(resident.tier_bytes, 0, "the second ask finds them resident");
     // Both terms are under the budget, so their tiers are complete and the
     // merge knows every document that carries both, with its score as the
     // kernel computes it: the index answers outright and nothing opens.
@@ -317,7 +357,14 @@ fn heads_cut_to_a_depth_answer_the_same_and_resolve_the_rare() {
     const DEPTH: usize = 64;
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
-    let with = table_with(&with_dir, true, Some(DEPTH));
+    let with = table_with(
+        &with_dir,
+        Build {
+            tiers: true,
+            depth: Some(DEPTH),
+            ..Build::default()
+        },
+    );
     let without = table(&without_dir, false);
     let (mut opened_with, mut opened_without) = (0u64, 0u64);
     for (query, mode) in queries() {
@@ -590,4 +637,158 @@ fn tmp_delete_probe2() {
     let sql = "SELECT body, score FROM bm25_search('body', 'the data search', 5, 'or')";
     eprintln!("PROBE after without sql: {:?}", rows_of(&without, sql));
     eprintln!("PROBE after with    sql: {:?}", rows_of(&with, sql));
+}
+
+/// With the gate on, the table learns whether to merge by trying both
+/// ways: every try answers the same, and both ways are tried.
+#[test]
+fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table_with(
+        &with_dir,
+        Build {
+            tiers: true,
+            gate: true,
+            ..Build::default()
+        },
+    );
+    let without = table(&without_dir, false);
+    for (query, mode) in [
+        ("the data", BoolMode::Or),
+        ("the data", BoolMode::And),
+        ("search index", BoolMode::And),
+        ("the data search", BoolMode::Or),
+        ("quokka tensor", BoolMode::And),
+    ] {
+        for k in [10usize, 100] {
+            let (expected, _, _) = run(&without, query, mode, k);
+            let (mut merged, mut plain) = (false, false);
+            for _ in 0..20 {
+                let (a, stats, _) = run(&with, query, mode, k);
+                assert_eq!(
+                    a, expected,
+                    "{query:?} {mode:?} k={k}: same answer every time"
+                );
+                if stats.tier_entries > 0 {
+                    merged = true;
+                } else {
+                    plain = true;
+                }
+            }
+            assert!(
+                merged && plain,
+                "{query:?} {mode:?} k={k}: both ways were tried"
+            );
+        }
+    }
+}
+
+/// Null bodies: the heads name rows, not the column's document ids, so a
+/// superfile the index answers for names the right rows.
+#[test]
+fn nulls_in_the_column_answer_the_same_and_still_resolve() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table_with(
+        &with_dir,
+        Build {
+            tiers: true,
+            nulls: true,
+            ..Build::default()
+        },
+    );
+    let without = table_with(
+        &without_dir,
+        Build {
+            tiers: false,
+            nulls: true,
+            ..Build::default()
+        },
+    );
+    for (query, mode) in queries() {
+        for k in [10usize, 100] {
+            let (a, _, _) = run(&with, &query, mode, k);
+            let (b, _, _) = run(&without, &query, mode, k);
+            assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer with nulls");
+        }
+    }
+    let (hits, stats, _) = run(&with, "quokka tensor", BoolMode::And, 10);
+    assert!(!hits.is_empty());
+    assert_eq!(
+        opened(&stats),
+        0,
+        "the rare conjunction is still answered from the index"
+    );
+}
+
+/// A cap on a term's entries cuts every superfile's head to the same
+/// shallower depth: the bounds hold through the raised tails and the
+/// answers do not change.
+#[test]
+fn a_per_term_budget_cuts_heads_and_answers_the_same() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table_with(
+        &with_dir,
+        Build {
+            tiers: true,
+            budget: Some(100),
+            ..Build::default()
+        },
+    );
+    let without = table(&without_dir, false);
+    let mut served = 0usize;
+    for (query, mode) in queries() {
+        for k in [10usize, 100] {
+            let (a, stats, _) = run(&with, &query, mode, k);
+            let (b, _, _) = run(&without, &query, mode, k);
+            assert_eq!(
+                a, b,
+                "{query:?} {mode:?} k={k}: same answer under the budget"
+            );
+            if stats.tier_entries > 0 {
+                served += 1;
+            }
+        }
+    }
+    assert!(served > 0, "the cut heads still serve queries");
+}
+
+/// The merge serves up to sixty-four distinct terms, a bit each; one more
+/// keeps the ceilings. Both answer as the table without tiers does.
+#[test]
+fn many_terms_are_served_up_to_the_mask_width() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    let mut words: Vec<String> = ["the", "data", "search", "index"]
+        .iter()
+        .map(|w| (*w).to_owned())
+        .collect();
+    words.extend((0..60).map(|i| format!("w{i:02}")));
+    let sixty_four = words.join(" ");
+    words.push("w60".to_owned());
+    let sixty_five = words.join(" ");
+    for (query, expect_tiers) in [(&sixty_four, true), (&sixty_five, false)] {
+        for k in [10usize, 100] {
+            let (a, stats, _) = run(&with, query, BoolMode::Or, k);
+            let (b, _, _) = run(&without, query, BoolMode::Or, k);
+            assert!(!b.is_empty());
+            assert_eq!(
+                a,
+                b,
+                "{} terms, k={k}: same answer",
+                query.split(' ').count()
+            );
+            assert_eq!(
+                stats.tier_entries > 0,
+                expect_tiers,
+                "{} terms, k={k}: read {} tier entries",
+                query.split(' ').count(),
+                stats.tier_entries
+            );
+        }
+    }
 }
