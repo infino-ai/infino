@@ -259,6 +259,16 @@ const LANE_GROUP: usize = 8;
 /// `start_bit` is the first lane's bit position; every lane's 8-byte load
 /// must lie inside `payload`.
 fn unpack_groups(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
+    #[cfg(target_arch = "x86_64")]
+    let (start_bit, out) =
+        if width <= SIMD_UNPACK_MAX_WIDTH && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 is present (checked above); see the function's notes
+            // for the bounds every load and store keeps to.
+            let done = unsafe { unpack_groups_avx2(payload, start_bit, width, out) };
+            (start_bit + done * usize::from(width), &mut out[done..])
+        } else {
+            (start_bit, out)
+        };
     macro_rules! dispatch {
         ($($w:literal)*) => {
             match width {
@@ -268,6 +278,75 @@ fn unpack_groups(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
         };
     }
     dispatch!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+/// Widest lane [`unpack_groups_avx2`] reads: a lane's bits, shifted by up to
+/// 7 within its first byte, fit the 32-bit load it is gathered into.
+#[cfg(target_arch = "x86_64")]
+const SIMD_UNPACK_MAX_WIDTH: u8 = 25;
+
+/// [`unpack_groups`] eight lanes per step: two 16-byte loads (lanes 0–3 and
+/// 4–7 each span at most 13 bytes at this width), one byte shuffle that
+/// gathers each lane's four bytes into its 32-bit slot, a per-lane shift and
+/// a mask. The run's bit phase fixes the shuffle and the shifts, so both are
+/// built once. Returns how many lanes it wrote (whole groups, from the
+/// front); it stops where a load would pass the payload's end and the
+/// scalar copy finishes the rest.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_groups_avx2(
+    payload: &[u8],
+    start_bit: usize,
+    width: u8,
+    out: &mut [u32],
+) -> usize {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=SIMD_UNPACK_MAX_WIDTH).contains(&width));
+    let w = usize::from(width);
+    let phase = start_bit % 8;
+    let offs: [usize; LANE_GROUP] = std::array::from_fn(|l| (phase + l * w) / 8);
+    let half = offs[4];
+    let mut shuffle = [0u8; 32];
+    let mut shifts = [0u32; LANE_GROUP];
+    for l in 0..LANE_GROUP {
+        let (slot, from) = match l < 4 {
+            true => (4 * l, offs[l]),
+            false => (16 + 4 * (l - 4), offs[l] - half),
+        };
+        for b in 0..4 {
+            shuffle[slot + b] = (from + b) as u8;
+        }
+        shifts[l] = ((phase + l * w) % 8) as u32;
+    }
+    let mut byte = start_bit / 8;
+    let mut done = 0usize;
+    // SAFETY, per obligation:
+    // - AVX2 intrinsics: reachable only through the dispatcher's
+    //   `is_x86_feature_detected!("avx2")` guard.
+    // - Loads: both 16-byte loads start at `byte` and `byte + half` and the
+    //   loop runs only while `byte + half + 16 <= payload.len()`, `half >= 0`.
+    //   Unaligned variants, so no alignment precondition.
+    // - Store: eight `u32`s at `out[done..done + 8]`, inside `out` while
+    //   `done + 8 <= out.len()`.
+    // - Shuffle indices are below 16 within each 128-bit half: a lane's
+    //   offset from its half's start is at most `(7 + 3·25) / 8 = 10`, plus 3.
+    unsafe {
+        let shuffle_v = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let shift_v = _mm256_loadu_si256(shifts.as_ptr().cast());
+        let mask_v = _mm256_set1_epi32(((1u32 << w) - 1) as i32);
+        let src = payload.as_ptr();
+        let dst = out.as_mut_ptr();
+        while done + LANE_GROUP <= out.len() && byte + half + 16 <= payload.len() {
+            let lo = _mm_loadu_si128(src.add(byte).cast());
+            let hi = _mm_loadu_si128(src.add(byte + half).cast());
+            let lanes = _mm256_shuffle_epi8(_mm256_set_m128i(hi, lo), shuffle_v);
+            let values = _mm256_and_si256(_mm256_srlv_epi32(lanes, shift_v), mask_v);
+            _mm256_storeu_si256(dst.add(done).cast(), values);
+            done += LANE_GROUP;
+            byte += w;
+        }
+    }
+    done
 }
 
 /// Unpack `out.len() / 8` groups of eight `W`-bit lanes starting at
