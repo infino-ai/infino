@@ -992,6 +992,24 @@ impl TermCursor {
                 }
                 let ids = &self.block_doc_ids[..self.block_n];
                 let mut p = 0usize;
+                // Candidates in this block about as dense as its postings: a
+                // branch-free merge (see `probe_tfs`). Sparse candidates keep
+                // the stepping loop, which runs long predictable stretches.
+                let r_end = r + docs[r..].partition_point(|&d| d <= block_last);
+                if (r_end - r) * BALANCED_PROBE_RATIO >= ids.len() {
+                    while r < r_end && p < ids.len() {
+                        let (d, x) = (docs[r], ids[p]);
+                        if d == x {
+                            docs[w] = d;
+                            w += 1;
+                            locs.push((b, p as u32));
+                            kept.push(r as u32);
+                        }
+                        r += usize::from(d <= x);
+                        p += usize::from(x <= d);
+                    }
+                    r = r_end;
+                }
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
                     while p < ids.len() && ids[p] < d {
