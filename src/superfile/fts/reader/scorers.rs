@@ -818,8 +818,8 @@ fn accumulate_step(
     c: &mut TermCursor,
     base: u32,
     window_end: u32,
-    scores: &mut [f32; OR_WINDOW as usize],
-    present: &mut [u64; OR_WINDOW_WORDS],
+    scores: &mut [f32],
+    present: &mut [u64],
     dl_norm_k1: &NormTable,
 ) {
     let d = c.current_doc_id();
@@ -2344,7 +2344,7 @@ impl FtsReader {
         // Per-window state, allocated once and reused across windows.
         // Cleared lazily during the drain (only touched slots), so reset
         // cost is proportional to matches, not to OR_WINDOW.
-        let mut scores: Box<[f32; OR_WINDOW as usize]> = Box::new([0.0; OR_WINDOW as usize]);
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
 
         loop {
@@ -2495,7 +2495,7 @@ impl FtsReader {
             }
             return Ok((drain_top_k_desc(heap), count));
         }
-        let mut scores: Box<[f32; OR_WINDOW as usize]> = Box::new([0.0; OR_WINDOW as usize]);
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
         loop {
             let mut min_doc = u32::MAX;
@@ -2671,7 +2671,7 @@ impl FtsReader {
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap = C::with_capacity(k, initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
-        let mut scores: Box<[f32; OR_WINDOW as usize]> = Box::new([0.0; OR_WINDOW as usize]);
+        let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
