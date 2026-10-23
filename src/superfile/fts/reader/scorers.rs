@@ -827,6 +827,12 @@ fn word_beats(slots: &[f32], threshold: f32) -> bool {
     hit.iter().fold(0, |a, &h| a | h) != 0
 }
 
+/// Four consecutive lanes of an eight-lane array, from `at`.
+#[inline(always)]
+fn lane_half<T: Copy>(lanes: &[T; 8], at: usize) -> [T; bm25::SCORE_SIMD_LANES] {
+    std::array::from_fn(|l| lanes[at + l])
+}
+
 /// Most optional terms the required-term walk takes; a wider list keeps
 /// the general must+should walk.
 const MAX_SHOULDS_LED: usize = 16;
@@ -2346,6 +2352,40 @@ impl FtsReader {
                         break;
                     }
                     let pos = c.pos;
+                    // Eight postings per SIMD call where the block and window allow,
+                    // then four, then one.
+                    if pos + 8 <= c.block_n {
+                        let dids: [u32; 8] = c.block_doc_ids[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: an 8-wide slice");
+                        if dids[7] < window_end {
+                            let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
+                                .try_into()
+                                .expect("invariant: an 8-wide slice");
+                            let contributions = bm25::score_one_term_x8(
+                                c.idf_weight,
+                                tfs,
+                                dids.map(|d| dl_norm_k1.get(d)),
+                            );
+                            let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                lo,
+                                lane_half(&contributions, 0),
+                            );
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                hi,
+                                lane_half(&contributions, 4),
+                            );
+                            c.advance_by(8);
+                            continue;
+                        }
+                    }
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
                         // Bind the 4-wide window as one subslice per array:
                         // the guard proves `pos + LANES <= block_n <= len`,
@@ -2559,6 +2599,40 @@ impl FtsReader {
                         break;
                     }
                     let pos = c.pos;
+                    // Eight postings per SIMD call where the block and window allow,
+                    // then four, then one.
+                    if pos + 8 <= c.block_n {
+                        let dids: [u32; 8] = c.block_doc_ids[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: an 8-wide slice");
+                        if dids[7] < window_end {
+                            let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
+                                .try_into()
+                                .expect("invariant: an 8-wide slice");
+                            let contributions = bm25::score_one_term_x8(
+                                c.idf_weight,
+                                tfs,
+                                dids.map(|d| dl_norm_k1.get(d)),
+                            );
+                            let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                lo,
+                                lane_half(&contributions, 0),
+                            );
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                hi,
+                                lane_half(&contributions, 4),
+                            );
+                            c.advance_by(8);
+                            continue;
+                        }
+                    }
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
                         let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
                         let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
@@ -3037,6 +3111,40 @@ impl FtsReader {
                         }
                     }
                     let pos = c.pos;
+                    // Eight postings per SIMD call where the block and window allow,
+                    // then four, then one.
+                    if pos + 8 <= c.block_n {
+                        let dids: [u32; 8] = c.block_doc_ids[pos..pos + 8]
+                            .try_into()
+                            .expect("invariant: an 8-wide slice");
+                        if dids[7] < window_end {
+                            let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
+                                .try_into()
+                                .expect("invariant: an 8-wide slice");
+                            let contributions = bm25::score_one_term_x8(
+                                c.idf_weight,
+                                tfs,
+                                dids.map(|d| dl_norm_k1.get(d)),
+                            );
+                            let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                lo,
+                                lane_half(&contributions, 0),
+                            );
+                            mark_four(
+                                &mut scores,
+                                &mut present,
+                                base,
+                                hi,
+                                lane_half(&contributions, 4),
+                            );
+                            c.advance_by(8);
+                            continue;
+                        }
+                    }
                     if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
                         // Bind the 4-wide window as one subslice per array:
                         // the guard proves `pos + LANES <= block_n <= len`,

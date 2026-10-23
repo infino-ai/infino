@@ -31,7 +31,7 @@
 //! non-negative because we use the +0.5 / +0.5 form ("BM25+1") which keeps
 //! the log argument ≥ 1.
 
-use wide::f32x4;
+use wide::{f32x4, f32x8};
 
 use crate::superfile::format;
 
@@ -274,6 +274,16 @@ pub(super) fn score_one_term_x4(
 ) -> [f32; SCORE_SIMD_LANES] {
     let tf_v = f32x4::from([tfs[0] as f32, tfs[1] as f32, tfs[2] as f32, tfs[3] as f32]);
     let scores = f32x4::splat(idf_weight) * tf_v / (tf_v + f32x4::from(dl_norm_k1));
+    scores.to_array()
+}
+
+/// [`score_one_term_x4`] over eight documents in one AVX-width operation:
+/// the same multiply, add and divide per lane, so each lane's result is
+/// bit-identical to the scalar [`score_with_dl_norm_k1`].
+#[inline(always)]
+pub(super) fn score_one_term_x8(idf_weight: f32, tfs: [u32; 8], dl_norm_k1: [f32; 8]) -> [f32; 8] {
+    let tf_v = f32x8::from(tfs.map(|t| t as f32));
+    let scores = f32x8::splat(idf_weight) * tf_v / (tf_v + f32x8::from(dl_norm_k1));
     scores.to_array()
 }
 
