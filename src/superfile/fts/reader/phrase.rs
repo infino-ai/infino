@@ -10,7 +10,7 @@
 use bytes::Bytes;
 
 use super::{
-    cursor::{TermCursor, TermMeta},
+    cursor::{CursorUse, TermCursor, TermMeta},
     metadata::NormTable,
 };
 use crate::superfile::{
@@ -151,12 +151,15 @@ impl PhraseMember {
 /// (`positions_of`, which fills its `pos_scratch`) once some start survives
 /// every rarer member, so on the many docs a rare member rejects the common
 /// members' runs are never decoded. Returns the surviving starts: the
-/// phrase's tf at the doc.
+/// phrase's tf at the doc. With `presence_only` (a phrase matched but never
+/// scored) the last member stops at the first start it confirms and the
+/// result is 0 or 1: whether the phrase occurs, not how often.
 fn verify_members(
     members: &mut [PhraseMember],
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
+    presence_only: bool,
     mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
@@ -168,13 +171,20 @@ fn verify_members(
             .iter()
             .filter_map(|&p| p.checked_sub(offsets[anchor])),
     );
-    for &j in &order[1..] {
+    for (stage, &j) in order.iter().enumerate().skip(1) {
         if starts.is_empty() {
             break;
         }
         positions_of(&mut members[j], j)?;
         let plist = &members[j].pos_scratch;
         let off = offsets[j];
+        if presence_only && stage + 1 == order.len() {
+            let found = starts.iter().any(|&s| {
+                s.checked_add(off)
+                    .is_some_and(|want| plist.binary_search(&want).is_ok())
+            });
+            return Ok(u32::from(found));
+        }
         starts.retain(|&s| {
             s.checked_add(off)
                 .is_some_and(|want| plist.binary_search(&want).is_ok())
@@ -552,11 +562,13 @@ impl PhraseCursor {
     /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
         let locs = &self.cand_locs;
+        let presence = self.presence_only();
         self.current_tf = verify_members(
             &mut self.members,
             &self.align_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            presence,
             |m, j| {
                 let (b, p) = locs[j][c];
                 m.located_positions(b as usize, p as usize)
@@ -579,17 +591,25 @@ impl PhraseCursor {
         // and `decode_current_positions` needs the whole block (its pair
         // index and tf run). Only a plain walk leaves the block decoded,
         // so these calls are not optional.
+        let presence = self.presence_only();
         self.current_tf = verify_members(
             &mut self.members,
             &self.align_order,
             &self.position_offsets,
             &mut self.verify_scratch,
+            presence,
             |m, _| {
                 m.cursor.materialize_at(aligned);
                 m.decode_current_positions()
             },
         )?;
         Ok(self.current_tf)
+    }
+
+    /// Whether the phrase is matched but never scored, so a doc needs one
+    /// verified occurrence rather than its count.
+    fn presence_only(&self) -> bool {
+        self.members[0].cursor.purpose != CursorUse::Score
     }
 
     /// Score the phrase at its current doc with the caller-supplied
