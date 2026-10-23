@@ -1044,6 +1044,12 @@ impl TermCursor {
                 let mut p = 0usize;
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
+                    // Far behind the candidate (a member much denser than the
+                    // rarest one): bisect the rest of the block, as the probe
+                    // does, instead of stepping through it.
+                    if p + PROBE_GALLOP < ids.len() && ids[p + PROBE_GALLOP] < d {
+                        p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < d);
+                    }
                     while p < ids.len() && ids[p] < d {
                         p += 1;
                     }
