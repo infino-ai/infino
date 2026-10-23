@@ -16073,6 +16073,115 @@ supertable:
         );
     }
 
+    /// The contribution a merge gathers as it writes the merged superfile
+    /// is the one derived from that superfile's bytes, byte for byte —
+    /// deleted rows dropped and the survivors renumbered on both sides.
+    #[test]
+    fn a_merge_gathered_contribution_is_the_reader_derived_one() {
+        const HEAD_DEPTH: usize = 64;
+        let mut fts = FtsConfig::new("title");
+        fts.positions = true;
+        let options =
+            SupertableOptions::new(schema_id_title(), vec![fts], vec![]).expect("valid options");
+        let st = Supertable::create(options).expect("create");
+        let manifest = st.reader().expect("reader").manifest().clone();
+        let part = |lo: usize, n: usize| -> Arc<SuperfileReader> {
+            let titles: Vec<String> = (lo..lo + n)
+                .map(|i| {
+                    let mut words = vec!["alpha"; 1 + i % 5];
+                    words.extend(std::iter::repeat_n("filler", i % 7));
+                    if i % 30 == 0 {
+                        words.extend(["beta", "beta"]);
+                    }
+                    if i % 97 == 17 {
+                        words.push("gamma");
+                    }
+                    words.join(" ")
+                })
+                .collect();
+            let ids = Decimal128Array::from_iter_values(
+                (lo as i128 + 1..=(lo + n) as i128).collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(38, 0)
+            .expect("ids");
+            let batch = RecordBatch::try_new(
+                manifest.scalar_schema(),
+                vec![
+                    Arc::new(ids),
+                    Arc::new(LargeStringArray::from(
+                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("batch");
+            let mut builder =
+                SuperfileBuilder::new(builder_options_of(&manifest)).expect("builder");
+            builder.add_batch(&batch, &[]).expect("add_batch");
+            let bytes = Bytes::from(builder.finish().expect("finish"));
+            Arc::new(
+                SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
+                    .expect("open"),
+            )
+        };
+        let readers = [part(0, 120), part(120, 90), part(210, 150)];
+        // The middle part loses rows to the merge, among them a beta
+        // carrier (row 30) and the gamma carrier (row 17).
+        let deleted: roaring::RoaringBitmap = [3u32, 17, 30, 71].into_iter().collect();
+        let inputs = crate::superfile::builder::same_shape_inputs(&[
+            (Arc::clone(&readers[0]), None),
+            (Arc::clone(&readers[1]), Some(Arc::new(deleted))),
+            (Arc::clone(&readers[2]), None),
+        ]);
+        let columns = HashMap::from([(
+            "title".to_owned(),
+            manifest.field_id("title").expect("title id"),
+        )]);
+        let sink = term_index::HeadSink::new(columns).expect("sink");
+        let mut merged = Vec::new();
+        SuperfileBuilder::build_from_readers_fts_merge_with_heads(
+            &inputs,
+            builder_options_of(&manifest),
+            &mut merged,
+            Some((Box::new(sink.clone()), HEAD_DEPTH)),
+        )
+        .expect("merge");
+        let superfile_id = Uuid::new_v4();
+        let gathered = sink
+            .into_contribution(superfile_id, 1)
+            .expect("gathered contribution")
+            .expect("the merge drove the sink to its end");
+
+        let reader = SuperfileReader::open_with(
+            Bytes::from(merged),
+            manifest.options.superfile_open_options(),
+        )
+        .expect("open merged");
+        assert_eq!(reader.n_docs(), 120 + 90 - 4 + 150, "the survivors");
+        let mut writer =
+            term_index::ContributionWriter::create_in_scratch(superfile_id, 1).expect("writer");
+        let policy = term_index::BuildPolicy {
+            head_depth_per_superfile: HEAD_DEPTH,
+            ..term_index::BuildPolicy::default()
+        };
+        bridge_sync_to_async(write_superfile_terms(
+            &reader,
+            &manifest.options.legacy_names(),
+            &mut writer,
+            &policy,
+        ))
+        .expect("derived facts");
+        let derived = writer.finish().expect("derived contribution");
+        let a = std::fs::read(&gathered.path).expect("gathered bytes");
+        let b = std::fs::read(&derived.path).expect("derived bytes");
+        assert!(!a.is_empty(), "the corpus has terms");
+        let difference = term_index::first_contribution_difference(&gathered.path, &derived.path)
+            .expect("both readable");
+        assert!(
+            a == b,
+            "the merge-gathered contribution is the derived one, byte for byte; first difference: {difference:?}"
+        );
+    }
+
     // ---- build_subsection_offsets on real superfile bytes ------------
 
     #[test]
