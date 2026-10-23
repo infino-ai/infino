@@ -515,6 +515,56 @@ const EAGER_RETRY_BLOCKS: u8 = 8;
 /// merges a packed block branch-free rather than stepping through it.
 const BALANCED_PROBE_RATIO: usize = 4;
 
+/// Doc span, in 64-doc words, the bitmap probe covers at most: one block's
+/// postings of a term dense enough to be probed this way span far less.
+const PROBE_BITMAP_WORDS: usize = 128;
+
+/// Answer every target of a balanced probe at once: mark `ids` (a block's
+/// postings, ascending) in a bitmap over their span, then give each target in
+/// `targets` (ascending) its tf from `tfs` when its bit is set, else 0. The
+/// posting's index is its rank among the marked bits (prefix popcounts per
+/// word), so no target waits on another, unlike a merge where every step
+/// depends on the last comparison. Returns `false`, writing nothing, when the
+/// span is too wide for the bitmap.
+fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
+    let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
+        return false;
+    };
+    let base = first & !63;
+    let words = ((last - base) / 64) as usize + 1;
+    if words > PROBE_BITMAP_WORDS {
+        return false;
+    }
+    let mut bits = [0u64; PROBE_BITMAP_WORDS];
+    for &d in ids {
+        let local = d - base;
+        bits[(local >> 6) as usize] |= 1u64 << (local & 63);
+    }
+    let mut prefix = [0u32; PROBE_BITMAP_WORDS];
+    let mut acc = 0u32;
+    for (slot, w) in prefix.iter_mut().zip(&bits).take(words) {
+        *slot = acc;
+        acc += w.count_ones();
+    }
+    for (o, &t) in out.iter_mut().zip(targets) {
+        *o = match t.checked_sub(base).filter(|&l| (l as usize) < words * 64) {
+            Some(local) => {
+                let (wi, bit) = ((local >> 6) as usize, local & 63);
+                let word = bits[wi];
+                match (word >> bit) & 1 {
+                    1 => {
+                        let rank = prefix[wi] + (word & ((1u64 << bit) - 1)).count_ones();
+                        tfs[rank as usize]
+                    }
+                    _ => 0,
+                }
+            }
+            None => 0,
+        };
+    }
+    true
+}
+
 /// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
 /// packed block rather than stepping: past this many docs behind the
 /// target, a bisection's ~7 steps beat the walk.
@@ -1226,6 +1276,18 @@ impl TermCursor {
             let k_end = k + docs[k..].partition_point(|&d| d <= last);
             if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
                 let tfs = &self.block_tfs[..n];
+                if p < n
+                    && probe_by_bitmap(&ids[p..], &tfs[p..], &docs[k..k_end], &mut out[k..k_end])
+                {
+                    // A later probe may bring more targets in this block: leave
+                    // the cursor at the first posting not below the last target,
+                    // as the merge would.
+                    let last_target = docs[k_end - 1];
+                    p += ids[p..].partition_point(|&x| x < last_target);
+                    k = k_end;
+                    self.pos = p.min(n.saturating_sub(1));
+                    continue;
+                }
                 while k < k_end && p < n {
                     let (t, x) = (docs[k], ids[p]);
                     out[k] = if t == x { tfs[p] } else { 0 };
@@ -1766,6 +1828,39 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_by_bitmap_answers_as_a_lookup_does() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for case in 0..400 {
+            let start = rng(10_000) as u32;
+            let mut ids: Vec<u32> = Vec::new();
+            let mut d = start;
+            for _ in 0..1 + rng(128) {
+                d += 1 + rng(case % 7 + 1) as u32;
+                ids.push(d);
+            }
+            let tfs: Vec<u32> = (0..ids.len()).map(|_| 1 + rng(9) as u32).collect();
+            let mut targets: Vec<u32> = (0..1 + rng(128))
+                .map(|_| start + rng(u64::from(d - start) + 64) as u32)
+                .collect();
+            targets.sort_unstable();
+            targets.dedup();
+            let mut out = vec![u32::MAX; targets.len()];
+            if !super::probe_by_bitmap(&ids, &tfs, &targets, &mut out) {
+                continue;
+            }
+            for (t, o) in targets.iter().zip(&out) {
+                let want = ids.binary_search(t).map_or(0, |i| tfs[i]);
+                assert_eq!(*o, want, "case {case} target {t}");
+            }
+        }
+    }
 
     use bytes::Bytes;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
