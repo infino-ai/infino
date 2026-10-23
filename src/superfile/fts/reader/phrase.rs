@@ -51,6 +51,10 @@ pub(super) struct PhraseMember {
     /// across blocks, so a block crossing allocates nothing.
     pub(super) group_index: GroupIndex,
     pub(super) group_block: usize,
+    /// Block `tfs_block`'s tfs, decoded without its doc ids, for reading
+    /// candidates by located pair ([`Self::located_positions`]).
+    tfs: Vec<u32>,
+    tfs_block: usize,
 }
 
 /// Sentinel for [`PhraseMember::group_block`]: no block located.
@@ -111,6 +115,69 @@ impl PhraseMember {
     }
 }
 
+impl PhraseMember {
+    /// Decode block `block`'s tfs into the member's cache, unless they are
+    /// the ones it holds.
+    fn ensure_tfs(&mut self, block: usize) {
+        if self.tfs_block != block {
+            self.cursor.block_tfs_into(block, &mut self.tfs);
+            self.tfs_block = block;
+        }
+    }
+
+    /// The member's tf in its `pair`-th posting of block `block`, a location
+    /// from [`TermCursor::retain_contained_located`].
+    fn located_tf(&mut self, block: usize, pair: usize) -> u32 {
+        if self.inline_position.is_some() {
+            return 1;
+        }
+        self.ensure_tfs(block);
+        self.tfs[pair]
+    }
+
+    /// The member's positions in its `pair`-th posting of block `block`,
+    /// decoded into `pos_scratch`. Reads the block's tfs and position group
+    /// once per block and the posting's run alone: the doc ids are never
+    /// expanded, and no cursor is walked to the doc.
+    fn located_positions(&mut self, block: usize, pair: usize) -> Result<(), FtsError> {
+        self.pos_scratch.clear();
+        if let Some(p) = self.inline_position {
+            self.pos_scratch.push(p);
+            return Ok(());
+        }
+        self.ensure_tfs(block);
+        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
+        if self.group_block != block {
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            self.group_index
+                .locate(&self.positions, &mut at, &self.tfs)
+                .ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(
+                        "position group truncated or undecodable".into(),
+                    ))
+                })?;
+            self.group_block = block;
+        }
+        self.group_index
+            .run_positions(&self.positions, pair, self.tfs[pair], &mut self.pos_scratch)
+            .ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "position run truncated or overflowing".into(),
+                ))
+            })?;
+        Ok(())
+    }
+}
+
+/// Compact `locs` to the entries at `kept` (ascending indices into it).
+fn compact_locs(locs: &mut Vec<(u32, u32)>, kept: &[u32]) {
+    for (i, &k) in kept.iter().enumerate() {
+        locs[i] = locs[k as usize];
+    }
+    locs.truncate(kept.len());
+}
+
 /// Doc-at-a-time cursor over an exact phrase: the members'
 /// intersection drives doc alignment, and a doc matches only when the
 /// members' positions verify the phrase's spacing (member `i` at
@@ -166,6 +233,11 @@ pub(super) struct PhraseCursor {
     /// by [`Self::seek_match`].
     cands: Vec<u32>,
     cand_next: usize,
+    /// Per member (query order), each candidate's (block, pair) location in
+    /// that member's postings, in step with `cands`.
+    cand_locs: Vec<Vec<(u32, u32)>>,
+    /// Scratch: which candidates a member's filter kept.
+    kept: Vec<u32>,
     /// Where the next block refill starts: one past the last block
     /// batched. `None` once the rarest member's last block is batched.
     refill_from: Option<u32>,
@@ -214,11 +286,14 @@ impl PhraseCursor {
                     pos_scratch: Vec::new(),
                     group_index: GroupIndex::default(),
                     group_block: NO_BLOCK_CACHED,
+                    tfs: Vec::new(),
+                    tfs_block: NO_BLOCK_CACHED,
                 }
             })
             .collect();
         // Rarest-first probe order for alignment: fewest posting blocks
         // (shortest list) first. Query order is preserved in `members`.
+        let n_members = members.len();
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
@@ -236,6 +311,8 @@ impl PhraseCursor {
             verify_scratch: Vec::new(),
             cands: Vec::new(),
             cand_next: 0,
+            cand_locs: vec![Vec::new(); n_members],
+            kept: Vec::new(),
             refill_from: Some(0),
         };
         cursor.seek_match_unranked(0)?;
@@ -369,28 +446,23 @@ impl PhraseCursor {
         let driver = self.align_order[0];
         loop {
             while self.cand_next < self.cands.len() {
-                let s = self.cands[self.cand_next];
+                let c = self.cand_next;
+                let s = self.cands[c];
                 self.cand_next += 1;
-                // Every member holds `s`: move each walk cursor's block to it
-                // without a decode (the verification materializes the block
-                // it lands in, and a skip would publish a dense block lazily
-                // only to expand it right after).
-                for &mi in &self.align_order {
-                    self.members[mi].cursor.seek_block(s);
-                }
+                // Every member holds `s` at a known (block, pair): its tf and
+                // positions are read there, with no cursor walked to it.
                 if let Some(norm) = bar_norm {
-                    let min_tf = self
-                        .members
-                        .iter_mut()
-                        .map(|m| m.cursor.tf_at_contained(s))
-                        .min()
-                        .expect("members >= 2");
+                    let mut min_tf = u32::MAX;
+                    for (m, locs) in self.members.iter_mut().zip(&self.cand_locs) {
+                        let (b, p) = locs[c];
+                        min_tf = min_tf.min(m.located_tf(b as usize, p as usize));
+                    }
                     let ub = bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, norm.get(s));
                     if ub < bar {
                         continue;
                     }
                 }
-                let tf = self.verify_at_aligned(s)?;
+                let tf = self.verify_located(c)?;
                 if tf > 0 {
                     self.current_doc = s;
                     self.current_tf = tf;
@@ -434,14 +506,72 @@ impl PhraseCursor {
             self.cands
                 .extend_from_slice(&d.block_doc_ids[d.pos..d.block_n]);
             self.cand_next = 0;
+            // The driver's candidates sit at their own pair indices in its
+            // decoded block; each other member's filter records where it
+            // holds the survivors, and the earlier members' locations are
+            // compacted to the same survivors.
+            let (b, pos0) = (d.current_block as u32, d.pos as u32);
+            for locs in &mut self.cand_locs {
+                locs.clear();
+            }
+            self.cand_locs[driver].extend((0..self.cands.len() as u32).map(|i| (b, pos0 + i)));
             for oi in 1..self.align_order.len() {
                 if self.cands.is_empty() {
                     break;
                 }
                 let mi = self.align_order[oi];
-                self.members[mi].probe.retain_contained(&mut self.cands);
+                let mut locs = std::mem::take(&mut self.cand_locs[mi]);
+                self.members[mi].probe.retain_contained_located(
+                    &mut self.cands,
+                    &mut locs,
+                    &mut self.kept,
+                );
+                self.cand_locs[mi] = locs;
+                for &pj in &self.align_order[..oi] {
+                    compact_locs(&mut self.cand_locs[pj], &self.kept);
+                }
             }
         }
+    }
+
+    /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
+    /// reading each member's positions at its recorded location rather than
+    /// through a walk cursor. Same staged, rarest-first verification.
+    fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
+        let anchor = self.align_order[0];
+        let anchor_off = self.position_offsets[anchor];
+        let (b, p) = self.cand_locs[anchor][c];
+        self.members[anchor].located_positions(b as usize, p as usize)?;
+        self.verify_scratch.clear();
+        for &pa in &self.members[anchor].pos_scratch {
+            if let Some(start) = pa.checked_sub(anchor_off) {
+                self.verify_scratch.push(start);
+            }
+        }
+        for oi in 1..self.align_order.len() {
+            if self.verify_scratch.is_empty() {
+                break;
+            }
+            let j = self.align_order[oi];
+            let (b, p) = self.cand_locs[j][c];
+            self.members[j].located_positions(b as usize, p as usize)?;
+            let plist = &self.members[j].pos_scratch;
+            let off = self.position_offsets[j];
+            let mut w = 0usize;
+            for r in 0..self.verify_scratch.len() {
+                let start = self.verify_scratch[r];
+                let keep = start
+                    .checked_add(off)
+                    .is_some_and(|want| plist.binary_search(&want).is_ok());
+                if keep {
+                    self.verify_scratch[w] = start;
+                    w += 1;
+                }
+            }
+            self.verify_scratch.truncate(w);
+        }
+        self.current_tf = self.verify_scratch.len() as u32;
+        Ok(self.current_tf)
     }
 
     /// Count the phrase's anchors at the members' aligned doc: the

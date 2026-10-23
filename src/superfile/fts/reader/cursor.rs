@@ -899,13 +899,27 @@ impl TermCursor {
     }
 
     /// Keep, in place, the docs of the ascending list `docs` that this term
-    /// contains. The block-at-a-time form of [`Self::contains`]: the block
-    /// cursor advances forward once per block, a bitset block is bit-tested
-    /// with its header parsed once, and a packed block is decoded once and
-    /// merged against the list. Like `contains` it moves `current_block`,
-    /// so a cursor filtered this way must not also be iterated; the
-    /// callers keep a separate cursor for the walk.
-    pub(super) fn retain_contained(&mut self, docs: &mut Vec<u32>) {
+    /// contains, and say where each kept doc sits in this term's postings:
+    /// `locs` receives its (block, pair index) and `kept` its index in the
+    /// list as it was passed, both in step with the kept docs. The pair index
+    /// is the doc's position among its block's postings: the merge position
+    /// in a packed block, the popcount rank in a bitset block, the offset
+    /// from the origin in a run block. With it a caller reads the doc's tf
+    /// and positions without walking a second cursor to the doc.
+    ///
+    /// The block-at-a-time form of [`Self::contains`]: the block cursor
+    /// advances forward once per block, a bitset block is bit-tested with
+    /// its header parsed once, and a packed block is decoded once and merged
+    /// against the list. Like `contains` it moves `current_block`, so a
+    /// cursor filtered this way must not also be iterated.
+    pub(super) fn retain_contained_located(
+        &mut self,
+        docs: &mut Vec<u32>,
+        locs: &mut Vec<(u32, u32)>,
+        kept: &mut Vec<u32>,
+    ) {
+        locs.clear();
+        kept.clear();
         let n = docs.len();
         let mut w = 0usize;
         let mut r = 0usize;
@@ -920,6 +934,8 @@ impl TermCursor {
                 if p < ids.len() && ids[p] == d {
                     docs[w] = d;
                     w += 1;
+                    locs.push((0, p as u32));
+                    kept.push(r as u32);
                 }
                 r += 1;
             }
@@ -936,36 +952,35 @@ impl TermCursor {
             if self.current_block >= self.blocks.len() {
                 break;
             }
+            let b = self.current_block as u32;
             let block = self.blocks[self.current_block];
             let block_last = block.last_doc_id;
             let hdr = self.current_header();
             if hdr.encoding == ENCODING_RUN {
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    r += 1;
                     if d >= hdr.base {
                         docs[w] = d;
                         w += 1;
+                        locs.push((b, d - hdr.base));
+                        kept.push(r as u32);
                     }
+                    r += 1;
                 }
             } else if hdr.encoding == ENCODING_BITSET {
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-                let words = &raw[hdr.payload()..raw.len() - hdr.tfs_size()];
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    r += 1;
-                    let Some(bit) = d.checked_sub(hdr.base) else {
-                        continue;
-                    };
-                    let wi = (bit as usize / 64) * 8;
-                    if wi + 8 > words.len() {
-                        continue;
-                    }
-                    let word = u64::from_le_bytes(words[wi..wi + 8].try_into().expect("8 bytes"));
-                    if (word >> (bit % 64)) & 1 == 1 {
+                    if let Some((bit, word, bitset_end)) = Self::bitset_word(raw, &hdr, d)
+                        && (word >> (bit % 64)) & 1 == 1
+                    {
+                        let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
                         docs[w] = d;
                         w += 1;
+                        locs.push((b, rank));
+                        kept.push(r as u32);
                     }
+                    r += 1;
                 }
             } else {
                 if self.decoded_block != self.current_block {
@@ -975,19 +990,39 @@ impl TermCursor {
                 let mut p = 0usize;
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    r += 1;
                     while p < ids.len() && ids[p] < d {
                         p += 1;
                     }
                     if p < ids.len() && ids[p] == d {
                         docs[w] = d;
                         w += 1;
+                        locs.push((b, p as u32));
+                        kept.push(r as u32);
                     }
+                    r += 1;
                 }
                 self.pos = p.min(ids.len().saturating_sub(1));
             }
         }
         docs.truncate(w);
+    }
+
+    /// Block `b`'s tfs, decoded into `out` (resized to the block's count)
+    /// without expanding its doc ids. A pre-decoded cursor's single block is
+    /// its buffer.
+    pub(super) fn block_tfs_into(&self, b: usize, out: &mut Vec<u32>) {
+        if self.predecoded {
+            out.clear();
+            out.extend_from_slice(&self.block_tfs[..self.block_n]);
+            return;
+        }
+        let block = self.blocks[b];
+        let hdr = self.block_header(b);
+        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
+        out.clear();
+        out.resize(BLOCK_LEN, 0);
+        decode_block_tfs(raw, &hdr, out);
+        out.truncate(hdr.count());
     }
 
     /// Move the block cursor to the block that holds `doc`, without a
