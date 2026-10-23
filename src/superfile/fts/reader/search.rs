@@ -896,8 +896,9 @@ impl FtsReader {
     }
 
     /// [`Self::run_prepared`] for clauses prepared with
-    /// `ClauseLists::exact_count`: scores every match and returns the
-    /// top-k with the exact match count.
+    /// `ClauseLists::exact_count`: the top-k with the exact match count.
+    /// A union with nothing to exclude counts and ranks in two passes;
+    /// every other shape scores every match.
     ///
     /// The top-k is the ranked search's up to float summation order: the
     /// exhaustive walks add a doc's term scores in a different order than
@@ -934,6 +935,22 @@ impl FtsReader {
                 k,
                 filter.as_mut(),
             )?,
+            // With nothing to exclude, a union's count is a bitmap walk that
+            // never scores, and its top-k is the pruned ranked search: two
+            // passes over the postings read less than one that scores every
+            // match, as most of a union's matches never reach the top-k.
+            PreparedClauses::Or {
+                column_id,
+                cursors,
+                filter: None,
+                k,
+                floor_eff,
+                ..
+            } => {
+                let count = or_count_unranked(cursors.clone());
+                let hits = self.dispatch_or_algo(column_id, cursors, k, None, floor_eff)?;
+                (hits, count)
+            }
             PreparedClauses::Or {
                 column_id,
                 cursors,
