@@ -159,6 +159,49 @@ impl ColumnLengthStats {
     }
 }
 
+/// Term frequencies a [`ScoreTable`] holds scores for, from 1.
+pub(super) const SCORE_TABLE_TFS: usize = 4;
+
+/// One term's BM25 contribution for every (tf, length bucket) pair with tf in
+/// `1..=SCORE_TABLE_TFS`, computed once per query with the scorer's own
+/// formula, so each entry is bit-identical to computing it. A posting is then
+/// scored by one load indexed by its tf and its doc's length byte, instead of
+/// the bucket's decode followed by a divide; a larger tf falls back to the
+/// formula.
+pub(super) struct ScoreTable {
+    idf_weight: f32,
+    scores: Box<[f32; SCORE_TABLE_TFS * 256]>,
+}
+
+impl ScoreTable {
+    pub(super) fn new(idf_weight: f32, norms: &NormTable) -> Self {
+        let mut scores = Box::new([0.0f32; SCORE_TABLE_TFS * 256]);
+        for (i, slot) in scores.iter_mut().enumerate() {
+            let (tf, bucket) = ((i / 256 + 1) as u32, (i % 256) as u8);
+            *slot = crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                idf_weight,
+                tf,
+                norms.norm_of(bucket),
+            );
+        }
+        Self { idf_weight, scores }
+    }
+
+    /// The term's score at `doc` with frequency `tf`.
+    #[inline(always)]
+    pub(super) fn score(&self, tf: u32, doc: u32, norms: &NormTable) -> f32 {
+        let bucket = norms.bucket(doc);
+        match (tf as usize).wrapping_sub(1) {
+            t if t < SCORE_TABLE_TFS => self.scores[t * 256 + bucket as usize],
+            _ => crate::superfile::fts::bm25::score_with_dl_norm_k1(
+                self.idf_weight,
+                tf,
+                norms.norm_of(bucket),
+            ),
+        }
+    }
+}
+
 impl NormTable {
     /// Build from a column's per-doc lengths, returning the table
     /// alongside the totals the pass produced.
@@ -290,6 +333,18 @@ impl NormTable {
     #[inline(always)]
     pub(super) fn get(&self, doc: u32) -> f32 {
         self.lut[self.bytes[doc as usize] as usize]
+    }
+
+    /// A doc's length bucket: the byte [`Self::get`] decodes.
+    #[inline(always)]
+    pub(super) fn bucket(&self, doc: u32) -> u8 {
+        self.bytes[doc as usize]
+    }
+
+    /// `dl_norm_k1` for a length bucket.
+    #[inline(always)]
+    pub(super) fn norm_of(&self, bucket: u8) -> f32 {
+        self.lut[bucket as usize]
     }
 
     /// The buckets this table scores by. Test-only: the query path indexes
@@ -848,6 +903,21 @@ impl OpenOptions {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_score_table_matches_the_formula_bit_for_bit() {
+        let lengths = (0..2000u32).map(|i| 1 + (i * 37) % 900);
+        let (norms, _) = NormTable::new(lengths, 2000, bm25::Bm25Params::default(), 120.0);
+        for idf in [0.3f32, 1.7, 6.25] {
+            let table = ScoreTable::new(idf, &norms);
+            for doc in 0..2000u32 {
+                for tf in 1..=10u32 {
+                    let want = bm25::score_with_dl_norm_k1(idf, tf, norms.get(doc));
+                    assert_eq!(table.score(tf, doc, &norms).to_bits(), want.to_bits());
+                }
+            }
+        }
+    }
+
     use bytes::Bytes;
 
     /// The two boundary rules the analysis fields live by, asserted on
