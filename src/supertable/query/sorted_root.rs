@@ -26,26 +26,28 @@
 //! would also restore the order, but only by paying for an exchange and a
 //! merge to parallelize what is typically a cast.
 //!
-//! [`OrderUnderScalarSubquery`] keeps the sort that DataFusion 54 plans away
-//! for a query with an uncorrelated scalar subquery, such as
-//! `WHERE v > (SELECT avg(v) FROM t) ORDER BY g`. Such a query is planned under
-//! a `ScalarSubqueryExec` root whose first child is the query and whose other
-//! children are the subqueries it runs first:
+//! A query with an uncorrelated scalar subquery, such as
+//! `WHERE v > (SELECT avg(v) FROM t) ORDER BY g`, is planned under a
+//! `ScalarSubqueryExec` root whose first child is the query and whose other
+//! children are the subqueries it runs first. Both walks down from the root
+//! must pass through that first child:
 //!
 //! ```text
 //!   ScalarSubqueryExec
-//!   ├── ProjectionExec: CAST(g AS LargeUtf8)   <- the query: rows come from here
-//!   │   └── SortPreservingMergeExec: g ASC     <- planned away without the rule
-//!   │       └── ...
-//!   └── AggregateExec: avg(v)                  <- the subquery: one value
+//!   ├── ProjectionExec: CAST(g AS LargeUtf8)     <- the query: rows come from here
+//!   │   └── RepartitionExec: RoundRobinBatch(8)  <- KeepSortedRoot removes this
+//!   │       └── SortPreservingMergeExec: g ASC   <- OrderUnderScalarSubquery keeps this
+//!   │           └── ...
+//!   └── AggregateExec: avg(v)                    <- the subquery: one value
 //! ```
 //!
-//! DataFusion's `OutputRequirements` rule looks for the `ORDER BY` by walking
-//! single-child operators down from the root, so it stops at this root and
-//! records none. The sort then looks unneeded under the round-robin
-//! repartition `EnforceDistribution` adds for the cast, and is removed: the
-//! rows come back unsorted with no error. With the `ORDER BY` recorded, no
-//! repartition is added and the root stays one sorted partition.
+//! - DataFusion's `OutputRequirements` rule looks for the `ORDER BY` by walking
+//!   single-child operators down from the root, so on DataFusion 54 it stops
+//!   at this root and records none, and the sort is planned away.
+//!   [`OrderUnderScalarSubquery`] runs that rule on the first child instead.
+//! - With the sort kept, `EnforceDistribution` still puts the round-robin
+//!   repartition between it and the cast, as it does without a subquery, so
+//!   [`KeepSortedRoot`] steps into the first child to remove it.
 
 use std::sync::Arc;
 
@@ -104,6 +106,13 @@ fn unsplit_sorted_stream(
     {
         return Ok(Some(Arc::clone(repartition.input())));
     }
+    // A scalar subquery's root: the rows come from its first child.
+    if let Some(subquery) = plan.downcast_ref::<ScalarSubqueryExec>() {
+        return match unsplit_sorted_stream(subquery.input())? {
+            Some(input) => Ok(Some(with_query_input(plan, input)?)),
+            None => Ok(None),
+        };
+    }
     // Past an operator that reorders rows, or one with several inputs, the
     // root's order no longer comes from this stream.
     let [child] = plan.children()[..] else {
@@ -140,10 +149,7 @@ impl PhysicalOptimizerRule for OrderUnderScalarSubquery {
         };
         let input =
             OutputRequirements::new_add_mode().optimize(Arc::clone(subquery.input()), config)?;
-        // The first child is the query; the subqueries stay as they are.
-        let mut children: Vec<_> = plan.children().into_iter().cloned().collect();
-        children[0] = input;
-        Arc::clone(&plan).with_new_children(children)
+        with_query_input(&plan, input)
     }
 
     fn name(&self) -> &str {
@@ -153,4 +159,15 @@ impl PhysicalOptimizerRule for OrderUnderScalarSubquery {
     fn schema_check(&self) -> bool {
         true
     }
+}
+
+/// `plan`, a `ScalarSubqueryExec`, with its first child (the query) replaced
+/// by `input` and its subqueries unchanged.
+fn with_query_input(
+    plan: &Arc<dyn ExecutionPlan>,
+    input: Arc<dyn ExecutionPlan>,
+) -> DfResult<Arc<dyn ExecutionPlan>> {
+    let mut children: Vec<_> = plan.children().into_iter().cloned().collect();
+    children[0] = input;
+    Arc::clone(plan).with_new_children(children)
 }

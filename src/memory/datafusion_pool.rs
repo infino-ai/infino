@@ -457,8 +457,15 @@ mod tests {
     /// `t`: a `Utf8View` group key `g` (zero-padded, so it sorts as a string)
     /// and an `Int64` value `v`, spread over `PARTITIONS` partitions.
     const PARTITIONS: usize = 8;
-    const ROWS_PER_PARTITION: usize = 4096;
-    const GROUPS: usize = 50;
+    const ROWS_PER_PARTITION: usize = 8192;
+    /// Enough groups that the result spans several batches, so a split of the
+    /// sorted result into partitions shows. With one batch, a split leaves it
+    /// all in one partition and the result looks sorted by luck.
+    const GROUPS: usize = 20_000;
+    /// Digits of the zero-padded group key.
+    const KEY_DIGITS: usize = 5;
+    /// Rows the top-k shape keeps.
+    const TOP_K: usize = 100;
 
     /// A session over `t`, pinned to `PARTITIONS` target partitions so the
     /// plan is parallel on any host.
@@ -471,7 +478,7 @@ mod tests {
             .map(|p| {
                 let groups = StringViewArray::from_iter_values(
                     (0..ROWS_PER_PARTITION)
-                        .map(|i| format!("{:02}", (i * PARTITIONS + p) % GROUPS)),
+                        .map(|i| format!("{:0KEY_DIGITS$}", (i * PARTITIONS + p) % GROUPS)),
                 );
                 let vals = Int64Array::from_iter_values(0..ROWS_PER_PARTITION as i64);
                 vec![
@@ -494,28 +501,68 @@ mod tests {
         ctx
     }
 
-    /// A grouped query over a string key with an uncorrelated scalar subquery
-    /// in its `WHERE` returns its groups in `ORDER BY` order. Without
-    /// `OrderUnderScalarSubquery` DataFusion 54 plans the sort away and the
-    /// groups arrive in whatever order the partitions finish; this is the check
-    /// to run before deleting that rule on the move to DataFusion 55.
+    /// Grouped queries over a string key with an uncorrelated scalar subquery,
+    /// in `WHERE`, in the `SELECT` list, in `ORDER BY` and under a top-k,
+    /// return their groups in `ORDER BY` order from one partition. Both rules
+    /// that walk through the `ScalarSubqueryExec` root are needed: without
+    /// `OrderUnderScalarSubquery` DataFusion 54 plans the sort away, and
+    /// without `KeepSortedRoot`'s step into the root's first child the
+    /// round-robin repartition above the output cast splits the sorted result.
+    /// A top-k's result fits one batch and comes back sorted even when split,
+    /// so the partition count is what catches it there. This is the check to
+    /// run before deleting `OrderUnderScalarSubquery` on the move to
+    /// DataFusion 55.
     #[test]
     fn order_by_survives_an_uncorrelated_scalar_subquery() {
+        let queries = [
+            (
+                "SELECT g, count(*) AS n FROM t \
+                 WHERE v > (SELECT avg(v) FROM t) GROUP BY g ORDER BY g"
+                    .to_string(),
+                GROUPS,
+            ),
+            (
+                "SELECT g, (SELECT max(v) FROM t) AS m FROM t GROUP BY g ORDER BY g".to_string(),
+                GROUPS,
+            ),
+            (
+                "SELECT g FROM t GROUP BY g \
+                 ORDER BY concat(g, (SELECT CAST(max(v) AS VARCHAR) FROM t))"
+                    .to_string(),
+                GROUPS,
+            ),
+            (
+                format!(
+                    "SELECT g, count(*) AS n FROM t \
+                     WHERE v > (SELECT avg(v) FROM t) GROUP BY g ORDER BY g LIMIT {TOP_K}"
+                ),
+                TOP_K,
+            ),
+        ];
         let runtime = Runtime::new().expect("tokio runtime");
         runtime.block_on(async {
             let ctx = scalar_subquery_session().await;
-            let out = ctx
-                .sql(
-                    "SELECT g, count(*) AS n FROM t \
-                     WHERE v > (SELECT avg(v) FROM t) GROUP BY g ORDER BY g",
-                )
-                .await
-                .expect("plan")
-                .collect()
-                .await
-                .expect("collect");
-            assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), GROUPS);
-            assert!(is_sorted(&out), "groups came back unsorted: {out:?}");
+            for (sql, rows) in queries {
+                let plan = ctx
+                    .sql(&sql)
+                    .await
+                    .expect("plan")
+                    .create_physical_plan()
+                    .await
+                    .expect("physical plan");
+                assert_eq!(
+                    plan.properties().output_partitioning().partition_count(),
+                    1,
+                    "the sorted result is split into partitions: {sql}"
+                );
+                let out = collect(plan, ctx.task_ctx()).await.expect("collect");
+                assert_eq!(
+                    out.iter().map(|b| b.num_rows()).sum::<usize>(),
+                    rows,
+                    "{sql}"
+                );
+                assert!(is_sorted(&out), "groups came back unsorted: {sql}");
+            }
         });
     }
 
