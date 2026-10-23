@@ -553,7 +553,9 @@ impl Collector for TopKBuffer {
         // A score equal to the bar is kept: the bar may trail the true k-th
         // best, and a tie there with a smaller doc wins on the doc-id leg,
         // which the final selection decides.
-        if k == 0 || (self.full && score < *threshold) {
+        // Under the bar is out whether or not the buffer is full: before it
+        // fills, the bar is the caller's floor.
+        if k == 0 || score < *threshold {
             return false;
         }
         self.buf.push(TopKEntry(score, FtsDocId::new(doc)));
