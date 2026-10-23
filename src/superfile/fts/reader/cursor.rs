@@ -1145,32 +1145,6 @@ impl TermCursor {
     /// the batch it covers. Same contract as the single probe: docs only
     /// ascend across calls, and a cursor probed this way is not iterated.
     pub(super) fn probe_tfs(&mut self, docs: &[u32], out: &mut [u32]) {
-        self.probe_tfs_impl::<false>(docs, out);
-    }
-
-    /// [`Self::probe_tfs`] for a cursor that is only ever probed, never
-    /// walked: a packed block's doc ids are decoded to find the targets, and
-    /// its tfs only once one of them is found there. Most probed docs of a
-    /// balanced pair are absent, so most blocks never pay for their tfs.
-    /// The block's tfs are then stale while its doc ids are current, which
-    /// a walk would read as valid, hence the precondition.
-    pub(super) fn probe_tfs_on_hit(&mut self, docs: &[u32], out: &mut [u32]) {
-        self.probe_tfs_impl::<true>(docs, out);
-    }
-
-    /// Decode the current block's doc ids alone, leaving `block_tfs` as it
-    /// was (still recorded against whichever block filled it).
-    fn decode_current_doc_ids(&mut self) {
-        self.lazy_bit = u32::MAX;
-        let block = self.blocks[self.current_block];
-        let hdr = self.current_header();
-        let bytes = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        self.block_n = decode_block_doc_ids(bytes, &hdr, &mut self.block_doc_ids);
-        self.pos = 0;
-        self.decoded_block = self.current_block;
-    }
-
-    fn probe_tfs_impl<const TFS_ON_HIT: bool>(&mut self, docs: &[u32], out: &mut [u32]) {
         debug_assert_eq!(docs.len(), out.len());
         if self.predecoded {
             let ids = &self.block_doc_ids[..self.block_n];
@@ -1216,10 +1190,7 @@ impl TermCursor {
                 continue;
             }
             if self.decoded_block != self.current_block || self.lazy_bit != u32::MAX {
-                match TFS_ON_HIT {
-                    true => self.decode_current_doc_ids(),
-                    false => self.decode_current_block(),
-                }
+                self.decode_current_block();
             }
             let n = self.block_n;
             let ids = &self.block_doc_ids[..n];
@@ -1236,12 +1207,6 @@ impl TermCursor {
                     p += 1;
                 }
                 out[k] = match p < n && ids[p] == t {
-                    true if TFS_ON_HIT && self.tf_decoded_block != self.current_block => {
-                        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-                        decode_block_tfs(raw, &hdr, &mut self.block_tfs);
-                        self.tf_decoded_block = self.current_block;
-                        self.block_tfs[p]
-                    }
                     true => self.block_tfs[p],
                     false => 0,
                 };
