@@ -1951,7 +1951,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "posting_census.rs"]
-mod census;

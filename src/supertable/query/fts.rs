@@ -2861,7 +2861,7 @@ async fn select_top_k_stable(
                     j += 1;
                 }
                 if j - i > 1 {
-                    cands[i..j].sort_unstable_by(|a, b| a.stable_id.cmp(&b.stable_id));
+                    cands[i..j].sort_unstable_by_key(|c| c.stable_id);
                 }
                 i = j;
             }

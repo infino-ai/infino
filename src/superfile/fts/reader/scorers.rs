@@ -8,7 +8,7 @@
 
 #[cfg(test)]
 use std::cell::RefCell;
-use std::{cmp::Ordering, collections::BinaryHeap, env, slice::from_mut, sync::OnceLock};
+use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
 use super::{
     core::*,
@@ -155,18 +155,6 @@ pub(super) struct BoundClaim {
 /// accumulation to probing.
 const DEMOTE_DENSITY: f32 = 8.0;
 
-/// [`DEMOTE_DENSITY`], overridable from the environment so a measurement
-/// box can sweep it without a rebuild.
-fn demote_density() -> f32 {
-    static D: OnceLock<f32> = OnceLock::new();
-    *D.get_or_init(|| {
-        env::var("INFINO_PROTO_DEMOTE_DENSITY")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEMOTE_DENSITY)
-    })
-}
-
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
 /// `docs[i]` the term contains, scoring matches in SIMD batches rather than one
 /// at a time. `docs` must be ascending — `bitset_probe_tf` advances the cursor
@@ -218,7 +206,7 @@ pub(super) fn cursors_max_doc(cursors: &[TermCursor]) -> u32 {
 pub(super) fn probe_cost(driver_df: u64, probes: usize) -> u64 {
     driver_df
         .saturating_mul(probes as u64)
-        .saturating_mul(count_probe_postings())
+        .saturating_mul(COUNT_PROBE_POSTINGS)
 }
 
 /// What folding costs, in postings read: every term read once into a
@@ -227,18 +215,6 @@ pub(super) fn fold_cost(cursors: &[TermCursor], max_doc: u32) -> u64 {
     let words = u64::from(max_doc) / 64 + 1;
     let reads: u64 = cursors.iter().map(|c| c.df).sum();
     words.saturating_mul(cursors.len() as u64) + reads
-}
-
-/// Postings-equivalent cost of testing one document against one term: a
-/// block locate and, on a packed block, a decode.
-pub(super) fn count_probe_postings() -> u64 {
-    static COST: OnceLock<u64> = OnceLock::new();
-    *COST.get_or_init(|| {
-        env::var("INFINO_PROTO_PROBE_POSTINGS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(COUNT_PROBE_POSTINGS)
-    })
 }
 
 /// Intersection cardinality by whichever plan reads less: probe the other
@@ -344,15 +320,12 @@ fn count_excluding_probe(mut pos: Vec<TermCursor>, all: bool, mut neg: Vec<TermC
         }
         return n;
     }
-    loop {
-        let Some(doc) = pos
-            .iter()
-            .filter(|c| !c.is_exhausted())
-            .map(TermCursor::current_doc_id)
-            .min()
-        else {
-            break;
-        };
+    while let Some(doc) = pos
+        .iter()
+        .filter(|c| !c.is_exhausted())
+        .map(TermCursor::current_doc_id)
+        .min()
+    {
         if !neg.iter_mut().any(|c| c.contains(doc)) {
             n += 1;
         }
@@ -2538,23 +2511,18 @@ impl FtsReader {
                     lane_scores[i..i + bm25::SCORE_SIMD_LANES].copy_from_slice(&s);
                     i += bm25::SCORE_SIMD_LANES;
                 }
-                for j in i..to {
-                    let d = c.block_doc_ids[j];
-                    lane_scores[j] = bm25::score_with_dl_norm_k1(
-                        c.idf_weight,
-                        c.block_tfs[j],
-                        dl_norm_k1.get(d),
-                    );
+                let tail = c.block_doc_ids[i..to].iter().zip(&c.block_tfs[i..to]);
+                for (slot, (&d, &tf)) in lane_scores[i..to].iter_mut().zip(tail) {
+                    *slot = bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm_k1.get(d));
                 }
-                for j in from..to {
-                    let doc = c.block_doc_ids[j];
+                for (&doc, &score) in c.block_doc_ids[from..to].iter().zip(&lane_scores[from..to]) {
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(doc)
                     {
                         continue;
                     }
                     count += 1;
-                    offer(&mut heap, &mut threshold, doc, lane_scores[j]);
+                    offer(&mut heap, &mut threshold, doc, score);
                 }
                 c.advance_by(to - from);
             }
@@ -3042,7 +3010,7 @@ impl FtsReader {
                     let f = recompute_f(&partial_win, threshold);
                     let kept: f32 = win_docs_est[..f].iter().sum();
                     let demoted: f32 = win_docs_est[f..f_essential].iter().sum();
-                    if f == 0 || demoted >= demote_density() * kept.max(1.0) {
+                    if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1.0) {
                         f
                     } else {
                         partial_win.copy_from_slice(&partial_max);
@@ -5582,7 +5550,7 @@ mod tests {
                 if x % 100 < 6 {
                     t.push_str(" rare");
                 }
-                if (x >> 8) % 7 == 0 {
+                if (x >> 8).is_multiple_of(7) {
                     t.push_str(" common common filler");
                 }
                 t

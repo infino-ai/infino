@@ -77,14 +77,14 @@
 use std::{
     cmp::Ordering,
     collections::BinaryHeap,
-    env, fs,
+    fs,
     fs::File,
     hash::{BuildHasher, Hash},
     io::{self, BufReader, BufWriter, Error, ErrorKind, Read, Seek, SeekFrom, Write},
     mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::{Duration, Instant},
     vec::IntoIter,
 };
@@ -282,24 +282,10 @@ const DENSE_BITSET_MIN_DF: usize = 256 * 1024;
 /// still be stored as a presence bitset.
 const DENSE_BITSET_BIAS: f32 = 2.0;
 
-/// The bitset bias a term with `df` documents is written with. The
-/// prototype reads both knobs from the environment so a measurement box can
-/// sweep them without a rebuild.
+/// The bitset bias a term with `df` documents is written with.
 fn dense_bitset_bias(df: usize) -> f32 {
-    static KNOBS: OnceLock<(usize, f32)> = OnceLock::new();
-    let (min_df, bias) = *KNOBS.get_or_init(|| {
-        let min_df = env::var("INFINO_PROTO_BITSET_MIN_DF")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DENSE_BITSET_MIN_DF);
-        let bias = env::var("INFINO_PROTO_BITSET_BIAS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DENSE_BITSET_BIAS);
-        (min_df, bias)
-    });
-    match df >= min_df {
-        true => bias,
+    match df >= DENSE_BITSET_MIN_DF {
+        true => DENSE_BITSET_BIAS,
         false => 1.0,
     }
 }

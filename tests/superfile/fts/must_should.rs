@@ -324,7 +324,7 @@ async fn one_must_with_shoulds_pruned_matches_unpruned() {
     };
     let vocab = ["t0", "t1", "t2", "t3", "t4", "t5"];
     for trial in 0..10u32 {
-        let n_docs = 2_000 + (rng() % 10_000) as u64;
+        let n_docs = 2_000 + rng() % 10_000;
         // Inclusion odds out of 1000: one stopword-like, the rest varied.
         let odds: Vec<u64> = (0..vocab.len())
             .map(|t| match t {
@@ -399,7 +399,7 @@ async fn rare_and_common_pair_matches_unpruned() {
         state
     };
     for trial in 0..10u32 {
-        let n_docs = 3_000 + (rng() % 12_000) as u64;
+        let n_docs = 3_000 + rng() % 12_000;
         // Odd trials: the common term covers a fifth of the corpus, so its idf
         // and its best score are real, and reaches that score in short
         // documents that repeat it, while rare-term documents are long. The
@@ -477,7 +477,7 @@ async fn intersection_pruned_matches_unpruned() {
         state
     };
     for trial in 0..8u32 {
-        let n_docs = 20_000 + (rng() % 20_000) as u64;
+        let n_docs = 20_000 + rng() % 20_000;
         let rare_odds: Vec<u64> = (0..3).map(|_| 3 + rng() % 12).collect();
         let mut owned: Vec<(u64, String)> = Vec::with_capacity(n_docs as usize);
         for d in 0..n_docs {
