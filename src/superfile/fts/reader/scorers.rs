@@ -2689,7 +2689,11 @@ impl FtsReader {
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
         // Leader-block positions that survive the batch bar, reused per block.
-        let mut survivors: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
+        // A fixed array and a count held in a register: pushing to a `Vec`
+        // and dropping the entry again keeps its length in memory, one
+        // store-to-load chain per posting.
+        let mut survivors = [0u16; BLOCK_LEN];
+        let mut n_survivors: usize;
         let mut leader_scores = [0.0f32; BLOCK_LEN];
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
@@ -2751,7 +2755,7 @@ impl FtsReader {
                 // dropped here the walk would drop too; the walk then jumps from
                 // survivor to survivor instead of scoring each posting behind a
                 // branch.
-                survivors.clear();
+                n_survivors = 0;
                 let batched = block_others_ub.is_finite()
                     && filter.is_none()
                     && cursors[0].holds_whole_block();
@@ -2771,11 +2775,10 @@ impl FtsReader {
                             tfs,
                             dids.map(|d| dl_norm_k1.get(d)),
                         );
+                        leader_scores[i..i + 8].copy_from_slice(&lanes);
                         for (l, &score) in lanes.iter().enumerate() {
-                            leader_scores[i + l] = score;
-                            survivors.push((i + l) as u16);
-                            let keep = score + block_others_ub > threshold;
-                            survivors.truncate(survivors.len() - usize::from(!keep));
+                            survivors[n_survivors] = (i + l) as u16;
+                            n_survivors += usize::from(score + block_others_ub > threshold);
                         }
                         i += 8;
                     }
@@ -2786,9 +2789,8 @@ impl FtsReader {
                         let score =
                             bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm_k1.get(d));
                         *slot = score;
-                        if score + block_others_ub > threshold {
-                            survivors.push(j as u16);
-                        }
+                        survivors[n_survivors] = j as u16;
+                        n_survivors += usize::from(score + block_others_ub > threshold);
                     }
                     // Complete the survivors the way a window drain does:
                     // strongest non-essential first, the survivors re-filtered
@@ -2800,7 +2802,7 @@ impl FtsReader {
                     let c0 = &mut ess[0];
                     win_docs.clear();
                     win_scores.clear();
-                    for &at in survivors.iter() {
+                    for &at in &survivors[..n_survivors] {
                         let d = c0.block_doc_ids[usize::from(at)];
                         if d >= doc_id_end {
                             break;
