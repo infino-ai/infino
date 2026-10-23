@@ -330,6 +330,25 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 }
             }
         }
+        // The same with two or three common words: the rare-led walk for wider
+        // unions, which must hand back to the general walk when the k-th best
+        // does not clear the common words' maxima together.
+        for commons in [&["music", "city"][..], &["band", "city", "music"]] {
+            for rare in ["onyx", "lynx"] {
+                let near_df = df(rare)
+                    .saturating_sub(RARE_PAIR_K_SLACK)
+                    .min(RARE_PAIR_MAX_K);
+                for k in [10, 50, near_df] {
+                    let mut shoulds: Vec<String> = commons.iter().map(|w| w.to_string()).collect();
+                    shoulds.insert(1, rare.to_string());
+                    queries.push(Query {
+                        shoulds,
+                        k: k.max(1),
+                        ..Query::default()
+                    });
+                }
+            }
+        }
         // Unions with an excluded term at small `k`: an exclusion keeps the
         // single-leader walk on its per-candidate path, which the batched
         // leader block otherwise takes over once the heap is full.

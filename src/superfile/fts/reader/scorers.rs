@@ -3534,8 +3534,62 @@ impl FtsReader {
             }
             self.run_wand_bmw(column_id, cursors, k)
         } else {
+            if cursors.len() > 2
+                && cursors.len() - 1 <= MAX_SHOULDS_LED
+                && k <= WAND_BMW_2TERM_MAX_K
+                && filter.is_none()
+                && no_floor
+                && let Some(hits) = self.rare_led(column_id, &cursors, k)
+            {
+                return Ok(hits);
+            }
             self.run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
         }
+    }
+
+    /// [`Self::rare_led_pair`] for three or more terms: one term much rarer
+    /// than every other leads, the others are probed at its documents, and
+    /// the result stands when the k-th best is strictly above the sum of the
+    /// others' maxima, which bounds any document without the rare term. The
+    /// bound is a sum of bounds, rounded, so it may only equal such a
+    /// document's score: strictly above, not at, is what rules a tie out.
+    fn rare_led(
+        &self,
+        column_id: u32,
+        cursors: &[TermCursor],
+        k: usize,
+    ) -> Option<Vec<(FtsDocId, f32)>> {
+        let rare_at = (0..cursors.len()).min_by_key(|&i| cursors[i].df)?;
+        let rare = &cursors[rare_at];
+        if rare.df == 0 || rare.df > RARE_LED_MAX_DF {
+            return None;
+        }
+        let others: Vec<TermCursor> = cursors
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != rare_at)
+            .map(|(_, c)| c.clone())
+            .collect();
+        if others
+            .iter()
+            .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
+        {
+            return None;
+        }
+        let others_max: f32 = others.iter().map(|c| c.term_max_bm25).sum();
+        let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+            must_lead_should_walk(
+                rare.clone(),
+                others,
+                k,
+                None,
+                f32::NEG_INFINITY,
+                dl_norm_k1,
+                heap,
+            );
+            heap.len() >= k && heap.peek().expect("full heap").0 > others_max
+        });
+        complete.then_some(hits)
     }
 
     /// A two-term OR of a rare term and a much commoner one, answered from
