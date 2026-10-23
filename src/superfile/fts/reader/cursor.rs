@@ -590,10 +590,40 @@ fn order_key(doc: u32) -> i32 {
     (doc ^ 0x8000_0000) as i32
 }
 
-/// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
-/// packed block rather than stepping: past this many docs behind the
-/// target, a bisection's ~7 steps beat the walk.
+/// How far ahead [`seek_sorted`] looks before it bisects a packed block
+/// rather than stepping: past this many docs behind the target, a
+/// bisection's ~7 steps beat the walk.
 const PROBE_GALLOP: usize = 16;
+
+/// The first index at or after `p` whose id in `ids` (ascending) is not
+/// below `t`. Far behind the target (a list much denser than the one
+/// probing it), it bisects the rest; near it, it moves eight ids at a time:
+/// the sorted lanes below the target form a prefix, so its popcount is how
+/// far to move, one compare where stepping would take a branch per id.
+#[inline(always)]
+fn seek_sorted(ids: &[u32], mut p: usize, t: u32) -> usize {
+    let n = ids.len();
+    if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
+        p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);
+    }
+    while p + 8 <= n {
+        let lanes: [u32; 8] = ids[p..p + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let below = i32x8::from(lanes.map(order_key))
+            .simd_lt(i32x8::splat(order_key(t)))
+            .to_bitmask()
+            .count_ones() as usize;
+        p += below;
+        if below < 8 {
+            return p;
+        }
+    }
+    while p < n && ids[p] < t {
+        p += 1;
+    }
+    p
+}
 
 impl TermCursor {
     /// Parse one term's metadata + skip table out of its own postings
@@ -1010,9 +1040,7 @@ impl TermCursor {
             let mut p = 0usize;
             while r < n {
                 let d = docs[r];
-                while p < ids.len() && ids[p] < d {
-                    p += 1;
-                }
+                p = seek_sorted(ids, p, d);
                 if p < ids.len() && ids[p] == d {
                     docs[w] = d;
                     w += 1;
@@ -1094,15 +1122,7 @@ impl TermCursor {
                 }
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    // Far behind the candidate (a member much denser than the
-                    // rarest one): bisect the rest of the block, as the probe
-                    // does, instead of stepping through it.
-                    if p + PROBE_GALLOP < ids.len() && ids[p + PROBE_GALLOP] < d {
-                        p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < d);
-                    }
-                    while p < ids.len() && ids[p] < d {
-                        p += 1;
-                    }
+                    p = seek_sorted(ids, p, d);
                     if p < ids.len() && ids[p] == d {
                         docs[w] = d;
                         w += 1;
@@ -1339,31 +1359,7 @@ impl TermCursor {
             }
             while k < n_docs && docs[k] <= last {
                 let t = docs[k];
-                // Far behind the target (a probed term much denser than the
-                // probing one): bisect the rest of the block instead of
-                // stepping through it.
-                if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
-                    p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);
-                }
-                // Eight postings at a time: the sorted lanes below the target
-                // form a prefix, so its popcount is how far to move, one
-                // compare where stepping would take a branch per posting.
-                while p + 8 <= n {
-                    let lanes: [u32; 8] = ids[p..p + 8]
-                        .try_into()
-                        .expect("invariant: an 8-wide slice");
-                    let below = i32x8::from(lanes.map(order_key))
-                        .simd_lt(i32x8::splat(order_key(t)))
-                        .to_bitmask()
-                        .count_ones() as usize;
-                    p += below;
-                    if below < 8 {
-                        break;
-                    }
-                }
-                while p < n && ids[p] < t {
-                    p += 1;
-                }
+                p = seek_sorted(ids, p, t);
                 out[k] = match p < n && ids[p] == t {
                     true => self.block_tfs[p],
                     false => 0,
@@ -1892,6 +1888,45 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn seek_sorted_lands_where_a_partition_point_does() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        for case in 0..400 {
+            let n = rng(160) as usize;
+            let gap = 1 + rng(if case % 2 == 0 { 3 } else { 40 }) as u32;
+            // Straddle the sign bit, where the lanes' ordering key flips.
+            let mut d = if case % 5 == 0 {
+                0x7FFF_FF00
+            } else {
+                rng(64) as u32
+            };
+            let ids: Vec<u32> = (0..n)
+                .map(|_| {
+                    d += 1 + rng(u64::from(gap)) as u32;
+                    d
+                })
+                .collect();
+            let hi = ids.last().map_or(64, |&l| u64::from(l) + 3);
+            let mut p = 0;
+            for _ in 0..20 {
+                let t = (rng(hi) as u32).max(ids.get(p).copied().unwrap_or(0));
+                let want = p + ids[p..].partition_point(|&v| v < t);
+                p = super::seek_sorted(&ids, p, t);
+                assert_eq!(p, want, "case {case} target {t}");
+            }
+            assert_eq!(
+                super::seek_sorted(&ids, 0, u32::MAX),
+                ids.partition_point(|&v| v < u32::MAX)
+            );
+        }
+    }
+
     #[test]
     fn probe_by_bitmap_answers_as_a_lookup_does() {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
