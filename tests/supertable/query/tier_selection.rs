@@ -68,12 +68,34 @@ fn tiers_change_which_superfiles_open_and_nothing_else() {
 fn a_rare_conjunction_opens_only_its_holders() {
     let dir = TempDir::new().expect("tempdir");
     let st = table(&dir, true);
+    // The first ask of the pair reads its tiers from storage, beside its
+    // first opens (whether it still waits for that read when its opens are
+    // done is a race, so its stats are not asserted on); it answers as the
+    // resident asks after it do.
+    let (first, _) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits(
+                "body",
+                "quokka tensor",
+                10,
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
+            )
+            .expect("search")
+    });
     let (hits, stats, holders) = run(&st, "quokka tensor", BoolMode::And, 10);
     assert!(!hits.is_empty(), "the planted pair matches");
-    assert!(stats.tier_bytes > 0, "the first ask reads the tiers");
-    let (again, resident, _) = run(&st, "quokka tensor", BoolMode::And, 10);
-    assert_eq!(again, hits);
-    assert_eq!(resident.tier_bytes, 0, "the second ask finds them resident");
+    assert_eq!(
+        first
+            .iter()
+            .map(|h| (h.local_doc_id, h.score))
+            .collect::<Vec<_>>(),
+        hits.iter()
+            .map(|&(_, row, score)| (row, score))
+            .collect::<Vec<_>>(),
+        "the first ask answers as a resident one"
+    );
+    assert_eq!(stats.tier_bytes, 0, "a later ask finds the tiers resident");
     // Both terms are under the budget, so their tiers are complete and the
     // merge knows every document that carries both, with its score as the
     // kernel computes it: the index answers outright and nothing opens.
@@ -576,8 +598,9 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
         for k in [10usize, 100] {
             let (expected, _, _) = run(&without, query, mode, k);
             let mut plain = false;
+            // Every ask observed: the policy alternates between asks.
             for _ in 0..20 {
-                let (a, stats, _) = run(&with, query, mode, k);
+                let (a, stats, _) = run_once(&with, query, mode, k);
                 assert_eq!(
                     a, expected,
                     "{query:?} {mode:?} k={k}: same answer every time"
@@ -797,7 +820,13 @@ fn two_text_columns_keep_their_heads_apart() {
     };
     let (_with_dir, with) = build(true);
     let (_without_dir, without) = build(false);
+    // Asked twice, the second metered: the first brings the column's tiers
+    // into memory, after which the merge runs before any open.
     let hits = |st: &Supertable, column: &str, query: &str, mode: BoolMode| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits(column, query, 10, Bm25SearchOptions::new().with_mode(mode))
+            .expect("search");
         with_op_stats(|| {
             st.reader()
                 .expect("reader")

@@ -57,7 +57,7 @@ pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::fs as async_fs;
+use tokio::{fs as async_fs, task};
 use uuid::Uuid;
 
 use crate::{
@@ -282,15 +282,23 @@ impl TierChunkData {
 /// are content-addressed, so the cache is shared across the roots a table
 /// goes through: a delta commit replaces the root, not the tiers already
 /// read.
-pub(crate) type TierChunkCache =
-    Arc<tokio::sync::Mutex<Resident<(ContentHash, u64), Arc<TierChunkData>>>>;
+pub(crate) type TierChunkCache = Arc<tokio::sync::Mutex<TierChunks>>;
+
+/// The tier chunks in memory, and the ones a read in flight is about to
+/// put there: a query of a term whose chunks another query is reading
+/// treats them as resident, and its merge then waits for that read rather
+/// than overlapping its opens.
+pub(crate) struct TierChunks {
+    resident: Resident<(ContentHash, u64), Arc<TierChunkData>>,
+    in_flight: HashSet<(ContentHash, u64)>,
+}
 
 /// A tier chunk cache of the resident byte budget.
 pub(crate) fn new_tier_chunk_cache() -> TierChunkCache {
-    Arc::new(tokio::sync::Mutex::new(Resident::new(
-        RESIDENT_SLICE_BUDGET_BYTES,
-        TierChunkData::weight,
-    )))
+    Arc::new(tokio::sync::Mutex::new(TierChunks {
+        resident: Resident::new(RESIDENT_SLICE_BUDGET_BYTES, TierChunkData::weight),
+        in_flight: HashSet::new(),
+    }))
 }
 
 pub(crate) fn tier_uri(hash: &ContentHash) -> String {
@@ -617,6 +625,49 @@ fn place_built(path: &Path, built: BuiltBytes) -> Result<(), TermIndexError> {
     Ok(())
 }
 
+/// One ranged read of a tier object: the chunks of `refs`, which lie in
+/// `start..end` back to back, parsed and every block verified on the pool.
+/// Returns the bytes fetched and the chunks, each with its place among
+/// the run's chunks.
+async fn read_span(
+    storage: Arc<dyn StorageProvider>,
+    uri: &str,
+    start: u64,
+    end: Option<u64>,
+    refs: Vec<(usize, TierChunkRef)>,
+) -> Result<(u64, Vec<(usize, Arc<TierChunkData>)>), TermIndexError> {
+    let end = end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+    let bytes = storage.get_range(uri, start..end).await?;
+    if bytes.len() as u64 != end - start {
+        return Err(TermIndexError::Malformed("short tier read".into()));
+    }
+    let fetched = bytes.len() as u64;
+    let chunks = run_on_pool(None, "tier chunk verify", move || {
+        let mut out = Vec::with_capacity(refs.len());
+        for (i, chunk) in refs {
+            let at = (chunk.offset - start) as usize;
+            let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
+            let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
+            if dir.chunk_len() as u64 != chunk.len {
+                return Err(TermIndexError::Malformed(
+                    "tier chunk directory does not match the run's chunk length".into(),
+                ));
+            }
+            let mut bodies = Vec::with_capacity(dir.n_blocks());
+            for b in 0..dir.n_blocks() {
+                let body = chunk_bytes.slice(dir.block_range(b));
+                dir.verify_block(b, &body)?;
+                bodies.push(body);
+            }
+            out.push((i, Arc::new(TierChunkData { dir, bodies })));
+        }
+        Ok::<_, TermIndexError>(out)
+    })
+    .await
+    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+    Ok((fetched, chunks))
+}
+
 /// Write freshly built tier objects into `dir`, each beside the spilled
 /// slice of `slices` that names it, so a merge finds them where
 /// [`download_segments`] would have put them.
@@ -745,6 +796,11 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
             budget,
             weigh,
         }
+    }
+
+    /// Whether `key` is held, without counting a use.
+    fn holds(&self, key: &K) -> bool {
+        self.map.contains_key(key)
     }
 
     fn get(&mut self, key: &K) -> Option<V> {
@@ -1209,6 +1265,21 @@ impl TermIndex {
     /// of a term lie back to back, so a whole tier is one read of up to
     /// [`TIER_READ_MAX_BYTES`]. Every directory is verified by its own CRC
     /// and every block by its own, and all of it is resident afterwards.
+    /// Whether every one of `chunks` in `object` is in memory or being
+    /// read into it, so a read of them costs no storage round trip of this
+    /// query's own.
+    pub(crate) async fn tier_chunks_resident(
+        &self,
+        object: &ContentHash,
+        chunks: &[TierChunkRef],
+    ) -> bool {
+        let cache = self.tier_chunks.lock().await;
+        chunks.iter().all(|c| {
+            let key = (*object, c.offset);
+            cache.resident.holds(&key) || cache.in_flight.contains(&key)
+        })
+    }
+
     pub(crate) async fn tier_chunks(
         &self,
         object: &ContentHash,
@@ -1216,9 +1287,9 @@ impl TermIndex {
     ) -> Result<(Vec<Arc<TierChunkData>>, u64), TermIndexError> {
         let mut out: Vec<Option<Arc<TierChunkData>>> = Vec::with_capacity(chunks.len());
         {
-            let mut resident = self.tier_chunks.lock().await;
+            let mut cache = self.tier_chunks.lock().await;
             for chunk in chunks {
-                out.push(resident.get(&(*object, chunk.offset)));
+                out.push(cache.resident.get(&(*object, chunk.offset)));
             }
         }
         if out.iter().all(Option::is_some) {
@@ -1247,8 +1318,20 @@ impl TermIndex {
             }
         }
         // Each span: one ranged read, then its chunks parsed and every
-        // block verified on the pool, off this task and off the lock.
+        // block verified on the pool, off this task and off the lock. The
+        // read runs as its own task and lands in the cache when it is done,
+        // whether or not the query that asked still waits: a query whose
+        // opens all finished first moves on, and the next query of the
+        // term finds its chunks in memory.
         let uri = tier_uri(object);
+        {
+            let mut cache = self.tier_chunks.lock().await;
+            for &(first, last) in &spans {
+                for c in &chunks[first..=last] {
+                    cache.in_flight.insert((*object, c.offset));
+                }
+            }
+        }
         let fetches: Vec<_> = spans
             .into_iter()
             .map(|(first, last)| {
@@ -1262,52 +1345,32 @@ impl TermIndex {
                     .collect();
                 let start = chunks[first].offset;
                 let end = chunks[last].offset.checked_add(chunks[last].len);
-                async move {
-                    let end =
-                        end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
-                    let bytes = self.storage.get_range(&uri, start..end).await?;
-                    if bytes.len() as u64 != end - start {
-                        return Err(TermIndexError::Malformed("short tier read".into()));
+                let storage = Arc::clone(&self.storage);
+                let cache = Arc::clone(&self.tier_chunks);
+                let object = *object;
+                let keys: Vec<(ContentHash, u64)> =
+                    refs.iter().map(|(_, c)| (object, c.offset)).collect();
+                task::spawn(async move {
+                    let read = read_span(storage, &uri, start, end, refs).await;
+                    let mut cache = cache.lock().await;
+                    for key in &keys {
+                        cache.in_flight.remove(key);
                     }
-                    let fetched = bytes.len() as u64;
-                    let chunks = run_on_pool(None, "tier chunk verify", move || {
-                        let mut out = Vec::with_capacity(refs.len());
-                        for (i, chunk) in refs {
-                            let at = (chunk.offset - start) as usize;
-                            let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
-                            let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
-                            if dir.chunk_len() as u64 != chunk.len {
-                                return Err(TermIndexError::Malformed(
-                                    "tier chunk directory does not match the run's chunk length"
-                                        .into(),
-                                ));
-                            }
-                            let mut bodies = Vec::with_capacity(dir.n_blocks());
-                            for b in 0..dir.n_blocks() {
-                                let body = chunk_bytes.slice(dir.block_range(b));
-                                dir.verify_block(b, &body)?;
-                                bodies.push(body);
-                            }
-                            out.push((i, Arc::new(TierChunkData { dir, bodies })));
-                        }
-                        Ok::<_, TermIndexError>(out)
-                    })
-                    .await
-                    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+                    let (fetched, chunks) = read?;
+                    for (key, (_, data)) in keys.iter().zip(&chunks) {
+                        cache.resident.insert(*key, Arc::clone(data));
+                    }
                     Ok::<_, TermIndexError>((fetched, chunks))
-                }
+                })
             })
             .collect();
-        let parsed: Vec<(u64, Vec<(usize, Arc<TierChunkData>)>)> = stream::iter(fetches)
-            .buffered(SLICE_FETCH_CONCURRENCY)
-            .try_collect()
-            .await?;
         let mut fetched = 0u64;
-        let mut resident = self.tier_chunks.lock().await;
-        for (bytes, span_chunks) in parsed {
+        for handle in fetches {
+            let (bytes, span_chunks) = handle
+                .await
+                .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
             fetched += bytes;
             for (i, data) in span_chunks {
-                resident.insert((*object, chunks[i].offset), Arc::clone(&data));
                 out[i] = Some(data);
             }
         }

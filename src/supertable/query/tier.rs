@@ -58,7 +58,7 @@ use std::{
     time::Instant,
 };
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::future::try_join_all;
 use rayon::{
     ThreadPool,
     iter::{IndexedParallelIterator, ParallelIterator},
@@ -232,10 +232,6 @@ impl TierPolicy {
 /// still in play. What has been read by then still bounds every superfile
 /// soundly; the merge just stops refining.
 const MAX_ENTRIES_PER_QUERY: u64 = 1 << 20;
-/// Tier fetches in flight at once for one query: a term's tier is one
-/// ranged read of up to a few megabytes, and a query of many terms must
-/// not flood the store.
-const TIER_FETCH_CONCURRENCY: usize = 8;
 /// Superfiles one pool job decodes in a round. A superfile's share of a
 /// round is several microseconds, so jobs this size still dwarf the
 /// pool's scheduling while a round of a hundred superfiles spreads over
@@ -488,17 +484,38 @@ pub(crate) fn fold_mean(cell: &AtomicU64, sample: u64, shift: u32) {
     cell.store(new, Ordering::Relaxed);
 }
 
-/// Select superfiles for `query` with the tiers of `index`, decoding on
-/// `pool`. `None` when a term has postings in a segment without a tier, a
-/// kept superfile is not in the root, or a table-wide idf is missing: the
-/// caller then keeps its ceilings.
-pub(crate) async fn select_with_tiers(
-    index: &TermIndex,
+/// A merge prepared up to its reads: the kept superfiles' slots bounded
+/// by their postings, the inline heads absorbed, the chunked heads
+/// located. [`PreparedMerge::run`] reads them and merges.
+pub(crate) struct PreparedMerge<'a> {
+    index: &'a TermIndex,
+    pool: &'a Arc<ThreadPool>,
+    merge: Merge,
+    sources: Vec<Vec<Source>>,
+    required: TermMask,
+    merge_gate: bool,
+    open_cost_ns: u64,
+    /// Whether the sums are the kernel's bit for bit, so a superfile whose
+    /// heads were read whole can be answered from the index.
+    exact_scores: bool,
+    /// Whether every chunked head the merge reads is in memory: the merge
+    /// then costs no storage round trip, and is worth running before any
+    /// open for the kernels it spares; one that must read from storage
+    /// runs beside the first opens instead.
+    pub(crate) resident: bool,
+}
+
+/// Prepare the merge of `query` over the tiers of `index`. `None` when a
+/// term has postings in a segment without a tier, a kept superfile is not
+/// in the root, or a table-wide idf is missing: the caller then keeps its
+/// ceilings.
+pub(crate) async fn prepare_merge<'a>(
+    index: &'a TermIndex,
     query: &TierQuery<'_>,
     kept: &[Arc<SuperfileEntry>],
     global_idf: &GlobalTermIdf,
-    pool: &Arc<ThreadPool>,
-) -> Result<Option<TierSelection>, TermIndexError> {
+    pool: &'a Arc<ThreadPool>,
+) -> Result<Option<PreparedMerge<'a>>, TermIndexError> {
     let terms = query.terms;
     let nt = terms.len();
     let k = query.k;
@@ -721,174 +738,202 @@ pub(crate) async fn select_with_tiers(
         }
     }
 
-    // Read: every term's whole tier, one wave of ranged reads. A term's
-    // chunks lie back to back, so this is a read per term in the common
-    // case, and the rounds then run without a storage round trip between
-    // them.
-    let mut tier_bytes = 0u64;
-    let reads: Vec<(usize, usize)> = sources
-        .iter()
-        .enumerate()
-        .flat_map(|(ti, term_sources)| (0..term_sources.len()).map(move |si| (ti, si)))
-        .collect();
-    let fetches: Vec<_> = reads
-        .iter()
-        .map(|&(ti, si)| {
-            let source = &sources[ti][si];
-            index.tier_chunks(&source.object, &source.chunks)
-        })
-        .collect();
-    let fetched: Vec<(Vec<Arc<TierChunkData>>, u64)> = stream::iter(fetches)
-        .buffered(TIER_FETCH_CONCURRENCY)
-        .try_collect()
-        .await?;
-    for (&(ti, si), (data, bytes)) in reads.iter().zip(fetched) {
-        sources[ti][si].data = data;
-        tier_bytes += bytes;
+    let mut resident = true;
+    for source in sources.iter().flatten() {
+        resident &= index
+            .tier_chunks_resident(&source.object, &source.chunks)
+            .await;
     }
-    // Decode, score, join and bound, round by round, as one job on the
-    // reader pool: a round is the next block of every live superfile whose
-    // head goes on, and the merge stops when a round moves nothing.
-    let required = query.required;
-    let max_rounds = match crate::config::global().diagnostics.tier_rounds {
-        0 => usize::MAX,
-        n => n as usize,
-    };
-    // With the gate off the merge is under test and reads on while a round
-    // excludes anything, whatever the opens were measured to cost: the
-    // rounds it takes then depend on the table alone.
-    let open_cost_ns = if query.merge_gate {
-        query.open_cost_ns
-    } else {
-        0
-    };
-    let (merge, merge_ns) = run_on_pool(Some(pool), "tier merge", move || {
-        let mut merge = merge;
-        let mut merge_ns = 0u64;
-        for round in 0..max_rounds {
-            let mut reads: Vec<Vec<BlockRead<'_>>> =
-                (0..merge.slots.len()).map(|_| Vec::new()).collect();
-            let mut read_any = false;
-            for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
-                if !slot.live {
-                    continue;
-                }
-                for (ti, state) in slot.heads.iter_mut().enumerate() {
-                    if state.done {
-                        continue;
-                    }
-                    let Some(si) = state.source else {
-                        continue;
-                    };
-                    let Some(chunk) = sources[ti][si].data.get(round) else {
-                        state.done = true;
-                        continue;
-                    };
-                    let Some(block) = chunk.dir.block_of(slot.ordinal) else {
-                        state.done = true;
-                        continue;
-                    };
-                    reads[slot_i].push(BlockRead {
-                        ti,
-                        dir: &chunk.dir,
-                        block,
-                        body: &chunk.bodies[block],
-                    });
-                    read_any = true;
-                }
-            }
-            if !read_any {
-                break;
-            }
-            let started = Instant::now();
-            let excluded = merge.round(&reads);
-            let round_ns = started.elapsed().as_nanos() as u64;
-            merge_ns += round_ns;
-            // Worth reading on: the opens this round saved, at what an open
-            // costs here, cover what the round cost. With the open cost
-            // unknown, any exclusion is taken as worth it. A round that
-            // found no threshold saved nothing and is not read past: the
-            // joint documents a conjunction needs for one sit deeper than
-            // the heads' top blocks, and reading on for them has bought
-            // nothing where it was measured.
-            let worth = pays(excluded as u64, 1, open_cost_ns, round_ns);
-            // A required term whose head the index holds whole settles,
-            // read to its end, which documents carry the term — ruling
-            // out, or answering for, every live superfile the conjunction
-            // has no joint document in. Finishing it is worth the rounds
-            // it still needs while the live opens at stake cover them at
-            // this round's cost; with the open cost unknown it is finished
-            // regardless.
-            let rounds_to_settle = merge
-                .slots
-                .iter()
-                .filter(|s| s.live)
-                .flat_map(|s| s.heads.iter().enumerate())
-                .filter(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
-                .map(|(_, h)| h.blocks.saturating_sub(round as u32 + 1).max(1))
-                .max();
-            let settling = rounds_to_settle.is_some_and(|rounds| {
-                let live = merge.slots.iter().filter(|s| s.live).count() as u64;
-                pays(live, u64::from(rounds), open_cost_ns, round_ns)
-            });
-            let read_on = worth || settling;
-            tracing::debug!(
-                round,
-                excluded,
-                live = merge.slots.iter().filter(|s| s.live).count(),
-                theta = merge.theta_lb,
-                entries = merge.entries_read,
-                round_us = round_ns / 1000,
-                open_cost_us = open_cost_ns / 1000,
-                settling,
-                read_on,
-                "tier merge round"
-            );
-            if !read_on || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
-                break;
-            }
-        }
-        (merge, merge_ns)
-    })
-    .await
-    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))?;
-
-    let bounds: Vec<SuperfileBounds> = merge
-        .slots
-        .iter()
-        .map(|s| SuperfileBounds {
-            lb: s.lb * lb_slack,
-            ub: if s.live { s.ub } else { f32::NEG_INFINITY },
-        })
-        .collect();
-    let mut resolved = Vec::new();
-    if exact_scores {
-        for (si, slot) in merge.slots.iter().enumerate() {
-            // Every head read to its end, and the sums exact: the superfile's
-            // matching documents are its candidates carrying the required
-            // terms, scored as the kernel would score them. One the merge
-            // ruled out holds none that place.
-            let whole = slot.live && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
-            if whole {
-                let mut docs: Vec<(u32, f32)> = Vec::new();
-                let mut scratch = Scratch::default();
-                slot.join(&mut scratch, |row, mask, contrib| {
-                    if mask & required == required {
-                        docs.push((row, contrib.iter().sum()));
-                    }
-                });
-                resolved.push((si, docs));
-            }
-        }
-    }
-    Ok(Some(TierSelection {
-        bounds,
-        theta_lb: merge.theta_lb,
-        resolved,
-        tier_bytes,
-        entries_read: merge.entries_read,
-        merge_ns,
+    Ok(Some(PreparedMerge {
+        index,
+        pool,
+        merge,
+        sources,
+        required: query.required,
+        merge_gate: query.merge_gate,
+        open_cost_ns: query.open_cost_ns,
+        exact_scores,
+        resident,
     }))
+}
+
+impl PreparedMerge<'_> {
+    /// Read the chunked heads and merge, round by round.
+    pub(crate) async fn run(self) -> Result<Option<TierSelection>, TermIndexError> {
+        let PreparedMerge {
+            index,
+            pool,
+            merge,
+            mut sources,
+            required,
+            merge_gate,
+            open_cost_ns,
+            exact_scores,
+            ..
+        } = self;
+        // Read: every term's whole tier, one wave of ranged reads, all started
+        // at once. A term's chunks lie back to back, so this is a read per
+        // term and segment, and the rounds then run without a storage round
+        // trip between them. Every read starts before the first completes, so
+        // a merge dropped early — its query's opens all finished — leaves each
+        // read under way, landing in memory for the next query of the term.
+        let mut tier_bytes = 0u64;
+        let reads: Vec<(usize, usize)> = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(ti, term_sources)| (0..term_sources.len()).map(move |si| (ti, si)))
+            .collect();
+        let fetches: Vec<_> = reads
+            .iter()
+            .map(|&(ti, si)| {
+                let source = &sources[ti][si];
+                index.tier_chunks(&source.object, &source.chunks)
+            })
+            .collect();
+        let fetched: Vec<(Vec<Arc<TierChunkData>>, u64)> = try_join_all(fetches).await?;
+        for (&(ti, si), (data, bytes)) in reads.iter().zip(fetched) {
+            sources[ti][si].data = data;
+            tier_bytes += bytes;
+        }
+        // Decode, score, join and bound, round by round, as one job on the
+        // reader pool: a round is the next block of every live superfile whose
+        // head goes on, and the merge stops when a round moves nothing.
+        let max_rounds = match crate::config::global().diagnostics.tier_rounds {
+            0 => usize::MAX,
+            n => n as usize,
+        };
+        // With the gate off the merge is under test and reads on while a round
+        // excludes anything, whatever the opens were measured to cost: the
+        // rounds it takes then depend on the table alone.
+        let open_cost_ns = if merge_gate { open_cost_ns } else { 0 };
+        let (merge, merge_ns) = run_on_pool(Some(pool), "tier merge", move || {
+            let mut merge = merge;
+            let mut merge_ns = 0u64;
+            for round in 0..max_rounds {
+                let mut reads: Vec<Vec<BlockRead<'_>>> =
+                    (0..merge.slots.len()).map(|_| Vec::new()).collect();
+                let mut read_any = false;
+                for (slot_i, slot) in merge.slots.iter_mut().enumerate() {
+                    if !slot.live {
+                        continue;
+                    }
+                    for (ti, state) in slot.heads.iter_mut().enumerate() {
+                        if state.done {
+                            continue;
+                        }
+                        let Some(si) = state.source else {
+                            continue;
+                        };
+                        let Some(chunk) = sources[ti][si].data.get(round) else {
+                            state.done = true;
+                            continue;
+                        };
+                        let Some(block) = chunk.dir.block_of(slot.ordinal) else {
+                            state.done = true;
+                            continue;
+                        };
+                        reads[slot_i].push(BlockRead {
+                            ti,
+                            dir: &chunk.dir,
+                            block,
+                            body: &chunk.bodies[block],
+                        });
+                        read_any = true;
+                    }
+                }
+                if !read_any {
+                    break;
+                }
+                let started = Instant::now();
+                let excluded = merge.round(&reads);
+                let round_ns = started.elapsed().as_nanos() as u64;
+                merge_ns += round_ns;
+                // Worth reading on: the opens this round saved, at what an open
+                // costs here, cover what the round cost. With the open cost
+                // unknown, any exclusion is taken as worth it. A round that
+                // found no threshold saved nothing and is not read past: the
+                // joint documents a conjunction needs for one sit deeper than
+                // the heads' top blocks, and reading on for them has bought
+                // nothing where it was measured.
+                let worth = pays(excluded as u64, 1, open_cost_ns, round_ns);
+                // A required term whose head the index holds whole settles,
+                // read to its end, which documents carry the term — ruling
+                // out, or answering for, every live superfile the conjunction
+                // has no joint document in. Finishing it is worth the rounds
+                // it still needs while the live opens at stake cover them at
+                // this round's cost; with the open cost unknown it is finished
+                // regardless.
+                let rounds_to_settle = merge
+                    .slots
+                    .iter()
+                    .filter(|s| s.live)
+                    .flat_map(|s| s.heads.iter().enumerate())
+                    .filter(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
+                    .map(|(_, h)| h.blocks.saturating_sub(round as u32 + 1).max(1))
+                    .max();
+                let settling = rounds_to_settle.is_some_and(|rounds| {
+                    let live = merge.slots.iter().filter(|s| s.live).count() as u64;
+                    pays(live, u64::from(rounds), open_cost_ns, round_ns)
+                });
+                let read_on = worth || settling;
+                tracing::debug!(
+                    round,
+                    excluded,
+                    live = merge.slots.iter().filter(|s| s.live).count(),
+                    theta = merge.theta_lb,
+                    entries = merge.entries_read,
+                    round_us = round_ns / 1000,
+                    open_cost_us = open_cost_ns / 1000,
+                    settling,
+                    read_on,
+                    "tier merge round"
+                );
+                if !read_on || merge.entries_read >= MAX_ENTRIES_PER_QUERY {
+                    break;
+                }
+            }
+            (merge, merge_ns)
+        })
+        .await
+        .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))?;
+
+        let bounds: Vec<SuperfileBounds> = merge
+            .slots
+            .iter()
+            .map(|s| SuperfileBounds {
+                lb: s.lb * merge.lb_slack,
+                ub: if s.live { s.ub } else { f32::NEG_INFINITY },
+            })
+            .collect();
+        let mut resolved = Vec::new();
+        if exact_scores {
+            for (si, slot) in merge.slots.iter().enumerate() {
+                // Every head read to its end, and the sums exact: the superfile's
+                // matching documents are its candidates carrying the required
+                // terms, scored as the kernel would score them. One the merge
+                // ruled out holds none that place.
+                let whole = slot.live && slot.heads.iter().all(|h| h.done && h.tail <= 0.0);
+                if whole {
+                    let mut docs: Vec<(u32, f32)> = Vec::new();
+                    let mut scratch = Scratch::default();
+                    slot.join(&mut scratch, |row, mask, contrib| {
+                        if mask & required == required {
+                            docs.push((row, contrib.iter().sum()));
+                        }
+                    });
+                    resolved.push((si, docs));
+                }
+            }
+        }
+        Ok(Some(TierSelection {
+            bounds,
+            theta_lb: merge.theta_lb,
+            resolved,
+            tier_bytes,
+            entries_read: merge.entries_read,
+            merge_ns,
+        }))
+    }
 }
 
 impl Merge {

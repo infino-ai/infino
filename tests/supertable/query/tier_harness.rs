@@ -209,7 +209,27 @@ pub fn queries() -> Vec<(String, BoolMode)> {
 /// (opens, index entries read, superfiles the index answered for), and the
 /// distinct superfiles among the hits. Superfiles are named by their place
 /// in id order so two tables built from the same commits compare.
+///
+/// The query runs twice and the second run is metered: the first brings
+/// the terms' tier chunks into memory, after which the merge runs before
+/// any open and can answer and rule out superfiles. A first query of a
+/// term reads its tiers from storage beside the first opens instead, and
+/// answers the same; what it opens is not what the tests assert on.
 pub fn run(
+    st: &Supertable,
+    query: &str,
+    mode: BoolMode,
+    k: usize,
+) -> (Vec<(usize, u32, f32)>, OpStats, usize) {
+    st.reader()
+        .expect("reader")
+        .bm25_hits("body", query, k, Bm25SearchOptions::new().with_mode(mode))
+        .expect("search");
+    run_once(st, query, mode, k)
+}
+
+/// [`run`] without the priming ask: this one ask, metered as it comes.
+pub fn run_once(
     st: &Supertable,
     query: &str,
     mode: BoolMode,

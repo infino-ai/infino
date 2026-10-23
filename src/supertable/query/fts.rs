@@ -78,7 +78,7 @@ use std::{
     slice,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::Instant,
 };
@@ -1085,15 +1085,8 @@ impl SupertableReader {
         // One span over the three awaits that read the term index (its load,
         // the score ceilings, the postings locations), with the synchronous
         // work between them.
-        // It also reports what the tiers settled: superfiles answered from
-        // the index, and superfiles ruled out before any open.
         let term_span = trace::phase(phases, || {
-            detail_span!(
-                "fts.term_index",
-                terms = tracing::field::Empty,
-                resolved = tracing::field::Empty,
-                ruled_out = tracing::field::Empty,
-            )
+            detail_span!("fts.term_index", terms = tracing::field::Empty)
         });
         let term_index = manifest.term_index().instrument(term_span.clone()).await?;
         // Every scored term, phrase members included, once: what the index
@@ -1125,20 +1118,14 @@ impl SupertableReader {
         // chooses its superfiles from the documents the tiers name — per
         // superfile a bound that knows which documents carry several of the
         // terms, and a superfile a required term has shown holds no
-        // candidate is not opened. The bounds replace the ceilings, and the
+        // candidate is not opened. The bounds tighten the ceilings, and the
         // merge's lower bound on the k-th score is seeded into the shared
-        // floor below. A phrase is bounded by its members and a negation
-        // by its positive terms, but neither yields a threshold: such a
-        // query is bounded and ordered, and seeds nothing. A query of more
-        // terms than the merge tracks keeps the ceilings. Only a complete index can rule a
-        // superfile out: one that does not yet list every live superfile
-        // knows nothing about the rest.
-        let mut tier_seed: Option<f32> = None;
-        // Superfiles the tiers answer for outright: their hits, tagged as a
-        // kernel's would be, and the scores to raise the shared floor with
-        // before any open.
-        let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
-        let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
+        // floor. A phrase is bounded by its members and a negation by its
+        // positive terms, but neither yields a threshold: such a query is
+        // bounded and ordered, and seeds nothing. A query of more terms
+        // than the merge tracks keeps the ceilings. Only a complete index
+        // can rule a superfile out: one that does not yet list every live
+        // superfile knows nothing about the rest.
         // Rows deleted from each kept superfile: the tiers still hold them,
         // so the merge reads past them, and a kernel admits only the live
         // rows, so its k best are live. A sidecar that cannot be read
@@ -1206,14 +1193,30 @@ impl SupertableReader {
         let ranked_started = Instant::now();
         let learned = manifest.options.tier_merge_gate;
         let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
-        let mut selected = false;
-        if let Some((index, column_id)) = index_column
+        // The merge, when it runs, runs beside the first opens rather than
+        // before them: its tier reads are a round trip of their own on a
+        // cold store, and spent ahead of the opens they would cost what
+        // they save. The fan-out starts in ceiling order; the units not
+        // yet issued when the merge reports are re-planned by what it
+        // found — answered from the index, ruled out, or reordered by
+        // their tighter bounds — and its threshold is seeded into the
+        // floor. What the merge needs is gathered here and it is started
+        // at the fan-out; `selected` records that it reported in time.
+        let selected = AtomicBool::new(false);
+        let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
+        let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
+        let merge_kept: Vec<Arc<SuperfileEntry>> = match merge_now {
+            true => kept.clone(),
+            false => Vec::new(),
+        };
+        let mut tier_query: Option<tier::TierQuery<'_>> = None;
+        if let Some((_, column_id)) = index_column
             && merge_now
         {
             // Bits over the distinct terms: the bare terms score on their
             // own; a match must carry the musts and every member of a
             // must-phrase.
-            let index_of = |n: &String| all_terms.iter().position(|t| *t == n.as_str());
+            let index_of = |n: &String| merge_term_refs.iter().position(|t| *t == n.as_str());
             let bits = |names: &[String]| -> tier::TermMask {
                 names
                     .iter()
@@ -1239,112 +1242,28 @@ impl SupertableReader {
             // the kernels; the tiers score each term once, so such a query
             // is not served.
             let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
-            let selection = match column_params(manifest, column) {
-                Some(params) if !repeated && deny_known => {
-                    let query = tier::TierQuery {
-                        column: column_id,
-                        terms: &all_terms,
-                        required,
-                        scoring,
-                        phrases: tier_phrases,
-                        negated: !negatives.is_empty(),
-                        k,
-                        deny,
-                        table_avgdl,
-                        params,
-                        open_cost_ns: self.open_cost_ns(),
-                        entry_cost_ns: self.tier_entry_cost_ns(),
-                        merge_gate: manifest.options.tier_merge_gate,
-                    };
-                    let selected = tier::select_with_tiers(
-                        index,
-                        &query,
-                        &kept,
-                        &global_idf,
-                        &manifest.options.reader_pool,
-                    )
-                    .instrument(term_span.clone())
-                    .await;
-                    match selected {
-                        Ok(selection) => selection,
-                        // The tiers only make the query faster, and its
-                        // ceilings are in hand: a tier that cannot be read
-                        // or does not verify leaves the query to them.
-                        Err(e) => {
-                            warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            if let Some(selection) = selection {
-                selected = true;
-                if let Some(stats) = &self.op_stats {
-                    stats.add_tier_read(selection.tier_bytes, selection.entries_read);
-                }
-                if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
-                    self.note_tier_entry_cost(per_entry);
-                }
-                let mut answered: Vec<bool> = vec![false; kept.len()];
-                if !selection.resolved.is_empty() {
-                    // The merge read past every deleted row, so what it
-                    // answers with is live.
-                    for (si, hits) in selection.resolved {
-                        let entry = &kept[si];
-                        answered[si] = true;
-                        resolved_scores.push((entry.id_max, hits.iter().map(|h| h.1).collect()));
-                        resolved_units.push(dispatch::tag_hits(entry, hits));
-                    }
-                    if let Some(stats) = &self.op_stats {
-                        stats.add_superfiles_resolved(answered.iter().filter(|a| **a).count() as u64);
-                    }
-                }
-                // A superfile the index answered for, or one the merge ruled
-                // out — every candidate it could hold is below the threshold,
-                // or a conjunction's term has shown it holds none — is not
-                // opened. The rest open by their upper bound, as the ceiling
-                // path opens by ceiling (the bound the skip decision reads),
-                // then by their best known candidate; equal bounds open in
-                // `_id` order, so a run of superfiles that can only tie is
-                // settled by the first of them.
-                let mut ordered: Vec<(Arc<SuperfileEntry>, tier::SuperfileBounds)> = kept
-                    .drain(..)
-                    .zip(selection.bounds)
-                    .enumerate()
-                    .filter(|(si, (_, b))| !answered[*si] && b.ub > f32::NEG_INFINITY)
-                    .map(|(_, pair)| pair)
-                    .collect();
-                ordered.sort_by(|(a, x), (b, y)| {
-                    y.ub.total_cmp(&x.ub)
-                        .then(y.lb.total_cmp(&x.lb))
-                        .then(a.id_min.cmp(&b.id_min))
+            if let Some(params) = column_params(manifest, column)
+                && !repeated
+                && deny_known
+            {
+                tier_query = Some(tier::TierQuery {
+                    column: column_id,
+                    terms: &merge_term_refs,
+                    required,
+                    scoring,
+                    phrases: tier_phrases,
+                    negated: !negatives.is_empty(),
+                    k,
+                    deny,
+                    table_avgdl,
+                    params,
+                    open_cost_ns: self.open_cost_ns(),
+                    entry_cost_ns: self.tier_entry_cost_ns(),
+                    merge_gate: manifest.options.tier_merge_gate,
                 });
-                ceilings = Some(
-                    ordered
-                        .iter()
-                        .map(|(e, b)| (e.superfile_id, b.ub))
-                        .collect(),
-                );
-                let resolved = answered.iter().filter(|a| **a).count();
-                term_span.record("resolved", resolved as u64);
-                term_span.record(
-                    "ruled_out",
-                    (answered.len() - resolved - ordered.len()) as u64,
-                );
-                kept = ordered.into_iter().map(|(e, _)| e).collect();
-                if selection.theta_lb.is_finite() {
-                    tier_seed = Some(selection.theta_lb);
-                }
             }
         }
-        // The index served but no merge ran: it answered for nothing and
-        // ruled nothing out, and the span says so.
-        if tiers_serve && !selected {
-            term_span.record("resolved", 0u64);
-            term_span.record("ruled_out", 0u64);
-        }
-        if !selected && let Some((index, column_id)) = index_column {
+        if let Some((index, column_id)) = index_column {
             // Ceilings rescale by each term's table idf, so they order and
             // skip only when the map holds every scored term.
             let terms: Vec<&str> = musts
@@ -1449,17 +1368,6 @@ impl SupertableReader {
         // beat what earlier units already found. Tombstoned hits are
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
-        // The tiers' lower bound on the k-th score is a floor every kernel
-        // may prune against from its first block; the real scores that
-        // replace these placeholders only raise it.
-        if let Some(seed) = tier_seed {
-            shared.merge(i128::MAX, repeat_n(seed, k));
-        }
-        // Scores the index settled are real documents at known ids: they
-        // raise the floor and settle ties before the first open.
-        for (id_max, scores) in resolved_scores {
-            shared.merge(id_max, scores);
-        }
         let floor_handle = Arc::clone(&shared);
         let merger = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
@@ -1501,6 +1409,9 @@ impl SupertableReader {
             None => HashSet::new(),
         });
         let merge_in_unit = exact_count || ceilings.is_none();
+        // What the merge, started at the fan-out below, scores and seeds.
+        let merge_idf = global_idf.clone();
+        let merge_floor = Arc::clone(&shared);
         let kernel = move |r: Arc<SuperfileReader>, params: UnitParams| {
             let UnitParams {
                 range,
@@ -1839,9 +1750,160 @@ impl SupertableReader {
                 Ok(rows_as_local_ids(hits))
             }
         };
-        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        // An exact count opens every unit: a skipped superfile's matches
-        // would go uncounted.
+        let fanout_span = trace::phase(phases, || {
+            tiered_span!(
+                "fts.fanout",
+                units = units.len(),
+                resolved = tracing::field::Empty,
+                ruled_out = tracing::field::Empty,
+            )
+        });
+        let fanout_records = fanout_span.clone();
+        // Units per superfile: a superfile the index answers for is
+        // answered only when none of its units was issued — an issued
+        // unit's kernel answers for its rows, and the rest open as planned.
+        let units_of: HashMap<Uuid, usize> = units.iter().fold(HashMap::new(), |mut m, (e, _)| {
+            *m.entry(e.superfile_id).or_insert(0) += 1;
+            m
+        });
+        // The merge, prepared here. With its tier chunks in memory it runs
+        // first: it costs no round trip, and the kernels it spares cost
+        // more than the wait. With chunks to read from storage it runs
+        // beside the first opens, and re-plans the units not yet issued
+        // when it reports. Either way one plan applies what it found.
+        let mut units = units;
+        let mut settled_before: Vec<Vec<SuperfileHit>> = Vec::new();
+        let mut replan: Option<dispatch::ReplanFuture<'_, UnitParams, Vec<SuperfileHit>>> = None;
+        if let (Some(query), Some((index, _))) = (tier_query, index_column) {
+            let global_idf = merge_idf;
+            let pool = &manifest.options.reader_pool;
+            let span = fanout_span.clone();
+            let merger = merge_floor;
+            // The kept superfiles in the order the merge bounds them.
+            let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
+            let reader = self;
+            let selected = &selected;
+            // What a selection does to the units it is handed: the
+            // superfiles the index answers for are settled and their
+            // scores folded into the floor, the ruled-out dropped, the rest
+            // reordered by their tighter bounds, and the threshold seeded.
+            let make_plan = move |selection: tier::TierSelection| -> dispatch::Replan<'_, UnitParams, Vec<SuperfileHit>> {
+                if let Some(stats) = &reader.op_stats {
+                    stats.add_tier_read(selection.tier_bytes, selection.entries_read);
+                }
+                if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
+                    reader.note_tier_entry_cost(per_entry);
+                }
+                Box::new(move |remaining: dispatch::Units<UnitParams>| {
+                    let bounds_of: HashMap<Uuid, tier::SuperfileBounds> =
+                        merged_ids.iter().copied().zip(selection.bounds).collect();
+                    let mut answers: HashMap<Uuid, Vec<(u32, f32)>> = selection
+                        .resolved
+                        .into_iter()
+                        .map(|(si, hits)| (merged_ids[si], hits))
+                        .collect();
+                    let mut remaining_of: HashMap<Uuid, usize> = HashMap::new();
+                    for (e, _) in &remaining {
+                        *remaining_of.entry(e.superfile_id).or_insert(0) += 1;
+                    }
+                    answers.retain(|id, _| remaining_of.get(id) == units_of.get(id));
+                    let answered: HashSet<Uuid> = answers.keys().copied().collect();
+                    let mut keep: Vec<(Arc<SuperfileEntry>, UnitParams, f32)> =
+                        Vec::with_capacity(remaining.len());
+                    let mut settled: Vec<Vec<SuperfileHit>> = Vec::new();
+                    let mut ruled_out = 0u64;
+                    for (entry, mut params) in remaining {
+                        let id = entry.superfile_id;
+                        if answered.contains(&id) {
+                            // The merge read past every deleted row, so
+                            // what it answers with is live; its scores
+                            // are real documents at known ids, and raise
+                            // the floor and settle ties.
+                            if let Some(hits) = answers.remove(&id) {
+                                merger.merge(entry.id_max, hits.iter().map(|h| h.1));
+                                settled.push(dispatch::tag_hits(&entry, hits));
+                            }
+                            continue;
+                        }
+                        let Some(b) = bounds_of.get(&id) else {
+                            keep.push((entry, params, f32::NEG_INFINITY));
+                            continue;
+                        };
+                        if b.ub == f32::NEG_INFINITY {
+                            ruled_out += 1;
+                            continue;
+                        }
+                        // A merged bound is at most the ceiling; the skip
+                        // decision reads it as such.
+                        params.ceiling = b.ub.min(params.ceiling);
+                        keep.push((entry, params, b.lb));
+                    }
+                    // The rest open by their upper bound, as the ceiling
+                    // path opens by ceiling, then by their best known
+                    // candidate; equal bounds open in `_id` order, so a run
+                    // of superfiles that can only tie is settled by the
+                    // first of them.
+                    keep.sort_by(|(a, x, xl), (b, y, yl)| {
+                        y.ceiling
+                            .total_cmp(&x.ceiling)
+                            .then(yl.total_cmp(xl))
+                            .then(a.id_min.cmp(&b.id_min))
+                    });
+                    // The tiers' lower bound on the k-th score is a floor
+                    // every kernel may prune against; the real scores that
+                    // replace these placeholders only raise it.
+                    if selection.theta_lb.is_finite() {
+                        merger.merge(i128::MAX, repeat_n(selection.theta_lb, k));
+                    }
+                    let resolved = answered.len() as u64;
+                    if resolved > 0 && let Some(stats) = &reader.op_stats {
+                        stats.add_superfiles_resolved(resolved);
+                    }
+                    span.record("resolved", resolved);
+                    span.record("ruled_out", ruled_out);
+                    selected.store(true, AtomicOrdering::Relaxed);
+                    (keep.into_iter().map(|(e, p, _)| (e, p)).collect(), settled)
+                })
+            };
+            // The tiers only make the query faster, and the ceilings are in
+            // hand: a tier that cannot be read or does not verify leaves
+            // the query to them.
+            let unreadable = |e: term_index::TermIndexError| {
+                warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
+            };
+            let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
+                .await
+                .unwrap_or_else(|e| {
+                    unreadable(e);
+                    None
+                });
+            match prepared {
+                Some(prepared) if prepared.resident => {
+                    let selection = prepared.run().await.unwrap_or_else(|e| {
+                        unreadable(e);
+                        None
+                    });
+                    if let Some(selection) = selection {
+                        let (keep, settled) = make_plan(selection)(units);
+                        units = keep;
+                        settled_before = settled;
+                    }
+                }
+                Some(prepared) => {
+                    replan = Some(Box::pin(async move {
+                        match prepared.run().await {
+                            Ok(Some(selection)) => Some(make_plan(selection)),
+                            Ok(None) => None,
+                            Err(e) => {
+                                unreadable(e);
+                                None
+                            }
+                        }
+                    }));
+                }
+                None => {}
+            }
+        }
         let per_unit = match !exact_count && ceilings.is_some() {
             // Units are in descending ceiling order. A unit whose ceiling is
             // strictly below the running k-th score cannot place a document
@@ -1879,6 +1941,7 @@ impl SupertableReader {
                             merger.merge(id_max, hits.iter().map(|h| h.score));
                         }
                     },
+                    replan,
                 )
                 .instrument(fanout_span)
                 .await?
@@ -1889,8 +1952,15 @@ impl SupertableReader {
                     .await?
             }
         };
+        // The index served but no merge reported in time — it declined,
+        // or every unit was issued before it did: it answered for nothing
+        // and ruled nothing out, and the span says so.
+        if tiers_serve && !selected.load(AtomicOrdering::Relaxed) {
+            fanout_records.record("resolved", 0u64);
+            fanout_records.record("ruled_out", 0u64);
+        }
         let mut per_unit = per_unit;
-        per_unit.extend(resolved_units);
+        per_unit.extend(settled_before);
         let hits = select_top_k_stable(self, per_unit, k).await?;
         // Noted for the way the policy chose, whether or not the merge
         // then ran: a shape it declines every time is thereby measured as

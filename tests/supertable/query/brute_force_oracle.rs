@@ -1087,6 +1087,12 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
             ),
         ];
         let hits_of = |st: &Supertable, q: &str, mode: BoolMode, k: usize| {
+            // Asked twice, the second metered: the first brings the terms'
+            // tiers into memory, after which the merge runs before any open.
+            st.reader()
+                .expect("reader")
+                .bm25_hits("title", q, k, Bm25SearchOptions::new().with_mode(mode))
+                .expect("search");
             let (hits, stats) = infino::runtime_metrics::op_stats::with_op_stats(|| {
                 st.reader()
                     .expect("reader")
