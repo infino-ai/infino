@@ -1305,7 +1305,10 @@ impl TermCursor {
             // the two lists interleave; it stays for sparse targets, where it
             // skips long stretches of postings.
             let k_end = k + docs[k..].partition_point(|&d| d <= last);
-            if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
+            // Enough targets to pay for marking the block: answer them all by
+            // bitmap (the threshold the phrase filter uses). Failing that, a
+            // balanced block still merges branch-free.
+            if (k_end - k) * FILTER_BITMAP_RATIO >= n - p {
                 let tfs = &self.block_tfs[..n];
                 if p < n
                     && probe_by_bitmap(&ids[p..], &tfs[p..], &docs[k..k_end], &mut out[k..k_end])
@@ -1319,6 +1322,9 @@ impl TermCursor {
                     self.pos = p.min(n.saturating_sub(1));
                     continue;
                 }
+            }
+            if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
+                let tfs = &self.block_tfs[..n];
                 while k < k_end && p < n {
                     let (t, x) = (docs[k], ids[p]);
                     out[k] = if t == x { tfs[p] } else { 0 };
