@@ -410,23 +410,18 @@ impl GroupIndex {
         // the prefix sum overflow-free; the per-encoding lane rule is chosen
         // once, not called per pair.
         u32::try_from(n).ok()?;
+        // Sized once and filled with the running sum in a register: pushing
+        // grew the vector through memory for every pair of every block.
         self.starts.clear();
-        self.starts.reserve(tfs.len() + 1);
-        self.starts.push(0);
+        self.starts.resize(tfs.len() + 1, 0);
         let mut acc = 0u32;
-        match self.kind {
-            GroupKind::Packed => {
-                for &tf in tfs {
-                    acc += tf.saturating_sub(1);
-                    self.starts.push(acc);
-                }
-            }
-            _ => {
-                for &tf in tfs {
-                    acc += tf;
-                    self.starts.push(acc);
-                }
-            }
+        let lanes_per_pair = |tf: u32| match self.kind {
+            GroupKind::Packed => tf.saturating_sub(1),
+            _ => tf,
+        };
+        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
+            acc += lanes_per_pair(tf);
+            *slot = acc;
         }
         Some(())
     }
