@@ -503,6 +503,46 @@ mod tests {
     }
 
     #[test]
+    fn score_key_orders_exactly_as_total_cmp() {
+        let values = [
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            1e-30,
+            0.25,
+            1.0,
+            1.0 + f32::EPSILON,
+            3.5,
+            7.25,
+            1e30,
+            f32::MAX,
+            -1.0,
+            -3.5,
+            f32::MIN,
+        ];
+        for &a in &values {
+            for &b in &values {
+                assert_eq!(
+                    score_key(a).cmp(&score_key(b)),
+                    a.total_cmp(&b),
+                    "score_key({a}) vs score_key({b})"
+                );
+            }
+        }
+        // Equal scores tie on the key, so the doc id decides: the heap keeps
+        // the smaller one.
+        let tied = |d: u32| TopKEntry(2.5f32, FtsDocId::new(d));
+        let mut heap: BinaryHeap<TopKEntry> = [tied(9), tied(3)].into_iter().collect();
+        assert_eq!(
+            heap.peek().map(|e| e.1.get()),
+            Some(9),
+            "the larger id is evicted first"
+        );
+        heap.pop();
+        assert_eq!(heap.peek().map(|e| e.1.get()), Some(3));
+    }
+
+    #[test]
     fn replace_worst_is_pop_then_push() {
         let mut a: BinaryHeap<TopKEntry> = [(1.0, 4), (2.0, 1), (3.0, 7)]
             .into_iter()
