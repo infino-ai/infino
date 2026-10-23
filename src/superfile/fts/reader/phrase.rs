@@ -175,10 +175,19 @@ fn verify_members(
         positions_of(&mut members[j], j)?;
         let plist = &members[j].pos_scratch;
         let off = offsets[j];
-        starts.retain(|&s| {
-            s.checked_add(off)
-                .is_some_and(|want| plist.binary_search(&want).is_ok())
-        });
+        // Compacted in place without a branch on the outcome, which on a
+        // common member is close to a coin flip; the search per start stays,
+        // as it beat a merge on every lane measured.
+        let mut w = 0usize;
+        for r in 0..starts.len() {
+            let s = starts[r];
+            let found = s
+                .checked_add(off)
+                .is_some_and(|want| plist.binary_search(&want).is_ok());
+            starts[w] = s;
+            w += usize::from(found);
+        }
+        starts.truncate(w);
     }
     Ok(starts.len() as u32)
 }
