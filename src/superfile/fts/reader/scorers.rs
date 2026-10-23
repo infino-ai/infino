@@ -895,24 +895,6 @@ fn leader_tf_floor(idf_weight: f32, min_norm: f32, others_ub: f32, threshold: f3
 /// Largest tf [`leader_tf_floor`] searches to.
 const TF_FLOOR_CAP: u32 = 16;
 
-/// Smallest `k` at which a whole-column union seeds its bar from its best
-/// windows before the main pass.
-const SEEDED_TOPK_MIN_K: usize = 512;
-
-/// Windows the seed scores exactly.
-#[cfg(not(test))]
-const SEED_WINDOWS: usize = 8;
-/// Test corpora span a few windows: seed from two, so the oracles grade the
-/// seeded pass.
-#[cfg(test)]
-const SEED_WINDOWS: usize = 2;
-
-/// Windows the column must hold per seed window for seeding to pay.
-#[cfg(not(test))]
-const SEED_MIN_WINDOWS_PER_SEED: usize = 4;
-#[cfg(test)]
-const SEED_MIN_WINDOWS_PER_SEED: usize = 1;
-
 /// Most optional terms the required-term walk takes; a wider list keeps
 /// the general must+should walk.
 const MAX_SHOULDS_LED: usize = 16;
@@ -2650,23 +2632,6 @@ impl FtsReader {
         // heap's sift per admission is a fifth of the kernel; a buffer cut by
         // selection costs an append instead. At a small `k` the bar must rise
         // on every admission, which only the heap does.
-        // A large `k` over the whole column with no exclusion: seed the bar
-        // from the best windows first (see `seed_threshold`). The seed is the
-        // k-th best of real docs, so it never exceeds the final k-th best; one
-        // step under it keeps a doc that ties it eligible on the doc-id leg,
-        // and pruning against it from the first window is exact.
-        let seeded = match k >= SEEDED_TOPK_MIN_K
-            && filter.is_none()
-            && doc_id_start == 0
-            && doc_id_end == u32::MAX
-        {
-            true => self.seed_threshold(column_id, &cursors, k)?,
-            false => None,
-        };
-        let (floor_eff, floor_prunes) = match seeded {
-            Some(seed) => (floor_eff.max(seed.next_down()), true),
-            None => (floor_eff, false),
-        };
         match k >= BUFFERED_TOPK_MIN_K {
             true => self.run_windowed_maxscore_with::<TopKBuffer>(
                 column_id,
@@ -2676,7 +2641,6 @@ impl FtsReader {
                 floor_eff,
                 doc_id_start,
                 doc_id_end,
-                floor_prunes,
             ),
             false => self.run_windowed_maxscore_with::<BinaryHeap<TopKEntry>>(
                 column_id,
@@ -2686,70 +2650,8 @@ impl FtsReader {
                 floor_eff,
                 doc_id_start,
                 doc_id_end,
-                floor_prunes,
             ),
         }
-    }
-
-    /// A lower bound on a union's k-th best score, from its most promising
-    /// windows: each window's bound is the sum over terms of the best block
-    /// maximum a term has there, read from block metadata alone; the
-    /// [`SEED_WINDOWS`] highest are scored exactly (on cloned cursors), and the
-    /// k-th best of those hits is returned. `None` when the column is too small
-    /// for seeding to pay or the windows hold fewer than `k` hits.
-    fn seed_threshold(
-        &self,
-        column_id: u32,
-        cursors: &[TermCursor],
-        k: usize,
-    ) -> Result<Option<f32>, FtsError> {
-        let n_windows = (self.n_docs as usize).div_ceil(OR_WINDOW as usize);
-        if n_windows < SEED_WINDOWS * SEED_MIN_WINDOWS_PER_SEED {
-            return Ok(None);
-        }
-        let mut bound = vec![0.0f32; n_windows];
-        let mut term_best = vec![0.0f32; n_windows];
-        for c in cursors {
-            term_best.fill(0.0);
-            let mut first = 0u32;
-            for block in c.blocks.iter() {
-                let (w0, w1) = (
-                    (first / OR_WINDOW) as usize,
-                    (block.last_doc_id / OR_WINDOW) as usize,
-                );
-                for best in &mut term_best[w0..=w1.min(n_windows - 1)] {
-                    *best = best.max(block.block_max_bm25);
-                }
-                first = block.last_doc_id.saturating_add(1);
-            }
-            for (b, t) in bound.iter_mut().zip(&term_best) {
-                *b += t;
-            }
-        }
-        let mut order: Vec<usize> = (0..n_windows).collect();
-        order.select_nth_unstable_by(SEED_WINDOWS - 1, |&a, &b| bound[b].total_cmp(&bound[a]));
-        order.truncate(SEED_WINDOWS);
-        order.sort_unstable();
-        let mut scores: Vec<f32> = Vec::new();
-        for w in order {
-            let start = w as u32 * OR_WINDOW;
-            let hits = self.run_windowed_maxscore_with::<TopKBuffer>(
-                column_id,
-                cursors.to_vec(),
-                k,
-                None,
-                0.0,
-                start,
-                start.saturating_add(OR_WINDOW),
-                false,
-            )?;
-            scores.extend(hits.iter().map(|&(_, s)| s));
-        }
-        if scores.len() < k {
-            return Ok(None);
-        }
-        scores.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-        Ok(Some(scores[k - 1]))
     }
 
     fn run_windowed_maxscore_with<C: Collector>(
@@ -2761,7 +2663,6 @@ impl FtsReader {
         floor_eff: f32,
         doc_id_start: u32,
         doc_id_end: u32,
-        floor_prunes: bool,
     ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         if k == 0 {
             return Ok(Vec::new());
@@ -2837,7 +2738,7 @@ impl FtsReader {
                     break;
                 }
                 // Skip the whole block if it cannot beat threshold.
-                if heap.is_full(k) || floor_prunes {
+                if heap.is_full(k) {
                     // The other terms bounded over this block's own range,
                     // not their whole lists: a mid-frequency term's best
                     // document elsewhere must not hold this block open.
@@ -3018,7 +2919,7 @@ impl FtsReader {
             // restricted to essentials.
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
-            let prune = heap.is_full(k) || floor_prunes;
+            let prune = heap.is_full(k);
             // Block-level partition for this window. A term whose block
             // maxima over the window cannot lift the weaker terms past the
             // threshold is non-essential *here*, even if its term max keeps
@@ -3162,7 +3063,7 @@ impl FtsReader {
             // the reference pipeline: SIMD-filter to competitive survivors,
             // complete the non-essentials over the survivors only, collect.
             let (_, non_ess) = cursors.split_at_mut(f_win);
-            let heap_full = heap.is_full(k) || floor_prunes;
+            let heap_full = heap.is_full(k);
             let words = ((window_end - base) as usize)
                 .div_ceil(64)
                 .min(OR_WINDOW_WORDS);
@@ -3179,7 +3080,7 @@ impl FtsReader {
                     }
                     // A word whose best score cannot beat the k-th best holds no
                     // hit: clear its slots without visiting a document.
-                    if heap.is_full(k) || floor_prunes {
+                    if heap.is_full(k) {
                         let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
                         if !word_beats(slots, threshold) {
                             slots.fill(0.0);
