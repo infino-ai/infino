@@ -3548,7 +3548,7 @@ impl FtsReader {
     }
 
     /// [`Self::rare_led_pair`] for three or more terms: one term much rarer
-    /// than every other leads, the others are probed at its documents, and
+    /// than every other, and first in the windowed kernel's order, leads, the others are probed at its documents, and
     /// the result stands when the k-th best is strictly above the sum of the
     /// others' maxima, which bounds any document without the rare term. The
     /// bound is a sum of bounds, rounded, so it may only equal such a
@@ -3559,17 +3559,23 @@ impl FtsReader {
         cursors: &[TermCursor],
         k: usize,
     ) -> Option<Vec<(FtsDocId, f32)>> {
-        let rare_at = (0..cursors.len()).min_by_key(|&i| cursors[i].df)?;
-        let rare = &cursors[rare_at];
+        // The terms in the order the windowed kernel sums them (descending
+        // by term maximum, the same sort on the same input, so the same
+        // permutation): the walk adds the lead first and the others in the
+        // order given, so a score here is the kernel's bits. The rare term
+        // must come first in that order to lead.
+        let mut order: Vec<usize> = (0..cursors.len()).collect();
+        order.sort_unstable_by(|&a, &b| {
+            cursors[b]
+                .term_max_bm25
+                .partial_cmp(&cursors[a].term_max_bm25)
+                .unwrap_or(Ordering::Equal)
+        });
+        let rare = &cursors[order[0]];
         if rare.df == 0 || rare.df > RARE_LED_MAX_DF {
             return None;
         }
-        let others: Vec<TermCursor> = cursors
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != rare_at)
-            .map(|(_, c)| c.clone())
-            .collect();
+        let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
         if others
             .iter()
             .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
