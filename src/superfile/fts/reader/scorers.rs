@@ -10,6 +10,8 @@
 use std::cell::RefCell;
 use std::{cmp::Ordering, collections::BinaryHeap, slice::from_mut};
 
+use wide::f32x8;
+
 use super::{
     core::*,
     cursor::{CursorUse, TermCursor},
@@ -30,7 +32,6 @@ use crate::superfile::{
 /// Left-pack control table: for each 8-bit survivor mask, the lane indices that
 /// gather the set lanes to the front (for `permutevar8x32`). Unset trailing
 /// slots are don't-cares (the store advances only by `popcount(mask)`).
-#[cfg(target_arch = "x86_64")]
 const fn build_left_pack() -> [[u8; 8]; 256] {
     let mut t = [[0u8; 8]; 256];
     let mut m = 0usize;
@@ -48,7 +49,6 @@ const fn build_left_pack() -> [[u8; 8]; 256] {
     }
     t
 }
-#[cfg(target_arch = "x86_64")]
 static LEFT_PACK: [[u8; 8]; 256] = build_left_pack();
 
 /// Compact `(docs, scores)` in place to the entries with `score >= min_score`,
@@ -2709,7 +2709,9 @@ impl FtsReader {
         // A fixed array and a count held in a register: pushing to a `Vec`
         // and dropping the entry again keeps its length in memory, one
         // store-to-load chain per posting.
-        let mut survivors = [0u16; BLOCK_LEN];
+        // Eight slots of slack: a batch of eight writes all its slots and
+        // keeps only the survivors.
+        let mut survivors = [0u16; BLOCK_LEN + 8];
         let mut n_survivors: usize;
         let mut leader_scores = [0.0f32; BLOCK_LEN];
         // Compacted per-window candidate list (doc + essential score), reused;
@@ -2792,10 +2794,19 @@ impl FtsReader {
                         let lanes =
                             bm25::score_one_term_x8(c.idf_weight, tfs, dl_norm_k1.get8(dids));
                         leader_scores[i..i + 8].copy_from_slice(&lanes);
-                        for (l, &score) in lanes.iter().enumerate() {
-                            survivors[n_survivors] = (i + l) as u16;
-                            n_survivors += usize::from(score + block_others_ub > threshold);
+                        // One compare for the eight lanes, then the survivors'
+                        // positions written left-packed from the mask: no
+                        // lane's slot waits on the count of the lane before.
+                        let keep = (f32x8::from(lanes) + f32x8::splat(block_others_ub))
+                            .simd_gt(f32x8::splat(threshold))
+                            .to_bitmask() as usize;
+                        let pack = &LEFT_PACK[keep];
+                        for (slot, &lane) in
+                            survivors[n_survivors..n_survivors + 8].iter_mut().zip(pack)
+                        {
+                            *slot = (i + usize::from(lane)) as u16;
                         }
+                        n_survivors += keep.count_ones() as usize;
                         i += 8;
                     }
                     let tail = c.block_doc_ids[i..to].iter().zip(&c.block_tfs[i..to]);
