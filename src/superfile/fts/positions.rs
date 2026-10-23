@@ -298,13 +298,22 @@ impl StreamIndex {
     }
 
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
-        let payload = &bytes[self.payload.clone()];
         let base = out.len();
         out.resize(base + n, 0);
-        if unpack_lanes_u32(payload, from, self.width, &mut out[base..]).is_none() {
+        let read = self.read_lanes_into(bytes, from, &mut out[base..]);
+        if read.is_none() {
             out.truncate(base);
-            return None;
         }
+        read
+    }
+
+    /// [`Self::read_lanes`] into a slice of exactly the lanes wanted, which
+    /// every lane overwrites: a buffer reused across groups is then sized,
+    /// not cleared and zero-filled again before the unpack.
+    fn read_lanes_into(&self, bytes: &[u8], from: usize, out: &mut [u32]) -> Option<()> {
+        let payload = &bytes[self.payload.clone()];
+        let n = out.len();
+        unpack_lanes_u32(payload, from, self.width, out)?;
         if self.exceptions.is_empty() {
             return Some(());
         }
@@ -316,7 +325,7 @@ impl StreamIndex {
             if lane >= from + n {
                 break;
             }
-            out[base + lane - from] |= self.exception_hi(hi);
+            out[lane - from] |= self.exception_hi(hi);
         }
         Some(())
     }
@@ -440,12 +449,14 @@ impl GroupIndex {
             && self.served >= BULK_AFTER_RUNS
             && pair < self.served as usize * BULK_MAX_STRIDE
         {
-            self.firsts.clear();
-            self.gaps.clear();
             let n_pairs = self.starts.len() - 1;
             let n_gaps = *self.starts.last()? as usize;
-            self.first.read_lanes(bytes, 0, n_pairs, &mut self.firsts)?;
-            self.gap.read_lanes(bytes, 0, n_gaps, &mut self.gaps)?;
+            // Sized, not cleared: every lane is overwritten, so only growth
+            // past the last group's length is zero-filled.
+            self.firsts.resize(n_pairs, 0);
+            self.gaps.resize(n_gaps, 0);
+            self.first.read_lanes_into(bytes, 0, &mut self.firsts)?;
+            self.gap.read_lanes_into(bytes, 0, &mut self.gaps)?;
             self.kind = GroupKind::Bulk;
         }
         self.served += 1;
