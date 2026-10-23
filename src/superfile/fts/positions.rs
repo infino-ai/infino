@@ -19,8 +19,8 @@ use std::ops::Range;
 
 use crate::{
     superfile::bits::{
-        ExceptionPlan, PackScratch, for_each_lane, get_bits, payload_bytes, plan_exceptions,
-        put_bits,
+        ExceptionPlan, PackScratch, get_bits, payload_bytes, plan_exceptions, put_bits,
+        unpack_lanes_u32,
     },
     utils::varint::{push_varint, read_varint, varint_len},
 };
@@ -300,8 +300,11 @@ impl StreamIndex {
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
         let payload = &bytes[self.payload.clone()];
         let base = out.len();
-        out.reserve(n);
-        for_each_lane(payload, from, n, self.width, |v| out.push(v as u32))?;
+        out.resize(base + n, 0);
+        if unpack_lanes_u32(payload, from, self.width, &mut out[base..]).is_none() {
+            out.truncate(base);
+            return None;
+        }
         if self.exceptions.is_empty() {
             return Some(());
         }
@@ -456,6 +459,7 @@ impl GroupIndex {
             GroupKind::Leb128 => {
                 self.run
                     .extend_from_slice(self.values.get(start..start + tf as usize)?);
+                positions_from_run_values(&self.run, out)
             }
             GroupKind::Packed => {
                 if tf as usize <= SMALL_TF {
@@ -472,18 +476,38 @@ impl GroupIndex {
                     }
                     return Some(());
                 }
-                self.first.read_lanes(bytes, pair, 1, &mut self.run)?;
-                self.gap
-                    .read_lanes(bytes, start, tf as usize - 1, &mut self.run)?;
+                // A long run: its raw values go straight into `out` and are
+                // summed there, with no staging buffer in between.
+                let base = out.len();
+                self.first.read_lanes(bytes, pair, 1, out)?;
+                self.gap.read_lanes(bytes, start, tf as usize - 1, out)?;
+                prefix_sum_in_place(&mut out[base..])
             }
             GroupKind::Bulk => {
-                self.run.push(*self.firsts.get(pair)?);
-                self.run
-                    .extend_from_slice(self.gaps.get(start..start + tf as usize - 1)?);
+                let base = out.len();
+                out.push(*self.firsts.get(pair)?);
+                out.extend_from_slice(self.gaps.get(start..start + tf as usize - 1)?);
+                prefix_sum_in_place(&mut out[base..])
             }
         }
-        positions_from_run_values(&self.run, out)
     }
+}
+
+/// Turn a run's values, already in place (first absolute, then gaps), into
+/// absolute positions. `None` on an overflowing gap.
+#[inline]
+fn prefix_sum_in_place(run: &mut [u32]) -> Option<()> {
+    // The running sum stays in a register: reading back the slot just
+    // written would put a store-to-load round trip on every position.
+    let Some((first, rest)) = run.split_first_mut() else {
+        return Some(());
+    };
+    let mut acc = *first;
+    for slot in rest {
+        acc = acc.checked_add(*slot)?;
+        *slot = acc;
+    }
+    Some(())
 }
 
 /// Turn a run's `tf` values (first absolute, then gaps) into absolute

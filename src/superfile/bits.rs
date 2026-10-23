@@ -192,6 +192,58 @@ pub(crate) fn for_each_lane(
     Some(())
 }
 
+/// Lanes `from..from + out.len()` of a `width`-bit stream (`width <= 32`)
+/// written into `out`: the values [`for_each_lane`] yields, without its
+/// per-lane sink call or tail test. Every lane whose 8-byte load lies inside
+/// the payload is read in one straight loop; only the stream's last few
+/// take the padded load. `None` when the run ends past the payload.
+#[inline]
+pub(crate) fn unpack_lanes_u32(
+    payload: &[u8],
+    from: usize,
+    width: u8,
+    out: &mut [u32],
+) -> Option<()> {
+    let n = out.len();
+    if width == 0 {
+        out.fill(0);
+        return Some(());
+    }
+    debug_assert!(width <= 32, "a u32 lane is at most 32 bits wide");
+    let w = width as usize;
+    if ((from + n) * w).div_ceil(8) > payload.len() {
+        return None;
+    }
+    let mask: u64 = (1u64 << w) - 1;
+    // Lane `l` loads bytes `l·w/8 .. +8`, inside the payload while
+    // `l ≤ ((len − 8)·8 + 7) / w`.
+    let fast = match payload.len().checked_sub(8) {
+        Some(room) => ((room * 8 + 7) / w + 1).saturating_sub(from).min(n),
+        None => 0,
+    };
+    let mut bit = from * w;
+    let (head, tail) = out.split_at_mut(fast);
+    for slot in head {
+        let byte = bit / 8;
+        let word = u64::from_le_bytes(
+            payload[byte..byte + 8]
+                .try_into()
+                .expect("invariant: a fast lane's load is in bounds"),
+        );
+        *slot = ((word >> (bit % 8)) & mask) as u32;
+        bit += w;
+    }
+    for slot in tail {
+        let byte = bit / 8;
+        let mut padded = [0u8; 8];
+        let rest = &payload[byte..payload.len().min(byte + 8)];
+        padded[..rest.len()].copy_from_slice(rest);
+        *slot = ((u64::from_le_bytes(padded) >> (bit % 8)) & mask) as u32;
+        bit += w;
+    }
+    Some(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +266,50 @@ mod tests {
             &mut candidates,
         );
         out
+    }
+
+    #[test]
+    fn unpack_lanes_agrees_with_for_each_lane_at_every_width_and_offset() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for width in 0..=32u8 {
+            for n_vals in [1usize, 2, 7, 8, 9, 31, 64, 129] {
+                let vals: Vec<u64> = (0..n_vals)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        if width == 0 {
+                            0
+                        } else {
+                            x & ((1u64 << width) - 1)
+                        }
+                    })
+                    .collect();
+                let mut buf = vec![0u8; payload_bytes(n_vals, width)];
+                for (i, &v) in vals.iter().enumerate() {
+                    put_bits(&mut buf, i * width as usize, v, width);
+                }
+                for from in 0..n_vals {
+                    for n in 0..=n_vals - from {
+                        let mut want = Vec::new();
+                        for_each_lane(&buf, from, n, width, |v| want.push(v as u32))
+                            .expect("in range");
+                        let mut got = vec![u32::MAX; n];
+                        unpack_lanes_u32(&buf, from, width, &mut got).expect("in range");
+                        assert_eq!(got, want, "width {width} from {from} n {n}");
+                    }
+                    // Past the payload both refuse alike (a partial last
+                    // byte may still hold one more whole lane).
+                    let n = n_vals - from + 9;
+                    let mut over = vec![0u32; n];
+                    assert_eq!(
+                        unpack_lanes_u32(&buf, from, width, &mut over).is_none(),
+                        for_each_lane(&buf, from, n, width, |_| ()).is_none(),
+                        "width {width} from {from}: overrun"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
