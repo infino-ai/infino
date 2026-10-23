@@ -257,6 +257,13 @@ fn encode_term(
         )?;
     }
     if budget == 0 || depth == 0 || term.entries.is_empty() {
+        // No tier: the postings stand on their bounds. A contribution
+        // writes a tail of zero when its head held every document, and
+        // zero reads as "the tier holds them all" once a later merge gives
+        // the term a tier, so the tail is raised past any key here.
+        for p in &mut term.postings {
+            p.tail = f32::INFINITY;
+        }
         return Ok(EncodedTerm {
             key: term.key,
             postings: term.postings,
@@ -311,6 +318,17 @@ fn encode_term(
             keys: g[..keep].iter().map(|(k, _)| *k).collect(),
             tail,
         });
+    }
+    // A superfile with no entry in the tier — its segment kept no heads —
+    // has nothing in the head its posting's tail would bound: the tail is
+    // raised past any key, where zero would read as a head that holds
+    // every document and drop the superfile's documents.
+    let mut with_heads: Vec<u32> = groups.iter().map(|g| g.ordinal).collect();
+    with_heads.sort_unstable();
+    for p in &mut term.postings {
+        if with_heads.binary_search(&p.superfile).is_err() {
+            p.tail = f32::INFINITY;
+        }
     }
     let n_entries: usize = groups.iter().map(|g| g.entries.len()).sum();
     let (chunks, inline) = match n_entries <= TIER_INLINE_MAX {
@@ -1677,8 +1695,8 @@ fn merge_range(
             let source_run = pending[source as usize]
                 .take()
                 .expect("pending run for heap head");
-            // A run without a tier bounds its postings by their tails
-            // alone; the merged tier holds nothing for them.
+            // A run without a tier contributes no entries; its postings
+            // stand on their bounds in the merged term (see `encode_term`).
             if let Some(tier) = &source_run.tier {
                 if tier.chunks.is_empty() {
                     entries.extend(tier.inline.iter().filter_map(|e| {

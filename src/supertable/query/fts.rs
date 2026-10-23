@@ -87,7 +87,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
-use tracing::{Instrument, debug};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 /// Fewest should-terms for which a ranged kernel is shipped to the
@@ -1159,7 +1159,25 @@ impl SupertableReader {
                 }
             }
         }
-        let tombstoned = deny.iter().any(Option::is_some);
+        // A unit whose superfile has deleted rows builds its live-row set
+        // from the kept set's row counts; a sidecar that could not be read
+        // leaves later units to their own lookups, which may find deleted
+        // rows, so the counts are built then too.
+        let tombstoned = !deny_known || deny.iter().any(Option::is_some);
+        // The deny sets the merge reads, by superfile, for the units to
+        // admit rows by: the threshold the merge seeds counts a row against
+        // these sets, and a unit that read the sidecar afresh after a delete
+        // committed in between could drop a row the threshold still counts.
+        // Unreadable sidecars leave every unit to its own lookup.
+        let deny_by_superfile: Arc<HashMap<Uuid, Arc<RoaringBitmap>>> =
+            Arc::new(match deny_known {
+                true => kept
+                    .iter()
+                    .zip(&deny)
+                    .map(|(e, d)| (e.superfile_id, d.clone().unwrap_or_default()))
+                    .collect(),
+                false => HashMap::new(),
+            });
         // A scope that admits only some rows of a superfile is one the
         // index cannot see, and the merge's threshold is the k-th score
         // over every row: seeding the floor with it, or ruling a superfile
@@ -1238,7 +1256,7 @@ impl SupertableReader {
                         entry_cost_ns: self.tier_entry_cost_ns(),
                         merge_gate: manifest.options.tier_merge_gate,
                     };
-                    tier::select_with_tiers(
+                    let selected = tier::select_with_tiers(
                         index,
                         &query,
                         &kept,
@@ -1246,7 +1264,17 @@ impl SupertableReader {
                         &manifest.options.reader_pool,
                     )
                     .instrument(term_span.clone())
-                    .await?
+                    .await;
+                    match selected {
+                        Ok(selection) => selection,
+                        // The tiers only make the query faster, and its
+                        // ceilings are in hand: a tier that cannot be read
+                        // or does not verify leaves the query to them.
+                        Err(e) => {
+                            warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
+                            None
+                        }
+                    }
                 }
                 _ => None,
             };
@@ -1493,6 +1521,7 @@ impl SupertableReader {
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
+            let deny_by_superfile = Arc::clone(&deny_by_superfile);
             let global_idf = global_idf.clone();
             let prefetch_memos = prefetch_memos.clone();
             let index_locations = Arc::clone(&index_locations);
@@ -1543,7 +1572,12 @@ impl SupertableReader {
                     false => shared.floor(),
                 };
                 let (live_floor, allow) = {
-                    let tomb = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
+                    // The set the merge read for this superfile, when every
+                    // sidecar was readable then; else this unit's own lookup.
+                    let tomb = match deny_by_superfile.get(&suid) {
+                        Some(set) => Some(Ok(Arc::clone(set))),
+                        None => tombstones.as_ref().map(|c| c.bitmap_for(suid, now)),
+                    };
                     // The atom walks may also read the floor LIVE mid-walk and
                     // publish their own local kth into it — but a kernel heap
                     // is pre-tombstone-filter, so only a superfile with no

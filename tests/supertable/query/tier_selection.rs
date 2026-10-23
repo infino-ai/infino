@@ -350,6 +350,204 @@ fn a_delete_of_the_top_documents_leaves_the_rest_answered() {
     }
 }
 
+/// A superfile indexed with no heads, merged with one that keeps them: the
+/// merged term's tier holds nothing for the first superfile, whose
+/// documents must still be found. (A tail that read as "a head that holds
+/// every document" once dropped them, with nothing opened.)
+#[test]
+fn a_heads_off_segment_merged_with_a_tiered_one_keeps_its_documents() {
+    let rows = |st: &Supertable, docs: &[&str]| {
+        let mut w = st.writer().expect("writer");
+        let col: ArrayRef = Arc::new(LargeStringArray::from(docs.to_vec()));
+        w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+    };
+    let fold = |st: &Supertable| {
+        // The index segments merge; the superfiles stay as committed.
+        st.optimize(&infino::OptimizeOptions::compact(
+            infino::CompactionSettings {
+                min_fill_percent: 100,
+                min_superfiles_for_merge: u64::MAX,
+                ..infino::CompactionSettings::default()
+            },
+        ))
+        .expect("optimize");
+    };
+    let build = |tiers: bool| Build {
+        tiers,
+        gate: false,
+        ..Build::default()
+    };
+    let first = ["alpha beta", "alpha gamma", "beta delta"];
+    let second = ["alpha beta delta", "alpha", "beta", "gamma delta"];
+    // The first superfile indexed without heads, the second with them.
+    let with_dir = TempDir::new().expect("tempdir");
+    let with = {
+        let st = Supertable::create(options_for(&with_dir, build(false))).expect("create");
+        rows(&st, &first);
+        drop(st);
+        let st = Supertable::open(options_for(&with_dir, build(true))).expect("open");
+        rows(&st, &second);
+        fold(&st);
+        st
+    };
+    // The same rows with no heads anywhere.
+    let without_dir = TempDir::new().expect("tempdir");
+    let without = {
+        let st = Supertable::create(options_for(&without_dir, build(false))).expect("create");
+        rows(&st, &first);
+        rows(&st, &second);
+        fold(&st);
+        st
+    };
+    for (query, mode) in [
+        ("alpha beta", BoolMode::And),
+        ("alpha beta", BoolMode::Or),
+        ("alpha", BoolMode::Or),
+    ] {
+        for k in [1usize, 10] {
+            let (a, _, _) = run(&with, query, mode, k);
+            let (b, _, _) = run(&without, query, mode, k);
+            assert!(!b.is_empty(), "{query:?} {mode:?} k={k}: hits");
+            assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer");
+        }
+    }
+    let (hits, _, _) = run(&with, "alpha beta", BoolMode::And, 10);
+    assert!(
+        hits.iter().any(|&(sf, row, _)| sf == 0 && row == 0),
+        "the heads-off superfile's document is among the hits: {hits:?}"
+    );
+}
+
+/// A tombstone sidecar that cannot be read leaves the query to its
+/// ceilings, and the query still answers: the superfiles whose sidecars
+/// do read build their live-row sets, so the row counts those are built
+/// from must be in hand. (A query once failed with "missing from the kept
+/// set" here.) The unreadable superfile holds no hit, since a hit's own
+/// sidecar is read again after ranking.
+#[test]
+fn an_unreadable_tombstone_sidecar_leaves_the_query_answered() {
+    let rows = |st: &Supertable, docs: &[&str]| {
+        let mut w = st.writer().expect("writer");
+        let col: ArrayRef = Arc::new(LargeStringArray::from(docs.to_vec()));
+        w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+    };
+    let build = |tiers: bool| Build {
+        tiers,
+        gate: false,
+        ..Build::default()
+    };
+    let make = |dir: &TempDir, tiers: bool| -> Supertable {
+        let st = Supertable::create(options_for(dir, build(tiers))).expect("create");
+        // The first superfile by id holds none of the query's words.
+        rows(&st, &["alpha", "alpha delta", "delta"]);
+        for i in 0..3 {
+            rows(
+                &st,
+                &[
+                    &format!("beta gamma {i}"),
+                    &format!("beta gamma doomed {i}"),
+                    &format!("gamma {i}"),
+                ],
+            );
+            st.delete(col("body").eq(lit(format!("beta gamma doomed {i}"))))
+                .expect("delete");
+        }
+        let first = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .superfiles
+            .iter()
+            .min_by_key(|e| e.id_min)
+            .expect("a superfile")
+            .superfile_id;
+        drop(st);
+        // Its sidecar, garbage; the table reopens so nothing remembers a
+        // sidecar it read before.
+        let sidecar = dir
+            .path()
+            .join("superfiles")
+            .join(format!("{first}.tombstones"));
+        std::fs::write(&sidecar, b"not a tombstone sidecar").expect("corrupt");
+        Supertable::open(options_for(dir, build(tiers))).expect("open")
+    };
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = make(&with_dir, true);
+    let without = make(&without_dir, false);
+    for (query, mode) in [
+        ("beta gamma", BoolMode::And),
+        ("beta gamma", BoolMode::Or),
+        ("beta", BoolMode::Or),
+    ] {
+        for k in [1usize, 10] {
+            let (a, _, _) = run(&with, query, mode, k);
+            let (b, _, _) = run(&without, query, mode, k);
+            assert!(!b.is_empty(), "{query:?} {mode:?} k={k}: hits");
+            assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer");
+            assert!(
+                a.iter().all(|&(_, row, _)| row != 1),
+                "{query:?} {mode:?} k={k}: no deleted row among {a:?}"
+            );
+        }
+    }
+}
+
+/// A tier object that does not verify fails nothing: the query keeps its
+/// ceilings and answers as a table without tiers does. (A rare term's few
+/// entries per commit ride inline in the slices, which the damage does not
+/// reach, so a query of such terms may still be answered from them.)
+#[test]
+fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let build = |tiers: bool| Build {
+        tiers,
+        gate: false,
+        ..Build::default()
+    };
+    let with = table_with(&with_dir, build(true));
+    let without = table_with(&without_dir, build(false));
+    drop(with);
+    // Every tier object damaged throughout.
+    let mut flipped = 0;
+    for entry in std::fs::read_dir(with_dir.path().join("term-index")).expect("term-index dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("tier-") {
+            continue;
+        }
+        // Every byte, so no block of the object verifies.
+        let mut bytes = std::fs::read(&path).expect("read");
+        for b in bytes.iter_mut() {
+            *b ^= 0xff;
+        }
+        std::fs::write(&path, &bytes).expect("write");
+        flipped += 1;
+    }
+    assert!(flipped > 0, "the table has tier objects");
+    let with = Supertable::open(options_for(&with_dir, build(true))).expect("open");
+    for (query, mode) in queries() {
+        let (a, _, _) = run(&with, &query, mode, 10);
+        let (b, _, _) = run(&without, &query, mode, 10);
+        assert_eq!(a, b, "{query:?} {mode:?}: same answer");
+    }
+    // Common terms' heads are in the damaged objects: nothing is read or
+    // answered from them.
+    for (query, mode) in [("the data", BoolMode::And), ("search index", BoolMode::Or)] {
+        let (_, stats, _) = run(&with, query, mode, 10);
+        assert_eq!(stats.tier_entries, 0, "{query:?} {mode:?}: no tier read");
+        assert_eq!(
+            stats.superfiles_resolved, 0,
+            "{query:?} {mode:?}: nothing answered from a tier"
+        );
+    }
+}
+
 /// With the gate on, the table learns whether to merge by trying both
 /// ways: every try answers the same. The way without the merge is always
 /// among the tries; the merge is, unless the measured costs rule it out

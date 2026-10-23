@@ -102,10 +102,8 @@ pub struct Build {
     pub nulls: bool,
 }
 
-/// A table with or without tiers, and with each superfile's head per term
-/// cut to `depth` when given: at 64 a common term's heads are read block by
-/// block and bounded by their tails rather than read whole.
-pub fn table_with(dir: &TempDir, build: Build) -> Supertable {
+/// The options a test table is created and reopened with.
+pub fn options_for(dir: &TempDir, build: Build) -> SupertableOptions {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     // Positions, so a phrase query is among the shapes compared.
@@ -127,7 +125,14 @@ pub fn table_with(dir: &TempDir, build: Build) -> Supertable {
     if let Some(depth) = build.depth {
         options = options.with_term_head_depth(depth);
     }
-    let st = Supertable::create(options).expect("create");
+    options
+}
+
+/// A table with or without tiers, and with each superfile's head per term
+/// cut to `depth` when given: at 64 a common term's heads are read block by
+/// block and bounded by their tails rather than read whole.
+pub fn table_with(dir: &TempDir, build: Build) -> Supertable {
+    let st = Supertable::create(options_for(dir, build)).expect("create");
     let mut w = st.writer().expect("writer");
     for s in 0..SUPERFILES {
         let docs: Vec<String> = (0..DOCS_PER_SUPERFILE)

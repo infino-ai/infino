@@ -150,6 +150,12 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
     jobs
 }
 
+/// A superfile at least this share deleted is rewritten by the next pass
+/// whatever its neighbours amount to: packing by id would otherwise leave
+/// it waiting for neighbours that may never fill a job, and the space its
+/// deleted rows hold with it.
+const RECLAIM_DELETED_PERCENT: u64 = 50;
+
 fn pack_partition(
     key: &[u8],
     segs: Vec<&SuperfileStats>,
@@ -173,8 +179,9 @@ fn pack_partition(
     // superfile whose best document can only tie the k-th score is skipped
     // when every id it holds is past the tied document's, which ranges
     // that do not interleave make the common case. Every sub-target
-    // superfile is a candidate regardless; a deleted-heavy one waits for
-    // its neighbours rather than leading the pass.
+    // superfile is a candidate regardless; a deleted-heavy one no longer
+    // leads the pass, and is instead rewritten with whatever neighbours
+    // its job has gathered (see [`RECLAIM_DELETED_PERCENT`]).
     candidates.sort_by(|a, b| {
         a.id_min
             .cmp(&b.id_min)
@@ -214,6 +221,9 @@ struct PendingJob {
     /// Whether an input holds a column in a type the table has moved on
     /// from; the job then runs however small.
     stale_type: bool,
+    /// Whether an input is at least [`RECLAIM_DELETED_PERCENT`] deleted;
+    /// the job then runs however small, to reclaim the space.
+    reclaiming: bool,
 }
 
 impl PendingJob {
@@ -227,6 +237,8 @@ impl PendingJob {
         self.inputs.push(s.superfile_id);
         self.live_bytes += s.live_bytes();
         self.stale_type |= s.stale_type;
+        self.reclaiming |= s.tombstoned_docs as u128 * 100
+            >= s.n_docs.max(1) as u128 * RECLAIM_DELETED_PERCENT as u128;
     }
 
     /// Emit a CompactionJob when the pending inputs clear either leg of the
@@ -234,6 +246,11 @@ impl PendingJob {
     /// - size: `>= 2` inputs and live bytes reach `min_output_bytes`;
     /// - count: `>= min_superfiles_for_merge` inputs (already `>= 2`), which
     ///   fires even when the live bytes sit far below the size floor.
+    ///
+    /// A job holding a stale-typed input runs however small, one input
+    /// included: the rewrite converges the type. One holding a mostly
+    /// deleted input runs however small too, with the two inputs a merge
+    /// needs: the rewrite reclaims the deleted rows' space.
     fn emit(
         &mut self,
         key: &[u8],
@@ -245,7 +262,8 @@ impl PendingJob {
         let size_ready = self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes;
         let count_ready = self.inputs.len() >= min_superfiles_for_merge;
         let converging = self.stale_type && !self.inputs.is_empty();
-        if size_ready || count_ready || converging {
+        let reclaiming = self.reclaiming && self.inputs.len() >= 2;
+        if size_ready || count_ready || converging || reclaiming {
             jobs.push(CompactionJob {
                 partition_key: key.to_vec(),
                 inputs: mem::take(&mut self.inputs),
@@ -441,6 +459,33 @@ pub(in crate::supertable::optimize::compact) mod tests {
     /// Candidates pack by document id, whatever order they are listed in
     /// and however deleted: a job's inputs are id-adjacent, so its output's
     /// range does not interleave with any other output's.
+    /// Packing by id must not strand a mostly deleted superfile: four
+    /// 300 MiB superfiles fill a job without the 900 MiB one at the
+    /// highest id that is 72% deleted, which the reclaim leg then rewrites
+    /// with the neighbour left over. Alone it waits, as every merge needs
+    /// two inputs; under the share it waits for its neighbours as any
+    /// other does.
+    #[test]
+    fn a_mostly_deleted_superfile_is_rewritten_by_the_next_pass() {
+        let mut segs: Vec<_> = (0..4).map(|i| seg(i, 300, 1000, 0)).collect();
+        let dead_heavy = seg(4, 900, 1000, 720);
+        segs.push(dead_heavy.clone());
+        let jobs = select(&segs, &default_cfg());
+        let holder = jobs
+            .iter()
+            .find(|j| j.inputs.contains(&dead_heavy.superfile_id))
+            .expect("the mostly deleted superfile is in a job");
+        assert_eq!(holder.inputs.len(), 2, "with the neighbour left over");
+        assert!(select(&segs[4..], &default_cfg()).is_empty(), "alone");
+        segs[4] = seg(4, 900, 1000, 100);
+        let jobs = select(&segs, &default_cfg());
+        assert!(
+            jobs.iter()
+                .all(|j| !j.inputs.contains(&segs[4].superfile_id)),
+            "lightly deleted, it waits with its neighbour: {jobs:?}"
+        );
+    }
+
     #[test]
     fn packs_id_adjacent_superfiles_together() {
         // Ten sub-target superfiles listed out of id order, one of them
