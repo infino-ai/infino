@@ -101,6 +101,10 @@ pub(crate) struct BuildPolicy {
     /// directory, which on a host sized for a large table may be small or
     /// in memory.
     pub(crate) scratch_root: Option<PathBuf>,
+    /// Key ranges a merge of segments is cut into and merged in parallel;
+    /// `None` chooses by the sources' size and the pool's width (see
+    /// [`merge_segments`]).
+    pub(crate) merge_shards: Option<usize>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
     /// superfile's own, as the manifest records them. A build takes these
@@ -165,6 +169,7 @@ impl Default for BuildPolicy {
             pool: None,
             spill_to_disk: false,
             scratch_root: None,
+            merge_shards: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
         }
     }
@@ -1339,10 +1344,16 @@ struct SegmentCursor {
     /// The last key decoded from the open slice, where the next batch
     /// resumes.
     last_key: Option<Vec<u8>>,
+    /// The keys the cursor yields: from `start` on, when set, and short of
+    /// `end`, when set.
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
 }
 
 impl SegmentCursor {
-    fn new(files: &[PathBuf]) -> Self {
+    /// A cursor over `files` in key order, yielding the keys in
+    /// `start..end` (either bound open when `None`).
+    fn new(files: &[PathBuf], start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
         Self {
             files: files.iter().cloned().collect(),
             bytes: Vec::new(),
@@ -1350,18 +1361,36 @@ impl SegmentCursor {
             tier_file: None,
             batch: VecDeque::new(),
             last_key: None,
+            start: start.map(<[u8]>::to_vec),
+            end: end.map(<[u8]>::to_vec),
         }
     }
 
-    /// The next term and its run, `None` once every slice is read.
+    /// The next term and its run, `None` once every slice is read or the
+    /// range's end is reached.
     fn next(&mut self) -> Result<Option<(Vec<u8>, Run)>, TermIndexError> {
         loop {
             if let Some(term) = self.batch.pop_front() {
+                if self
+                    .end
+                    .as_deref()
+                    .is_some_and(|end| term.0.as_slice() >= end)
+                {
+                    // Past the range: nothing later in this file or the
+                    // files after it belongs to it.
+                    self.batch.clear();
+                    self.files.clear();
+                    self.bytes.clear();
+                    return Ok(None);
+                }
                 return Ok(Some(term));
             }
             if !self.bytes.is_empty() {
-                let batch = Slice::open(&self.bytes)?
-                    .terms_after(self.last_key.as_deref(), MERGE_BATCH_TERMS)?;
+                let slice = Slice::open(&self.bytes)?;
+                let batch = match (&self.last_key, &self.start) {
+                    (None, Some(start)) => slice.terms_from(Some(start), MERGE_BATCH_TERMS)?,
+                    _ => slice.terms_after(self.last_key.as_deref(), MERGE_BATCH_TERMS)?,
+                };
                 if let Some((key, _)) = batch.last() {
                     self.last_key = Some(key.clone());
                     self.batch = batch.into();
@@ -1467,7 +1496,8 @@ fn tier_entries(
     Ok(())
 }
 
-/// Merge segments into one, renumbering every posting through
+/// Merge segments into one, in key-range shards on the pool when the
+/// sources are large (see [`shard_ranges`]), renumbering every posting through
 /// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
 /// result, and is dropped when that is `None` (a superfile that is gone, or
 /// padding). `sources` holds each segment's slice files in key order, each
@@ -1484,7 +1514,145 @@ pub(crate) fn merge_segments(
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
-    let mut cursors: Vec<SegmentCursor> = sources.iter().map(|s| SegmentCursor::new(s)).collect();
+    let ranges = shard_ranges(sources, policy)?;
+    if ranges.len() <= 1 {
+        return merge_range(sources, None, None, ordinals, policy);
+    }
+    // Each range merges the slices that reach into it, on its own writer;
+    // the ranges' outputs follow each other in key order, which is what one
+    // writer over everything would have produced, slice cuts aside.
+    let merge_one = |(start, end): &(Option<Vec<u8>>, Option<Vec<u8>>)| {
+        let (start, end) = (start.as_deref(), end.as_deref());
+        let in_range: Vec<Vec<PathBuf>> = sources
+            .iter()
+            .map(|files| {
+                files
+                    .iter()
+                    .filter(|path| slice_reaches(path, start, end).unwrap_or(true))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        merge_range(&in_range, start, end, ordinals, policy)
+    };
+    let merge_all = || -> Result<Vec<MergedSegment>, TermIndexError> {
+        ranges.par_iter().map(merge_one).collect()
+    };
+    let parts = match policy.pool.as_deref() {
+        Some(pool) => pool.install(merge_all)?,
+        None => merge_all()?,
+    };
+    let mut segment = Segment::default();
+    let mut slices = Vec::new();
+    let mut tiers = Vec::new();
+    for part in parts {
+        segment.slices.extend(part.segment.slices);
+        slices.extend(part.slices);
+        tiers.extend(part.tiers);
+    }
+    Ok(MergedSegment {
+        segment,
+        slices,
+        tiers,
+    })
+}
+
+/// Sources of at least this many bytes are merged in key-range shards.
+const MERGE_SHARD_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Shards a merge is cut into at most: each holds a cursor per segment
+/// with a slice's bytes resident, so the width is bounded by memory as
+/// well as by threads.
+const MERGE_SHARDS_MAX: usize = 32;
+
+/// The smallest and largest keys the slice at `path` holds, read from
+/// its dictionary; `None` for a slice of no terms.
+fn slice_key_range(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, TermIndexError> {
+    let bytes = fs::read(path)?;
+    Ok(Slice::open(&bytes)?.key_range())
+}
+
+/// Whether the slice at `path` holds a key in `start..end`.
+fn slice_reaches(
+    path: &Path,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+) -> Result<bool, TermIndexError> {
+    Ok(match slice_key_range(path)? {
+        None => false,
+        Some((first, last)) => {
+            start.is_none_or(|s| last.as_slice() >= s) && end.is_none_or(|e| first.as_slice() < e)
+        }
+    })
+}
+
+/// The key ranges a merge of `sources` is cut into: one when the sources
+/// are small or the policy says so, else up to the pool's width (at most
+/// [`MERGE_SHARDS_MAX`]) cut at slice boundaries, evenly by slice count.
+fn shard_ranges(
+    sources: &[Vec<PathBuf>],
+    policy: &BuildPolicy,
+) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, TermIndexError> {
+    let single = vec![(None, None)];
+    let files: Vec<&PathBuf> = sources.iter().flatten().collect();
+    let want = match policy.merge_shards {
+        Some(n) => n.max(1),
+        None => {
+            let mut bytes = 0u64;
+            for path in &files {
+                bytes += fs::metadata(path)?.len();
+            }
+            if bytes < MERGE_SHARD_MIN_BYTES {
+                return Ok(single);
+            }
+            policy
+                .pool
+                .as_deref()
+                .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
+                .clamp(1, MERGE_SHARDS_MAX)
+        }
+    };
+    if want <= 1 || files.len() < 2 {
+        return Ok(single);
+    }
+    // Candidate cuts: every slice's first key but the smallest overall.
+    let mut firsts: Vec<Vec<u8>> = files
+        .iter()
+        .filter_map(|path| slice_key_range(path).transpose())
+        .map(|range| range.map(|(first, _)| first))
+        .collect::<Result<_, _>>()?;
+    firsts.sort_unstable();
+    firsts.dedup();
+    if firsts.len() < 2 {
+        return Ok(single);
+    }
+    let candidates = &firsts[1..];
+    let n = want.min(candidates.len() + 1);
+    let mut cuts: Vec<Vec<u8>> = (1..n)
+        .map(|i| candidates[i * candidates.len() / n].clone())
+        .collect();
+    cuts.dedup();
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut start: Option<Vec<u8>> = None;
+    for cut in cuts {
+        ranges.push((start.take(), Some(cut.clone())));
+        start = Some(cut);
+    }
+    ranges.push((start, None));
+    Ok(ranges)
+}
+
+/// Merge the keys in `start..end` of `sources` into one run of slices.
+fn merge_range(
+    sources: &[Vec<PathBuf>],
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+) -> Result<MergedSegment, TermIndexError> {
+    let mut cursors: Vec<SegmentCursor> = sources
+        .iter()
+        .map(|s| SegmentCursor::new(s, start, end))
+        .collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
     for (source, cursor) in cursors.iter_mut().enumerate() {

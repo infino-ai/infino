@@ -911,6 +911,49 @@ impl<'a> Slice<'a> {
         }
     }
 
+    /// Up to `limit` terms from `start` on, `start` included (from the
+    /// first term when `None`), in key order, with their runs.
+    pub(crate) fn terms_from(
+        &self,
+        start: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Run)>, TermIndexError> {
+        let mut out = Vec::new();
+        let mut failed: Option<TermIndexError> = None;
+        self.dict
+            .for_each_from(b"", start.unwrap_or_default(), |key, value| {
+                match self.run_at(value) {
+                    Ok(run) => {
+                        out.push((key.to_vec(), run));
+                        out.len() < limit
+                    }
+                    Err(e) => {
+                        failed = Some(e);
+                        false
+                    }
+                }
+            });
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// The smallest and largest keys the slice holds; `None` when it holds
+    /// no term.
+    pub(crate) fn key_range(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut first: Option<Vec<u8>> = None;
+        let mut last: Option<Vec<u8>> = None;
+        self.dict.for_each_from(b"", b"", |key, _| {
+            if first.is_none() {
+                first = Some(key.to_vec());
+            }
+            last = Some(key.to_vec());
+            true
+        });
+        Some((first?, last?))
+    }
+
     /// Up to `limit` terms after `after` (from the first term when `None`),
     /// in key order, with their runs. A walk resumes by passing the last
     /// key it got back.

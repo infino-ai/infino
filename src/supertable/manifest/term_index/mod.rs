@@ -1562,6 +1562,117 @@ mod tests {
         assert!(built.tiers.is_empty());
     }
 
+    /// A merge cut into key-range shards writes the terms one writer over
+    /// everything writes: every key's postings and tier entries agree, and
+    /// the shards' slices follow each other in key order.
+    #[test]
+    fn a_sharded_merge_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        // Many terms over two superfiles, slices cut small: plenty of
+        // boundaries to shard at, heads both inline and chunked.
+        let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
+        let make = |id: u128| {
+            let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    (
+                        "body",
+                        t.as_str(),
+                        docs(id as f32 + i as f32 * 0.001, 2 + (i % 20) as u32),
+                    )
+                })
+                .collect();
+            contribution_with_heads(&dir, id, &entries, 64)
+        };
+        let policy = BuildPolicy {
+            slice_target_bytes: 2048,
+            tier_entries_per_term: 100_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[make(1), make(2)], &policy).expect("build");
+        let segment = built.root.segments[0].clone();
+        assert!(segment.slices.len() >= 8, "{} slices", segment.slices.len());
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
+        let sources = vec![spill_slices(scratch.path(), built.slices).expect("place slices")];
+        let merge = |shards: usize| {
+            let policy = BuildPolicy {
+                merge_shards: Some(shards),
+                ..policy.clone()
+            };
+            merge_segments(&sources, &[Some(0), Some(1)], &policy).expect("merge")
+        };
+        // Every term of a merged output: its postings and its tier's entries.
+        let terms_of =
+            |m: &build::MergedSegment| -> Vec<(Vec<u8>, Vec<Posting>, Vec<(u32, u32, u32, u8)>)> {
+                let mut out = Vec::new();
+                for (i, (_, bytes)) in m.slices.iter().enumerate() {
+                    let bytes = bytes_of(bytes);
+                    let slice = Slice::open(&bytes).expect("open");
+                    for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
+                        let mut entries: Vec<tier::TierEntry> = match &run.tier {
+                            None => Vec::new(),
+                            Some(t) if t.chunks.is_empty() => t.inline.clone(),
+                            Some(t) => {
+                                let object = m.segment.slices[i].tier.expect("a tier object");
+                                let object = bytes_of(
+                                    &m.tiers
+                                        .iter()
+                                        .find(|(h, _)| *h == object)
+                                        .expect("the tier object is among the built")
+                                        .1,
+                                );
+                                let mut all = Vec::new();
+                                for chunk in &t.chunks {
+                                    let range =
+                                        chunk.offset as usize..(chunk.offset + chunk.len) as usize;
+                                    let mut block = Vec::new();
+                                    tier::TierChunk::open(&object[range], chunk.n_blocks)
+                                        .expect("chunk")
+                                        .entries(&mut block)
+                                        .expect("entries");
+                                    all.extend(block);
+                                }
+                                all
+                            }
+                        };
+                        let mut entries: Vec<(u32, u32, u32, u8)> = entries
+                            .drain(..)
+                            .map(|e| (e.superfile, e.doc_id, e.tf, e.len))
+                            .collect();
+                        entries.sort_unstable();
+                        out.push((key, run.postings, entries));
+                    }
+                }
+                out
+            };
+        let (one, many) = (merge(1), merge(4));
+        assert!(
+            many.segment.slices.len() >= 4,
+            "{} slices from the shards",
+            many.segment.slices.len()
+        );
+        let ranges: Vec<(&[u8], &[u8])> = many
+            .segment
+            .slices
+            .iter()
+            .map(|s| (s.first_key.as_slice(), s.last_key.as_slice()))
+            .collect();
+        assert!(
+            ranges.windows(2).all(|w| w[0].1 < w[1].0),
+            "the shards' slices follow each other in key order"
+        );
+        let (a, b) = (terms_of(&one), terms_of(&many));
+        assert_eq!(a.len(), b.len(), "the same terms");
+        assert_eq!(a, b, "the same postings and entries per term");
+    }
+
     /// A tier of more than a few entries is chunked into the slice's tier
     /// object; one of a few rides in the run. A merge keeps each where it
     /// belongs and renumbers the inline entries like the chunked ones.
