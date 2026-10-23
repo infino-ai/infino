@@ -143,6 +143,11 @@ impl PhraseMember {
     }
 }
 
+/// A member's positions per surviving start at or under which
+/// [`verify_members`] confirms the starts by one merge rather than a binary
+/// search each: past it, the searches touch less of the list.
+const MERGE_MAX_RATIO: usize = 4;
+
 /// The phrase's occurrences at one aligned doc, verified in stages,
 /// rarest member first. A phrase starting at position `s` has member `j` at
 /// `s + offsets[j]`, so the rarest member (`order[0]`) seeds the candidate
@@ -175,10 +180,29 @@ fn verify_members(
         positions_of(&mut members[j], j)?;
         let plist = &members[j].pos_scratch;
         let off = offsets[j];
-        starts.retain(|&s| {
-            s.checked_add(off)
-                .is_some_and(|want| plist.binary_search(&want).is_ok())
-        });
+        if plist.len() <= starts.len() * MERGE_MAX_RATIO {
+            // Lists of like length (two common members): both ascend, so
+            // one forward merge confirms every start, the position pointer
+            // only moving on, where a search per start re-bisects the list.
+            let (mut w, mut q) = (0usize, 0usize);
+            for r in 0..starts.len() {
+                let s = starts[r];
+                let Some(want) = s.checked_add(off) else {
+                    break;
+                };
+                while q < plist.len() && plist[q] < want {
+                    q += 1;
+                }
+                starts[w] = s;
+                w += usize::from(q < plist.len() && plist[q] == want);
+            }
+            starts.truncate(w);
+        } else {
+            starts.retain(|&s| {
+                s.checked_add(off)
+                    .is_some_and(|want| plist.binary_search(&want).is_ok())
+            });
+        }
     }
     Ok(starts.len() as u32)
 }
