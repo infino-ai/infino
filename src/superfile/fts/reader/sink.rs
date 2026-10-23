@@ -85,6 +85,29 @@ fn score_key(score: f32) -> u32 {
     }
 }
 
+/// The score whose [`score_key`] is `key`.
+#[inline(always)]
+fn score_of_key(key: u32) -> f32 {
+    f32::from_bits(match key >> 31 {
+        1 => key & 0x7FFF_FFFF,
+        _ => !key,
+    })
+}
+
+/// `(score, doc)` packed so a larger integer is a better entry: the score's
+/// key above, the doc id inverted below so that on a tied score the smaller
+/// doc is the better one. Selecting on these is one integer compare a step.
+#[inline(always)]
+fn rank_key(score: f32, doc: u32) -> u64 {
+    (u64::from(score_key(score)) << 32) | u64::from(!doc)
+}
+
+/// The `(score, doc)` a [`rank_key`] packs.
+#[inline(always)]
+fn unrank_key(key: u64) -> (f32, u32) {
+    (score_of_key((key >> 32) as u32), !(key as u32))
+}
+
 impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
         score_key(self.0) == score_key(other.0) && self.1 == other.1
@@ -508,10 +531,11 @@ impl Collector for BinaryHeap<TopKEntry> {
 /// with a low bar is most of them; the buffer pays an append, and a linear
 /// selection per `slack` appends. Its bar is the k-th best at the last cut:
 /// never above the true k-th best, so pruning against it stays safe, and
-/// refreshed often enough (`slack` is `k / 4`) that it trails closely.
+/// refreshed often enough (`slack` is `k / 2`) that it trails closely.
+/// Entries are held as [`rank_key`]s.
 pub(super) struct TopKBuffer {
     k: usize,
-    buf: Vec<TopKEntry>,
+    buf: Vec<u64>,
     full: bool,
 }
 
@@ -524,10 +548,10 @@ impl TopKBuffer {
     /// Keep the best `k` and return the k-th best's score.
     fn cut(&mut self, k: usize) -> f32 {
         if self.buf.len() > k {
-            self.buf.select_nth_unstable(k - 1);
+            self.buf.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
             self.buf.truncate(k);
         }
-        self.buf.iter().max().expect("k > 0 entries").0
+        unrank_key(*self.buf.iter().min().expect("k > 0 entries")).0
     }
 }
 
@@ -556,7 +580,7 @@ impl Collector for TopKBuffer {
         if k == 0 || (self.full && score < *threshold) {
             return false;
         }
-        self.buf.push(TopKEntry(score, FtsDocId::new(doc)));
+        self.buf.push(rank_key(score, doc));
         let due = match self.full {
             false => self.buf.len() == k,
             true => self.buf.len() >= k.saturating_add(Self::slack(k)),
@@ -569,15 +593,53 @@ impl Collector for TopKBuffer {
         true
     }
     fn into_sorted(mut self) -> Vec<(FtsDocId, f32)> {
-        self.buf.sort_unstable();
+        self.buf.sort_unstable_by(|a, b| b.cmp(a));
         self.buf.truncate(self.k);
-        self.buf.into_iter().map(|e| (e.1, e.0)).collect()
+        self.buf
+            .into_iter()
+            .map(|key| {
+                let (score, doc) = unrank_key(key);
+                (FtsDocId::new(doc), score)
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_keys_round_trip_and_order_as_the_entries_do() {
+        let scores = [
+            0.0f32,
+            -0.0,
+            1e-30,
+            0.5,
+            1.0,
+            7.25,
+            1e30,
+            -1.0,
+            -1e-30,
+            f32::INFINITY,
+        ];
+        let docs = [0u32, 1, 7, u32::MAX - 1, u32::MAX];
+        for &s in &scores {
+            for &d in &docs {
+                let (s2, d2) = unrank_key(rank_key(s, d));
+                assert_eq!((s2.to_bits(), d2), (s.to_bits(), d));
+                for &t in &scores {
+                    for &e in &docs {
+                        // A larger key is a better entry: the smaller in
+                        // `TopKEntry`'s reversed order.
+                        let by_key = rank_key(t, e).cmp(&rank_key(s, d));
+                        let by_entry = TopKEntry(s, d).cmp(&TopKEntry(t, e));
+                        assert_eq!(by_key, by_entry, "({s}, {d}) vs ({t}, {e})");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn and_heap_push_keeps_the_smaller_doc_on_a_tied_score() {
