@@ -597,16 +597,19 @@ const PROBE_GALLOP: usize = 16;
 
 /// The first index at or after `p` whose id in `ids` (ascending) is not
 /// below `t`. Far behind the target (a list much denser than the one
-/// probing it), it bisects the rest; near it, it moves eight ids at a time:
-/// the sorted lanes below the target form a prefix, so its popcount is how
-/// far to move, one compare where stepping would take a branch per id.
+/// probing it), it bisects the rest; near it, it steps. With `WIDE` it
+/// steps eight ids at a time: the sorted lanes below the target form a
+/// prefix, so its popcount is how far to move, one compare where stepping
+/// would take a branch per id. That pays off where targets sit many ids
+/// apart (the intersection probe); where the next one is usually a step or
+/// two on (the phrase filter), plain stepping measured faster.
 #[inline(always)]
-fn seek_sorted(ids: &[u32], mut p: usize, t: u32) -> usize {
+fn seek_sorted<const WIDE: bool>(ids: &[u32], mut p: usize, t: u32) -> usize {
     let n = ids.len();
     if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
         p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);
     }
-    while p + 8 <= n {
+    while WIDE && p + 8 <= n {
         let lanes: [u32; 8] = ids[p..p + 8]
             .try_into()
             .expect("invariant: an 8-wide slice");
@@ -1040,7 +1043,7 @@ impl TermCursor {
             let mut p = 0usize;
             while r < n {
                 let d = docs[r];
-                p = seek_sorted(ids, p, d);
+                p = seek_sorted::<false>(ids, p, d);
                 if p < ids.len() && ids[p] == d {
                     docs[w] = d;
                     w += 1;
@@ -1122,7 +1125,7 @@ impl TermCursor {
                 }
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    p = seek_sorted(ids, p, d);
+                    p = seek_sorted::<false>(ids, p, d);
                     if p < ids.len() && ids[p] == d {
                         docs[w] = d;
                         w += 1;
@@ -1359,7 +1362,7 @@ impl TermCursor {
             }
             while k < n_docs && docs[k] <= last {
                 let t = docs[k];
-                p = seek_sorted(ids, p, t);
+                p = seek_sorted::<true>(ids, p, t);
                 out[k] = match p < n && ids[p] == t {
                     true => self.block_tfs[p],
                     false => 0,
@@ -1917,11 +1920,16 @@ mod tests {
             for _ in 0..20 {
                 let t = (rng(hi) as u32).max(ids.get(p).copied().unwrap_or(0));
                 let want = p + ids[p..].partition_point(|&v| v < t);
-                p = super::seek_sorted(&ids, p, t);
+                assert_eq!(
+                    super::seek_sorted::<false>(&ids, p, t),
+                    want,
+                    "case {case} target {t}"
+                );
+                p = super::seek_sorted::<true>(&ids, p, t);
                 assert_eq!(p, want, "case {case} target {t}");
             }
             assert_eq!(
-                super::seek_sorted(&ids, 0, u32::MAX),
+                super::seek_sorted::<true>(&ids, 0, u32::MAX),
                 ids.partition_point(|&v| v < u32::MAX)
             );
         }
