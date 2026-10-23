@@ -5423,6 +5423,32 @@ mod tests {
             assert_eq!(indexed, 1, "only the new superfile is indexed");
         }
         let mixed_answers = answers(&st);
+        // At a pruning k: an index that does not list every superfile
+        // serves no tier, and the rebuilt one answers the same. (The old
+        // superfiles record no baked average length, so the merge declines
+        // them even then: a bound needs the average a head was keyed at.)
+        let probe = |st: &Supertable| {
+            crate::runtime_metrics::op_stats::with_op_stats(|| {
+                st.reader()
+                    .expect("reader")
+                    .bm25_hits(
+                        "title",
+                        "alpha shared",
+                        10,
+                        Bm25SearchOptions::new().with_mode(BoolMode::And),
+                    )
+                    .expect("search")
+                    .iter()
+                    .map(|h| (h.superfile, h.local_doc_id, h.score))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let (mixed_top, mixed_stats) = probe(&st);
+        assert!(!mixed_top.is_empty());
+        assert_eq!(
+            mixed_stats.tier_entries, 0,
+            "an index that does not cover the table serves no tier"
+        );
 
         // Cell 3: a maintenance rebuild covers everything and flips the flag.
         maintenance_only_optimize(&st);
@@ -5434,6 +5460,8 @@ mod tests {
             );
         }
         let rebuilt_answers = answers(&st);
+        let (rebuilt_top, _) = probe(&st);
+        assert_eq!(rebuilt_top, mixed_top, "the same answer at a pruning k");
 
         // Cell 4: the same rows written entirely by the current writer.
         let (_d, _s, fresh) = fresh_table();

@@ -24,6 +24,10 @@ fn a_round_cap_of_one_still_answers_the_same() {
         "diagnostics:\n  tier_rounds: 1\n",
     )
     .expect("config file");
+    assert!(
+        std::env::var("XDG_CONFIG_HOME").is_err(),
+        "the test owns the configuration path"
+    );
     // SAFETY: this is the only test in the binary and nothing else has
     // started yet, so no other thread reads the environment.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };

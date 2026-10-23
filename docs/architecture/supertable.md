@@ -272,9 +272,10 @@ part share a single fetch.
 Which superfiles contain a term is answered by one table-level
 structure rather than by anything carried per superfile. For every
 `(column, term)` the term index records the superfiles that hold it and,
-for each, the term's document frequency there, an upper bound on the
-BM25 score the term can reach there, and where the term's postings sit
-in that superfile's bytes. One artifact therefore answers three
+for each, the term's document frequency there, the key of its best
+document there (the length-normalized term frequency a score multiplies
+the idf by, from which a score ceiling is computed at the query's idf),
+and where the term's postings sit in that superfile's bytes. One artifact therefore answers three
 questions: where a term lives, how often it occurs table-wide, and where
 its postings are. Per-superfile bloom filters would saturate on a large
 table and then prune nothing, and inlining every superfile's term
@@ -356,8 +357,11 @@ terms have a posting or two, and a block's fixed header would outweigh
 them.
 
 A ranked query of plain terms merges its terms' tiers before it opens
-anything, when the table has learned that this pays for the query's
-shape. Per superfile it reads the terms' heads a block at a time and
+anything, when the table has learned that this pays: per class of query
+(conjunction, disjunction or a mix; a bucket of `k`; of the term count;
+of the rarest term's idf) it keeps a running wall of the search with the
+merge and without it, alternates until both are measured, takes the
+cheaper way and tries the other one query in sixteen. Per superfile it reads the terms' heads a block at a time and
 joins them by document, so a document read under several terms is
 known with its contributions from each and bounded through the other
 terms' tails; from the documents carrying every required term it takes
@@ -365,8 +369,10 @@ a lower bound on the k-th score, and from the tails an upper bound on
 anything it has not seen. Superfiles whose
 upper bound cannot reach the k-th lower bound are not opened, a
 conjunction's superfiles that a complete term has shown hold no joint
-document are not opened, and the k-th lower bound seeds the floor every
-kernel prunes against from its first block. Nothing in the answer
+document are not opened, a conjunction of one or two bare terms whose
+required heads are whole is answered from the index without an open,
+and the k-th lower bound seeds the floor every kernel prunes against
+from its first block. Nothing in the answer
 changes — the superfiles that do open run the same kernels against the
 same floor semantics — only which superfiles open. Impacts are stored at
 the superfile's own statistics and rescaled to the table's as ceilings
@@ -379,7 +385,10 @@ contribution; a superfile built without the sink has its heads read
 from its own index with the single-term kernel instead, which gives the
 same bytes. The delta segment pools the contributions into tiers, and
 the maintenance rebuild re-pools every segment's tiers table-wide. A
-superfile's bytes are not changed by any of this.
+superfile's bytes are not changed by any of this. An index written by
+the layout before tiers is still read: its bounds, scores at each
+superfile's own idf, serve ceilings as they did, and the next
+maintenance rebuild writes the current layout.
 
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new

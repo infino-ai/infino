@@ -69,7 +69,11 @@ pub fn document(global: usize) -> String {
     } else {
         "yak"
     });
-    words.join(" ")
+    // One of sixty-one words, so a query can name sixty-four distinct
+    // terms every superfile holds.
+    let mut text = words.join(" ");
+    text.push_str(&format!(" w{:02}", global % 61));
+    text
 }
 
 pub fn table(dir: &TempDir, tiers: bool) -> Supertable {

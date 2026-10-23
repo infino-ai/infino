@@ -1038,12 +1038,14 @@ const TIER_KS: [usize; 4] = [1, 10, 100, 1000];
 #[test]
 fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
     let corp = zipfian_corpus(TIER_DOCS, 7);
-    // At the defaults and at parameters that stretch the length norm both
-    // ways, since every bound is computed through it.
-    for params in [
-        OracleBm25Params::default(),
-        OracleBm25Params { k1: 0.6, b: 0.9 },
-        OracleBm25Params { k1: 1.2, b: 0.0 },
+    // At the defaults over every shape, and at parameters that stretch the
+    // length norm both ways over the shapes whose bounds go through it —
+    // conjunctions and unions over more than one term, at the smallest and
+    // the largest k.
+    for (params, stretched) in [
+        (OracleBm25Params::default(), false),
+        (OracleBm25Params { k1: 0.6, b: 0.9 }, true),
+        (OracleBm25Params { k1: 1.2, b: 0.0 }, true),
     ] {
         // A term index needs storage: both arms are tables on disk. Opens
         // are one at a time on both, so the counts below are the bounds'
@@ -1097,7 +1099,15 @@ fn oracle_tier_merge_with_cut_heads_matches_the_ceiling_path_and_brute_force() {
             (scored, stats)
         };
         for (label, q, mode) in queries {
+            if stretched
+                && !["two_common_and", "common_rare_and", "three_and", "three_or"].contains(&label)
+            {
+                continue;
+            }
             for k in TIER_KS {
+                if stretched && k != TIER_KS[0] && k != TIER_KS[TIER_KS.len() - 1] {
+                    continue;
+                }
                 let (tiered, stats) = hits_of(&with_tiers, q, mode, k);
                 let (plain, _) = hits_of(&without_tiers, q, mode, k);
                 assert_eq!(

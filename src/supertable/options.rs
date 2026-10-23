@@ -393,10 +393,11 @@ pub struct SupertableOptions {
     /// before tiers existed.
     pub term_tier_entries_per_term: Option<u64>,
     /// Documents each superfile keeps per term in its head (see
-    /// `term_tier_entries_per_term`). `None` is the engine's depth, chosen
-    /// so that a superfile's tail — the first document its head leaves out
-    /// — sits well below its best, which is what lets a query rule the
-    /// superfile out without opening it.
+    /// `term_tier_entries_per_term`), clamped to `1..=4096`. `None` is the
+    /// engine's depth, chosen so that a superfile's tail — the first
+    /// document its head leaves out — sits well below its best, which is
+    /// what lets a query rule the superfile out without opening it. To
+    /// keep no tiers, set `term_tier_entries_per_term` to zero.
     pub term_head_depth: Option<usize>,
     /// Whether a ranked query merges its terms' tiers only when that is
     /// measured to pay on this table: a running cost per tier entry

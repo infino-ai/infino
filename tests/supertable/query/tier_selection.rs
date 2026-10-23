@@ -509,10 +509,11 @@ fn many_terms_are_served_up_to_the_mask_width() {
 }
 
 /// A per-query parameter override scores off the declared parameters the
-/// tiers hold impacts at: such a query keeps its ceilings, and answers as
-/// the table without tiers does under the same override.
+/// index holds keys at: such a query takes no bound from the index — no
+/// tiers, no ceilings, as before — and answers as the table without tiers
+/// does under the same override.
 #[test]
-fn a_parameter_override_keeps_the_ceilings() {
+fn a_parameter_override_opens_without_an_index_bound() {
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
     let with = table(&with_dir, true);
@@ -538,11 +539,210 @@ fn a_parameter_override_keeps_the_ceilings() {
     let (a, stats) = hits_of(&with);
     let (b, _) = hits_of(&without);
     assert!(!a.is_empty());
-    assert_eq!(a.len(), b.len());
-    assert_eq!(
-        a.iter().map(|h| h.1).collect::<Vec<_>>(),
-        b.iter().map(|h| h.1).collect::<Vec<_>>(),
-        "same scores under the override"
-    );
+    assert_eq!(a, b, "same rows and scores under the override");
     assert_eq!(stats.tier_entries, 0, "the tiers do not serve an override");
+}
+
+/// Two text columns: heads are per column, so a query on one takes nothing
+/// from the other's — the same words in both columns, and each column
+/// answers as the table without tiers does and still resolves its rare pair.
+#[test]
+fn two_text_columns_keep_their_heads_apart() {
+    let build = |tiers: bool| -> (TempDir, Supertable) {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("body", arrow_schema::DataType::LargeUtf8, true),
+            arrow_schema::Field::new("tags", arrow_schema::DataType::LargeUtf8, true),
+        ]));
+        let mut options = SupertableOptions::new(
+            Arc::clone(&schema),
+            vec![FtsConfig::new("body"), FtsConfig::new("tags")],
+            vec![],
+        )
+        .expect("options")
+        .with_storage(storage)
+        .with_bound_ordered_open_window(1)
+        .with_tier_merge_gate(false);
+        if !tiers {
+            options = options.with_term_tier_entries_per_term(0);
+        }
+        let st = Supertable::create(options).expect("create");
+        let mut w = st.writer().expect("writer");
+        for s in 0..SUPERFILES {
+            // The tags column holds the body of the document after it, so
+            // the same words sit in both columns at different rows.
+            let body: Vec<String> = (0..DOCS_PER_SUPERFILE)
+                .map(|i| document(s * DOCS_PER_SUPERFILE + i))
+                .collect();
+            let tags: Vec<String> = (0..DOCS_PER_SUPERFILE)
+                .map(|i| document(s * DOCS_PER_SUPERFILE + i + 1))
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(
+                        body.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                    Arc::new(LargeStringArray::from(
+                        tags.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )) as ArrayRef,
+                ],
+            )
+            .expect("batch");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        (dir, st)
+    };
+    let (_with_dir, with) = build(true);
+    let (_without_dir, without) = build(false);
+    let hits = |st: &Supertable, column: &str, query: &str, mode: BoolMode| {
+        with_op_stats(|| {
+            st.reader()
+                .expect("reader")
+                .bm25_hits(column, query, 10, Bm25SearchOptions::new().with_mode(mode))
+                .expect("search")
+                .iter()
+                .map(|h| (h.local_doc_id, h.score))
+                .collect::<Vec<_>>()
+        })
+    };
+    for column in ["body", "tags"] {
+        for (query, mode) in [
+            ("the data", BoolMode::Or),
+            ("search index", BoolMode::And),
+            ("quokka tensor", BoolMode::And),
+        ] {
+            let (a, stats) = hits(&with, column, query, mode);
+            let (b, _) = hits(&without, column, query, mode);
+            assert_eq!(a, b, "{column} {query:?} {mode:?}: same answer");
+            if query == "quokka tensor" {
+                assert!(!a.is_empty());
+                assert_eq!(
+                    stats.score_pruning_survived, 0,
+                    "{column}: the rare pair is answered from the column's own heads"
+                );
+            }
+        }
+    }
+    // The same rows, shifted by one between the columns: the answers
+    // differ, which is what shows each column read its own heads.
+    let (body, _) = hits(&with, "body", "quokka tensor", BoolMode::And);
+    let (tags, _) = hits(&with, "tags", "quokka tensor", BoolMode::And);
+    assert_ne!(body, tags);
+}
+
+/// A table whose term index was written by the layout before tiers (root
+/// at version 3, slices at version 1, the committed fixture): the current
+/// reader serves it as that layout did — ceilings, no tier read — and after
+/// a commit and the maintenance rebuild it answers the same, now from the
+/// tiers.
+#[test]
+fn a_table_indexed_by_the_layout_before_tiers_serves_as_before_and_rebuilds() {
+    use infino::test_helpers::copy_dir_recursive;
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/pre_tier_term_index_table");
+    let work = TempDir::new().expect("tempdir");
+    copy_dir_recursive(&fixture, work.path());
+    let open = |dir: &std::path::Path| -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        Supertable::open(
+            SupertableOptions::new(schema(), vec![fts], vec![])
+                .expect("options")
+                .with_storage(storage)
+                .with_bound_ordered_open_window(1)
+                .with_tier_merge_gate(false),
+        )
+        .expect("open the fixture")
+    };
+    let st = open(work.path());
+    let shapes = [
+        ("the data", BoolMode::Or),
+        ("the data", BoolMode::And),
+        ("search index", BoolMode::And),
+        ("quokka tensor", BoolMode::And),
+        ("\"the data\"", BoolMode::Or),
+    ];
+    for (q, mode) in &shapes {
+        let (hits, stats, _) = run(&st, q, *mode, 10);
+        assert!(!hits.is_empty(), "{q:?}: the fixture answers");
+        assert_eq!(
+            stats.tier_entries, 0,
+            "{q:?}: the old layout has no tier to read"
+        );
+        assert_eq!(
+            stats.superfiles_resolved, 0,
+            "{q:?}: nothing is answered from the index"
+        );
+    }
+    // A commit on top of the old root: a delta in the current layout
+    // beside the old slices.
+    let mut w = st.writer().expect("writer");
+    let docs: Vec<String> = (0..20).map(|i| document(1_000 + i)).collect();
+    let col: ArrayRef = Arc::new(LargeStringArray::from(
+        docs.iter().map(String::as_str).collect::<Vec<_>>(),
+    ));
+    w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+        .expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    let plain = {
+        // The same rows in a table without tiers, to compare the mixed and
+        // rebuilt states against.
+        let dir = TempDir::new().expect("tempdir");
+        copy_dir_recursive(&fixture, dir.path());
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut fts = FtsConfig::new("body");
+        fts.positions = true;
+        let st = Supertable::open(
+            SupertableOptions::new(schema(), vec![fts], vec![])
+                .expect("options")
+                .with_storage(storage)
+                .with_bound_ordered_open_window(1)
+                .with_term_tier_entries_per_term(0),
+        )
+        .expect("open");
+        let mut w = st.writer().expect("writer");
+        let docs: Vec<String> = (0..20).map(|i| document(1_000 + i)).collect();
+        let col: ArrayRef = Arc::new(LargeStringArray::from(
+            docs.iter().map(String::as_str).collect::<Vec<_>>(),
+        ));
+        w.append(&RecordBatch::try_new(schema(), vec![col]).expect("batch"))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        (dir, st)
+    };
+    for (q, mode) in &shapes {
+        let (a, _, _) = run(&st, q, *mode, 10);
+        let (b, _, _) = run(&plain.1, q, *mode, 10);
+        assert_eq!(
+            a, b,
+            "{q:?} {mode:?}: the mixed index answers as a table without tiers"
+        );
+    }
+    // The maintenance rebuild writes the current layout throughout.
+    st.optimize(&infino::OptimizeOptions::compact(
+        infino::CompactionSettings {
+            min_fill_percent: 100,
+            min_superfiles_for_merge: u64::MAX,
+            ..infino::CompactionSettings::default()
+        },
+    ))
+    .expect("optimize");
+    let mut served = false;
+    for (q, mode) in &shapes {
+        let (a, stats, _) = run(&st, q, *mode, 10);
+        let (b, _, _) = run(&plain.1, q, *mode, 10);
+        assert_eq!(a, b, "{q:?} {mode:?}: the rebuilt index answers the same");
+        served |= stats.tier_entries > 0 || stats.superfiles_resolved > 0;
+    }
+    assert!(served, "after the rebuild the tiers serve");
 }

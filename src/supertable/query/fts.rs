@@ -1127,10 +1127,10 @@ impl SupertableReader {
         // terms, and a superfile a required term has shown holds no
         // candidate is not opened. The bounds replace the ceilings, and the
         // merge's lower bound on the k-th score is seeded into the shared
-        // floor below. A phrase scores only where its words are adjacent
-        // and a negation removes documents, so neither takes a bound from
-        // the tiers: such a query keeps the ceilings, as does one with more
-        // terms than the merge tracks. Only a complete index can rule a
+        // floor below. A phrase is bounded by its members and a negation
+        // by its positive terms, but neither yields a threshold: such a
+        // query is bounded and ordered, and seeds nothing. A query of more
+        // terms than the merge tracks keeps the ceilings. Only a complete index can rule a
         // superfile out: one that does not yet list every live superfile
         // knows nothing about the rest.
         let mut tier_seed: Option<f32> = None;

@@ -1,0 +1,87 @@
+{
+  "format_version": "3.0",
+  "manifest_id": 1,
+  "options_hash": "blake3:c9e7fc9e3f52b5067babce99a7c27fc003888033cfc8becd882788e24da5242c",
+  "schema": {
+    "fields": [
+      {
+        "id": 1,
+        "index": {
+          "analyzer": "standard",
+          "b": 0.75,
+          "k1": 1.2000000476837158,
+          "kind": "fts",
+          "positions": true,
+          "stored": true
+        },
+        "name": "body",
+        "nullable": true,
+        "type": "large_utf8"
+      }
+    ],
+    "last_field_id": 1,
+    "max_depth": 20,
+    "max_fields": 10000,
+    "schema_id": 1,
+    "tombstoned": []
+  },
+  "id_column": "_id",
+  "commit_token": "d09f0453-56a4-4ebc-8616-4d6e8ff37476",
+  "vector_index_storage_prefix": null,
+  "deleted_user_ids_inline_b64": null,
+  "slow_vector_state_uri": null,
+  "slow_vector_state_content_hash": null,
+  "term_index_uri": "term-index/root-0fa3f724668049ea9881aba623182d0b20e390231587ef3436d05fb3d6ed6934.bin",
+  "term_index_content_hash": "blake3:0fa3f724668049ea9881aba623182d0b20e390231587ef3436d05fb3d6ed6934",
+  "term_index_complete": true,
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "global_vector_index": null,
+  "drained_ranges": [],
+  "parts": [
+    {
+      "part_id": "ae4014cd-3899-4831-a0c0-fa95150f8353",
+      "uri": "manifest-parts/part-64c9d5498bcdc2d9a2560dd7d3c54cc19b8c1fa0cd14520950e567ceee308045.avro.zst",
+      "n_superfiles": 1,
+      "size_bytes_compressed": 3653,
+      "size_bytes_uncompressed": 3653,
+      "content_hash": "blake3:64c9d5498bcdc2d9a2560dd7d3c54cc19b8c1fa0cd14520950e567ceee308045",
+      "routing_uri": "manifest-parts/part-64c9d5498bcdc2d9a2560dd7d3c54cc19b8c1fa0cd14520950e567ceee308045.avro.zst",
+      "routing_content_hash": "blake3:64c9d5498bcdc2d9a2560dd7d3c54cc19b8c1fa0cd14520950e567ceee308045",
+      "id_range": [
+        "33070200183811457270617542230016",
+        "33070200183811457270617542230055"
+      ],
+      "scalar_stats_agg": {},
+      "scalar_stats_agg_ipc": "/////+ABAAAQAAAAAAAKAAwACgAJAAQACgAAABAAAAAAAQQACAAIAAAABAAIAAAABAAAAAgAAAB4AQAAOAEAAAQBAADUAAAAqAAAAHQAAAA8AAAABAAAALj+//8QAAAAFAAAAAAAAQIQAAAAov7//0AAAAAAAAAADwAAADQyOTQ5NjcyOTVfX21heADs/v//EAAAABQAAAAAAAECEAAAANb+//9AAAAAAAAAAA8AAAA0Mjk0OTY3Mjk1X19taW4AIP///xAAAAAUAAAAAAABAhAAAAAK////QAAAAAAAAAAIAAAAMV9fbnVsbHMAAAAAUP///xQAAAAMAAAAAAABFAwAAAAAAAAA2P///wYAAAAxX19tYXgAAHj///8YAAAADAAAAAAAARQQAAAAAAAAAAQABAAEAAAABgAAADFfX21pbgAApP///xAAAAAUAAAAAAABAhAAAACO////QAAAAAAAAAAIAAAAMF9fbnVsbHMAAAAA1P///xQAAAAMAAAAAAABBxAAAAAAAAAAwv///yYAAAAGAAAAMF9fbWF4AAAQABQAEAAOAA8ABAAAAAgAEAAAABwAAAAMAAAAAAABBxgAAAAAAAAAAAAGAAgABAAGAAAAJgAAAAYAAAAwX19taW4AAAAAAAD/////+AEAABAAAAAMABoAGAAXAAQACAAMAAAAIAAAABABAAAAAAAAAAAAAAAAAAMEAAoAGAAMAAgABAAKAAAAnAAAABAAAAABAAAAAAAAAAAAAAAIAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAAAAAAAAAAAAAQAAAAAAAAAIAAAAAAAAABAAAAAAAAAAGAAAAAAAAAABAAAAAAAAACAAAAAAAAAAEAAAAAAAAAAwAAAAAAAAAAEAAAAAAAAAOAAAAAAAAAAIAAAAAAAAAEAAAAAAAAAAAQAAAAAAAABIAAAAAAAAABAAAAAAAAAAWAAAAAAAAABiAAAAAAAAAMAAAAAAAAAAAQAAAAAAAADIAAAAAAAAABAAAAAAAAAA2AAAAAAAAAAHAAAAAAAAAOAAAAAAAAAAAQAAAAAAAADoAAAAAAAAAAgAAAAAAAAA8AAAAAAAAAABAAAAAAAAAPgAAAAAAAAACAAAAAAAAAAAAQAAAAAAAAEAAAAAAAAACAEAAAAAAAAIAAAAAAAAAP8AAAAAAAAAAAAAG0lmDPL+cZRnoQEAAP8AAAAAAAAAJwAAG0lmDPL+cZRnoQEAAP8AAAAAAAAAAAAAAAAAAAD/AAAAAAAAAAAAAAAAAAAAYgAAAAAAAAB0aGUgZGF0YSBkYXRhIGRhdGEgc2VhcmNoIHNlYXJjaCBzZWFyY2ggaW5kZXggaW5kZXggaW5kZXggZmlsbGVyIGZpbGxlciBmaWxsZXIgZmlsbGVyIGZpbGxlciB6ZWJyYQAAAAAAAP8AAAAAAAAAAAAAAAAAAAAHAAAAAAAAAHRoZSB5YWsA/wAAAAAAAAAAAAAAAAAAAP8AAAAAAAAAAQAAAAAAAAD/AAAAAAAAAAEAAAAAAAAA/////wAAAAA=",
+      "fts_summary_agg": {
+        "1": {
+          "term_bloom_union": "",
+          "n_terms_distinct": 11,
+          "term_range_union": {
+            "min": "ZGF0YQ==",
+            "max": "emVicmE="
+          },
+          "length_stats": {
+            "total_tokens": 342,
+            "n_scored_docs": 40
+          }
+        }
+      },
+      "fts_length_totals": {
+        "1": {
+          "total_tokens": 342,
+          "n_scored_docs": 40
+        }
+      },
+      "summaries_uri": "manifest-summaries/summ-bd59fac2f149e249ad106b2e39ffcc2e116432bc8aef4f3c40e81c301d4032f3.bin",
+      "summaries_content_hash": "blake3:bd59fac2f149e249ad106b2e39ffcc2e116432bc8aef4f3c40e81c301d4032f3",
+      "summaries_size_bytes": 6140
+    }
+  ],
+  "tombstone_seqs": {},
+  "superseded_cells": {},
+  "split_checks": {}
+}
