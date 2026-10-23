@@ -647,6 +647,17 @@ impl Supertable {
     /// commit record it again. It attaches none, and returns `Err`, when
     /// more than one companion of the purpose is stored there.
     ///
+    /// Looking for an unrecorded companion lists the table's location once.
+    /// A purpose found absent is remembered on this handle, so later asks
+    /// cost nothing; a freshly opened handle lists once again. A caller on
+    /// a hot path should keep its handle rather than reopen the table.
+    ///
+    /// A create that loses a race to another create of the same table
+    /// leaves its companions' directories under the location with no table
+    /// recording them. Nothing removes them, as nothing removes the losing
+    /// create's vector index; an ask that then finds two candidates of a
+    /// purpose refuses rather than guess.
+    ///
     /// A purpose that cannot name a companion (see
     /// [`IndexSpec::companion`]) is refused with [`InfinoError::Config`].
     ///
