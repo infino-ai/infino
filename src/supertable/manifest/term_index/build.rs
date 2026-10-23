@@ -35,8 +35,8 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        Location, Posting, Root, Segment, Slice, SliceRef, encode_run, encode_slice, push_posting,
-        read_posting,
+        Location, Posting, Root, Segment, Slice, SliceFormat, SliceRef, encode_run, encode_slice,
+        push_posting, read_posting,
     },
 };
 use crate::{
@@ -53,17 +53,23 @@ use crate::{
 /// measured value.
 pub(crate) const SLICE_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
+/// Layout new slices are written in.
+const SLICE_WRITE_FORMAT: SliceFormat = SliceFormat::Ranged;
+
 /// Knobs the build takes from its caller.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BuildPolicy {
     /// See [`SLICE_TARGET_BYTES`].
     pub(crate) slice_target_bytes: usize,
+    /// See [`SLICE_WRITE_FORMAT`].
+    pub(crate) slice_format: SliceFormat,
 }
 
 impl Default for BuildPolicy {
     fn default() -> Self {
         Self {
             slice_target_bytes: SLICE_TARGET_BYTES,
+            slice_format: SLICE_WRITE_FORMAT,
         }
     }
 }
@@ -303,6 +309,7 @@ impl Ord for Head {
 
 /// The slice under construction.
 struct SliceBuilder {
+    format: SliceFormat,
     /// Keys arrive in order from the merge, so the dictionary streams into
     /// its final bytes and its size is known exactly as it grows.
     dict: TermBlockWriter<Vec<u8>>,
@@ -313,8 +320,9 @@ struct SliceBuilder {
 }
 
 impl SliceBuilder {
-    fn new() -> Self {
+    fn new(format: SliceFormat) -> Self {
         Self {
+            format,
             dict: TermBlockWriter::new(Vec::new()),
             postings: Vec::new(),
             first_key: None,
@@ -334,7 +342,7 @@ impl SliceBuilder {
                 },
             )
             .expect("Vec sink cannot fail");
-        self.postings.extend_from_slice(run);
+        self.format.push_run(&mut self.postings, run);
         if self.first_key.is_none() {
             self.first_key = Some(key.to_vec());
         }
@@ -348,13 +356,13 @@ impl SliceBuilder {
     /// column, and a column of random keys shares almost no prefix, so a
     /// fixed guess undercounted those slices to about twice the target.
     fn encoded_bytes(&self) -> usize {
-        self.postings.len() + self.dict.encoded_len()
+        self.postings.len() + self.dict.encoded_len() + self.format.table_len(self.n_terms)
     }
 
     fn finish(self) -> Option<(SliceRef, Vec<u8>)> {
         let first_key = self.first_key?;
         let dict = self.dict.finish().expect("Vec sink cannot fail");
-        let bytes = encode_slice(&dict, &self.postings);
+        let bytes = encode_slice(self.format, &dict, &self.postings);
         let content_hash = ContentHash::of(&bytes);
         Some((
             SliceRef {
@@ -375,23 +383,24 @@ struct SegmentWriter {
     current: SliceBuilder,
     slices: Vec<SliceRef>,
     slice_bytes: Vec<(ContentHash, Vec<u8>)>,
-    target_bytes: usize,
+    policy: BuildPolicy,
 }
 
 impl SegmentWriter {
     fn new(policy: &BuildPolicy) -> Self {
         Self {
-            current: SliceBuilder::new(),
+            current: SliceBuilder::new(policy.slice_format),
             slices: Vec::new(),
             slice_bytes: Vec::new(),
-            target_bytes: policy.slice_target_bytes,
+            policy: *policy,
         }
     }
 
     /// Append one term, first cutting the slice when the run would push it
     /// past the target.
     fn add(&mut self, key: &[u8], run: &[u8]) {
-        if self.current.n_terms > 0 && self.current.encoded_bytes() + run.len() > self.target_bytes
+        if self.current.n_terms > 0
+            && self.current.encoded_bytes() + run.len() > self.policy.slice_target_bytes
         {
             self.cut();
         }
@@ -399,8 +408,11 @@ impl SegmentWriter {
     }
 
     fn cut(&mut self) {
-        if let Some((reference, bytes)) =
-            mem::replace(&mut self.current, SliceBuilder::new()).finish()
+        if let Some((reference, bytes)) = mem::replace(
+            &mut self.current,
+            SliceBuilder::new(self.policy.slice_format),
+        )
+        .finish()
         {
             self.slice_bytes.push((reference.content_hash, bytes));
             self.slices.push(reference);
