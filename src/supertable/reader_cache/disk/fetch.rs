@@ -47,7 +47,7 @@ use crate::{
         StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            block_source::BlockCachedSource,
+            block_source::{BlockCachedSource, SourceLayout},
             config::ColdFetchMode,
             disk::{sources::mmap_readonly_with_handle, *},
         },
@@ -96,14 +96,14 @@ impl DiskCacheStore {
         ));
 
         // This source charges the vector blocks it holds, so the entry is charged only for the
-        // bytes the copy holds.
+        // bytes the copy holds. It serves only vector bytes, so every GET is aligned.
         let vector_source = BlockCachedSource::new_with_accounting(
             remote,
             Arc::downgrade(self),
             *uri,
             self.blocks_path(uri),
             true,
-            None,
+            SourceLayout::ALL_ALIGNED,
         );
 
         self.holed_mmap_entry(mmap, bytes, hole, vector_source, size)
@@ -681,9 +681,10 @@ impl DiskCacheStore {
                 *uri,
                 self.blocks_path(uri),
                 !eager,
-                // FTS subsection reads bypass block rounding (exact ranges);
-                // see the `passthrough` field docs.
-                offsets.fts,
+                SourceLayout {
+                    fts_hole: offsets.fts,
+                    aligned_region: offsets.vec,
+                },
             );
             block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
@@ -838,8 +839,8 @@ impl DiskCacheStore {
             *uri,
             self.blocks_path(uri),
             owns_accounting,
-            // No manifest hints here, so the FTS subsection is unknown.
-            None,
+            // No manifest hints here, so the layout is unknown.
+            SourceLayout::ALL_ALIGNED,
         );
         let shared = Arc::clone(&block_source);
         let source: Arc<dyn LazyByteSource> = shared;
@@ -1490,7 +1491,7 @@ async fn lazy_background_fill(
                             Arc::downgrade(&store),
                             uri,
                             store.blocks_path(&uri),
-                            None,
+                            SourceLayout::ALL_ALIGNED,
                         )
                     });
 
@@ -1647,6 +1648,24 @@ impl LazyByteSource for HoleFallbackSource {
         Ok(Bytes::from(out))
     }
 
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let end = start.saturating_add(len);
+        let hole_start = self.hole_start.clamp(start, end);
+        let hole_end = self.hole_end().clamp(start, end);
+        // The parts before and after the hole come from the local copy.
+        (hole_start == start || self.local.is_local(start, hole_start - start))
+            && (hole_end == hole_start || self.fallback.is_local(hole_start, hole_end - hole_start))
+            && (hole_end == end || self.local.is_local(hole_end, end - hole_end))
+    }
+
+    fn note_read(&self, start: u64, len: u64) {
+        self.local.note_read(start, len);
+        self.fallback.note_read(start, len);
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());
@@ -1687,7 +1706,9 @@ mod tests {
             manifest::{SubsectionOffsets, SuperfileUri},
             reader_cache::{
                 OpenTier,
-                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES, indexed_filled_bytes},
+                block_source::{
+                    BlockCachedSource, CACHE_BLOCK_BYTES, SourceLayout, indexed_filled_bytes,
+                },
                 config::{ColdFetchMode, DiskCacheConfig},
                 disk::{
                     EntryAccounting, fetch::*, sources::mmap_readonly_with_handle, test_support::*,
@@ -3233,7 +3254,10 @@ mod tests {
             uri,
             store.blocks_path(&uri),
             true,
-            Some(passthrough),
+            SourceLayout {
+                fts_hole: Some(passthrough),
+                ..SourceLayout::default()
+            },
         );
         // The whole file lands in the cache; this source is not the entry's.
         store
@@ -3276,7 +3300,7 @@ mod tests {
             uri,
             store.config.cache_root.join("replaced.blocks"),
             true,
-            None,
+            SourceLayout::ALL_ALIGNED,
         );
         drop(
             store
@@ -3342,7 +3366,7 @@ mod tests {
             uri,
             store.blocks_path(&uri),
             true,
-            None,
+            SourceLayout::ALL_ALIGNED,
         );
         let entry = store
             .holed_mmap_entry(
@@ -3435,7 +3459,7 @@ mod tests {
             Arc::downgrade(&store),
             uri,
             store.blocks_path(&uri),
-            None,
+            SourceLayout::ALL_ALIGNED,
         );
         let hfs = HoleFallbackSource {
             local,

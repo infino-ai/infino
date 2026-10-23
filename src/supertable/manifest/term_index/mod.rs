@@ -2958,6 +2958,7 @@ mod tests {
                         prefetched: memo,
                         live_floor: None,
                         allow: None,
+                        exact_count: false,
                     },
                     DOCS_PER_SEGMENT,
                     f32::NEG_INFINITY,

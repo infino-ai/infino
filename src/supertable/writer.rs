@@ -196,7 +196,7 @@ use crate::{
             resolve::{resolve_batch, try_conform, union_schema},
         },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
-        utils::vector_split::split_vectors,
+        utils::{idgen::flatten_spans, vector_split::split_vectors},
         wal::{
             Lease, WalStore,
             lease::{self, DEFAULT_LEASE_DURATION},
@@ -1547,20 +1547,19 @@ impl SupertableWriter {
         // are tied to `batch`, which the caller reclaims after this returns.
         let vectors = owned_vector_arrays(batch, &manifest)?;
 
-        // Mint one id per row and prepend the id column. The lock
-        // is held only long enough to drain N ids into the Vec.
+        // Reserve one id per row and prepend the id column. The lock is
+        // held only to reserve the ids as spans (one clock read per ms of
+        // sequence, so almost always one); they are expanded after it is
+        // released, so concurrent appends on this handle wait on the
+        // reservation, not on the batch's length.
         let n_rows = scalar_no_id.num_rows();
-        let mut ids: Vec<i128> = Vec::with_capacity(n_rows);
-        {
-            let generator = self
-                .inner
-                .id_generator
-                .lock()
-                .expect("id_generator mutex poisoned");
-            for _ in 0..n_rows {
-                ids.push(generator.next_id());
-            }
-        }
+        let id_spans = self
+            .inner
+            .id_generator
+            .lock()
+            .expect("id_generator mutex poisoned")
+            .reserve_range(n_rows);
+        let ids = flatten_spans(&id_spans);
 
         let scalar = with_id_column(&scalar_no_id, ids, &options.id_column);
 
@@ -1821,7 +1820,7 @@ impl SupertableWriter {
         let (wal_id_value, minted_id_spans, preallocated_superfile_id) = {
             let idgen = self.inner.id_generator.lock().expect("idgen mutex");
             let spans = idgen
-                .reserve_range(matched as u32)
+                .reserve_range(matched)
                 .into_iter()
                 .map(|(first, last)| IdSpan {
                     first: RowId(first),
@@ -12319,7 +12318,12 @@ pub(crate) async fn try_commit_attempt(
             contributions = term_contributions.len(),
         ))
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // A storage error keeps its kind, so a caller can tell a retried
+        // fault from refused credentials.
+        .map_err(|e| match e {
+            TermIndexError::Storage(source) => SupertableCommitError::Storage(source),
+            other => BuildError::Store(other.to_string()).into(),
+        })?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
     } else if !every_new_covered
         && current_manifest.term_index_complete()

@@ -30,6 +30,8 @@ pub mod graph;
 pub mod hierarchical_iter;
 pub mod provider;
 pub mod prune;
+pub(crate) mod read_ahead;
+pub(crate) mod read_ahead_rule;
 pub(crate) mod scalar_cache;
 pub(crate) mod schema_adapter;
 pub mod skip;

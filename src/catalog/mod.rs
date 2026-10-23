@@ -449,7 +449,19 @@ impl Connection {
         indexes
             .check_analyzers()
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_companions()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
+        // A companion is a table on storage beside this one; a catalog with
+        // no storage, or one forwarding to a hosted service, has nowhere to
+        // put it.
+        if indexes.has_companions() && !matches!(self.inner.store, CatalogStore::Storage { .. }) {
+            return Err(InfinoError::Unsupported(
+                "companion tables need a storage-backed connection".to_string(),
+            )
+            .with_context("create_table", Some(name)));
+        }
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -565,7 +577,9 @@ impl Connection {
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
+                opts = opts
+                    .with_read_consistency(self.inner.options.read_consistency)
+                    .with_companions(indexes.companion_specs());
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -909,6 +923,11 @@ impl Connection {
     /// table. When the table was already absent there is nothing to purge.
     /// For `memory://`, tables live in-process and free with the
     /// last handle, so `purge` has nothing extra to do.
+    ///
+    /// The hidden tables kept under the table's location — its vector
+    /// index, and any companions declared with [`IndexSpec::companion`] —
+    /// are part of those bytes: a drop without `purge` leaves them there,
+    /// orphaned with the rest of the table, and `purge` removes them.
     ///
     /// ```
     /// # use std::sync::Arc;

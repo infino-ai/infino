@@ -46,8 +46,8 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
-        sorted_root::KeepSortedRoot, topk_row_filter::RowFilterUnderTopK,
-        values_subquery::ValuesSubqueryRewrite,
+        read_ahead_rule::ReadAheadOff, sorted_root::KeepSortedRoot,
+        topk_row_filter::RowFilterUnderTopK, values_subquery::ValuesSubqueryRewrite,
     },
 };
 
@@ -158,12 +158,15 @@ pub(crate) fn budgeted_session_context(
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.
-    //  - `KeepSortedRoot` last, to remove the round-robin repartition that
-    //    `EnforceDistribution` adds above a sorted result, which would return
-    //    an `ORDER BY` out of order.
+    //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
+    //    repartition that `EnforceDistribution` adds above a sorted result,
+    //    which would return an `ORDER BY` out of order.
+    //  - `ReadAheadOff` last, once DataFusion has placed every limit, to turn
+    //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(budgeted_runtime(budget)?)
@@ -191,6 +194,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
+    use crate::memory::tests::Holder;
 
     #[test]
     fn measured_pool_never_refuses() {
@@ -222,6 +226,23 @@ mod tests {
         assert_eq!(pool.reserved(), 900);
         res.shrink(900);
         assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn a_refused_operator_takes_back_what_read_ahead_holds() {
+        // A hash join's build side can't spill, so it needs read-ahead's
+        // memory back. 1000 configured -> gate 900, 600 held.
+        let budget = ConnectionMemoryBudget::with_limit(1000);
+        let held = Holder::holding(&budget, 600);
+        let pool: Arc<dyn MemoryPool> = Arc::new(ConnectionBudgetPool {
+            budget: Arc::clone(&budget),
+        });
+        let build = MemoryConsumer::new("build").register(&pool);
+        build
+            .try_grow(800)
+            .expect("fits once read-ahead gives back");
+        assert_eq!(held.asked(), 1);
+        assert_eq!(pool.reserved(), 800);
     }
 
     #[test]

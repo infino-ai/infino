@@ -98,7 +98,7 @@ release-prep:
 # the internal `test-helpers` modules stay out of scope — this is exactly the
 # page docs.rs renders. Keeps the reference fully populated and navigable.
 doc-check:
-	RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links" cargo doc --no-deps --lib
+	RUSTDOCFLAGS="-D missing_docs -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" cargo doc --no-deps --lib
 
 test:
 	cargo test --features test-helpers,graph-index

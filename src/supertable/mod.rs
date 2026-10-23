@@ -24,6 +24,7 @@
 //!   `SupertableReader` (snapshot-pinned reader).
 
 pub(crate) mod build;
+pub(crate) mod companion;
 pub mod error;
 pub(crate) mod gc;
 #[cfg(feature = "graph-index")]

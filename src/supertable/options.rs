@@ -84,6 +84,7 @@ use crate::{
         vector::layout::VectorLayout,
     },
     supertable::{
+        companion::CompanionSpec,
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
@@ -634,6 +635,11 @@ pub struct SupertableOptions {
     /// Per-table override for the **hidden** vector-index grid's cell
     /// count. `None` → `vector.hidden_cell_count` from the YAML config.
     pub hidden_cell_count: Option<usize>,
+    /// Hidden companion tables to create beside the table, each under this
+    /// one's storage at its own prefix, recorded on its manifest and
+    /// reopened from there. Read at create only; on open the manifest says
+    /// which companions exist. Requires storage. Default empty.
+    pub(crate) companions: Vec<CompanionSpec>,
 }
 
 impl SupertableOptions {
@@ -805,6 +811,7 @@ impl SupertableOptions {
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
             hidden_cell_count: None,
+            companions: Vec::new(),
         })
     }
 
@@ -852,6 +859,13 @@ impl SupertableOptions {
     /// Override the writer thread pool.
     pub fn with_writer_pool(mut self, pool: Arc<ThreadPool>) -> Self {
         self.writer_pool = pool;
+        self
+    }
+
+    /// Create the table with `companions` beside it. See
+    /// [`Self::companions`].
+    pub(crate) fn with_companions(mut self, companions: Vec<CompanionSpec>) -> Self {
+        self.companions = companions;
         self
     }
 

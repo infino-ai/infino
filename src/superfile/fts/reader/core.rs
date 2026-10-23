@@ -162,6 +162,10 @@ pub(crate) struct ClauseLists<'a> {
     /// underflows. `None` ranks every matching row. Owned (`Arc`), not
     /// borrowed: the prepared clauses carry it into a `'static` kernel.
     pub allow: Option<Arc<RoaringBitmap>>,
+    /// Score every match in one pass and count them, instead of pruning
+    /// to the top-k. Set by the exact-count entry points, which pair it
+    /// with `run_prepared_with_count`.
+    pub exact_count: bool,
 }
 
 impl ClauseLists<'_> {
@@ -197,6 +201,11 @@ pub(crate) enum PreparedClauses {
     /// shapes do.
     Done {
         hits: Vec<(FtsDocId, f32)>,
+        /// Exact match count when the inline walk ran under
+        /// `ClauseLists::exact_count`; 0 otherwise.
+        count: u64,
+        /// Whether the clauses were prepared for the exact-count walk.
+        exact_count: bool,
         postings_bytes: u64,
         /// Byte-source ranges the inline walk requested (0 for the df=1
         /// inline-entry and empty-resolution paths).
@@ -217,6 +226,8 @@ pub(crate) enum PreparedClauses {
         /// term-dictionary ranges the builds requested (one per
         /// `build_term_cursors` call — must / should / negation lists).
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
     /// AND with should-boosted scoring.
     MustShould {
@@ -228,6 +239,8 @@ pub(crate) enum PreparedClauses {
         floor_eff: f32,
         /// See [`PreparedClauses::Must::dict_ranges`].
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
     /// Plain multi-term OR (no musts) — algorithm choice resolved in
     /// `run_prepared`.
@@ -239,10 +252,22 @@ pub(crate) enum PreparedClauses {
         floor_eff: f32,
         /// See [`PreparedClauses::Must::dict_ranges`].
         dict_ranges: u64,
+        /// See [`PreparedClauses::Done::exact_count`].
+        exact_count: bool,
     },
 }
 
 impl PreparedClauses {
+    /// Whether the clauses were prepared for the exact-count walk.
+    pub(crate) fn exact_count(&self) -> bool {
+        match self {
+            PreparedClauses::Done { exact_count, .. }
+            | PreparedClauses::Must { exact_count, .. }
+            | PreparedClauses::MustShould { exact_count, .. }
+            | PreparedClauses::Or { exact_count, .. } => *exact_count,
+        }
+    }
+
     /// Scan-cost proxy callers gate reader-pool dispatch on: the driving
     /// (smallest) posting list for the AND-intersect shapes, the full
     /// union for OR. `Done` has nothing left to scan, so it's zero.
@@ -354,9 +379,9 @@ pub enum OrAlgo {
     /// (it pivots on the rare term to skip the common term's long list); a
     /// bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. Bench-only — the
-    /// dispatcher never routes here (see `run_exhaustive_union`); kept for the
-    /// one narrow shape where it narrowly wins.
+    /// Exhaustive union walk with SIMD scoring + top-K heap. The OR
+    /// dispatcher never routes here; the exact-count search does (see
+    /// `run_exhaustive_union`), and the benches keep it as a baseline.
     Exhaustive,
     /// Windowed union: accumulate each term's contribution into a fixed doc-id
     /// window (presence bitset + score array), then drain in doc order into the
