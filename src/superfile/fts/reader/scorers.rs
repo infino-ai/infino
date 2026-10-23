@@ -807,73 +807,81 @@ fn lane_half<T: Copy>(lanes: &[T; 8], at: usize) -> [T; bm25::SCORE_SIMD_LANES] 
     std::array::from_fn(|l| lanes[at + l])
 }
 
-/// Add `c`'s next postings into a union window whose slot 0 is doc `base`:
-/// eight per SIMD call where the block and the window both allow, else
-/// four, else one, then move the cursor past them. One step; the caller
-/// loops while the cursor is inside the window, checking whatever per-block
-/// bound it applies between steps. The cursor's current doc must be at or
-/// past `base` and before `window_end`.
-#[inline(always)]
-fn accumulate_step(
-    c: &mut TermCursor,
-    base: u32,
-    window_end: u32,
-    scores: &mut [f32],
-    present: &mut [u64],
-    dl_norm_k1: &NormTable,
-) {
-    let d = c.current_doc_id();
-    let pos = c.pos;
-    // Eight postings per SIMD call where the block and window allow,
-    // then four, then one.
-    if pos + 8 <= c.block_n {
-        let dids: [u32; 8] = c.block_doc_ids[pos..pos + 8]
-            .try_into()
-            .expect("invariant: an 8-wide slice");
-        if dids[7] < window_end {
-            let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
+/// Add the cursor's next postings into a union window whose slot 0 is doc
+/// `base`: eight per SIMD call where the block and the window both allow,
+/// else four, else one, then move the cursor past them and `continue` the
+/// caller's loop. One step; the caller loops while the cursor is inside the
+/// window, checking whatever per-block bound it applies between steps. A
+/// macro rather than a function: called through a function the counted
+/// union measured 3% slower, the window buffers no longer seen whole.
+macro_rules! accumulate_step {
+    ($c:expr, $base:expr, $window_end:expr, $scores:expr, $present:expr, $norms:expr) => {{
+        let d = $c.current_doc_id();
+        let pos = $c.pos;
+        // Eight postings per SIMD call where the block and window allow,
+        // then four, then one.
+        if pos + 8 <= $c.block_n {
+            let dids: [u32; 8] = $c.block_doc_ids[pos..pos + 8]
                 .try_into()
                 .expect("invariant: an 8-wide slice");
-            let contributions =
-                bm25::score_one_term_x8(c.idf_weight, tfs, dids.map(|d| dl_norm_k1.get(d)));
-            let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
-            mark_four(scores, present, base, lo, lane_half(&contributions, 0));
-            mark_four(scores, present, base, hi, lane_half(&contributions, 4));
-            c.advance_by(8);
-            return;
+            if dids[7] < $window_end {
+                let tfs: [u32; 8] = $c.block_tfs[pos..pos + 8]
+                    .try_into()
+                    .expect("invariant: an 8-wide slice");
+                let contributions =
+                    bm25::score_one_term_x8($c.idf_weight, tfs, dids.map(|d| $norms.get(d)));
+                let (lo, hi) = (lane_half(&dids, 0), lane_half(&dids, 4));
+                mark_four(
+                    &mut $scores,
+                    &mut $present,
+                    $base,
+                    lo,
+                    lane_half(&contributions, 0),
+                );
+                mark_four(
+                    &mut $scores,
+                    &mut $present,
+                    $base,
+                    hi,
+                    lane_half(&contributions, 4),
+                );
+                $c.advance_by(8);
+                continue;
+            }
         }
-    }
-    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
-        // Bind the 4-wide window as one subslice per array:
-        // the guard proves `pos + LANES <= block_n <= len`,
-        // so this is a single range check and the lane reads
-        // off the fixed-length-4 slice carry none — replacing
-        // the eight separate element bounds checks the direct
-        // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
-        // emitted in this per-block SIMD group.
-        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
-        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
-        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
-            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
-            let contributions = bm25::score_one_term_x4(
-                c.idf_weight,
-                [tfs[0], tfs[1], tfs[2], tfs[3]],
-                [
-                    dl_norm_k1.get(doc_ids[0]),
-                    dl_norm_k1.get(doc_ids[1]),
-                    dl_norm_k1.get(doc_ids[2]),
-                    dl_norm_k1.get(doc_ids[3]),
-                ],
-            );
-            mark_four(scores, present, base, doc_ids, contributions);
-            c.advance_by(bm25::SCORE_SIMD_LANES);
-            return;
+        if pos + bm25::SCORE_SIMD_LANES <= $c.block_n {
+            // Bind the 4-wide window as one subslice per array:
+            // the guard proves `pos + LANES <= block_n <= len`,
+            // so this is a single range check and the lane reads
+            // off the fixed-length-4 slice carry none — replacing
+            // the eight separate element bounds checks the direct
+            // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
+            // emitted in this per-block SIMD group.
+            let dids = &$c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
+            let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
+            if doc_ids[bm25::SCORE_SIMD_LANES - 1] < $window_end {
+                let tfs = &$c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
+                let contributions = bm25::score_one_term_x4(
+                    $c.idf_weight,
+                    [tfs[0], tfs[1], tfs[2], tfs[3]],
+                    [
+                        $norms.get(doc_ids[0]),
+                        $norms.get(doc_ids[1]),
+                        $norms.get(doc_ids[2]),
+                        $norms.get(doc_ids[3]),
+                    ],
+                );
+                mark_four(&mut $scores, &mut $present, $base, doc_ids, contributions);
+                $c.advance_by(bm25::SCORE_SIMD_LANES);
+                continue;
+            }
         }
-    }
-    let local = (d - base) as usize;
-    scores[local] += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), dl_norm_k1.get(d));
-    present[local >> 6] |= 1u64 << (local & 63);
-    c.next();
+        let local = (d - $base) as usize;
+        $scores[local] +=
+            bm25::score_with_dl_norm_k1($c.idf_weight, $c.current_tf(), $norms.get(d));
+        $present[local >> 6] |= 1u64 << (local & 63);
+        $c.next();
+    }};
 }
 
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
@@ -2376,7 +2384,7 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_step!(c, base, window_end, scores, present, dl_norm_k1);
                 }
             }
 
@@ -2533,7 +2541,7 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_step!(c, base, window_end, scores, present, dl_norm_k1);
                 }
             }
             for (word_idx, word) in present.iter_mut().enumerate() {
@@ -3011,7 +3019,7 @@ impl FtsReader {
                             continue;
                         }
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_step!(c, base, window_end, scores, present, dl_norm_k1);
                 }
             }
 
