@@ -52,7 +52,7 @@ fn document(global: usize) -> String {
     for (rank, w) in VOCABULARY.iter().enumerate() {
         // Word `w` appears in one document in `2^rank`, one to three times.
         let odds = 1u64 << rank;
-        if next() % odds == 0 {
+        if next().is_multiple_of(odds) {
             for _ in 0..(1 + next() % 3) {
                 words.push(w);
             }

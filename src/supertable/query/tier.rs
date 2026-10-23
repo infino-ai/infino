@@ -1219,7 +1219,7 @@ mod tests {
                     let len = 2 + (next() % 3) as usize;
                     let members: Vec<usize> =
                         (0..len).map(|_| (next() % nt as u64) as usize).collect();
-                    phrases.push((members, next() % 2 == 0));
+                    phrases.push((members, next().is_multiple_of(2)));
                 }
             }
             if phrases.is_empty() && scoring == 0 {
@@ -1233,7 +1233,7 @@ mod tests {
                     }
                 }
             }
-            let negated = next() % 4 == 0;
+            let negated = next().is_multiple_of(4);
             let shape = Shape {
                 required,
                 scoring,
@@ -1249,7 +1249,7 @@ mod tests {
             // head takes a hidden contribution within the tail.
             let mut truth: Vec<Vec<f32>> = Vec::with_capacity(nt);
             for ti in 0..nt {
-                let whole = next() % 3 == 0;
+                let whole = next().is_multiple_of(3);
                 let in_head = (next() % u64::from(UNIVERSE)) as u32;
                 let tail = if whole {
                     0.0
@@ -1266,7 +1266,7 @@ mod tests {
                         slot.absorb(ti, doc, c);
                         contribution[doc as usize] = c;
                         ceiling = ceiling.max(c);
-                    } else if !whole && next() % 2 == 0 {
+                    } else if !whole && next().is_multiple_of(2) {
                         contribution[doc as usize] = tail * (next() % 1000) as f32 / 1000.0;
                     }
                 }
