@@ -532,7 +532,7 @@ impl TopKBuffer {
 }
 
 /// [`TopKBuffer`] cuts once it holds `k + k / this` entries.
-const TOPK_BUFFER_SLACK_DIVISOR: usize = 4;
+const TOPK_BUFFER_SLACK_DIVISOR: usize = 2;
 
 impl Collector for TopKBuffer {
     fn with_capacity(k: usize, capacity: usize) -> Self {
