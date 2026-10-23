@@ -3045,10 +3045,8 @@ impl ShardOutput {
 
     pub(in crate::supertable) fn with_term_contribution(
         mut self,
-        superfile_id: Uuid,
         contribution: TermContribution,
     ) -> Self {
-        self.superfile_id = superfile_id;
         self.term_contribution = Some(contribution);
         self
     }

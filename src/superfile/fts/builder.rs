@@ -111,7 +111,7 @@ use crate::{
             bm25,
             positions::{TermRuns, encode_group, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
-            reader::{ColumnLengthStats, TopKEntry},
+            reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
             tokenize::{StandardTokenizer, Tokenizer},
@@ -1485,34 +1485,15 @@ fn term_head(
             *worst = TopKEntry(score, (doc, tf));
         }
     }
-    let complete = heap.len() <= depth;
-    out.kept.clear();
-    out.kept.extend(heap.drain().map(|TopKEntry(s, d)| (d, s)));
-    out.kept
-        .sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-    // The key of a document: what the term index orders its tiers by. The
-    // bound is the largest over the documents kept: the best by impact is
-    // among them, and impact orders as the key does.
-    let key = |doc: u32, tf: u32| {
+    // The key of a document: what the term index orders its tiers by.
+    let key = |(doc, tf): (u32, u32)| {
         bm25::tf_factor(
             tf,
             enc.params
                 .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
         )
     };
-    out.bound = out
-        .kept
-        .iter()
-        .map(|&((doc, tf), _)| key(doc, tf))
-        .fold(0.0f32, f32::max);
-    out.tail = if complete {
-        0.0
-    } else {
-        out.kept
-            .pop()
-            .map(|((doc, tf), _)| key(doc, tf))
-            .unwrap_or(0.0)
-    };
+    (out.bound, out.tail) = finish_head(heap, depth, &mut out.kept, key);
     out.docs.clear();
     out.docs.extend(out.kept.iter().map(|&((doc, tf), _)| {
         let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
@@ -4279,18 +4260,20 @@ fn encode_term(
     );
 
     let df = pairs.len() as u64;
+    // Every posting's score, as a reader scores it: the heads rank by it
+    // and each block's maximum is read from it.
+    let idf_t = bm25::idf(n_scored_docs as u64, df);
+    scratch.scores.clear();
+    scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
+        bm25::score(
+            idf_t,
+            tf,
+            bm25::stored_len(col_doc_lengths[doc as usize]),
+            avgdl,
+            params,
+        )
+    }));
     if enc.heads {
-        let idf_t = bm25::idf(n_scored_docs as u64, df);
-        scratch.scores.clear();
-        scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
-            bm25::score(
-                idf_t,
-                tf,
-                bm25::stored_len(col_doc_lengths[doc as usize]),
-                avgdl,
-                params,
-            )
-        }));
         term_head(
             pairs,
             &scratch.scores,
@@ -4358,7 +4341,6 @@ fn encode_term(
         EncodedTerm::Short
     } else {
         profile.encode_pfor += 1;
-        let idf_t = bm25::idf(n_scored_docs as u64, df);
         // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
@@ -4403,26 +4385,9 @@ fn encode_term(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            // With a head gathered the scores are already in hand, from the
-            // same arithmetic.
-            let block_max = match enc.heads {
-                true => scratch.scores[at * BLOCK_LEN..at * BLOCK_LEN + chunk.len()]
-                    .iter()
-                    .fold(0.0f32, |m, &s| m.max(s)),
-                false => block_doc_ids
-                    .iter()
-                    .zip(block_tfs.iter())
-                    .map(|(&d, &t)| {
-                        bm25::score(
-                            idf_t,
-                            t,
-                            bm25::stored_len(col_doc_lengths[d as usize]),
-                            avgdl,
-                            params,
-                        )
-                    })
-                    .fold(0.0f32, f32::max),
-            };
+            let block_max = scratch.scores[at * BLOCK_LEN..at * BLOCK_LEN + chunk.len()]
+                .iter()
+                .fold(0.0f32, |m, &s| m.max(s));
             block_maxes.push(block_max);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),

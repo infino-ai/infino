@@ -557,13 +557,7 @@ mod tests {
     /// and lengths across the whole bucket range, each head in descending
     /// key with a tail below its last key.
     fn sample(per_sf: usize, superfiles: u32, docs: u32, seed: u64) -> Vec<HeadGroup> {
-        let mut x = seed;
-        let mut next = || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut next = crate::test_helpers::xorshift(seed);
         (0..superfiles)
             .map(|sf| {
                 let mut entries: Vec<TierEntry> = (0..per_sf)

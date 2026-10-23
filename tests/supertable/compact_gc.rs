@@ -103,13 +103,7 @@ fn optimize_leaves_superfile_id_ranges_disjoint_and_in_order() {
         .expect("create");
     // Titles of pseudo-random words, so the superfiles do not compress to
     // nothing and the optimize has several outputs to cut.
-    let mut x = 0x9E37_79B9_7F4A_7C15u64;
-    let mut next = move || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut next = infino::test_helpers::xorshift(0x9E37_79B9_7F4A_7C15);
     for _ in 0..COMMITS {
         let titles: Vec<String> = (0..TITLES_PER_COMMIT)
             .map(|_| {

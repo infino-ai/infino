@@ -91,16 +91,10 @@ use crate::{
 /// score bit for bit: one term is one product, two commute, three or more
 /// depend on the order the kernel adds them in.
 const EXACT_SUM_TERMS: usize = 2;
-/// Widening applied to an upper bound before it is compared against the
-/// threshold: the bound is assembled from separately rounded terms the
-/// score itself does not go through. Mirrors the term index's ceiling
-/// slack.
+/// Widening applied to a bound taken from a stored key — a tail or a
+/// ceiling — which is rounded once more than the kernel rounds a score.
+/// Mirrors the term index's ceiling slack.
 const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
-/// Narrowing applied to a lower bound as it is assembled: a stored impact
-/// times the idf ratio can land an ulp above the score the kernel computes
-/// for the same document, and a threshold an ulp above a real k-th score
-/// would prune a document tied with it. The mirror of [`BOUND_SLACK`].
-const LOWER_SLACK: f32 = 1.0 - 8.0 * f32::EPSILON;
 /// Most distinct terms, phrase members included, the merge serves: a
 /// document's terms are a bit mask. Past two bare terms a candidate's sum
 /// carries slack (see [`EXACT_SUM_TERMS`]); the bounds hold for any
@@ -569,8 +563,7 @@ pub(crate) async fn select_with_tiers(
             .superfile_id(ordinal)
             .and_then(|id| slot_of.get(&id).copied())
     };
-    let runs_per_term =
-        try_join_all(terms.iter().map(|term| index.runs(query.column, term))).await?;
+    let runs_per_term = index.runs_many(query.column, terms).await?;
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     for (ti, runs) in runs_per_term.iter().enumerate() {
@@ -671,11 +664,13 @@ pub(crate) async fn select_with_tiers(
     }
     // What lies past a block is bounded through its tail, already widened
     // where the tail is set; a read document's sum needs widening only
-    // when the kernel may add it in another order.
+    // when the kernel may add it in another order, by a rounding per
+    // addition.
     let (lb_slack, ub_slack) = if exact_scores {
         (1.0, 1.0)
     } else {
-        (LOWER_SLACK, BOUND_SLACK)
+        let slack = (8 + nt) as f32 * f32::EPSILON;
+        (1.0 - slack, 1.0 + slack)
     };
     let scoring = Scoring::new(idf, query.params, query.table_avgdl);
     // Inline heads are whole: their entries are in hand before any read.
@@ -1210,13 +1205,7 @@ mod tests {
     #[test]
     #[allow(clippy::needless_range_loop)]
     fn bounds_hold_against_every_corpus_the_heads_allow() {
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut next = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut next = crate::test_helpers::xorshift(0x9E37_79B9_7F4A_7C15);
         for case in 0..BOUND_CASES {
             let nt = 1 + (next() % TERMS as u64) as usize;
             let all: TermMask = (1u64 << nt) - 1;

@@ -188,6 +188,18 @@ pub fn lazy_foreground_disk_cache(
 ///     .with_precision_and_scale(38, 0)
 ///     .expect("decimal128")
 /// ```
+/// A xorshift64 stream from `seed`: what tests draw corpora and samples
+/// from, the same on every run.
+pub fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+    let mut x = seed;
+    move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    }
+}
+
 pub fn decimal128_ids<I: IntoIterator<Item = u64>>(ids: I) -> Decimal128Array {
     Decimal128Array::from(ids.into_iter().map(|v| v as i128).collect::<Vec<_>>())
         .with_precision_and_scale(38, 0)

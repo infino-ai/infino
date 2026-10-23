@@ -18,7 +18,7 @@ use super::{
     options::BoolMode,
     phrase::AnyCursor,
     search::FetchedTermMemo,
-    sink::{TopKEntry, drain_top_k_desc},
+    sink::{TopKEntry, finish_head},
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
 #[cfg(any(test, feature = "test-helpers"))]
@@ -502,7 +502,6 @@ impl FtsReader {
         // term has, up to the depth and the tail.
         let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> =
             BinaryHeap::with_capacity((depth + 1).min(cursor.df as usize + 1));
-        let mut tail = 0.0f32;
         while !cursor.is_exhausted() {
             if heap.len() > depth
                 && let Some(TopKEntry(min, _)) = heap.peek()
@@ -523,23 +522,11 @@ impl FtsReader {
             }
             cursor.next();
         }
-        // One more than the depth was kept so the tail is the first
-        // document left out, exactly: its key, as the term index orders
-        // its tiers, at the average length and parameters this file scores
-        // at.
-        let complete = heap.len() <= depth;
-        let mut hits = drain_top_k_desc(heap);
-        // The key of a document, as the term index orders its tiers. The
-        // bound is the largest over the documents kept: the best by impact
-        // is among them, and impact orders as the key does.
-        let key = |id: FtsDocId, tf: u32| bm25::tf_factor(tf, norms.get(id.get()));
-        let bound = hits
-            .iter()
-            .map(|&((id, tf), _)| key(id, tf))
-            .fold(0.0f32, f32::max);
-        if !complete {
-            tail = hits.pop().map(|((id, tf), _)| key(id, tf)).unwrap_or(0.0);
-        }
+        // The key of a document, as the term index orders its tiers, at
+        // the average length and parameters this file scores at.
+        let key = |(id, tf): (FtsDocId, u32)| bm25::tf_factor(tf, norms.get(id.get()));
+        let mut hits = Vec::new();
+        let (bound, tail) = finish_head(&mut heap, depth, &mut hits, key);
         let buckets = norms.buckets();
         let docs = hits
             .into_iter()

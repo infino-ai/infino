@@ -510,9 +510,10 @@ impl SharedTopK {
     /// below `id_min`. The final top-k breaks a tie at the k-th score by
     /// ascending `_id`, so a document of this superfile tied at the floor
     /// ranks behind each of those, and one below it is out regardless.
-    /// Sound only when superfile `_id` ranges are disjoint, which the
-    /// caller checks. A seed placeholder carries `i128::MAX` and so never
-    /// justifies a skip.
+    /// Sound for any `_id` ranges: every `_id` of this superfile is at
+    /// least `id_min`, and every tied document's is at most its
+    /// superfile's `id_max`. A seed placeholder carries `i128::MAX` and so
+    /// never justifies a skip.
     ///
     /// Of the entries at the floor the last is the one from the highest
     /// range (equal scores order by range descending), so one look settles
@@ -1938,21 +1939,20 @@ impl SupertableReader {
         {
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
             let asked: Vec<&str> = misses.iter().map(String::as_str).collect();
-            let runs = index.postings_many(column_id, &asked).await?;
+            let runs = index.runs_many(column_id, &asked).await?;
             // The index keeps postings for removed superfiles, so only live
             // ones count; liveness is checked for the terms' holders alone.
             let holders: HashSet<Uuid> = runs
                 .iter()
-                .flat_map(|run| run.iter())
+                .flat_map(|r| term_index::postings_of(r))
                 .filter_map(|p| index.superfile_id(p.superfile))
                 .collect();
             let live = manifest
                 .live_among(&index, &holders)
                 .await
                 .map_err(QueryError::ManifestLoad)?;
-            for (t, postings) in misses.iter().zip(runs) {
-                let df: u64 = postings
-                    .iter()
+            for (t, runs) in misses.iter().zip(runs) {
+                let df: u64 = term_index::postings_of(&runs)
                     .filter(|p| {
                         index
                             .superfile_id(p.superfile)

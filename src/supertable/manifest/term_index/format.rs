@@ -492,14 +492,26 @@ pub(crate) fn push_posting(out: &mut Vec<u8>, p: &Posting) {
     }
 }
 
-/// Encode a term's run: count, the tier reference, then its postings in
-/// ascending superfile ordinal.
-pub(crate) fn encode_run(postings: &[Posting]) -> Vec<u8> {
-    encode_run_with_tier(None, postings)
+/// Append a document's facts — row, term frequency, length bucket — as a
+/// head or contribution record carries them.
+pub(crate) fn push_doc_facts(out: &mut Vec<u8>, row: u32, tf: u32, len: u8) {
+    push_varint(out, row);
+    push_varint(out, tf);
+    out.push(len);
 }
 
-/// [`encode_run`] with the term's tier reference.
-pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting]) -> Vec<u8> {
+/// Read what [`push_doc_facts`] wrote at `at`, advancing it; `None` short.
+pub(crate) fn read_doc_facts(bytes: &[u8], at: &mut usize) -> Option<(u32, u32, u8)> {
+    let row = read_varint(bytes, at)?;
+    let tf = read_varint(bytes, at)?;
+    let len = *bytes.get(*at)?;
+    *at += 1;
+    Some((row, tf, len))
+}
+
+/// Encode a term's run: count, the tier reference, then its postings in
+/// ascending superfile ordinal.
+pub(crate) fn encode_run(tier: Option<&TierRef>, postings: &[Posting]) -> Vec<u8> {
     let mut out = Vec::with_capacity(postings.len() * (1 + 2 + 2 * F32_LEN + 1 + 8));
     push_varint(&mut out, postings.len() as u32);
     match tier {
@@ -509,9 +521,7 @@ pub(crate) fn encode_run_with_tier(tier: Option<&TierRef>, postings: &[Posting])
             push_varint(&mut out, t.inline.len() as u32);
             for e in &t.inline {
                 push_varint(&mut out, e.superfile);
-                push_varint(&mut out, e.doc_id);
-                push_varint(&mut out, e.tf);
-                out.push(e.len);
+                push_doc_facts(&mut out, e.doc_id, e.tf, e.len);
             }
         }
         Some(t) => {
@@ -612,14 +622,8 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
             for _ in 0..n {
                 let superfile =
                     read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry ordinal"))?;
-                let doc_id =
-                    read_varint(bytes, &mut at).ok_or_else(|| malformed("inline entry row"))?;
-                let tf = read_varint(bytes, &mut at)
-                    .ok_or_else(|| malformed("inline entry term frequency"))?;
-                let len = *bytes
-                    .get(at)
-                    .ok_or_else(|| malformed("inline entry length"))?;
-                at += 1;
+                let (doc_id, tf, len) =
+                    read_doc_facts(bytes, &mut at).ok_or_else(|| malformed("inline entry"))?;
                 inline.push(TierEntry {
                     superfile,
                     doc_id,
@@ -705,6 +709,7 @@ impl<'a> Slice<'a> {
     }
 
     /// The postings for `key`, `None` when the slice holds no such term.
+    #[cfg(test)]
     pub(crate) fn postings(&self, key: &[u8]) -> Result<Option<Vec<Posting>>, TermIndexError> {
         Ok(self.run(key)?.map(|r| r.postings))
     }
@@ -866,12 +871,12 @@ mod tests {
     #[test]
     fn run_round_trips_its_tier_reference() {
         let postings = sample_postings();
-        let bytes = encode_run_with_tier(Some(&sample_tier()), &postings);
+        let bytes = encode_run(Some(&sample_tier()), &postings);
         let run = decode_run_with_tier(&bytes).expect("decode");
         assert_eq!(run.tier, Some(sample_tier()));
         assert_eq!(run.postings, postings);
         assert_eq!(decode_run(&bytes).expect("postings only"), postings);
-        let inline = encode_run_with_tier(Some(&sample_inline_tier()), &postings);
+        let inline = encode_run(Some(&sample_inline_tier()), &postings);
         let run = decode_run_with_tier(&inline).expect("decode");
         assert_eq!(run.tier, Some(sample_inline_tier()));
         assert_eq!(run.postings, postings);
@@ -880,7 +885,7 @@ mod tests {
             decode_run_with_tier(&inline[..inline.len() - 1]).is_err(),
             "a truncated inline tier is refused"
         );
-        let without = encode_run(&postings);
+        let without = encode_run(None, &postings);
         assert_eq!(decode_run_with_tier(&without).expect("decode").tier, None);
         let mut bad = without.clone();
         bad[1] = 7;
@@ -892,15 +897,15 @@ mod tests {
     #[test]
     fn run_round_trips_every_location_kind() {
         let postings = sample_postings();
-        let bytes = encode_run(&postings);
+        let bytes = encode_run(None, &postings);
         assert_eq!(decode_run(&bytes).expect("decode"), postings);
     }
 
     #[test]
     fn run_rejects_truncation_and_unknown_tag() {
-        let bytes = encode_run(&sample_postings());
+        let bytes = encode_run(None, &sample_postings());
         assert!(decode_run(&bytes[..bytes.len() - 1]).is_err(), "truncated");
-        let mut bad = encode_run(&sample_postings()[3..]);
+        let mut bad = encode_run(None, &sample_postings()[3..]);
         // The last byte of a `None` posting is its tag.
         *bad.last_mut().expect("tag") = 200;
         assert!(
@@ -1117,7 +1122,7 @@ mod tests {
         let mut dict = TermDictBuilder::new();
         let mut postings = Vec::new();
         for (col, term, run) in entries {
-            let bytes = encode_run(run);
+            let bytes = encode_run(None, run);
             dict.insert(
                 &make_key(col, term),
                 DictEntry::Pfor {

@@ -101,6 +101,30 @@ impl<I: Ord> Ord for TopKEntry<I> {
     }
 }
 
+/// What a `depth + 1` heap kept, as a term's head. `kept` receives the
+/// documents in descending score, ascending id on a tie — a reader's
+/// top-k order. The bound is the largest key among them; when more than
+/// `depth` were kept, the last is popped as the tail, the first document
+/// left out by its key, else the tail is zero. Returns `(bound, tail)`.
+pub(in crate::superfile::fts) fn finish_head<I: Ord + Copy>(
+    heap: &mut BinaryHeap<TopKEntry<I>>,
+    depth: usize,
+    kept: &mut Vec<(I, f32)>,
+    key: impl Fn(I) -> f32,
+) -> (f32, f32) {
+    let complete = heap.len() <= depth;
+    kept.clear();
+    kept.extend(heap.drain().map(|TopKEntry(s, d)| (d, s)));
+    kept.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let bound = kept.iter().map(|&(d, _)| key(d)).fold(0.0f32, f32::max);
+    let tail = if complete {
+        0.0
+    } else {
+        kept.pop().map(|(d, _)| key(d)).unwrap_or(0.0)
+    };
+    (bound, tail)
+}
+
 /// Drain a top-k min-heap into the public result order: descending
 /// score, ascending doc_id on ties.
 ///

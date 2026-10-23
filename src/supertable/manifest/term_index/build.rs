@@ -38,8 +38,8 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        Location, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
-        encode_run_with_tier, encode_slice, push_posting, read_posting,
+        Location, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run, encode_slice,
+        push_doc_facts, push_posting, read_doc_facts, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, TierChunk, TierChunkRef, TierEntry,
@@ -332,7 +332,21 @@ impl ContributionWriter {
         id_min: i128,
     ) -> Result<Self, TermIndexError> {
         fs::create_dir_all(dir)?;
-        let path = dir.join(format!("{superfile_id}.terms"));
+        Self::create_at(
+            dir.join(format!("{superfile_id}.terms")),
+            superfile_id,
+            id_min,
+        )
+    }
+
+    /// A writer for one part of a contribution — one column's terms —
+    /// under `dir`, named `part`; the parts are joined in key order once
+    /// every column is written.
+    fn create_part(dir: &Path, part: usize) -> Result<Self, TermIndexError> {
+        Self::create_at(dir.join(format!("part-{part}.terms")), Uuid::nil(), 0)
+    }
+
+    fn create_at(path: PathBuf, superfile_id: Uuid, id_min: i128) -> Result<Self, TermIndexError> {
         let out = BufWriter::new(File::create(&path)?);
         Ok(Self {
             out,
@@ -340,26 +354,6 @@ impl ContributionWriter {
             scratch: None,
             superfile_id,
             id_min,
-            scoring: BTreeMap::new(),
-            prev_key: Vec::new(),
-            n_terms: 0,
-            record: Vec::new(),
-            frame: Vec::new(),
-        })
-    }
-
-    /// A writer for one part of a contribution — one column's terms —
-    /// under `dir`, named `part`; the parts are joined in key order once
-    /// every column is written.
-    fn create_part(dir: &Path, part: usize) -> Result<Self, TermIndexError> {
-        let path = dir.join(format!("part-{part}.terms"));
-        let out = BufWriter::new(File::create(&path)?);
-        Ok(Self {
-            out,
-            path,
-            scratch: None,
-            superfile_id: Uuid::nil(),
-            id_min: 0,
             scoring: BTreeMap::new(),
             prev_key: Vec::new(),
             n_terms: 0,
@@ -416,9 +410,7 @@ impl ContributionWriter {
         );
         push_varint(&mut self.record, head.len() as u32);
         for &(row, tf, len) in head {
-            push_varint(&mut self.record, row);
-            push_varint(&mut self.record, tf);
-            self.record.push(len);
+            push_doc_facts(&mut self.record, row, tf, len);
         }
         self.frame.clear();
         push_varint(&mut self.frame, self.record.len() as u32);
@@ -761,17 +753,10 @@ impl ContributionReader {
             as usize;
         let mut docs = Vec::with_capacity(n);
         for _ in 0..n {
-            let row = read_varint(&self.buf, &mut at)
-                .ok_or_else(|| TermIndexError::Malformed("contribution head row".into()))?;
-            let tf = read_varint(&self.buf, &mut at).ok_or_else(|| {
-                TermIndexError::Malformed("contribution head term frequency".into())
-            })?;
-            let len = *self
-                .buf
-                .get(at)
-                .ok_or_else(|| TermIndexError::Malformed("contribution head length".into()))?;
-            at += 1;
-            docs.push((row, tf, len));
+            docs.push(
+                read_doc_facts(&self.buf, &mut at)
+                    .ok_or_else(|| TermIndexError::Malformed("contribution head entry".into()))?,
+            );
         }
         if at != self.buf.len() {
             return Err(TermIndexError::Malformed(
@@ -940,13 +925,7 @@ impl SegmentWriter {
     /// A writer for a merge, renumbering decoded tiers through `ordinals`
     /// and keying entries by the policy's per-ordinal scoring.
     fn for_merge(policy: &BuildPolicy, ordinals: &[Option<u32>]) -> Result<Self, TermIndexError> {
-        let by_ordinal = Arc::clone(&policy.scoring_by_ordinal);
-        let scoring: ScoringOf = Arc::new(move |ordinal, column| {
-            by_ordinal
-                .get(ordinal as usize)
-                .and_then(|columns| columns.get(&column).copied())
-                .unwrap_or_default()
-        });
+        let scoring = scoring_lookup(Arc::clone(&policy.scoring_by_ordinal), 0);
         Ok(Self {
             ordinals: Arc::from(ordinals.to_vec()),
             ..Self::new(policy, scoring)?
@@ -1075,17 +1054,17 @@ impl SegmentWriter {
     /// the term lands in, so a cut moves them to the fresh slice's object.
     fn add_encoded(&mut self, term: EncodedTerm) -> Result<(), TermIndexError> {
         let Some(encoded) = term.tier else {
-            return self.add(&term.key, &encode_run(&term.postings));
+            return self.add(&term.key, &encode_run(None, &term.postings));
         };
         let mut tier = TierRef {
             chunks: self.refs_at(&encoded.chunks),
             inline: encoded.inline,
         };
-        let mut run = encode_run_with_tier(Some(&tier), &term.postings);
+        let mut run = encode_run(Some(&tier), &term.postings);
         if self.cuts_before(run.len()) {
             self.cut()?;
             tier.chunks = self.refs_at(&encoded.chunks);
-            run = encode_run_with_tier(Some(&tier), &term.postings);
+            run = encode_run(Some(&tier), &term.postings);
         }
         self.place_chunks(&encoded.chunks);
         self.current.add(&term.key, &run);
@@ -1227,15 +1206,10 @@ pub(crate) fn build_segment(
         readers.push(rd);
     }
 
-    let scoring: Vec<BTreeMap<FieldId, ColumnScoring>> =
-        contributions.iter().map(|c| c.scoring.clone()).collect();
-    let scoring: ScoringOf = Arc::new(move |ordinal: u32, column| {
-        ordinal
-            .checked_sub(ordinal_base)
-            .and_then(|i| scoring.get(i as usize))
-            .and_then(|columns| columns.get(&column).copied())
-            .unwrap_or_default()
-    });
+    let scoring = scoring_lookup(
+        Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
+        ordinal_base,
+    );
     let mut writer = SegmentWriter::new(policy, scoring)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
@@ -1400,6 +1374,24 @@ pub(crate) fn tier_path(dir: &Path, slice_hash: &ContentHash) -> PathBuf {
     dir.join(format!("{}.{TIER_FILE_EXTENSION}", slice_hash.to_hex()))
 }
 
+/// The new ordinal of old ordinal `old` under `ordinals`; `None` for a
+/// superfile that is gone, or padding.
+fn renumber(ordinals: &[Option<u32>], old: u32) -> Option<u32> {
+    *ordinals.get(old as usize)?
+}
+
+/// The per-ordinal scoring of a build's contributions, ordinals counted
+/// from `base`; a superfile with none scores at the defaults.
+fn scoring_lookup(table: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>, base: u32) -> ScoringOf {
+    Arc::new(move |ordinal: u32, column| {
+        ordinal
+            .checked_sub(base)
+            .and_then(|i| table.get(i as usize))
+            .and_then(|columns| columns.get(&column).copied())
+            .unwrap_or_default()
+    })
+}
+
 /// Every entry of `chunks` in `object`, renumbered through `ordinals`;
 /// entries of superfiles that are gone are dropped.
 fn tier_entries(
@@ -1420,7 +1412,7 @@ fn tier_entries(
         TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
         out.extend(block.iter().filter_map(|e| {
             Some(TierEntry {
-                superfile: (*ordinals.get(e.superfile as usize)?)?,
+                superfile: renumber(ordinals, e.superfile)?,
                 ..*e
             })
         }));
@@ -1481,7 +1473,7 @@ pub(crate) fn merge_segments(
                 if tier.chunks.is_empty() {
                     entries.extend(tier.inline.iter().filter_map(|e| {
                         Some(TierEntry {
-                            superfile: (*ordinals.get(e.superfile as usize)?)?,
+                            superfile: renumber(ordinals, e.superfile)?,
                             ..*e
                         })
                     }));
@@ -1493,7 +1485,7 @@ pub(crate) fn merge_segments(
                 }
             }
             run.extend(source_run.postings.into_iter().filter_map(|mut p| {
-                p.superfile = (*ordinals.get(p.superfile as usize)?)?;
+                p.superfile = renumber(ordinals, p.superfile)?;
                 Some(p)
             }));
             if let Some((key, next_run)) = cursors[source as usize].next()? {

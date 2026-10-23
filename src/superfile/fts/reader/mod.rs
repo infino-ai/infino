@@ -38,6 +38,7 @@ pub(crate) use search::FetchedTermMemo;
 pub(crate) use search::FetchedTermSlot;
 pub(crate) use sink::LiveFloor;
 pub(in crate::superfile::fts) use sink::TopKEntry;
+pub(in crate::superfile::fts) use sink::finish_head;
 pub use size::{DfBucket, FtsSizeBreakdown};
 pub(crate) use staleness::{FtsStaleness, StaleColumn};
 pub use work::MatchWork;

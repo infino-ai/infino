@@ -839,8 +839,7 @@ impl Supertable {
                 .into_contribution(shard.superfile_id(), superfile_stats.id_min)
                 .map_err(|e| BuildError::Store(e.to_string()))?
         {
-            let superfile_id = shard.superfile_id();
-            shard = shard.with_term_contribution(superfile_id, contribution);
+            shard = shard.with_term_contribution(contribution);
         }
 
         // A merge keeps a source stem only when every input carries the same

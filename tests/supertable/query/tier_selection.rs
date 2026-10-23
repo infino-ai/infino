@@ -46,13 +46,8 @@ fn schema() -> Arc<arrow_schema::Schema> {
 /// probability falling with its rank, repeated up to three times so term
 /// frequencies and lengths vary, and a few documents carry rare pairs.
 fn document(global: usize) -> String {
-    let mut x = (global as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let mut next = move || {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        x
-    };
+    let mut next =
+        infino::test_helpers::xorshift((global as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let mut words: Vec<&str> = Vec::new();
     for (rank, w) in VOCABULARY.iter().enumerate() {
         // Word `w` appears in one document in `2^rank`, one to three times.

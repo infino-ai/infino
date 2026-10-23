@@ -652,6 +652,11 @@ pub(crate) struct SliceRun {
     pub(crate) run: Run,
 }
 
+/// A term's postings across its runs, in segment order.
+pub(crate) fn postings_of(runs: &[SliceRun]) -> impl Iterator<Item = &Posting> {
+    runs.iter().flat_map(|r| r.run.postings.iter())
+}
+
 /// The resident half of the index plus a cache of fetched slices.
 ///
 /// A slice is fetched whole on first use and kept; slices are immutable
@@ -678,13 +683,7 @@ pub(crate) struct TermIndex {
     tier_chunks: tokio::sync::Mutex<Resident<(ContentHash, u64), TierChunkData>>,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
-    runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
-    /// A term's runs per segment with their tier objects, by key, under the
-    /// same count budget: a repeated term then opens no slice at all. The
-    /// slices themselves outgrow their byte budget on a large table, so
-    /// without this every query re-read and re-verified one slice per
-    /// segment per term.
-    tier_runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<SliceRun>>>>,
+    runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<SliceRun>>>>,
 }
 
 /// A bounded resident set, least recently used first out: `weigh` gives
@@ -765,7 +764,6 @@ impl TermIndex {
                 TierChunkData::weight,
             )),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
-            tier_runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
     }
 
@@ -851,9 +849,8 @@ impl TermIndex {
         mode: BoolMode,
     ) -> Result<HashSet<Uuid>, TermIndexError> {
         let mut out: Option<HashSet<Uuid>> = None;
-        for run in self.postings_many(column, terms).await? {
-            let set: HashSet<Uuid> = run
-                .iter()
+        for runs in self.runs_many(column, terms).await? {
+            let set: HashSet<Uuid> = postings_of(&runs)
                 .filter_map(|p| self.superfile_id(p.superfile))
                 .collect();
             out = Some(match (out, mode) {
@@ -896,10 +893,10 @@ impl TermIndex {
         all_terms.extend(phrases.iter().flatten().copied());
         all_terms.sort_unstable();
         all_terms.dedup();
-        let runs = self.postings_many(column_id, &all_terms).await?;
-        for (term, run) in all_terms.into_iter().zip(runs) {
+        let runs = self.runs_many(column_id, &all_terms).await?;
+        for (term, runs) in all_terms.into_iter().zip(runs) {
             let mut by_sf = HashMap::new();
-            for p in run.iter() {
+            for p in postings_of(&runs) {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
@@ -965,9 +962,9 @@ impl TermIndex {
             .filter(|id| self.is_indexed(id))
             .collect();
         let mut out: HashMap<Uuid, Vec<(String, u64, Location)>> = HashMap::new();
-        let runs = self.postings_many(column, terms).await?;
-        for (term, run) in terms.iter().zip(runs) {
-            for p in run.iter() {
+        let runs = self.runs_many(column, terms).await?;
+        for (term, runs) in terms.iter().zip(runs) {
+            for p in postings_of(&runs) {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
@@ -1028,9 +1025,11 @@ impl TermIndex {
         &self,
         column: FieldId,
         term: &str,
-    ) -> Result<Arc<Vec<Posting>>, TermIndexError> {
-        let mut runs = self.postings_many(column, &[term]).await?;
-        Ok(runs.pop().expect("one run per term asked"))
+    ) -> Result<Vec<Posting>, TermIndexError> {
+        let mut runs = self.runs_many(column, &[term]).await?;
+        Ok(postings_of(&runs.pop().expect("one run per term asked"))
+            .cloned()
+            .collect())
     }
 
     /// [`Self::postings`] for each of `terms`, in the same order.
@@ -1044,31 +1043,33 @@ impl TermIndex {
     /// a slice shared by two terms if the resident set evicted it between
     /// them. Each slice's bytes are dropped once its terms are decoded, so
     /// the batch holds at most the in-flight slices beyond the resident set.
-    pub(crate) async fn postings_many(
+    pub(crate) async fn runs_many(
         &self,
         column: FieldId,
         terms: &[&str],
-    ) -> Result<Vec<Arc<Vec<Posting>>>, TermIndexError> {
+    ) -> Result<Vec<Arc<Vec<SliceRun>>>, TermIndexError> {
         let keys: Vec<Vec<u8>> = terms.iter().map(|t| column.term_key(t)).collect();
-        let mut out: Vec<Option<Arc<Vec<Posting>>>> = {
+        let mut out: Vec<Option<Arc<Vec<SliceRun>>>> = {
             let mut resident = self.runs.lock().expect("resident runs lock");
             keys.iter().map(|k| resident.get(k)).collect()
         };
-        // Per missing term, the slices that can hold it in segment order;
-        // per distinct slice, the missing terms it can hold.
+        // Per missing term, the slices that can hold it in segment order,
+        // each with its tier object; per distinct slice, the missing terms
+        // it can hold.
         let mut wanted: Vec<(usize, Vec<ContentHash>)> = Vec::new();
-        let mut by_slice: HashMap<ContentHash, Vec<usize>> = HashMap::new();
+        let mut by_slice: HashMap<ContentHash, (Option<ContentHash>, Vec<usize>)> = HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             if out[i].is_some() {
                 continue;
             }
-            let hashes: Vec<ContentHash> = self
-                .root
-                .slices_for_key(key)
-                .map(|r| r.content_hash)
-                .collect();
-            for hash in &hashes {
-                by_slice.entry(*hash).or_default().push(i);
+            let mut hashes = Vec::new();
+            for r in self.root.slices_for_key(key) {
+                by_slice
+                    .entry(r.content_hash)
+                    .or_insert_with(|| (r.tier, Vec::new()))
+                    .1
+                    .push(i);
+                hashes.push(r.content_hash);
             }
             wanted.push((i, hashes));
         }
@@ -1080,14 +1081,20 @@ impl TermIndex {
                 .collect());
         }
         let keys = &keys;
-        let mut decoded: HashMap<(usize, ContentHash), Vec<Posting>> = stream::iter(by_slice)
-            .map(|(hash, terms_here)| async move {
+        let mut decoded: HashMap<(usize, ContentHash), SliceRun> = stream::iter(by_slice)
+            .map(|(hash, (tier_object, terms_here))| async move {
                 let bytes = self.slice_bytes(&hash).await?;
                 let slice = Slice::open(&bytes)?;
                 let mut found = Vec::new();
                 for i in terms_here {
-                    if let Some(run) = slice.postings(&keys[i])? {
-                        found.push(((i, hash), run));
+                    if let Some(run) = slice.run(&keys[i])? {
+                        let chunked = run.tier.as_ref().is_some_and(|t| !t.chunks.is_empty());
+                        if chunked && tier_object.is_none() {
+                            return Err(TermIndexError::Malformed(
+                                "a run has tier chunks but its slice names no tier object".into(),
+                            ));
+                        }
+                        found.push(((i, hash), SliceRun { tier_object, run }));
                     }
                 }
                 Ok::<_, TermIndexError>(found)
@@ -1100,62 +1107,18 @@ impl TermIndex {
             .await?;
         let mut resident = self.runs.lock().expect("resident runs lock");
         for (i, hashes) in wanted {
-            let mut run = Vec::new();
-            for hash in hashes {
-                if let Some(part) = decoded.remove(&(i, hash)) {
-                    run.extend(part);
-                }
-            }
-            let run = Arc::new(run);
-            resident.insert(keys[i].clone(), Arc::clone(&run));
-            out[i] = Some(run);
+            let runs: Vec<SliceRun> = hashes
+                .into_iter()
+                .filter_map(|hash| decoded.remove(&(i, hash)))
+                .collect();
+            let runs = Arc::new(runs);
+            resident.insert(keys[i].clone(), Arc::clone(&runs));
+            out[i] = Some(runs);
         }
         Ok(out
             .into_iter()
             .map(|run| run.expect("every term resolved above"))
             .collect())
-    }
-
-    /// A term's run in each segment that holds it, in segment order, each
-    /// with the tier object of the slice it came from.
-    pub(crate) async fn runs(
-        &self,
-        column: FieldId,
-        term: &str,
-    ) -> Result<Arc<Vec<SliceRun>>, TermIndexError> {
-        let key = column.term_key(term);
-        if let Some(runs) = self
-            .tier_runs
-            .lock()
-            .expect("resident tier runs lock")
-            .get(&key)
-        {
-            return Ok(runs);
-        }
-        let refs: Vec<(ContentHash, Option<ContentHash>)> = self
-            .root
-            .slices_for_key(&key)
-            .map(|r| (r.content_hash, r.tier))
-            .collect();
-        let mut out = Vec::with_capacity(refs.len());
-        for (hash, tier_object) in refs {
-            let bytes = self.slice_bytes(&hash).await?;
-            if let Some(run) = Slice::open(&bytes)?.run(&key)? {
-                let chunked = run.tier.as_ref().is_some_and(|t| !t.chunks.is_empty());
-                if chunked && tier_object.is_none() {
-                    return Err(TermIndexError::Malformed(
-                        "a run has tier chunks but its slice names no tier object".into(),
-                    ));
-                }
-                out.push(SliceRun { tier_object, run });
-            }
-        }
-        let out = Arc::new(out);
-        self.tier_runs
-            .lock()
-            .expect("resident tier runs lock")
-            .insert(key, Arc::clone(&out));
-        Ok(out)
     }
 
     /// Every entry of a tier, block by block, in tier order (descending
@@ -3844,7 +3807,11 @@ mod tests {
             .segments
             .iter()
             .flat_map(|s| s.slices.iter())
-            .map(|s| format!("slice-{}.bin", s.content_hash.to_hex()))
+            .map(|s| {
+                slice_uri(&s.content_hash)
+                    .trim_start_matches(STORAGE_PREFIX)
+                    .to_string()
+            })
             .collect();
         named.extend(
             root.segments
@@ -3896,7 +3863,10 @@ mod tests {
             "every tier object on disk is a slice's and named: {after_commits:?}"
         );
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
         assert_eq!(runs.len(), 2, "one run per delta");
         let mut held = 0;
         for SliceRun { tier_object, run } in runs.iter() {
@@ -3929,7 +3899,10 @@ mod tests {
                 .any(|slice| slice.tier.is_some())
         );
         let index = TermIndex::new(rebuilt.clone(), String::new(), Arc::clone(&storage), None);
-        let runs = rt.block_on(index.runs(title_id(), "shared")).expect("runs");
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
         assert_eq!(runs.len(), 1, "one run in the rebuilt base");
         let object = runs[0].tier_object.expect("the slice has a tier object");
         let tier = runs[0]
@@ -5388,20 +5361,16 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let a = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("first");
-        let b = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("second");
+        let ask = |term: &str| {
+            rt.block_on(index.runs_many(title_id(), &[term]))
+                .expect("runs")
+                .remove(0)
+        };
+        let (a, b) = (ask("shared"), ask("shared"));
         assert!(Arc::ptr_eq(&a, &b), "the second ask is the resident run");
-        let absent = rt
-            .block_on(index.postings(title_id(), "absent"))
-            .expect("absent");
+        let absent = ask("absent");
         assert!(absent.is_empty());
-        let again = rt
-            .block_on(index.postings(title_id(), "absent"))
-            .expect("absent again");
+        let again = ask("absent");
         assert!(
             Arc::ptr_eq(&absent, &again),
             "an absent term is remembered too"
@@ -5542,16 +5511,20 @@ mod tests {
         let slow = SlowGets::wrap(Arc::clone(&local));
         let batched_index = TermIndex::new(root.clone(), String::new(), slow.clone(), None);
         let batched = batched_index
-            .postings_many(fid("body"), &asked)
+            .runs_many(fid("body"), &asked)
             .await
             .expect("batched");
         let single_index = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None);
-        for (term, run) in asked.iter().zip(&batched) {
+        for (term, runs) in asked.iter().zip(&batched) {
             let one = single_index
                 .postings(fid("body"), term)
                 .await
                 .expect("single");
-            assert_eq!(run.as_slice(), one.as_slice(), "{term}");
+            assert_eq!(
+                postings_of(runs).cloned().collect::<Vec<_>>(),
+                one,
+                "{term}"
+            );
         }
         let spans_both = batched_index
             .postings(fid("body"), &terms[0])
