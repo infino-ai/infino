@@ -511,6 +511,10 @@ pub(crate) struct TermCursor {
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
+/// Postings per probe target at or under which [`TermCursor::probe_tfs`]
+/// merges a packed block branch-free rather than stepping through it.
+const BALANCED_PROBE_RATIO: usize = 4;
+
 /// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
 /// packed block rather than stepping: past this many docs behind the
 /// target, a bisection's ~7 steps beat the walk.
@@ -1195,6 +1199,26 @@ impl TermCursor {
             let n = self.block_n;
             let ids = &self.block_doc_ids[..n];
             let mut p = self.pos.min(n);
+            // Targets in this block about as dense as its postings (a
+            // balanced pair): a branch-free merge, which writes every target's
+            // answer and advances whichever side is behind by its comparison.
+            // The stepping loop below mispredicts on nearly every step when
+            // the two lists interleave; it stays for sparse targets, where it
+            // skips long stretches of postings.
+            let k_end = k + docs[k..].partition_point(|&d| d <= last);
+            if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
+                let tfs = &self.block_tfs[..n];
+                while k < k_end && p < n {
+                    let (t, x) = (docs[k], ids[p]);
+                    out[k] = if t == x { tfs[p] } else { 0 };
+                    k += usize::from(t <= x);
+                    p += usize::from(x <= t);
+                }
+                out[k..k_end].fill(0);
+                k = k_end;
+                self.pos = p.min(n.saturating_sub(1));
+                continue;
+            }
             while k < n_docs && docs[k] <= last {
                 let t = docs[k];
                 // Far behind the target (a probed term much denser than the
