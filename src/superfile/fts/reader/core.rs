@@ -2199,33 +2199,69 @@ pub(super) fn or_cursor_into_bitset(
     // pre-decoded and have no block bytes to slice.
     if c.predecoded {
         for &d in &c.block_doc_ids[..c.block_n] {
-            dest[(d >> 6) as usize] |= 1u64 << (d & 63);
+            mark_in(dest, 0, d);
         }
         return;
     }
-    for (b, block) in c.blocks.iter().enumerate() {
-        // Borrow the block bytes in place rather than `.slice()` them: a
-        // per-block `.slice()` bumps and drops an atomic refcount on `c.bytes`
-        // for every block of the union, while a borrowed subslice needs none —
-        // the same fix already applied to the membership `contains` path.
-        let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
-        let hdr = c.block_header(b);
-        if hdr.encoding == ENCODING_BITSET {
-            // Word-OR the presence bitset in at its aligned base word.
-            // Tfs trail; the bitset is everything between them.
-            let base_word = hdr.base as usize / 64;
-            let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
-            for (i, chunk) in presence.chunks_exact(8).enumerate() {
-                dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+    for b in 0..c.blocks.len() {
+        or_block_into(dest, c, b, 0, scratch);
+    }
+}
+
+/// OR block `b` of `c` into `dest`, a bitset whose bit 0 is doc `base` (a
+/// multiple of 64), dropping docs past its span: a **bitset** block's
+/// presence words are copied at their aligned word, a **run** block is set
+/// as a range, a **packed** block is decoded doc-ids-only and scattered. The
+/// block bytes are borrowed in place rather than `.slice()`d, so the walk
+/// over a long list takes no refcount per block.
+fn or_block_into(
+    dest: &mut [u64],
+    c: &TermCursor,
+    b: usize,
+    base: u32,
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    debug_assert_eq!(base % 64, 0, "a bitset's origin is word-aligned");
+    let block = c.blocks[b];
+    let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
+    let hdr = c.block_header(b);
+    if hdr.encoding == ENCODING_BITSET {
+        debug_assert_eq!(hdr.base % 64, 0, "a bitset block starts on a word");
+        // Tfs trail; the presence words are everything between them.
+        let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
+        let (block_word, base_word) = ((hdr.base / 64) as usize, (base / 64) as usize);
+        for (i, chunk) in presence.chunks_exact(8).enumerate() {
+            let Some(wi) = (block_word + i).checked_sub(base_word) else {
+                continue;
+            };
+            if wi >= dest.len() {
+                break;
             }
-        } else if hdr.encoding == ENCODING_RUN {
-            set_bit_range(dest, hdr.base, hdr.base + hdr.count() as u32);
-        } else {
-            let n = decode_block_doc_ids(bytes, &hdr, scratch);
-            for &d in &scratch[..n] {
-                dest[(d >> 6) as usize] |= 1u64 << (d & 63);
-            }
+            dest[wi] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
         }
+    } else if hdr.encoding == ENCODING_RUN {
+        let span_end = u64::from(base) + dest.len() as u64 * 64;
+        let lo = hdr.base.max(base);
+        let hi = (u64::from(hdr.base) + hdr.count() as u64).min(span_end) as u32;
+        if lo < hi {
+            set_bit_range(dest, lo - base, hi - base);
+        }
+    } else {
+        let n = decode_block_doc_ids(bytes, &hdr, scratch);
+        for &d in &scratch[..n] {
+            mark_in(dest, base, d);
+        }
+    }
+}
+
+/// Set doc `d`'s bit in `dest`, a bitset whose bit 0 is doc `base`, if `d`
+/// falls inside its span.
+#[inline(always)]
+fn mark_in(dest: &mut [u64], base: u32, d: u32) {
+    if let Some(local) = d.checked_sub(base)
+        && let Some(word) = dest.get_mut((local >> 6) as usize)
+    {
+        *word |= 1u64 << (local & 63);
     }
 }
 
@@ -2369,23 +2405,16 @@ fn or_blocks_into_window(
     dest: &mut [u64; OR_WINDOW_WORDS],
     scratch: &mut [u32; BLOCK_LEN],
 ) {
-    let end = base.saturating_add(OR_WINDOW);
-    let mark = |dest: &mut [u64; OR_WINDOW_WORDS], d: u32| {
-        if d >= base && d < end {
-            let local = d - base;
-            dest[(local >> 6) as usize] |= 1u64 << (local & 63);
-        }
-    };
     if c.predecoded {
         for &d in &c.block_doc_ids[..c.block_n] {
-            mark(dest, d);
+            mark_in(dest, base, d);
         }
         return;
     }
     while *from_block < c.blocks.len() && c.blocks[*from_block].last_doc_id < base {
         *from_block += 1;
     }
-    let base_word = (base / 64) as usize;
+    let end = base.saturating_add(OR_WINDOW);
     for b in *from_block..c.blocks.len() {
         let first = match b {
             0 => 0,
@@ -2394,34 +2423,7 @@ fn or_blocks_into_window(
         if first >= end {
             break;
         }
-        let block = c.blocks[b];
-        let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
-        let hdr = c.block_header(b);
-        if hdr.encoding == ENCODING_BITSET {
-            debug_assert_eq!(hdr.base % 64, 0, "a bitset block starts on a word");
-            let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
-            let block_word = (hdr.base / 64) as usize;
-            for (i, chunk) in presence.chunks_exact(8).enumerate() {
-                let Some(wi) = (block_word + i).checked_sub(base_word) else {
-                    continue;
-                };
-                if wi >= OR_WINDOW_WORDS {
-                    break;
-                }
-                dest[wi] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-            }
-        } else if hdr.encoding == ENCODING_RUN {
-            let lo = hdr.base.max(base);
-            let hi = (hdr.base + hdr.count() as u32).min(end);
-            if lo < hi {
-                set_bit_range(dest, lo - base, hi - base);
-            }
-        } else {
-            let n = decode_block_doc_ids(bytes, &hdr, scratch);
-            for &d in &scratch[..n] {
-                mark(dest, d);
-            }
-        }
+        or_block_into(dest, c, b, base, scratch);
     }
 }
 
