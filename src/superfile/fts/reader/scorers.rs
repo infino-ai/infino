@@ -880,6 +880,21 @@ fn accumulate_step(
 /// buffer rather than a heap.
 const BUFFERED_TOPK_MIN_K: usize = 512;
 
+/// The smallest tf at which a leader posting, scored at the column's
+/// smallest norm (its best case), plus `others_ub` can clear `threshold`:
+/// any smaller tf is rejected without reading the doc's norm, since a
+/// posting's score only falls as its norm grows. Tested with the walk's own
+/// expression, so a rejection here is one the walk would make. Searched up to
+/// [`TF_FLOOR_CAP`]; a floor that high stops filtering there.
+fn leader_tf_floor(idf_weight: f32, min_norm: f32, others_ub: f32, threshold: f32) -> u32 {
+    (1..TF_FLOOR_CAP)
+        .find(|&tf| bm25::score_with_dl_norm_k1(idf_weight, tf, min_norm) + others_ub > threshold)
+        .unwrap_or(TF_FLOOR_CAP)
+}
+
+/// Largest tf [`leader_tf_floor`] searches to.
+const TF_FLOOR_CAP: u32 = 16;
+
 /// Most optional terms the required-term walk takes; a wider list keeps
 /// the general must+should walk.
 const MAX_SHOULDS_LED: usize = 16;
@@ -2654,6 +2669,7 @@ impl FtsReader {
         }
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
+        let min_norm = dl_norm_k1.min_norm();
 
         if doc_id_start > 0 {
             for c in &mut cursors {
@@ -2750,6 +2766,9 @@ impl FtsReader {
                 let mut others_ub = 0.0f32;
                 let mut bound_holds_to = 0u32;
                 let mut have_bound = false;
+                // The smallest leader tf that can clear the bar at the
+                // column's shortest-doc norm; set with the bound below.
+                let mut tf_floor = 1u32;
                 while !c0.is_exhausted()
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
@@ -2761,9 +2780,6 @@ impl FtsReader {
                         c0.next();
                         continue;
                     }
-                    let norm = dl_norm_k1.get(candidate);
-                    let essential_score =
-                        bm25::score_with_dl_norm_k1(c0.idf_weight, c0.current_tf(), norm);
                     // Bound the non-essentials at `candidate` by each one's
                     // block-max for the block that *contains* it (monotonic
                     // `shallow_advance` hint — amortized O(1), no decode), not by
@@ -2790,7 +2806,18 @@ impl FtsReader {
                             noness_suffix[i] = noness_suffix[i + 1] + noness_ub[i];
                         }
                         have_bound = true;
+                        tf_floor = leader_tf_floor(c0.idf_weight, min_norm, others_ub, threshold);
                     }
+                    // A tf under the floor cannot clear the bar even at the
+                    // shortest doc's norm, the best case for its score: reject
+                    // it before loading this doc's norm.
+                    let tf = c0.current_tf();
+                    if tf < tf_floor {
+                        c0.next();
+                        continue;
+                    }
+                    let norm = dl_norm_k1.get(candidate);
+                    let essential_score = bm25::score_with_dl_norm_k1(c0.idf_weight, tf, norm);
                     if essential_score + others_ub <= threshold {
                         c0.next();
                         continue;
@@ -2825,6 +2852,7 @@ impl FtsReader {
                     let mut raised = false;
                     if heap.offer(k, &mut threshold, score, candidate) {
                         raised = true;
+                        tf_floor = leader_tf_floor(c0.idf_weight, min_norm, others_ub, threshold);
                     }
                     c0.next();
                     // Only when the threshold actually rose: if even this term
