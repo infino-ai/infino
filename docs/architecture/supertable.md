@@ -355,12 +355,14 @@ is written in the run itself instead: on a table of short texts most
 terms have a posting or two, and a block's fixed header would outweigh
 them.
 
-A ranked query of plain terms merges its terms' tiers in descending
-impact before it opens anything. Per superfile it learns the best known
-document for every subset of the terms, with a lower and an upper bound
-on its score; from the documents whose score is fully known it takes a
-lower bound on the k-th score, and from the unread blocks' maxima and
-the tails an upper bound on anything it has not seen. Superfiles whose
+A ranked query of plain terms merges its terms' tiers before it opens
+anything, when the table has learned that this pays for the query's
+shape. Per superfile it reads the terms' heads a block at a time and
+joins them by document, so a document read under several terms is
+known with its contributions from each and bounded through the other
+terms' tails; from the documents carrying every required term it takes
+a lower bound on the k-th score, and from the tails an upper bound on
+anything it has not seen. Superfiles whose
 upper bound cannot reach the k-th lower bound are not opened, a
 conjunction's superfiles that a complete term has shown hold no joint
 document are not opened, and the k-th lower bound seeds the floor every

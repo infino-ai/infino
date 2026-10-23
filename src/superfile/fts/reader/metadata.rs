@@ -322,7 +322,7 @@ impl NormTable {
 /// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
 /// place on the heap so the 256 `f32`s are not built on the stack and
 /// moved.
-fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+pub(crate) fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
     let mut lut = Box::new([0.0_f32; 256]);
     for (bucket, slot) in lut.iter_mut().enumerate() {
         let dl = bm25::dequantize_len(bucket as u8);

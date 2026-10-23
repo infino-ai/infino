@@ -1206,12 +1206,16 @@ impl TermIndex {
             if out[i].is_some() {
                 continue;
             }
+            let end = chunk
+                .offset
+                .checked_add(chunk.len)
+                .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
             match spans.last_mut() {
                 Some((first, last))
                     if *last + 1 == i
-                        && chunks[*last].offset + chunks[*last].len == chunk.offset
-                        && chunk.offset + chunk.len - chunks[*first].offset
-                            <= TIER_READ_MAX_BYTES =>
+                        && chunks[*last].offset.checked_add(chunks[*last].len)
+                            == Some(chunk.offset)
+                        && end - chunks[*first].offset <= TIER_READ_MAX_BYTES =>
                 {
                     *last = i;
                 }

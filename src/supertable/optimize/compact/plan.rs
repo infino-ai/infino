@@ -169,12 +169,12 @@ fn pack_partition(
     // Neighbours by document id pack together: ingest gives each superfile
     // a contiguous id range disjoint from every other's, and a job over
     // adjacent ranges produces an output whose range is as disjoint and as
-    // monotone as its inputs'. A ranked search leans on that — a superfile
-    // whose best document can only tie the k-th score is settled by id
-    // order, which is only decidable when ranges do not interleave. Every
-    // sub-target superfile is a candidate regardless, so tombstoned space is
-    // reclaimed in the same pass as before, in id order rather than
-    // most-deleted first.
+    // monotone as its inputs'. A ranked search profits from that — a
+    // superfile whose best document can only tie the k-th score is skipped
+    // when every id it holds is past the tied document's, which ranges
+    // that do not interleave make the common case. Every sub-target
+    // superfile is a candidate regardless; a deleted-heavy one waits for
+    // its neighbours rather than leading the pass.
     candidates.sort_by(|a, b| {
         a.id_min
             .cmp(&b.id_min)

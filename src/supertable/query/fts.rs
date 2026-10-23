@@ -631,14 +631,6 @@ pub(crate) async fn memo_from_locations(
     Some(Arc::new(memo))
 }
 
-/// Whether a superfile whose best possible score is `ceiling` can still
-/// place a document once the running k-th score is `floor`. Only a ceiling
-/// strictly below the floor cannot: a ceiling equal to it may hold a
-/// document that ties the k-th, and the stable `_id` order may admit that
-/// tie, so an equal ceiling is opened. This comparison handles an exact tie
-/// on its own; a ceiling that rounding put an ulp below a real score is
-/// protected by the widening the term index applies to every ceiling
-/// (`CEILING_SLACK`), not by this test.
 /// What a ranked fan-out unit carries to its kernel and its skip test.
 #[derive(Clone)]
 struct UnitParams {
@@ -653,23 +645,14 @@ struct UnitParams {
     id_max: i128,
 }
 
-/// Whether the `_id` ranges of `kept` are pairwise disjoint: when they are,
-/// every document of a superfile with a larger `id_min` has a larger `_id`
-/// than every document of one with a smaller, and the stable top-k's tie
-/// order between two superfiles' documents is known before either is
-/// opened. An empty superfile's range is meaningless and is skipped.
-fn id_ranges_disjoint(kept: &[Arc<SuperfileEntry>]) -> bool {
-    let mut ranges: Vec<(i128, i128)> = kept
-        .iter()
-        .filter(|e| e.n_docs > 0)
-        .map(|e| (e.id_min, e.id_max))
-        .collect();
-    ranges.sort_unstable();
-    ranges
-        .windows(2)
-        .all(|w| w[0].1 < w[1].0 && w[0].0 <= w[0].1)
-}
-
+/// Whether a superfile whose best possible score is `ceiling` can still
+/// place a document once the running k-th score is `floor`. Only a ceiling
+/// strictly below the floor cannot: a ceiling equal to it may hold a
+/// document that ties the k-th, and the stable `_id` order may admit that
+/// tie, so an equal ceiling is opened. This comparison handles an exact tie
+/// on its own; a ceiling that rounding put an ulp below a real score is
+/// protected by the widening the term index applies to every ceiling
+/// (`CEILING_SLACK`), not by this test.
 pub(crate) fn ceiling_can_compete(ceiling: f32, floor: f32) -> bool {
     // Written as "not strictly less" rather than `>=` so an incomparable
     // ceiling (a NaN from a degenerate rescale) is opened, never skipped.
@@ -1155,7 +1138,13 @@ impl SupertableReader {
         // before any open.
         let mut resolved_units: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut resolved_scores: Vec<(i128, Vec<f32>)> = Vec::new();
+        // A scope admits rows the index cannot see, and the merge's
+        // threshold is the k-th score over every row: seeding the floor
+        // with it, or ruling a superfile out under it, would prune the
+        // admitted rows that score below it. A scoped search keeps its
+        // ceilings.
         let tiers_serve = index_column.is_some()
+            && scope.is_none()
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
             && !config::global().diagnostics.disable_tier_selection;
@@ -1182,20 +1171,17 @@ impl SupertableReader {
             // Bits over the distinct terms: the bare terms score on their
             // own; a match must carry the musts and every member of a
             // must-phrase.
+            let index_of = |n: &String| all_terms.iter().position(|t| *t == n.as_str());
             let bits = |names: &[String]| -> tier::TermMask {
                 names
                     .iter()
-                    .filter_map(|n| all_terms.iter().position(|t| *t == n.as_str()))
+                    .filter_map(index_of)
                     .fold(0, |m, i| m | (1 << i))
             };
             let scoring = bits(&musts) | bits(&shoulds);
             // A phrase's members in order, a repeated word repeated: the
             // kernel weights every occurrence.
-            let members = |p: &[String]| -> Vec<usize> {
-                p.iter()
-                    .filter_map(|n| all_terms.iter().position(|t| *t == n.as_str()))
-                    .collect()
-            };
+            let members = |p: &[String]| -> Vec<usize> { p.iter().filter_map(index_of).collect() };
             let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
                 .iter()
                 .map(|p| (members(p), true))
@@ -1211,8 +1197,27 @@ impl SupertableReader {
             // the kernels; the tiers score each term once, so such a query
             // is not served.
             let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
+            // Rows deleted from each kept superfile, which the tiers still
+            // hold: the merge reads past them. A sidecar that cannot be
+            // read leaves the query to its ceilings.
+            let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
+            let mut deny_known = true;
+            if let Some(cache) = &self.tombstone_cache {
+                let now = Instant::now();
+                let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+                cache.prefetch(&ids, now).await;
+                for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
+                    match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
+                        Ok(set) => *slot = set,
+                        Err(_) => {
+                            deny_known = false;
+                            break;
+                        }
+                    }
+                }
+            }
             let selection = match column_params(manifest, column) {
-                Some(params) if !repeated => {
+                Some(params) if !repeated && deny_known => {
                     let query = tier::TierQuery {
                         column: column_id,
                         terms: &all_terms,
@@ -1221,11 +1226,9 @@ impl SupertableReader {
                         phrases: tier_phrases,
                         negated: !negatives.is_empty(),
                         k,
+                        deny,
                         table_avgdl,
                         params,
-                        // A scope admits rows the index cannot see, so a
-                        // scoped search opens as before.
-                        want_resolved: scope.is_none(),
                         open_cost_ns: self.open_cost_ns(),
                         entry_cost_ns: self.tier_entry_cost_ns(),
                         merge_gate: manifest.options.tier_merge_gate,
@@ -1252,26 +1255,10 @@ impl SupertableReader {
                 }
                 let mut answered: Vec<bool> = vec![false; kept.len()];
                 if !selection.resolved.is_empty() {
-                    let now = Instant::now();
-                    if let Some(cache) = &self.tombstone_cache {
-                        let ids: Vec<Uuid> = selection
-                            .resolved
-                            .iter()
-                            .map(|(si, _)| kept[*si].superfile_id)
-                            .collect();
-                        cache.prefetch(&ids, now).await;
-                    }
-                    for (si, mut hits) in selection.resolved {
+                    // The merge read past every deleted row, so what it
+                    // answers with is live.
+                    for (si, hits) in selection.resolved {
                         let entry = &kept[si];
-                        // A tombstone sidecar that cannot be read leaves the
-                        // superfile to the kernel, which filters as it opens.
-                        if let Some(cache) = &self.tombstone_cache {
-                            match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
-                                Ok(Some(bitmap)) => hits.retain(|(doc, _)| !bitmap.contains(*doc)),
-                                Ok(None) => {}
-                                Err(_) => continue,
-                            }
-                        }
                         answered[si] = true;
                         resolved_scores.push((entry.id_max, hits.iter().map(|h| h.1).collect()));
                         resolved_units.push(dispatch::tag_hits(entry, hits));
@@ -1546,8 +1533,18 @@ impl SupertableReader {
                     true => f32::NEG_INFINITY,
                     false => shared.floor(),
                 };
-                let (live_floor, allow) = {
+                let (live_floor, allow, k_unit) = {
                     let tomb = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
+                    // A kernel's heap holds the k best before the tombstone
+                    // filter drops the deleted among them: a superfile with
+                    // deleted rows is asked for that many more, so its k
+                    // best live rows are in the heap when they are dropped.
+                    let k_unit = match &tomb {
+                        Some(Ok(deleted)) if !deleted.is_empty() => {
+                            k.saturating_add(usize::try_from(deleted.len()).unwrap_or(usize::MAX))
+                        }
+                        _ => k,
+                    };
                     // The atom walks may also read the floor LIVE mid-walk and
                     // publish their own local kth into it — but a kernel heap
                     // is pre-tombstone-filter, so only a superfile with no
@@ -1592,7 +1589,7 @@ impl SupertableReader {
                         }
                         _ => allow,
                     };
-                    (live_floor, allow)
+                    (live_floor, allow, k_unit)
                 };
                 let hits = match range {
                     // Ranged units exist only for pure multi-should
@@ -1646,7 +1643,7 @@ impl SupertableReader {
                                     op_stats::timed_kernel(&kernel_stats, || {
                                         kernel_reader.bm25_search_or_range_prebuilt(
                                             &kernel_set,
-                                            k,
+                                            k_unit,
                                             start,
                                             end,
                                             floor,
@@ -1659,7 +1656,9 @@ impl SupertableReader {
                             .map_err(|e| QueryError::Internal(e.to_string()))??
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor, &scoring)
+                                r.bm25_search_or_range_prebuilt(
+                                    set, k_unit, start, end, floor, &scoring,
+                                )
                             })?
                         }
                     }
@@ -1684,7 +1683,7 @@ impl SupertableReader {
                                     allow,
                                     exact_count,
                                 },
-                                k,
+                                k_unit,
                                 floor,
                                 &scoring,
                             )
@@ -1818,10 +1817,10 @@ impl SupertableReader {
             true => {
                 let window = manifest.options.bound_ordered_open_window.max(1);
                 // A superfile whose ceiling only ties the running k-th score
-                // is skipped once the tie is settled by `_id` order, which
-                // needs the superfiles' `_id` ranges disjoint and an exact
-                // comparison: no tolerance widening the floor.
-                let tie_walk = score_tolerance <= 0.0 && id_ranges_disjoint(&kept);
+                // is skipped once the tie is settled by `_id` order: every
+                // `_id` it holds is past the tied document's. That needs
+                // an exact comparison, no tolerance widening the floor.
+                let tie_walk = score_tolerance <= 0.0;
                 // The driver folds each finished unit's surviving scores
                 // (tombstoned ones are already gone) into the floor.
                 let id_max_of: HashMap<SuperfileUri, i128> =
@@ -1858,10 +1857,13 @@ impl SupertableReader {
         let mut per_unit = per_unit;
         per_unit.extend(resolved_units);
         let hits = select_top_k_stable(self, per_unit, k).await?;
+        // Noted for the way the policy chose, whether or not the merge
+        // then ran: a shape it declines every time is thereby measured as
+        // the cost of asking, and the class settles on not asking.
         if tiers_serve && learned {
             self.tier_policy().note(
                 policy_class,
-                selected,
+                merge_now,
                 ranked_started.elapsed().as_nanos() as u64,
             );
         }
@@ -3711,33 +3713,6 @@ mod tests {
     }
 
     #[test]
-    fn id_ranges_are_disjoint_only_when_no_two_overlap() {
-        let entry = |id_min: i128, id_max: i128| {
-            let mut e = (*manifest_entry(1)).clone();
-            e.id_min = id_min;
-            e.id_max = id_max;
-            Arc::new(e)
-        };
-        assert!(id_ranges_disjoint(&[
-            entry(0, 9),
-            entry(10, 19),
-            entry(20, 20)
-        ]));
-        assert!(
-            !id_ranges_disjoint(&[entry(0, 10), entry(10, 19)]),
-            "a shared id"
-        );
-        assert!(
-            !id_ranges_disjoint(&[entry(0, 30), entry(10, 19)]),
-            "nested"
-        );
-        assert!(
-            id_ranges_disjoint(&[entry(0, 9), manifest_entry(0), entry(10, 19)]),
-            "an empty superfile's range is skipped"
-        );
-    }
-
-    #[test]
     fn a_tolerance_raises_the_bar() {
         let floor = 100.0f32;
         assert!(
@@ -3807,7 +3782,7 @@ mod tests {
 
     use super::{
         BoolMode, FanOut, SharedTopK, SuperfileHit, SupertableReader, build_work_units,
-        ceilings_at_table_avgdl, fanout_for, id_ranges_disjoint,
+        ceilings_at_table_avgdl, fanout_for,
     };
     use crate::{
         config::{CompactionSettings, OptimizeOptions},

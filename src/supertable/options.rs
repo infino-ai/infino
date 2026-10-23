@@ -402,7 +402,7 @@ pub struct SupertableOptions {
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
     /// wall of the search with the merge against without it, the cheaper
-    /// taken and the other tried one query in thirty-two. Off, the merge
+    /// taken and the other tried one query in sixteen. Off, the merge
     /// runs for every query the tiers can serve (what a test of the merge
     /// wants).
     pub tier_merge_gate: bool,

@@ -64,14 +64,15 @@ use rayon::{
     iter::{IndexedParallelIterator, ParallelIterator},
     slice::{ParallelSlice, ParallelSliceMut},
 };
+use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use super::fts::baked_avgdl;
 use crate::{
     runtime_bridge::run_on_pool,
     superfile::fts::{
-        bm25::{Bm25Params, dequantize_len},
-        reader::GlobalTermIdf,
+        bm25::{Bm25Params, score_with_dl_norm_k1},
+        reader::{GlobalTermIdf, norm_table},
     },
     supertable::{
         manifest::{
@@ -145,8 +146,8 @@ impl TierPolicy {
     /// are compared: queries of a class differ in cost several-fold, so an
     /// average over one query does not compare with one over the mix.
     const MIN_SAMPLES: u32 = 8;
-    /// The average's reach: each sample moves it an eighth of the way.
-    const SMOOTHING: u64 = 8;
+    /// The average's reach: each sample moves it a `2^-SMOOTHING` of the way.
+    const SMOOTHING: u32 = 3;
 
     pub(crate) fn new() -> Self {
         Self {
@@ -196,11 +197,10 @@ impl TierPolicy {
             5..=8 => 3,
             _ => 4,
         };
-        // ln(10⁴), ln(10³), ln(10²).
         let rb = match rarest_idf {
-            r if r >= 9.21 => 0,
-            r if r >= 6.9 => 1,
-            r if r >= 4.6 => 2,
+            r if r >= 1e4f32.ln() => 0,
+            r if r >= 1e3f32.ln() => 1,
+            r if r >= 1e2f32.ln() => 2,
             _ => 3,
         };
         ((shape * Self::K_BUCKETS + kb) * Self::TERM_BUCKETS + tb) * Self::RARITY_BUCKETS + rb
@@ -230,14 +230,7 @@ impl TierPolicy {
     pub(crate) fn note(&self, class: usize, merged: bool, wall_ns: u64) {
         let arm = usize::from(merged);
         self.samples[class][arm].fetch_add(1, Ordering::Relaxed);
-        let cell = &self.walls[class][arm];
-        let old = cell.load(Ordering::Relaxed);
-        let new = if old == 0 {
-            wall_ns
-        } else {
-            old - old / Self::SMOOTHING + wall_ns / Self::SMOOTHING
-        };
-        cell.store(new, Ordering::Relaxed);
+        fold_mean(&self.walls[class][arm], wall_ns, Self::SMOOTHING);
     }
 }
 /// Entries the merge reads per query before it stops regardless of what is
@@ -284,14 +277,15 @@ pub(crate) struct TierQuery<'a> {
     /// no threshold and answers for nothing.
     pub(crate) negated: bool,
     pub(crate) k: usize,
+    /// Per kept superfile, the rows deleted since it was written, when
+    /// any: a deleted document is in the tiers but not in the table, so
+    /// the merge reads past it as a kernel's tombstone filter drops it.
+    pub(crate) deny: Vec<Option<Arc<RoaringBitmap>>>,
     /// The average length every kept superfile scores at.
     pub(crate) table_avgdl: f32,
     /// The column's declared parameters, which every kept superfile scores
     /// at.
     pub(crate) params: Bm25Params,
-    /// Whether the caller can use documents the index settles outright
-    /// (it cannot when a scope admits rows the index does not see).
-    pub(crate) want_resolved: bool,
     /// What one superfile open costs on this table, in nanoseconds of
     /// query wall; zero when not yet known. A round of the merge is read
     /// while the opens the last round saved are worth more than the round
@@ -420,11 +414,32 @@ struct Slot {
     /// The ratio the superfile's stored keys and tails are scaled by to
     /// hold at the table's average length.
     scale_up: f32,
+    /// Rows deleted from the superfile: read past, never candidates.
+    deny: Option<Arc<RoaringBitmap>>,
+}
+
+impl Slot {
+    /// A superfile before any round: every head absent, nothing bounded.
+    fn new(terms: usize, scale_up: f32, deny: Option<Arc<RoaringBitmap>>) -> Self {
+        Self {
+            heads: vec![HeadState::absent(); terms],
+            top: Vec::new(),
+            touched: false,
+            ub: f32::INFINITY,
+            lb: f32::NEG_INFINITY,
+            live: true,
+            ordinal: u32::MAX,
+            scale_up,
+            deny,
+        }
+    }
 }
 
 /// Buffers a refresh works in, reused across superfiles.
 #[derive(Default)]
 struct Scratch {
+    /// A contribution of zero per term, for a document read under none.
+    zero: Vec<f32>,
     merged: Vec<(u32, f32)>,
     at: Vec<usize>,
     contrib: Vec<f32>,
@@ -450,6 +465,28 @@ struct Merge {
     ub_slack: f32,
     theta_lb: f32,
     entries_read: u64,
+}
+
+/// Whether `opens` superfile opens at `open_cost_ns` each are worth
+/// `rounds` more rounds at `round_ns` each. With the open cost not yet
+/// measured, any open is taken as worth it.
+fn pays(opens: u64, rounds: u64, open_cost_ns: u64, round_ns: u64) -> bool {
+    if open_cost_ns == 0 {
+        return opens > 0;
+    }
+    u128::from(opens) * u128::from(open_cost_ns) >= u128::from(rounds) * u128::from(round_ns)
+}
+
+/// Fold `sample` into the running average in `cell`, moving it a
+/// `2^-shift` of the way from its old value; the first sample sets it.
+pub(crate) fn fold_mean(cell: &AtomicU64, sample: u64, shift: u32) {
+    let old = cell.load(Ordering::Relaxed);
+    let new = if old == 0 {
+        sample
+    } else {
+        old - (old >> shift) + (sample >> shift)
+    };
+    cell.store(new, Ordering::Relaxed);
 }
 
 /// Select superfiles for `query` with the tiers of `index`, decoding on
@@ -519,18 +556,19 @@ pub(crate) async fn select_with_tiers(
         } else {
             1.0
         };
-        slots.push(Slot {
-            heads: vec![HeadState::absent(); nt],
-            // Room for a block of every term before the map has to grow.
-            top: Vec::new(),
-            touched: false,
-            ub: f32::INFINITY,
-            lb: f32::NEG_INFINITY,
-            live: true,
-            ordinal: u32::MAX,
+        slots.push(Slot::new(
+            nt,
             scale_up,
-        });
+            query.deny.get(slots.len()).cloned().flatten(),
+        ));
     }
+    // The slot of a superfile the index files under `ordinal`; `None` for
+    // one the query does not keep.
+    let slot_for = |ordinal: u32| {
+        index
+            .superfile_id(ordinal)
+            .and_then(|id| slot_of.get(&id).copied())
+    };
     let runs_per_term =
         try_join_all(terms.iter().map(|term| index.runs(query.column, term))).await?;
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
@@ -560,10 +598,7 @@ pub(crate) async fn select_with_tiers(
                 None
             };
             for p in &run.postings {
-                let Some(id) = index.superfile_id(p.superfile) else {
-                    continue;
-                };
-                let Some(&si) = slot_of.get(&id) else {
+                let Some(si) = slot_for(p.superfile) else {
                     continue;
                 };
                 let slot = &mut slots[si];
@@ -571,12 +606,16 @@ pub(crate) async fn select_with_tiers(
                 // The stored bound and tail are keys at the superfile's own
                 // average; the table's idf and the scale to its average make
                 // them bounds on the term's contribution, as the ceiling
-                // path makes its ceilings.
-                let ceiling = p.bound * idf_table * slot.scale_up;
-                // A build that recorded no tail leaves the ceiling as the
-                // bound.
-                let tail = if p.tail.is_finite() {
-                    (p.tail * idf_table * slot.scale_up).min(ceiling)
+                // path makes its ceilings. A stored key is rounded once more
+                // than the kernel rounds a score, so what it bounds is
+                // widened by an ulp, as the ceiling path widens its own.
+                let ceiling = p.bound * idf_table * slot.scale_up * BOUND_SLACK;
+                // An inline head is in hand whole, so what it leaves out is
+                // bounded by its tail; a chunked head bounds nothing below
+                // its ceiling until a block of it is read (a build that
+                // recorded no tail leaves the ceiling either way).
+                let tail = if p.tail.is_finite() && !chunked {
+                    (p.tail * idf_table * slot.scale_up * BOUND_SLACK).min(ceiling)
                 } else {
                     ceiling
                 };
@@ -630,6 +669,9 @@ pub(crate) async fn select_with_tiers(
     {
         return Ok(None);
     }
+    // What lies past a block is bounded through its tail, already widened
+    // where the tail is set; a read document's sum needs widening only
+    // when the kernel may add it in another order.
     let (lb_slack, ub_slack) = if exact_scores {
         (1.0, 1.0)
     } else {
@@ -639,10 +681,7 @@ pub(crate) async fn select_with_tiers(
     // Inline heads are whole: their entries are in hand before any read.
     let mut entries_read = 0u64;
     for (ti, e) in &inline {
-        let Some(id) = index.superfile_id(e.superfile) else {
-            continue;
-        };
-        let Some(&si) = slot_of.get(&id) else {
+        let Some(si) = slot_for(e.superfile) else {
             continue;
         };
         let c = scoring.contribution(*ti, e);
@@ -750,11 +789,7 @@ pub(crate) async fn select_with_tiers(
             // joint documents a conjunction needs for one sit deeper than
             // the heads' top blocks, and reading on for them has bought
             // nothing where it was measured.
-            let worth = if open_cost_ns == 0 {
-                excluded > 0
-            } else {
-                u128::from(excluded as u64) * u128::from(open_cost_ns) >= u128::from(round_ns)
-            };
+            let worth = pays(excluded as u64, 1, open_cost_ns, round_ns);
             // A required term whose head the index holds whole settles,
             // read to its end, which documents carry the term — ruling
             // out, or answering for, every live superfile the conjunction
@@ -770,15 +805,10 @@ pub(crate) async fn select_with_tiers(
                 .filter(|(ti, h)| required & (1 << ti) != 0 && h.whole && !h.done)
                 .map(|(_, h)| h.blocks.saturating_sub(round as u32 + 1).max(1))
                 .max();
-            let settling = match rounds_to_settle {
-                None => false,
-                Some(_) if open_cost_ns == 0 => true,
-                Some(rounds) => {
-                    let live = merge.slots.iter().filter(|s| s.live).count() as u64;
-                    u128::from(live) * u128::from(open_cost_ns)
-                        >= u128::from(rounds) * u128::from(round_ns)
-                }
-            };
+            let settling = rounds_to_settle.is_some_and(|rounds| {
+                let live = merge.slots.iter().filter(|s| s.live).count() as u64;
+                pays(live, u64::from(rounds), open_cost_ns, round_ns)
+            });
             let read_on = worth || settling;
             tracing::debug!(
                 round,
@@ -810,7 +840,7 @@ pub(crate) async fn select_with_tiers(
         })
         .collect();
     let mut resolved = Vec::new();
-    if query.want_resolved && exact_scores {
+    if exact_scores {
         for (si, slot) in merge.slots.iter().enumerate() {
             // Every head read to its end, and the sums exact: the superfile's
             // matching documents are its candidates carrying the required
@@ -866,17 +896,19 @@ impl Merge {
                             .decode_block(read.block, read.body, &mut decoded)
                             .is_err()
                         {
-                            // A block that does not decode leaves the head
-                            // where it was: the bound stays its tail, which
-                            // is sound, and the superfile opens as it would
-                            // have.
+                            // A block that does not decode leaves the rest
+                            // of the head unread: it bounds nothing below
+                            // its ceiling, and the superfile opens as it
+                            // would have.
+                            state.tail = state.ceiling;
                             state.done = true;
                             continue;
                         }
                         n += decoded.len() as u64;
                         let tail_key = read.dir.block_tail(read.block);
                         state.tail =
-                            (tail_key * scoring.idf[read.ti] * slot.scale_up).min(state.ceiling);
+                            (tail_key * scoring.idf[read.ti] * slot.scale_up * BOUND_SLACK)
+                                .min(state.ceiling);
                         if tail_key <= 0.0 || decoded.len() < BLOCK_ENTRIES {
                             state.done = true;
                         }
@@ -921,7 +953,7 @@ impl Merge {
         if self.theta_lb.is_finite() {
             let theta = self.theta_lb;
             for slot in self.slots.iter_mut() {
-                if slot.live && slot.ub * BOUND_SLACK < theta {
+                if slot.live && slot.ub < theta {
                     slot.live = false;
                     excluded += 1;
                 }
@@ -937,6 +969,9 @@ impl Slot {
     /// next refresh merges it into the term's documents.
     fn absorb(&mut self, ti: usize, row: u32, c: f32) {
         self.heads[ti].seen = true;
+        if self.deny.as_ref().is_some_and(|d| d.contains(row)) {
+            return;
+        }
         self.heads[ti].pending.push((row, c));
         self.touched = true;
     }
@@ -1047,9 +1082,10 @@ impl Slot {
             }
             ub
         };
-        let zero = vec![0.0f32; nt];
+        scratch.zero.clear();
+        scratch.zero.resize(nt, 0.0);
         let mut ub = if settled == 0 {
-            doc_ub(0, &zero)
+            doc_ub(0, &scratch.zero)
         } else {
             f32::NEG_INFINITY
         };
@@ -1115,30 +1151,24 @@ fn bare_sum(contrib: &[f32], scoring: TermMask) -> f32 {
 struct Scoring {
     /// Per term, the table-wide idf the kernel weights it with.
     idf: Vec<f32>,
-    /// Per length bucket, the length norm the kernel adds to `tf`, at the
-    /// column's parameters and the average every kept superfile scores
-    /// at: the part of a contribution that does not depend on the entry.
-    norm: Vec<f32>,
+    /// Per length bucket, the length norm the kernel adds to `tf`: the
+    /// kernel's own table, at the column's parameters and the average
+    /// every kept superfile scores at.
+    norm: Arc<[f32; 256]>,
 }
 
 impl Scoring {
     fn new(idf: Vec<f32>, params: Bm25Params, avgdl: f32) -> Self {
-        let norm = (0..=u8::MAX)
-            .map(|b| params.dl_norm_k1(dequantize_len(b), avgdl))
-            .collect();
-        Self { idf, norm }
+        Self {
+            idf,
+            norm: norm_table(avgdl, params),
+        }
     }
 
     /// What term `ti` contributes to the score of a document of `e.tf`
-    /// occurrences and length bucket `e.len`: the kernel's own expression
-    /// (`score`), with its length norm looked up.
+    /// occurrences and length bucket `e.len`: the kernel's own arithmetic.
     fn contribution(&self, ti: usize, e: &TierEntry) -> f32 {
-        let tf = e.tf as f32;
-        let denom = tf + self.norm[usize::from(e.len)];
-        if denom == 0.0 {
-            return 0.0;
-        }
-        self.idf[ti] * tf / denom
+        score_with_dl_norm_k1(self.idf[ti], e.tf, self.norm[usize::from(e.len)])
     }
 }
 
@@ -1224,16 +1254,7 @@ mod tests {
             let idf: Vec<f32> = (0..nt)
                 .map(|_| 0.5 + (next() % 1000) as f32 / 500.0)
                 .collect();
-            let mut slot = Slot {
-                heads: vec![HeadState::absent(); nt],
-                top: Vec::new(),
-                touched: false,
-                ub: f32::INFINITY,
-                lb: f32::NEG_INFINITY,
-                live: true,
-                ordinal: 0,
-                scale_up: 1.0,
-            };
+            let mut slot = Slot::new(nt, 1.0, None);
             // Per term: a head of documents with contributions, and a tail
             // (zero means the head is whole); every document outside the
             // head takes a hidden contribution within the tail.

@@ -479,6 +479,8 @@ impl FtsReader {
             .zip(cursors)
             .map(|(entry, cursor)| {
                 let mut cursor = cursor?;
+                // A depth of zero is read as one: an empty head would read
+                // as a term no document carries.
                 let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,

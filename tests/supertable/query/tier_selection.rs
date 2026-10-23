@@ -420,7 +420,8 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
     ] {
         for k in [10usize, 100] {
             let (a, stats, _) = run(&with, query, mode, k);
-            let (b, _, _) = run(&without, query, mode, k);
+            let (b, without_stats, _) = run(&without, query, mode, k);
+            let without_opened = without_stats.score_pruning_survived;
             assert_eq!(a, b, "{query:?} {mode:?} k={k}: same answer");
             let total = (SUPERFILES_TIED * DOCS_PER_SUPERFILE_TIED) as u64;
             assert!(
@@ -429,15 +430,169 @@ fn tied_short_text_stops_the_merge_early_and_answers_the_same() {
                 stats.tier_entries
             );
             // Every superfile holds the same documents, so after the first
-            // open every other can only tie the k-th score, and a tie is
-            // settled by `_id` order: the first superfile's documents come
-            // first, so the rest are not opened. The tiers' bound for a
-            // candidate is its score bit for bit, which is what lets the
-            // tie be recognised before the open.
-            assert_eq!(
-                stats.score_pruning_survived, 1,
-                "{query:?} {mode:?} k={k}: only the first superfile is opened"
+            // open every other can only tie the k-th score. A tie is settled
+            // by `_id` order before the open only where the bound is a read
+            // document's score bit for bit; what lies past the blocks read
+            // is bounded through a stored key, widened by an ulp as the
+            // ceiling path widens its ceilings, so here the rest open as
+            // they do there — never more.
+            assert!(
+                stats.score_pruning_survived <= without_opened,
+                "{query:?} {mode:?} k={k}: opens {} superfiles, the ceiling path {without_opened}",
+                stats.score_pruning_survived
             );
         }
     }
+}
+
+/// `(body, score bits)` per row of `sql`, sorted: what two tables built
+/// from the same commits compare by, their `_id`s being their own.
+fn rows_of(st: &Supertable, sql: &str) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    for b in st.reader().expect("reader").query_sql(sql).expect("sql") {
+        let body = b
+            .column(b.schema().index_of("body").expect("body"))
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("body text");
+        let score = b
+            .column(b.schema().index_of("score").expect("score"))
+            .as_any()
+            .downcast_ref::<arrow_array::Float32Array>()
+            .expect("f32 score");
+        for i in 0..b.num_rows() {
+            out.push((body.value(i).to_string(), score.value(i).to_bits()));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A `WHERE` the index bounds admits only some rows, and the tiers' bounds
+/// and threshold are over every row: a scoped search answers as the table
+/// without tiers does, with every admitted hit.
+#[test]
+fn a_scoped_search_answers_as_its_twin_does() {
+    let (with, without) = (TempDir::new().expect("dir"), TempDir::new().expect("dir"));
+    let tiered = table(&with, true);
+    let plain = table(&without, false);
+    for k in [1usize, 10, 100] {
+        for (query, mode) in [
+            ("the data", "or"),
+            ("the data", "and"),
+            ("search index", "or"),
+        ] {
+            let sql = format!(
+                "SELECT body, score FROM bm25_search('body', '{query}', {k}, '{mode}') \
+                 WHERE body LIKE '%quokka%'"
+            );
+            let a = rows_of(&tiered, &sql);
+            let b = rows_of(&plain, &sql);
+            assert!(!b.is_empty(), "{sql}: the scope admits hits");
+            assert_eq!(a, b, "{sql}: same answer");
+        }
+    }
+}
+
+/// Documents deleted after the index was built are in the tiers: the
+/// merge's threshold and exclusions must leave them out, or the live
+/// documents that score below them are pruned by the kernels and the
+/// superfiles holding them are never opened. Deleting a query's top
+/// documents and asking again must answer as the table without tiers does.
+#[test]
+fn a_delete_of_the_top_documents_leaves_the_rest_answered() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    for (query, mode) in [
+        ("the data search", BoolMode::Or),
+        ("the data search", BoolMode::And),
+        ("data search", BoolMode::And),
+        ("data search", BoolMode::Or),
+    ] {
+        // The top documents before the delete, named by their place.
+        let (top, _, _) = run(&without, query, mode, 10);
+        for &(sf, row, _) in &top {
+            let doomed = document(sf * DOCS_PER_SUPERFILE + row as usize);
+            for st in [&with, &without] {
+                st.delete(col("body").eq(lit(doomed.as_str())))
+                    .expect("delete");
+            }
+        }
+        for k in [1usize, 10, 100] {
+            let (a, _, _) = run(&with, query, mode, k);
+            let (b, _, _) = run(&without, query, mode, k);
+            assert!(!b.is_empty(), "{query:?} {mode:?} k={k}: hits remain");
+            assert_eq!(
+                a, b,
+                "{query:?} {mode:?} k={k}: same answer after the delete"
+            );
+        }
+    }
+}
+
+#[test]
+fn tmp_delete_probe() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    let count = |st: &Supertable, sql: &str| -> i64 {
+        let b = st.reader().expect("reader").query_sql(sql).expect("sql");
+        b[0].column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("i64")
+            .value(0)
+    };
+    let (top, _, _) = run(&without, "the data search", BoolMode::Or, 10);
+    for &(sf, row, _) in &top {
+        let doomed = document(sf * DOCS_PER_SUPERFILE + row as usize);
+        let sql = format!("SELECT count(*) FROM supertable WHERE body = '{doomed}'");
+        let before = (count(&with, &sql), count(&without, &sql));
+        for st in [&with, &without] {
+            st.delete(col("body").eq(lit(doomed.as_str())))
+                .expect("delete");
+        }
+        let after = (count(&with, &sql), count(&without, &sql));
+        eprintln!("PROBE {sf}/{row} {doomed:?}: before {before:?} after {after:?}");
+    }
+    eprintln!(
+        "PROBE totals with={} without={}",
+        count(&with, "SELECT count(*) FROM supertable"),
+        count(&without, "SELECT count(*) FROM supertable")
+    );
+}
+
+#[test]
+fn tmp_delete_probe2() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    let (top, _, _) = run(&without, "the data search", BoolMode::Or, 10);
+    eprintln!("PROBE before without top10: {top:?}");
+    let (topw, _, _) = run(&with, "the data search", BoolMode::Or, 10);
+    eprintln!("PROBE before with    top10: {topw:?}");
+    for &(sf, row, _) in &top {
+        let doomed = document(sf * DOCS_PER_SUPERFILE + row as usize);
+        for st in [&with, &without] {
+            st.delete(col("body").eq(lit(doomed.as_str())))
+                .expect("delete");
+        }
+    }
+    for k in [1usize, 2, 3, 5, 10] {
+        let (a, _, _) = run(&without, "the data search", BoolMode::Or, k);
+        eprintln!("PROBE after without k={k}: {a:?}");
+        let (a, _, _) = run(&with, "the data search", BoolMode::Or, k);
+        eprintln!("PROBE after with    k={k}: {a:?}");
+    }
+    let (a, _, _) = run(&without, "the data search", BoolMode::Or, 5);
+    eprintln!("PROBE after without top5: {a:?}");
+    let (b, _, _) = run(&with, "the data search", BoolMode::Or, 5);
+    eprintln!("PROBE after with    top5: {b:?}");
+    let sql = "SELECT body, score FROM bm25_search('body', 'the data search', 5, 'or')";
+    eprintln!("PROBE after without sql: {:?}", rows_of(&without, sql));
+    eprintln!("PROBE after with    sql: {:?}", rows_of(&with, sql));
 }

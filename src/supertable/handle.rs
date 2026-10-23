@@ -2174,14 +2174,7 @@ impl SupertableReader {
     }
 
     fn fold(cell: &AtomicU64, sample_ns: u64) {
-        use std::sync::atomic::Ordering;
-        let old = cell.load(Ordering::Relaxed);
-        let new = if old == 0 {
-            sample_ns
-        } else {
-            old - old / 4 + sample_ns / 4
-        };
-        cell.store(new, Ordering::Relaxed);
+        crate::supertable::query::tier::fold_mean(cell, sample_ns, 2);
     }
 
     /// ManifestSnapshot id pinned at construction. Useful for asserting

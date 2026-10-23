@@ -1400,12 +1400,8 @@ pub(crate) fn tier_path(dir: &Path, slice_hash: &ContentHash) -> PathBuf {
     dir.join(format!("{}.{TIER_FILE_EXTENSION}", slice_hash.to_hex()))
 }
 
-/// Every entry of a run's tier, read from its chunks in `object` (the
-/// slice's tier object), renumbered through `ordinals`; entries of
-/// superfiles that are gone are dropped. Impacts come back as the stored
-/// lower bounds, which is what a merged tier may carry: the directory
-/// bounds are recomputed from them, so they stay exact for the entries the
-/// merged blocks hold.
+/// Every entry of `chunks` in `object`, renumbered through `ordinals`;
+/// entries of superfiles that are gone are dropped.
 fn tier_entries(
     chunks: &[TierChunkRef],
     object: &[u8],
