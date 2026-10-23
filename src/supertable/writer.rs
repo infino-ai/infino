@@ -3808,7 +3808,14 @@ async fn write_superfile_terms(
         if let (Some(avgdl), Some(params)) =
             (fts.column_baked_avgdl(column), fts.column_params(column))
         {
-            writer.set_scoring(*column_id, term_index::ColumnScoring { avgdl, params });
+            writer.set_scoring(
+                *column_id,
+                term_index::ColumnScoring {
+                    avgdl,
+                    params,
+                    scored_docs: 0,
+                },
+            );
         }
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -11382,12 +11389,18 @@ fn scoring_by_ordinal(
             columns
                 .iter()
                 .filter_map(|(column, params)| {
-                    let avgdl = entry.fts_summary.get(column)?.baked_avgdl?;
+                    let summary = entry.fts_summary.get(column)?;
+                    let avgdl = summary.baked_avgdl?;
+                    let scored_docs = summary
+                        .length_stats
+                        .as_ref()
+                        .map_or(entry.n_docs, |l| l.n_scored_docs);
                     Some((
                         *column,
                         term_index::ColumnScoring {
                             avgdl,
                             params: *params,
+                            scored_docs,
                         },
                     ))
                 })

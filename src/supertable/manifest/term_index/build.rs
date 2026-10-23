@@ -39,7 +39,7 @@ use super::{
     TermIndexError,
     format::{
         Location, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run, encode_slice,
-        push_doc_facts, push_posting, read_doc_facts, read_posting,
+        legacy_bound_as_key, push_doc_facts, push_posting, read_doc_facts, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, TierChunk, TierChunkRef, TierEntry,
@@ -551,6 +551,7 @@ impl TermHeadSink for HeadSink {
                     ColumnScoring {
                         avgdl: facts.avgdl,
                         params: facts.params,
+                        scored_docs: 0,
                     },
                 );
                 let prefix = id.term_key("");
@@ -1484,8 +1485,17 @@ pub(crate) fn merge_segments(
                     });
                 }
             }
+            // A segment of the layout before tiers bounds a posting by a
+            // score at the superfile's own idf; it is written on as the
+            // key the current layout stores.
+            let legacy = source_run.legacy_bound;
+            let column = FieldId::of_term_key(&key).unwrap_or(FieldId(u32::MAX));
             run.extend(source_run.postings.into_iter().filter_map(|mut p| {
                 p.superfile = renumber(ordinals, p.superfile)?;
+                if legacy {
+                    let n = (writer.scoring)(p.superfile, column).scored_docs;
+                    p.bound = legacy_bound_as_key(p.bound, p.df, n);
+                }
                 Some(p)
             }));
             if let Some((key, next_run)) = cursors[source as usize].next()? {

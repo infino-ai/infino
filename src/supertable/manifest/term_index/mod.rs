@@ -53,7 +53,7 @@ use bytes::Bytes;
 use format::Segment;
 #[cfg(test)]
 pub(crate) use format::TierRef;
-pub(crate) use format::{Location, Posting, Root, Run, Slice};
+pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
@@ -887,6 +887,20 @@ impl TermIndex {
         entries: &[Arc<SuperfileEntry>],
         idf_used: &(dyn Fn(&str) -> f32 + Sync),
     ) -> Result<HashMap<Uuid, f32>, TermIndexError> {
+        // A segment of the layout before tiers stores a bound as a score
+        // at the superfile's own idf: each superfile's scored document
+        // count turns it into the key the current layout stores.
+        let scored_docs = |id: Uuid| -> u64 {
+            entries
+                .iter()
+                .find(|e| e.superfile_id == id)
+                .map_or(0, |e| {
+                    e.fts_summary
+                        .get(&column_id)
+                        .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                        .unwrap_or(e.n_docs)
+                })
+        };
         // Per term: superfile → the key of its best document there.
         let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
         let mut all_terms: Vec<&str> = terms.to_vec();
@@ -896,11 +910,17 @@ impl TermIndex {
         let runs = self.runs_many(column_id, &all_terms).await?;
         for (term, runs) in all_terms.into_iter().zip(runs) {
             let mut by_sf = HashMap::new();
-            for p in postings_of(&runs) {
-                let Some(id) = self.superfile_id(p.superfile) else {
-                    continue;
-                };
-                by_sf.insert(id, p.bound);
+            for slice_run in runs.iter() {
+                for p in &slice_run.run.postings {
+                    let Some(id) = self.superfile_id(p.superfile) else {
+                        continue;
+                    };
+                    let key = match slice_run.run.legacy_bound {
+                        true => legacy_bound_as_key(p.bound, p.df, scored_docs(id)),
+                        false => p.bound,
+                    };
+                    by_sf.insert(id, key);
+                }
             }
             per_term.insert(term, by_sf);
         }
@@ -2196,6 +2216,125 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
         alpha
+    }
+
+    /// A term index written by the layout before tiers — a root at its
+    /// version naming slices at theirs — serves ceilings as that layout
+    /// did: each stored score over the superfile's own idf, times the
+    /// query's idf. Nothing opens more than it did before the upgrade.
+    #[test]
+    fn a_term_index_of_the_layout_before_tiers_serves_ceilings_as_before() {
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        commit_segment(&st, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reader = st.reader().expect("reader");
+        let entries: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(entries.len(), 2);
+        let key = title_id().term_key("shared");
+        let slice = format::encode_legacy_slice(&[(
+            key.clone(),
+            vec![(0, 5, 2.5, Location::None), (1, 7, 1.9, Location::None)],
+        )]);
+        let hash = ContentHash::of(&slice);
+        rt.block_on(put_content_addressed(
+            storage.as_ref(),
+            "slice",
+            slice.clone(),
+        ))
+        .expect("slice stored");
+        let root = Root {
+            superfiles: entries.iter().map(|e| e.superfile_id).collect(),
+            id_mins: entries.iter().map(|e| e.id_min).collect(),
+            segments: vec![Segment {
+                slices: vec![format::SliceRef {
+                    first_key: key.clone(),
+                    last_key: key.clone(),
+                    content_hash: hash,
+                    tier: None,
+                }],
+            }],
+        };
+        let root = Root::decode(&format::encode_legacy_root(&root, &[slice.len() as u64]))
+            .expect("a legacy root decodes");
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let idf_used = |_: &str| 1.7f32;
+        let ceilings = rt
+            .block_on(index.query_ceilings(title_id(), &["shared"], &[], &entries, &idf_used))
+            .expect("ceilings");
+        for (e, (df, bound)) in entries.iter().zip([(5u64, 2.5f32), (7, 1.9)]) {
+            let n = e
+                .fts_summary
+                .get(&title_id())
+                .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                .unwrap_or(e.n_docs);
+            let expected = bound / bm25::idf(n, df.min(n)) * 1.7 * CEILING_SLACK;
+            let got = ceilings[&e.superfile_id];
+            assert!(
+                (got - expected).abs() <= expected * 1e-5,
+                "superfile {}: ceiling {got}, expected {expected}",
+                e.superfile_id
+            );
+        }
+        // Its runs serve postings and are not mistaken for tiers.
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
+        assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
+    }
+
+    /// A merge that rewrites a segment of the layout before tiers writes
+    /// its bounds as the keys the current layout stores, through each
+    /// superfile's scored document count.
+    #[test]
+    fn a_merge_writes_a_legacy_segments_bounds_as_keys() {
+        let key = title_id().term_key("shared");
+        let slice = format::encode_legacy_slice(&[(
+            key.clone(),
+            vec![(0, 5, 2.5, Location::None), (1, 7, 1.9, Location::None)],
+        )]);
+        let scratch = TempDir::new().expect("scratch");
+        let sources = vec![
+            spill_slices(
+                scratch.path(),
+                vec![(ContentHash::of(&slice), BuiltBytes::Resident(slice))],
+            )
+            .expect("place slices"),
+        ];
+        let scoring = |n: u64| {
+            std::collections::BTreeMap::from([(
+                title_id(),
+                tier::ColumnScoring {
+                    scored_docs: n,
+                    ..tier::ColumnScoring::default()
+                },
+            )])
+        };
+        let policy = BuildPolicy {
+            scoring_by_ordinal: Arc::new(vec![scoring(100), scoring(1000)]),
+            ..BuildPolicy::default()
+        };
+        let merged = merge_segments(&sources, &[Some(0), Some(1)], &policy).expect("merge");
+        let bytes = bytes_of(&merged.slices[0].1);
+        let run = Slice::open(&bytes)
+            .expect("open")
+            .run(&key)
+            .expect("run")
+            .expect("indexed");
+        assert!(!run.legacy_bound, "written on in the current layout");
+        let keys: Vec<f32> = run.postings.iter().map(|p| p.bound).collect();
+        assert_eq!(
+            keys,
+            vec![
+                legacy_bound_as_key(2.5, 5, 100),
+                legacy_bound_as_key(1.9, 7, 1000)
+            ]
+        );
+        assert!(
+            run.postings.iter().all(|p| p.tail == f32::INFINITY),
+            "nothing below a legacy bound is known"
+        );
     }
 
     /// Optimize options that merge nothing: the maintenance passes alone.

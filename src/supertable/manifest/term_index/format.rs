@@ -93,19 +93,25 @@ pub(crate) const ROOT_MAGIC: &[u8; 8] = b"INFTIDX1";
 /// Identifies a slice file and its major layout family.
 pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// Layout version of the root. `2` added each superfile's smallest doc id;
-/// `3` keys terms by the column's field id instead of its name; `4` is
-/// the root whose slices carry tails and tiers (slice version 2); `5` is
-/// the root whose slices are at version 3; `6` the root whose slices are at
-/// version 4 and names each slice's tier object by hash alone. A root at an
-/// older version does not decode: the index is rebuilt, not translated.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 6;
-/// Layout version of a slice. `2` added the per-posting tail and the
-/// run's tier reference; `3` keeps a small tier in the run and gives a
-/// tier chunk a directory CRC and a CRC per block, so a block is read on
-/// its own; `4` lays a tier out per superfile, in regions of one block per
-/// superfile, with the superfile and its tail in each block's directory
-/// entry, and stores a posting's bound as a key rather than a score.
-pub(crate) const SLICE_FORMAT_VERSION: u32 = 4;
+/// `3` keys terms by the column's field id instead of its name; `4` names
+/// each slice's tier object beside the slice. A root at version `3` still
+/// decodes — its slices are at version 1 and serve ceilings until the next
+/// maintenance rebuild writes the current layout; anything older does
+/// not, and the index is rebuilt, not translated.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 4;
+/// The root version before tiers: slices named with their byte length and
+/// no tier object.
+pub(crate) const LEGACY_ROOT_FORMAT_VERSION: u32 = 3;
+/// Layout version of a slice. `2` adds the per-posting tail and the run's
+/// tier reference (a small tier in the run itself, a larger one in the
+/// slice's tier object, laid out per superfile in regions of one block
+/// per superfile, each block with its own CRC), and stores a posting's
+/// bound as a key rather than a score.
+pub(crate) const SLICE_FORMAT_VERSION: u32 = 2;
+/// The slice version before tiers: a run is its postings alone, each a
+/// superfile, a document frequency, a bound that is a BM25 score at the
+/// superfile's own idf, and a location.
+pub(crate) const LEGACY_SLICE_FORMAT_VERSION: u32 = 1;
 /// Run header tag: the term has no tier.
 const TIER_ABSENT: u8 = 0;
 /// Run header tag: a tier reference follows.
@@ -251,6 +257,27 @@ pub(crate) struct TierRef {
 pub(crate) struct Run {
     pub(crate) tier: Option<TierRef>,
     pub(crate) postings: Vec<Posting>,
+    /// Whether the run came from a slice of the layout before tiers:
+    /// its postings' bounds are BM25 scores at each superfile's own idf
+    /// rather than keys, and carry no tail. A reader divides such a bound
+    /// by that idf, which needs the superfile's scored document count.
+    pub(crate) legacy_bound: bool,
+}
+
+/// A bound stored by the layout before tiers — the term's best BM25 score
+/// in a superfile at that superfile's own idf — as the key the current
+/// layout stores: the factor the score multiplies the idf by. `n` is the
+/// superfile's scored document count; with none known, nothing is bounded.
+pub(crate) fn legacy_bound_as_key(bound: f32, df: u64, n: u64) -> f32 {
+    if n == 0 {
+        return f32::INFINITY;
+    }
+    let local_idf = crate::superfile::fts::bm25::idf(n, df.min(n));
+    if local_idf > 0.0 {
+        bound / local_idf
+    } else {
+        bound
+    }
 }
 
 /// A slice's place in the key space and in storage.
@@ -328,24 +355,26 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Check the magic and read the version, which must be the current one
+/// (`accepted[0]`) or a legacy one still read; the version found.
 fn check_magic_version(
     c: &mut Cursor<'_>,
     magic: &[u8; 8],
-    expected: u32,
+    accepted: &[u32],
     what: &'static str,
-) -> Result<(), TermIndexError> {
+) -> Result<u32, TermIndexError> {
     if c.take(MAGIC_LEN, what)? != magic {
         return Err(malformed(&format!("{what}: bad magic")));
     }
     let found = c.u32(what)?;
-    if found != expected {
+    if !accepted.contains(&found) {
         return Err(TermIndexError::UnsupportedVersion {
             what,
             found,
-            expected,
+            expected: accepted[0],
         });
     }
-    Ok(())
+    Ok(found)
 }
 
 impl Root {
@@ -379,10 +408,17 @@ impl Root {
         out
     }
 
-    /// Parse, refusing an unknown magic or version.
+    /// Parse, refusing an unknown magic or a version no longer read. A
+    /// root of the layout before tiers names each slice with its byte
+    /// length and no tier object.
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        check_magic_version(&mut c, ROOT_MAGIC, ROOT_FORMAT_VERSION, "root")?;
+        let version = check_magic_version(
+            &mut c,
+            ROOT_MAGIC,
+            &[ROOT_FORMAT_VERSION, LEGACY_ROOT_FORMAT_VERSION],
+            "root",
+        )?;
         let n_superfiles = c.u32("root superfile count")? as usize;
         let mut superfiles = Vec::with_capacity(n_superfiles);
         let mut id_mins = Vec::with_capacity(n_superfiles);
@@ -402,10 +438,15 @@ impl Root {
                 let last_key = c.bytes_u32_len("slice last key")?.to_vec();
                 let hash = c.take(HASH_LEN, "slice hash")?;
                 let content_hash = ContentHash(hash.try_into().expect("32 bytes"));
-                let hash = c.take(HASH_LEN, "slice tier hash")?;
-                let tier = match hash.iter().all(|b| *b == 0) {
-                    true => None,
-                    false => Some(ContentHash(hash.try_into().expect("32 bytes"))),
+                let tier = if version == LEGACY_ROOT_FORMAT_VERSION {
+                    c.u64("slice length")?;
+                    None
+                } else {
+                    let hash = c.take(HASH_LEN, "slice tier hash")?;
+                    match hash.iter().all(|b| *b == 0) {
+                        true => None,
+                        false => Some(ContentHash(hash.try_into().expect("32 bytes"))),
+                    }
                 };
                 slices.push(SliceRef {
                     first_key,
@@ -535,6 +576,35 @@ pub(crate) fn encode_run(tier: Option<&TierRef>, postings: &[Posting]) -> Vec<u8
     out
 }
 
+/// Decode a posting's location at `at`, advancing it.
+fn read_location(bytes: &[u8], at: &mut usize) -> Result<Location, TermIndexError> {
+    let tag = *bytes
+        .get(*at)
+        .ok_or_else(|| malformed("posting location tag"))?;
+    *at += 1;
+    Ok(match tag {
+        LOC_NONE => Location::None,
+        LOC_PFOR | LOC_SHORT => {
+            let offset = read_u64_varint(bytes, at).ok_or_else(|| malformed("location offset"))?;
+            let len = read_varint(bytes, at).ok_or_else(|| malformed("location len"))?;
+            match tag {
+                LOC_PFOR => Location::Pfor { offset, len },
+                _ => Location::Short { offset, len },
+            }
+        }
+        LOC_INLINE => {
+            let doc_id = read_varint(bytes, at).ok_or_else(|| malformed("inline doc id"))?;
+            let tf = read_varint(bytes, at).ok_or_else(|| malformed("inline tf"))?;
+            Location::Inline { doc_id, tf }
+        }
+        other => {
+            return Err(TermIndexError::Malformed(format!(
+                "posting: unknown location tag {other}"
+            )));
+        }
+    })
+}
+
 /// Decode one posting at `at`, advancing it.
 pub(crate) fn read_posting(bytes: &[u8], at: &mut usize) -> Result<Posting, TermIndexError> {
     let tagged = read_varint(bytes, at).ok_or_else(|| malformed("posting superfile"))?;
@@ -560,31 +630,7 @@ pub(crate) fn read_posting(bytes: &[u8], at: &mut usize) -> Result<Posting, Term
     } else {
         0.0
     };
-    let tag = *bytes
-        .get(*at)
-        .ok_or_else(|| malformed("posting location tag"))?;
-    *at += 1;
-    let location = match tag {
-        LOC_NONE => Location::None,
-        LOC_PFOR | LOC_SHORT => {
-            let offset = read_u64_varint(bytes, at).ok_or_else(|| malformed("location offset"))?;
-            let len = read_varint(bytes, at).ok_or_else(|| malformed("location len"))?;
-            match tag {
-                LOC_PFOR => Location::Pfor { offset, len },
-                _ => Location::Short { offset, len },
-            }
-        }
-        LOC_INLINE => {
-            let doc_id = read_varint(bytes, at).ok_or_else(|| malformed("inline doc id"))?;
-            let tf = read_varint(bytes, at).ok_or_else(|| malformed("inline tf"))?;
-            Location::Inline { doc_id, tf }
-        }
-        other => {
-            return Err(TermIndexError::Malformed(format!(
-                "posting: unknown location tag {other}"
-            )));
-        }
-    };
+    let location = read_location(bytes, at)?;
     Ok(Posting {
         superfile,
         df,
@@ -649,7 +695,131 @@ pub(crate) fn decode_run_with_tier(bytes: &[u8]) -> Result<Run, TermIndexError> 
     if at != bytes.len() {
         return Err(malformed("run: trailing bytes"));
     }
-    Ok(Run { tier, postings })
+    Ok(Run {
+        tier,
+        postings,
+        legacy_bound: false,
+    })
+}
+
+/// Decode a run of the layout before tiers: a count, then postings of a
+/// superfile ordinal, a document frequency, a bound (a BM25 score at the
+/// superfile's own idf) and a location; no tail, no tier.
+fn decode_legacy_run(bytes: &[u8]) -> Result<Run, TermIndexError> {
+    let mut at = 0usize;
+    let n = read_varint(bytes, &mut at).ok_or_else(|| malformed("run count"))? as usize;
+    let mut postings = Vec::with_capacity(n);
+    for _ in 0..n {
+        let superfile =
+            read_varint(bytes, &mut at).ok_or_else(|| malformed("posting superfile"))?;
+        let df = read_u64_varint(bytes, &mut at).ok_or_else(|| malformed("posting df"))?;
+        let end = at
+            .checked_add(F32_LEN)
+            .ok_or_else(|| malformed("posting bound"))?;
+        let bound_bytes = bytes
+            .get(at..end)
+            .ok_or_else(|| malformed("posting bound"))?;
+        let bound = f32::from_le_bytes(bound_bytes.try_into().expect("4 bytes"));
+        at = end;
+        let location = read_location(bytes, &mut at)?;
+        postings.push(Posting {
+            superfile,
+            df,
+            bound,
+            tail: f32::INFINITY,
+            location,
+        });
+    }
+    if at != bytes.len() {
+        return Err(malformed("run: trailing bytes"));
+    }
+    Ok(Run {
+        tier: None,
+        postings,
+        legacy_bound: true,
+    })
+}
+
+/// Encode `root` as the layout before tiers wrote it: each slice named
+/// with its byte length (`lens`, parallel to the slices in order) and no
+/// tier object. What a table indexed by that layout holds.
+#[cfg(test)]
+pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(ROOT_MAGIC);
+    out.extend_from_slice(&LEGACY_ROOT_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&(root.superfiles.len() as u32).to_le_bytes());
+    for (id, id_min) in root.superfiles.iter().zip(&root.id_mins) {
+        out.extend_from_slice(id.as_bytes());
+        out.extend_from_slice(&id_min.to_le_bytes());
+    }
+    out.extend_from_slice(&(root.segments.len() as u32).to_le_bytes());
+    let mut lens = lens.iter();
+    for seg in &root.segments {
+        out.extend_from_slice(&(seg.slices.len() as u32).to_le_bytes());
+        for s in &seg.slices {
+            push_bytes_u32_len(&mut out, &s.first_key);
+            push_bytes_u32_len(&mut out, &s.last_key);
+            out.extend_from_slice(&s.content_hash.0);
+            out.extend_from_slice(&lens.next().copied().unwrap_or(0).to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Encode a slice as the layout before tiers wrote it: per term, a run of
+/// `(superfile, df, bound, location)` postings, the bound a BM25 score at
+/// the superfile's own idf.
+#[cfg(test)]
+pub(crate) fn encode_legacy_slice(terms: &[(Vec<u8>, Vec<(u32, u64, f32, Location)>)]) -> Vec<u8> {
+    use crate::utils::terms::TermDictBuilder;
+    let mut dict = TermDictBuilder::new();
+    let mut postings = Vec::new();
+    for (key, run) in terms {
+        let mut bytes = Vec::new();
+        push_varint(&mut bytes, run.len() as u32);
+        for &(superfile, df, bound, location) in run {
+            push_varint(&mut bytes, superfile);
+            push_u64_varint(&mut bytes, df);
+            bytes.extend_from_slice(&bound.to_le_bytes());
+            match location {
+                Location::None => bytes.push(LOC_NONE),
+                Location::Pfor { offset, len } => {
+                    bytes.push(LOC_PFOR);
+                    push_u64_varint(&mut bytes, offset);
+                    push_varint(&mut bytes, len);
+                }
+                Location::Short { offset, len } => {
+                    bytes.push(LOC_SHORT);
+                    push_u64_varint(&mut bytes, offset);
+                    push_varint(&mut bytes, len);
+                }
+                Location::Inline { doc_id, tf } => {
+                    bytes.push(LOC_INLINE);
+                    push_varint(&mut bytes, doc_id);
+                    push_varint(&mut bytes, tf);
+                }
+            }
+        }
+        dict.insert(
+            key,
+            DictEntry::Pfor {
+                metadata_offset: postings.len() as u64,
+                postings_length: bytes.len() as u32,
+                short: false,
+            },
+        );
+        postings.extend_from_slice(&bytes);
+    }
+    let dict = dict.finish();
+    let mut out = Vec::with_capacity(SLICE_HEADER_LEN + dict.len() + postings.len());
+    out.extend_from_slice(SLICE_MAGIC);
+    out.extend_from_slice(&LEGACY_SLICE_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&(dict.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(postings.len() as u64).to_le_bytes());
+    out.extend_from_slice(&dict);
+    out.extend_from_slice(&postings);
+    out
 }
 
 /// Assemble a slice from an encoded block dictionary and its postings
@@ -669,13 +839,23 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
 pub(crate) struct Slice<'a> {
     dict: TermBlocks<'a>,
     postings: &'a [u8],
+    /// Whether the slice is of the layout before tiers (see
+    /// [`Run::legacy_bound`]).
+    legacy: bool,
 }
 
 impl<'a> Slice<'a> {
-    /// Parse a slice, refusing an unknown magic or version.
+    /// Parse a slice, refusing an unknown magic or a version no longer
+    /// read; a slice of the layout before tiers is read with its runs'
+    /// bounds marked as the scores they are.
     pub(crate) fn open(bytes: &'a [u8]) -> Result<Self, TermIndexError> {
         let mut c = Cursor { bytes, at: 0 };
-        check_magic_version(&mut c, SLICE_MAGIC, SLICE_FORMAT_VERSION, "slice")?;
+        let version = check_magic_version(
+            &mut c,
+            SLICE_MAGIC,
+            &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
+            "slice",
+        )?;
         let dict_len = c.u64("slice dict length")? as usize;
         let postings_len = c.u64("slice postings length")? as usize;
         let dict_bytes = c.take(dict_len, "slice dictionary")?;
@@ -685,7 +865,11 @@ impl<'a> Slice<'a> {
         }
         let dict = TermBlocks::open(dict_bytes)
             .map_err(|e| TermIndexError::Malformed(format!("slice dictionary: {e}")))?;
-        Ok(Self { dict, postings })
+        Ok(Self {
+            dict,
+            postings,
+            legacy: version == LEGACY_SLICE_FORMAT_VERSION,
+        })
     }
 
     fn run_at(&self, value: DictEntry) -> Result<Run, TermIndexError> {
@@ -705,7 +889,11 @@ impl<'a> Slice<'a> {
             .postings
             .get(start..end)
             .ok_or_else(|| malformed("slice entry range past postings region"))?;
-        decode_run_with_tier(run)
+        if self.legacy {
+            decode_legacy_run(run)
+        } else {
+            decode_run_with_tier(run)
+        }
     }
 
     /// The postings for `key`, `None` when the slice holds no such term.
@@ -1189,6 +1377,95 @@ mod tests {
             })
             .expect("scan");
         assert_eq!(n, 2, "the visitor can stop the walk");
+    }
+
+    /// A root written by the layout before tiers decodes: its slices carry
+    /// no tier object, and the length it named each with is dropped.
+    #[test]
+    fn a_root_of_the_layout_before_tiers_decodes_without_tier_objects() {
+        let untiered = |a: &str, b: &str, n: u8| SliceRef {
+            tier: None,
+            ..slice_ref(a, b, n)
+        };
+        let root = Root {
+            superfiles: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            id_mins: vec![10, -20],
+            segments: vec![
+                Segment {
+                    slices: vec![untiered("a", "b", 1), untiered("c", "d", 2)],
+                },
+                Segment {
+                    slices: vec![untiered("c", "d", 3)],
+                },
+            ],
+        };
+        let legacy = encode_legacy_root(&root, &[100, 200, 300]);
+        assert_eq!(
+            u32::from_le_bytes(
+                legacy[MAGIC_LEN..MAGIC_LEN + U32_LEN]
+                    .try_into()
+                    .expect("4")
+            ),
+            LEGACY_ROOT_FORMAT_VERSION
+        );
+        assert_eq!(Root::decode(&legacy).expect("decodes"), root);
+        assert_ne!(
+            legacy,
+            root.encode(),
+            "the current layout writes its own version"
+        );
+    }
+
+    /// A slice written by the layout before tiers opens; its runs carry no
+    /// tier and no tail, and are marked for what their bounds are: scores
+    /// at the superfile's own idf, which become keys through that idf.
+    #[test]
+    fn a_slice_of_the_layout_before_tiers_opens_with_its_bounds_as_scores() {
+        let key = make_key("body", "alpha");
+        let bytes = encode_legacy_slice(&[(
+            key.clone(),
+            vec![
+                (0, 5, 2.5, Location::None),
+                (3, 40, 1.25, Location::Pfor { offset: 77, len: 9 }),
+            ],
+        )]);
+        let slice = Slice::open(&bytes).expect("a legacy slice opens");
+        let run = slice.run(&key).expect("run").expect("indexed");
+        assert!(run.legacy_bound && run.tier.is_none());
+        assert_eq!(run.postings.len(), 2);
+        assert_eq!(
+            (
+                run.postings[0].superfile,
+                run.postings[0].df,
+                run.postings[0].bound
+            ),
+            (0, 5, 2.5)
+        );
+        assert_eq!(
+            run.postings[1].location,
+            Location::Pfor { offset: 77, len: 9 }
+        );
+        assert!(
+            run.postings.iter().all(|p| p.tail == f32::INFINITY),
+            "no tail was stored: nothing below the bound is known"
+        );
+        assert!(slice.run(&make_key("body", "zzz")).expect("run").is_none());
+        // The conversion main's ceilings made: score over the local idf.
+        let local_idf = crate::superfile::fts::bm25::idf(100, 5);
+        assert_eq!(legacy_bound_as_key(2.5, 5, 100), 2.5 / local_idf);
+        assert_eq!(
+            legacy_bound_as_key(2.5, 5, 0),
+            f32::INFINITY,
+            "with no document count the bound is unknown"
+        );
+        // The current layout's runs are not marked.
+        let current = build_slice(&[("body", "alpha", vec![])]);
+        let run = Slice::open(&current)
+            .expect("open")
+            .run(&key)
+            .expect("run")
+            .expect("indexed");
+        assert!(!run.legacy_bound);
     }
 
     #[test]

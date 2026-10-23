@@ -108,6 +108,11 @@ pub(crate) struct TierEntry {
 pub(crate) struct ColumnScoring {
     pub(crate) avgdl: f32,
     pub(crate) params: Bm25Params,
+    /// The superfile's scored document count in the column: what turns a
+    /// bound stored by the layout before tiers, a score at the superfile's
+    /// own idf, into a key when such a segment is merged. Zero when not
+    /// known, which leaves such a bound unbounded.
+    pub(crate) scored_docs: u64,
 }
 
 impl Default for ColumnScoring {
@@ -115,6 +120,7 @@ impl Default for ColumnScoring {
         Self {
             avgdl: DEFAULT_KEY_AVGDL,
             params: Bm25Params::default(),
+            scored_docs: 0,
         }
     }
 }
@@ -543,6 +549,7 @@ mod tests {
     /// The scoring the tests key their samples at.
     fn scoring() -> ColumnScoring {
         ColumnScoring {
+            scored_docs: 0,
             avgdl: 20.0,
             params: Bm25Params::default(),
         }
