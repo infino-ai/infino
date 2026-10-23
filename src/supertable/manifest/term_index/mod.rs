@@ -38,7 +38,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs, io,
     iter::repeat_n,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
@@ -47,7 +47,7 @@ use build::build_segment;
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
     BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, build, build_onto, merge_segments, scratch_dir, tier_path,
+    HeadSink, SliceFile, build, build_onto, merge_segments, scratch_dir, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
@@ -523,7 +523,7 @@ pub(crate) async fn download_segments(
     storage: &dyn StorageProvider,
     segments: &[Segment],
     dir: &Path,
-) -> Result<Vec<Vec<PathBuf>>, TermIndexError> {
+) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let path_of = |hash: &ContentHash| dir.join(format!("{}.slice", hash.to_hex()));
     let mut unique: HashSet<ContentHash> = HashSet::new();
     let fetches = segments
@@ -559,24 +559,46 @@ pub(crate) async fn download_segments(
             segment
                 .slices
                 .iter()
-                .map(|slice| path_of(&slice.content_hash))
+                .map(|slice| SliceFile {
+                    path: path_of(&slice.content_hash),
+                    first_key: slice.first_key.clone(),
+                    last_key: slice.last_key.clone(),
+                })
                 .collect()
         })
         .collect())
 }
 
-/// Write freshly built slices into `dir`, in order, so a merge can read
-/// them like downloaded ones.
+/// Write freshly built slices into `dir`, each with the key range its
+/// segment entry in `refs` records, so a merge finds them where
+/// [`download_segments`] would have put them.
 pub(crate) fn spill_slices(
     dir: &Path,
+    refs: &[format::SliceRef],
     slices: Vec<(ContentHash, BuiltBytes)>,
-) -> Result<Vec<PathBuf>, TermIndexError> {
+) -> Result<Vec<SliceFile>, TermIndexError> {
+    let keys_of: HashMap<ContentHash, (&[u8], &[u8])> = refs
+        .iter()
+        .map(|r| {
+            (
+                r.content_hash,
+                (r.first_key.as_slice(), r.last_key.as_slice()),
+            )
+        })
+        .collect();
     slices
         .into_iter()
         .map(|(hash, built)| {
+            let (first_key, last_key) = keys_of.get(&hash).ok_or_else(|| {
+                TermIndexError::Build("a built slice its segment does not list".into())
+            })?;
             let path = dir.join(format!("{}.slice", hash.to_hex()));
             place_built(&path, built)?;
-            Ok(path)
+            Ok(SliceFile {
+                path,
+                first_key: first_key.to_vec(),
+                last_key: last_key.to_vec(),
+            })
         })
         .collect()
 }
@@ -1562,96 +1584,99 @@ mod tests {
         assert!(built.tiers.is_empty());
     }
 
-    /// A merge cut into key-range shards writes the terms one writer over
-    /// everything writes: every key's postings and tier entries agree, and
-    /// the shards' slices follow each other in key order.
-    #[test]
-    fn a_sharded_merge_writes_the_terms_one_writer_writes() {
-        let dir = TempDir::new().expect("tempdir");
+    /// Six hundred terms in one contribution, docs scored off `id`: with
+    /// slices cut small there are many boundaries to shard at, and heads
+    /// both inline and chunked.
+    fn shard_contribution(dir: &TempDir, id: u128) -> Contribution {
+        let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
         let docs = |base: f32, n: u32| {
             (0..n)
                 .map(|i| (i * 3, base + i as f32 * 0.01))
                 .collect::<Vec<_>>()
         };
-        // Many terms over two superfiles, slices cut small: plenty of
-        // boundaries to shard at, heads both inline and chunked.
-        let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
-        let make = |id: u128| {
-            let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    (
-                        "body",
-                        t.as_str(),
-                        docs(id as f32 + i as f32 * 0.001, 2 + (i % 20) as u32),
-                    )
-                })
-                .collect();
-            contribution_with_heads(&dir, id, &entries, 64)
-        };
-        let policy = BuildPolicy {
+        let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    "body",
+                    t.as_str(),
+                    docs(id as f32 + i as f32 * 0.001, 2 + (i % 20) as u32),
+                )
+            })
+            .collect();
+        contribution_with_heads(dir, id, &entries, 64)
+    }
+
+    /// The policy the shard tests build and merge under: slices cut small.
+    fn shard_policy() -> BuildPolicy {
+        BuildPolicy {
             slice_target_bytes: 2048,
             tier_entries_per_term: 100_000,
             ..BuildPolicy::default()
-        };
-        let built = build(&[make(1), make(2)], &policy).expect("build");
-        let segment = built.root.segments[0].clone();
-        assert!(segment.slices.len() >= 8, "{} slices", segment.slices.len());
-        let scratch = TempDir::new().expect("scratch");
-        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
-        let sources = vec![spill_slices(scratch.path(), built.slices).expect("place slices")];
+        }
+    }
+
+    /// Every term of a merged output: its postings and its tier's entries.
+    fn merged_terms(
+        m: &build::MergedSegment,
+    ) -> Vec<(Vec<u8>, Vec<Posting>, Vec<(u32, u32, u32, u8)>)> {
+        let mut out = Vec::new();
+        for (i, (_, bytes)) in m.slices.iter().enumerate() {
+            let bytes = bytes_of(bytes);
+            let slice = Slice::open(&bytes).expect("open");
+            for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
+                let mut entries: Vec<tier::TierEntry> = match &run.tier {
+                    None => Vec::new(),
+                    Some(t) if t.chunks.is_empty() => t.inline.clone(),
+                    Some(t) => {
+                        let object = m.segment.slices[i].tier.expect("a tier object");
+                        let object = bytes_of(
+                            &m.tiers
+                                .iter()
+                                .find(|(h, _)| *h == object)
+                                .expect("the tier object is among the built")
+                                .1,
+                        );
+                        let mut all = Vec::new();
+                        for chunk in &t.chunks {
+                            let range = chunk.offset as usize..(chunk.offset + chunk.len) as usize;
+                            let mut block = Vec::new();
+                            tier::TierChunk::open(&object[range], chunk.n_blocks)
+                                .expect("chunk")
+                                .entries(&mut block)
+                                .expect("entries");
+                            all.extend(block);
+                        }
+                        all
+                    }
+                };
+                let mut entries: Vec<(u32, u32, u32, u8)> = entries
+                    .drain(..)
+                    .map(|e| (e.superfile, e.doc_id, e.tf, e.len))
+                    .collect();
+                entries.sort_unstable();
+                out.push((key, run.postings, entries));
+            }
+        }
+        out
+    }
+
+    /// A merge of `sources` in four shards writes the terms the one-writer
+    /// merge writes, each with the same postings and tier entries, in
+    /// slices that follow each other in key order.
+    fn assert_shards_match_one_writer(
+        sources: &[Vec<SliceFile>],
+        ordinals: &[Option<u32>],
+        policy: &BuildPolicy,
+    ) {
         let merge = |shards: usize| {
             let policy = BuildPolicy {
                 merge_shards: Some(shards),
                 ..policy.clone()
             };
-            merge_segments(&sources, &[Some(0), Some(1)], &policy).expect("merge")
+            merge_segments(sources, ordinals, &policy).expect("merge")
         };
-        // Every term of a merged output: its postings and its tier's entries.
-        let terms_of =
-            |m: &build::MergedSegment| -> Vec<(Vec<u8>, Vec<Posting>, Vec<(u32, u32, u32, u8)>)> {
-                let mut out = Vec::new();
-                for (i, (_, bytes)) in m.slices.iter().enumerate() {
-                    let bytes = bytes_of(bytes);
-                    let slice = Slice::open(&bytes).expect("open");
-                    for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
-                        let mut entries: Vec<tier::TierEntry> = match &run.tier {
-                            None => Vec::new(),
-                            Some(t) if t.chunks.is_empty() => t.inline.clone(),
-                            Some(t) => {
-                                let object = m.segment.slices[i].tier.expect("a tier object");
-                                let object = bytes_of(
-                                    &m.tiers
-                                        .iter()
-                                        .find(|(h, _)| *h == object)
-                                        .expect("the tier object is among the built")
-                                        .1,
-                                );
-                                let mut all = Vec::new();
-                                for chunk in &t.chunks {
-                                    let range =
-                                        chunk.offset as usize..(chunk.offset + chunk.len) as usize;
-                                    let mut block = Vec::new();
-                                    tier::TierChunk::open(&object[range], chunk.n_blocks)
-                                        .expect("chunk")
-                                        .entries(&mut block)
-                                        .expect("entries");
-                                    all.extend(block);
-                                }
-                                all
-                            }
-                        };
-                        let mut entries: Vec<(u32, u32, u32, u8)> = entries
-                            .drain(..)
-                            .map(|e| (e.superfile, e.doc_id, e.tf, e.len))
-                            .collect();
-                        entries.sort_unstable();
-                        out.push((key, run.postings, entries));
-                    }
-                }
-                out
-            };
         let (one, many) = (merge(1), merge(4));
         assert!(
             many.segment.slices.len() >= 4,
@@ -1668,9 +1693,65 @@ mod tests {
             ranges.windows(2).all(|w| w[0].1 < w[1].0),
             "the shards' slices follow each other in key order"
         );
-        let (a, b) = (terms_of(&one), terms_of(&many));
+        let (a, b) = (merged_terms(&one), merged_terms(&many));
         assert_eq!(a.len(), b.len(), "the same terms");
         assert_eq!(a, b, "the same postings and entries per term");
+    }
+
+    /// A merge cut into key-range shards writes the terms one writer over
+    /// everything writes: every key's postings and tier entries agree, and
+    /// the shards' slices follow each other in key order.
+    #[test]
+    fn a_sharded_merge_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = shard_policy();
+        let built = build(
+            &[shard_contribution(&dir, 1), shard_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let segment = built.root.segments[0].clone();
+        assert!(segment.slices.len() >= 8, "{} slices", segment.slices.len());
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
+        let sources = vec![
+            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
+        ];
+        assert_shards_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
+    }
+
+    /// The same over two source segments, a base and a delta built onto
+    /// it, whose slices are cut at different keys: each shard takes the
+    /// slices of each segment that reach into it and interleaves them.
+    #[test]
+    fn a_sharded_merge_over_two_segments_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = shard_policy();
+        let base = build(&[shard_contribution(&dir, 1)], &policy).expect("base");
+        let delta = build_onto(
+            base.root.clone(),
+            &[shard_contribution(&dir, 2), shard_contribution(&dir, 3)],
+            &policy,
+        )
+        .expect("delta");
+        let (base_refs, delta_refs) = (
+            &base.root.segments[0].slices,
+            &delta.root.segments[1].slices,
+        );
+        assert!(base_refs.len() >= 4 && delta_refs.len() >= 4);
+        assert_ne!(
+            base_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
+            delta_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
+            "the segments' slices are cut at different keys"
+        );
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), base_refs, base.tiers).expect("place base tiers");
+        spill_tiers(scratch.path(), delta_refs, delta.tiers).expect("place delta tiers");
+        let sources = vec![
+            spill_slices(scratch.path(), base_refs, base.slices).expect("place base"),
+            spill_slices(scratch.path(), delta_refs, delta.slices).expect("place delta"),
+        ];
+        assert_shards_match_one_writer(&sources, &[Some(0), Some(1), Some(2)], &policy);
     }
 
     /// A tier of more than a few entries is chunked into the slice's tier
@@ -1750,7 +1831,9 @@ mod tests {
         // ordinal 0 in the inline entries as in the chunked ones.
         let scratch = TempDir::new().expect("scratch");
         spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
-        let sources = vec![spill_slices(scratch.path(), built.slices).expect("place slices")];
+        let sources = vec![
+            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
+        ];
         let merged = merge_segments(&sources, &[None, Some(0)], &policy).expect("merge");
         let merged_bytes = bytes_of(&merged.slices[0].1);
         let merged_slice = Slice::open(&merged_bytes).expect("open");
@@ -1848,7 +1931,14 @@ mod tests {
             spilled.tiers,
         )
         .expect("place tiers");
-        let sources = vec![spill_slices(scratch.path(), spilled.slices).expect("place slices")];
+        let sources = vec![
+            spill_slices(
+                scratch.path(),
+                &spilled.root.segments[0].slices,
+                spilled.slices,
+            )
+            .expect("place slices"),
+        ];
         let merged = merge_segments(&sources, &[Some(0), Some(1)], &resident).expect("merge");
         assert_eq!(
             merged.slices, kept.slices,
@@ -1897,8 +1987,10 @@ mod tests {
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), base.slices).expect("spill base"),
-            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
         ];
         // Drop the middle superfile; the merge renumbers the survivors.
         let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
@@ -1949,8 +2041,10 @@ mod tests {
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), base.slices).expect("spill base"),
-            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
         ];
         let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let slice_bytes = bytes_of(&merged.slices[0].1);
@@ -2173,8 +2267,10 @@ mod tests {
         let base = build(&[first, gone], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[last], &policy).expect("delta");
         let sources = vec![
-            spill_slices(dir.path(), base.slices).expect("spill base"),
-            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
         ];
         let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let (segment, slices) = (merged.segment, merged.slices);
@@ -2449,13 +2545,13 @@ mod tests {
             vec![(0, 5, 2.5, Location::None), (1, 7, 1.9, Location::None)],
         )]);
         let scratch = TempDir::new().expect("scratch");
-        let sources = vec![
-            spill_slices(
-                scratch.path(),
-                vec![(ContentHash::of(&slice), BuiltBytes::Resident(slice))],
-            )
-            .expect("place slices"),
-        ];
+        let path = scratch.path().join("legacy.slice");
+        fs::write(&path, &slice).expect("place slice");
+        let sources = vec![vec![build::SliceFile {
+            path,
+            first_key: key.clone(),
+            last_key: key.clone(),
+        }]];
         let scoring = |n: u64| {
             std::collections::BTreeMap::from([(
                 title_id(),

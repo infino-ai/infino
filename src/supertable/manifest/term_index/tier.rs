@@ -718,8 +718,13 @@ mod tests {
         assert_eq!(decoded.len(), 300);
     }
 
-    /// Bytes per entry on a billion-document shape: a head block names its
-    /// superfile once and packs its rows and facts to a few bits each.
+    /// The most a head entry may cost on a billion-document shape: a head
+    /// block names its superfile once and packs its rows and facts to a
+    /// few bits each, which comes to about four bytes an entry.
+    const HEAD_BYTES_PER_ENTRY_MAX: f64 = 4.3;
+
+    /// Bytes per entry on a billion-document shape stay under
+    /// [`HEAD_BYTES_PER_ENTRY_MAX`].
     #[test]
     fn heads_cost_a_few_bytes_per_entry() {
         let groups = sample(512, 1_080, 1_000_000, 3);
@@ -728,10 +733,9 @@ mod tests {
         let bytes: usize = chunks.iter().map(|c| c.bytes.len()).sum();
         let per_entry = bytes as f64 / entries as f64;
         assert!(
-            per_entry <= 4.3,
+            per_entry <= HEAD_BYTES_PER_ENTRY_MAX,
             "{per_entry:.2} bytes per entry at 1,080 superfiles x 512 deep"
         );
-        eprintln!("heads: {per_entry:.2} bytes per entry at 1,080 superfiles x 512 deep");
     }
 
     #[test]

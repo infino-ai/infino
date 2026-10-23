@@ -939,21 +939,6 @@ impl<'a> Slice<'a> {
         }
     }
 
-    /// The smallest and largest keys the slice holds; `None` when it holds
-    /// no term.
-    pub(crate) fn key_range(&self) -> Option<(Vec<u8>, Vec<u8>)> {
-        let mut first: Option<Vec<u8>> = None;
-        let mut last: Option<Vec<u8>> = None;
-        self.dict.for_each_from(b"", b"", |key, _| {
-            if first.is_none() {
-                first = Some(key.to_vec());
-            }
-            last = Some(key.to_vec());
-            true
-        });
-        Some((first?, last?))
-    }
-
     /// Up to `limit` terms after `after` (from the first term when `None`),
     /// in key order, with their runs. A walk resumes by passing the last
     /// key it got back.

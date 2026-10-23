@@ -1327,6 +1327,19 @@ pub(crate) fn build_segment(
 /// slice decoded.
 const MERGE_BATCH_TERMS: usize = 4096;
 
+/// A slice on local disk, with the key range its segment records for it,
+/// so a merge can be sharded and its sources selected without opening
+/// a slice.
+#[derive(Debug, Clone)]
+pub(crate) struct SliceFile {
+    /// The slice's bytes, as downloaded or spilled.
+    pub(crate) path: PathBuf,
+    /// Smallest key the slice holds.
+    pub(crate) first_key: Vec<u8>,
+    /// Largest key the slice holds.
+    pub(crate) last_key: Vec<u8>,
+}
+
 /// Reads one segment's slices, already on local disk, term by term in key
 /// order.
 struct SegmentCursor {
@@ -1353,9 +1366,9 @@ struct SegmentCursor {
 impl SegmentCursor {
     /// A cursor over `files` in key order, yielding the keys in
     /// `start..end` (either bound open when `None`).
-    fn new(files: &[PathBuf], start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
+    fn new(files: &[SliceFile], start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
         Self {
-            files: files.iter().cloned().collect(),
+            files: files.iter().map(|f| f.path.clone()).collect(),
             bytes: Vec::new(),
             tier: None,
             tier_file: None,
@@ -1500,17 +1513,18 @@ fn tier_entries(
 /// sources are large (see [`shard_ranges`]), renumbering every posting through
 /// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
 /// result, and is dropped when that is `None` (a superfile that is gone, or
-/// padding). `sources` holds each segment's slice files in key order, each
-/// with its tier object beside it (see [`tier_path`]). Tiers merge the same
-/// way: their entries are pooled, renumbered and re-cut at the policy's
-/// budget.
+/// padding). `sources` holds each segment's slices in key order, each with
+/// its tier object beside it (see [`tier_path`]). Tiers merge the same way:
+/// their entries are pooled, renumbered and re-cut at the policy's budget.
 ///
-/// Runs come out in ascending new ordinal and are cut into slices exactly
-/// as [`build_segment`] cuts them, so a merge whose ordinals follow the
-/// order a build would give its contributions writes the same bytes as that
-/// build.
+/// Runs come out in ascending new ordinal and are cut into slices as
+/// [`build_segment`] cuts them, with a cut at every shard bound as well.
+/// A merge in one shard whose ordinals follow the order a build would give
+/// its contributions writes the same bytes as that build; a sharded one
+/// writes the same terms, each with the same postings and tier entries,
+/// in slices cut at the shard bounds too.
 pub(crate) fn merge_segments(
-    sources: &[Vec<PathBuf>],
+    sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
@@ -1523,12 +1537,12 @@ pub(crate) fn merge_segments(
     // writer over everything would have produced, slice cuts aside.
     let merge_one = |(start, end): &(Option<Vec<u8>>, Option<Vec<u8>>)| {
         let (start, end) = (start.as_deref(), end.as_deref());
-        let in_range: Vec<Vec<PathBuf>> = sources
+        let in_range: Vec<Vec<SliceFile>> = sources
             .iter()
             .map(|files| {
                 files
                     .iter()
-                    .filter(|path| slice_reaches(path, start, end).unwrap_or(true))
+                    .filter(|slice| slice_reaches(slice, start, end))
                     .cloned()
                     .collect()
             })
@@ -1564,42 +1578,27 @@ const MERGE_SHARD_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// well as by threads.
 const MERGE_SHARDS_MAX: usize = 32;
 
-/// The smallest and largest keys the slice at `path` holds, read from
-/// its dictionary; `None` for a slice of no terms.
-fn slice_key_range(path: &Path) -> Result<Option<(Vec<u8>, Vec<u8>)>, TermIndexError> {
-    let bytes = fs::read(path)?;
-    Ok(Slice::open(&bytes)?.key_range())
-}
-
-/// Whether the slice at `path` holds a key in `start..end`.
-fn slice_reaches(
-    path: &Path,
-    start: Option<&[u8]>,
-    end: Option<&[u8]>,
-) -> Result<bool, TermIndexError> {
-    Ok(match slice_key_range(path)? {
-        None => false,
-        Some((first, last)) => {
-            start.is_none_or(|s| last.as_slice() >= s) && end.is_none_or(|e| first.as_slice() < e)
-        }
-    })
+/// Whether `slice` holds a key in `start..end`.
+fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
+    start.is_none_or(|s| slice.last_key.as_slice() >= s)
+        && end.is_none_or(|e| slice.first_key.as_slice() < e)
 }
 
 /// The key ranges a merge of `sources` is cut into: one when the sources
 /// are small or the policy says so, else up to the pool's width (at most
 /// [`MERGE_SHARDS_MAX`]) cut at slice boundaries, evenly by slice count.
 fn shard_ranges(
-    sources: &[Vec<PathBuf>],
+    sources: &[Vec<SliceFile>],
     policy: &BuildPolicy,
 ) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, TermIndexError> {
     let single = vec![(None, None)];
-    let files: Vec<&PathBuf> = sources.iter().flatten().collect();
+    let files: Vec<&SliceFile> = sources.iter().flatten().collect();
     let want = match policy.merge_shards {
         Some(n) => n.max(1),
         None => {
             let mut bytes = 0u64;
-            for path in &files {
-                bytes += fs::metadata(path)?.len();
+            for file in &files {
+                bytes += fs::metadata(&file.path)?.len();
             }
             if bytes < MERGE_SHARD_MIN_BYTES {
                 return Ok(single);
@@ -1615,11 +1614,7 @@ fn shard_ranges(
         return Ok(single);
     }
     // Candidate cuts: every slice's first key but the smallest overall.
-    let mut firsts: Vec<Vec<u8>> = files
-        .iter()
-        .filter_map(|path| slice_key_range(path).transpose())
-        .map(|range| range.map(|(first, _)| first))
-        .collect::<Result<_, _>>()?;
+    let mut firsts: Vec<Vec<u8>> = files.iter().map(|file| file.first_key.clone()).collect();
     firsts.sort_unstable();
     firsts.dedup();
     if firsts.len() < 2 {
@@ -1643,7 +1638,7 @@ fn shard_ranges(
 
 /// Merge the keys in `start..end` of `sources` into one run of slices.
 fn merge_range(
-    sources: &[Vec<PathBuf>],
+    sources: &[Vec<SliceFile>],
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     ordinals: &[Option<u32>],

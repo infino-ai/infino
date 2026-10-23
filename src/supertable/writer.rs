@@ -11226,7 +11226,11 @@ async fn merge_term_index(
             .last()
             .expect("a build onto a root appends its segment");
         term_index::spill_tiers(scratch.path(), &fresh.slices, built.tiers)?;
-        sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
+        sources.push(term_index::spill_slices(
+            scratch.path(),
+            &fresh.slices,
+            built.slices,
+        )?);
         old = built.root;
     }
 
