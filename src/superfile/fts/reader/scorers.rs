@@ -563,11 +563,17 @@ fn must_lead_should_walk(
         }
     };
     let mut threshold = bar(heap);
+    // The one-optional-term batch's scratch: the block's candidates, their
+    // required scores, and the optional term's tfs at them.
+    let mut cand_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut cand_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     while !lead.is_exhausted() {
         let start = lead.current_doc_id();
         let block_end = lead.current_block_last_doc_id();
+        let mut window = f32::INFINITY;
         if threshold > f32::NEG_INFINITY {
-            let window: f32 = shoulds
+            window = shoulds
                 .iter_mut()
                 .map(|c| c.block_max_in_range(start, block_end))
                 .sum();
@@ -575,6 +581,63 @@ fn must_lead_should_walk(
                 lead.skip_to(block_end.saturating_add(1));
                 continue;
             }
+        }
+        // One optional term: score the rest of the required block at once,
+        // keep the docs that can clear the bar with the optional term at its
+        // maximum over the block (the walk's own test, against a bound never
+        // tighter than its per-doc one), and probe the optional term for all
+        // of them in one sorted pass. A doc without it adds exactly 0, so the
+        // score is the walk's bits; the bar is the block's opening one, which
+        // admits a superset of what the walk would, each offer checked as the
+        // walk checks it.
+        if m == 1 && filter.is_none() && lead.holds_whole_block() {
+            let (from, to) = (lead.pos, lead.block_n);
+            cand_docs.clear();
+            cand_scores.clear();
+            for j in from..to {
+                let d = lead.block_doc_ids[j];
+                let s = bm25::score_with_dl_norm_k1(
+                    lead.idf_weight,
+                    lead.block_tfs[j],
+                    dl_norm_k1.get(d),
+                );
+                cand_docs.push(d);
+                cand_scores.push(s);
+            }
+            lead.advance_by(to - from);
+            if threshold > f32::NEG_INFINITY {
+                let mut w = 0usize;
+                for r in 0..cand_docs.len() {
+                    let (d, s) = (cand_docs[r], cand_scores[r]);
+                    cand_docs[w] = d;
+                    cand_scores[w] = s;
+                    w += usize::from(s + window > threshold);
+                }
+                cand_docs.truncate(w);
+                cand_scores.truncate(w);
+            }
+            if cand_docs.is_empty() {
+                continue;
+            }
+            let should = &mut shoulds[0];
+            cand_tfs.clear();
+            cand_tfs.resize(cand_docs.len(), 0);
+            should.probe_tfs(&cand_docs, &mut cand_tfs);
+            for ((&d, &lead_score), &tf) in cand_docs.iter().zip(&cand_scores).zip(&cand_tfs) {
+                let contrib = match tf {
+                    0 => 0.0,
+                    _ => bm25::score_with_dl_norm_k1(should.idf_weight, tf, dl_norm_k1.get(d)),
+                };
+                let score = lead_score + contrib;
+                if threshold > f32::NEG_INFINITY && score <= threshold {
+                    continue;
+                }
+                if score > floor_eff {
+                    and_heap_push(heap, k, None, score, d);
+                    threshold = bar(heap);
+                }
+            }
+            continue;
         }
         let mut have_bound = false;
         let mut bound_holds_to = 0u32;
