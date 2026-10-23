@@ -12318,7 +12318,12 @@ pub(crate) async fn try_commit_attempt(
             contributions = term_contributions.len(),
         ))
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // A storage error keeps its kind, so a caller can tell a retried
+        // fault from refused credentials.
+        .map_err(|e| match e {
+            TermIndexError::Storage(source) => SupertableCommitError::Storage(source),
+            other => BuildError::Store(other.to_string()).into(),
+        })?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
     } else if !every_new_covered
         && current_manifest.term_index_complete()

@@ -44,6 +44,7 @@ use crate::{
     config::{CompactionSettings, RecalibratePolicy, global},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     runtime_metrics::rss::{available_memory_bytes, memory_budget},
+    storage::StorageError,
     superfile::{
         builder::{BuilderOptions, MergeInput, SuperfileBuilder},
         stats::SuperfileStats as BuiltSuperfileStats,
@@ -60,11 +61,11 @@ use crate::{
             term_index::{Contribution as TermContribution, ReservedSegment},
         },
         opann::rerank_pool_hint,
-        query::dispatch::open_compaction_input,
+        query::{dispatch::open_compaction_input, vector},
         reader_cache::disk::mmap_readonly_bytes,
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
-            Etag, SealRecord, TombstonesSidecar, WalStore,
+            Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
             tombstones_admin::{self, TombstonesAdminError},
         },
         writer::{
@@ -80,6 +81,11 @@ use crate::{
 
 /// Number of seal/reseal/unseal requests to run in parallel at a time
 const MAX_CONCURRENT_SEAL_WRITES: usize = 64;
+
+/// Failed merges and dropped batches in a row, with no batch committing in
+/// between, after which a pass stops starting merges. One failure is usually
+/// that job's own; several in a row point at the table or the store.
+const MAX_FAILURES_IN_A_ROW: usize = 3;
 
 /// How long a compaction commit keeps retrying lost races after
 /// `max_commit_retries` is used up. Its merged superfiles are already
@@ -392,6 +398,19 @@ impl Supertable {
             inner.manifest.load().partition_strategy(),
             Some(PartitionStrategy::VectorCell { .. })
         );
+        // Skip split + recalibration when this table is served by the
+        // centroid-graph router: that path walks fine centroids, not the
+        // coarse grid, so growing or recalibrating the grid is dead-weight
+        // optimize work — the grid is frozen at its create-time size.
+        let graph_served = hidden_ivf && {
+            let snap = inner.manifest.load();
+            match snap.partition_strategy() {
+                Some(PartitionStrategy::VectorCell { column, .. }) => {
+                    vector::serves_via_graph(&snap, column)
+                }
+                _ => false,
+            }
+        };
         // Grid size before the split phase. A split grows `n_cent` (a merge
         // never does), so comparing it to the post-pass count tells the
         // recalibration trigger whether the grid actually changed.
@@ -409,7 +428,7 @@ impl Supertable {
         // are planned from one snapshot, so the width must not drift mid-pass.
         let concurrency = global().compaction_concurrency(cfg);
         let mut __pt = Instant::now();
-        if hidden_ivf {
+        if hidden_ivf && !graph_served {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
@@ -571,6 +590,7 @@ impl Supertable {
         // Auto runs it only on a grid or growth change, or a lagging rerank
         // law. Storage work above already ran regardless of the policy.
         let run_recalibrate = hidden_ivf
+            && !graph_served
             && match recalibrate {
                 RecalibratePolicy::Skip => false,
                 RecalibratePolicy::Force => true,
@@ -1140,10 +1160,15 @@ impl Supertable {
                 Ok(stale) => stale,
                 // Storage failed, so nothing is known about who holds these
                 // sidecars and the batch cannot be committed on the strength
-                // of it.
+                // of it. A transient error costs this batch only; the refresh
+                // after it shows whether storage is really down.
                 Err(e) => {
                     unseal_batch(&wal_store, batch).await;
-                    return Err(e);
+                    let message = e.to_string();
+                    return Err(match commit_failure(sidecar_commit_error(e)) {
+                        CompactionError::BatchDropped(_) => CompactionError::BatchDropped(message),
+                        _ => CompactionError::Seal(message),
+                    });
                 }
             };
             // Back-to-front so the surviving indices stay valid. `resolved[k]`
@@ -1333,13 +1358,13 @@ impl Supertable {
                 Err(e) => {
                     inner.note_commit_error(&e);
                     unseal_batch(&wal_store, batch).await;
-                    return Err(CompactionError::Commit(e.to_string()));
+                    return Err(commit_failure(e));
                 }
             }
         }
 
         unseal_batch(&wal_store, batch).await;
-        Err(CompactionError::Commit(
+        Err(CompactionError::BatchDropped(
             "commit retries exhausted".to_string(),
         ))
     }
@@ -1389,20 +1414,26 @@ impl Supertable {
     /// Merges are admitted one at a time against the host and committed when
     /// ready, taking along whatever else has finished, so a serial pass (the
     /// default `concurrency` of 1) is prepare-commit-refresh per job, exactly
-    /// as before. A merge that fails does not cost the others their work: the
-    /// successful merges commit and the first error surfaces after.
+    /// as before. A merge that fails, or a batch whose commit is dropped, does
+    /// not cost the others their work: the rest still merge and commit. The
+    /// first failed merge, lost input, or the dropped batch that stopped the
+    /// pass surfaces after. Otherwise returns how many jobs were dropped at
+    /// commit.
     async fn run_compaction_jobs(
         &self,
         jobs: Vec<CompactionJob>,
         stale_seal_timeout: Duration,
         concurrency: usize,
-    ) -> Result<(), CompactionError> {
+    ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         let mut first_error: Option<CompactionError> = None;
         let mut fatal: Option<CompactionError> = None;
+        // Merges and commits that failed since a batch last committed.
+        let mut failures_in_a_row = 0usize;
         let mut stop_admitting = false;
+        let mut dropped = DroppedJobs::default();
         // When the next admission may be considered. A deadline rather than a
         // fresh timer per iteration: a merge finishing is not a reason to make
         // the next admission wait another full settle, and under merges
@@ -1431,11 +1462,11 @@ impl Supertable {
 
             // Cheap half of the admission test, as a select guard; the half
             // that reads the host runs inside the branch, after the settle.
-            // A failure that will repeat stops the pass admitting more: under
-            // a systemic one, say storage is down and every seal exhausts its
-            // retries, admitting the rest of the plan only burns each job's
-            // retries to reach the same error. A job whose inputs another
-            // compactor took is not that, and the rest of the plan still runs.
+            // Failures in a row stop the pass admitting more: under a systemic
+            // one, say storage is down and every seal exhausts its retries,
+            // admitting the rest of the plan only burns each job's retries to
+            // reach the same error. One failure on its own is usually that
+            // job's, and the rest of the plan still runs.
             let may_admit = !stop_admitting
                 && admits_another_merge(merging.len(), concurrency, queued.len(), true);
             let joined = tokio::select! {
@@ -1473,13 +1504,18 @@ impl Supertable {
             };
 
             let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
-            stop_admitting |= collect_merge(joined, &mut ready, &mut first_error);
+            if collect_merge(joined, &mut ready, &mut first_error, &mut dropped) {
+                failures_in_a_row += 1;
+            }
             // Whatever else has already finished rides along in the same CAS.
             // Polling once never waits, so committing early costs a sibling
             // nothing and merges that land together still batch.
             while let Some(next) = merging.try_join_next() {
-                stop_admitting |= collect_merge(next, &mut ready, &mut first_error);
+                if collect_merge(next, &mut ready, &mut first_error, &mut dropped) {
+                    failures_in_a_row += 1;
+                }
             }
+            stop_admitting |= failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
             if ready.is_empty() {
                 continue;
             }
@@ -1487,21 +1523,50 @@ impl Supertable {
             // committing merges when they finish can preserve.
             ready.sort_by_key(|(plan_index, _)| *plan_index);
             let batch: Vec<PreparedJob> = ready.into_iter().map(|(_, prepared)| prepared).collect();
+            let batch_jobs = batch.len();
 
             let commit = self.commit_compaction_batch(batch).await;
             // Both failures leave by the same door: merges are still running,
             // and returning here would drop their tasks with their seals
-            // placed and nothing to clear them until they went stale.
+            // placed and nothing to clear them until they went stale. The
+            // refresh also runs after a dropped batch, so storage that cannot
+            // be read ends the pass here. One that only refuses writes is
+            // stopped by `MAX_FAILURES_IN_A_ROW` instead.
             if let Err(e) = self.refresh().await {
                 fatal = Some(CompactionError::Refresh(e.to_string()));
                 break;
             }
-            if let Err(e) = commit {
-                fatal = Some(e);
-                break;
+            match commit {
+                Ok(()) => failures_in_a_row = 0,
+                // Another writer replaced some inputs, which is a race rather
+                // than a sick table. The rest of the batch may have committed.
+                Err(e @ CompactionError::SuperfileNotFound(_)) => {
+                    failures_in_a_row = 0;
+                    first_error.get_or_insert(e);
+                }
+                Err(e @ CompactionError::BatchDropped(_)) => {
+                    dropped.record(batch_jobs, e);
+                    failures_in_a_row += 1;
+                }
+                Err(e) => {
+                    fatal = Some(e);
+                    break;
+                }
             }
+            stop_admitting |= failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
         }
 
+        if dropped.jobs > 0 {
+            warn!(
+                dropped_jobs = dropped.jobs,
+                "compaction pass dropped jobs it could not commit"
+            );
+        }
+        // A pass that stopped admitting on dropped batches must not read as a
+        // success.
+        if stop_admitting && let Some(e) = dropped.last {
+            first_error.get_or_insert(e);
+        }
         if let Some(e) = fatal {
             // Merges still running hold seals this pass will not commit. Let
             // them finish and clear their own, rather than dropping the tasks
@@ -1512,7 +1577,7 @@ impl Supertable {
         if let Some(e) = first_error {
             return Err(e);
         }
-        Ok(())
+        Ok(dropped.jobs)
     }
 
     /// Start one merge, tagged with its position in the plan.
@@ -1569,7 +1634,7 @@ impl Supertable {
             Err(e) => {
                 let wal_store = WalStore::new(storage);
                 unseal_batch(&wal_store, vec![prepared]).await;
-                Err(CompactionError::Commit(e.to_string()))
+                Err(commit_failure(e))
             }
         }
     }
@@ -1720,31 +1785,81 @@ fn admits_another_merge(
     in_flight < concurrency.max(1) && host_has_room
 }
 
+/// A failed commit as the pass should see it. A race lost on every attempt
+/// and a storage error the provider already retried are this batch's alone,
+/// so they drop the batch. Anything else, such as refused credentials or a
+/// dropped table, would fail every batch after it and ends the pass.
+fn commit_failure(e: CommitError) -> CompactionError {
+    if e.is_conflict()
+        || matches!(
+            e,
+            CommitError::Storage(StorageError::TransientExhausted { .. })
+        )
+    {
+        CompactionError::BatchDropped(e.to_string())
+    } else {
+        CompactionError::Commit(e.to_string())
+    }
+}
+
+/// A failed sidecar re-stamp as a commit error. A storage error keeps its
+/// kind, so [`commit_failure`] can tell one the provider already retried from
+/// refused credentials.
+fn sidecar_commit_error(e: TombstonesAdminError) -> CommitError {
+    match e {
+        TombstonesAdminError::WalStore(WalStoreError::Storage { source, .. }) => {
+            CommitError::Storage(source)
+        }
+        other => CommitError::Encode(other.to_string()),
+    }
+}
+
 /// Sort one finished merge into the batch being assembled, or record why it
 /// produced nothing. A failed prepare has already cleared its own seals.
 ///
-/// Returns whether the pass should stop admitting work. A job whose inputs
-/// another compactor took is a race rather than a sick table: the rest of the
-/// plan is independent of it and still runs, which is what keeps a contended
-/// table compacting at all. Every other failure is one the next job is likely
-/// to hit too.
+/// Returns whether the merge failed in a way that counts toward
+/// [`MAX_FAILURES_IN_A_ROW`]. A job whose inputs another compactor took is a
+/// race rather than a sick table, so it does not count: the rest of the plan
+/// is independent of it and still runs, which is what keeps a contended table
+/// compacting at all. A job dropped at upload is recorded like a dropped
+/// batch, so it does not fail the pass on its own.
 #[must_use]
 fn collect_merge(
     joined: Result<(usize, Result<PreparedJob, CompactionError>), JoinError>,
     ready: &mut Vec<(usize, PreparedJob)>,
     first_error: &mut Option<CompactionError>,
+    dropped: &mut DroppedJobs,
 ) -> bool {
     let failure = match joined {
         Ok((plan_index, Ok(prepared))) => {
             ready.push((plan_index, prepared));
             return false;
         }
+        Ok((_, Err(e @ CompactionError::BatchDropped(_)))) => {
+            dropped.record(1, e);
+            return true;
+        }
         Ok((_, Err(e))) => e,
         Err(e) => CompactionError::Build(format!("merge task failed: {e}")),
     };
-    let stops_the_pass = !matches!(failure, CompactionError::SuperfileNotFound(_));
+    let counts = !matches!(failure, CompactionError::SuperfileNotFound(_));
     first_error.get_or_insert(failure);
-    stops_the_pass
+    counts
+}
+
+/// Jobs a pass dropped without committing, and the last reason why.
+#[derive(Default)]
+struct DroppedJobs {
+    jobs: usize,
+    last: Option<CompactionError>,
+}
+
+impl DroppedJobs {
+    fn record(&mut self, jobs: usize, e: CompactionError) {
+        warn!(jobs, error = %e, "compaction jobs dropped, the pass goes on");
+        self.jobs += jobs;
+        self.last = Some(e);
+    }
 }
 
 /// One merge that has run and is waiting for its manifest commit.
@@ -1810,7 +1925,7 @@ impl CommitFence for SealFence<'_> {
             }
             let stale = restamp_seals(self.wal_store, self.batch, Utc::now())
                 .await
-                .map_err(|e| CommitError::Encode(e.to_string()))?;
+                .map_err(sidecar_commit_error)?;
             let Some(&(_, superfile_id)) = stale.first() else {
                 return Ok(());
             };
@@ -1891,7 +2006,7 @@ async fn restamp_seals(
     wal_store: &WalStore,
     batch: &mut [PreparedJob],
     now: DateTime<Utc>,
-) -> Result<Vec<(usize, Uuid)>, CompactionError> {
+) -> Result<Vec<(usize, Uuid)>, TombstonesAdminError> {
     let mut due = vec![false; batch.len()];
     // Set when a job loses a write, to skip the rest of that job only.
     let job_lost: Vec<AtomicBool> = batch.iter().map(|_| AtomicBool::new(false)).collect();
@@ -1959,7 +2074,7 @@ async fn restamp_seals(
         }
     }
     if let Some(e) = failed {
-        return Err(CompactionError::Seal(e.to_string()));
+        return Err(e);
     }
 
     let mut stale = Vec::new();
@@ -2374,8 +2489,11 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             error::CompactionError,
-            manifest::commit::{
-                MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
+            manifest::{
+                commit::{
+                    MANIFEST_PARTS_DIR, POINTER_PATH, get_current_manifest_etag, manifest_uri,
+                },
+                term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
             },
             schema::{
                 ColumnIndex,
@@ -6608,6 +6726,325 @@ mod tests {
             .collect()
     }
 
+    /// Jobs in the dropped-batch tests. More than [`MAX_FAILURES_IN_A_ROW`],
+    /// so a pass that stops at the cap leaves one job never started.
+    const DROP_TEST_JOBS: usize = MAX_FAILURES_IN_A_ROW + 1;
+    /// Arms a fault for every pointer swap the dropped-batch tests can make.
+    const EVERY_POINTER_SWAP: usize = 1_000;
+
+    /// A table over fault storage holding `jobs` pairs of mergeable
+    /// superfiles, with one two-input job per pair.
+    fn fault_st_with_pair_jobs(
+        dir: &TempDir,
+        jobs: usize,
+    ) -> (Arc<FaultStorage>, Supertable, Vec<CompactionJob>) {
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(default_supertable_options().with_storage(storage))
+            .expect("create supertable");
+        for i in 0..jobs * PAIR {
+            commit_titles(&st, &[&format!("doc{i} first"), &format!("doc{i} second")]);
+        }
+        let live = listed_ids(&st);
+        assert_eq!(live.len(), jobs * PAIR, "fixture");
+        let planned = live
+            .chunks(PAIR)
+            .map(|pair| CompactionJob {
+                partition_key: Vec::new(),
+                inputs: pair.to_vec(),
+                estimated_output_bytes: 0,
+                merge_memory_mb: None,
+            })
+            .collect();
+        (faults, st, planned)
+    }
+
+    /// A storage error on one batch's commit costs that batch only. The
+    /// failure is the provider's own retries running out on the pointer PUT,
+    /// which is how a GCS 5xx reaches the commit. The rest of the pass still
+    /// commits, and the pass reports the job it dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_error_on_one_commit_drops_only_that_batch() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let dropped_inputs = jobs[0].inputs.clone();
+        faults.fail(FaultOp::PutIfMatch, POINTER_PATH, 1);
+
+        // Serial, so each job is its own batch and the first commit fails.
+        let dropped = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("one dropped batch must not fail the pass");
+
+        assert_eq!(faults.fired(), 1, "the pointer PUT failed once");
+        assert_eq!(dropped, 1, "the pass reports the dropped job");
+        let listed = listed_ids(&st);
+        assert_eq!(
+            listed.len(),
+            PAIR + DROP_TEST_JOBS - 1,
+            "every other job merged its pair into one superfile: {listed:?}"
+        );
+        let wal_store = plain_wal_store(&dir);
+        for id in &dropped_inputs {
+            assert!(
+                listed.contains(id),
+                "the dropped job's {id} is still listed"
+            );
+            assert!(
+                !is_sealed(&wal_store, *id).await,
+                "the dropped job's {id} must be unsealed"
+            );
+        }
+    }
+
+    /// Batches that keep failing stop the pass from starting more. The pass
+    /// returns an error, the job it never started is left as it was, and no
+    /// seal is left behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failures_in_a_row_stop_the_pass() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let all_inputs: Vec<Uuid> = jobs.iter().flat_map(|j| j.inputs.clone()).collect();
+        faults.fail(FaultOp::PutIfMatch, POINTER_PATH, EVERY_POINTER_SWAP);
+
+        let err = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect_err("a pass that stopped early must not read as a success");
+
+        assert!(
+            matches!(err, CompactionError::BatchDropped(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            faults.fired(),
+            MAX_FAILURES_IN_A_ROW,
+            "the job after the cap must not be started"
+        );
+        let listed = listed_ids(&st);
+        let wal_store = plain_wal_store(&dir);
+        for id in &all_inputs {
+            assert!(listed.contains(id), "{id} must still be listed");
+            assert!(!is_sealed(&wal_store, *id).await, "{id} must be unsealed");
+        }
+    }
+
+    /// A failure that is not one batch's own still ends the pass at once:
+    /// refused credentials would fail every commit after it too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_systemic_commit_error_still_ends_the_pass() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        faults.fail_with(
+            FaultKind::PermissionDenied,
+            FaultOp::PutIfMatch,
+            POINTER_PATH,
+            EVERY_POINTER_SWAP,
+        );
+
+        let err = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect_err("refused credentials must end the pass");
+
+        assert!(
+            matches!(err, CompactionError::Commit(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(faults.fired(), 1, "no commit is tried after the first");
+    }
+
+    /// Superfile bytes a merge uploads before its commit.
+    const SUPERFILE_UPLOAD: &str = ".sf.parquet";
+
+    /// Asserts every input is still listed and unsealed.
+    async fn assert_untouched(dir: &TempDir, st: &Supertable, inputs: &[Uuid]) {
+        let listed = listed_ids(st);
+        let wal_store = plain_wal_store(dir);
+        for id in inputs {
+            assert!(listed.contains(id), "{id} must still be listed");
+            assert!(!is_sealed(&wal_store, *id).await, "{id} must be unsealed");
+        }
+    }
+
+    /// A batch that commits resets the failures in a row, so failures either
+    /// side of it do not add up to the cap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_between_failures_resets_the_count() {
+        let dir = TempDir::new().expect("tempdir");
+        // Two failures, a commit, then two more: one short of the cap each side.
+        let jobs_count = 2 * (MAX_FAILURES_IN_A_ROW - 1) + 1;
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, jobs_count);
+        let committed_inputs = jobs[MAX_FAILURES_IN_A_ROW - 1].inputs.clone();
+        faults.fail(FaultOp::PutIfMatch, POINTER_PATH, MAX_FAILURES_IN_A_ROW - 1);
+        // Hooks fire one per pointer swap, so the last one re-arms the
+        // failures on the swap after the commit.
+        for _ in 0..MAX_FAILURES_IN_A_ROW {
+            faults.before(FaultOp::PutIfMatch, POINTER_PATH, || {});
+        }
+        let rearm = Arc::clone(&faults);
+        faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
+            rearm.fail(FaultOp::PutIfMatch, POINTER_PATH, MAX_FAILURES_IN_A_ROW - 1);
+        });
+
+        let dropped = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("failures split by a commit must not stop the pass");
+
+        assert_eq!(dropped, jobs_count - 1, "every other job was dropped");
+        assert_eq!(faults.fired(), jobs_count - 1);
+        let listed = listed_ids(&st);
+        for id in &committed_inputs {
+            assert!(!listed.contains(id), "the committed job merged {id} away");
+        }
+    }
+
+    /// A storage error uploading one merge's output drops only that job, as a
+    /// dropped commit does, and the rest of the pass still commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_error_on_one_upload_drops_only_that_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let dropped_inputs = jobs[0].inputs.clone();
+        faults.fail(FaultOp::PutAtomic, SUPERFILE_UPLOAD, 1);
+
+        let dropped = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("one failed upload must not fail the pass");
+
+        assert_eq!(faults.fired(), 1, "the upload failed once");
+        assert_eq!(dropped, 1, "the pass reports the dropped job");
+        assert_eq!(listed_ids(&st).len(), PAIR + DROP_TEST_JOBS - 1);
+        assert_untouched(&dir, &st, &dropped_inputs).await;
+    }
+
+    /// A storage error writing the term index inside a commit keeps its kind,
+    /// so it drops only that batch like one on the pointer swap.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_storage_error_on_the_term_index_drops_only_that_batch() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let dropped_inputs = jobs[0].inputs.clone();
+        faults.fail(FaultOp::PutAtomic, TERM_INDEX_PREFIX, 1);
+
+        let dropped = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect("one failed term-index write must not fail the pass");
+
+        assert_eq!(faults.fired(), 1, "the term-index write failed once");
+        assert_eq!(dropped, 1, "the pass reports the dropped job");
+        assert_eq!(listed_ids(&st).len(), PAIR + DROP_TEST_JOBS - 1);
+        assert_untouched(&dir, &st, &dropped_inputs).await;
+    }
+
+    /// Jobs dropped at upload and batches dropped at commit count toward the
+    /// same cap, and a pass stopped by them fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_and_commit_failures_share_the_cap() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let all_inputs: Vec<Uuid> = jobs.iter().flat_map(|j| j.inputs.clone()).collect();
+        faults.fail(FaultOp::PutAtomic, SUPERFILE_UPLOAD, 1);
+        faults.fail(FaultOp::PutIfMatch, POINTER_PATH, EVERY_POINTER_SWAP);
+
+        let err = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1)
+            .await
+            .expect_err("a pass that stopped early must not read as a success");
+
+        assert!(
+            matches!(err, CompactionError::BatchDropped(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            faults.fired(),
+            MAX_FAILURES_IN_A_ROW,
+            "one upload and two commits failed, and the last job never started"
+        );
+        assert_untouched(&dir, &st, &all_inputs).await;
+    }
+
+    /// With merges running side by side when the cap is reached, the pass
+    /// lets them finish and leaves no seal behind.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cap_with_merges_in_flight_leaves_no_seal() {
+        let dir = TempDir::new().expect("tempdir");
+        let (faults, st, jobs) = fault_st_with_pair_jobs(&dir, DROP_TEST_JOBS);
+        let all_inputs: Vec<Uuid> = jobs.iter().flat_map(|j| j.inputs.clone()).collect();
+        faults.fail(FaultOp::PutAtomic, SUPERFILE_UPLOAD, EVERY_POINTER_SWAP);
+
+        let err = st
+            .run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, DROP_TEST_JOBS)
+            .await
+            .expect_err("a pass that stopped early must not read as a success");
+
+        assert!(
+            matches!(err, CompactionError::BatchDropped(_)),
+            "unexpected error: {err:?}"
+        );
+        assert_untouched(&dir, &st, &all_inputs).await;
+    }
+
+    /// Only a lost race or a storage error the provider already retried
+    /// drops a batch; anything else ends the pass.
+    #[test]
+    fn commit_failure_drops_only_batch_local_errors() {
+        let batch_local = [
+            CommitError::WriteContentionExhausted,
+            CommitError::InputsChanged {
+                superfile_id: Uuid::new_v4(),
+            },
+            CommitError::Storage(transient(POINTER_PATH)),
+            CommitError::Storage(precondition(POINTER_PATH)),
+        ];
+        for e in batch_local {
+            assert!(
+                matches!(commit_failure(e), CompactionError::BatchDropped(_)),
+                "a batch-local failure must drop the batch"
+            );
+        }
+        let systemic = [
+            CommitError::PointerVanished,
+            CommitError::Storage(StorageError::PermissionDenied {
+                uri: POINTER_PATH.to_string(),
+            }),
+        ];
+        for e in systemic {
+            assert!(
+                matches!(commit_failure(e), CompactionError::Commit(_)),
+                "a systemic failure must end the pass"
+            );
+        }
+    }
+
+    /// A sidecar re-stamp keeps its storage error's kind on the way to the
+    /// commit, so a transient one at the fence drops only the batch.
+    #[test]
+    fn a_sidecar_storage_error_keeps_its_kind() {
+        let sidecar_error = |source| {
+            TombstonesAdminError::WalStore(WalStoreError::Storage {
+                path: POINTER_PATH.to_string(),
+                source,
+            })
+        };
+        assert!(matches!(
+            commit_failure(sidecar_commit_error(sidecar_error(transient(POINTER_PATH)))),
+            CompactionError::BatchDropped(_)
+        ));
+        let denied = StorageError::PermissionDenied {
+            uri: POINTER_PATH.to_string(),
+        };
+        assert!(matches!(
+            commit_failure(sidecar_commit_error(sidecar_error(denied))),
+            CompactionError::Commit(_)
+        ));
+    }
+
     /// A `WalStore` over this table's storage, for tests that read or poke
     /// tombstone sidecars directly.
     fn wal_store_for(st: &Supertable) -> WalStore {
@@ -6782,9 +7219,8 @@ mod tests {
     /// A seal taken over at the fence costs its own job, not the batch.
     ///
     /// The fence runs after every merged superfile is uploaded, so a failure
-    /// there is expensive: the catch-all arm would unseal the batch, fail the
-    /// commit, and `run_compaction_jobs` would treat that as fatal and end the
-    /// pass — throwing away every finished, already-uploaded merge in it for
+    /// there is expensive: the catch-all arm would unseal and drop the whole
+    /// batch — throwing away every finished, already-uploaded merge in it for
     /// one stolen seal. `InputsChanged` is a lost race with nothing published,
     /// so it takes the retry arm instead: the attempt re-resolves, its early
     /// re-stamp drops the job whose sidecar moved, and the rest commit.

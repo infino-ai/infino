@@ -53,7 +53,6 @@ use std::{
     cmp,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    ops::Range,
     sync::{Arc, atomic},
     time::Instant,
 };
@@ -81,19 +80,13 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
-use futures::{
-    FutureExt,
-    future::{BoxFuture, try_join_all},
-};
+use futures::future::try_join_all;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
-        arrow_reader::{
-            ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
-        },
-        async_reader::{AsyncFileReader, ParquetObjectReader},
+        arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+        async_reader::AsyncFileReader,
     },
-    errors,
     file::metadata::ParquetMetaData,
 };
 use rayon::ThreadPool;
@@ -126,6 +119,7 @@ use crate::{
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
+            read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
@@ -1438,7 +1432,8 @@ impl TableProvider for SupertableProvider {
             }
         }
 
-        // The single object store DataFusion reads every survivor through.
+        // The store DataFusion resolves the scan's URL to. Byte reads go
+        // through the reader factory below, which uses this same store.
         let store: Arc<dyn OsObjectStore> = self.scan_store.clone();
 
         // Build each superfile's PartitionedFile + access plan. An access
@@ -1502,8 +1497,17 @@ impl TableProvider for SupertableProvider {
         // warm flat cost at 256 superfiles), and on predicated scans it
         // would fetch page-index bytes through the metered store for
         // lazily-opened readers (a cache-state-dependent priced counter).
-        source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
-            store: Arc::clone(&store),
+        //
+        // The factory also sends byte reads through read-ahead. The meter
+        // hands it the scan's final filter when the scan runs, and
+        // `ReadAheadOff` turns it off under a LIMIT that can stop the scan.
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::clone(&self.scan_store),
+            Arc::clone(&self.manifest.options.connection_memory_budget),
+            Arc::clone(&self.schema),
+        ));
+        source = source.with_parquet_file_reader_factory(Arc::new(ScanReaderFactory {
+            read_ahead: Arc::clone(&read_ahead),
             footers: Arc::clone(&self.scan_footers),
         }));
 
@@ -1558,14 +1562,16 @@ impl TableProvider for SupertableProvider {
         // when there are no filters, for the same reason.
         let scan = DataSourceExec::from_data_source(config);
         let op_stats = self.scan_store.op_stats();
-        Ok(if filters.is_empty() {
-            Arc::new(MeteredExec::new(scan, op_stats).with_footers(Arc::clone(&self.scan_footers)))
+        let meter = if filters.is_empty() {
+            MeteredExec::new(scan, op_stats)
         } else {
-            Arc::new(
-                MeteredExec::without_limit_pushdown(scan, op_stats)
-                    .with_footers(Arc::clone(&self.scan_footers)),
-            )
-        })
+            MeteredExec::without_limit_pushdown(scan, op_stats)
+        };
+        Ok(Arc::new(
+            meter
+                .with_footers(Arc::clone(&self.scan_footers))
+                .with_read_ahead(read_ahead),
+        ))
     }
 }
 
@@ -1677,60 +1683,29 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
         .collect())
 }
 
-/// Serves DataFusion's parquet opener the footer metadata each
-/// segment's [`SuperfileReader`] parsed at open, so a scan never
-/// re-reads or re-parses footers. Byte ranges still flow through the
-/// unified [`SuperfileObjectStore`] (zero-copy slices on warm
-/// segments, range GETs on cold ones).
+/// Gives DataFusion's Parquet opener the footer each [`SuperfileReader`]
+/// parsed at open, so a scan never reads a footer twice. Byte reads go
+/// through a [`ReadAhead`] per file and partition, which reads the
+/// [`SuperfileObjectStore`] and downloads the next row groups on cold files.
 ///
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
-struct CachedMetadataReaderFactory {
-    store: Arc<dyn OsObjectStore>,
+struct ScanReaderFactory {
+    /// The scan's store, budget and filter, shared by every reader.
+    read_ahead: Arc<ScanReadAhead>,
     footers: Arc<ScanFooters>,
 }
 
-impl fmt::Debug for CachedMetadataReaderFactory {
+impl fmt::Debug for ScanReaderFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CachedMetadataReaderFactory")
+        f.debug_struct("ScanReaderFactory")
             .field("superfiles", &self.footers.len())
             .finish()
     }
 }
 
-/// [`AsyncFileReader`] handed to DataFusion's opener: byte ranges
-/// delegate to the plain object-store reader; `get_metadata` returns
-/// the open-time parse instead of re-fetching the footer.
-struct CachedMetadataReader {
-    inner: ParquetObjectReader,
-    /// `None` only for a file outside the survivors loop (never
-    /// expected) — falls back to the inner reader's footer fetch.
-    meta: Option<Arc<ParquetMetaData>>,
-}
-
-impl AsyncFileReader for CachedMetadataReader {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, errors::Result<Bytes>> {
-        self.inner.get_bytes(range)
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, errors::Result<Vec<Bytes>>> {
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, errors::Result<Arc<ParquetMetaData>>> {
-        match self.meta.clone() {
-            Some(meta) => async move { Ok(meta) }.boxed(),
-            None => self.inner.get_metadata(options),
-        }
-    }
-}
-
-impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
+impl ParquetFileReaderFactory for ScanReaderFactory {
+    /// Every file a scan reads had its footer cached when it was opened, so a
+    /// missing one is our bug.
     fn create_reader(
         &self,
         _partition_index: usize,
@@ -1739,18 +1714,19 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
         _metrics: &ExecutionPlanMetricsSet,
     ) -> DfResult<Box<dyn AsyncFileReader + Send>> {
         let location = &partitioned_file.object_meta.location;
-        let mut inner = ParquetObjectReader::new(Arc::clone(&self.store), location.clone())
-            .with_file_size(partitioned_file.object_meta.size);
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint);
-        }
-        Ok(Box::new(CachedMetadataReader {
-            meta: self
-                .footers
-                .get(location)
-                .map(|footer| Arc::clone(&footer.meta)),
-            inner,
-        }))
+        let footer = self
+            .footers
+            .get(location)
+            .map(|footer| Arc::clone(&footer.meta));
+        Ok(match footer {
+            Some(meta) => Box::new(self.read_ahead.reader(partitioned_file, meta)),
+            // No footer from open: read it like DataFusion's own reader does.
+            // Without it there's no plan, so no read-ahead.
+            None => Box::new(
+                self.read_ahead
+                    .plain_reader(&partitioned_file, metadata_size_hint),
+            ),
+        })
     }
 }
 
@@ -2196,20 +2172,33 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, slice::from_ref};
+    use std::{
+        collections::HashMap,
+        hash::{DefaultHasher, Hash, Hasher},
+        slice::from_ref,
+        time::Duration,
+    };
 
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
-        prelude::{cast, col, lit},
+        common::DFSchema,
+        datasource::physical_plan::FileGroup,
+        execution::context::ExecutionProps,
+        physical_expr::create_physical_expr,
+        physical_plan::collect,
+        prelude::{SessionContext, cast, col, lit},
         scalar::ScalarValue,
     };
-    use object_store::memory::InMemory;
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use tokio::runtime;
 
     use super::*;
     use crate::{
+        memory::ConnectionMemoryBudget,
         superfile::{
             builder::FtsConfig,
             fts::{
@@ -2221,6 +2210,7 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            query::read_ahead::fixture,
         },
         test_helpers::{default_tokenizer, fid},
     };
@@ -3356,20 +3346,537 @@ mod tests {
         assert!(scalar_null_count(&missing).is_none());
     }
 
-    /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile
-    /// (cached-meta) count and is otherwise unreachable from a normal
-    /// scan. Build one with an empty meta map over an in-memory store
-    /// and render it.
+    /// How a test scan reads a wide file: its projection, filter (a row filter
+    /// when `row_filter`), access plan, number of partitions, and which row
+    /// groups are already cached.
+    #[derive(Debug)]
+    struct ScanShape {
+        name: &'static str,
+        projection: Option<Vec<usize>>,
+        filter: Option<Expr>,
+        row_filter: bool,
+        plan: Option<ParquetAccessPlan>,
+        partitions: u64,
+        cached_row_groups: Vec<usize>,
+    }
+
+    /// What one scan returned and cost.
+    #[derive(Debug)]
+    struct ScanRun {
+        rows: usize,
+        /// Every value of every row, see [`answer_of`].
+        answer: u64,
+        /// Bytes the scan downloaded from object storage, through the cache.
+        fetched: u64,
+        /// GETs the cache made to object storage.
+        gets: usize,
+    }
+
+    impl ScanRun {
+        /// What must not change with read-ahead: the answer and the bytes
+        /// downloaded.
+        fn answer_and_bytes(&self) -> (usize, u64, u64) {
+            (self.rows, self.answer, self.fetched)
+        }
+    }
+
+    /// A fingerprint of every value of every row in `batches`, whatever order
+    /// the partitions return them in: each row's values are hashed, and the
+    /// row hashes added up.
+    fn answer_of(batches: &[RecordBatch]) -> u64 {
+        let options = FormatOptions::default();
+        let mut answer = 0u64;
+        for batch in batches {
+            let columns: Vec<ArrayFormatter> = batch
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &options).expect("formatter"))
+                .collect();
+            for row in 0..batch.num_rows() {
+                let mut hasher = DefaultHasher::new();
+                for column in &columns {
+                    column.value(row).to_string().hash(&mut hasher);
+                }
+                answer = answer.wrapping_add(hasher.finish());
+            }
+        }
+        answer
+    }
+
+    /// A wide test file: its bytes and footer.
+    type WideFile = (Bytes, Arc<ParquetMetaData>);
+
+    /// Rows per row group in the wide file, enough to cross the cache's blocks.
+    const WIDE_ROWS_PER_GROUP: usize = 20_000;
+    /// Rows per page in the wide file, so the page index can narrow a chunk.
+    const WIDE_PAGE_ROWS: usize = 2_000;
+    /// Where the page-index test's range starts and ends, in tenths of a row
+    /// group: the last tenth of row group 1 to the first tenth of row group 5,
+    /// so most of both is left unread.
+    const NARROWED_TENTHS: (i64, i64) = (9, 1);
+    /// Percent of rows the row-filter test's filter on `a` keeps: most row
+    /// groups, so batches run, but not the last ones.
+    const ROW_FILTER_KEPT_PERCENT: i64 = 85;
+    /// How long each read from object storage takes, so reads in flight
+    /// together overlap like GETs do.
+    const GET_LATENCY: Duration = Duration::from_millis(20);
+    /// Random shapes the randomized contract test checks.
+    const RANDOM_SHAPES: u64 = 48;
+    /// Rows per row group and per page of the random test's files: row groups
+    /// inside one cache block, a few blocks wide, many blocks wide, and many
+    /// blocks with one page per column.
+    const RANDOM_LAYOUTS: [(usize, usize); 4] = [
+        (2_000, 500),
+        (8_000, 2_000),
+        (20_000, 2_000),
+        (20_000, 20_000),
+    ];
+    /// Odds and choices for [`random_shape`]: projecting some columns, keeping
+    /// each one, a row filter, an access plan, a cached row group, and how
+    /// many kinds of filter and row-group access it picks from.
+    const RANDOM_PROJECTION_ODDS: f64 = 0.6;
+    const RANDOM_COLUMN_ODDS: f64 = 0.5;
+    const RANDOM_ROW_FILTER_ODDS: f64 = 0.5;
+    const RANDOM_PLAN_ODDS: f64 = 0.4;
+    const RANDOM_CACHED_ODDS: f64 = 0.15;
+    const RANDOM_FILTER_KINDS: u32 = 4;
+    const RANDOM_ACCESS_KINDS: u32 = 5;
+    /// Latency of each read in the random test: enough for reads to overlap,
+    /// small enough to run many shapes.
+    const RANDOM_GET_LATENCY: Duration = Duration::from_millis(2);
+    /// Size of the file the no-footer test opens; it's never read.
+    const FOOTERLESS_FILE_BYTES: u64 = 1024;
+    /// Extra GETs one shape may take: read-ahead downloads the same blocks,
+    /// but groups them into GETs its own way.
+    const GET_SLACK: usize = 2;
+    /// The smallest download the fixture's cache makes. A short miss
+    /// downloads this much, and where the extra bytes land depends on which
+    /// read misses first.
+    const CACHE_MIN_GET: u64 = 512 * 1024;
+
+    /// Scan `file` cold through DataFusion's own Parquet opener and the disk
+    /// cache, as in production, with each read taking `latency`. Returns the
+    /// run and the most bytes read-ahead held.
+    async fn scan_through_the_cache(
+        read_ahead: bool,
+        shape: &ScanShape,
+        file: &WideFile,
+        latency: Duration,
+    ) -> (ScanRun, usize) {
+        let (bytes, meta) = (file.0.clone(), Arc::clone(&file.1));
+        let size = bytes.len() as u64;
+        let superfile = fixture::Superfile::with_latency(bytes, latency);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_cache, source) = fixture::block_cached(&superfile, dir.path());
+        for &rg in &shape.cached_row_groups {
+            let (start, len) = (0..meta.row_group(rg).num_columns())
+                .map(|c| meta.row_group(rg).column(c).byte_range())
+                .fold((u64::MAX, 0), |(s, e), (cs, cl)| {
+                    (s.min(cs), e.max(cs + cl))
+                });
+            source.range(start, len - start).await.expect("warm");
+        }
+        superfile.clear();
+
+        let path = ObjPath::from("t/sf.parquet");
+        let store = Arc::new(SuperfileObjectStore::new());
+        store.insert_source(path.clone(), source);
+        let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
+        footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
+        let schema = fixture::schema();
+        let budget = ConnectionMemoryBudget::measured();
+        let read_ahead_state = Arc::new(ScanReadAhead::new(
+            Arc::clone(&store),
+            Arc::clone(&budget),
+            Arc::clone(&schema),
+        ));
+        if !read_ahead {
+            read_ahead_state.disable();
+        }
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::clone(&read_ahead_state),
+            footers,
+        };
+        let mut parquet = ParquetSource::new(Arc::clone(&schema))
+            .with_parquet_file_reader_factory(Arc::new(factory));
+        if let Some(filter) = &shape.filter {
+            let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+            let predicate = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
+                .expect("predicate");
+            // The way the meter hands it over when the scan runs.
+            read_ahead_state.set_predicate(Arc::clone(&predicate), None);
+            parquet = parquet
+                .with_predicate(predicate)
+                .with_pushdown_filters(shape.row_filter)
+                .with_reorder_filters(shape.row_filter);
+        }
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let mut builder = FileScanConfigBuilder::new(url.clone(), Arc::new(parquet));
+        for p in 0..shape.partitions {
+            let (start, end) = (
+                size * p / shape.partitions,
+                size * (p + 1) / shape.partitions,
+            );
+            let mut file =
+                PartitionedFile::new_with_range(path.to_string(), size, start as i64, end as i64);
+            if let Some(plan) = &shape.plan {
+                file = file.with_extension(plan.clone());
+            }
+            builder = builder.with_file_group(FileGroup::new(vec![file]));
+        }
+        let builder = builder
+            .with_projection_indices(shape.projection.clone())
+            .expect("projection");
+        let scan = DataSourceExec::from_data_source(builder.build());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(url.as_ref(), store);
+        let batches = collect(scan, ctx.task_ctx()).await.expect("scan");
+
+        let run = ScanRun {
+            rows: batches.iter().map(|b| b.num_rows()).sum(),
+            answer: answer_of(&batches),
+            fetched: superfile.fetched_bytes(),
+            gets: superfile.reads().len(),
+        };
+        assert_eq!(budget.used(), 0, "every byte held ahead is given back");
+        (run, budget.peak())
+    }
+
+    // Several workers, so a download ahead starts as soon as it's spawned and
+    // races the scan's own reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_ahead_fetches_only_what_the_scan_would_through_the_cache() {
+        // Each shape below is scanned twice, read-ahead off and on, through
+        // DataFusion's own opener and the real disk cache:
+        //  - the rows must match;
+        //  - the bytes downloaded must match, within the cache's own slack;
+        //  - the GETs must not grow beyond `GET_SLACK`.
+        // This test pins that read-ahead downloads nothing the scan wouldn't.
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let group = WIDE_ROWS_PER_GROUP as i64;
+        let mut plan = ParquetAccessPlan::new_all(fixture::GROUPS);
+        plan.skip(2);
+        // The last rows of 4: the scan's own read of them ends next to 5.
+        plan.scan_selection(
+            4,
+            RowSelection::from(vec![
+                RowSelector::skip(WIDE_ROWS_PER_GROUP - 100),
+                RowSelector::select(100),
+            ]),
+        );
+        let every = |name| ScanShape {
+            name,
+            projection: None,
+            filter: None,
+            row_filter: false,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: Vec::new(),
+        };
+        let shapes = [
+            every("every column"),
+            ScanShape {
+                projection: Some(vec![0, 2]),
+                ..every("two columns, one unread between")
+            },
+            ScanShape {
+                // See `NARROWED_TENTHS`.
+                filter: Some(
+                    col("a")
+                        .gt_eq(lit(group + NARROWED_TENTHS.0 * group / 10))
+                        .and(col("a").lt(lit(5 * group + NARROWED_TENTHS.1 * group / 10))),
+                ),
+                ..every("a range the page index narrows")
+            },
+            ScanShape {
+                filter: Some(col("c").gt(lit(0i64))),
+                row_filter: true,
+                ..every("a row filter")
+            },
+            ScanShape {
+                plan: Some(plan),
+                ..every("a plan that skips and selects")
+            },
+            ScanShape {
+                partitions: 2,
+                ..every("two partitions")
+            },
+            ScanShape {
+                cached_row_groups: vec![0, 1],
+                ..every("the first row groups already cached")
+            },
+        ];
+        for shape in &shapes {
+            let (off, _) = scan_through_the_cache(false, shape, &file, GET_LATENCY).await;
+            let (on, held) = scan_through_the_cache(true, shape, &file, GET_LATENCY).await;
+            let name = shape.name;
+            assert_eq!(
+                (on.rows, on.answer),
+                (off.rows, off.answer),
+                "{name}: same rows"
+            );
+            assert!(
+                on.fetched.abs_diff(off.fetched) <= partition_slack(shape.partitions),
+                "{name}: same bytes from storage: {on:?} vs {off:?}"
+            );
+            assert!(
+                on.gets <= off.gets + GET_SLACK,
+                "{name}: GETs: {on:?} vs {off:?}"
+            );
+            assert!(held > 0, "{name}: reads ahead");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_row_filter_reading_in_turns_downloads_each_block_once() {
+        // Under a row filter the scan reads a row group's columns in turns:
+        //  - a batch starts on the first of those reads;
+        //  - the scan's later reads of that row group can share a cache block
+        //    with the batch's first column (one page per column here, so
+        //    adjacent row groups meet inside a block).
+        // This test pins that shared block being downloaded once.
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_ROWS_PER_GROUP);
+        let rows = (WIDE_ROWS_PER_GROUP * fixture::GROUPS) as i64;
+        let shape = ScanShape {
+            name: "a row filter reading in turns",
+            projection: None,
+            filter: Some(
+                col("a")
+                    .lt(lit(rows * ROW_FILTER_KEPT_PERCENT / 100))
+                    .and(col("c").lt(lit(0i64))),
+            ),
+            row_filter: true,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: vec![1, 4],
+        };
+        let (off, _) = scan_through_the_cache(false, &shape, &file, GET_LATENCY).await;
+        let (on, held) = scan_through_the_cache(true, &shape, &file, GET_LATENCY).await;
+        assert_eq!(
+            on.answer_and_bytes(),
+            off.answer_and_bytes(),
+            "same rows and bytes"
+        );
+        assert!(on.gets <= off.gets + GET_SLACK, "GETs: {on:?} vs {off:?}");
+        assert!(held > 0, "reads ahead");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn random_scan_shapes_return_the_same_rows_and_bytes_with_read_ahead() {
+        // The same check over random shapes: file layouts, projections,
+        // filters, row filters, access plans, up to three partitions, and row
+        // groups already cached. Read-ahead off vs on:
+        //  - every shape returns the same rows;
+        //  - bytes differ at most by where a short miss's window lands, and by
+        //    partitions that meet inside a block each downloading it;
+        //  - GETs can differ by one per shape, but not in total;
+        //  - bytes don't grow in total over one-partition shapes. With more
+        //    partitions, which one downloads a shared block first changes from
+        //    run to run even without read-ahead, so they keep only their own
+        //    bound.
+        // This test pins read-ahead staying cost-neutral across shapes.
+        let files: Vec<WideFile> = RANDOM_LAYOUTS
+            .iter()
+            .map(|&(rows, page_rows)| fixture::wide_file(rows, page_rows))
+            .collect();
+        let (mut gets_on, mut gets_off, mut read_ahead) = (0, 0, 0);
+        let (mut bytes_on, mut bytes_off) = (0, 0);
+        for seed in 0..RANDOM_SHAPES {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let layout = rng.random_range(0..files.len());
+            let shape = random_shape(&mut rng, RANDOM_LAYOUTS[layout].0);
+            let file = &files[layout];
+            let (off, _) = scan_through_the_cache(false, &shape, file, RANDOM_GET_LATENCY).await;
+            let (on, held) = scan_through_the_cache(true, &shape, file, RANDOM_GET_LATENCY).await;
+            let case = format!(
+                "seed {seed}, layout {:?}, {shape:?}",
+                RANDOM_LAYOUTS[layout]
+            );
+            assert_eq!(
+                (on.rows, on.answer),
+                (off.rows, off.answer),
+                "same rows: {case}"
+            );
+            assert!(
+                on.fetched.abs_diff(off.fetched)
+                    <= CACHE_MIN_GET + partition_slack(shape.partitions),
+                "bytes differ at most by where a download's minimum lands ({on:?} vs {off:?}): {case}"
+            );
+            if shape.partitions == 1 {
+                bytes_on += on.fetched;
+                bytes_off += off.fetched;
+            }
+            assert!(
+                on.gets <= off.gets + GET_SLACK,
+                "GETs ({on:?} vs {off:?}): {case}"
+            );
+            gets_on += on.gets;
+            gets_off += off.gets;
+            read_ahead += usize::from(held > 0);
+        }
+        assert!(
+            gets_on <= gets_off,
+            "no more GETs in all: {gets_on} vs {gets_off}"
+        );
+        assert!(
+            bytes_on <= bytes_off + CACHE_MIN_GET,
+            "no more bytes in all one-partition shapes: {bytes_on} vs {bytes_off}"
+        );
+        assert!(read_ahead > 0, "some shapes read ahead");
+    }
+
+    /// How much a scan with `partitions` partitions can download differently
+    /// from run to run, with or without read-ahead: partitions that meet
+    /// inside a cache block can each download it.
+    fn partition_slack(partitions: u64) -> u64 {
+        2 * (partitions - 1) * CACHE_MIN_GET
+    }
+
+    /// A random scan of a wide file with `rows_per_group` rows per row group.
+    fn random_shape(rng: &mut StdRng, rows_per_group: usize) -> ScanShape {
+        let rows = (rows_per_group * fixture::GROUPS) as i64;
+        let column_count = fixture::schema().fields().len();
+        let projection = rng.random_bool(RANDOM_PROJECTION_ODDS).then(|| {
+            let columns: Vec<usize> = (0..column_count)
+                .filter(|_| rng.random_bool(RANDOM_COLUMN_ODDS))
+                .collect();
+            if columns.is_empty() {
+                vec![rng.random_range(0..column_count)]
+            } else {
+                columns
+            }
+        });
+        let filter = match rng.random_range(0..RANDOM_FILTER_KINDS) {
+            // A range on `a`, which counts up, so statistics and the page index
+            // prune around it.
+            0 => {
+                let lo = rng.random_range(0..rows);
+                let hi = rng.random_range(lo..=rows);
+                Some(col("a").gt_eq(lit(lo)).and(col("a").lt(lit(hi))))
+            }
+            // On scrambled `c`: nothing prunes.
+            1 => Some(col("c").gt(lit(rng.random_range(i64::MIN / 2..i64::MAX / 2)))),
+            // Both.
+            2 => Some(
+                col("a")
+                    .lt(lit(rng.random_range(0..rows)))
+                    .and(col("c").lt(lit(0i64))),
+            ),
+            _ => None,
+        };
+        let row_filter = filter.is_some() && rng.random_bool(RANDOM_ROW_FILTER_ODDS);
+        let plan = rng.random_bool(RANDOM_PLAN_ODDS).then(|| {
+            let mut plan = ParquetAccessPlan::new_all(fixture::GROUPS);
+            for rg in 0..fixture::GROUPS {
+                match rng.random_range(0..RANDOM_ACCESS_KINDS) {
+                    0 => plan.skip(rg),
+                    1 => {
+                        let skip = rng.random_range(0..rows_per_group);
+                        let select = rng.random_range(1..=rows_per_group - skip);
+                        plan.scan_selection(
+                            rg,
+                            RowSelection::from(vec![
+                                RowSelector::skip(skip),
+                                RowSelector::select(select),
+                                RowSelector::skip(rows_per_group - skip - select),
+                            ]),
+                        );
+                    }
+                    // Every row: what page pruning leaves when it rules out nothing.
+                    2 => plan.scan_selection(
+                        rg,
+                        RowSelection::from(vec![RowSelector::select(rows_per_group)]),
+                    ),
+                    _ => {}
+                }
+            }
+            plan
+        });
+        ScanShape {
+            name: "random",
+            projection,
+            filter,
+            row_filter,
+            plan,
+            partitions: rng.random_range(1..=3),
+            cached_row_groups: (0..fixture::GROUPS)
+                .filter(|_| rng.random_bool(RANDOM_CACHED_ODDS))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_meter_hands_read_ahead_the_predicate_its_scan_runs_with() {
+        // DataFusion's filter pushdown puts the filter on the scan after the
+        // provider built it, so read-ahead gets it from the meter when the
+        // scan runs. This test pins that handover.
+        let schema = fixture::schema();
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::new(SuperfileObjectStore::new()),
+            ConnectionMemoryBudget::measured(),
+            Arc::clone(&schema),
+        ));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+        let predicate =
+            create_physical_expr(&col("a").lt(lit(5i64)), &df_schema, &ExecutionProps::new())
+                .expect("predicate");
+        let source = ParquetSource::new(Arc::clone(&schema)).with_predicate(Arc::clone(&predicate));
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let config = FileScanConfigBuilder::new(url.clone(), Arc::new(source))
+            .with_file_group(FileGroup::new(Vec::new()))
+            .build();
+        let meter = MeteredExec::new(DataSourceExec::from_data_source(config), None)
+            .with_read_ahead(Arc::clone(&read_ahead));
+        assert!(
+            read_ahead.predicate().is_none(),
+            "nothing before the scan runs"
+        );
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(url.as_ref(), Arc::new(SuperfileObjectStore::new()));
+        meter.execute(0, ctx.task_ctx()).expect("execute");
+        assert_eq!(
+            read_ahead.predicate().map(|p| p.to_string()),
+            Some(predicate.to_string())
+        );
+    }
+
     #[test]
-    fn cached_metadata_reader_factory_debug_reports_superfile_count() {
-        let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
-        let factory = CachedMetadataReaderFactory {
-            store,
+    fn a_file_without_a_cached_footer_gets_a_plain_reader() {
+        // A file whose footer wasn't parsed at open gets a reader that reads
+        // the footer itself, instead of failing the scan.
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::new(ScanReadAhead::new(
+                Arc::new(SuperfileObjectStore::new()),
+                ConnectionMemoryBudget::measured(),
+                Arc::new(Schema::empty()),
+            )),
+            footers: Arc::new(DashMap::new()),
+        };
+        let file = PartitionedFile::new("t/missing.parquet", FOOTERLESS_FILE_BYTES);
+        assert!(
+            factory
+                .create_reader(0, file, None, &ExecutionPlanMetricsSet::new())
+                .is_ok()
+        );
+    }
+
+    /// `ScanReaderFactory`'s `Debug` reports the superfile
+    /// (cached-meta) count and is otherwise unreachable from a normal
+    /// scan. Build one with an empty meta map and render it.
+    #[test]
+    fn scan_reader_factory_debug_reports_superfile_count() {
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::new(ScanReadAhead::new(
+                Arc::new(SuperfileObjectStore::new()),
+                ConnectionMemoryBudget::measured(),
+                Arc::new(Schema::empty()),
+            )),
             footers: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(
-            dbg.contains("CachedMetadataReaderFactory") && dbg.contains("superfiles: 0"),
+            dbg.contains("ScanReaderFactory") && dbg.contains("superfiles: 0"),
             "Debug missing fields: {dbg}"
         );
     }
