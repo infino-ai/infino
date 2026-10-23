@@ -24,10 +24,9 @@ fn a_round_cap_of_one_still_answers_the_same() {
         "diagnostics:\n  tier_rounds: 1\n",
     )
     .expect("config file");
-    assert!(
-        std::env::var("XDG_CONFIG_HOME").is_err(),
-        "the test owns the configuration path"
-    );
+    // The host may already point `XDG_CONFIG_HOME` somewhere (CI runners
+    // do); the configuration is read once per process, below, so pointing
+    // it at the test's own directory first is all the ownership needed.
     // SAFETY: this is the only test in the binary and nothing else has
     // started yet, so no other thread reads the environment.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
