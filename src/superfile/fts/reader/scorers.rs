@@ -818,13 +818,13 @@ fn word_beats(slots: &[f32], threshold: f32) -> bool {
     let slots: &[f32; 64] = slots
         .try_into()
         .expect("invariant: a presence word spans 64 slots");
-    let mut hit = [false; 8];
+    let mut hit = [0u32; 8];
     for chunk in slots.chunks_exact(8) {
         for (h, &x) in hit.iter_mut().zip(chunk) {
-            *h |= x > threshold;
+            *h |= u32::from(x > threshold);
         }
     }
-    hit.iter().any(|&h| h)
+    hit.iter().fold(0, |a, &h| a | h) != 0
 }
 
 /// Most optional terms the required-term walk takes; a wider list keeps
