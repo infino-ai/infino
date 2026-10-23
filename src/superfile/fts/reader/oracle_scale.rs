@@ -64,6 +64,11 @@ const EVERY_GAP: u32 = 1000;
 /// bits: the packed encoding, which random placement never produces.
 const STRIDED: [(&str, u32, u32); 2] = [("triad", 3, 0), ("penta", 5, 1)];
 
+/// How far under the rare word's document frequency the explicit pairs'
+/// deepest `k` sits, and the largest `k` the rare-led walk is routed for.
+const RARE_PAIR_K_SLACK: usize = 4;
+const RARE_PAIR_MAX_K: usize = 128;
+
 /// Words a query may name: the drawn vocabulary and the planted terms.
 const QUERY_WORDS: [&str; 19] = [
     "the", "of", "and", "to", "new", "york", "city", "music", "band", "album", "river", "stone",
@@ -131,7 +136,7 @@ fn corpus(n_docs: u32, seed: u64) -> Vec<String> {
                 words.extend(["new", "york"]);
             }
             let room = MAX_DOC_LEN - words.len() as u64;
-            let short = (i / WINDOW) % 2 == 0;
+            let short = (i / WINDOW).is_multiple_of(2);
             let max_len = if short { room / 2 } else { room };
             let len = 1 + rng.below(max_len.max(1));
             words.extend((0..len).map(|_| rng.word()));
@@ -209,9 +214,9 @@ impl Query {
             let tokens: Vec<String> = match phrase {
                 true if rng.below(2) == 0 => vec!["new".into(), "york".into()],
                 true => (0..2 + rng.below(2))
-                    .map(|_| rng.word().to_string())
+                    .map(|_| rng.pick(&QUERY_WORDS).to_string())
                     .collect(),
-                false => vec![rng.word().to_string()],
+                false => vec![rng.pick(&QUERY_WORDS).to_string()],
             };
             if !seen.insert(tokens.clone()) {
                 continue;
@@ -296,8 +301,36 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
         let oracle = BruteForceBm25::index(&refs, tokenizer.as_ref());
 
         let mut rng = Rng(seed.rotate_left(17));
-        for qi in 0..QUERIES {
-            let q = Query::generate(&mut rng);
+        let mut queries: Vec<Query> = (0..QUERIES).map(|_| Query::generate(&mut rng)).collect();
+        // Rare-plus-common pairs at the small `k` the rare-led walk serves,
+        // listed rather than drawn, so that walk's completion rule is graded
+        // on every corpus whatever the generator happens to draw. A `k` just
+        // under the rare word's document frequency puts the walk's k-th best
+        // among the rare word's weakest documents, below the common word's
+        // best: the case where accepting the walk's answer would be wrong.
+        let df = |w: &str| {
+            texts
+                .iter()
+                .filter(|t| t.split(' ').any(|x| x == w))
+                .count()
+        };
+        // The pair must be at least sixteen times apart in document frequency
+        // for the router to send it there.
+        for common in ["music", "band", "city"] {
+            for rare in ["onyx", "lynx"] {
+                let near_df = df(rare)
+                    .saturating_sub(RARE_PAIR_K_SLACK)
+                    .min(RARE_PAIR_MAX_K);
+                for k in [10, 50, 128, near_df] {
+                    queries.push(Query {
+                        shoulds: vec![common.to_string(), rare.to_string()],
+                        k: k.max(1),
+                        ..Query::default()
+                    });
+                }
+            }
+        }
+        for (qi, q) in queries.into_iter().enumerate() {
             let label = format!("corpus {ci} ({n_docs} docs) query {qi}: {q:?}");
             let want = oracle.top_k_atoms(
                 &q.musts,
