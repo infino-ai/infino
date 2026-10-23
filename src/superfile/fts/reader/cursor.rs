@@ -516,6 +516,10 @@ pub(crate) struct TermCursor {
     bitset_prefix_block: usize,
 }
 
+/// Targets in one bitset block at or above which the batch probe ranks them
+/// from a table of prefix popcounts built for the block.
+const BITSET_PREFIX_MIN_TARGETS: usize = 2;
+
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
 const EAGER_RETRY_BLOCKS: u8 = 8;
 
@@ -1324,7 +1328,14 @@ impl TermCursor {
             if is_dense_encoding(hdr.encoding) {
                 let lazy = self.lazy_bit != u32::MAX;
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-                if hdr.encoding != ENCODING_RUN {
+                // Several targets in this block (or its table already built):
+                // count the presence words once. A lone target counts only
+                // the words before it, cheaper than building the table.
+                let in_block = docs[k..].partition_point(|&d| d <= last);
+                if hdr.encoding != ENCODING_RUN
+                    && (in_block >= BITSET_PREFIX_MIN_TARGETS
+                        || self.bitset_prefix_block == self.current_block)
+                {
                     if self.bitset_prefix_block != self.current_block {
                         let bitset_end = raw.len() - hdr.tfs_size();
                         let presence = &raw[hdr.payload()..bitset_end];
