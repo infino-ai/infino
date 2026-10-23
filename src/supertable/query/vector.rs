@@ -84,7 +84,7 @@ use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -99,6 +99,7 @@ use crate::{
     storage::io_counters,
     superfile::{
         SuperfileReader,
+        error::ReadError,
         fts::reader::BoolMode,
         id_space::RowId,
         vector::{
@@ -1879,9 +1880,10 @@ async fn build_gapped_placement_index(
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-    // Every row, so the scalar `_id` column: one contiguous chunk per row
-    // group. The inline region is stored per cell, so reading all of it costs
-    // one small read per cell, each rounded up to a whole cache block.
+    // Every row, so never the inline region: it is stored per cell, so
+    // reading all of it costs one small read per cell, each rounded up to a
+    // whole cache block. A cold file serves every row from its stable-id
+    // sidecar in one range; see `read_ids_for_locals`.
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false, op_stats).await?;
     // Build scratch only, released the moment the sorted arrays are extracted.
     // The transient peak holds all three vectors at once — the decoded `ids`
@@ -1980,17 +1982,20 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
 ///
-/// Both sources hold the same ids in the same row order; `allow_inline_region`
+/// Every source holds the same ids in the same row order; `allow_inline_region`
 /// picks the cheaper one for the rows asked for:
 ///
 ///   - `true`: the vector blob's inline `_id` region, stored once per cell.
 ///     Free when resident; cold, it costs one read per cell the rows touch,
 ///     so it suits a few rows.
-///   - `false`: the scalar `_id` column, one contiguous chunk per row group,
-///     so it suits many rows or a whole file.
+///   - `false`: the scalar `_id` column, one chunk per row group, read
+///     through its page index, so it suits rows spread over a file.
 ///
+/// Every row of a cold file comes from the packed stable-id sidecar instead,
+/// whichever is asked for: one contiguous range of a few bytes per row,
+/// where either source above costs a read per cell or per column chunk.
 /// A file whose vector blob carries rows the Parquet body does not (boundary
-/// stubs) always reads the scalar column; the inline order would not match.
+/// stubs) never reads the inline region; its order would not match.
 async fn read_ids_for_locals(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
@@ -2013,8 +2018,9 @@ async fn read_ids_for_locals(
     // diverges from Parquet row order and the shortcut would pair ids with
     // the wrong locals. Hidden cells keep the shortcut — their replicas are
     // real Parquet rows, so the counts (and orders) match.
-    let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
-    if allow_inline_region && inline_is_parquet_ordered {
+    let inline_usable =
+        allow_inline_region && reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
+    if inline_usable {
         // The inline-region read is one planned range per file — the plan
         // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
@@ -2050,6 +2056,17 @@ async fn read_ids_for_locals(
             }
             return Ok(ids);
         }
+    }
+    // Cold, and asked for every row: the sidecar holds them all in one
+    // range of a few bytes per row, where the inline region costs a read per
+    // cell and the column a read per row-group chunk (`id_sidecar_serves`
+    // says when it applies).
+    if reader.id_sidecar_serves(local_ids, id_column)
+        && let Some(ids) = ids_from_sidecar(manifest, entry, &reader, local_ids, op_stats).await?
+    {
+        return Ok(ids);
+    }
+    if inline_usable {
         // Cold path: fetch the inline region async when present but not resident.
         if let Some(v) = reader.vec()
             && let Some(ids) = v.inline_stable_ids_for_locals_async(local_ids).await?
@@ -2090,6 +2107,53 @@ async fn read_ids_for_locals(
         .await
         .map_err(QueryError::DataFusion)?;
     id_values_from_batch(&batch)
+}
+
+/// The `_id`s of `local_ids` from `reader`'s stable-id sidecar: one ranged
+/// read for the whole sidecar, decoded on the reader pool. `None` when the
+/// superfile carries no sidecar, or it does not decode (then marked, so later
+/// reads skip it); the caller then reads another source, which holds the
+/// same ids in the same row order. A doc past the file's end is the caller's
+/// error, returned as such, and leaves the sidecar unmarked.
+async fn ids_from_sidecar(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    reader: &SuperfileReader,
+    local_ids: &Arc<Vec<u32>>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Option<Vec<i128>>, QueryError> {
+    let Some(sidecar) = reader.fetch_id_sidecar().await? else {
+        return Ok(None);
+    };
+    let locals = Arc::clone(local_ids);
+    let (decoded, decode_ns) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "id sidecar decode: reader pool dropped result",
+        move || op_stats::timed_section(|| sidecar.ids(&locals)),
+    )
+    .await
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
+    if let Some(stats) = op_stats {
+        stats.add_kernel_cpu_ns(decode_ns);
+    }
+    match decoded {
+        Ok(ids) => {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
+            Ok(Some(ids))
+        }
+        Err(error @ ReadError::DocIdOutOfRange { .. }) => Err(QueryError::from(error)),
+        Err(error) => {
+            reader.mark_id_sidecar_broken();
+            warn!(
+                uri = ?entry.uri,
+                %error,
+                "reading _id from another source, the id sidecar does not decode"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
@@ -7922,6 +7986,7 @@ mod tests {
 
     use arrow::array::Array;
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::IndexOutcome;
     use crate::{
@@ -7947,23 +8012,26 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
-        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
+        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, ReadIntent,
+        SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
         admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
         build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
+        decode_centroid_router_section, dispatch, encode_centroid_router_section, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, lookup_user_placements_by_id,
-        postings_by_cell_from_summaries, read_ids_for_locals, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        id_values_from_batch, is_hidden_vector_manifest, law_floor_serve_selection,
+        lookup_user_placements_by_id, postings_by_cell_from_summaries, read_ids_for_locals,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist,
+        take_rows_byte_source, union_cell_selection,
     };
     use crate::{
         BoolMode, InfinoError,
         config::{CompactionSettings, OptimizeOptions},
         superfile::{
             SuperfileReader,
-            builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+            builder::{
+                BuilderOptions, DEFAULT_ROW_GROUP_SIZE, FtsConfig, SuperfileBuilder, VectorConfig,
+            },
             error::{ReadError, VectorError},
             vector::{
                 distance::Metric,
@@ -9078,12 +9146,11 @@ mod tests {
     /// Vector width in the cold placement-build test; wide vectors spread the
     /// cells' inline `_id` regions across the blob.
     const COLD_PLACEMENT_DIM: usize = 128;
-    /// GETs the cold placement build may take: the `_id` chunk of the one row
-    /// group, plus its page index if the open did not already fetch it.
-    const COLD_PLACEMENT_MAX_GETS: u64 = 2;
+    /// GETs the cold placement build may take: the id sidecar's one range.
+    const COLD_PLACEMENT_MAX_GETS: u64 = 1;
 
     #[test]
-    fn a_cold_placement_build_reads_the_id_column_not_every_cell() {
+    fn a_cold_placement_build_reads_ids_in_one_range_not_every_cell() {
         let dim = COLD_PLACEMENT_DIM;
         let schema = schema_with_vector(dim);
         let dir = TempDir::new().expect("tempdir");
@@ -9126,14 +9193,146 @@ mod tests {
         ))
         .expect("placements");
         let io = local.usage_meter().snapshot().since(&before);
-        // The `_id` chunk of the file's one row group. Reading the cells'
-        // inline regions instead took 109 GETs and 56 MB here.
+        // One range for every id. Reading the cells' inline regions instead
+        // took 109 GETs and 56 MB here.
         assert!(
             io.get_count <= COLD_PLACEMENT_MAX_GETS,
-            "a cold placement build must read the `_id` column, not every cell: {io:?}"
+            "a cold placement build must read ids in one range, not every cell: {io:?}"
         );
 
         assert_places_every_row(manifest);
+    }
+
+    /// Full row groups in the multi-row-group cold placement test, so the
+    /// `_id` column is that many chunks with the other columns' between them.
+    const SIDECAR_PLACEMENT_ROW_GROUPS: usize = 4;
+    /// Rows in the multi-row-group cold placement test.
+    const SIDECAR_PLACEMENT_ROWS: usize = SIDECAR_PLACEMENT_ROW_GROUPS * DEFAULT_ROW_GROUP_SIZE;
+    /// Seed for the multi-row-group test's random titles, so a run is
+    /// repeatable.
+    const SIDECAR_PLACEMENT_SEED: u64 = 7;
+    /// Vector width in the multi-row-group test; the smallest the options
+    /// accept, since only the id read is measured.
+    const SIDECAR_PLACEMENT_DIM: usize = 16;
+    /// Random 64-bit words per title in the multi-row-group test: enough
+    /// incompressible text that each row group's title chunk outgrows a
+    /// cache block, so the `_id` chunks land in separate blocks, as they do
+    /// on any table that stores text.
+    const SIDECAR_PLACEMENT_TITLE_WORDS: usize = 4;
+    /// GETs the cold placement build may take once the file carries an id
+    /// sidecar: the one contiguous sidecar range.
+    const SIDECAR_PLACEMENT_MAX_GETS: u64 = 1;
+
+    /// `n` rows whose titles are random hex, `SIDECAR_PLACEMENT_TITLE_WORDS`
+    /// words each, deterministic per row; vectors as `build_vector_batch`.
+    fn wide_title_batch(n: usize, dim: usize, schema: Arc<Schema>) -> RecordBatch {
+        // Seeded random words: they neither compress nor change between runs.
+        let mut rng = StdRng::seed_from_u64(SIDECAR_PLACEMENT_SEED);
+        let titles: Vec<String> = (0..n)
+            .map(|_| {
+                (0..SIDECAR_PLACEMENT_TITLE_WORDS)
+                    .map(|_| format!("{:016x}", rng.random::<u64>()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let vectors = build_vector_batch(0, n, dim, Arc::clone(&schema));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::clone(vectors.column(1)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// A cold placement build over a file with several row groups reads the
+    /// stable-id sidecar, one range of a few bytes per row, rather than the
+    /// `_id` column's chunk in every row group.
+    #[test]
+    fn a_cold_placement_build_reads_the_id_sidecar_in_one_range() {
+        let dim = SIDECAR_PLACEMENT_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let local = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), UsageMeter::new()).expect("storage"),
+        );
+        let storage: Arc<dyn StorageProvider> = local.clone();
+        {
+            let st = Supertable::create(
+                options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+            )
+            .expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&wide_title_batch(SIDECAR_PLACEMENT_ROWS, dim, schema))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        let before = local.usage_meter().snapshot();
+        block_on(lookup_user_placements_by_id(
+            manifest,
+            &[entry.id_min, entry.id_max],
+            &None,
+        ))
+        .expect("placements");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The `_id` column instead costs a GET per row-group chunk, and more
+        // where its pages are fetched apart.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "a cold placement build must read the id sidecar in one range: {io:?}"
+        );
+        assert_places_every_row(manifest);
+
+        // Routing asks for every row with the inline region allowed; cold, the
+        // sidecar still serves it in one range rather than a read per cell.
+        let cache_dir = TempDir::new().expect("second cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold again");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        let every_row = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+        let before = local.usage_meter().snapshot();
+        let ids = block_on(read_ids_for_locals(
+            manifest,
+            &entry,
+            &every_row,
+            &manifest.options.id_column,
+            true,
+            &None,
+        ))
+        .expect("every row's id");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The inline region instead costs a GET per cell.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "an every-row read must take the sidecar before the inline region: {io:?}"
+        );
+        assert_eq!(
+            ids,
+            parquet_column_ids(manifest, &entry),
+            "the sidecar's ids, row for row, are the `_id` column's"
+        );
     }
 
     /// Rows per commit in the merged-file placement test.
@@ -9188,17 +9387,34 @@ mod tests {
         assert_places_every_row(manifest);
     }
 
+    /// Every row's `_id` of `entry`, read from the Parquet `_id` column
+    /// itself: the oracle the placement map is checked against, independent
+    /// of the stable-id sidecar the map is built from.
+    fn parquet_column_ids(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Vec<i128> {
+        let reader = block_on(dispatch::open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        ))
+        .expect("open the superfile");
+        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+        let batch = block_on(take_rows_byte_source(
+            &reader,
+            &locals,
+            &[manifest.options.id_column.as_str()],
+        ))
+        .expect("read the `_id` column");
+        id_values_from_batch(&batch).expect("decimal `_id`")
+    }
+
     /// Place every id in the table and check each lands on its own row. The
-    /// rows' ids are read from the cells' inline `_id` regions, the source the
-    /// map no longer reads, so the two must agree on row order.
+    /// rows' ids come from the Parquet `_id` column, not the sidecar the map
+    /// is built from, so the two must agree on row order.
     fn assert_places_every_row(manifest: &ManifestSnapshot) {
-        let id_column = manifest.options.id_column.as_str();
         for entry in manifest.superfiles.iter() {
-            let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-            let ids = block_on(read_ids_for_locals(
-                manifest, entry, &locals, id_column, true, &None,
-            ))
-            .expect("inline ids");
+            let ids = parquet_column_ids(manifest, entry);
             let placed =
                 block_on(lookup_user_placements_by_id(manifest, &ids, &None)).expect("placements");
             for (local, (owner, placed_local)) in placed.iter().enumerate() {

@@ -1051,6 +1051,13 @@ mod tests {
             QueryError::PermissionDenied(_)
         ));
         assert!(matches!(
+            QueryError::from(ReadError::RangeFetch {
+                what: "stable-id sidecar fetch",
+                source: refused(),
+            }),
+            QueryError::PermissionDenied(_)
+        ));
+        assert!(matches!(
             QueryError::from(VectorError::LazySource(LazyByteSourceError::ShortRead {
                 start: 0,
                 requested: 8,
