@@ -311,6 +311,43 @@ impl AndSink for ScoreCountSink<'_> {
     }
 }
 
+/// [`ScoreSink`] collecting into a [`TopKBuffer`]: the same floor gate and
+/// filter, an append per admitted hit instead of a sift, and a bar that rises
+/// at each cut. For a large `k`, where most hits are admitted.
+pub(super) struct BufferedScoreSink<'a> {
+    pub(super) top: TopKBuffer,
+    pub(super) k: usize,
+    pub(super) filter: Option<&'a mut ExcludeFilter>,
+    pub(super) floor_eff: f32,
+    /// The k-th best at the last cut, never below the floor.
+    pub(super) kth: f32,
+}
+
+impl AndSink for BufferedScoreSink<'_> {
+    fn bar(&self) -> f32 {
+        match self.top.is_full(self.k) {
+            true => self.kth.max(self.floor_eff),
+            false => self.floor_eff,
+        }
+    }
+
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, doc: u32, score: f32) {
+        if score <= self.floor_eff {
+            return;
+        }
+        if let Some(f) = self.filter.as_deref_mut()
+            && !f.admits(doc)
+        {
+            return;
+        }
+        self.top.offer(self.k, &mut self.kth, score, doc);
+    }
+}
+
 /// [`MustShouldSink`] without pruning: every must-intersection doc is
 /// scored and counted, and the shoulds only add to its score.
 pub(super) struct MustShouldCountSink<'a> {
@@ -513,7 +550,10 @@ impl Collector for TopKBuffer {
     }
     #[inline]
     fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool {
-        if k == 0 || (self.full && score <= *threshold) {
+        // A score equal to the bar is kept: the bar may trail the true k-th
+        // best, and a tie there with a smaller doc wins on the doc-id leg,
+        // which the final selection decides.
+        if k == 0 || (self.full && score < *threshold) {
             return false;
         }
         self.buf.push(TopKEntry(score, FtsDocId::new(doc)));

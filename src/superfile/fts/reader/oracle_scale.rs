@@ -193,7 +193,7 @@ impl Query {
                 ];
                 let n = 2 + rng.below(3);
                 q.musts = rng.distinct(&pool, n);
-                q.k = [1, 10, 100][rng.below(3) as usize];
+                q.k = [1, 10, 100, 1000][rng.below(4) as usize];
                 return q;
             }
             6 => {

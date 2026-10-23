@@ -16,9 +16,9 @@ use super::{
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
-        AndSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink, ScoreCountSink,
-        ScoreSink, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc, offer_top_k,
-        replace_worst,
+        AndSink, BufferedScoreSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink,
+        ScoreCountSink, ScoreSink, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc,
+        offer_top_k, replace_worst,
     },
 };
 use crate::superfile::{
@@ -1246,6 +1246,21 @@ impl FtsReader {
     ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         if cursors.is_empty() {
             return Ok(Vec::new());
+        }
+        // At a large `k` most hits are admitted: collect into a buffer cut by
+        // selection rather than sifting a heap per hit.
+        if k >= BUFFERED_TOPK_MIN_K {
+            let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
+            let capacity = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+            let mut sink = BufferedScoreSink {
+                top: TopKBuffer::with_capacity(k, capacity),
+                k,
+                filter,
+                floor_eff,
+                kth: floor_eff.max(0.0),
+            };
+            self.and_scored_walk(cursors, dl_norm_k1, &mut sink);
+            return Ok(sink.top.into_sorted());
         }
         let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
             let mut sink = ScoreSink {
