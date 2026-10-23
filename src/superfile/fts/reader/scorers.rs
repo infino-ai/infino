@@ -723,8 +723,30 @@ fn and_membership_scored_batched<S: AndSink>(
             }
             tfs.resize(docs.len(), 0);
             o.probe_tfs(&docs, &mut tfs);
+            // Score every candidate, eight per SIMD call, and compact without
+            // a branch: whether a candidate holds the term is a coin flip the
+            // predictor cannot learn. A missing term's tf of 0 scores exactly
+            // 0, and the slot it writes is overwritten by the next keeper.
             let mut w = 0usize;
-            for r in 0..docs.len() {
+            let mut r = 0usize;
+            while r + 8 <= docs.len() {
+                let dids: [u32; 8] = docs[r..r + 8]
+                    .try_into()
+                    .expect("invariant: an 8-wide slice");
+                let tf8: [u32; 8] = tfs[r..r + 8]
+                    .try_into()
+                    .expect("invariant: an 8-wide slice");
+                let add =
+                    bm25::score_one_term_x8(o.idf_weight, tf8, dids.map(|d| dl_norm_k1.get(d)));
+                for l in 0..8 {
+                    let total = scores[r + l] + add[l];
+                    docs[w] = dids[l];
+                    scores[w] = total;
+                    w += usize::from(tf8[l] != 0);
+                }
+                r += 8;
+            }
+            for r in r..docs.len() {
                 let (d, tf) = (docs[r], tfs[r]);
                 if tf != 0 {
                     docs[w] = d;
