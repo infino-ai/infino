@@ -275,24 +275,8 @@ fn unpack_groups(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
 /// within its group for the whole run; each group then advances `W` bytes.
 #[inline(always)]
 fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [u32]) {
-    // A run read from a stream's start (a whole group read at once) begins
-    // byte-aligned: with the phase a literal 0 every lane's offset and shift
-    // fold to constants instead of being read back per lane.
-    match start_bit % 8 {
-        0 => unpack_groups_phase::<W>(payload, start_bit, 0, out),
-        phase => unpack_groups_phase::<W>(payload, start_bit, phase, out),
-    }
-}
-
-/// [`unpack_groups_w`] at a given bit phase within the first byte.
-#[inline(always)]
-fn unpack_groups_phase<const W: usize>(
-    payload: &[u8],
-    start_bit: usize,
-    phase: usize,
-    out: &mut [u32],
-) {
     let mask: u64 = (1u64 << W) - 1;
+    let phase = start_bit % 8;
     let offs: [usize; LANE_GROUP] = std::array::from_fn(|l| (phase + l * W) / 8);
     let shifts: [u32; LANE_GROUP] = std::array::from_fn(|l| ((phase + l * W) % 8) as u32);
     let span = offs[LANE_GROUP - 1] + 8;
