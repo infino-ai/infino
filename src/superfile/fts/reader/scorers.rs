@@ -17,7 +17,7 @@ use super::{
     metadata::{NormTable, unscored_norm_table},
     sink::{
         AndSink, CollectSink, MustShouldCountSink, MustShouldSink, ScoreCountSink, ScoreSink,
-        TopKEntry, and_heap_push, drain_top_k_desc, replace_worst,
+        TopKEntry, and_heap_push, drain_top_k_desc, offer_top_k, replace_worst,
     },
 };
 use crate::superfile::{
@@ -2020,21 +2020,7 @@ impl FtsReader {
                         score += bm25::score_simd_x4(idfs, tfs, norm);
                     }
 
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
-                        if heap.len() == k {
-                            // max(): a seeded floor must never be
-                            // lowered by a weaker local kth-best.
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                            let new_f = recompute_f(&partial_max, threshold);
-                            if new_f != f_essential {
-                                f_essential = new_f;
-                                f_changed = true;
-                            }
-                        }
-                    } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    if offer_top_k(&mut heap, k, &mut threshold, score, candidate) {
                         let new_f = recompute_f(&partial_max, threshold);
                         if new_f != f_essential {
                             f_essential = new_f;
@@ -2201,15 +2187,7 @@ impl FtsReader {
                 // f32 instead of paying for a heap.peek() per iter.
                 // (max(): a seeded floor must never be lowered by a
                 // weaker local kth-best.)
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, FtsDocId::new(candidate)));
-                    if heap.len() == k {
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
-                        f_essential = recompute_f(&partial_max, threshold);
-                    }
-                } else if score > threshold {
-                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
-                    threshold = heap.peek().expect("non-empty").0.max(threshold);
+                if offer_top_k(&mut heap, k, &mut threshold, score, candidate) {
                     f_essential = recompute_f(&partial_max, threshold);
                 }
             }
@@ -2414,15 +2392,7 @@ impl FtsReader {
                     {
                         continue;
                     }
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                        if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                        }
-                    } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
-                    }
+                    offer_top_k(&mut heap, k, &mut threshold, score, doc);
                 }
             }
         }
@@ -2459,15 +2429,7 @@ impl FtsReader {
                 if k == 0 {
                     return;
                 }
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                    if heap.len() == k {
-                        *threshold = heap.peek().expect("non-empty").0;
-                    }
-                } else if score > *threshold {
-                    replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
-                    *threshold = heap.peek().expect("non-empty").0;
-                }
+                offer_top_k(heap, k, threshold, score, doc);
             };
         cursors.retain(|c| !c.is_exhausted());
         if let [c] = cursors.as_mut_slice() {
@@ -2867,15 +2829,7 @@ impl FtsReader {
                         continue;
                     }
                     let mut raised = false;
-                    if heap.len() < k {
-                        heap.push(TopKEntry(score, FtsDocId::new(candidate)));
-                        if heap.len() == k {
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                            raised = true;
-                        }
-                    } else if score > threshold {
-                        replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
+                    if offer_top_k(&mut heap, k, &mut threshold, score, candidate) {
                         raised = true;
                     }
                     c0.next();
@@ -3191,15 +3145,7 @@ impl FtsReader {
                         {
                             continue;
                         }
-                        if heap.len() < k {
-                            heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                            if heap.len() == k {
-                                threshold = heap.peek().expect("non-empty").0.max(threshold);
-                            }
-                        } else if score > threshold {
-                            replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
-                            threshold = heap.peek().expect("non-empty").0.max(threshold);
-                        }
+                        offer_top_k(&mut heap, k, &mut threshold, score, doc);
                     }
                 }
                 continue;
@@ -3260,15 +3206,7 @@ impl FtsReader {
             // Collect the fully-scored candidates (ascending doc order).
             for (idx, &doc) in win_docs.iter().enumerate() {
                 let score = win_scores[idx];
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, FtsDocId::new(doc)));
-                    if heap.len() == k {
-                        threshold = heap.peek().expect("non-empty").0.max(threshold);
-                    }
-                } else if score > threshold {
-                    replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(doc)));
-                    threshold = heap.peek().expect("non-empty").0.max(threshold);
-                }
+                offer_top_k(&mut heap, k, &mut threshold, score, doc);
             }
         }
 
@@ -3403,15 +3341,7 @@ impl FtsReader {
 
             // Top-K update. `threshold` mirrors `heap.peek().0` so the
             // replace-or-skip branch doesn't re-peek per iteration.
-            if heap.len() < k {
-                heap.push(TopKEntry(score, FtsDocId::new(candidate)));
-                if heap.len() == k {
-                    threshold = heap.peek().expect("non-empty").0;
-                }
-            } else if score > threshold {
-                replace_worst(&mut heap, TopKEntry(score, FtsDocId::new(candidate)));
-                threshold = heap.peek().expect("non-empty").0;
-            }
+            offer_top_k(&mut heap, k, &mut threshold, score, candidate);
         }
 
         Ok((drain_top_k_desc(heap), count))

@@ -402,6 +402,38 @@ pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) 
     }
 }
 
+/// Offer `(score, doc)` to a top-`k` heap whose admission bar is
+/// `threshold`: pushed while the heap fills, and once it is full kept only
+/// when it beats the bar, in place of the worst entry. Whenever the heap is
+/// full after the offer the bar becomes its worst score, but never drops
+/// below where it was, so a floor the caller seeded is kept. Returns whether
+/// the bar was set or rose, for callers that re-plan on a higher bar. A
+/// `k` of zero admits nothing.
+#[inline]
+pub(super) fn offer_top_k(
+    heap: &mut BinaryHeap<TopKEntry>,
+    k: usize,
+    threshold: &mut f32,
+    score: f32,
+    doc: u32,
+) -> bool {
+    if k == 0 {
+        return false;
+    }
+    if heap.len() < k {
+        heap.push(TopKEntry(score, FtsDocId::new(doc)));
+        if heap.len() < k {
+            return false;
+        }
+    } else if score > *threshold {
+        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
+    } else {
+        return false;
+    }
+    *threshold = heap.peek().expect("a full heap").0.max(*threshold);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +466,39 @@ mod tests {
         assert_eq!(
             drain_top_k_desc(heap),
             vec![(FtsDocId::new(30), 2.0), (FtsDocId::new(5), 1.0)]
+        );
+    }
+
+    #[test]
+    fn offer_top_k_fills_then_keeps_the_best_and_never_lowers_a_seeded_bar() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        let mut bar = 0.0f32;
+        assert!(
+            !offer_top_k(&mut heap, 2, &mut bar, 1.0, 1),
+            "still filling"
+        );
+        assert!(
+            offer_top_k(&mut heap, 2, &mut bar, 3.0, 2),
+            "full: the bar is set"
+        );
+        assert_eq!(bar, 1.0);
+        assert!(
+            !offer_top_k(&mut heap, 2, &mut bar, 0.5, 3),
+            "under the bar"
+        );
+        assert!(offer_top_k(&mut heap, 2, &mut bar, 2.0, 4), "beats the bar");
+        assert_eq!(bar, 2.0);
+        let mut docs: Vec<u32> = heap.iter().map(|e| e.1.get()).collect();
+        docs.sort_unstable();
+        assert_eq!(docs, [2, 4]);
+        // A seeded floor above the heap's worst score is kept.
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        let mut bar = 5.0f32;
+        assert!(offer_top_k(&mut heap, 1, &mut bar, 1.0, 1));
+        assert_eq!(bar, 5.0);
+        assert!(
+            !offer_top_k(&mut heap, 0, &mut bar, 9.0, 2),
+            "k = 0 admits nothing"
         );
     }
 
