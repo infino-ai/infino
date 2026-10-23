@@ -223,6 +223,12 @@ pub(crate) fn unpack_lanes_u32(
     };
     let mut bit = from * w;
     let (head, tail) = out.split_at_mut(fast);
+    // Whole groups of eight lanes first: eight lanes of `w` bits span
+    // exactly `w` bytes, so each lane's byte offset and shift within its
+    // group are the same in every group and are worked out once per run.
+    let (grouped, head) = head.split_at_mut(head.len() / LANE_GROUP * LANE_GROUP);
+    unpack_groups(payload, bit, width, grouped);
+    bit += grouped.len() * w;
     for slot in head {
         let byte = bit / 8;
         let word = u64::from_le_bytes(
@@ -242,6 +248,51 @@ pub(crate) fn unpack_lanes_u32(
         bit += w;
     }
     Some(())
+}
+
+/// Lanes a width-specialized group unpacks together; eight lanes of any
+/// width end on a byte boundary.
+const LANE_GROUP: usize = 8;
+
+/// [`unpack_lanes_u32`]'s whole groups, dispatched once to the copy built
+/// for `width`, so the inner loop's shifts and masks are constants.
+/// `start_bit` is the first lane's bit position; every lane's 8-byte load
+/// must lie inside `payload`.
+fn unpack_groups(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
+    macro_rules! dispatch {
+        ($($w:literal)*) => {
+            match width {
+                $($w => unpack_groups_w::<$w>(payload, start_bit, out),)*
+                _ => unreachable!("a u32 lane is 1 to 32 bits wide"),
+            }
+        };
+    }
+    dispatch!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+/// Unpack `out.len() / 8` groups of eight `W`-bit lanes starting at
+/// `start_bit`. The run's bit phase fixes each lane's byte offset and shift
+/// within its group for the whole run; each group then advances `W` bytes.
+#[inline(always)]
+fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [u32]) {
+    let mask: u64 = (1u64 << W) - 1;
+    let phase = start_bit % 8;
+    let offs: [usize; LANE_GROUP] = std::array::from_fn(|l| (phase + l * W) / 8);
+    let shifts: [u32; LANE_GROUP] = std::array::from_fn(|l| ((phase + l * W) % 8) as u32);
+    let span = offs[LANE_GROUP - 1] + 8;
+    let mut byte = start_bit / 8;
+    for group in out.chunks_exact_mut(LANE_GROUP) {
+        let chunk = &payload[byte..byte + span];
+        for (l, slot) in group.iter_mut().enumerate() {
+            let word = u64::from_le_bytes(
+                chunk[offs[l]..offs[l] + 8]
+                    .try_into()
+                    .expect("invariant: eight bytes"),
+            );
+            *slot = ((word >> shifts[l]) & mask) as u32;
+        }
+        byte += W;
+    }
 }
 
 #[cfg(test)]
