@@ -70,48 +70,13 @@ impl PhraseMember {
     /// and would read the wrong run; `materialize_at` expands it first,
     /// which is why every caller goes through it.
     pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
-        self.pos_scratch.clear();
-        if let Some(p) = self.inline_position {
-            self.pos_scratch.push(p);
-            return Ok(());
+        if self.inline_position.is_none() {
+            debug_assert_eq!(
+                self.cursor.decoded_block, self.cursor.current_block,
+                "positions need the whole block decoded; call materialize_at first"
+            );
         }
-        debug_assert_eq!(
-            self.cursor.decoded_block, self.cursor.current_block,
-            "positions need the whole block decoded; call materialize_at first"
-        );
-        let block = self.cursor.current_block;
-        let pair = self.cursor.pos;
-        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
-
-        // The block's runs are one group. It is located once per block and
-        // each pair's run read on its own — no run walk, and no decode of
-        // the runs a phrase never visits.
-        if self.group_block != block {
-            let mut at =
-                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
-            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
-            self.group_index
-                .locate(&self.positions, &mut at, tfs)
-                .ok_or_else(|| {
-                    FtsError::Read(ReadError::Malformed(
-                        "position group truncated or undecodable".into(),
-                    ))
-                })?;
-            self.group_block = block;
-        }
-        self.group_index
-            .run_positions(
-                &self.positions,
-                pair,
-                self.cursor.block_tfs[pair],
-                &mut self.pos_scratch,
-            )
-            .ok_or_else(|| {
-                FtsError::Read(ReadError::Malformed(
-                    "position run truncated or overflowing".into(),
-                ))
-            })?;
-        Ok(())
+        self.located_positions(self.cursor.current_block, self.cursor.pos)
     }
 }
 
@@ -119,10 +84,18 @@ impl PhraseMember {
     /// Decode block `block`'s tfs into the member's cache, unless they are
     /// the ones it holds.
     fn ensure_tfs(&mut self, block: usize) {
-        if self.tfs_block != block {
-            self.cursor.block_tfs_into(block, &mut self.tfs);
-            self.tfs_block = block;
+        if self.tfs_block == block {
+            return;
         }
+        let c = &self.cursor;
+        if !c.predecoded && c.decoded_block == block && c.tf_decoded_block == block {
+            // The walk cursor already holds this block's tfs.
+            self.tfs.clear();
+            self.tfs.extend_from_slice(&c.block_tfs[..c.block_n]);
+        } else {
+            c.block_tfs_into(block, &mut self.tfs);
+        }
+        self.tfs_block = block;
     }
 
     /// The member's tf in its `pair`-th posting of block `block`, a location
@@ -168,6 +141,46 @@ impl PhraseMember {
             })?;
         Ok(())
     }
+}
+
+/// The phrase's occurrences at one aligned doc, verified in stages,
+/// rarest member first. A phrase starting at position `s` has member `j` at
+/// `s + offsets[j]`, so the rarest member (`order[0]`) seeds the candidate
+/// starts and each other member, in `order`, keeps the starts it confirms,
+/// compacted in place in `starts`. A member's positions are only read
+/// (`positions_of`, which fills its `pos_scratch`) once some start survives
+/// every rarer member, so on the many docs a rare member rejects the common
+/// members' runs are never decoded. Returns the surviving starts: the
+/// phrase's tf at the doc.
+fn verify_members(
+    members: &mut [PhraseMember],
+    order: &[usize],
+    offsets: &[u32],
+    starts: &mut Vec<u32>,
+    mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
+) -> Result<u32, FtsError> {
+    let anchor = order[0];
+    positions_of(&mut members[anchor], anchor)?;
+    starts.clear();
+    starts.extend(
+        members[anchor]
+            .pos_scratch
+            .iter()
+            .filter_map(|&p| p.checked_sub(offsets[anchor])),
+    );
+    for &j in &order[1..] {
+        if starts.is_empty() {
+            break;
+        }
+        positions_of(&mut members[j], j)?;
+        let plist = &members[j].pos_scratch;
+        let off = offsets[j];
+        starts.retain(|&s| {
+            s.checked_add(off)
+                .is_some_and(|want| plist.binary_search(&want).is_ok())
+        });
+    }
+    Ok(starts.len() as u32)
 }
 
 /// Compact `locs` to the entries at `kept` (ascending indices into it).
@@ -536,41 +549,19 @@ impl PhraseCursor {
 
     /// [`Self::verify_at_aligned`] for candidate `c` of the current batch,
     /// reading each member's positions at its recorded location rather than
-    /// through a walk cursor. Same staged, rarest-first verification.
+    /// through a walk cursor.
     fn verify_located(&mut self, c: usize) -> Result<u32, FtsError> {
-        let anchor = self.align_order[0];
-        let anchor_off = self.position_offsets[anchor];
-        let (b, p) = self.cand_locs[anchor][c];
-        self.members[anchor].located_positions(b as usize, p as usize)?;
-        self.verify_scratch.clear();
-        for &pa in &self.members[anchor].pos_scratch {
-            if let Some(start) = pa.checked_sub(anchor_off) {
-                self.verify_scratch.push(start);
-            }
-        }
-        for oi in 1..self.align_order.len() {
-            if self.verify_scratch.is_empty() {
-                break;
-            }
-            let j = self.align_order[oi];
-            let (b, p) = self.cand_locs[j][c];
-            self.members[j].located_positions(b as usize, p as usize)?;
-            let plist = &self.members[j].pos_scratch;
-            let off = self.position_offsets[j];
-            let mut w = 0usize;
-            for r in 0..self.verify_scratch.len() {
-                let start = self.verify_scratch[r];
-                let keep = start
-                    .checked_add(off)
-                    .is_some_and(|want| plist.binary_search(&want).is_ok());
-                if keep {
-                    self.verify_scratch[w] = start;
-                    w += 1;
-                }
-            }
-            self.verify_scratch.truncate(w);
-        }
-        self.current_tf = self.verify_scratch.len() as u32;
+        let locs = &self.cand_locs;
+        self.current_tf = verify_members(
+            &mut self.members,
+            &self.align_order,
+            &self.position_offsets,
+            &mut self.verify_scratch,
+            |m, j| {
+                let (b, p) = locs[j][c];
+                m.located_positions(b as usize, p as usize)
+            },
+        )?;
         Ok(self.current_tf)
     }
 
@@ -579,23 +570,7 @@ impl PhraseCursor {
     /// for every `i`. Member position lists are ascending, so each
     /// probe is a binary search over a per-doc-tf-sized slice.
     pub(super) fn verify_at_aligned(&mut self, aligned: u32) -> Result<u32, FtsError> {
-        // Staged, rarest-first, lazy-decode verification. A phrase match
-        // starting at position `s` has member `j` at
-        // `s + position_offsets[j]`,
-        // so any
-        // member can seed the candidate starts: the rarest member (by
-        // posting length — `align_order[0]`) seeds them, then each
-        // remaining member filters the survivors *in rarest-first order*.
-        //
-        // Two wins over decode-all-then-probe-from-the-first-member:
-        //   * The seed loop is as short as the rarest member's per-doc tf,
-        //     not the (often common) query-first member's.
-        //   * Decoding is lazy: a common member's positions — whose
-        //     per-block run-offset walk is the real cost — are only
-        //     decoded once some candidate survives every rarer member.
-        //     On the huge co-occurrence sets a phrase with a common word
-        //     produces, almost every doc is rejected by a rare member
-        //     first, so the common members are never decoded there.
+        // Staged, rarest first: see [`verify_members`].
         //
         // `materialize_at` decodes each member's block only now: on the
         // unranked path a common member reached `aligned` by a `contains`
@@ -604,44 +579,16 @@ impl PhraseCursor {
         // and `decode_current_positions` needs the whole block (its pair
         // index and tf run). Only a plain walk leaves the block decoded,
         // so these calls are not optional.
-        let anchor = self.align_order[0];
-        let anchor_off = self.position_offsets[anchor];
-        self.members[anchor].cursor.materialize_at(aligned);
-        self.members[anchor].decode_current_positions()?;
-        self.verify_scratch.clear();
-        for &pa in &self.members[anchor].pos_scratch {
-            if let Some(start) = pa.checked_sub(anchor_off) {
-                self.verify_scratch.push(start);
-            }
-        }
-        for oi in 1..self.align_order.len() {
-            if self.verify_scratch.is_empty() {
-                break;
-            }
-            let j = self.align_order[oi];
-            self.members[j].cursor.materialize_at(aligned);
-            self.members[j].decode_current_positions()?;
-            let plist = &self.members[j].pos_scratch;
-            let off = self.position_offsets[j];
-            // Compact the survivors in place: keep a start iff member `j`
-            // holds `start + position_offsets[j]`.
-            let mut w = 0usize;
-            for r in 0..self.verify_scratch.len() {
-                let start = self.verify_scratch[r];
-                let keep = start
-                    .checked_add(off)
-                    .is_some_and(|want| plist.binary_search(&want).is_ok());
-                if keep {
-                    self.verify_scratch[w] = start;
-                    w += 1;
-                }
-            }
-            self.verify_scratch.truncate(w);
-        }
-        // The surviving starts are this doc's phrase occurrences — its tf.
-        // Store it so `score_current` scores the phrase after a two-phase
-        // `verify_at` (the single-phase `skip_to_pruned` sets it itself).
-        self.current_tf = self.verify_scratch.len() as u32;
+        self.current_tf = verify_members(
+            &mut self.members,
+            &self.align_order,
+            &self.position_offsets,
+            &mut self.verify_scratch,
+            |m, _| {
+                m.cursor.materialize_at(aligned);
+                m.decode_current_positions()
+            },
+        )?;
         Ok(self.current_tf)
     }
 
