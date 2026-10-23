@@ -237,10 +237,6 @@ struct StreamIndex {
     width: u8,
     payload: Range<usize>,
     exceptions: Vec<(u32, u32)>,
-    /// The first exception not below the last lane read: lanes are read in
-    /// rising order within a block, so the next lookup steps forward from
-    /// here rather than searching the whole list.
-    exc_cursor: usize,
 }
 
 impl StreamIndex {
@@ -262,7 +258,6 @@ impl StreamIndex {
         bytes.get(payload.clone())?;
         *at = payload.end;
         self.exceptions.clear();
-        self.exc_cursor = 0;
         let mut prev_lane: Option<u32> = None;
         for _ in 0..n_exc {
             let lane = read_varint(bytes, at)?;
@@ -281,25 +276,17 @@ impl StreamIndex {
     /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
     /// One lane of the stream, exception applied.
     #[inline]
-    fn lane(&mut self, bytes: &[u8], i: usize) -> Option<u32> {
+    fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
         let low = u32::try_from(get_bits(&bytes[self.payload.clone()], i, self.width)?).ok()?;
         if self.exceptions.is_empty() {
             return Some(low);
         }
-        let lane = i as u32;
-        // Step forward from the last lookup; a lane behind it (an
-        // out-of-order read) searches afresh.
-        let mut c = self.exc_cursor;
-        if c > 0 && self.exceptions[c - 1].0 >= lane {
-            c = self.exceptions.partition_point(|&(l, _)| l < lane);
-        }
-        while c < self.exceptions.len() && self.exceptions[c].0 < lane {
-            c += 1;
-        }
-        self.exc_cursor = c;
-        let hi = match self.exceptions.get(c) {
-            Some(&(l, hi)) if l == lane => self.exception_hi(hi),
-            _ => 0,
+        let hi = match self
+            .exceptions
+            .binary_search_by_key(&(i as u32), |&(lane, _)| lane)
+        {
+            Ok(k) => self.exception_hi(self.exceptions[k].1),
+            Err(_) => 0,
         };
         Some(low | hi)
     }
@@ -389,12 +376,6 @@ pub(crate) struct GroupIndex {
     /// the pairs before it) for a packed group, in the values (`Σ tf`)
     /// for a LEB128 one. `tfs.len() + 1` entries.
     starts: Vec<u32>,
-    /// The located block's tfs, for extending `starts` on demand: a pair's
-    /// start is computed only when a run at or past it is read, so a block
-    /// with one or two candidates sums one or two tfs, not 128.
-    tfs: Vec<u32>,
-    /// Lanes in the whole group (the sum of `tfs`).
-    total_lanes: u32,
     /// A run's raw values before the gaps are summed into positions.
     run: Vec<u32>,
 }
@@ -428,31 +409,21 @@ impl GroupIndex {
         // Every partial sum is at most `n`, so one check that `n` fits makes
         // the prefix sum overflow-free; the per-encoding lane rule is chosen
         // once, not called per pair.
-        self.total_lanes = u32::try_from(n).ok()?;
-        self.tfs.clear();
-        self.tfs.extend_from_slice(tfs);
+        u32::try_from(n).ok()?;
+        // Sized once and filled with the running sum in a register: pushing
+        // grew the vector through memory for every pair of every block.
         self.starts.clear();
-        self.starts.push(0);
+        self.starts.resize(tfs.len() + 1, 0);
+        let mut acc = 0u32;
+        let lanes_per_pair = |tf: u32| match self.kind {
+            GroupKind::Packed => tf.saturating_sub(1),
+            _ => tf,
+        };
+        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
+            acc += lanes_per_pair(tf);
+            *slot = acc;
+        }
         Some(())
-    }
-
-    /// Where pair `pair`'s lanes begin, extending the running starts up to
-    /// it. Every partial sum is at most the group's lane count, checked at
-    /// `locate`, so the sum cannot overflow. `None` past the block's pairs.
-    #[inline]
-    fn start_of(&mut self, pair: usize) -> Option<usize> {
-        if pair >= self.tfs.len() {
-            return None;
-        }
-        // A packed group (and the bulk decode of one) stores each pair's first
-        // position apart from its gaps; only the LEB128 layout counts them all.
-        let per_pair_minus = u32::from(self.kind != GroupKind::Leb128);
-        let mut acc = *self.starts.last().expect("starts holds the origin");
-        while self.starts.len() <= pair {
-            acc += self.tfs[self.starts.len() - 1].saturating_sub(per_pair_minus);
-            self.starts.push(acc);
-        }
-        Some(self.starts[pair] as usize)
     }
 
     /// The absolute positions of pair `pair` (whose term frequency is
@@ -464,17 +435,15 @@ impl GroupIndex {
         tf: u32,
         out: &mut Vec<u32>,
     ) -> Option<()> {
-        let start = self.start_of(pair)?;
+        let start = *self.starts.get(pair)? as usize;
         if self.kind == GroupKind::Packed
             && self.served >= BULK_AFTER_RUNS
             && pair < self.served as usize * BULK_MAX_STRIDE
         {
             self.firsts.clear();
             self.gaps.clear();
-            let n_pairs = self.tfs.len();
-            // Packed: every pair's first position is its own lane, the rest
-            // are gaps.
-            let n_gaps = self.total_lanes as usize - n_pairs;
+            let n_pairs = self.starts.len() - 1;
+            let n_gaps = *self.starts.last()? as usize;
             self.first.read_lanes(bytes, 0, n_pairs, &mut self.firsts)?;
             self.gap.read_lanes(bytes, 0, n_gaps, &mut self.gaps)?;
             self.kind = GroupKind::Bulk;
