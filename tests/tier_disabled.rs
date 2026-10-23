@@ -21,10 +21,9 @@ fn switching_tier_selection_off_reads_no_tier_and_answers_the_same() {
         "diagnostics:\n  disable_tier_selection: true\n",
     )
     .expect("config file");
-    assert!(
-        std::env::var("XDG_CONFIG_HOME").is_err(),
-        "the test owns the configuration path"
-    );
+    // The host may already point `XDG_CONFIG_HOME` somewhere (CI runners
+    // do); the configuration is read once per process, below, so pointing
+    // it at the test's own directory first is all the ownership needed.
     // SAFETY: this is the only test in the binary and nothing else has
     // started yet, so no other thread reads the environment.
     unsafe { std::env::set_var("XDG_CONFIG_HOME", config.path()) };
