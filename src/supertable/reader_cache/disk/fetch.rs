@@ -131,7 +131,7 @@ impl DiskCacheStore {
         });
         let mut reader =
             SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false }).await?;
-        reader.install_resident_parquet(bytes)?;
+        reader.install_resident_parquet(bytes, (hole_start, hole_len))?;
 
         let charge = if vector_source.owns_accounting() {
             size.saturating_sub(hole_len)

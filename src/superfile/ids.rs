@@ -354,6 +354,23 @@ test_visible! {
 
 #[cfg(any(test, feature = "test-helpers"))]
 test_visible! {
+    /// Test-only: a copy of `superfile` whose id sidecar block `b` still
+    /// decodes but to the wrong ids: its high base is one more, which moves
+    /// every id in the block out of the file's id range. The damage a block
+    /// check cannot see and only a check against the footer can.
+    fn with_shifted_id_block(superfile: &[u8], b: usize) -> Vec<u8> {
+        let mut out = superfile.to_vec();
+        let range = id_sidecar_range(superfile);
+        let sidecar = &mut out[range];
+        let at = block_offset(sidecar, b);
+        let base = u64_le_at(sidecar, at).expect("block header");
+        sidecar[at..at + size_of::<u64>()].copy_from_slice(&base.wrapping_add(1).to_le_bytes());
+        out
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
     /// Test-only: checks every block of `superfile`'s packed id sidecar, the
     /// way a rewrite does before copying it.
     fn check_id_sidecar(superfile: &[u8]) -> Result<(), String> {

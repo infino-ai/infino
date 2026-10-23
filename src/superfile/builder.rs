@@ -684,10 +684,6 @@ pub struct BuilderOptions {
 /// walks), not page decode volume.
 pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 
-/// Rows per Parquet row group unless the caller sets its own: the unit a scan
-/// skips by statistics and a column chunk covers.
-pub(crate) const DEFAULT_ROW_GROUP_SIZE: usize = 65_536;
-
 /// Append one batch's `_id` values to a stable-id sidecar buffer: each id as
 /// a little-endian `i128`, in the batch's row order. Returns `false` (leaving
 /// `out` untouched for this batch) when the id column is absent or not
@@ -714,7 +710,7 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
 fn rebuild_id_sidecar(source: &SuperfileReader) -> Result<Vec<u8>, BuildError> {
     let docs: Vec<u32> = (0..source.n_docs() as u32).collect();
     let batch = source
-        .take_by_local_doc_ids(&docs, &[source.id_column()])
+        .take_by_local_doc_ids_from_parquet(&docs, &[source.id_column()])
         .map_err(Error::other)?;
     let mut raw = Vec::new();
     if !append_stable_id_sidecar(&mut raw, &batch, source.id_column()) {
@@ -743,7 +739,7 @@ fn stable_id_sidecar_bytes(batches: &[RecordBatch], id_column: &str) -> Vec<u8> 
 }
 
 impl BuilderOptions {
-    /// Default `row_group_size = DEFAULT_ROW_GROUP_SIZE`, `compression = ZSTD(3)`.
+    /// Default `row_group_size = 65_536`, `compression = ZSTD(3)`.
     ///
     /// TODO: expose `row_group_size` and `compression` as
     /// `supertable.parquet.*` fields in `config.yaml` so
@@ -772,7 +768,7 @@ impl BuilderOptions {
             id_column: id_column.into(),
             fts_columns,
             vector_columns,
-            row_group_size: DEFAULT_ROW_GROUP_SIZE,
+            row_group_size: 65_536,
             compression: Compression::ZSTD(
                 ZstdLevel::try_new(3).expect("zstd level 3 is in the valid 1..=22 range"),
             ),

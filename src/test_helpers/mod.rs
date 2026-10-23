@@ -93,6 +93,7 @@ use std::{
     fs::{copy as copy_file, create_dir_all, read_dir},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 #[cfg(test)]
 use std::{io, sync::Mutex};
@@ -149,6 +150,31 @@ pub fn default_disk_cache(
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned).expect("test disk cache")
+}
+
+/// [`lazy_foreground_disk_cache`] whose background fill never promotes a
+/// superfile while its reader is held, so a test's reads all take the cold,
+/// lazy path: a test that pins what a cold read fetches uses it, where the
+/// default fill could swap in resident bytes between two of its reads.
+pub fn lazy_disk_cache_without_promotion(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &Path,
+) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: TEST_DISK_CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+        cold_fetch_streams: TEST_COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: TEST_COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        promotion_defer_timeout: Duration::MAX,
+        eviction: Box::new(LruPolicy::new()),
+        crc_verification: CrcVerification::Always,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned).expect("test lazy disk cache without promotion")
 }
 
 /// A `DiskCacheStore` in `LazyForegroundWithBackgroundFill`: the foreground
