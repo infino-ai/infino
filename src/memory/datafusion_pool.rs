@@ -46,7 +46,8 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
-        sorted_root::KeepSortedRoot, topk_row_filter::RowFilterUnderTopK,
+        sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
+        topk_row_filter::RowFilterUnderTopK,
         values_subquery::ValuesSubqueryRewrite,
     },
 };
@@ -158,11 +159,15 @@ pub(crate) fn budgeted_session_context(
     // DataFusion's rules, with ours at both ends:
     //  - `RowFilterUnderTopK` first, so DataFusion's filter pushdown sees the
     //    marked scans and drops their `FilterExec`.
+    //  - `OrderUnderScalarSubquery` before DataFusion's `OutputRequirements`,
+    //    which on DataFusion 54 loses the `ORDER BY` of a query under a
+    //    `ScalarSubqueryExec` root.
     //  - `KeepSortedRoot` last, to remove the round-robin repartition that
     //    `EnforceDistribution` adds above a sorted result, which would return
     //    an `ORDER BY` out of order.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
+    rules.insert(1, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(KeepSortedRoot));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
@@ -180,9 +185,10 @@ pub(crate) fn budgeted_session_context(
 mod tests {
     use datafusion::{
         arrow::{
-            array::{Array, StringArray},
+            array::{Int64Array, StringArray, StringViewArray},
             datatypes::{DataType, Field, Schema},
             record_batch::RecordBatch,
+            util::display::array_value_to_string,
         },
         datasource::MemTable,
         execution::memory_pool::MemoryConsumer,
@@ -263,23 +269,17 @@ mod tests {
             .sum::<usize>()
     }
 
+    /// Whether the first column of `batches` is in ascending order, comparing
+    /// each value's display string (so keys must sort as strings).
     fn is_sorted(batches: &[RecordBatch]) -> bool {
-        let mut prev: Option<String> = None;
-        for b in batches {
-            let col = b
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("string column");
-            for i in 0..col.len() {
-                let v = col.value(i).to_string();
-                if prev.as_ref().is_some_and(|p| &v < p) {
-                    return false;
-                }
-                prev = Some(v);
-            }
-        }
-        true
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|b| {
+                (0..b.num_rows())
+                    .map(move |row| array_value_to_string(b.column(0), row).expect("value"))
+            })
+            .collect();
+        values.windows(2).all(|w| w[0] <= w[1])
     }
 
     /// Sort `batches` by their string column under a bounded budget; returns
@@ -429,6 +429,90 @@ mod tests {
 
                 prev_peak = peak;
             }
+        });
+    }
+
+    /// `t`: a `Utf8View` group key `g` (zero-padded, so it sorts as a string)
+    /// and an `Int64` value `v`, spread over `PARTITIONS` partitions.
+    const PARTITIONS: usize = 8;
+    const ROWS_PER_PARTITION: usize = 4096;
+    const GROUPS: usize = 50;
+
+    /// A session over `t`, pinned to `PARTITIONS` target partitions so the
+    /// plan is parallel on any host.
+    async fn scalar_subquery_session() -> SessionContext {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8View, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let partitions: Vec<Vec<RecordBatch>> = (0..PARTITIONS)
+            .map(|p| {
+                let groups = StringViewArray::from_iter_values(
+                    (0..ROWS_PER_PARTITION)
+                        .map(|i| format!("{:02}", (i * PARTITIONS + p) % GROUPS)),
+                );
+                let vals = Int64Array::from_iter_values(0..ROWS_PER_PARTITION as i64);
+                vec![
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![Arc::new(groups), Arc::new(vals)],
+                    )
+                    .expect("batch"),
+                ]
+            })
+            .collect();
+        let ctx = budgeted_session_context(&ConnectionMemoryBudget::measured()).expect("session");
+        ctx.sql(&format!(
+            "SET datafusion.execution.target_partitions = {PARTITIONS}"
+        ))
+        .await
+        .expect("set partitions");
+        let table = MemTable::try_new(schema, partitions).expect("memtable");
+        ctx.register_table("t", Arc::new(table)).expect("register");
+        ctx
+    }
+
+    /// A grouped query over a string key with an uncorrelated scalar subquery
+    /// in its `WHERE` returns its groups in `ORDER BY` order. Without
+    /// `OrderUnderScalarSubquery` DataFusion 54 plans the sort away and the
+    /// groups arrive in whatever order the partitions finish; this is the check
+    /// to run before deleting that rule on the move to DataFusion 55.
+    #[test]
+    fn order_by_survives_an_uncorrelated_scalar_subquery() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let ctx = scalar_subquery_session().await;
+            let out = ctx
+                .sql(
+                    "SELECT g, count(*) AS n FROM t \
+                     WHERE v > (SELECT avg(v) FROM t) GROUP BY g ORDER BY g",
+                )
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("collect");
+            assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), GROUPS);
+            assert!(is_sorted(&out), "groups came back unsorted: {out:?}");
+        });
+    }
+
+    /// A scalar subquery that returns more than one row is an error, not a
+    /// join that repeats the outer rows: DataFusion's `ScalarSubqueryExec`
+    /// stays on, and its older plan, a left join, would give a wrong count.
+    #[test]
+    fn a_scalar_subquery_returning_many_rows_is_an_error() {
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            let ctx = scalar_subquery_session().await;
+            let result = ctx
+                .sql("SELECT count(*) FROM t WHERE v > (SELECT v FROM t)")
+                .await
+                .expect("plan")
+                .collect()
+                .await;
+            let err = result.expect_err("a many-row scalar subquery fails");
+            assert!(err.to_string().contains("more than one row"), "{err}");
         });
     }
 }

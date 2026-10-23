@@ -25,20 +25,46 @@
 //! one stream, and the root stays a single, sorted partition. A merge on top
 //! would also restore the order, but only by paying for an exchange and a
 //! merge to parallelize what is typically a cast.
+//!
+//! [`OrderUnderScalarSubquery`] keeps the sort that DataFusion 54 plans away
+//! for a query with an uncorrelated scalar subquery, such as
+//! `WHERE v > (SELECT avg(v) FROM t) ORDER BY g`. Such a query is planned under
+//! a `ScalarSubqueryExec` root whose first child is the query and whose other
+//! children are the subqueries it runs first:
+//!
+//! ```text
+//!   ScalarSubqueryExec
+//!   ├── ProjectionExec: CAST(g AS LargeUtf8)   <- the query: rows come from here
+//!   │   └── SortPreservingMergeExec: g ASC     <- planned away without the rule
+//!   │       └── ...
+//!   └── AggregateExec: avg(v)                  <- the subquery: one value
+//! ```
+//!
+//! DataFusion's `OutputRequirements` rule looks for the `ORDER BY` by walking
+//! single-child operators down from the root, so it stops at this root and
+//! records none. The sort then looks unneeded under the round-robin
+//! repartition `EnforceDistribution` adds for the cast, and is removed: the
+//! rows come back unsorted with no error. With the `ORDER BY` recorded, no
+//! repartition is added and the root stays one sorted partition.
 
 use std::sync::Arc;
 
 use datafusion::{
     config::ConfigOptions,
     error::Result as DfResult,
-    physical_optimizer::PhysicalOptimizerRule,
+    physical_optimizer::{PhysicalOptimizerRule, output_requirements::OutputRequirements},
     physical_plan::{
         ExecutionPlan, ExecutionPlanProperties, Partitioning, repartition::RepartitionExec,
+        scalar_subquery::ScalarSubqueryExec,
     },
 };
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "KeepSortedRoot";
+
+/// [`OrderUnderScalarSubquery`]'s name, as DataFusion lists it in
+/// `EXPLAIN VERBOSE`.
+const SUBQUERY_RULE_NAME: &str = "OrderUnderScalarSubquery";
 
 /// Removes the round-robin repartition that splits a plan's sorted result
 /// above its sort; see the module docs.
@@ -89,5 +115,42 @@ fn unsplit_sorted_stream(
     match unsplit_sorted_stream(child)? {
         Some(child) => Ok(Some(Arc::clone(plan).with_new_children(vec![child])?)),
         None => Ok(None),
+    }
+}
+
+/// Records the `ORDER BY` of a query planned under a `ScalarSubqueryExec`
+/// root, so DataFusion keeps its sort; see the module docs. Runs before
+/// DataFusion's `OutputRequirements` and applies that same rule to the
+/// root's first child, the query, where the sort is.
+///
+/// TODO: delete on the move to DataFusion 55, whose `OutputRequirements`
+/// walks through `ScalarSubqueryExec` itself:
+/// <https://github.com/apache/datafusion/pull/23677>.
+#[derive(Debug, Default)]
+pub(crate) struct OrderUnderScalarSubquery;
+
+impl PhysicalOptimizerRule for OrderUnderScalarSubquery {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        config: &ConfigOptions,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let Some(subquery) = plan.downcast_ref::<ScalarSubqueryExec>() else {
+            return Ok(plan);
+        };
+        let input =
+            OutputRequirements::new_add_mode().optimize(Arc::clone(subquery.input()), config)?;
+        // The first child is the query; the subqueries stay as they are.
+        let mut children: Vec<_> = plan.children().into_iter().cloned().collect();
+        children[0] = input;
+        Arc::clone(&plan).with_new_children(children)
+    }
+
+    fn name(&self) -> &str {
+        SUBQUERY_RULE_NAME
+    }
+
+    fn schema_check(&self) -> bool {
+        true
     }
 }
