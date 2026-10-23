@@ -175,10 +175,22 @@ fn verify_members(
         positions_of(&mut members[j], j)?;
         let plist = &members[j].pos_scratch;
         let off = offsets[j];
-        starts.retain(|&s| {
-            s.checked_add(off)
-                .is_some_and(|want| plist.binary_search(&want).is_ok())
-        });
+        // Both lists ascend, so one forward merge confirms every start: the
+        // member's position pointer only moves on, where a binary search
+        // per start would re-bisect the whole list.
+        let (mut w, mut q) = (0usize, 0usize);
+        for r in 0..starts.len() {
+            let s = starts[r];
+            let Some(want) = s.checked_add(off) else {
+                break;
+            };
+            while q < plist.len() && plist[q] < want {
+                q += 1;
+            }
+            starts[w] = s;
+            w += usize::from(q < plist.len() && plist[q] == want);
+        }
+        starts.truncate(w);
     }
     Ok(starts.len() as u32)
 }
