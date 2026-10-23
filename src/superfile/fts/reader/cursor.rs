@@ -506,6 +506,8 @@ pub(crate) struct TermCursor {
     /// [`EAGER_RETRY_BLOCKS`] of them one lazy probe is tried again, so a
     /// cursor whose caller turned sparse can leave eager mode.
     eager_blocks: u8,
+    /// Scratch for the phrase filter's bitmap ranks, reused across blocks.
+    rank_scratch: Vec<u32>,
 }
 
 /// While a cursor is eager, retry a lazy probe once per this many blocks.
@@ -519,14 +521,14 @@ const BALANCED_PROBE_RATIO: usize = 4;
 /// postings of a term dense enough to be probed this way span far less.
 const PROBE_BITMAP_WORDS: usize = 128;
 
-/// Answer every target of a balanced probe at once: mark `ids` (a block's
-/// postings, ascending) in a bitmap over their span, then give each target in
-/// `targets` (ascending) its tf from `tfs` when its bit is set, else 0. The
-/// posting's index is its rank among the marked bits (prefix popcounts per
-/// word), so no target waits on another, unlike a merge where every step
-/// depends on the last comparison. Returns `false`, writing nothing, when the
-/// span is too wide for the bitmap.
-fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
+/// Rank every target against a block's postings at once: mark `ids`
+/// (ascending) in a bitmap over their span, then give each target in
+/// `targets` (ascending) its posting's index plus one when its bit is set,
+/// else 0. The index is the bit's rank among the marked bits (prefix
+/// popcounts per word), so no target waits on another, unlike a merge where
+/// every step depends on the last comparison. Returns `false`, writing
+/// nothing, when the span is too wide for the bitmap.
+fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
         return false;
     };
@@ -552,10 +554,7 @@ fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -
                 let (wi, bit) = ((local >> 6) as usize, local & 63);
                 let word = bits[wi];
                 match (word >> bit) & 1 {
-                    1 => {
-                        let rank = prefix[wi] + (word & ((1u64 << bit) - 1)).count_ones();
-                        tfs[rank as usize]
-                    }
+                    1 => prefix[wi] + (word & ((1u64 << bit) - 1)).count_ones() + 1,
                     _ => 0,
                 }
             }
@@ -564,6 +563,25 @@ fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -
     }
     true
 }
+
+/// A balanced probe answered by [`rank_by_bitmap`]: each target's tf from
+/// `tfs`, or 0 when the block does not hold it.
+fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
+    if !rank_by_bitmap(ids, targets, out) {
+        return false;
+    }
+    for o in out.iter_mut() {
+        *o = match *o {
+            0 => 0,
+            r => tfs[r as usize - 1],
+        };
+    }
+    true
+}
+
+/// Postings per candidate at or under which the phrase filter ranks a
+/// packed block's candidates by bitmap rather than merging.
+const FILTER_BITMAP_RATIO: usize = 16;
 
 /// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
 /// packed block rather than stepping: past this many docs behind the
@@ -660,6 +678,7 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
+            rank_scratch: Vec::new(),
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -757,6 +776,7 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
+            rank_scratch: Vec::new(),
         })
     }
 
@@ -830,6 +850,7 @@ impl TermCursor {
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
+            rank_scratch: Vec::new(),
         })
     }
 
@@ -1042,6 +1063,28 @@ impl TermCursor {
                 }
                 let ids = &self.block_doc_ids[..self.block_n];
                 let mut p = 0usize;
+                // Enough candidates in the block to pay for marking it: rank
+                // them all by bitmap, none waiting on another. Fewer, and a
+                // bisection or two per candidate is cheaper.
+                let r_end = r + docs[r..].partition_point(|&d| d <= block_last);
+                if (r_end - r) * FILTER_BITMAP_RATIO >= ids.len() {
+                    let ranks = &mut self.rank_scratch;
+                    ranks.clear();
+                    ranks.resize(r_end - r, 0);
+                    if rank_by_bitmap(ids, &docs[r..r_end], ranks) {
+                        for (i, &rank) in ranks.iter().enumerate() {
+                            if rank != 0 {
+                                docs[w] = docs[r + i];
+                                w += 1;
+                                locs.push((b, rank - 1));
+                                kept.push((r + i) as u32);
+                            }
+                        }
+                        let last_candidate = docs[r_end - 1];
+                        p = ids.partition_point(|&x| x < last_candidate);
+                        r = r_end;
+                    }
+                }
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
                     // Far behind the candidate (a member much denser than the
