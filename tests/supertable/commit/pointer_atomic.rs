@@ -187,6 +187,7 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
         vector_index_storage_prefix: None,
+        companions: Default::default(),
         deleted_user_ids_inline: None,
         slow_vector_state_uri: None,
         slow_vector_state_content_hash: None,

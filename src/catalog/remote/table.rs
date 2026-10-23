@@ -20,13 +20,13 @@ use serde_json::{Value, json};
 use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
-    OptimizeOptions, ReindexError, ReindexOptions, VectorFilter,
-    catalog::table::Table,
+    OptimizeOptions, ReindexError, ReindexOptions, Supertable, VectorFilter,
+    catalog::{remote_schema_unsupported, table::Table},
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
-        schema::TableSchema,
+        schema::{TableSchema, change::SchemaPatch},
     },
 };
 
@@ -355,6 +355,20 @@ impl Table for RemoteTable {
     fn gc(&self, _safety_gap: Duration) -> Result<GcReport, GcError> {
         // Retention/GC on a hosted table is server-side; not a client operation.
         Err(GcError::NoStorage)
+    }
+
+    fn companion(&self, _purpose: &str) -> Result<Option<Supertable>, InfinoError> {
+        // A hosted table is never created with one: `create_table` refuses
+        // companions on a hosted connection.
+        Ok(None)
+    }
+
+    fn apply_schema(
+        &self,
+        _patch: &SchemaPatch,
+        _expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        Err(remote_schema_unsupported("apply_schema", &self.table_name))
     }
 
     #[cfg(any(test, feature = "test-helpers"))]

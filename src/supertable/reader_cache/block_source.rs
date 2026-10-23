@@ -118,7 +118,7 @@ use super::disk::BlockWriteTicket;
 use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
 use crate::{
     runtime_bridge::shared_io_runtime,
-    superfile::{LazyByteSource, LazyByteSourceError},
+    superfile::{CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError},
     supertable::manifest::SuperfileUri,
 };
 
@@ -1465,18 +1465,28 @@ impl LazyByteSource for BlockCachedSource {
 
     async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
         let bytes = self.read(start, len).await;
-        if len > 0 {
-            self.note_read_end(start.saturating_add(len));
-        }
+        self.note_read(start, len);
         bytes
     }
 
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         let bytes = self.read_sync(start, len)?;
+        self.note_read(start, len);
+        Some(bytes)
+    }
+
+    fn note_read(&self, start: u64, len: u64) {
         if len > 0 {
             self.note_read_end(start.saturating_add(len));
         }
-        Some(bytes)
+    }
+
+    fn is_local(&self, start: u64, len: u64) -> bool {
+        self.holds(start, len) || self.whole_file().is_some()
+    }
+
+    async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.read(start, len).await
     }
 
     async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
@@ -1486,6 +1496,30 @@ impl LazyByteSource for BlockCachedSource {
         // prefetch overlay above this source, so caching them here as
         // (mostly partial) blocks buys nothing.
         self.inner.tail(len).await
+    }
+
+    fn cache_blocks(&self) -> Option<CacheBlocks> {
+        // A file whose layout was unknown at open is treated as all vector
+        // section, so every miss there downloads whole groups.
+        let grouped = self.aligned_blocks().map_or((0, 0), |(first, last)| {
+            (
+                u64::from(first) * CACHE_BLOCK_BYTES,
+                (u64::from(last) + 1) * CACHE_BLOCK_BYTES,
+            )
+        });
+        Some(CacheBlocks {
+            block_bytes: CACHE_BLOCK_BYTES,
+            min_get_bytes: MIN_GET_BYTES,
+            group_bytes: ALIGNED_GET_BYTES,
+            grouped,
+        })
+    }
+
+    fn cache_room_ahead(&self, bytes: u64) -> Option<CacheRoom> {
+        match self.store.upgrade() {
+            Some(store) => Some(Box::new(store.try_reserve_ahead(bytes)?)),
+            None => Some(Box::new(())),
+        }
     }
 }
 
@@ -1516,6 +1550,27 @@ impl BlockCachedSource {
         }
     }
 
+    /// Whether every block of the range is on disk or being written, without
+    /// reading it or noting a read end. Without a block file, the inner
+    /// source answers.
+    fn holds(&self, start: u64, len: u64) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let Some(bf) = self.block_file_for(self.in_fts_hole(start, len)) else {
+            return self.inner.is_local(start, len);
+        };
+        if start.saturating_add(len) > bf.size {
+            return false;
+        }
+        let (b0, b1) = Self::block_span(start, len);
+        self.all_filled(b0, b1)
+            || self
+                .segments(b0, b1)
+                .iter()
+                .all(|segment| !matches!(segment, Segment::Missing { .. }))
+    }
+
     // No whole-file fallback here: a caller that gets `None` takes the async `range`, which has it.
     fn read_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
@@ -1543,6 +1598,7 @@ mod tests {
     use std::{
         collections::BTreeSet,
         future::pending,
+        ops::Range,
         path::Path,
         sync::{atomic::AtomicUsize, mpsc},
         thread,
@@ -1590,6 +1646,7 @@ mod tests {
         blob: Bytes,
         calls: AtomicUsize,
         bytes: AtomicU64,
+        ranges: Mutex<Vec<Range<u64>>>,
     }
 
     impl CountingSource {
@@ -1599,7 +1656,13 @@ mod tests {
                 blob: Bytes::from(blob),
                 calls: AtomicUsize::new(0),
                 bytes: AtomicU64::new(0),
+                ranges: Mutex::new(Vec::new()),
             }
+        }
+
+        /// Every range asked for, in order.
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.ranges.lock().expect("ranges").clone()
         }
 
         fn calls(&self) -> usize {
@@ -1620,6 +1683,7 @@ mod tests {
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.bytes.fetch_add(len, Ordering::AcqRel);
+            self.ranges.lock().expect("ranges").push(start..start + len);
             let (s, e) = (start as usize, (start + len) as usize);
             if e > self.blob.len() {
                 return Err(LazyByteSourceError::OutOfBounds {
@@ -2481,6 +2545,93 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
+    /// Asking whether bytes are local is not a read: more probes far ahead than
+    /// there are read-end slots still leave a forward reader's next window
+    /// ahead of it. And the whole range is checked, not just its ends.
+    #[tokio::test]
+    async fn asking_whether_bytes_are_local_is_not_a_read() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        let _ = src.range(10, 100).await.expect("read blocks 0 to 7");
+        store.block_writes_settled().await;
+        let bf = src.block_file().expect("block file");
+        bf.file
+            .write_all_at(&inner.blob[24 * b as usize..32 * b as usize], 24 * b)
+            .expect("write blocks 24 to 31");
+        src.mark_filled(bf.size, 24, 31);
+        let calls = inner.calls();
+        for block in 24..32 {
+            for _ in 0..2 {
+                assert!(src.is_local(block * b, b), "block {block} is filled");
+            }
+        }
+        assert_eq!(inner.calls(), calls, "a probe downloads nothing");
+        assert!(
+            !src.is_local(7 * b, 18 * b),
+            "both ends filled, blocks between them missing"
+        );
+
+        let _ = src
+            .range(10 * b + 10, 100)
+            .await
+            .expect("a read further on");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(10, 17), "its window still goes ahead");
+        assert!(!src.all_filled(8, 9), "nothing behind it");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A reader served from what it downloaded ahead never asks the cache, so
+    /// it notes the read instead. However many other reads end past it in the
+    /// meantime, its next miss still puts the window ahead.
+    #[tokio::test]
+    async fn a_read_served_from_bytes_downloaded_ahead_keeps_its_direction() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        let _ = src.range(10, 100).await.expect("read blocks 0 to 7");
+        store.block_writes_settled().await;
+        // Other readers of the file end far ahead, more of them than there
+        // are read-end slots.
+        for _ in 0..READ_ENDS {
+            src.note_read(60 * b, b);
+        }
+        // This reader reads blocks 8 and 9 from memory.
+        src.note_read(8 * b, 2 * b);
+        let _ = src.range(10 * b + 10, 100).await.expect("its next read");
+        store.block_writes_settled().await;
+        assert!(src.all_filled(10, 17), "its window goes ahead");
+        assert!(!src.all_filled(8, 9), "nothing behind it");
+
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// Blocks downloaded but not written yet are served from memory, so they
+    /// count as local.
+    #[tokio::test]
+    async fn blocks_being_written_are_local() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, _inner, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+
+        let stall = src.stall_writes();
+        let _ = src.range(10, 100).await.expect("read blocks 0 to 7");
+        assert!(!src.all_filled(0, 7), "not written yet");
+        assert!(src.is_local(0, 8 * b), "but local");
+        assert!(!src.is_local(8 * b, b), "block 8 was never read");
+
+        drop(stall);
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
     /// A GET stops at a filled stretch longer than `FETCH_THROUGH_BLOCKS`,
     /// rather than downloading it again.
     #[tokio::test]
@@ -2627,6 +2778,80 @@ mod tests {
 
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A file of unknown layout downloads whole 512 KiB groups, and says so to
+    /// read-ahead; any other file reports blocks plus a window for a short
+    /// miss.
+    #[tokio::test]
+    async fn a_file_of_unknown_layout_reports_whole_group_downloads() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (uri, inner, src) = layout_source(
+            dir.path(),
+            &store,
+            4 * GROUP as usize,
+            SourceLayout::ALL_ALIGNED.aligned_region,
+        );
+        let blocks = src.cache_blocks().expect("cache blocks");
+        let start = GROUP + 3 * CACHE_BLOCK_BYTES + 10;
+        let read = start..start + 100;
+        assert_eq!(blocks.reach(&read), GROUP..2 * GROUP);
+        let _ = src.range(read.start, 100).await.expect("read");
+        assert_eq!(inner.fetched_bytes(), GROUP, "the group its reach names");
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+
+        let (uri, _, src) = layout_source(dir.path(), &store, 4 * GROUP as usize, None);
+        assert_eq!(
+            src.cache_blocks(),
+            Some(CacheBlocks {
+                block_bytes: CACHE_BLOCK_BYTES,
+                min_get_bytes: MIN_GET_BYTES,
+                group_bytes: GROUP,
+                grouped: (0, 0),
+            })
+        );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// What [`CacheBlocks`] says a cold miss downloads holds for the cache
+    /// itself, around a vector section that covers only part of the file: a
+    /// short and a long miss starting at every block, each on a cold file.
+    /// - every byte downloaded is inside the miss's `reach`;
+    /// - the bytes downloaded are at most its `download_len`.
+    #[tokio::test]
+    async fn cache_blocks_bound_every_miss_around_a_vector_section() {
+        let b = CACHE_BLOCK_BYTES;
+        let size = 8 * GROUP;
+        // Starts and ends mid-group, so both edges round out.
+        let region = (2 * GROUP + 3 * b, 2 * GROUP);
+        for len in [100, 3 * b] {
+            for block in 0..(size - len) / b {
+                let dir = tempdir().expect("tempdir");
+                let store = test_store(dir.path(), u64::MAX);
+                let (uri, inner, src) =
+                    layout_source(dir.path(), &store, size as usize, Some(region));
+                let read = block * b + 10..block * b + 10 + len;
+                let blocks = src.cache_blocks().expect("cache blocks");
+                let _ = src.range(read.start, len).await.expect("read");
+                let reach = blocks.reach(&read);
+                for got in inner.ranges() {
+                    assert!(
+                        reach.start <= got.start && got.end <= reach.end.min(size),
+                        "{read:?}: downloaded {got:?}, reach {reach:?}"
+                    );
+                }
+                assert!(
+                    inner.fetched_bytes() <= blocks.download_len(&read),
+                    "{read:?}: downloaded {} bytes, download_len {}",
+                    inner.fetched_bytes(),
+                    blocks.download_len(&read)
+                );
+                store.block_writes_settled().await;
+                store.remove_block_entry_for_test(&uri);
+            }
+        }
     }
 
     /// Only the aligned region rounds to aligned groups: a small read at the end

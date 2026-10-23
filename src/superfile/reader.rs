@@ -2128,6 +2128,7 @@ impl SuperfileReader {
             None,
             rerank_mult,
             cold_rerank_mult,
+            false,
             allow,
             deny,
             pool,

@@ -26,8 +26,10 @@ use crate::{
     superfile::VectorSearchOptions,
     supertable::{
         Supertable as SupertableHandle,
+        companion::check_purpose,
         hydrate::hydrate_from_reader,
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
+        schema::{TableSchema, change::SchemaPatch},
     },
 };
 
@@ -98,6 +100,12 @@ pub(crate) trait Table: Send + Sync {
     fn index_staleness(&self, opts: &ReindexOptions) -> Result<StalenessReport, ReindexError>;
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
+    fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError>;
+    fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError>;
 
     /// Test-only: expose the concrete handle behind the trait object so tests
     /// can reach engine internals (`options`, `stats`, `reader`, …) through the
@@ -223,6 +231,18 @@ impl Table for SupertableHandle {
     }
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         SupertableHandle::gc(self, safety_gap)
+    }
+    fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError> {
+        SupertableHandle::companion(self, purpose)
+            .map(|found| found.map(Supertable::from_local))
+            .map_err(|e| InfinoError::from(e).with_context("companion", None))
+    }
+    fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        Ok((*SupertableHandle::apply_schema(self, patch, expected)?).clone())
     }
     #[cfg(any(test, feature = "test-helpers"))]
     fn as_any(&self) -> &dyn Any {
@@ -607,6 +627,64 @@ impl Supertable {
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         self.inner.gc(safety_gap)
+    }
+
+    /// The hidden companion table of `purpose` beside this table, as
+    /// declared with [`IndexSpec::companion`] when the table was created.
+    ///
+    /// - `Ok(None)` when the table has no companion of that purpose.
+    /// - `Err` when it has one that does not open. The table itself stays
+    ///   usable: a companion that fails to open never fails the table's
+    ///   open, and its error is reported here, to the caller that asks for
+    ///   it. Each ask tries the open again, so a transient failure clears
+    ///   without reopening the table.
+    /// - `Ok(Some(handle))` otherwise: a table like any other, with the
+    ///   schema and indexes the companion was declared with.
+    ///
+    /// An engine older than companions that commits the table drops the
+    /// manifest's record of them; this finds a companion whose record was
+    /// lost by its storage location, attaches it, and has the table's next
+    /// commit record it again. It attaches none, and returns `Err`, when
+    /// more than one companion of the purpose is stored there.
+    ///
+    /// Looking for an unrecorded companion lists the table's location once.
+    /// A purpose found absent is remembered on this handle, so later asks
+    /// cost nothing; a freshly opened handle lists once again. A caller on
+    /// a hot path should keep its handle rather than reopen the table.
+    ///
+    /// A create that loses a race to another create of the same table
+    /// leaves its companions' directories under the location with no table
+    /// recording them. Nothing removes them, as nothing removes the losing
+    /// create's vector index; an ask that then finds two candidates of a
+    /// purpose refuses rather than guess.
+    ///
+    /// A purpose that cannot name a companion (see
+    /// [`IndexSpec::companion`]) is refused with [`InfinoError::Config`].
+    ///
+    /// [`IndexSpec::companion`]: crate::IndexSpec::companion
+    pub fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError> {
+        check_purpose(purpose).map_err(InfinoError::Config)?;
+        self.inner.companion(purpose)
+    }
+
+    /// Change this table's schema by merging `patch` into it, as
+    /// [`Connection::apply_schema`](crate::Connection::apply_schema) does
+    /// for a table it names; returns the document the table holds
+    /// afterwards. This is how a companion's schema evolves, since a
+    /// companion has no name in the catalog: add, rename, retype or retire
+    /// its columns through its handle. A patch that changes nothing
+    /// commits nothing and reads the current document back. `expected` is
+    /// an optional compare-and-set against the current `schema_id`; it
+    /// fails with [`InfinoError::Conflict`] when the schema has moved.
+    ///
+    /// Hosted tables do not carry the schema document yet and return an
+    /// error.
+    pub fn apply_schema(
+        &self,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        self.inner.apply_schema(patch, expected)
     }
 
     /// Test-only: the underlying local engine handle. Panics for a hosted

@@ -998,6 +998,23 @@ pub(crate) fn select_eager_router_column(
 /// loosest at the smallest anchor), and skips the pin only for `auto` tables
 /// that route `stamped` at every `k` — the wasteful case this guards against.
 /// Resident inputs only (no I/O), matching the query-path gate.
+/// Whether this table's vector `column` is served by the centroid-graph
+/// router under the current config. Used by optimize to skip split /
+/// recalibration — the graph path walks fine centroids, not the coarse grid,
+/// so growing or recalibrating the grid is dead-weight (and the grid is frozen
+/// at its create-time size by design). Mirrors the query-time router choice.
+pub(crate) fn serves_via_graph(manifest: &ManifestSnapshot, column: &str) -> bool {
+    let vcfg = &config::global().vector;
+    if vcfg.search_mode != config::VectorSearchMode::Ivf {
+        return false;
+    }
+    match vcfg.ivf_router {
+        config::IvfRouter::CentroidGraph => true,
+        config::IvfRouter::Stamped => false,
+        config::IvfRouter::Auto => auto_prefers_centroid_graph(manifest, column, vcfg),
+    }
+}
+
 pub(crate) fn auto_prefers_centroid_graph(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -1097,6 +1114,31 @@ fn resolve_ivf_router(
 /// selecting `centroid_graph` where the calibrated fanout is not actually a
 /// concentrated subset of the routable clusters. Counting only cells with at
 /// least one indexed doc realigns the denominator with the calibration input.
+/// Coefficient `c` in the deterministic coverage fanout `c·√n_fine` for the
+/// centroid-graph path — fit to deep1b's coverage knee (`c·√115000 ≈ 1024` at
+/// 1B, the validated point). PROVISIONAL: being finalized from the 1M/10M/1B
+/// coverage-knee sweep.
+const CENTROID_GRAPH_FANOUT_SQRT_COEFF: f64 = 3.0;
+/// Minimum deterministic graph fanout, so small tables still scan enough fine
+/// clusters for coverage (clamped to the cluster count for tiny tables).
+const CENTROID_GRAPH_FANOUT_FLOOR: usize = 32;
+
+/// Deterministic coverage fanout for the centroid-graph path: scan about
+/// `CENTROID_GRAPH_FANOUT_SQRT_COEFF · √n_fine` fine clusters, clamped to
+/// `[floor, n_fine]`. Replaces the calibrated `fanout_for_k` stamp — optimize
+/// no longer recalibrates under graph serving — so fanout needs no per-table
+/// measurement. The coverage knee scales ~√(fine clusters) (measured: ~56% of
+/// clusters at 1M, ~22% at 10M, ~1.8% at 1B); the coefficient is fit to the
+/// hard case (deep1b) so easier data is over-provisioned — recall met, a
+/// little more latency, the safe direction.
+fn graph_fanout_for_fine_clusters(n_fine: usize) -> usize {
+    if n_fine == 0 {
+        return CENTROID_GRAPH_FANOUT_FLOOR;
+    }
+    let f = (CENTROID_GRAPH_FANOUT_SQRT_COEFF * (n_fine as f64).sqrt()).round() as usize;
+    f.clamp(CENTROID_GRAPH_FANOUT_FLOOR.min(n_fine), n_fine)
+}
+
 pub(crate) fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
     let Some(id) = manifest.field_id(column) else {
         return 0;
@@ -4416,6 +4458,24 @@ impl SupertableReader {
         let rerank_mult = options
             .rerank_mult()
             .unwrap_or(config::global().vector.global_fine_rerank_mult);
+        // Grid-independent per-cluster rerank budget + rerank-all: each
+        // scanned fine cluster keeps `k·rerank_mult` candidates (pool =
+        // `fanout·k·rerank_mult`, independent of the coarse grid) and the
+        // whole pool is exact-reranked, instead of a per-cell budget cut by
+        // a global 1-bit shortlist. `false` restores the legacy per-cell
+        // budget + global 1-bit cut.
+        let per_cluster = config::global().vector.global_fine_per_cluster_budget;
+        // Pool floor: at small N, `fanout` (≈√fine-clusters) is tiny, so
+        // `fanout·k·rerank_mult` under-reranks and recall turns depth-limited.
+        // Boost the per-cluster budget so the pooled — and fully reranked —
+        // count stays ≥ the configured floor. The floor binds only at small N;
+        // large tables already pool above it, so it's a no-op there.
+        let pool_floor = config::global().vector.global_fine_rerank_pool_floor;
+        let effective_rerank_mult = if per_cluster {
+            rerank_mult.max(pool_floor.div_ceil(k.max(1).saturating_mul(fanout.max(1))))
+        } else {
+            rerank_mult
+        };
 
         // Phase 1: build the global candidate pool. Scores are comparable
         // across cells/superfiles (one metric + one query), so a single
@@ -4552,8 +4612,9 @@ impl SupertableReader {
                         k,
                         &fetch,
                         score_only.as_deref(),
-                        rerank_mult,
-                        rerank_mult,
+                        effective_rerank_mult,
+                        effective_rerank_mult,
+                        per_cluster,
                         None,
                         None,
                         Some(pool),
@@ -4607,7 +4668,11 @@ impl SupertableReader {
             // fanout law (routed fanout x cluster size) — recall is the side we protect
             // here, and latency is bounded by the fanout knob upstream, not by capping this
             // shortlist.
-            let shortlist_limit = global_fine_shortlist_limit(k, rerank_mult, pooled.len());
+            let shortlist_limit = if per_cluster {
+                pooled.len()
+            } else {
+                global_fine_shortlist_limit(k, rerank_mult, pooled.len())
+            };
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
@@ -4988,23 +5053,20 @@ impl SupertableReader {
         // L2Sq by squared distance), so it engages for any metric.
         // Fanout precedence. The default config value
         // ([`config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT`]) and an explicit `0`
-        // both DEFER to the per-table calibrated `fanout_for_k` stamp — a drain
-        // stamps `width × fine` (clamped to the table's cluster count) per k, so
-        // a ~1M table no longer over-reads to a full scan — and fall back to the
-        // default only when the table carries no stamp, so an engaged graph on
-        // an unstamped table never resolves to 0. Any OTHER explicit value
-        // overrides the stamp (manual tuning / fanout sweeps), capped at
-        // `centroid_graph_max_fanout` so one config line cannot drive
-        // `fanout × rerank_mult` into a runaway exact rerank. The default path
-        // is byte-identical to the pre-override behaviour (stamp wins, else the
-        // 1024 fallback).
+        // both resolve to a DETERMINISTIC coverage fanout from the table's
+        // fine-cluster count (`graph_fanout_for_fine_clusters` ≈ c·√n_fine) —
+        // no per-table calibration, which optimize no longer runs under graph
+        // serving. Any OTHER explicit value overrides it (manual tuning /
+        // fanout sweeps), capped at `centroid_graph_max_fanout` so one config
+        // line cannot drive `fanout × rerank_mult` into a runaway exact rerank.
         let stamped_fanout = manifest
             .vector_cell_routing()
             .and_then(|routing| routing.fanout_for_k_at(k));
         let default_fanout = config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT;
         let resolved_fanout =
             if vcfg.global_fine_fanout == 0 || vcfg.global_fine_fanout == default_fanout {
-                stamped_fanout.unwrap_or(default_fanout)
+                graph_fanout_for_fine_clusters(total_fine_clusters(manifest, column))
+                    .min(vcfg.centroid_graph_max_fanout)
             } else {
                 vcfg.global_fine_fanout.min(vcfg.centroid_graph_max_fanout)
             };
