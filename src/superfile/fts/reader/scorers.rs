@@ -157,35 +157,40 @@ pub(super) struct BoundClaim {
 const DEMOTE_DENSITY: f32 = 8.0;
 
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
-/// `docs[i]` the term contains, scoring matches in SIMD batches rather than one
-/// at a time. `docs` must be ascending — `bitset_probe_tf` advances the cursor
-/// monotonically. Only touches matched survivors.
-fn score_noness_batched(c: &mut TermCursor, docs: &[u32], scores: &mut [f32], dl_norm: &NormTable) {
-    const L: usize = bm25::SCORE_SIMD_LANES;
-    let mut n = 0usize;
-    let mut bidx = [0usize; L];
-    let mut btf = [0u32; L];
-    let mut bnorm = [0f32; L];
-    let mut tfs = vec![0u32; docs.len()];
-    c.probe_tfs(docs, &mut tfs);
-    for (i, &doc) in docs.iter().enumerate() {
-        let tf = tfs[i];
-        if tf != 0 {
-            bidx[n] = i;
-            btf[n] = tf;
-            bnorm[n] = dl_norm.get(doc);
-            n += 1;
-            if n == L {
-                let contrib = bm25::score_one_term_x4(c.idf_weight, btf, bnorm);
-                for l in 0..L {
-                    scores[bidx[l]] += contrib[l];
-                }
-                n = 0;
-            }
+/// `docs[i]` the term contains, eight per SIMD call. `docs` must be ascending:
+/// the probe advances the cursor monotonically. Every survivor is scored and
+/// added without a branch on whether the term holds it, which the predictor
+/// cannot learn: a tf of 0 scores exactly 0, so it leaves the sum unchanged.
+/// `tfs` is scratch.
+fn score_noness_batched(
+    c: &mut TermCursor,
+    docs: &[u32],
+    scores: &mut [f32],
+    dl_norm: &NormTable,
+    tfs: &mut Vec<u32>,
+) {
+    tfs.clear();
+    tfs.resize(docs.len(), 0);
+    c.probe_tfs(docs, tfs);
+    let scores = &mut scores[..docs.len()];
+    let mut i = 0usize;
+    while i + 8 <= docs.len() {
+        let dids: [u32; 8] = docs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let tf8: [u32; 8] = tfs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let add = bm25::score_one_term_x8(c.idf_weight, tf8, dids.map(|d| dl_norm.get(d)));
+        for (s, a) in scores[i..i + 8].iter_mut().zip(add) {
+            *s += a;
         }
+        i += 8;
     }
-    for l in 0..n {
-        scores[bidx[l]] += bm25::score_with_dl_norm_k1(c.idf_weight, btf[l], bnorm[l]);
+    for ((s, &d), &tf) in scores[i..].iter_mut().zip(&docs[i..]).zip(&tfs[i..]) {
+        if tf != 0 {
+            *s += bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm.get(d));
+        }
     }
 }
 
@@ -2712,6 +2717,8 @@ impl FtsReader {
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
+        // The non-essentials' tfs at the window's survivors, reused.
+        let mut noness_tfs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
         let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
         // Per-window block-level upper bounds and their suffix sums, in the
         // same term-max order as `partial_max`.
@@ -2841,7 +2848,13 @@ impl FtsReader {
                         if win_docs.is_empty() {
                             break;
                         }
-                        score_noness_batched(c, &win_docs, &mut win_scores, dl_norm_k1);
+                        score_noness_batched(
+                            c,
+                            &win_docs,
+                            &mut win_scores,
+                            dl_norm_k1,
+                            &mut noness_tfs,
+                        );
                     }
                     for (&doc, &score) in win_docs.iter().zip(&win_scores) {
                         if heap.offer(k, &mut threshold, score, doc) && total_term_ub <= threshold {
@@ -3229,11 +3242,23 @@ impl FtsReader {
                     if win_docs.is_empty() {
                         break;
                     }
-                    score_noness_batched(&mut non_ess[jj], &win_docs, &mut win_scores, dl_norm_k1);
+                    score_noness_batched(
+                        &mut non_ess[jj],
+                        &win_docs,
+                        &mut win_scores,
+                        dl_norm_k1,
+                        &mut noness_tfs,
+                    );
                 }
             } else {
                 for c in non_ess.iter_mut() {
-                    score_noness_batched(c, &win_docs, &mut win_scores, dl_norm_k1);
+                    score_noness_batched(
+                        c,
+                        &win_docs,
+                        &mut win_scores,
+                        dl_norm_k1,
+                        &mut noness_tfs,
+                    );
                 }
             }
 
