@@ -2690,6 +2690,7 @@ impl FtsReader {
         let mut present = [0u64; OR_WINDOW_WORDS];
         // Leader-block positions that survive the batch bar, reused per block.
         let mut survivors: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
+        let mut leader_scores = [0.0f32; BLOCK_LEN];
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
@@ -2771,24 +2772,72 @@ impl FtsReader {
                             dids.map(|d| dl_norm_k1.get(d)),
                         );
                         for (l, &score) in lanes.iter().enumerate() {
+                            leader_scores[i + l] = score;
                             survivors.push((i + l) as u16);
                             let keep = score + block_others_ub > threshold;
                             survivors.truncate(survivors.len() - usize::from(!keep));
                         }
                         i += 8;
                     }
-                    for j in i..to {
-                        let score = bm25::score_with_dl_norm_k1(
-                            c.idf_weight,
-                            c.block_tfs[j],
-                            dl_norm_k1.get(c.block_doc_ids[j]),
-                        );
+                    let tail = c.block_doc_ids[i..to].iter().zip(&c.block_tfs[i..to]);
+                    for (j, (slot, (&d, &tf))) in
+                        (i..).zip(leader_scores[i..to].iter_mut().zip(tail))
+                    {
+                        let score =
+                            bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm_k1.get(d));
+                        *slot = score;
                         if score + block_others_ub > threshold {
                             survivors.push(j as u16);
                         }
                     }
+                    // Complete the survivors the way a window drain does:
+                    // strongest non-essential first, the survivors re-filtered
+                    // against the bound of the clauses still unprobed, each
+                    // term probed for the whole list in one sorted pass.
+                    let start = cursors[0].current_doc_id();
+                    let end = cursors[0].current_block_last_doc_id();
+                    let (ess, non_ess) = cursors.split_at_mut(1);
+                    let c0 = &mut ess[0];
+                    win_docs.clear();
+                    win_scores.clear();
+                    for &at in survivors.iter() {
+                        let d = c0.block_doc_ids[usize::from(at)];
+                        if d >= doc_id_end {
+                            break;
+                        }
+                        win_docs.push(d);
+                        win_scores.push(leader_scores[usize::from(at)]);
+                    }
+                    let m = non_ess.len();
+                    noness_suffix[m] = 0.0;
+                    for i in (0..m).rev() {
+                        noness_suffix[i] =
+                            noness_suffix[i + 1] + non_ess[i].block_max_in_range(start, end);
+                    }
+                    for (jj, c) in non_ess.iter_mut().enumerate() {
+                        let sv = filter_survivors(
+                            &mut win_docs,
+                            &mut win_scores,
+                            threshold - noness_suffix[jj],
+                        );
+                        win_docs.truncate(sv);
+                        win_scores.truncate(sv);
+                        if win_docs.is_empty() {
+                            break;
+                        }
+                        score_noness_batched(c, &win_docs, &mut win_scores, dl_norm_k1);
+                    }
+                    for (&doc, &score) in win_docs.iter().zip(&win_scores) {
+                        if heap.offer(k, &mut threshold, score, doc) && total_term_ub <= threshold {
+                            // Not even every term at its maximum can beat the
+                            // bar now: no later doc can either.
+                            break;
+                        }
+                    }
+                    let rest = c0.block_n - c0.pos;
+                    c0.advance_by(rest);
+                    continue;
                 }
-                let mut next_survivor = 0usize;
                 let block_end = cursors[0].current_block_last_doc_id();
                 let (ess, non_ess) = cursors.split_at_mut(1);
                 let c0 = &mut ess[0];
@@ -2805,28 +2854,6 @@ impl FtsReader {
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
                 {
-                    if batched {
-                        // Jump to the next survivor, or past the block.
-                        match survivors.get(next_survivor) {
-                            Some(&at) => {
-                                next_survivor += 1;
-                                let at = usize::from(at);
-                                if at > c0.pos {
-                                    c0.advance_by(at - c0.pos);
-                                }
-                            }
-                            None => {
-                                c0.advance_by(c0.block_n - c0.pos);
-                                break;
-                            }
-                        }
-                        if c0.is_exhausted()
-                            || c0.current_doc_id() > block_end
-                            || c0.current_doc_id() >= doc_id_end
-                        {
-                            break;
-                        }
-                    }
                     let candidate = c0.current_doc_id();
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(candidate)

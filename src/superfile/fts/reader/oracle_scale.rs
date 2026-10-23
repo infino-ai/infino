@@ -330,6 +330,24 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 }
             }
         }
+        // Unions with an excluded term at small `k`: an exclusion keeps the
+        // single-leader walk on its per-candidate path, which the batched
+        // leader block otherwise takes over once the heap is full.
+        // A strong term with weak ones, so the walk has a single leader.
+        for shoulds in [
+            &["stone", "the"][..],
+            &["quartz", "of", "and"],
+            &["river", "the"],
+        ] {
+            for k in [10, 50] {
+                queries.push(Query {
+                    shoulds: shoulds.iter().map(|w| w.to_string()).collect(),
+                    negatives: vec!["onyx".to_string()],
+                    k,
+                    ..Query::default()
+                });
+            }
+        }
         for (qi, q) in queries.into_iter().enumerate() {
             let label = format!("corpus {ci} ({n_docs} docs) query {qi}: {q:?}");
             let want = oracle.top_k_atoms(
