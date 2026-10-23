@@ -307,6 +307,16 @@ impl IndexSpec {
     /// `create_table` only; one cannot be added to an existing table.
     /// A `memory://` or hosted connection refuses a spec with companions.
     ///
+    /// A companion is strictly optional, and the engine never interprets
+    /// what it holds. The engine guarantees three things: the companion is
+    /// hidden from the catalog, it shares the table's lifecycle, and it
+    /// keeps the schema it was declared or patched with. Everything else
+    /// belongs to the component that creates it: what its purpose means,
+    /// what its rows say, when they are written, and any consistency it
+    /// keeps with the table's own rows (writing the table's new rows before
+    /// it removes old ones, say). No engine operation reads a companion or
+    /// depends on its contents.
+    ///
     /// Every engine that writes the table must be at least the version
     /// that created it. An older one does not know the manifest field
     /// naming the companions and drops it on its next commit; the
