@@ -2295,9 +2295,13 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
     let mut anchor = cursors.swap_remove(anchor_idx);
     let mut n = anchor.df;
     // The rarer cursors' docs, one window at a time, deduplicated by the
-    // window bitmap; each distinct doc then costs one membership test of the
-    // anchor, in ascending order.
+    // window bitmap. A window holding few of them tests each against the
+    // anchor; a window holding many reads the anchor's own window from its
+    // blocks and counts the rarer docs it lacks a word at a time.
     let mut present = [0u64; OR_WINDOW_WORDS];
+    let mut anchor_win = [0u64; OR_WINDOW_WORDS];
+    let mut anchor_block = 0usize;
+    let mut scratch = [0u32; BLOCK_LEN];
     loop {
         let mut min_doc = u32::MAX;
         for c in &cursors {
@@ -2312,6 +2316,21 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         let window_end = base.saturating_add(OR_WINDOW);
         for c in &mut cursors {
             mark_window(c, base, window_end, &mut present);
+        }
+        let marked: u32 = present.iter().map(|w| w.count_ones()).sum();
+        if marked >= ANCHOR_WINDOW_MIN_DOCS {
+            anchor_win.fill(0);
+            or_blocks_into_window(
+                &anchor,
+                &mut anchor_block,
+                base,
+                &mut anchor_win,
+                &mut scratch,
+            );
+            for (w, a) in present.iter_mut().zip(&anchor_win) {
+                n += u64::from((std::mem::take(w) & !a).count_ones());
+            }
+            continue;
         }
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
@@ -2329,6 +2348,81 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         }
     }
     n
+}
+
+/// Rarer-term docs in a window at which the anchored count reads the
+/// anchor's window from its blocks rather than testing each doc: a dense
+/// anchor covers a window in a few dozen blocks, whose presence words cost
+/// less than this many membership tests.
+const ANCHOR_WINDOW_MIN_DOCS: u32 = 64;
+
+/// OR `c`'s docs in the window `[base, base + OR_WINDOW)` into `dest` (bit 0
+/// is doc `base`), from its blocks rather than by walking it: a bitset block's
+/// presence words are copied, a run block is set as a range, a packed block is
+/// decoded and scattered. `from_block` is the first block that may reach the
+/// window; it advances past blocks that end before it, so windows must come
+/// in ascending order.
+fn or_blocks_into_window(
+    c: &TermCursor,
+    from_block: &mut usize,
+    base: u32,
+    dest: &mut [u64; OR_WINDOW_WORDS],
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    let end = base.saturating_add(OR_WINDOW);
+    let mark = |dest: &mut [u64; OR_WINDOW_WORDS], d: u32| {
+        if d >= base && d < end {
+            let local = d - base;
+            dest[(local >> 6) as usize] |= 1u64 << (local & 63);
+        }
+    };
+    if c.predecoded {
+        for &d in &c.block_doc_ids[..c.block_n] {
+            mark(dest, d);
+        }
+        return;
+    }
+    while *from_block < c.blocks.len() && c.blocks[*from_block].last_doc_id < base {
+        *from_block += 1;
+    }
+    let base_word = (base / 64) as usize;
+    for b in *from_block..c.blocks.len() {
+        let first = match b {
+            0 => 0,
+            _ => c.blocks[b - 1].last_doc_id + 1,
+        };
+        if first >= end {
+            break;
+        }
+        let block = c.blocks[b];
+        let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
+        let hdr = c.block_header(b);
+        if hdr.encoding == ENCODING_BITSET {
+            debug_assert_eq!(hdr.base % 64, 0, "a bitset block starts on a word");
+            let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
+            let block_word = (hdr.base / 64) as usize;
+            for (i, chunk) in presence.chunks_exact(8).enumerate() {
+                let Some(wi) = (block_word + i).checked_sub(base_word) else {
+                    continue;
+                };
+                if wi >= OR_WINDOW_WORDS {
+                    break;
+                }
+                dest[wi] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+            }
+        } else if hdr.encoding == ENCODING_RUN {
+            let lo = hdr.base.max(base);
+            let hi = (hdr.base + hdr.count() as u32).min(end);
+            if lo < hi {
+                set_bit_range(dest, lo - base, hi - base);
+            }
+        } else {
+            let n = decode_block_doc_ids(bytes, &hdr, scratch);
+            for &d in &scratch[..n] {
+                mark(dest, d);
+            }
+        }
+    }
 }
 
 /// Document `d`'s stored length from a doc-lengths array of `u16`
