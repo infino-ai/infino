@@ -750,25 +750,20 @@ fn and_membership_scored_batched<S: AndSink>(
         let (from, to) = (driver.pos, driver.block_n);
         docs.clear();
         scores.clear();
-        // Four lanes per call: the same operations in the same order as
+        // Eight lanes per call: the same operations in the same order as
         // the scalar score, so the same bits.
         let mut j = from;
-        while j + bm25::SCORE_SIMD_LANES <= to {
-            let d = &driver.block_doc_ids[j..j + bm25::SCORE_SIMD_LANES];
-            let t = &driver.block_tfs[j..j + bm25::SCORE_SIMD_LANES];
-            let lanes = bm25::score_one_term_x4(
-                driver.idf_weight,
-                [t[0], t[1], t[2], t[3]],
-                [
-                    dl_norm_k1.get(d[0]),
-                    dl_norm_k1.get(d[1]),
-                    dl_norm_k1.get(d[2]),
-                    dl_norm_k1.get(d[3]),
-                ],
-            );
-            docs.extend_from_slice(d);
+        while j + 8 <= to {
+            let d: [u32; 8] = driver.block_doc_ids[j..j + 8]
+                .try_into()
+                .expect("invariant: an 8-wide slice");
+            let t: [u32; 8] = driver.block_tfs[j..j + 8]
+                .try_into()
+                .expect("invariant: an 8-wide slice");
+            let lanes = bm25::score_one_term_x8(driver.idf_weight, t, dl_norm_k1.get8(d));
+            docs.extend_from_slice(&d);
             scores.extend_from_slice(&lanes);
-            j += bm25::SCORE_SIMD_LANES;
+            j += 8;
         }
         for j in j..to {
             let d = driver.block_doc_ids[j];
