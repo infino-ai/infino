@@ -792,3 +792,42 @@ fn many_terms_are_served_up_to_the_mask_width() {
         }
     }
 }
+
+/// A per-query parameter override scores off the declared parameters the
+/// tiers hold impacts at: such a query keeps its ceilings, and answers as
+/// the table without tiers does under the same override.
+#[test]
+fn a_parameter_override_keeps_the_ceilings() {
+    let with_dir = TempDir::new().expect("tempdir");
+    let without_dir = TempDir::new().expect("tempdir");
+    let with = table(&with_dir, true);
+    let without = table(&without_dir, false);
+    let hits_of = |st: &Supertable| {
+        with_op_stats(|| {
+            st.reader()
+                .expect("reader")
+                .bm25_hits(
+                    "body",
+                    "the data",
+                    10,
+                    Bm25SearchOptions::new()
+                        .with_mode(BoolMode::Or)
+                        .with_bm25(0.9, 0.3),
+                )
+                .expect("search")
+                .iter()
+                .map(|h| (h.local_doc_id, h.score))
+                .collect::<Vec<_>>()
+        })
+    };
+    let (a, stats) = hits_of(&with);
+    let (b, _) = hits_of(&without);
+    assert!(!a.is_empty());
+    assert_eq!(a.len(), b.len());
+    assert_eq!(
+        a.iter().map(|h| h.1).collect::<Vec<_>>(),
+        b.iter().map(|h| h.1).collect::<Vec<_>>(),
+        "same scores under the override"
+    );
+    assert_eq!(stats.tier_entries, 0, "the tiers do not serve an override");
+}
