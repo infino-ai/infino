@@ -16,6 +16,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use wide::i32x8;
 
 use super::{
     bounds::BoundDecoder,
@@ -582,6 +583,12 @@ fn probe_by_bitmap(ids: &[u32], tfs: &[u32], targets: &[u32], out: &mut [u32]) -
 /// Postings per candidate at or under which the phrase filter ranks a
 /// packed block's candidates by bitmap rather than merging.
 const FILTER_BITMAP_RATIO: usize = 16;
+
+/// A doc id as a signed lane that orders as the unsigned id does.
+#[inline(always)]
+fn order_key(doc: u32) -> i32 {
+    (doc ^ 0x8000_0000) as i32
+}
 
 /// How far ahead [`TermCursor::probe_tfs`] looks before it bisects a
 /// packed block rather than stepping: past this many docs behind the
@@ -1337,6 +1344,22 @@ impl TermCursor {
                 // stepping through it.
                 if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
                     p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);
+                }
+                // Eight postings at a time: the sorted lanes below the target
+                // form a prefix, so its popcount is how far to move, one
+                // compare where stepping would take a branch per posting.
+                while p + 8 <= n {
+                    let lanes: [u32; 8] = ids[p..p + 8]
+                        .try_into()
+                        .expect("invariant: an 8-wide slice");
+                    let below = i32x8::from(lanes.map(order_key))
+                        .simd_lt(i32x8::splat(order_key(t)))
+                        .to_bitmask()
+                        .count_ones() as usize;
+                    p += below;
+                    if below < 8 {
+                        break;
+                    }
                 }
                 while p < n && ids[p] < t {
                     p += 1;
