@@ -434,6 +434,107 @@ pub(super) fn offer_top_k(
     true
 }
 
+/// A top-`k` collector a ranked kernel is generic over: the heap, which
+/// raises the bar on every admission, or the buffer, which raises it in
+/// steps and costs no sift per admission.
+pub(super) trait Collector: Sized {
+    fn with_capacity(k: usize, capacity: usize) -> Self;
+    /// Whether `k` entries have been admitted, so the bar is a real k-th best.
+    fn is_full(&self, k: usize) -> bool;
+    /// Offer `(score, doc)`; see [`offer_top_k`] for the admission rule. Returns
+    /// whether the bar was set or rose.
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool;
+    /// The best `k`, by descending score and ascending doc on a tie.
+    fn into_sorted(self) -> Vec<(FtsDocId, f32)>;
+}
+
+impl Collector for BinaryHeap<TopKEntry> {
+    fn with_capacity(_k: usize, capacity: usize) -> Self {
+        BinaryHeap::with_capacity(capacity)
+    }
+    #[inline]
+    fn is_full(&self, k: usize) -> bool {
+        self.len() >= k
+    }
+    #[inline]
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool {
+        offer_top_k(self, k, threshold, score, doc)
+    }
+    fn into_sorted(self) -> Vec<(FtsDocId, f32)> {
+        drain_top_k_desc(self)
+    }
+}
+
+/// The best `k` entries offered, kept in an unordered buffer cut back to the
+/// best `k` by selection whenever it outgrows them by [`TopKBuffer::slack`].
+/// A heap pays a `log k`-step sift for every admission, which at a large `k`
+/// with a low bar is most of them; the buffer pays an append, and a linear
+/// selection per `slack` appends. Its bar is the k-th best at the last cut:
+/// never above the true k-th best, so pruning against it stays safe, and
+/// refreshed often enough (`slack` is `k / 4`) that it trails closely.
+pub(super) struct TopKBuffer {
+    k: usize,
+    buf: Vec<TopKEntry>,
+    full: bool,
+}
+
+impl TopKBuffer {
+    /// Appends between cuts once full.
+    fn slack(k: usize) -> usize {
+        (k / TOPK_BUFFER_SLACK_DIVISOR).max(1)
+    }
+
+    /// Keep the best `k` and return the k-th best's score.
+    fn cut(&mut self, k: usize) -> f32 {
+        if self.buf.len() > k {
+            self.buf.select_nth_unstable(k - 1);
+            self.buf.truncate(k);
+        }
+        self.buf.iter().max().expect("k > 0 entries").0
+    }
+}
+
+/// [`TopKBuffer`] cuts once it holds `k + k / this` entries.
+const TOPK_BUFFER_SLACK_DIVISOR: usize = 4;
+
+impl Collector for TopKBuffer {
+    fn with_capacity(k: usize, capacity: usize) -> Self {
+        Self {
+            k,
+            // `k` may stand for "every hit" (`usize::MAX`): size from the
+            // caller's bounded estimate, never from `k` itself.
+            buf: Vec::with_capacity(capacity),
+            full: false,
+        }
+    }
+    #[inline]
+    fn is_full(&self, _k: usize) -> bool {
+        self.full
+    }
+    #[inline]
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool {
+        if k == 0 || (self.full && score <= *threshold) {
+            return false;
+        }
+        self.buf.push(TopKEntry(score, FtsDocId::new(doc)));
+        let due = match self.full {
+            false => self.buf.len() == k,
+            true => self.buf.len() >= k.saturating_add(Self::slack(k)),
+        };
+        if !due {
+            return false;
+        }
+        self.full = true;
+        *threshold = self.cut(k).max(*threshold);
+        true
+    }
+    fn into_sorted(mut self) -> Vec<(FtsDocId, f32)> {
+        self.buf.sort_unstable();
+        self.buf.truncate(self.k);
+        self.buf.into_iter().map(|e| (e.1, e.0)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +641,43 @@ mod tests {
         );
         heap.pop();
         assert_eq!(heap.peek().map(|e| e.1.get()), Some(3));
+    }
+
+    #[test]
+    fn the_buffered_collector_keeps_what_the_heap_keeps() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        // `usize::MAX` stands for "every hit" and must neither overflow nor cut.
+        for k in [1usize, 2, 7, 64, 512, 1000, usize::MAX] {
+            for floor in [0.0f32, 3.0] {
+                let mut heap: BinaryHeap<TopKEntry> = Collector::with_capacity(k, 0);
+                let mut buf = TopKBuffer::with_capacity(k, 0);
+                let (mut bar_h, mut bar_b) = (floor, floor);
+                // Ascending docs, as every kernel offers them, with heavy ties.
+                for doc in 0..5 * k.min(1000) as u32 + 37 {
+                    let score = rng(64) as f32 / 8.0;
+                    heap.offer(k, &mut bar_h, score, doc);
+                    buf.offer(k, &mut bar_b, score, doc);
+                    assert!(bar_b <= bar_h, "the buffer's bar never passes the heap's");
+                }
+                let want = heap.into_sorted();
+                let got = buf.into_sorted();
+                // Entries under a seeded floor may sit in either (a floor only
+                // prunes); the ones above it must agree exactly.
+                let above = |v: &[(FtsDocId, f32)]| -> Vec<(u32, f32)> {
+                    v.iter()
+                        .filter(|e| e.1 > floor)
+                        .map(|e| (e.0.get(), e.1))
+                        .collect()
+                };
+                assert_eq!(above(&got), above(&want), "k={k} floor={floor}");
+            }
+        }
     }
 
     #[test]
