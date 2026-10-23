@@ -48,11 +48,16 @@ use crate::runtime_bridge::bridge_sync_to_async_send;
 
 /// How a cache sizes its download for a miss: whole `block_bytes` blocks, and
 /// at least `min_get_bytes`. A shorter miss grows to a window around it, which
-/// can reach behind the miss as well as ahead.
+/// can reach behind the miss as well as ahead. An end of a miss that falls in
+/// `grouped` (the groups touching a vector section) rounds out to a whole group
+/// of `group_bytes` instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CacheBlocks {
     pub block_bytes: u64,
     pub min_get_bytes: u64,
+    pub group_bytes: u64,
+    /// Byte range `(start, end)`; `(0, 0)` when the file has no such section.
+    pub grouped: (u64, u64),
 }
 
 impl CacheBlocks {
@@ -65,18 +70,37 @@ impl CacheBlocks {
     ///   |<-- spare -->[ miss's blocks ]<-- spare -->|
     /// ```
     pub fn reach(&self, range: &Range<u64>) -> Range<u64> {
-        let start = range.start / self.block_bytes * self.block_bytes;
-        let end = range.end.div_ceil(self.block_bytes) * self.block_bytes;
-        let spare = self.min_get_bytes.saturating_sub(end - start);
-        start.saturating_sub(spare)..end + spare
+        let blocks = self.rounded(range);
+        let spare = self.min_get_bytes.saturating_sub(blocks.end - blocks.start);
+        self.rounded(&(blocks.start.saturating_sub(spare)..blocks.end + spare))
     }
 
     /// The most bytes one cold miss of `range` downloads: its blocks, or one
-    /// `min_get_bytes` window if that's more.
+    /// `min_get_bytes` window if that's more. A window that runs into a group
+    /// takes the whole group, so near one it's all of [`Self::reach`].
     pub fn download_len(&self, range: &Range<u64>) -> u64 {
-        let start = range.start / self.block_bytes * self.block_bytes;
-        let end = range.end.div_ceil(self.block_bytes) * self.block_bytes;
-        (end - start).max(self.min_get_bytes)
+        let blocks = self.rounded(range);
+        let window = (blocks.end - blocks.start).max(self.min_get_bytes);
+        let reach = self.reach(range);
+        if reach.start < self.grouped.1 && self.grouped.0 < reach.end {
+            window.max(reach.end - reach.start)
+        } else {
+            window
+        }
+    }
+
+    /// `range` with each end rounded out to its block, or to its group inside
+    /// `grouped`, the way the cache rounds a miss.
+    fn rounded(&self, range: &Range<u64>) -> Range<u64> {
+        let unit = |at: u64| {
+            if (self.grouped.0..self.grouped.1).contains(&at) {
+                self.group_bytes
+            } else {
+                self.block_bytes
+            }
+        };
+        let (first, last) = (unit(range.start), unit(range.end.saturating_sub(1)));
+        range.start / first * first..range.end.div_ceil(last) * last
     }
 }
 
@@ -140,6 +164,11 @@ pub trait LazyByteSource: Send + Sync {
     async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
         self.range(start, len).await
     }
+
+    /// Count `[start, start + len)` as read, for a reader served those bytes
+    /// from what it downloaded ahead, so a cache that tracks which way reads
+    /// move still follows it. Downloads nothing. Does nothing by default.
+    fn note_read(&self, _start: u64, _len: u64) {}
 
     /// How the cache in front of the object sizes a miss's download, so a
     /// caller reading ahead can keep clear of other reads' downloads. `None`
@@ -610,6 +639,12 @@ impl LazyByteSource for LazySubSource {
     fn is_local(&self, start: u64, len: u64) -> bool {
         start.saturating_add(len) <= self.len && self.inner.is_local(self.offset + start, len)
     }
+
+    fn note_read(&self, start: u64, len: u64) {
+        if start.saturating_add(len) <= self.len {
+            self.inner.note_read(self.offset + start, len);
+        }
+    }
 }
 
 /// Prefetched overlay: — overlay that serves pre-fetched byte ranges
@@ -715,6 +750,10 @@ impl LazyByteSource for PrefetchedSource {
             return Ok(b);
         }
         self.inner.range_ahead(start, len).await
+    }
+
+    fn note_read(&self, start: u64, len: u64) {
+        self.inner.note_read(start, len);
     }
 
     fn cache_blocks(&self) -> Option<CacheBlocks> {

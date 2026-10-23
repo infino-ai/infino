@@ -1661,6 +1661,11 @@ impl LazyByteSource for HoleFallbackSource {
             && (hole_end == end || self.local.is_local(hole_end, end - hole_end))
     }
 
+    fn note_read(&self, start: u64, len: u64) {
+        self.local.note_read(start, len);
+        self.fallback.note_read(start, len);
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if len == 0 {
             return Some(Bytes::new());

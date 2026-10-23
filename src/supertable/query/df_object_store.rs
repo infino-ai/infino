@@ -141,6 +141,16 @@ impl SuperfileObjectStore {
         self.source(location).ok()?.cache_room_ahead(bytes)
     }
 
+    /// Count `ranges` of `location` as read, for a reader served them from
+    /// bytes it downloaded ahead. See [`LazyByteSource::note_read`].
+    pub(crate) fn note_reads(&self, location: &ObjPath, ranges: &[Range<u64>]) {
+        if let Ok(source) = self.source(location) {
+            for range in ranges {
+                source.note_read(range.start, range.end - range.start);
+            }
+        }
+    }
+
     /// Whether all of `range` in `location` can be read without a download.
     /// See [`LazyByteSource::is_local`]: it copies nothing and isn't counted
     /// as a read.
@@ -283,9 +293,9 @@ async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsRes
 
 /// How the store merges `ranges` into reads: sorted, and merged where the
 /// gap between two is at most object_store's default coalesce distance. The
-/// one merge rule for fetching, counting and charging; it matches
-/// object_store's own `coalesce_ranges` (pinned by a test), so a scan reads
-/// what it read before this store owned its `get_ranges`.
+/// one merge rule for fetching, counting and charging. It matches
+/// object_store's own `coalesce_ranges` (pinned by a test), so merging is the
+/// same as the default `get_ranges`.
 pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable_by_key(|range| range.start);

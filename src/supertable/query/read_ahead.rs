@@ -44,8 +44,15 @@
 //!
 //! Downloaded bytes are held here until the scan reads them, reserved from the
 //! connection's memory budget: at most half of it ([`BUDGET_SHARE_PERCENT`]),
-//! 16 MiB per file and 256 MiB per scan. A batch also reserves room in the
-//! disk cache's write queue first, so the cache keeps what it downloads.
+//! 16 MiB per reader (one file in one partition) and 256 MiB per scan. A batch
+//! is charged what the cache downloads for it, which can be more than the
+//! scan's bytes. It also reserves room in the disk cache's write queue first,
+//! so the cache keeps what it downloads.
+//!
+//! When anything else on the connection needs memory the budget can't give, a
+//! join's build side say, read-ahead gives back everything it holds and stays
+//! off for the rest of the scan (see [`Reclaim`]). The scan then reads those
+//! row groups itself, usually from the disk cache.
 //!
 //! # Counting
 //!
@@ -56,11 +63,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fmt,
+    fmt, mem,
     ops::Range,
     panic::resume_unwind,
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, MutexGuard, Once, OnceLock, PoisonError, Weak,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -92,11 +99,14 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::{ParquetMetaData, RowGroupMetaData},
 };
-use tokio::{spawn, task::JoinHandle};
+use tokio::{
+    spawn,
+    task::{AbortHandle, JoinHandle},
+};
 use tracing::Instrument;
 
 use crate::{
-    memory::{ConnectionMemoryBudget, Reservation},
+    memory::{ConnectionMemoryBudget, Reclaim, Reservation},
     superfile::CacheBlocks,
     supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
 };
@@ -105,9 +115,9 @@ use crate::{
 /// one downloads; more would only hold more memory.
 const READ_AHEAD_ROW_GROUPS: usize = 2;
 
-/// Most bytes one file's reader may hold. Two row groups of the projected
-/// columns are usually a few MiB; a row group bigger than this is left to the
-/// scan.
+/// Most bytes one reader (one file in one partition) may hold. Two row groups
+/// of the projected columns are usually a few MiB; a row group bigger than
+/// this is left to the scan.
 const READ_AHEAD_MAX_BYTES: usize = 16 << 20;
 
 /// Most bytes all readers of one scan may hold, so a scan stays bounded even
@@ -142,6 +152,10 @@ pub(crate) struct ScanReadAhead {
     /// Bytes all readers of this scan hold, capped at
     /// [`READ_AHEAD_SCAN_MAX_BYTES`].
     held: AtomicUsize,
+    /// Every reader's batches, so [`Reclaim::reclaim`] can give them back.
+    batches: Mutex<Vec<Weak<Mutex<Held>>>>,
+    /// Registers the scan with the budget on its first batch.
+    registered: Once,
 }
 
 impl fmt::Debug for ScanReadAhead {
@@ -169,6 +183,8 @@ impl ScanReadAhead {
             schema,
             enabled: AtomicBool::new(true),
             held: AtomicUsize::new(0),
+            batches: Mutex::new(Vec::new()),
+            registered: Once::new(),
         }
     }
 
@@ -190,7 +206,8 @@ impl ScanReadAhead {
         self.predicate.get().map(|(predicate, _)| predicate)
     }
 
-    /// Turn read-ahead off for every reader created from now on.
+    /// Turn read-ahead off: readers created from now on never read ahead, and
+    /// readers already reading start no more batches.
     pub(crate) fn disable(&self) {
         self.enabled.store(false, Ordering::Relaxed);
     }
@@ -267,6 +284,10 @@ impl ScanReadAhead {
     /// The share is checked before and after reserving, so readers racing for
     /// the last of it can't all get through.
     fn reserve(self: &Arc<Self>, bytes: usize) -> Option<Hold> {
+        self.registered.call_once(|| {
+            let scan: Weak<ScanReadAhead> = Arc::downgrade(self);
+            self.budget.register_reclaim(scan);
+        });
         let over_share = |extra: usize| {
             self.budget.limit().is_some_and(|limit| {
                 self.budget.used().saturating_add(extra).saturating_mul(100)
@@ -279,11 +300,36 @@ impl ScanReadAhead {
         let held = Hold {
             scan: Arc::clone(self),
             bytes,
-            _reservation: self.budget.try_reserve(bytes).ok()?,
+            _reservation: self.budget.try_reserve_without_reclaim(bytes).ok()?,
         };
         self.held.fetch_add(bytes, Ordering::Relaxed);
         let over_scan_cap = self.held.load(Ordering::Relaxed) > READ_AHEAD_SCAN_MAX_BYTES;
         (!over_scan_cap && !over_share(0)).then_some(held)
+    }
+
+    /// Track a reader's batch so [`Reclaim::reclaim`] can give it back, or give
+    /// it back now if read-ahead was turned off while it was being set up.
+    fn track(&self, held: &Arc<Mutex<Held>>) {
+        let mut batches = self.batches.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.is_enabled() {
+            batches.retain(|batch| batch.strong_count() > 0);
+            batches.push(Arc::downgrade(held));
+        } else {
+            lock(held).give_back();
+        }
+    }
+}
+
+impl Reclaim for ScanReadAhead {
+    /// Turn read-ahead off and give back what every reader holds; each reader
+    /// then reads for itself. Off for the rest of the scan, so a join that
+    /// grows step by step doesn't race read-ahead for the memory.
+    fn reclaim(&self) {
+        self.disable();
+        let batches = mem::take(&mut *self.batches.lock().unwrap_or_else(PoisonError::into_inner));
+        for held in batches.iter().filter_map(Weak::upgrade) {
+            lock(&held).give_back();
+        }
     }
 }
 
@@ -383,18 +429,40 @@ struct Batch {
     row_groups: Vec<(usize, Vec<Range<u64>>)>,
     /// What the download fetches, in order (see [`fetch_spans`]).
     spans: Vec<Range<u64>>,
-    fetch: Fetch,
+    /// The download, until the scan has waited for it.
+    task: Option<JoinHandle<OsResult<Vec<Bytes>>>>,
     /// Which of `row_groups` the scan has read.
     served: Vec<bool>,
-    /// The bytes reserved for it.
-    hold: Hold,
+    /// Bytes of `spans`, counted against the reader's cap.
+    charge: usize,
+    /// What the batch holds, shared with the scan so it can give it back.
+    held: Arc<Mutex<Held>>,
 }
 
-/// A batch's download: still running, or done with the bytes of its spans
-/// (`None` if it failed or was cancelled; the scan then downloads for itself).
-enum Fetch {
-    Running(JoinHandle<OsResult<Vec<Bytes>>>),
-    Done(Option<Vec<Bytes>>),
+/// A batch's bytes and the memory reserved for them. The scan can empty it
+/// from any thread when the connection needs the memory (see
+/// [`Reclaim::reclaim`]); the reader then reads those row groups itself.
+struct Held {
+    /// The bytes of the batch's spans. `None` while downloading, or if the
+    /// download failed or was given back.
+    bytes: Option<Vec<Bytes>>,
+    /// The memory reserved; `None` once given back.
+    hold: Option<Hold>,
+    /// Cancels the download.
+    download: AbortHandle,
+}
+
+impl Held {
+    /// Cancel the download, and drop the bytes and their reservation.
+    fn give_back(&mut self) {
+        self.download.abort();
+        self.bytes = None;
+        self.hold = None;
+    }
+}
+
+fn lock(held: &Mutex<Held>) -> MutexGuard<'_, Held> {
+    held.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Batch {
@@ -403,17 +471,28 @@ impl Batch {
     }
 
     fn is_running(&self) -> bool {
-        matches!(self.fetch, Fetch::Running(_))
+        self.task.is_some()
     }
 
-    /// Wait for the download, if it's still running.
+    /// Whether the batch has bytes to serve: downloaded, and not given back.
+    fn has_bytes(&self) -> bool {
+        lock(&self.held).bytes.is_some()
+    }
+
+    /// Wait for the download, if it's still running. Bytes given back while
+    /// it ran stay given back.
     async fn settle(&mut self) {
-        if let Fetch::Running(task) = &mut self.fetch {
-            self.fetch = Fetch::Done(match task.await {
+        if let Some(task) = &mut self.task {
+            let fetched = match task.await {
                 Ok(Ok(spans)) => Some(spans),
                 Err(e) if e.is_panic() => resume_unwind(e.into_panic()),
                 Ok(Err(_)) | Err(_) => None,
-            });
+            };
+            self.task = None;
+            let mut held = lock(&self.held);
+            if held.hold.is_some() {
+                held.bytes = fetched;
+            }
         }
     }
 
@@ -422,7 +501,7 @@ impl Batch {
     fn pieces(&self, range: &Range<u64>) -> Vec<Piece> {
         let mut pieces = Vec::new();
         let mut at = range.start;
-        if let Fetch::Done(Some(fetched)) = &self.fetch {
+        if let Some(fetched) = &lock(&self.held).bytes {
             for (span, bytes) in self.spans.iter().zip(fetched) {
                 let (start, end) = (
                     at.max(span.start),
@@ -454,9 +533,7 @@ enum Piece {
 
 impl Drop for Batch {
     fn drop(&mut self) {
-        if let Fetch::Running(task) = &self.fetch {
-            task.abort();
-        }
+        lock(&self.held).download.abort();
     }
 }
 
@@ -737,8 +814,8 @@ impl ReadAhead {
         ranges: &[Range<u64>],
     ) -> ParquetResult<Vec<Bytes>> {
         self.batches[batch].settle().await;
-        let held = &mut self.batches[batch];
-        let (Some(position), Fetch::Done(Some(_))) = (held.position(row_group), &held.fetch) else {
+        let held = &self.batches[batch];
+        let (Some(position), true) = (held.position(row_group), held.has_bytes()) else {
             self.batches.remove(batch);
             return self.fetch(ranges).await;
         };
@@ -749,6 +826,9 @@ impl ReadAhead {
             .store
             .clamped(&self.file.object_meta.location, ranges)?;
         self.scan.store.count_page_reads(&ranges);
+        // The cache doesn't see reads served from here, so tell it where this
+        // reader is, or it may take the reader's next miss for a jump back.
+        self.scan.store.note_reads(self.location(), &ranges);
         let held = &mut self.batches[batch];
         let pieces: Vec<Vec<Piece>> = ranges.iter().map(|r| held.pieces(r)).collect();
         held.served[position] = true;
@@ -777,7 +857,10 @@ impl ReadAhead {
                     .into_iter()
                     .map(|piece| match piece {
                         Piece::Held(bytes) => Some(bytes),
-                        Piece::Missing(_) => fetched.next(),
+                        // A short gap would shift every byte after it.
+                        Piece::Missing(range) => fetched
+                            .next()
+                            .filter(|bytes| bytes.len() as u64 == range.end - range.start),
                     })
                     .collect::<Option<Vec<Bytes>>>()
                     .ok_or_else(|| {
@@ -801,7 +884,7 @@ impl ReadAhead {
     ///   has no room.
     /// - It does nothing while a batch is still downloading.
     fn start_ahead(&mut self, row_group: usize, columns: &[usize]) {
-        if self.batches.iter().any(Batch::is_running) {
+        if !self.scan.is_enabled() || self.batches.iter().any(Batch::is_running) {
             return;
         }
         let Some(order) = &self.order else {
@@ -827,7 +910,7 @@ impl ReadAhead {
         }
         // The batch holds whole spans, gaps included, so reserve those. Drop row
         // groups from the end until it fits the reader's cap.
-        let held: usize = self.batches.iter().map(|b| b.hold.bytes).sum();
+        let held: usize = self.batches.iter().map(|b| b.charge).sum();
         let blocks = self.scan.store.cache_blocks(location);
         let (clusters, charge) = loop {
             if row_groups.is_empty() {
@@ -858,7 +941,9 @@ impl ReadAhead {
         let Some(room) = self.scan.store.cache_room_ahead(location, downloads) else {
             return;
         };
-        let Some(hold) = self.scan.reserve(charge) else {
+        // Charged what the cache downloads, not just the spans: a read of a
+        // whole download is served as a slice of it, which keeps it all alive.
+        let Some(hold) = self.scan.reserve(charge.max(downloads as usize)) else {
             return;
         };
         let spans: Vec<Range<u64>> = clusters.iter().flatten().cloned().collect();
@@ -872,13 +957,20 @@ impl ReadAhead {
             }
             .in_current_span(),
         );
+        let held = Arc::new(Mutex::new(Held {
+            bytes: None,
+            hold: Some(hold),
+            download: task.abort_handle(),
+        }));
+        self.scan.track(&held);
         let served = vec![false; row_groups.len()];
         self.batches.push(Batch {
             row_groups,
             spans,
-            fetch: Fetch::Running(task),
+            task: Some(task),
             served,
-            hold,
+            charge,
+            held,
         });
     }
 
@@ -1089,9 +1181,13 @@ pub(crate) mod fixture {
         resident: bool,
         latency: Option<Duration>,
         pub(crate) fail_at: Mutex<Option<u64>>,
+        /// Returns the first read starting at this offset one byte short.
+        pub(crate) short_at: Mutex<Option<u64>>,
         /// Whether it reports room in the cache for downloads ahead.
         pub(crate) keeps: AtomicBool,
         reads: Mutex<Vec<Range<u64>>>,
+        /// Reads noted without a download, see [`LazyByteSource::note_read`].
+        noted: Mutex<Vec<Range<u64>>>,
     }
 
     #[async_trait]
@@ -1116,7 +1212,13 @@ pub(crate) mod fixture {
             if let Some(latency) = self.latency {
                 sleep(latency).await;
             }
-            Ok(self.bytes.slice(start as usize..(start + len) as usize))
+            let short = self
+                .short_at
+                .lock()
+                .expect("short_at")
+                .take_if(|at| *at == start);
+            let end = start + len - u64::from(short.is_some());
+            Ok(self.bytes.slice(start as usize..end as usize))
         }
 
         fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
@@ -1129,6 +1231,10 @@ pub(crate) mod fixture {
                 .load(Ordering::Relaxed)
                 .then(|| Box::new(()) as CacheRoom)
         }
+
+        fn note_read(&self, start: u64, len: u64) {
+            self.noted.lock().expect("noted").push(start..start + len);
+        }
     }
 
     impl Superfile {
@@ -1138,8 +1244,10 @@ pub(crate) mod fixture {
                 resident,
                 latency: None,
                 fail_at: Mutex::new(None),
+                short_at: Mutex::new(None),
                 keeps: AtomicBool::new(true),
                 reads: Mutex::new(Vec::new()),
+                noted: Mutex::new(Vec::new()),
             })
         }
 
@@ -1150,8 +1258,10 @@ pub(crate) mod fixture {
                 resident: false,
                 latency: Some(latency),
                 fail_at: Mutex::new(None),
+                short_at: Mutex::new(None),
                 keeps: AtomicBool::new(true),
                 reads: Mutex::new(Vec::new()),
+                noted: Mutex::new(Vec::new()),
             })
         }
 
@@ -1162,6 +1272,10 @@ pub(crate) mod fixture {
         /// Bytes served so far, overlapping reads counted each time.
         pub(crate) fn fetched_bytes(&self) -> u64 {
             self.reads().iter().map(|r| r.end - r.start).sum()
+        }
+
+        pub(crate) fn noted(&self) -> Vec<Range<u64>> {
+            self.noted.lock().expect("noted").clone()
         }
 
         pub(crate) fn clear(&self) {
@@ -1299,7 +1413,8 @@ mod tests {
     use std::{
         collections::HashMap,
         ops::Range,
-        sync::{Arc, atomic::Ordering},
+        slice::from_ref,
+        sync::{Arc, Mutex, atomic::Ordering},
         time::Duration,
     };
 
@@ -1325,18 +1440,20 @@ mod tests {
         },
         file::metadata::ParquetMetaData,
     };
-    use tokio::{task::yield_now, time::timeout};
+    use tokio::{spawn, task::yield_now, time::timeout};
 
     use crate::{
-        memory::ConnectionMemoryBudget,
+        memory::{ConnectionMemoryBudget, Reclaim},
         runtime_metrics::op_stats::with_op_stats,
         superfile::{CacheBlocks, lazy_source::LazyByteSource},
         supertable::query::{
             df_object_store::SuperfileObjectStore,
             read_ahead::{
-                Batch, Fetch, ReadAhead, ScanReadAhead, chunk_range, download_bytes, fetch_spans,
-                fixture::{GROUPS, ROWS_PER_GROUP, Superfile, schema, small_file},
-                leave_shared_ends, row_group_span,
+                Batch, Held, ReadAhead, ScanReadAhead, chunk_range, download_bytes, fetch_spans,
+                fixture::{
+                    GROUPS, ROWS_PER_GROUP, Superfile, block_cached, schema, small_file, wide_file,
+                },
+                leave_shared_ends, lock, row_group_span,
             },
         },
     };
@@ -1351,6 +1468,8 @@ mod tests {
     const BLOCKS: CacheBlocks = CacheBlocks {
         block_bytes: BLOCK,
         min_get_bytes: MIN_GET,
+        group_bytes: MIN_GET,
+        grouped: (0, 0),
     };
     /// How long a download takes in the test that drops a reader mid-download,
     /// so the batch is still running when the last read returns.
@@ -1377,6 +1496,25 @@ mod tests {
         );
         let (store, _) = with_op_stats(|| SuperfileObjectStore::from_sources(sources));
         (superfile, Arc::new(store), path, meta)
+    }
+
+    /// [`setup`] over a superfile whose every download takes
+    /// [`SLOW_DOWNLOAD`], so a test can act while a batch downloads.
+    fn setup_slow() -> (
+        Arc<Superfile>,
+        Arc<SuperfileObjectStore>,
+        ObjPath,
+        Arc<ParquetMetaData>,
+    ) {
+        let (bytes, meta) = small_file();
+        let superfile = Superfile::with_latency(bytes, SLOW_DOWNLOAD);
+        let path = ObjPath::from("t/sf.parquet");
+        let sources = HashMap::from([(
+            path.clone(),
+            Arc::clone(&superfile) as Arc<dyn LazyByteSource>,
+        )]);
+        let store = Arc::new(SuperfileObjectStore::from_sources(sources));
+        (superfile, store, path, meta)
     }
 
     /// A scan of the test table with `filters`, handed over the way the meter
@@ -1488,7 +1626,7 @@ mod tests {
             while reader
                 .batches
                 .iter()
-                .any(|b| matches!(&b.fetch, Fetch::Running(task) if !task.is_finished()))
+                .any(|b| b.task.as_ref().is_some_and(|task| !task.is_finished()))
             {
                 yield_now().await;
             }
@@ -1526,6 +1664,11 @@ mod tests {
         assert_eq!(got, superfile.slices(&chunks(&meta, 2)));
         settle(&reader).await;
         assert!(!touched(&superfile.reads(), &meta, 2), "served from memory");
+        assert_eq!(
+            superfile.noted(),
+            chunks(&meta, 2),
+            "and the cache is told, so it still knows where the scan is"
+        );
     }
 
     #[tokio::test]
@@ -1936,14 +2079,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reader_dropped_while_its_batch_downloads_gives_the_bytes_back_at_once() {
-        let (bytes, meta) = small_file();
-        let superfile = Superfile::with_latency(bytes, SLOW_DOWNLOAD);
-        let path = ObjPath::from("t/sf.parquet");
-        let sources = HashMap::from([(
-            path.clone(),
-            Arc::clone(&superfile) as Arc<dyn LazyByteSource>,
-        )]);
-        let store = Arc::new(SuperfileObjectStore::from_sources(sources));
+        let (_superfile, store, path, meta) = setup_slow();
         let budget = ConnectionMemoryBudget::measured();
         let mut reader = plain_reader(&store, &budget, &path, &meta);
         read_row_groups(&mut reader, &meta, &[0, 1]).await;
@@ -1958,6 +2094,173 @@ mod tests {
             0,
             "given back without waiting for the download"
         );
+    }
+
+    // -- Giving memory back --------------------------------------------------
+
+    /// A budget this many batches big: read-ahead's half of it fits one batch,
+    /// with room to spare.
+    const BUDGET_BATCHES: u64 = 4;
+    /// Rows per row group in a file big enough that the cache downloads more
+    /// than a batch's spans.
+    const WIDE_ROWS: usize = 20_000;
+    /// Bytes on each side of where a batch's bytes start, in the short-gap
+    /// test.
+    const GAP_BYTES: u64 = 10;
+
+    /// The bytes of `rg`'s projected chunks as `reader` serves them, checked
+    /// against the file.
+    async fn read_and_check(reader: &mut ReadAhead, superfile: &Superfile, rg: usize) {
+        let meta = Arc::clone(&reader.meta);
+        let got = reader
+            .get_byte_ranges(chunks(&meta, rg))
+            .await
+            .expect("read");
+        assert_eq!(got, superfile.slices(&chunks(&meta, rg)), "row group {rg}");
+    }
+
+    #[tokio::test]
+    async fn a_reservation_that_does_not_fit_takes_back_what_read_ahead_holds() {
+        // A batch is held when something else, a join's build side say, wants
+        // more than is left.
+        let (superfile, store, path, meta) = setup(false);
+        let batch = charge(&meta, &[2, 3]);
+        let budget = ConnectionMemoryBudget::with_limit(batch as u64 * BUDGET_BATCHES);
+        let mut reader = plain_reader(&store, &budget, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        assert_eq!(budget.used(), batch);
+        let wanted = budget.limit().expect("bounded") - batch / 2;
+        let build = budget
+            .try_reserve(wanted)
+            .expect("fits once read-ahead gives its batch back");
+        assert_eq!(budget.used(), wanted, "nothing held ahead");
+
+        // The scan reads 2 and 3 itself, the same bytes. Nothing more is read
+        // ahead for the rest of the scan, even once the memory is free again.
+        drop(build);
+        superfile.clear();
+        read_and_check(&mut reader, &superfile, 2).await;
+        read_and_check(&mut reader, &superfile, 3).await;
+        settle(&reader).await;
+        let reads = superfile.reads();
+        assert!(touched(&reads, &meta, 2) && touched(&reads, &meta, 3));
+        assert!(!touched(&reads, &meta, 4), "off for the rest of the scan");
+        assert!(reader.batches.is_empty(), "no batch even set up");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_given_back_while_downloading_frees_its_memory_at_once() {
+        let (superfile, store, path, meta) = setup_slow();
+        let budget = ConnectionMemoryBudget::measured();
+        let scan = scan(&store, &budget, &[]);
+        let mut reader = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        assert!(reader.batches.iter().any(Batch::is_running));
+        scan.reclaim();
+        assert_eq!(budget.used(), 0, "without waiting for the download");
+        read_and_check(&mut reader, &superfile, 2).await;
+        read_and_check(&mut reader, &superfile, 3).await;
+    }
+
+    #[tokio::test]
+    async fn a_batch_given_back_after_part_of_it_was_read_leaves_the_rest_to_the_scan() {
+        let (superfile, store, path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        let scan = scan(&store, &budget, &[]);
+        let mut reader = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        // 2 comes from memory, and starts 4 and 5 ahead.
+        read_and_check(&mut reader, &superfile, 2).await;
+        settle(&reader).await;
+        scan.reclaim();
+        assert_eq!(budget.used(), 0);
+        superfile.clear();
+        read_and_check(&mut reader, &superfile, 3).await;
+        read_and_check(&mut reader, &superfile, 4).await;
+        assert!(touched(&superfile.reads(), &meta, 3), "3 read again");
+    }
+
+    #[tokio::test]
+    async fn a_batch_set_up_while_read_ahead_turns_off_is_given_back() {
+        // A reader reserves its batch, everything is taken back before it
+        // tracks the batch, and then it tracks it.
+        let (_superfile, store, _path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        let scan = scan(&store, &budget, &[]);
+        let hold = scan.reserve(charge(&meta, &[2, 3])).expect("room");
+        let download = spawn(async {});
+        let held = Arc::new(Mutex::new(Held {
+            bytes: None,
+            hold: Some(hold),
+            download: download.abort_handle(),
+        }));
+        scan.reclaim();
+        scan.track(&held);
+        assert!(lock(&held).hold.is_none());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_scan_on_the_connection_gives_back() {
+        let (_a, store_a, path_a, meta) = setup(false);
+        let (_b, store_b, path_b, _) = setup(false);
+        let batch = charge(&meta, &[2, 3]);
+        let budget = ConnectionMemoryBudget::with_limit(batch as u64 * BUDGET_BATCHES * 2);
+        let mut a = plain_reader(&store_a, &budget, &path_a, &meta);
+        let mut b = plain_reader(&store_b, &budget, &path_b, &meta);
+        read_row_groups(&mut a, &meta, &[0, 1]).await;
+        read_row_groups(&mut b, &meta, &[0, 1]).await;
+        assert_eq!(budget.used(), batch * 2);
+        let wanted = budget.limit().expect("bounded") - batch / 2;
+        let _build = budget
+            .try_reserve(wanted)
+            .expect("fits once both give back");
+        assert_eq!(budget.used(), wanted);
+    }
+
+    #[tokio::test]
+    async fn a_batch_is_charged_what_the_cache_downloads_for_it() {
+        // The cache downloads whole blocks, and a read of a whole download is
+        // served as a slice of it, which keeps all of it alive.
+        let (bytes, meta) = wide_file(WIDE_ROWS, WIDE_ROWS);
+        let superfile = Superfile::new(bytes, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_cache, source) = block_cached(&superfile, dir.path());
+        let path = ObjPath::from("t/sf.parquet");
+        let store = Arc::new(SuperfileObjectStore::from_sources(HashMap::from([(
+            path.clone(),
+            source,
+        )])));
+        let budget = ConnectionMemoryBudget::measured();
+        let mut reader = plain_reader(&store, &budget, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        let batch = reader.batches.first().expect("a batch");
+        let blocks = store.cache_blocks(&path).expect("cached");
+        let downloads = download_bytes(from_ref(&batch.spans), blocks) as usize;
+        assert!(downloads > batch.charge, "the cache downloads more");
+        assert_eq!(budget.used(), downloads);
+    }
+
+    #[tokio::test]
+    async fn a_gap_that_comes_back_short_is_an_error_not_shifted_bytes() {
+        // A request that starts before what the batch holds: a gap, then held
+        // bytes. Superfiles never change, so a short gap can't happen today.
+        let (superfile, store, path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        let mut reader = plain_reader(&store, &budget, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        let held = reader.batches[0].spans[0].start;
+        let gap = held - GAP_BYTES;
+        *superfile.short_at.lock().expect("short_at") = Some(gap);
+        let request = gap..held + GAP_BYTES;
+        reader
+            .serve(2, 0, from_ref(&request))
+            .await
+            .expect_err("a short gap");
     }
 
     #[tokio::test]

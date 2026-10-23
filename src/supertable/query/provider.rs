@@ -2172,9 +2172,14 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, slice::from_ref, time::Duration};
+    use std::{
+        collections::HashMap,
+        hash::{DefaultHasher, Hash, Hasher},
+        slice::from_ref,
+        time::Duration,
+    };
 
-    use arrow::compute::sum;
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -3359,7 +3364,8 @@ mod tests {
     #[derive(Debug)]
     struct ScanRun {
         rows: usize,
-        sum_a: i64,
+        /// Every value of every row, see [`answer_of`].
+        answer: u64,
         /// Bytes the scan downloaded from object storage, through the cache.
         fetched: u64,
         /// GETs the cache made to object storage.
@@ -3369,9 +3375,32 @@ mod tests {
     impl ScanRun {
         /// What must not change with read-ahead: the answer and the bytes
         /// downloaded.
-        fn answer_and_bytes(&self) -> (usize, i64, u64) {
-            (self.rows, self.sum_a, self.fetched)
+        fn answer_and_bytes(&self) -> (usize, u64, u64) {
+            (self.rows, self.answer, self.fetched)
         }
+    }
+
+    /// A fingerprint of every value of every row in `batches`, whatever order
+    /// the partitions return them in: each row's values are hashed, and the
+    /// row hashes added up.
+    fn answer_of(batches: &[RecordBatch]) -> u64 {
+        let options = FormatOptions::default();
+        let mut answer = 0u64;
+        for batch in batches {
+            let columns: Vec<ArrayFormatter> = batch
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &options).expect("formatter"))
+                .collect();
+            for row in 0..batch.num_rows() {
+                let mut hasher = DefaultHasher::new();
+                for column in &columns {
+                    column.value(row).to_string().hash(&mut hasher);
+                }
+                answer = answer.wrapping_add(hasher.finish());
+            }
+        }
+        answer
     }
 
     /// A wide test file: its bytes and footer.
@@ -3503,15 +3532,9 @@ mod tests {
         ctx.runtime_env().register_object_store(url.as_ref(), store);
         let batches = collect(scan, ctx.task_ctx()).await.expect("scan");
 
-        let rows = batches.iter().map(|b| b.num_rows()).sum();
-        let sum_a = batches
-            .iter()
-            .filter_map(|b| b.column_by_name("a"))
-            .map(|a| sum(a.as_any().downcast_ref::<Int64Array>().expect("i64")).unwrap_or(0))
-            .sum();
         let run = ScanRun {
-            rows,
-            sum_a,
+            rows: batches.iter().map(|b| b.num_rows()).sum(),
+            answer: answer_of(&batches),
             fetched: superfile.fetched_bytes(),
             gets: superfile.reads().len(),
         };
@@ -3588,8 +3611,8 @@ mod tests {
             let (on, held) = scan_through_the_cache(true, shape, &file, GET_LATENCY).await;
             let name = shape.name;
             assert_eq!(
-                (on.rows, on.sum_a),
-                (off.rows, off.sum_a),
+                (on.rows, on.answer),
+                (off.rows, off.answer),
                 "{name}: same rows"
             );
             assert!(
@@ -3670,8 +3693,8 @@ mod tests {
                 RANDOM_LAYOUTS[layout]
             );
             assert_eq!(
-                (on.rows, on.sum_a),
-                (off.rows, off.sum_a),
+                (on.rows, on.answer),
+                (off.rows, off.answer),
                 "same rows: {case}"
             );
             assert!(

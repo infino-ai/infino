@@ -194,6 +194,7 @@ mod tests {
     use tokio::runtime::Runtime;
 
     use super::*;
+    use crate::memory::tests::Holder;
 
     #[test]
     fn measured_pool_never_refuses() {
@@ -225,6 +226,23 @@ mod tests {
         assert_eq!(pool.reserved(), 900);
         res.shrink(900);
         assert_eq!(pool.reserved(), 0);
+    }
+
+    #[test]
+    fn a_refused_operator_takes_back_what_read_ahead_holds() {
+        // A hash join's build side can't spill, so it needs read-ahead's
+        // memory back. 1000 configured -> gate 900, 600 held.
+        let budget = ConnectionMemoryBudget::with_limit(1000);
+        let held = Holder::holding(&budget, 600);
+        let pool: Arc<dyn MemoryPool> = Arc::new(ConnectionBudgetPool {
+            budget: Arc::clone(&budget),
+        });
+        let build = MemoryConsumer::new("build").register(&pool);
+        build
+            .try_grow(800)
+            .expect("fits once read-ahead gives back");
+        assert_eq!(held.asked(), 1);
+        assert_eq!(pool.reserved(), 800);
     }
 
     #[test]
