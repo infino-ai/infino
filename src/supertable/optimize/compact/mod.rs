@@ -60,7 +60,7 @@ use crate::{
             term_index::{Contribution as TermContribution, ReservedSegment},
         },
         opann::rerank_pool_hint,
-        query::dispatch::open_compaction_input,
+        query::{dispatch::open_compaction_input, vector},
         reader_cache::disk::mmap_readonly_bytes,
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
@@ -400,7 +400,7 @@ impl Supertable {
             let snap = inner.manifest.load();
             match snap.partition_strategy() {
                 Some(PartitionStrategy::VectorCell { column, .. }) => {
-                    crate::supertable::query::vector::serves_via_graph(&snap, column)
+                    vector::serves_via_graph(&snap, column)
                 }
                 _ => false,
             }
