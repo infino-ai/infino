@@ -538,10 +538,18 @@ fn rank_by_bitmap(ids: &[u32], targets: &[u32], out: &mut [u32]) -> bool {
     if words > PROBE_BITMAP_WORDS {
         return false;
     }
+    // The ids ascend, so a word is complete once they move past it: the word
+    // being filled stays in a register and is stored whole on every id, with
+    // no load of the store before it, which `|=` into memory would wait on.
     let mut bits = [0u64; PROBE_BITMAP_WORDS];
+    let (mut prev, mut acc) = (usize::MAX, 0u64);
     for &d in ids {
         let local = d - base;
-        bits[(local >> 6) as usize] |= 1u64 << (local & 63);
+        let wi = (local >> 6) as usize;
+        let bit = 1u64 << (local & 63);
+        acc = if wi == prev { acc | bit } else { bit };
+        bits[wi] = acc;
+        prev = wi;
     }
     let mut prefix = [0u32; PROBE_BITMAP_WORDS];
     let mut acc = 0u32;
