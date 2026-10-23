@@ -2688,9 +2688,6 @@ impl FtsReader {
         let mut threshold: f32 = floor_eff.max(0.0);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
-        let mut leader_norms = [0.0f32; BLOCK_LEN];
-        // Not a doc id any slot can hold before it is filled.
-        let mut leader_docs = [u32::MAX; BLOCK_LEN];
         // Compacted per-window candidate list (doc + essential score), reused;
         // the drain fills it, the SIMD filter compacts it to survivors.
         let mut win_docs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
@@ -2753,15 +2750,6 @@ impl FtsReader {
                 let mut others_ub = 0.0f32;
                 let mut bound_holds_to = 0u32;
                 let mut have_bound = false;
-                // The block's norms, fetched together before the walk: one
-                // tight loop of independent loads the core overlaps, where the
-                // walk's own loads, one per candidate behind a mispredicted
-                // branch, would each wait out a cache miss.
-                let fetched = &c0.block_doc_ids[c0.pos..c0.block_n];
-                leader_docs[c0.pos..c0.block_n].copy_from_slice(fetched);
-                for (slot, &d) in leader_norms[c0.pos..c0.block_n].iter_mut().zip(fetched) {
-                    *slot = dl_norm_k1.get(d);
-                }
                 while !c0.is_exhausted()
                     && c0.current_doc_id() <= block_end
                     && c0.current_doc_id() < doc_id_end
@@ -2773,14 +2761,7 @@ impl FtsReader {
                         c0.next();
                         continue;
                     }
-                    // Each slot remembers the doc it was fetched for: a lazily
-                    // held bitset block moves its one decoded doc under a fixed
-                    // `pos`, and one that expands mid-walk reaches slots this
-                    // block never filled. Read the norm directly then.
-                    let norm = match leader_docs.get(c0.pos) == Some(&candidate) {
-                        true => leader_norms[c0.pos],
-                        false => dl_norm_k1.get(candidate),
-                    };
+                    let norm = dl_norm_k1.get(candidate);
                     let essential_score =
                         bm25::score_with_dl_norm_k1(c0.idf_weight, c0.current_tf(), norm);
                     // Bound the non-essentials at `candidate` by each one's
