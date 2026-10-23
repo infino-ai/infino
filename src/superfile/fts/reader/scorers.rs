@@ -181,7 +181,7 @@ fn score_noness_batched(
         let tf8: [u32; 8] = tfs[i..i + 8]
             .try_into()
             .expect("invariant: an 8-wide slice");
-        let add = bm25::score_one_term_x8(c.idf_weight, tf8, dids.map(|d| dl_norm.get(d)));
+        let add = bm25::score_one_term_x8(c.idf_weight, tf8, dl_norm.get8(dids));
         for (s, a) in scores[i..i + 8].iter_mut().zip(add) {
             *s += a;
         }
@@ -741,8 +741,7 @@ fn and_membership_scored_batched<S: AndSink>(
                 let tf8: [u32; 8] = tfs[r..r + 8]
                     .try_into()
                     .expect("invariant: an 8-wide slice");
-                let add =
-                    bm25::score_one_term_x8(o.idf_weight, tf8, dids.map(|d| dl_norm_k1.get(d)));
+                let add = bm25::score_one_term_x8(o.idf_weight, tf8, dl_norm_k1.get8(dids));
                 for l in 0..8 {
                     let total = scores[r + l] + add[l];
                     docs[w] = dids[l];
@@ -855,8 +854,7 @@ fn accumulate_step(
             let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
                 .try_into()
                 .expect("invariant: an 8-wide slice");
-            let contributions =
-                bm25::score_one_term_x8(c.idf_weight, tfs, dids.map(|d| dl_norm_k1.get(d)));
+            let contributions = bm25::score_one_term_x8(c.idf_weight, tfs, dl_norm_k1.get8(dids));
             mark_lanes(scores, present, base, dids, contributions);
             c.advance_by(8);
             return;
@@ -2791,11 +2789,8 @@ impl FtsReader {
                         let tfs: [u32; 8] = c.block_tfs[i..i + 8]
                             .try_into()
                             .expect("invariant: an 8-wide slice");
-                        let lanes = bm25::score_one_term_x8(
-                            c.idf_weight,
-                            tfs,
-                            dids.map(|d| dl_norm_k1.get(d)),
-                        );
+                        let lanes =
+                            bm25::score_one_term_x8(c.idf_weight, tfs, dl_norm_k1.get8(dids));
                         leader_scores[i..i + 8].copy_from_slice(&lanes);
                         for (l, &score) in lanes.iter().enumerate() {
                             survivors[n_survivors] = (i + l) as u16;

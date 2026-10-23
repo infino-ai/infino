@@ -282,7 +282,13 @@ pub(super) fn score_one_term_x4(
 /// bit-identical to the scalar [`score_with_dl_norm_k1`].
 #[inline(always)]
 pub(super) fn score_one_term_x8(idf_weight: f32, tfs: [u32; 8], dl_norm_k1: [f32; 8]) -> [f32; 8] {
-    let tf_v = f32x8::from(tfs.map(|t| t as f32));
+    // An explicit loop, not `[u32; 8]::map`: the map is left out of line
+    // under code-size pressure, a call per eight postings.
+    let mut tf_f = [0.0f32; 8];
+    for (f, &t) in tf_f.iter_mut().zip(&tfs) {
+        *f = t as f32;
+    }
+    let tf_v = f32x8::from(tf_f);
     let scores = f32x8::splat(idf_weight) * tf_v / (tf_v + f32x8::from(dl_norm_k1));
     scores.to_array()
 }

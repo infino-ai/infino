@@ -292,6 +292,18 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
+    /// [`Self::get`] for eight docs. A loop the compiler always inlines:
+    /// `[u32; 8]::map` with a closure is left out of line under code-size
+    /// pressure, a call per eight postings on the hottest paths.
+    #[inline(always)]
+    pub(super) fn get8(&self, docs: [u32; 8]) -> [f32; 8] {
+        let mut out = [0.0f32; 8];
+        for (o, &d) in out.iter_mut().zip(&docs) {
+            *o = self.get(d);
+        }
+        out
+    }
+
     /// The buckets this table scores by. Test-only: the query path indexes
     /// them and never needs the slice.
     #[cfg(test)]
