@@ -14,7 +14,7 @@ use super::{
     core::*,
     cursor::{CursorUse, TermCursor},
     filter::ExcludeFilter,
-    metadata::{NormTable, ScoreTable, unscored_norm_table},
+    metadata::{NormTable, unscored_norm_table},
     sink::{
         AndSink, BufferedScoreSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink,
         ScoreCountSink, ScoreSink, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc,
@@ -2669,12 +2669,6 @@ impl FtsReader {
                 .partial_cmp(&a.term_max_bm25)
                 .unwrap_or(Ordering::Equal)
         });
-        // Per-term score tables for the per-candidate leader walk, in the
-        // same term-max order as `cursors`.
-        let score_tables: Vec<ScoreTable> = cursors
-            .iter()
-            .map(|c| ScoreTable::new(c.idf_weight, dl_norm_k1))
-            .collect();
         let n = cursors.len();
         let mut partial_max = vec![0.0_f32; n + 1];
         for i in (0..n).rev() {
@@ -2746,7 +2740,6 @@ impl FtsReader {
                 }
                 let block_end = cursors[0].current_block_last_doc_id();
                 let (ess, non_ess) = cursors.split_at_mut(1);
-                let (ess_table, noness_tables) = score_tables.split_at(1);
                 let c0 = &mut ess[0];
                 // The non-essentials' bound changes only when a candidate
                 // crosses one of their block boundaries, which for a rare
@@ -2768,8 +2761,9 @@ impl FtsReader {
                         c0.next();
                         continue;
                     }
+                    let norm = dl_norm_k1.get(candidate);
                     let essential_score =
-                        ess_table[0].score(c0.current_tf(), candidate, dl_norm_k1);
+                        bm25::score_with_dl_norm_k1(c0.idf_weight, c0.current_tf(), norm);
                     // Bound the non-essentials at `candidate` by each one's
                     // block-max for the block that *contains* it (monotonic
                     // `shallow_advance` hint — amortized O(1), no decode), not by
@@ -2817,7 +2811,7 @@ impl FtsReader {
                     let mut abandoned = false;
                     for (i, c) in non_ess.iter_mut().enumerate() {
                         if let Some(tf) = c.bitset_probe_tf(candidate) {
-                            score += noness_tables[i].score(tf, candidate, dl_norm_k1);
+                            score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
                         }
                         if score + noness_suffix[i + 1] <= threshold {
                             abandoned = true;
