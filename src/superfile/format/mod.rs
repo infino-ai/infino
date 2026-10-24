@@ -145,14 +145,17 @@ pub mod fts {
 
     /// The version written once posting blocks may be **runs** (consecutive
     /// doc ids stored as an origin and a count, encoding 3) and store their
-    /// tfs minus one (flagged per block by header bit 31).
+    /// tfs minus one (flagged per block by header bit 31), and position
+    /// groups carry their exceptions as fixed-width tables (group header 2)
+    /// rather than varint pairs.
     ///
-    /// Both changes live inside the blocks and each block says which form
-    /// it takes, so a `V10` reader decodes a `V9` file's blocks unchanged,
-    /// and a postings copy from an older container is already correct; the
-    /// smaller forms arrive as a merge re-encodes the blocks. The version
-    /// moves because a `V9` reader would reject a run block, and should
-    /// refuse the file whole rather than fail mid-query.
+    /// Every change lives inside a block or group, and each says which form
+    /// it takes, so a `V10` reader decodes a `V9` file's blocks and groups
+    /// unchanged, and a postings copy from an older container is already
+    /// correct; the smaller forms arrive as a merge re-encodes the blocks.
+    /// The version moves because a `V9` reader would reject a run block or
+    /// a fixed-table group, and should refuse the file whole rather than
+    /// fail mid-query.
     pub const VERSION_V10: u32 = 10;
 
     /// Whether `version` stores the scorer's length buckets and the widened
