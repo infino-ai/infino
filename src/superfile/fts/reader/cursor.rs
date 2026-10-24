@@ -1612,6 +1612,16 @@ impl TermCursor {
         if self.is_exhausted() {
             return (0.0, 0.0);
         }
+        // Nothing of this term lies before its current doc, so the range
+        // starts there: a range the cursor has already passed is bounded by
+        // 0, not by the maximum of the block the cursor still sits in (a
+        // rare term held in one block would otherwise bound every window).
+        // A probed cursor's current doc may trail its true position, never
+        // lead it, so this start stays at or below the term's next doc.
+        let range_start = range_start.max(self.current_doc_id());
+        if range_start > range_end {
+            return (0.0, 0.0);
+        }
         // Advance inspect_block to the first block whose last_doc_id
         // could intersect the range. shallow_advance_block_to lands on
         // the first block with last_doc_id >= range_start, which is
