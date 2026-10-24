@@ -897,8 +897,9 @@ impl FtsReader {
 
     /// [`Self::run_prepared`] for clauses prepared with
     /// `ClauseLists::exact_count`: the top-k with the exact match count.
-    /// A union with nothing to exclude counts and ranks in two passes;
-    /// every other shape scores every match.
+    /// A union, an intersection or a must-and-should query with nothing to
+    /// exclude counts and ranks in two passes; every other shape scores
+    /// every match.
     ///
     /// The top-k is the ranked search's up to float summation order: the
     /// exhaustive walks add a doc's term scores in a different order than
@@ -935,6 +936,29 @@ impl FtsReader {
                 k,
                 ..
             } => self.run_and_intersect_counted(column_id, must_cursors, k, filter.as_mut())?,
+            // Shoulds never change which docs match, so with nothing to
+            // exclude the count is the musts' unscored intersection, and the
+            // top-k is the pruned ranked walk.
+            PreparedClauses::MustShould {
+                column_id,
+                must_cursors,
+                should_cursors,
+                filter: None,
+                k,
+                floor_eff,
+                ..
+            } => {
+                let count = self.count_and_intersect(must_cursors.clone());
+                let hits = self.run_must_should(
+                    column_id,
+                    must_cursors,
+                    should_cursors,
+                    k,
+                    None,
+                    floor_eff,
+                )?;
+                (hits, count)
+            }
             PreparedClauses::MustShould {
                 column_id,
                 must_cursors,
