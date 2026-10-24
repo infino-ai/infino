@@ -19,8 +19,8 @@ use super::{
     metadata::{NormTable, unscored_norm_table},
     sink::{
         AndSink, BufferedScoreSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink,
-        ScoreCountSink, ScoreSink, ShouldBatch, TopKBuffer, TopKEntry, and_heap_push,
-        drain_top_k_desc, offer_top_k, replace_worst,
+        ScoreCountSink, ScoreSink, ShouldBatch, TopKBuffer, TopKEntry, drain_top_k_desc,
+        offer_top_k, replace_worst,
     },
 };
 use crate::superfile::{
@@ -617,14 +617,14 @@ fn must_lead_should_count(
 /// Docs arrive in ascending order and a tie keeps the smaller doc, so a
 /// candidate whose bound only equals the k-th best can never enter the heap:
 /// pruning on `<=` drops nothing that would have been kept.
-fn must_lead_should_walk(
+fn must_lead_should_walk<C: Collector>(
     mut lead: TermCursor,
     mut shoulds: Vec<TermCursor>,
     k: usize,
     mut filter: Option<&mut ExcludeFilter>,
     floor_eff: f32,
     dl_norm_k1: &NormTable,
-    heap: &mut BinaryHeap<TopKEntry>,
+    heap: &mut C,
 ) {
     // Probe the optional terms strongest first (the bound on what is still
     // unprobed then falls fastest), but add their scores in query order, as
@@ -645,15 +645,18 @@ fn must_lead_should_walk(
     let mut contrib = [0.0_f32; MAX_SHOULDS_LED];
     let mut doc_ub = vec![0.0_f32; m];
     let mut doc_suffix = vec![0.0_f32; m + 1];
-    // The bar a doc must beat: the k-th best once the heap is full, else the
-    // floor (`NEG_INFINITY` when there is none, which prunes nothing).
-    let bar = |heap: &BinaryHeap<TopKEntry>| -> f32 {
-        match heap.len() >= k {
-            true => heap.peek().expect("full heap").0.max(floor_eff),
+    // The bar a doc must beat: the collector's k-th best once it is full (a
+    // heap keeps it exact, a buffer at its last cut, never above the true
+    // one), else the floor (`NEG_INFINITY` when there is none, which prunes
+    // nothing).
+    let mut kth = f32::NEG_INFINITY;
+    let bar = |heap: &C, kth: f32| -> f32 {
+        match heap.is_full(k) {
+            true => kth.max(floor_eff),
             false => floor_eff,
         }
     };
-    let mut threshold = bar(heap);
+    let mut threshold = bar(heap, kth);
     // The block batch's scratch: the block's candidates, their required
     // scores and running sums, the optional terms' tfs at the candidates
     // still alive, each candidate's contribution per optional term, and each
@@ -739,8 +742,8 @@ fn must_lead_should_walk(
                         continue;
                     }
                     if score > floor_eff {
-                        and_heap_push(heap, k, None, score, d);
-                        threshold = bar(heap);
+                        heap.offer(k, &mut kth, score, d);
+                        threshold = bar(heap, kth);
                     }
                 }
                 continue;
@@ -799,8 +802,8 @@ fn must_lead_should_walk(
                     continue;
                 }
                 if score > floor_eff {
-                    and_heap_push(heap, k, None, score, cand_docs[i]);
-                    threshold = bar(heap);
+                    heap.offer(k, &mut kth, score, cand_docs[i]);
+                    threshold = bar(heap, kth);
                 }
             }
             continue;
@@ -862,8 +865,8 @@ fn must_lead_should_walk(
                 score += x;
             }
             if !abandoned && score > floor_eff {
-                and_heap_push(heap, k, None, score, candidate);
-                threshold = bar(heap);
+                heap.offer(k, &mut kth, score, candidate);
+                threshold = bar(heap, kth);
             }
             lead.next();
         }
@@ -1945,7 +1948,7 @@ impl FtsReader {
     pub(super) fn run_must_should(
         &self,
         column_id: u32,
-        mut must_cursors: Vec<TermCursor>,
+        must_cursors: Vec<TermCursor>,
         should_cursors: Vec<TermCursor>,
         k: usize,
         filter: Option<&mut ExcludeFilter>,
@@ -1955,6 +1958,52 @@ impl FtsReader {
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
+        let dl_norm_k1 = self.columns[column_id as usize].dl_norm_k1();
+        let cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+        // At a large `k` most scored docs are admitted and a heap's sift per
+        // admission dominates; the selection buffer pays an append instead.
+        Ok(match k >= BUFFERED_TOPK_MIN_K {
+            true => {
+                let mut buf = TopKBuffer::with_capacity(k, cap);
+                self.must_should_into(
+                    must_cursors,
+                    should_cursors,
+                    k,
+                    filter,
+                    floor_eff,
+                    dl_norm_k1,
+                    &mut buf,
+                );
+                buf.into_sorted()
+            }
+            false => {
+                let mut heap = <BinaryHeap<TopKEntry> as Collector>::with_capacity(k, cap);
+                self.must_should_into(
+                    must_cursors,
+                    should_cursors,
+                    k,
+                    filter,
+                    floor_eff,
+                    dl_norm_k1,
+                    &mut heap,
+                );
+                heap.into_sorted()
+            }
+        })
+    }
+
+    /// The ranked must+should walk into `heap`, whichever collector it is.
+    #[allow(clippy::too_many_arguments)]
+    fn must_should_into<C: Collector>(
+        &self,
+        mut must_cursors: Vec<TermCursor>,
+        should_cursors: Vec<TermCursor>,
+        k: usize,
+        filter: Option<&mut ExcludeFilter>,
+        floor_eff: f32,
+        dl_norm_k1: &NormTable,
+        heap: &mut C,
+    ) {
         // The per-candidate walk wins where the bar prunes; at a large `k`
         // the bar stays low and the general walk's sequential completion is
         // cheaper with several optional terms. With one optional term the
@@ -1964,27 +2013,23 @@ impl FtsReader {
             && (k <= WAND_BMW_2TERM_MAX_K || should_cursors.len() == 1)
         {
             let lead = must_cursors.pop().expect("one must cursor");
-            let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
-                must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
-            });
-            return Ok(hits);
+            must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
+            return;
         }
-        let (hits, ()) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
-            must_cursors.sort_by_key(|c| c.block_count());
-            let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
-            let mut sink = MustShouldSink {
-                heap,
-                k,
-                filter,
-                floor_eff,
-                shoulds: ShouldBatch::new(should_cursors),
-                should_ub,
-                dl_norm_k1,
-            };
-            self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
-            sink.flush();
-        });
-        Ok(hits)
+        must_cursors.sort_by_key(|c| c.block_count());
+        let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
+        let mut sink = MustShouldSink {
+            heap,
+            kth: f32::NEG_INFINITY,
+            k,
+            filter,
+            floor_eff,
+            shoulds: ShouldBatch::new(should_cursors),
+            should_ub,
+            dl_norm_k1,
+        };
+        self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+        sink.flush();
     }
 
     /// [`Self::run_must_should`] with pruning off: every must-intersection

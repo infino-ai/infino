@@ -235,8 +235,11 @@ impl AndSink for ScoreSink<'_> {
 /// the sink — the AND walk emits docs in ascending order, so each
 /// should list is `skip_to`-streamed forward at most once per query,
 /// exactly like [`ExcludeFilter`]'s negated cursors.
-pub(super) struct MustShouldSink<'a> {
-    pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
+pub(super) struct MustShouldSink<'a, C: Collector> {
+    pub(super) heap: &'a mut C,
+    /// The collector's k-th best: exact in a heap, at its last cut in a
+    /// buffer (never above the true one).
+    pub(super) kth: f32,
     pub(super) k: usize,
     pub(super) filter: Option<&'a mut ExcludeFilter>,
     pub(super) floor_eff: f32,
@@ -249,21 +252,16 @@ pub(super) struct MustShouldSink<'a> {
     pub(super) dl_norm_k1: &'a NormTable,
 }
 
-impl AndSink for MustShouldSink<'_> {
+impl<C: Collector> AndSink for MustShouldSink<'_, C> {
     fn bar(&self) -> f32 {
         // The AND walk's block-max arithmetic bounds the MUST portion
         // of a doc's score only, so the pruning bar is lowered by the
         // most the shoulds could add: a must block that can't reach
         // (kth-best − should_ub) can't produce a top-k doc even with
         // every should matching at its maximum.
-        let full_bar = if self.heap.len() >= self.k {
-            self.heap
-                .peek()
-                .expect("heap len == k")
-                .0
-                .max(self.floor_eff)
-        } else {
-            self.floor_eff
+        let full_bar = match self.heap.is_full(self.k) {
+            true => self.kth.max(self.floor_eff),
+            false => self.floor_eff,
         };
         full_bar - self.should_ub
     }
@@ -287,7 +285,7 @@ impl AndSink for MustShouldSink<'_> {
     }
 }
 
-impl MustShouldSink<'_> {
+impl<C: Collector> MustShouldSink<'_, C> {
     /// Score the held docs' shoulds and offer them to the heap. The walk
     /// calls this once more after its last doc.
     pub(super) fn flush(&mut self) {
@@ -295,9 +293,17 @@ impl MustShouldSink<'_> {
         for (&doc, &score) in docs.iter().zip(scores) {
             // Floor gate on the FULL score — a must-only score below the
             // floor can still survive once its shoulds are added.
-            if score > self.floor_eff {
-                and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+            if score <= self.floor_eff || (self.heap.is_full(self.k) && score <= self.kth) {
+                continue;
             }
+            // The negation is asked only of a doc that would be admitted, in
+            // ascending doc order.
+            if let Some(f) = self.filter.as_deref_mut()
+                && !f.admits(doc)
+            {
+                continue;
+            }
+            self.heap.offer(self.k, &mut self.kth, score, doc);
         }
         self.shoulds.clear();
     }
