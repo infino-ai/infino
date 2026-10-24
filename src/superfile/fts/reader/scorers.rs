@@ -3205,6 +3205,18 @@ impl FtsReader {
             // bounded by the others' window maxima rather than their term
             // maxima. Measured once per window, before any cursor moves.
             let windowed = prune && !sole;
+            // The non-essentials' maxima over this window, summed: what they
+            // can add to any doc in it, never more than their term maxima.
+            let mut noness_win = partial_max[f_essential];
+            if prune {
+                let win_last = window_end.saturating_sub(1);
+                let mut sum = 0.0_f32;
+                for i in f_essential..n {
+                    win_ub[i] = cursors[i].block_max_in_range(base, win_last);
+                    sum += win_ub[i];
+                }
+                noness_win = sum.min(partial_max[f_essential]);
+            }
             let mut win_all_sum = 0.0_f32;
             if windowed {
                 let win_last = window_end.saturating_sub(1);
@@ -3221,7 +3233,7 @@ impl FtsReader {
                 let weakest = f_essential - 1;
                 let (weakest_ub, weakest_docs) =
                     cursors[weakest].block_max_and_density_in_range(base, win_last);
-                if weakest_ub + partial_max[f_essential] > threshold {
+                if weakest_ub + noness_win > threshold {
                     partial_win.copy_from_slice(&partial_max);
                     f_essential
                 } else {
@@ -3231,9 +3243,6 @@ impl FtsReader {
                         let (ub, docs) = c.block_max_and_density_in_range(base, win_last);
                         win_ub[i] = ub;
                         win_docs_est[i] = docs;
-                    }
-                    for i in f_essential..n {
-                        win_ub[i] = cursors[i].term_max_bm25;
                     }
                     partial_win[n] = 0.0;
                     for i in (0..n).rev() {
@@ -3285,7 +3294,7 @@ impl FtsReader {
                         let global_ub = total_term_ub - c.term_max_bm25;
                         let inside = c.current_block_last_doc_id() < window_end;
                         let others_ub = match (sole, windowed && inside) {
-                            (true, _) => partial_max[f_essential],
+                            (true, _) => noness_win,
                             (false, true) => (win_all_sum - win_all[ci]).min(global_ub),
                             (false, false) => global_ub,
                         };
