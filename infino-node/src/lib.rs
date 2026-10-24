@@ -1325,7 +1325,6 @@ impl Table {
     #[napi]
     pub fn optimize(&self, settings: Option<OptimizeOptions>) -> Result<()> {
         let mut s = CompactionSettings::default();
-        let mut recalibrate = RecalibratePolicy::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
                 s.max_memory_mb = v as u64;
@@ -1340,7 +1339,7 @@ impl Table {
                 s.stale_seal_timeout_ms = v as u64;
             }
             if let Some(v) = o.recalibrate.as_deref() {
-                recalibrate = match v.to_ascii_lowercase().as_str() {
+                s.steps.recalibrate = match v.to_ascii_lowercase().as_str() {
                     "auto" => RecalibratePolicy::Auto,
                     "force" => RecalibratePolicy::Force,
                     "skip" => RecalibratePolicy::Skip,
@@ -1352,7 +1351,7 @@ impl Table {
                 };
             }
         }
-        let opts = InfinoOptimizeOptions::compact(s).with_recalibrate(recalibrate);
+        let opts = InfinoOptimizeOptions::compact(s);
         self.inner.optimize(&opts).map_err(optimize_err)
     }
 
