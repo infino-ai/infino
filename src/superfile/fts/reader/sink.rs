@@ -506,16 +506,24 @@ pub(super) fn and_heap_push(
     score: f32,
     doc_id: u32,
 ) {
+    let full = heap.len() >= k;
+    if full
+        && heap
+            .peek()
+            .is_some_and(|w| !(score > w.0 || (score == w.0 && doc_id < w.1.get())))
+    {
+        return;
+    }
+    // The negation is asked only of a doc that would enter the heap: one that
+    // would not is dropped either way, and the docs asked still ascend.
     if let Some(f) = filter
         && !f.admits(doc_id)
     {
         return;
     }
-    if heap.len() < k {
+    if !full {
         heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
-    } else if let Some(mut worst) = heap.peek_mut()
-        && (score > worst.0 || (score == worst.0 && doc_id < worst.1.get()))
-    {
+    } else if let Some(mut worst) = heap.peek_mut() {
         *worst = TopKEntry(score, FtsDocId::new(doc_id));
     }
 }

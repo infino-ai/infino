@@ -295,6 +295,7 @@ impl NormTable {
     /// The per-doc buckets and the bucket-to-norm table, for a SIMD lookup
     /// that reads a run of docs' buckets at once. `get(d)` is
     /// `lut[buckets[d]]`.
+    #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     pub(super) fn parts(&self) -> (&[u8], &[f32; 256]) {
         (&self.bytes, &self.lut)

@@ -1529,12 +1529,6 @@ impl FtsReader {
 
             for j in 0..n {
                 let doc_id = buf_d[j];
-                // Drop docs excluded by a negated term (None = keep all).
-                if let Some(f) = filter.as_deref_mut()
-                    && !f.admits(doc_id)
-                {
-                    continue;
-                }
                 let tf = buf_t[j];
                 let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1.get(doc_id));
                 // Floor gate: strictly-below-floor docs are dead to the
@@ -1543,11 +1537,21 @@ impl FtsReader {
                 if score <= floor_eff {
                     continue;
                 }
-                if heap.len() < k {
-                    heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
-                } else if let Some(mut worst) = heap.peek_mut()
-                    && score > worst.0
+                let full = heap.len() >= k;
+                if full && heap.peek().is_some_and(|worst| score <= worst.0) {
+                    continue;
+                }
+                // Drop docs excluded by a negated term (None = keep all). Asked
+                // only of a doc that would enter the heap: one that would not
+                // is dropped either way, and the docs asked still ascend.
+                if let Some(f) = filter.as_deref_mut()
+                    && !f.admits(doc_id)
                 {
+                    continue;
+                }
+                if !full {
+                    heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
+                } else if let Some(mut worst) = heap.peek_mut() {
                     *worst = TopKEntry(score, FtsDocId::new(doc_id));
                 }
             }
