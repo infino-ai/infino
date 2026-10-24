@@ -11095,9 +11095,12 @@ pub(in crate::supertable) async fn stamp_term_index(
                                     "term index: publish lost a race, rebased the build onto the commits since"
                                 );
                             }
+                            // The rebased root is made of segments already on
+                            // storage, their slices and tier objects with them.
                             Some(term_index::Built {
                                 root,
                                 slices: Vec::new(),
+                                tiers: Vec::new(),
                             })
                         }
                         None => match fold_term_index(&old, base, prior, current, &entries).await
