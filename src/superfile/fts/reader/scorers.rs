@@ -2835,7 +2835,7 @@ impl FtsReader {
             };
         cursors.retain(|c| !c.is_exhausted());
         if let [c] = cursors.as_mut_slice() {
-            let mut lane_scores = [0.0f32; BLOCK_LEN];
+            let mut lane_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
             while !c.is_exhausted() {
                 if c.decoded_block != c.current_block {
                     let start = c.current_doc_id();
@@ -2843,35 +2843,34 @@ impl FtsReader {
                     c.materialize_at(start);
                 }
                 let (from, to) = (c.pos, c.block_n);
-                let mut i = from;
-                while i + bm25::SCORE_SIMD_LANES <= to {
-                    let d = &c.block_doc_ids[i..i + bm25::SCORE_SIMD_LANES];
-                    let t = &c.block_tfs[i..i + bm25::SCORE_SIMD_LANES];
-                    let s = bm25::score_one_term_x4(
-                        c.idf_weight,
-                        [t[0], t[1], t[2], t[3]],
-                        [
-                            dl_norm_k1.get(d[0]),
-                            dl_norm_k1.get(d[1]),
-                            dl_norm_k1.get(d[2]),
-                            dl_norm_k1.get(d[3]),
-                        ],
-                    );
-                    lane_scores[i..i + bm25::SCORE_SIMD_LANES].copy_from_slice(&s);
-                    i += bm25::SCORE_SIMD_LANES;
-                }
-                let tail = c.block_doc_ids[i..to].iter().zip(&c.block_tfs[i..to]);
-                for (slot, (&d, &tf)) in lane_scores[i..to].iter_mut().zip(tail) {
-                    *slot = bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm_k1.get(d));
-                }
-                for (&doc, &score) in c.block_doc_ids[from..to].iter().zip(&lane_scores[from..to]) {
-                    if let Some(f) = filter.as_deref_mut()
-                        && !f.admits(doc)
-                    {
-                        continue;
+                score_postings(
+                    c.idf_weight,
+                    &c.block_doc_ids[from..to],
+                    &c.block_tfs[from..to],
+                    dl_norm_k1,
+                    &mut lane_scores,
+                );
+                let docs = c.block_doc_ids[from..to].iter();
+                match filter.as_deref_mut() {
+                    // Every doc counts; only one that beats the k-th best (or
+                    // fills the heap) is offered, which is the offer's own test.
+                    None => {
+                        count += (to - from) as u64;
+                        for (&doc, &score) in docs.zip(&lane_scores) {
+                            if heap.len() < k || score > threshold {
+                                offer(&mut heap, &mut threshold, doc, score);
+                            }
+                        }
                     }
-                    count += 1;
-                    offer(&mut heap, &mut threshold, doc, score);
+                    Some(f) => {
+                        for (&doc, &score) in docs.zip(&lane_scores) {
+                            if !f.admits(doc) {
+                                continue;
+                            }
+                            count += 1;
+                            offer(&mut heap, &mut threshold, doc, score);
+                        }
+                    }
                 }
                 c.advance_by(to - from);
             }

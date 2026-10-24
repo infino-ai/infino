@@ -914,6 +914,17 @@ impl FtsReader {
         );
         let (hits, count) = match prep {
             PreparedClauses::Done { hits, count, .. } => (hits, count),
+            // One required term matches exactly its own postings, as a
+            // one-term union does: that walk scores a block at a time.
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                mut filter,
+                k,
+                ..
+            } if must_cursors.len() == 1 => {
+                self.run_windowed_union_counted(column_id, must_cursors, k, filter.as_mut())?
+            }
             PreparedClauses::Must {
                 column_id,
                 must_cursors,
