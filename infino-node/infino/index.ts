@@ -9,6 +9,7 @@ import * as arrow from "apache-arrow";
 import { connect as nativeConnect, IndexSpec, builderId } from "./native.js";
 
 export { IndexSpec };
+export type { FtsOptions } from "./native.js";
 
 /** Infino's build identifier (version + build hash). */
 export const BUILDER_ID: string = builderId();
