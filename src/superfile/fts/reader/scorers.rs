@@ -3629,6 +3629,21 @@ impl FtsReader {
                 Err(seed) if seed > f32::NEG_INFINITY => {
                     self.run_windowed_maxscore(column_id, cursors, k, None, seed, 0, u32::MAX)
                 }
+                // The rare term walked but held fewer documents than `k`, so
+                // there is no seed: the windowed kernel scores the common term
+                // a block at a time where WAND would walk it a document at a
+                // time.
+                Err(_) if cursors.iter().map(|c| c.df).min().unwrap_or(0) <= RARE_LED_MAX_DF => {
+                    self.run_windowed_maxscore(
+                        column_id,
+                        cursors,
+                        k,
+                        None,
+                        f32::NEG_INFINITY,
+                        0,
+                        u32::MAX,
+                    )
+                }
                 Err(_) => self.run_wand_bmw(column_id, cursors, k),
             }
         } else {
