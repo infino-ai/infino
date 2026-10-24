@@ -142,15 +142,30 @@ fn field_bytes(v: u32) -> usize {
     }
 }
 
-/// Read a `width`-byte little-endian field at `at`.
-#[inline]
-fn read_field(bytes: &[u8], at: usize, width: usize) -> Option<u32> {
-    let f = bytes.get(at..at + width)?;
-    Some(match width {
-        1 => u32::from(f[0]),
-        2 => u32::from(u16::from_le_bytes([f[0], f[1]])),
-        _ => u32::from_le_bytes([f[0], f[1], f[2], f[3]]),
-    })
+/// Field `i` of a table of `W`-byte little-endian fields.
+#[inline(always)]
+fn field<const W: usize>(table: &[u8], i: usize) -> u32 {
+    let f: [u8; W] = table[i * W..i * W + W]
+        .try_into()
+        .expect("invariant: a W-byte field");
+    let mut word = [0u8; 4];
+    word[..W].copy_from_slice(&f);
+    u32::from_le_bytes(word)
+}
+
+/// Both exception tables of one stream read into `out`, `n_exc` lanes of
+/// `LB` bytes then as many high bits of `HB` bytes, the widths constant
+/// so each field is one load. `None` when the tables run past `bytes`.
+fn read_tables<const LB: usize, const HB: usize>(
+    bytes: &[u8],
+    at: usize,
+    n_exc: usize,
+    out: &mut Vec<(u32, u32)>,
+) -> Option<usize> {
+    let lanes = bytes.get(at..at + n_exc * LB)?;
+    let his = bytes.get(at + n_exc * LB..at + n_exc * (LB + HB))?;
+    out.extend((0..n_exc).map(|e| (field::<LB>(lanes, e), field::<HB>(his, e))));
+    Some(at + n_exc * (LB + HB))
 }
 /// Widest packed position value: a `u32`.
 const GROUP_MAX_WIDTH: u8 = 32;
@@ -360,17 +375,27 @@ impl StreamIndex {
             // little-endian fields of the width the leading byte gives.
             let widths = *bytes.get(*at)?;
             *at += 1;
-            let (lane_bytes, hi_bytes) = (usize::from(widths & 0xF), usize::from(widths >> 4));
-            if ![1, 2, 4].contains(&lane_bytes) || ![1, 2, 4].contains(&hi_bytes) {
-                return None;
+            let tables = &mut self.exceptions;
+            *at = match (widths & 0xF, widths >> 4) {
+                (1, 1) => read_tables::<1, 1>(bytes, *at, n_exc, tables),
+                (1, 2) => read_tables::<1, 2>(bytes, *at, n_exc, tables),
+                (1, 4) => read_tables::<1, 4>(bytes, *at, n_exc, tables),
+                (2, 1) => read_tables::<2, 1>(bytes, *at, n_exc, tables),
+                (2, 2) => read_tables::<2, 2>(bytes, *at, n_exc, tables),
+                (2, 4) => read_tables::<2, 4>(bytes, *at, n_exc, tables),
+                (4, 1) => read_tables::<4, 1>(bytes, *at, n_exc, tables),
+                (4, 2) => read_tables::<4, 2>(bytes, *at, n_exc, tables),
+                (4, 4) => read_tables::<4, 4>(bytes, *at, n_exc, tables),
+                _ => None,
+            }?;
+            // Lanes must ascend and fall inside the stream.
+            let mut prev: Option<u32> = None;
+            for &(lane, _) in tables.iter() {
+                if lane as usize >= n || prev.is_some_and(|p| lane <= p) {
+                    return None;
+                }
+                prev = Some(lane);
             }
-            let his_at = *at + n_exc * lane_bytes;
-            for e in 0..n_exc {
-                let lane = read_field(bytes, *at + e * lane_bytes, lane_bytes)?;
-                let hi = read_field(bytes, his_at + e * hi_bytes, hi_bytes)?;
-                push(lane, hi)?;
-            }
-            *at = his_at + n_exc * hi_bytes;
         } else if !fixed {
             for _ in 0..n_exc {
                 let lane = read_varint(bytes, at)?;
