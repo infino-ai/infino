@@ -240,7 +240,7 @@ pub(super) struct MustShouldSink<'a> {
     pub(super) k: usize,
     pub(super) filter: Option<&'a mut ExcludeFilter>,
     pub(super) floor_eff: f32,
-    pub(super) shoulds: Vec<TermCursor>,
+    pub(super) shoulds: ShouldBatch,
     /// Σ `term_max_bm25` over the should cursors — the most the
     /// shoulds can add to any single doc's score.
     pub(super) should_ub: f32,
@@ -281,26 +281,85 @@ impl AndSink for MustShouldSink<'_> {
     }
 
     fn emit(&mut self, doc: u32, must_score: f32) {
-        let mut score = must_score;
-        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
-        // Floor gate on the FULL score — a must-only score below the
-        // floor can still survive once its shoulds are added.
-        if score > self.floor_eff {
-            and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+        if self.shoulds.push(doc, must_score) {
+            self.flush();
         }
     }
 }
 
-/// Add each should term's BM25 at `doc` to `score`, streaming the
-/// cursors forward to it. Accumulates in cursor order so the ranked and
-/// the counted must+should sinks produce the same bits.
-#[inline]
-fn add_should_scores(shoulds: &mut [TermCursor], doc: u32, norm: f32, score: &mut f32) {
-    for c in shoulds {
-        c.skip_to(doc);
-        if !c.is_exhausted() && c.current_doc_id() == doc {
-            *score += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), norm);
+impl MustShouldSink<'_> {
+    /// Score the held docs' shoulds and offer them to the heap. The walk
+    /// calls this once more after its last doc.
+    pub(super) fn flush(&mut self) {
+        let (docs, scores) = self.shoulds.score(self.dl_norm_k1);
+        for (&doc, &score) in docs.iter().zip(scores) {
+            // Floor gate on the FULL score — a must-only score below the
+            // floor can still survive once its shoulds are added.
+            if score > self.floor_eff {
+                and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+            }
         }
+        self.shoulds.clear();
+    }
+}
+
+/// How many must-intersection docs wait for their should scores.
+const SHOULD_BATCH: usize = 128;
+
+/// Must-intersection docs held until a batch is full, so each should term
+/// is probed once for the batch ([`TermCursor::probe_tfs`]) rather than
+/// stepped to every doc. Each doc adds its should scores in cursor order,
+/// so the ranked and the counted must+should sinks produce the same bits.
+/// The should cursors are only probed, never iterated.
+pub(super) struct ShouldBatch {
+    shoulds: Vec<TermCursor>,
+    docs: Vec<u32>,
+    scores: Vec<f32>,
+    norms: Vec<f32>,
+    tfs: Vec<u32>,
+}
+
+impl ShouldBatch {
+    pub(super) fn new(shoulds: Vec<TermCursor>) -> Self {
+        Self {
+            shoulds,
+            docs: Vec::with_capacity(SHOULD_BATCH),
+            scores: Vec::with_capacity(SHOULD_BATCH),
+            norms: Vec::with_capacity(SHOULD_BATCH),
+            tfs: Vec::with_capacity(SHOULD_BATCH),
+        }
+    }
+
+    /// Hold `doc` with its must score; `true` once the batch is full.
+    #[inline]
+    fn push(&mut self, doc: u32, must_score: f32) -> bool {
+        self.docs.push(doc);
+        self.scores.push(must_score);
+        self.docs.len() == SHOULD_BATCH
+    }
+
+    /// Add every should term's BM25 to each held doc's score; the held
+    /// docs with their full scores, in ascending doc order.
+    fn score(&mut self, dl_norm_k1: &NormTable) -> (&[u32], &[f32]) {
+        let n = self.docs.len();
+        self.norms.clear();
+        self.norms
+            .extend(self.docs.iter().map(|&d| dl_norm_k1.get(d)));
+        self.tfs.resize(n, 0);
+        for c in &mut self.shoulds {
+            c.probe_tfs(&self.docs, &mut self.tfs);
+            for ((score, &tf), &norm) in self.scores.iter_mut().zip(&self.tfs).zip(&self.norms) {
+                if tf != 0 {
+                    *score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
+                }
+            }
+        }
+        (&self.docs, &self.scores)
+    }
+
+    fn clear(&mut self) {
+        self.docs.clear();
+        self.scores.clear();
     }
 }
 
@@ -377,7 +436,7 @@ pub(super) struct MustShouldCountSink<'a> {
     pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
     pub(super) k: usize,
     pub(super) filter: Option<&'a mut ExcludeFilter>,
-    pub(super) shoulds: Vec<TermCursor>,
+    pub(super) shoulds: ShouldBatch,
     pub(super) dl_norm_k1: &'a NormTable,
     pub(super) count: u64,
 }
@@ -398,9 +457,21 @@ impl AndSink for MustShouldCountSink<'_> {
             return;
         }
         self.count += 1;
-        let mut score = must_score;
-        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
-        and_heap_push(self.heap, self.k, None, score, doc);
+        if self.shoulds.push(doc, must_score) {
+            self.flush();
+        }
+    }
+}
+
+impl MustShouldCountSink<'_> {
+    /// Score the held docs' shoulds and offer them to the heap. The walk
+    /// calls this once more after its last doc.
+    pub(super) fn flush(&mut self) {
+        let (docs, scores) = self.shoulds.score(self.dl_norm_k1);
+        for (&doc, &score) in docs.iter().zip(scores) {
+            and_heap_push(self.heap, self.k, None, score, doc);
+        }
+        self.shoulds.clear();
     }
 }
 

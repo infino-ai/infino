@@ -19,8 +19,8 @@ use super::{
     metadata::{NormTable, unscored_norm_table},
     sink::{
         AndSink, BufferedScoreSink, CollectSink, Collector, MustShouldCountSink, MustShouldSink,
-        ScoreCountSink, ScoreSink, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc,
-        offer_top_k, replace_worst,
+        ScoreCountSink, ScoreSink, ShouldBatch, TopKBuffer, TopKEntry, and_heap_push,
+        drain_top_k_desc, offer_top_k, replace_worst,
     },
 };
 use crate::superfile::{
@@ -1777,11 +1777,12 @@ impl FtsReader {
                 k,
                 filter,
                 floor_eff,
-                shoulds: should_cursors,
+                shoulds: ShouldBatch::new(should_cursors),
                 should_ub,
                 dl_norm_k1,
             };
             self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+            sink.flush();
         });
         Ok(hits)
     }
@@ -1806,11 +1807,12 @@ impl FtsReader {
                 heap,
                 k,
                 filter,
-                shoulds: should_cursors,
+                shoulds: ShouldBatch::new(should_cursors),
                 dl_norm_k1,
                 count: 0,
             };
             self.and_flat_merge(&mut must_cursors, dl_norm_k1, &mut sink);
+            sink.flush();
             sink.count
         }))
     }
