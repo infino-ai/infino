@@ -125,13 +125,33 @@ pub(crate) const GROUP_LEB128: u8 = 0;
 /// exceptions are varints (every blob before `VERSION_V10`).
 pub(crate) const GROUP_PACKED: u8 = 1;
 /// Group header value for a group stored as two patched streams whose
-/// exception tables are fixed-width little-endian `u32` arrays, which a
-/// reader takes in place instead of decoding a varint pair per exception
-/// on every group it locates. The streams and their lanes are those of
-/// [`GROUP_PACKED`]. Written from `VERSION_V10`.
+/// exception tables are fixed-width little-endian arrays, which a reader
+/// takes in place instead of decoding a varint pair per exception on every
+/// group it locates. Each table's field width (1, 2 or 4 bytes) is the
+/// narrowest its values fit, so the tables take about what the varints did.
+/// The streams and their lanes are those of [`GROUP_PACKED`]. Written from
+/// `VERSION_V10`.
 pub(crate) const GROUP_PACKED_FIXED: u8 = 2;
-/// Bytes of one fixed-width exception table entry: a lane or high bits.
-const EXCEPTION_FIELD_BYTES: usize = 4;
+
+/// Bytes a little-endian field needs to hold `v`: 1, 2 or 4.
+fn field_bytes(v: u32) -> usize {
+    match v {
+        0..=0xFF => 1,
+        0x100..=0xFFFF => 2,
+        _ => 4,
+    }
+}
+
+/// Read a `width`-byte little-endian field at `at`.
+#[inline]
+fn read_field(bytes: &[u8], at: usize, width: usize) -> Option<u32> {
+    let f = bytes.get(at..at + width)?;
+    Some(match width {
+        1 => u32::from(f[0]),
+        2 => u32::from(u16::from_le_bytes([f[0], f[1]])),
+        _ => u32::from_le_bytes([f[0], f[1], f[2], f[3]]),
+    })
+}
 /// Widest packed position value: a `u32`.
 const GROUP_MAX_WIDTH: u8 = 32;
 /// Most exception lanes a packed stream may carry; bounds the patch loop.
@@ -150,8 +170,10 @@ const GROUP_MAX_EXCEPTIONS: usize = 64;
 /// its lanes fit, and the lanes that do not — one long document, one
 /// long gap — store their high bits as **exceptions** `(lane, high
 /// bits)` so a single outlier never widens the whole stream. Stream
-/// layout: `width (u8) | n_exceptions (u8) | packed low bits |
-/// exception lanes (u32 LE each) | exception high bits (u32 LE each)`
+/// layout: `width (u8) | n_exceptions (u8) | packed low bits |` and, with
+/// any exceptions, `field widths (u8: lane bytes, high-bits bytes in the
+/// high nibble) | exception lanes | exception high bits`, each table one
+/// little-endian field per exception
 /// ([`GROUP_PACKED_FIXED`]; the [`GROUP_PACKED`] groups of older blobs
 /// carry a varint count and varint `(lane, high bits)` pairs instead).
 ///
@@ -231,7 +253,7 @@ fn plan_stream(
         GROUP_MAX_EXCEPTIONS,
         |width| 2 + payload_bytes(lanes.len(), width),
         |lane, hi| match fixed {
-            true => 2 * EXCEPTION_FIELD_BYTES,
+            true => field_bytes(lane) + field_bytes(hi),
             false => varint_len(lane) + varint_len(hi),
         },
         plan,
@@ -262,11 +284,23 @@ fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: b
         }
     }
     if fixed {
+        let Some(&(last_lane, _)) = plan.exceptions.last() else {
+            return;
+        };
+        // Lanes ascend, so the last is the widest.
+        let lane_bytes = field_bytes(last_lane);
+        let hi_bytes = plan
+            .exceptions
+            .iter()
+            .map(|&(_, hi)| field_bytes(hi))
+            .max()
+            .unwrap_or(1);
+        out.push((lane_bytes as u8) | ((hi_bytes as u8) << 4));
         for &(lane, _) in &plan.exceptions {
-            out.extend_from_slice(&lane.to_le_bytes());
+            out.extend_from_slice(&lane.to_le_bytes()[..lane_bytes]);
         }
         for &(_, hi) in &plan.exceptions {
-            out.extend_from_slice(&hi.to_le_bytes());
+            out.extend_from_slice(&hi.to_le_bytes()[..hi_bytes]);
         }
         return;
     }
@@ -321,22 +355,23 @@ impl StreamIndex {
             prev_lane = Some(lane);
             Some(())
         };
-        if fixed {
+        if fixed && n_exc > 0 {
             // Both tables in place: lanes, then high bits, each `n_exc`
-            // little-endian `u32`s.
-            let table = n_exc * EXCEPTION_FIELD_BYTES;
-            let lanes = bytes.get(*at..*at + table)?;
-            let his = bytes.get(*at + table..*at + 2 * table)?;
-            *at += 2 * table;
-            for (l, h) in lanes
-                .chunks_exact(EXCEPTION_FIELD_BYTES)
-                .zip(his.chunks_exact(EXCEPTION_FIELD_BYTES))
-            {
-                let lane = u32::from_le_bytes(l.try_into().expect("four bytes"));
-                let hi = u32::from_le_bytes(h.try_into().expect("four bytes"));
+            // little-endian fields of the width the leading byte gives.
+            let widths = *bytes.get(*at)?;
+            *at += 1;
+            let (lane_bytes, hi_bytes) = (usize::from(widths & 0xF), usize::from(widths >> 4));
+            if ![1, 2, 4].contains(&lane_bytes) || ![1, 2, 4].contains(&hi_bytes) {
+                return None;
+            }
+            let his_at = *at + n_exc * lane_bytes;
+            for e in 0..n_exc {
+                let lane = read_field(bytes, *at + e * lane_bytes, lane_bytes)?;
+                let hi = read_field(bytes, his_at + e * hi_bytes, hi_bytes)?;
                 push(lane, hi)?;
             }
-        } else {
+            *at = his_at + n_exc * hi_bytes;
+        } else if !fixed {
             for _ in 0..n_exc {
                 let lane = read_varint(bytes, at)?;
                 let hi = read_varint(bytes, at)?;
@@ -706,8 +741,9 @@ mod tests {
         let mut out = Vec::new();
         group(&mut out, &tfs, &vals, true);
         assert_eq!(out[0], GROUP_PACKED_FIXED);
-        // firsts: 1 + 1 + 138 (11 bits) + one 8-byte exception; gaps: 1 + 1 + 125 (5 bits) + one.
-        assert!(out.len() <= 1 + 148 + 135, "got {} bytes", out.len());
+        // firsts: 1 + 1 + 138 (11 bits) + one exception; gaps: 1 + 1 + 125 (5 bits) + one;
+        // each table adds one byte of field widths.
+        assert!(out.len() < 1 + 145 + 133 + 2, "got {} bytes", out.len());
         assert_eq!(decode_all(&out, 0, &tfs), Some(positions_of(&tfs, &vals)));
 
         // A short term with a lone value: LEB128 is smaller and allowed.
