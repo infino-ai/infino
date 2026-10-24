@@ -953,7 +953,7 @@ fn accumulate_step(
 
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
-const BUFFERED_TOPK_MIN_K: usize = 512;
+const BUFFERED_TOPK_MIN_K: usize = 64;
 
 /// Most optional terms the required-term walk takes; a wider list keeps
 /// the general must+should walk.
