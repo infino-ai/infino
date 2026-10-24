@@ -545,6 +545,62 @@ fn and_prefer_membership(cursors: &[TermCursor]) -> bool {
     false
 }
 
+/// [`must_lead_should_walk`] with pruning off, for the exact-count search:
+/// every doc of the one required term is scored and counted. A block at a
+/// time: the required term's postings scored eight-wide, then each optional
+/// term probed for the whole block and its contributions added in query
+/// order (a missing term adds exactly 0), as the general counted walk adds
+/// them, so the scores are the same bits. Only a doc that beats the k-th best
+/// (or fills the heap) is offered.
+fn must_lead_should_count(
+    mut lead: TermCursor,
+    mut shoulds: Vec<TermCursor>,
+    k: usize,
+    dl_norm_k1: &NormTable,
+    heap: &mut BinaryHeap<TopKEntry>,
+) -> u64 {
+    let mut count = 0u64;
+    let mut threshold = 0.0f32;
+    let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    while !lead.is_exhausted() {
+        if lead.decoded_block != lead.current_block {
+            let start = lead.current_doc_id();
+            lead.decode_current_block();
+            lead.materialize_at(start);
+        }
+        let (from, to) = (lead.pos, lead.block_n);
+        docs.clear();
+        docs.extend_from_slice(&lead.block_doc_ids[from..to]);
+        score_postings(
+            lead.idf_weight,
+            &docs,
+            &lead.block_tfs[from..to],
+            dl_norm_k1,
+            &mut scores,
+        );
+        for c in &mut shoulds {
+            tfs.clear();
+            tfs.resize(docs.len(), 0);
+            c.probe_tfs(&docs, &mut tfs);
+            score_postings(c.idf_weight, &docs, &tfs, dl_norm_k1, &mut contribs);
+            for (s, &x) in scores.iter_mut().zip(&contribs) {
+                *s += x;
+            }
+        }
+        count += docs.len() as u64;
+        for (&doc, &score) in docs.iter().zip(&scores) {
+            if heap.len() < k || score > threshold {
+                offer_top_k(heap, k, &mut threshold, score, doc);
+            }
+        }
+        lead.advance_by(to - from);
+    }
+    count
+}
+
 /// One required term with optional terms: the required term drives, one
 /// block at a time, and the optional terms are only probed at its docs.
 ///
@@ -1945,6 +2001,12 @@ impl FtsReader {
             !must_cursors.is_empty() && !should_cursors.is_empty(),
             "dispatch routes empty-side shapes to the AND/OR kernels"
         );
+        if must_cursors.len() == 1 && filter.is_none() {
+            let lead = must_cursors.pop().expect("one must cursor");
+            return Ok(self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
+                must_lead_should_count(lead, should_cursors, k, dl_norm_k1, heap)
+            }));
+        }
         Ok(self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
             must_cursors.sort_by_key(|c| c.block_count());
             let mut sink = MustShouldCountSink {
