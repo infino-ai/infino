@@ -1070,6 +1070,10 @@ fn accumulate_segment(
     c.advance_by(to - pos);
 }
 
+/// Smallest `k` at which a union window runs to its cap rather than ending
+/// at the nearest essential block boundary.
+const WIDE_WINDOW_MIN_K: usize = 512;
+
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
 const BUFFERED_TOPK_MIN_K: usize = 512;
@@ -3230,7 +3234,10 @@ impl FtsReader {
             let base = min_doc & !63;
             let cap_end = base.saturating_add(OR_WINDOW).min(doc_id_end);
             let sole = second_doc >= cap_end;
-            let window_end = if sole {
+            // At a large `k` the bar rises slowly and a block boundary buys
+            // little pruning, while each window pays its bounds and drain: the
+            // window runs to the cap.
+            let window_end = if sole || k >= WIDE_WINDOW_MIN_K {
                 cap_end
             } else {
                 block_bound.min(cap_end)
