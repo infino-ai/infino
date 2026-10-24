@@ -959,6 +959,12 @@ const BUFFERED_TOPK_MIN_K: usize = 512;
 /// the general must+should walk.
 const MAX_SHOULDS_LED: usize = 16;
 
+/// How many times commoner than the rare term every other term of a wider
+/// union must be for the rare-led walk to be tried. The answer is proved
+/// before it is taken, so this only bounds the work an attempt that falls
+/// back wastes.
+const RARE_LED_MIN_DF_RATIO: u64 = 4;
+
 /// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
 /// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
 /// when the block bound allows and `weak` holds the doc. `weak` is only
@@ -3573,7 +3579,7 @@ impl FtsReader {
         let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
         if others
             .iter()
-            .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
+            .any(|c| c.df < rare.df.saturating_mul(RARE_LED_MIN_DF_RATIO))
         {
             return None;
         }
