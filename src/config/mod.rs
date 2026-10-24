@@ -450,10 +450,27 @@ const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
 /// table, and an explicit `0` also defers to the stamp (falling back to this
 /// default when the table is unstamped) so it never disables an engaged graph.
 pub(crate) const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
-/// Default exact-rerank over-fetch for `ivf_router = centroid_graph` —
-/// the measured knee; scoped to this path so it never shifts the stamped,
-/// filtered, or user-table defaults.
-const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
+/// Default per-cluster exact-rerank over-fetch for `ivf_router =
+/// centroid_graph` (with `global_fine_per_cluster_budget` on): each scanned
+/// fine cluster keeps `k·rerank_mult` candidates, so the pooled — and fully
+/// reranked — count is `fanout·k·rerank_mult`. The measured 1B knee is
+/// `k·12 ≈ 120` per cluster (recall@10 ≈ 0.98); far below the old per-cell
+/// default because a coarse cell holds many clusters. Scoped to this path so
+/// it never shifts the stamped / filtered / user-table defaults.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 12;
+/// Default for `global_fine_per_cluster_budget`: the grid-independent
+/// per-cluster rerank budget + rerank-all is the centroid-graph serving
+/// default. `false` restores the legacy per-cell budget + global 1-bit
+/// shortlist cut (then raise `global_fine_rerank_mult` back toward ~128).
+const DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET: bool = true;
+/// Default rerank-pool floor for `ivf_router = centroid_graph` with
+/// `global_fine_per_cluster_budget` on: the per-cluster budget is boosted so
+/// the pooled — and fully reranked — candidate count never drops below this.
+/// It binds only at small N (where `fanout ≈ √fine-clusters` is tiny); large
+/// tables already pool above it, so it is a no-op there. A candidate count,
+/// so the bytes reranked scale with it times the vector width — on high-dim
+/// data a given floor costs proportionally more latency than on low-dim.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR: usize = 30_000;
 /// Default `ivf_router = auto` concentration threshold: `centroid_graph` only
 /// when the calibrated fanout selects under half the fine clusters (a real
 /// subset to concentrate on). A documented starting point, tuned per corpus.
@@ -820,10 +837,26 @@ pub struct VectorSettings {
     /// graph). See `config.yaml` for sizing guidance. Ignored otherwise.
     pub global_fine_fanout: usize,
     /// For `ivf_router = centroid_graph`: the exact-rerank over-fetch
-    /// multiplier for this path specifically (a caller-set `rerank_mult`
-    /// still wins). Scoped here rather than the shared default so tuning
-    /// it never touches the stamped / filtered / user-table paths.
+    /// multiplier (a caller-set `rerank_mult` still wins). With
+    /// `global_fine_per_cluster_budget` on (default) it is applied PER
+    /// SCANNED FINE CLUSTER — each keeps `k·rerank_mult` candidates, so the
+    /// pool is `fanout·k·rerank_mult`, independent of the coarse grid.
+    /// Scoped here so tuning it never touches the stamped / filtered /
+    /// user-table paths.
     pub global_fine_rerank_mult: usize,
+    /// For `ivf_router = centroid_graph`: apply the rerank budget PER FINE
+    /// CLUSTER (pool `fanout·k·rerank_mult`, independent of how clusters
+    /// group into coarse cells) and exact-rerank the whole pool, instead of
+    /// a per-cell budget cut down by a global 1-bit shortlist. On by
+    /// default; `false` restores the legacy per-cell + global-cut path.
+    pub global_fine_per_cluster_budget: bool,
+    /// For `ivf_router = centroid_graph` with `global_fine_per_cluster_budget`
+    /// on: the minimum pooled (and fully reranked) candidate count. Boosts the
+    /// per-cluster budget at small N so recall does not turn depth-limited;
+    /// a no-op at large N, where the pool already exceeds it. Higher trades
+    /// latency for recall, and the cost scales with the vector width (it is a
+    /// candidate count, not a byte budget). Ignored otherwise.
+    pub global_fine_rerank_pool_floor: usize,
     /// For `ivf_router = centroid_graph`: coalesce the selected clusters
     /// within each cell into contiguous reads. Ignored otherwise.
     pub global_fine_coalesce: bool,
@@ -1043,6 +1076,8 @@ impl Default for VectorSettings {
             ivf_router: IvfRouter::Auto,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
+            global_fine_per_cluster_budget: DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET,
+            global_fine_rerank_pool_floor: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,

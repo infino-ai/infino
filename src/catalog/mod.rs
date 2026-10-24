@@ -26,7 +26,10 @@ mod uri;
 use std::sync::Weak;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    io::{Error as IoError, ErrorKind},
     ops::ControlFlow,
+    path::Path,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -65,7 +68,7 @@ use manifest::{
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
-use tracing::{Instrument, debug, info};
+use tracing::{Instrument, debug, info, warn};
 use uri::{Backend, parse_uri};
 
 /// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
@@ -80,6 +83,14 @@ const MIN_BYTES_PER_CONNECTIVE: usize = 3;
 /// Most digits a whole-number literal can carry and still be read exactly: `Decimal128`'s
 /// precision, which is also the `_id` column's (`DECIMAL(38, 0)`).
 const MAX_EXACT_INTEGER_DIGITS: usize = 38;
+
+/// The file in a table's disk-cache directory naming the storage location of
+/// the table generation its cached bytes belong to. The directory is keyed on
+/// the stable table name, which a drop and re-create reuses; superfile keys
+/// carry the location, so a later generation never reads an earlier one's
+/// bytes, but nothing else would ever reclaim them. Not a superfile name, so
+/// the cache's own scan leaves it alone.
+const TABLE_CACHE_LOCATION_FILE: &str = ".table-location";
 
 /// What `query_sql` answers a write with, from either read-only check.
 const READ_ONLY_REFUSAL: &str =
@@ -438,7 +449,19 @@ impl Connection {
         indexes
             .check_analyzers()
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_companions()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
+        // A companion is a table on storage beside this one; a catalog with
+        // no storage, or one forwarding to a hosted service, has nowhere to
+        // put it.
+        if indexes.has_companions() && !matches!(self.inner.store, CatalogStore::Storage { .. }) {
+            return Err(InfinoError::Unsupported(
+                "companion tables need a storage-backed connection".to_string(),
+            )
+            .with_context("create_table", Some(name)));
+        }
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -532,9 +555,12 @@ impl Connection {
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
                 // cache directory; superfile keys carry the location, so a
-                // re-created table never reads a dropped generation's bytes.
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("create_table", Some(name)))?;
+                // re-created table never reads a dropped generation's bytes,
+                // and the directory is claimed for this location, so a
+                // dropped generation's bytes do not stay on disk either.
+                let disk_cache =
+                    build_disk_cache(&self.inner.options, &table_storage, name, &location)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -551,7 +577,9 @@ impl Connection {
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
+                opts = opts
+                    .with_read_consistency(self.inner.options.read_consistency)
+                    .with_companions(indexes.companion_specs());
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -712,8 +740,9 @@ impl Connection {
 
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let disk_cache =
+                    build_disk_cache(&self.inner.options, &table_storage, name, &entry.location)
+                        .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -895,6 +924,11 @@ impl Connection {
     /// For `memory://`, tables live in-process and free with the
     /// last handle, so `purge` has nothing extra to do.
     ///
+    /// The hidden tables kept under the table's location — its vector
+    /// index, and any companions declared with [`IndexSpec::companion`] —
+    /// are part of those bytes: a drop without `purge` leaves them there,
+    /// orphaned with the rest of the table, and `purge` removes them.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_schema::{DataType, Field, Schema};
@@ -963,6 +997,15 @@ impl Connection {
                         &shared_io_runtime(),
                     )
                     .map_err(|e| InfinoError::from(e).with_context("drop_table", Some(name)))?;
+                }
+                // The table's local disk cache goes with it: its bytes belong
+                // to a generation nothing will read again. Under the gate, so
+                // no open of the same name is building a cache over it. The
+                // catalog commit above is the drop; a cache that cannot be
+                // removed here is cleared by the next open of the name
+                // (`claim_table_cache`), so it does not fail the drop.
+                if let Some(cache_root) = self.inner.options.cache_dir.as_ref() {
+                    remove_table_cache(&cache_root.join(name));
                 }
                 Ok(())
             }
@@ -1585,11 +1628,13 @@ fn build_disk_cache(
     options: &ConnectOptions,
     storage: &Arc<dyn StorageProvider>,
     name: &str,
+    location: &str,
 ) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
     let table_root = cache_root.join(name);
+    claim_table_cache(&table_root, location)?;
     let mut cfg = DiskCacheConfig {
         cache_root: table_root.clone(),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
@@ -1614,6 +1659,46 @@ fn build_disk_cache(
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))
+}
+
+/// Make `table_root` the disk cache of the table generation stored at
+/// `location`. A directory holding another generation's bytes - the table was
+/// dropped and re-created under the same name, by this process or another -
+/// or bytes of no recorded generation (a cache written before the record
+/// existed) is emptied first: those bytes are keyed by locations nothing will
+/// read again, and the cache would otherwise count them against its budget
+/// and keep them on disk until eviction. Then `location` is recorded.
+fn claim_table_cache(table_root: &Path, location: &str) -> Result<(), InfinoError> {
+    let record = table_root.join(TABLE_CACHE_LOCATION_FILE);
+    let io = |e: IoError| InfinoError::Io(format!("disk cache {}: {e}", table_root.display()));
+    match fs::read_to_string(&record) {
+        Ok(held) if held == location => return Ok(()),
+        Ok(_) => remove_table_cache(table_root),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let holds_files = fs::read_dir(table_root)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if holds_files {
+                remove_table_cache(table_root);
+            }
+        }
+        Err(e) => return Err(io(e)),
+    }
+    fs::create_dir_all(table_root).map_err(io)?;
+    fs::write(&record, location).map_err(io)
+}
+
+/// Remove a table's disk-cache directory, if there is one. A failure is
+/// logged, not returned: the bytes are a cache, and the next claim of the
+/// directory ([`claim_table_cache`]) clears what this left.
+fn remove_table_cache(table_root: &Path) {
+    match fs::remove_dir_all(table_root) {
+        Ok(()) => info!(dir = %table_root.display(), "removed a table's disk cache"),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(dir = %table_root.display(), error = %e, "could not remove a table's disk cache")
+        }
+    }
 }
 
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
@@ -2787,6 +2872,142 @@ mod tests {
         assert_eq!(
             cold_after_q2, cold_after_q1,
             "second query must reuse the warm disk cache, not cold-fetch again"
+        );
+    }
+
+    /// The files under a table's disk-cache directory, its location record
+    /// aside, by path relative to the directory.
+    fn table_cache_files(table_root: &Path) -> HashSet<PathBuf> {
+        let mut found = HashSet::new();
+        let mut pending = vec![table_root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if !path.ends_with(TABLE_CACHE_LOCATION_FILE) {
+                    found.insert(
+                        path.strip_prefix(table_root)
+                            .expect("under root")
+                            .to_path_buf(),
+                    );
+                }
+            }
+        }
+        found
+    }
+
+    /// A cached reader over `uri`, with strong reads so it sees a peer's drop.
+    fn cached_reader(uri: &str, cache: &Path) -> Connection {
+        connect_with(
+            uri,
+            ConnectOptions::new()
+                .with_cache_dir(cache.to_path_buf())
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect cached reader")
+    }
+
+    /// Dropping a table removes its local disk cache: the bytes belong to a
+    /// generation nothing will read again, and kept, they count against the
+    /// disk the cache shares with every other table.
+    #[test]
+    fn dropping_a_table_removes_its_disk_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        connect(&uri)
+            .expect("connect writer")
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let reader = cached_reader(&uri, cache.path());
+        reader.query_sql("SELECT title FROM docs").expect("scan");
+        let table_root = cache.path().join("docs");
+        assert!(
+            !table_cache_files(&table_root).is_empty(),
+            "the scan cached the superfile"
+        );
+
+        reader.drop_table("docs", true).expect("drop");
+        assert!(!table_root.exists(), "the dropped table's cache is gone");
+    }
+
+    /// A table dropped and re-created by another process keeps its name, and
+    /// so its cache directory here; opening the new generation clears the old
+    /// one's bytes rather than keep them beside its own until eviction.
+    #[test]
+    fn a_re_created_table_clears_the_dropped_generations_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let reader = cached_reader(&uri, cache.path());
+        reader.query_sql("SELECT title FROM docs").expect("scan");
+        let table_root = cache.path().join("docs");
+        let first = table_cache_files(&table_root);
+        assert!(!first.is_empty(), "the first generation is cached");
+
+        writer.drop_table("docs", true).expect("drop elsewhere");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["a slow green turtle"]))
+            .expect("append");
+        // Trip the reader's freshness probe, as a peer's drop is first seen
+        // (`storage_recreated_table_after_a_peer_drop_reads_the_new_generation`).
+        let _ = reader.query_sql("SELECT COUNT(*) FROM docs");
+        reader
+            .query_sql("SELECT title FROM docs")
+            .expect("scan again");
+
+        let second = table_cache_files(&table_root);
+        assert!(!second.is_empty(), "the new generation is cached");
+        assert!(
+            first.is_disjoint(&second),
+            "no file of the dropped generation is left: {first:?} {second:?}"
+        );
+    }
+
+    /// A cache directory with no location record - written before the record
+    /// existed - holds bytes of no known generation, and is emptied when the
+    /// table is opened.
+    #[test]
+    fn a_table_cache_of_no_recorded_generation_is_emptied_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        connect(&uri)
+            .expect("connect writer")
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let table_root = cache.path().join("docs");
+        fs::create_dir_all(&table_root).expect("mkdir");
+        let leftover = table_root.join("seg-leftover.sf.parquet");
+        fs::write(&leftover, b"bytes of an unknown generation").expect("seed");
+
+        cached_reader(&uri, cache.path())
+            .open_table_handle("docs")
+            .expect("open");
+        assert!(!leftover.exists(), "the unrecorded bytes are gone");
+        assert!(
+            table_root.join(TABLE_CACHE_LOCATION_FILE).exists(),
+            "the directory now records its generation"
         );
     }
 

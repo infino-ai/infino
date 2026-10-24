@@ -116,6 +116,9 @@ pub(crate) enum TableRole {
     /// The derived, cell-ordered vector index that accelerates vector
     /// search over [`Self::User`].
     VectorIndex,
+    /// A hidden companion table a caller declared beside a [`Self::User`]
+    /// table, with its own schema and indexes.
+    Companion,
 }
 
 impl TableRole {
@@ -126,6 +129,7 @@ impl TableRole {
         match self {
             Self::User => "user",
             Self::VectorIndex => "vector_index",
+            Self::Companion => "companion",
         }
     }
 }
@@ -452,5 +456,6 @@ mod tests {
         assert_eq!(OpOrigin::Open.as_str(), "open");
         assert_eq!(TableRole::User.as_str(), "user");
         assert_eq!(TableRole::VectorIndex.as_str(), "vector_index");
+        assert_eq!(TableRole::Companion.as_str(), "companion");
     }
 }

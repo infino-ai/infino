@@ -65,6 +65,10 @@ const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 /// not memory or query time.
 pub(super) const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Share of [`WRITE_BEHIND_CAP_BYTES`], in percent, that downloads ahead of reads may use. The
+/// rest is left for reads' own downloads.
+pub(super) const AHEAD_WRITE_BEHIND_PERCENT: u64 = 50;
+
 /// Block-file writes a store runs at once. Each one holds a thread of the blocking pool, which a
 /// query also needs to hand off its worker in `block_in_place`; more writers would not write faster
 /// anyway, since they wait on the same disk.
@@ -356,6 +360,9 @@ pub struct DiskCacheStore {
     /// [`WRITE_BEHIND_CAP_BYTES`] a read's run is not cached, so a slow disk limits memory, not
     /// queries.
     write_behind_bytes: AtomicU64,
+    /// Room reserved by downloads ahead of reads that are still downloading; see
+    /// [`Self::try_reserve_ahead`].
+    ahead_bytes: AtomicU64,
     /// [`BLOCK_WRITERS`] slots; a fetched run waits for one before its write takes a thread.
     block_writers: Arc<Semaphore>,
     /// Queued block-file writes not finished yet (index write included), and a wake-up when it
@@ -472,6 +479,7 @@ impl DiskCacheStore {
             block_files: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             write_behind_bytes: AtomicU64::new(0),
+            ahead_bytes: AtomicU64::new(0),
             block_writers: Arc::new(Semaphore::new(BLOCK_WRITERS)),
             #[cfg(test)]
             block_writes: AtomicUsize::new(0),

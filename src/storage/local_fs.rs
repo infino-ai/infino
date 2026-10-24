@@ -28,7 +28,7 @@ use object_store::{
     PutPayload, local::LocalFileSystem, path::Path as ObjPath,
 };
 
-use super::{ObjectMeta, StorageError, StorageProvider, counting};
+use super::{ObjectMeta, StorageError, StorageProvider, child_prefix_names, counting};
 use crate::{runtime_bridge::carry_span, runtime_metrics::io::UsageMeter};
 
 #[derive(Debug)]
@@ -456,6 +456,14 @@ impl StorageProvider for LocalFsStorageProvider {
             ));
         }
         Ok(out)
+    }
+
+    async fn list_child_prefixes(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = Self::path(prefix)?;
+        self.meter.record_list();
+        child_prefix_names(self.store.as_ref(), &path)
+            .await
+            .map_err(|e| translate(prefix, e))
     }
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {

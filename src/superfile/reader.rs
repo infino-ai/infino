@@ -63,7 +63,7 @@ use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
-        BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
         error::FtsError,
         format::{self, footer, kv},
         fts::{
@@ -75,7 +75,7 @@ use crate::{
             tokenize::{Phrase, Tokenizer},
         },
         id_space::RowId,
-        ids,
+        ids::PackedIds,
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -89,6 +89,13 @@ use crate::{
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
+/// A cold `_id` read takes the whole stable-id sidecar once it asks for at
+/// least one distinct row in this many. At half the rows nearly every page of
+/// the `_id` column is touched, so reading the pages costs more GETs and more
+/// bytes than the sidecar's few bytes a row; below it the column's page index
+/// reads less.
+const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
@@ -222,21 +229,211 @@ pub struct SuperfileReader {
     /// columns thrashes it and simply pays what it paid before.
     scored_fts: RwLock<Option<(ScoringKey, Arc<FtsReader>)>>,
     vec: Option<VectorReader>,
-    /// Byte range of the stable-id sidecar within `bytes` (a packed
-    /// little-endian `i128` per local doc id), when the superfile carries
-    /// one. Lets `take_by_local_doc_ids` resolve `_id` from a fixed-width
-    /// slice instead of decompressing the Parquet id pages. `None` on
-    /// superfiles written before the sidecar existed, or when there are no
-    /// resident bytes to slice (lazy path) — both fall back to the Parquet
-    /// id column.
-    id_sidecar: Option<Range<usize>>,
-    /// Whether `id_sidecar` holds the packed layout (`superfile::ids`)
-    /// rather than the raw `i128` array.
-    id_sidecar_packed: bool,
-    /// Set by the first read that finds a bad block in `id_sidecar`. Later
+    /// Where the stable-id sidecar sits in the file, when the superfile
+    /// carries one (absent on superfiles written before it existed). The
+    /// sidecar holds every row's `_id` in row order, so it answers `_id`
+    /// without decoding Parquet pages: a fully resident reader slices it
+    /// ([`resident_id_sidecar`](Self::resident_id_sidecar)), and any reader
+    /// can fetch it whole in one read
+    /// ([`fetch_id_sidecar`](Self::fetch_id_sidecar)).
+    id_sidecar: Option<IdSidecarLocation>,
+    /// Set by the first read that finds a bad block in the sidecar. Later
     /// reads take `_id` from Parquet, so the sidecar is not retried or warned
     /// about again.
     id_sidecar_broken: AtomicBool,
+    /// The `(offset, len)` the resident bytes do not hold, when they are a
+    /// local copy with a hole ([`install_resident_parquet`]); every other byte
+    /// of them is the file's own.
+    ///
+    /// [`install_resident_parquet`]: Self::install_resident_parquet
+    resident_hole: Option<(u64, u64)>,
+}
+
+/// Where a superfile's stable-id sidecar lives and how it is laid out, from
+/// the footer key-values. Its range was checked against the file length when
+/// it was parsed ([`id_sidecar_location`]).
+#[derive(Debug, Clone, Copy)]
+struct IdSidecarLocation {
+    offset: u64,
+    len: u64,
+    /// The packed layout (`superfile::ids`) rather than the raw `i128` array.
+    packed: bool,
+}
+
+impl IdSidecarLocation {
+    /// The sidecar, given its bytes.
+    fn with_bytes(self, bytes: Bytes, n_docs: u64) -> IdSidecar {
+        IdSidecar {
+            bytes,
+            packed: self.packed,
+            n_docs,
+        }
+    }
+
+    /// The sidecar cut from the whole file's `bytes`.
+    fn slice(self, file: &Bytes, n_docs: u64) -> IdSidecar {
+        let start = self.offset as usize;
+        self.with_bytes(file.slice(start..start + self.len as usize), n_docs)
+    }
+}
+
+/// A superfile's whole stable-id sidecar: one `_id` per local doc, in
+/// Parquet row order (every writer builds it from the same rows, in the same
+/// order, as the Parquet body). Decoding it is CPU over the rows asked for,
+/// so it is a step of its own that the caller runs where CPU work belongs.
+#[derive(Debug)]
+pub(crate) struct IdSidecar {
+    bytes: Bytes,
+    packed: bool,
+    n_docs: u64,
+}
+
+impl IdSidecar {
+    /// Check the sidecar's shape without decoding it: a packed one's header,
+    /// a raw one's length (sixteen bytes per doc). An eager open checks this
+    /// much; [`ids`](Self::ids) also checks each block it reads.
+    fn check(&self) -> Result<(), ReadError> {
+        if self.packed {
+            return PackedIds::open(&self.bytes, self.n_docs as usize)
+                .map(|_| ())
+                .map_err(ReadError::MalformedKv);
+        }
+        let expected = self.n_docs as usize * format::ID_SIDECAR_ENTRY_BYTES;
+        if self.bytes.len() != expected {
+            return Err(ReadError::MalformedKv(format!(
+                "stable-id sidecar length {} != {expected} (16 x n_docs)",
+                self.bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `_id` of each of `local_doc_ids`, in caller order; repeats and any
+    /// order are fine. A doc past the end is the caller's mistake
+    /// ([`ReadError::DocIdOutOfRange`]); a sidecar that does not decode is
+    /// [`ReadError::MalformedKv`], and the caller can read the same ids from
+    /// the Parquet `_id` column instead.
+    pub(crate) fn ids(&self, local_doc_ids: &[u32]) -> Result<Vec<i128>, ReadError> {
+        /// Width of one raw id, aliased from the format const for the
+        /// fixed-size `from_le_bytes` decode.
+        const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
+        if let Some(&doc_id) = local_doc_ids
+            .iter()
+            .find(|&&doc| u64::from(doc) >= self.n_docs)
+        {
+            return Err(ReadError::DocIdOutOfRange {
+                doc_id,
+                n_docs: self.n_docs,
+            });
+        }
+        let mut out: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
+        if self.packed {
+            // Opening the packed layout is its check. A block walk hands its
+            // docs over ascending, so a large resolve unpacks each block's two
+            // streams once instead of reading two bit fields per doc.
+            PackedIds::open(&self.bytes, self.n_docs as usize)
+                .map_err(ReadError::MalformedKv)?
+                .get_many(local_doc_ids, &mut out)
+                .ok_or_else(|| {
+                    ReadError::MalformedKv("a block of the stable-id sidecar is malformed".into())
+                })?;
+            return Ok(out);
+        }
+        self.check()?;
+        // In bounds: every doc is below `n_docs`, and the length is
+        // `n_docs * ENTRY`.
+        out.extend(local_doc_ids.iter().map(|&doc_id| {
+            let start = doc_id as usize * ENTRY;
+            let raw: [u8; ENTRY] = self.bytes[start..start + ENTRY]
+                .try_into()
+                .expect("a raw sidecar entry is ENTRY bytes");
+            i128::from_le_bytes(raw)
+        }));
+        Ok(out)
+    }
+
+    /// Every row's `_id`, in row order, checked against what the footer
+    /// already records about them. The sidecar carries no checksum, so a
+    /// damaged block that still decodes would hand back wrong ids; these
+    /// checks catch that before the ids place a hit or a delete:
+    ///
+    ///   - the ids span exactly `id_range`, the file's lowest and highest
+    ///     `_id` as the table recorded them;
+    ///   - each row group's ids have that group's `_id` column minimum and
+    ///     maximum, where the footer carries them.
+    ///
+    /// A mismatch is [`ReadError::MalformedKv`], like a block that does not
+    /// decode, so the caller reads the column instead.
+    pub(crate) fn verified_ids(
+        &self,
+        metadata: &ParquetMetaData,
+        id_column: &str,
+        id_range: (i128, i128),
+    ) -> Result<Vec<i128>, ReadError> {
+        let every: Vec<u32> = (0..self.n_docs as u32).collect();
+        let ids = self.ids(&every)?;
+        let span = ids.iter().min().zip(ids.iter().max());
+        if span.is_some_and(|(&lo, &hi)| (lo, hi) != id_range) {
+            return Err(ReadError::MalformedKv(
+                "the stable-id sidecar's ids do not span the file's id range".into(),
+            ));
+        }
+        let Some(column) = metadata
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.name() == id_column)
+        else {
+            return Ok(ids);
+        };
+        let mut start = 0usize;
+        for (group, row_group) in metadata.row_groups().iter().enumerate() {
+            let rows = usize::try_from(row_group.num_rows()).unwrap_or(0);
+            let end = start.saturating_add(rows).min(ids.len());
+            let slice = &ids[start..end];
+            start = end;
+            let Some((stat_min, stat_max)) = row_group.column(column).statistics().and_then(|s| {
+                Some((
+                    decimal_stat(s.min_bytes_opt()?)?,
+                    decimal_stat(s.max_bytes_opt()?)?,
+                ))
+            }) else {
+                continue;
+            };
+            let found = slice.iter().min().zip(slice.iter().max());
+            if found != Some((&stat_min, &stat_max)) {
+                return Err(ReadError::MalformedKv(format!(
+                    "the stable-id sidecar disagrees with row group {group}'s `_id` statistics"
+                )));
+            }
+        }
+        Ok(ids)
+    }
+}
+
+/// Whether `local_doc_ids` names at least one distinct row of a file of
+/// `n_docs` in every [`SIDECAR_MIN_ROW_SHARE`]. Counts distinct rows, so a
+/// list with repeats is not mistaken for coverage, and rows past the end do
+/// not count.
+fn covers_row_share(local_doc_ids: &[u32], n_docs: u64) -> bool {
+    let needed = n_docs.div_ceil(SIDECAR_MIN_ROW_SHARE);
+    if n_docs == 0 || (local_doc_ids.len() as u64) < needed {
+        return false;
+    }
+    let distinct: RoaringBitmap = local_doc_ids
+        .iter()
+        .copied()
+        .filter(|&doc| u64::from(doc) < n_docs)
+        .collect();
+    distinct.len() >= needed
+}
+
+/// A `Decimal128` column statistic as stored in the footer: sixteen
+/// big-endian bytes. `None` for any other width (a truncated statistic says
+/// nothing exact).
+fn decimal_stat(bytes: &[u8]) -> Option<i128> {
+    Some(i128::from_be_bytes(bytes.try_into().ok()?))
 }
 
 struct LazyMetadataFetch {
@@ -441,6 +638,13 @@ impl SuperfileReader {
         };
 
         let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
+        // Lazy reads use the sidecar only to fetch every `_id` at once, a
+        // shortcut with the Parquet column behind it, so a malformed location
+        // switches the shortcut off rather than failing the open.
+        let id_sidecar = id_sidecar_location(&kv_map, source.size()).unwrap_or_else(|error| {
+            warn!(%error, "ignoring the stable-id sidecar of a lazily opened superfile");
+            None
+        });
 
         Ok(Self {
             bytes: None,
@@ -454,11 +658,12 @@ impl SuperfileReader {
             fts,
             scored_fts: RwLock::new(None),
             vec,
-            // No resident bytes to slice on the lazy path; `_id` resolution
-            // there goes through the Parquet id column.
-            id_sidecar: None,
-            id_sidecar_packed: false,
+            // No resident bytes to slice on the lazy path; a read of a few
+            // `_id`s goes through the Parquet id column, and a read of every
+            // one fetches the sidecar through `fetch_id_sidecar`.
+            id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            resident_hole: None,
         })
     }
 
@@ -568,44 +773,17 @@ impl SuperfileReader {
             None
         };
 
-        // 6. Stable-id sidecar (optional): a packed little-endian `i128` per
-        //    local doc id. Record its byte range so `take_by_local_doc_ids`
-        //    resolves `_id` from a fixed-width slice instead of the Parquet
-        //    id pages. Absent on pre-sidecar superfiles → Parquet fallback.
-        //    Only the packed header is checked here; see `PackedIds::open`.
-        let id_sidecar_packed =
-            kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
-        let id_sidecar = if all_present(&kv_map, kv::IDS_KEYS) {
-            let off = parse_u64(&kv_map, kv::IDS_OFFSET)? as usize;
-            let len = parse_u64(&kv_map, kv::IDS_LENGTH)? as usize;
-            let end = off
-                .checked_add(len)
-                .filter(|&end| end <= bytes.len())
-                .ok_or_else(|| {
-                    ReadError::MalformedKv("stable-id sidecar range out of bounds".into())
-                })?;
-            match id_sidecar_packed {
-                true => {
-                    ids::PackedIds::open(&bytes[off..end], n_docs as usize)
-                        .map_err(ReadError::MalformedKv)?;
-                }
-                false => {
-                    let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
-                    if len != expected {
-                        return Err(ReadError::MalformedKv(format!(
-                            "stable-id sidecar length {len} != {expected} (16 x n_docs)"
-                        )));
-                    }
-                }
-            }
-            Some(off..end)
-        } else if any_present(&kv_map, kv::IDS_KEYS) {
-            return Err(ReadError::MalformedKv(
-                "partial inf.ids.* keys present".into(),
-            ));
-        } else {
-            None
-        };
+        // 6. Stable-id sidecar (optional): every row's `_id` in row order,
+        //    packed (`superfile::ids`) or raw (a little-endian `i128` per
+        //    doc). Recorded so `take_by_local_doc_ids` answers `_id` without
+        //    decoding the Parquet id pages. Absent on superfiles written
+        //    before it existed, which then read the Parquet column. Only its
+        //    shape is checked here (a packed header, or a raw length); each
+        //    packed block is checked when it is read.
+        let id_sidecar = id_sidecar_location(&kv_map, bytes.len() as u64)?;
+        if let Some(loc) = id_sidecar {
+            loc.slice(&bytes, n_docs).check()?;
+        }
 
         Ok(Self {
             bytes: Some(bytes),
@@ -621,8 +799,8 @@ impl SuperfileReader {
             scored_fts: RwLock::new(None),
             vec,
             id_sidecar,
-            id_sidecar_packed,
             id_sidecar_broken: AtomicBool::new(false),
+            resident_hole: None,
         })
     }
 
@@ -791,11 +969,7 @@ impl SuperfileReader {
             row_groups: self.parquet_meta.row_groups().len() as u64,
             row_group_bytes,
             columns,
-            id_sidecar_bytes: self
-                .id_sidecar
-                .as_ref()
-                .map(|r| r.len() as u64)
-                .unwrap_or(0),
+            id_sidecar_bytes: self.id_sidecar.map_or(0, |loc| loc.len),
             vec_bytes: kv_len(kv::VEC_LENGTH),
             fts_bytes: kv_len(kv::FTS_LENGTH),
             fts,
@@ -861,7 +1035,7 @@ impl SuperfileReader {
 
     /// Whether the stable-id sidecar is in the packed layout.
     pub(crate) fn id_sidecar_is_packed(&self) -> bool {
-        self.id_sidecar_packed
+        self.id_sidecar.is_some_and(|loc| loc.packed)
     }
 
     /// Whole-file bytes, but only when every region of them is valid.
@@ -879,14 +1053,19 @@ impl SuperfileReader {
     /// `get_record_batch`, `id_lookup`) run main-style sync decodes instead
     /// of the async stream machinery. Used by the disk cache's hybrid mmap
     /// promotion, where `bytes` is the fill-file mmap with the **vector blob
-    /// left sparse** — valid for every parquet-referenced byte (data pages,
-    /// footer) and for the FTS subsection, but NOT for the vector region.
-    /// The FTS/vector sub-readers keep the sources they were opened over;
-    /// [`byte_source`] keeps preferring the reader's lazy source, so no
-    /// consumer can reach the sparse region through this reader.
+    /// left sparse**: `hole` is that blob's `(offset, len)`, and every byte
+    /// outside it is the file's own. The FTS/vector sub-readers keep the
+    /// sources they were opened over; [`byte_source`] keeps preferring the
+    /// reader's lazy source, so no consumer can reach the sparse region
+    /// through this reader.
     ///
     /// [`byte_source`]: SuperfileReader::byte_source
-    pub(crate) fn install_resident_parquet(&mut self, bytes: Bytes) -> Result<(), ReadError> {
+    pub(crate) fn install_resident_parquet(
+        &mut self,
+        bytes: Bytes,
+        hole: (u64, u64),
+    ) -> Result<(), ReadError> {
+        self.resident_hole = Some(hole);
         let arrow_meta = ArrowReaderMetadata::load(
             &bytes,
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
@@ -959,6 +1138,71 @@ impl SuperfileReader {
             .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
+    /// The whole stable-id sidecar, fetched with one ranged read through
+    /// [`byte_source`](Self::byte_source). On a cold reader that is one
+    /// request for a few bytes per row, where reading every `_id` from the
+    /// Parquet column costs a request per column chunk. `None` when the
+    /// superfile carries no sidecar (written before it existed) or an earlier
+    /// read found it does not decode
+    /// ([`mark_id_sidecar_broken`](Self::mark_id_sidecar_broken)); the caller
+    /// then reads `_id` from the Parquet column, which holds the same ids.
+    pub(crate) async fn fetch_id_sidecar(&self) -> Result<Option<IdSidecar>, ReadError> {
+        let Some(loc) = self.id_sidecar else {
+            return Ok(None);
+        };
+        if self.id_sidecar_broken.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let bytes = self
+            .byte_source()
+            .range(loc.offset, loc.len)
+            .await
+            .map_err(|source| ReadError::RangeFetch {
+                what: "stable-id sidecar fetch",
+                source,
+            })?;
+        // A short buffer is a failed read, not a damaged sidecar: it must
+        // stay in the fetch class, so the caller retries the sidecar on a
+        // later read instead of marking a healthy one broken.
+        if bytes.len() as u64 != loc.len {
+            return Err(ReadError::RangeFetch {
+                what: "stable-id sidecar fetch",
+                source: LazyByteSourceError::ShortRead {
+                    start: loc.offset,
+                    requested: loc.len,
+                    got: bytes.len() as u64,
+                },
+            });
+        }
+        Ok(Some(loc.with_bytes(bytes, self.n_docs)))
+    }
+
+    /// Whether a read of `local_doc_ids` from `id_column` should fetch the
+    /// stable-id sidecar whole ([`fetch_id_sidecar`](Self::fetch_id_sidecar))
+    /// rather than read the Parquet column or the vector blob's inline ids.
+    /// All four must hold:
+    ///
+    ///   - no resident Parquet: a resident reader answers without any read;
+    ///   - at least one distinct row in [`SIDECAR_MIN_ROW_SHARE`] of the file
+    ///     asked for: the sidecar is fetched whole, while a smaller subset
+    ///     reads only its own pages through the column's page index, and at
+    ///     that share those pages are nearly all of the column;
+    ///   - the table's id column: the only column the sidecar holds;
+    ///   - the packed layout: a raw sidecar is sixteen bytes a row, more than
+    ///     the compressed column it would replace.
+    pub(crate) fn id_sidecar_serves(&self, local_doc_ids: &[u32], id_column: &str) -> bool {
+        self.bytes.is_none()
+            && id_column == self.id_column
+            && self.id_sidecar_is_packed()
+            && covers_row_share(local_doc_ids, self.n_docs)
+    }
+
+    /// Record that this superfile's sidecar does not decode, so later reads
+    /// take `_id` from another source without fetching it again.
+    pub(crate) fn mark_id_sidecar_broken(&self) {
+        self.id_sidecar_broken.store(true, Ordering::Relaxed);
+    }
+
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
     /// how the reader was opened. The single byte-access handle the
     /// SQL/DataFusion path reads through -- callers never branch on
@@ -1020,6 +1264,29 @@ impl SuperfileReader {
         local_doc_ids: &[u32],
         projection: &[&str],
     ) -> Result<RecordBatch, ReadError> {
+        self.take_rows(local_doc_ids, projection, true)
+    }
+
+    /// [`take_by_local_doc_ids`](Self::take_by_local_doc_ids) with `_id`
+    /// decoded from the Parquet column even where the stable-id sidecar could
+    /// answer, for a caller rebuilding that sidecar: its ids must come from
+    /// the column, not from the copy being replaced.
+    pub(crate) fn take_by_local_doc_ids_from_parquet(
+        &self,
+        local_doc_ids: &[u32],
+        projection: &[&str],
+    ) -> Result<RecordBatch, ReadError> {
+        self.take_rows(local_doc_ids, projection, false)
+    }
+
+    /// The rows behind both takes; `id_from_sidecar` lets the stable-id
+    /// sidecar answer `_id` when the reader holds it.
+    fn take_rows(
+        &self,
+        local_doc_ids: &[u32],
+        projection: &[&str],
+        id_from_sidecar: bool,
+    ) -> Result<RecordBatch, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -1064,8 +1331,8 @@ impl SuperfileReader {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        // The `_id` column resolves from the fixed-width stable-id sidecar
-        // when the superfile carries one — a direct slice, no Parquet decode.
+        // On a fully resident reader, `_id` resolves from the stable-id
+        // sidecar when the superfile carries one: a slice, no Parquet decode.
         // Every other column still comes from the id-selected Parquet read;
         // when `_id` is the only projection, that read is skipped entirely.
         // A sidecar that can't be read (a bad block) falls back to the Parquet
@@ -1073,15 +1340,18 @@ impl SuperfileReader {
         // The first failure marks the sidecar broken, so later reads skip it and
         // it warns once. `Relaxed` is enough: a read that misses the mark only
         // retries the sidecar and falls back the same way.
-        let sidecar_id = match &self.id_sidecar {
-            Some(range)
+        let resident_sidecar = id_from_sidecar
+            .then(|| self.resident_id_sidecar())
+            .flatten();
+        let sidecar_id = match resident_sidecar {
+            Some(sidecar)
                 if projection.iter().any(|&n| n == self.id_column)
                     && !self.id_sidecar_broken.load(Ordering::Relaxed) =>
             {
-                match self.id_array_from_sidecar(&bytes, range.clone(), local_doc_ids) {
+                match self.id_array_from_sidecar(&sidecar, local_doc_ids) {
                     Ok(ids) => Some(ids),
                     Err(error) => {
-                        self.id_sidecar_broken.store(true, Ordering::Relaxed);
+                        self.mark_id_sidecar_broken();
                         warn!(%error, "reading _id from Parquet, the id sidecar is unreadable");
                         None
                     }
@@ -1185,52 +1455,36 @@ impl SuperfileReader {
         .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
-    /// Build the `_id` column for `local_doc_ids` (in caller order) from the
-    /// stable-id sidecar `range` within `bytes`: a packed sidecar is opened
-    /// by its header and indexed per doc, checking each block it reads; a
-    /// raw one holds a little-endian `i128` at
-    /// `local_doc_id * ENTRY`. Direct indexing, so duplicates and ordering
-    /// need no rank-back. Raw bounds are guaranteed by the doc-id
-    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length
-    /// check at open, so the fixed-width reads cannot overrun the region.
+    /// The stable-id sidecar sliced from resident bytes, without a read: on a
+    /// [fully resident](Self::is_fully_resident) reader, and on a promoted one
+    /// whose missing range ([`install_resident_parquet`]) does not overlap
+    /// the sidecar. The promotion leaves out only the vector blob, which ends
+    /// before the sidecar starts, so a promoted reader's sidecar bytes are the
+    /// file's own; the overlap check keeps that true should the hole move.
+    ///
+    /// [`install_resident_parquet`]: Self::install_resident_parquet
+    fn resident_id_sidecar(&self) -> Option<IdSidecar> {
+        let loc = self.id_sidecar?;
+        let bytes = self.bytes.as_ref()?;
+        let holds_sidecar = match self.resident_hole {
+            None => self.is_fully_resident(),
+            Some((hole, hole_len)) => {
+                loc.offset.saturating_add(loc.len) <= hole
+                    || loc.offset >= hole.saturating_add(hole_len)
+            }
+        };
+        holds_sidecar.then(|| loc.slice(bytes, self.n_docs))
+    }
+
+    /// Build the `_id` column for `local_doc_ids` (in caller order) from
+    /// `sidecar`, through [`IdSidecar::ids`]. Direct indexing, so duplicates
+    /// and ordering need no rank-back.
     fn id_array_from_sidecar(
         &self,
-        bytes: &Bytes,
-        range: Range<usize>,
+        sidecar: &IdSidecar,
         local_doc_ids: &[u32],
     ) -> Result<ArrayRef, ReadError> {
-        /// Width of one packed id, aliased from the format const for the
-        /// fixed-size `from_le_bytes` decode.
-        const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
-        let region = &bytes[range];
-        let packed = match self.id_sidecar_packed {
-            true => Some(
-                ids::PackedIds::open(region, self.n_docs as usize)
-                    .map_err(ReadError::MalformedKv)?,
-            ),
-            false => None,
-        };
-        let mut ids: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
-        match &packed {
-            // A block walk hands its docs over ascending, so a large
-            // resolve unpacks each block's two streams once instead of
-            // reading two bit fields per doc.
-            Some(p) => p.get_many(local_doc_ids, &mut ids).ok_or_else(|| {
-                ReadError::MalformedKv(
-                    "stable-id sidecar has no entry for a requested doc, or its block is malformed"
-                        .into(),
-                )
-            })?,
-            None => {
-                for &doc_id in local_doc_ids {
-                    let start = doc_id as usize * ENTRY;
-                    let raw: [u8; ENTRY] = region[start..start + ENTRY]
-                        .try_into()
-                        .expect("sidecar entry within bounds");
-                    ids.push(i128::from_le_bytes(raw));
-                }
-            }
-        }
+        let ids = sidecar.ids(local_doc_ids)?;
         let id_idx = self
             .schema
             .index_of(&self.id_column)
@@ -2128,6 +2382,7 @@ impl SuperfileReader {
             None,
             rerank_mult,
             cold_rerank_mult,
+            false,
             allow,
             deny,
             pool,
@@ -2236,6 +2491,36 @@ impl VectorSearchOptions {
         let rerank_mult = self.rerank_mult.unwrap_or(Self::RERANK_MULT);
         (nprobe, rerank_mult)
     }
+}
+
+/// The stable-id sidecar's location from the footer key-values, `None` on a
+/// superfile written before the sidecar existed. Partial keys, or a range
+/// past `file_len`, are malformed.
+fn id_sidecar_location(
+    kv_map: &footer::KvMap,
+    file_len: u64,
+) -> Result<Option<IdSidecarLocation>, ReadError> {
+    if !all_present(kv_map, kv::IDS_KEYS) {
+        if any_present(kv_map, kv::IDS_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.ids.* keys present".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let offset = parse_u64(kv_map, kv::IDS_OFFSET)?;
+    let len = parse_u64(kv_map, kv::IDS_LENGTH)?;
+    if offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(ReadError::MalformedKv(
+            "stable-id sidecar range out of bounds".into(),
+        ));
+    }
+    let packed = kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
+    Ok(Some(IdSidecarLocation {
+        offset,
+        len,
+        packed,
+    }))
 }
 
 fn all_present(map: &footer::KvMap, keys: &[&str]) -> bool {
@@ -2415,6 +2700,7 @@ mod tests {
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
+    use async_trait::async_trait;
     use tracing::Level;
 
     use super::*;
@@ -2422,6 +2708,7 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
             format::footer::with_forged_footer_kv,
+            ids,
             vector::distance::normalize,
         },
         test_helpers::{capture_logs, decimal128_ids, default_vector_config},
@@ -2514,8 +2801,21 @@ mod tests {
     /// superfiles don't guarantee it). Returns the bytes alongside the ids
     /// in row order, which is the oracle's ground truth.
     fn build_shuffled_id_superfile() -> (Bytes, Vec<i128>) {
+        let opts = BuilderOptions::new(schema_with_text(), "doc_id", vec![], vec![]);
+        build_shuffled_id_superfile_with(opts)
+    }
+
+    /// [`build_shuffled_id_superfile`] in row groups of `rows` rows.
+    fn build_shuffled_id_superfile_in_row_groups(rows: usize) -> (Bytes, Vec<i128>) {
+        let opts = BuilderOptions::new(schema_with_text(), "doc_id", vec![], vec![]);
+        build_shuffled_id_superfile_with(BuilderOptions {
+            row_group_size: rows,
+            ..opts
+        })
+    }
+
+    fn build_shuffled_id_superfile_with(opts: BuilderOptions) -> (Bytes, Vec<i128>) {
         let schema = schema_with_text();
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
         let ids: Vec<i128> = (0..SHUFFLED_ID_ROWS)
@@ -3430,6 +3730,326 @@ mod tests {
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
+    }
+
+    /// The lazy reader of [`build_shuffled_id_superfile`], whose ids are
+    /// out of row order, so a decode that loses the order cannot pass.
+    async fn lazy_shuffled_id_reader(bytes: Bytes) -> SuperfileReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        SuperfileReader::open_lazy(src).await.expect("open_lazy")
+    }
+
+    /// A lazily opened reader keeps the sidecar's location and fetches it
+    /// whole: every id it decodes is the id the superfile was built with, in
+    /// row order, for any request order and with repeats.
+    #[tokio::test]
+    async fn lazy_reader_fetches_the_id_sidecar_in_row_order() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let lazy = lazy_shuffled_id_reader(bytes).await;
+        assert!(lazy.parquet_bytes().is_none());
+
+        let sidecar = lazy
+            .fetch_id_sidecar()
+            .await
+            .expect("fetch")
+            .expect("the superfile carries a sidecar");
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        assert_eq!(sidecar.ids(&every).expect("decode"), ids);
+
+        let last = SHUFFLED_ID_ROWS as u32 - 1;
+        let locals = [last, 0, 37, last, last / 2];
+        let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+        assert_eq!(sidecar.ids(&locals).expect("decode"), expected);
+        assert!(matches!(
+            sidecar.ids(&[last + 1]),
+            Err(ReadError::DocIdOutOfRange { .. })
+        ));
+    }
+
+    /// A sidecar that does not decode on the cold path is marked broken, and
+    /// a marked sidecar is not fetched again: the caller reads `_id` from
+    /// another source once, not once per query.
+    #[tokio::test]
+    async fn a_lazy_reader_does_not_refetch_a_sidecar_marked_broken() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
+        let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));
+        let lazy = lazy_shuffled_id_reader(damaged).await;
+        let sidecar = lazy
+            .fetch_id_sidecar()
+            .await
+            .expect("fetch")
+            .expect("the header is fine, so the fetch is");
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        assert!(matches!(
+            sidecar.ids(&every),
+            Err(ReadError::MalformedKv(_))
+        ));
+        lazy.mark_id_sidecar_broken();
+        assert!(lazy.fetch_id_sidecar().await.expect("fetch").is_none());
+    }
+
+    /// A promoted reader (opened lazily, then given the disk cache's fill
+    /// file) slices the sidecar from its local copy when the copy's hole
+    /// leaves the sidecar out, as the promotion's vector-blob hole does, and
+    /// not when the hole reaches into it; `_id` is right either way.
+    #[tokio::test]
+    async fn a_promoted_reader_slices_its_sidecar_unless_the_hole_covers_it() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        let loc = lazy_shuffled_id_reader(bytes.clone())
+            .await
+            .id_sidecar
+            .expect("the superfile carries a sidecar");
+
+        let mut beside = lazy_shuffled_id_reader(bytes.clone()).await;
+        beside
+            .install_resident_parquet(bytes.clone(), (loc.offset - 1, 1))
+            .expect("promote with a hole ending where the sidecar starts");
+        let sliced = beside
+            .resident_id_sidecar()
+            .expect("the local copy holds the whole sidecar");
+        assert_eq!(sliced.ids(&every).expect("decode"), ids);
+
+        let mut over = lazy_shuffled_id_reader(bytes.clone()).await;
+        over.install_resident_parquet(bytes, (loc.offset + loc.len - 1, 1))
+            .expect("promote with a hole over the sidecar's last byte");
+        assert!(over.resident_id_sidecar().is_none());
+        let last = SHUFFLED_ID_ROWS as u32 - 1;
+        let batch = over
+            .take_by_local_doc_ids(&[last, 0], &["doc_id"])
+            .expect("take _id from resident Parquet");
+        let got = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal _id");
+        assert_eq!(got.values().to_vec(), vec![ids[last as usize], ids[0]]);
+        assert!(over.fetch_id_sidecar().await.expect("fetch").is_some());
+    }
+
+    /// The sidecar serves a cold read of the id column that names at least
+    /// half the file's rows, counted once each, and only a packed sidecar:
+    /// a resident reader, a smaller subset, another column or a raw sidecar
+    /// keep their own source.
+    #[tokio::test]
+    async fn the_sidecar_serves_cold_reads_of_half_the_rows_or_more() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let rows = SHUFFLED_ID_ROWS as u32;
+        let every: Vec<u32> = (0..rows).collect();
+        let half = (SHUFFLED_ID_ROWS as u64).div_ceil(SIDECAR_MIN_ROW_SHARE) as usize;
+        let lazy = lazy_shuffled_id_reader(bytes.clone()).await;
+        assert!(lazy.id_sidecar_serves(&every, "doc_id"));
+        assert!(
+            lazy.id_sidecar_serves(&every[1..], "doc_id"),
+            "one row short of every row, as an allow-set missing a deleted row"
+        );
+        assert!(lazy.id_sidecar_serves(&every[..half], "doc_id"));
+        assert!(!lazy.id_sidecar_serves(&every[..half - 1], "doc_id"));
+        assert!(
+            !lazy.id_sidecar_serves(&vec![last_row(rows); rows as usize], "doc_id"),
+            "as many entries as rows, all one row, is one row"
+        );
+        assert!(!lazy.id_sidecar_serves(&every, "title"));
+
+        let mut raw = lazy_shuffled_id_reader(bytes.clone()).await;
+        raw.id_sidecar = raw.id_sidecar.map(|loc| IdSidecarLocation {
+            packed: false,
+            ..loc
+        });
+        assert!(
+            !raw.id_sidecar_serves(&every, "doc_id"),
+            "a raw sidecar is sixteen bytes a row, more than the column"
+        );
+
+        let eager = SuperfileReader::open(bytes.clone()).expect("open");
+        assert!(!eager.id_sidecar_serves(&every, "doc_id"));
+    }
+
+    /// The last row of a file of `rows` rows.
+    fn last_row(rows: u32) -> u32 {
+        rows - 1
+    }
+
+    /// A source that hands back one byte short of any read starting at `at`,
+    /// as a storage backend that clamps a range without an error would.
+    struct ShortAt {
+        inner: BytesLazyByteSource,
+        at: u64,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for ShortAt {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let bytes = self.inner.range(start, len).await?;
+            Ok(match start == self.at {
+                true => bytes.slice(..bytes.len() - 1),
+                false => bytes,
+            })
+        }
+    }
+
+    /// A sidecar read that comes back short is a failed read, not a damaged
+    /// sidecar: it errors as a fetch, leaves the sidecar unmarked, and the
+    /// next read tries the sidecar again.
+    #[tokio::test]
+    async fn a_short_sidecar_read_is_a_failed_fetch_not_a_damaged_sidecar() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let loc = lazy_shuffled_id_reader(bytes.clone())
+            .await
+            .id_sidecar
+            .expect("the superfile carries a sidecar");
+        let src: Arc<dyn LazyByteSource> = Arc::new(ShortAt {
+            inner: BytesLazyByteSource::new(bytes),
+            at: loc.offset,
+        });
+        let lazy = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        for attempt in 0..2 {
+            assert!(
+                matches!(
+                    lazy.fetch_id_sidecar().await,
+                    Err(ReadError::RangeFetch {
+                        source: LazyByteSourceError::ShortRead { .. },
+                        ..
+                    })
+                ),
+                "attempt {attempt}: a short read is a fetch error"
+            );
+            assert!(!lazy.id_sidecar_broken.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Rows per row group in the footer-check test, so the file has several.
+    const VERIFY_ROW_GROUP_ROWS: usize = 1_250;
+
+    /// The footer holds the sidecar to account: ids that still span the
+    /// file's id range but sit in the wrong row group fail the row groups'
+    /// `_id` statistics, and ids outside the range fail the range.
+    #[test]
+    fn verified_ids_hold_the_sidecar_to_the_footer() {
+        let (bytes, ids) = build_shuffled_id_superfile_in_row_groups(VERIFY_ROW_GROUP_ROWS);
+        let reader = SuperfileReader::open(bytes.clone()).expect("open");
+        assert!(reader.parquet_metadata().num_row_groups() > 1);
+        let loc = reader.id_sidecar.expect("the superfile carries a sidecar");
+        let id_range = (
+            *ids.iter().min().expect("rows"),
+            *ids.iter().max().expect("rows"),
+        );
+        let verify = |ids: &[i128]| {
+            let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            IdSidecar {
+                bytes: Bytes::from(ids::encode_packed(&raw)),
+                packed: true,
+                n_docs: ids.len() as u64,
+            }
+            .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+        };
+        assert_eq!(
+            loc.slice(&bytes, SHUFFLED_ID_ROWS as u64)
+                .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+                .expect("the written sidecar passes"),
+            ids
+        );
+
+        // Move the file's highest id into another row group: the span is
+        // unchanged, but its own row group's maximum is not.
+        let top = ids
+            .iter()
+            .position(|&id| id == id_range.1)
+            .expect("max row");
+        let other = match top / VERIFY_ROW_GROUP_ROWS {
+            0 => ids.len() - 1,
+            _ => 0,
+        };
+        let mut moved = ids.clone();
+        moved.swap(top, other);
+        assert!(matches!(verify(&moved), Err(ReadError::MalformedKv(_))));
+
+        let mut outside = ids.clone();
+        outside[0] = id_range.1 + 1;
+        assert!(matches!(verify(&outside), Err(ReadError::MalformedKv(_))));
+
+        // Without the footer's `_id` statistics, the range alone still
+        // catches ids outside it.
+        let raw: Vec<u8> = outside.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let no_stats = IdSidecar {
+            bytes: Bytes::from(ids::encode_packed(&raw)),
+            packed: true,
+            n_docs: outside.len() as u64,
+        }
+        .verified_ids(
+            reader.parquet_metadata(),
+            "a column with no statistics",
+            id_range,
+        );
+        assert!(matches!(no_stats, Err(ReadError::MalformedKv(_))));
+    }
+
+    /// A malformed sidecar location fails an eager open, as it always has, but
+    /// only switches the sidecar off on a lazy open: the lazy path uses it as
+    /// a shortcut with the Parquet column behind it. A superfile written before
+    /// the sidecar existed has none either way.
+    #[tokio::test]
+    async fn a_malformed_sidecar_location_fails_eager_and_is_ignored_lazily() {
+        let lazy =
+            |bytes: Bytes| -> Arc<dyn LazyByteSource> { Arc::new(BytesLazyByteSource::new(bytes)) };
+        let mut partial = required_kv();
+        partial.push((kv::IDS_OFFSET.into(), "0".into()));
+        let mut out_of_bounds = required_kv();
+        out_of_bounds.push((kv::IDS_OFFSET.into(), u64::MAX.to_string()));
+        out_of_bounds.push((kv::IDS_LENGTH.into(), "16".into()));
+        for kvs in [partial, out_of_bounds] {
+            let bytes = superfile_with_kv(&kvs);
+            assert!(matches!(
+                SuperfileReader::open(bytes.clone()),
+                Err(ReadError::MalformedKv(_))
+            ));
+            let r = SuperfileReader::open_lazy(lazy(bytes))
+                .await
+                .expect("a lazy open ignores the location");
+            assert!(r.fetch_id_sidecar().await.expect("fetch").is_none());
+        }
+
+        let pre_sidecar = superfile_with_kv(&required_kv());
+        let r = SuperfileReader::open_lazy(lazy(pre_sidecar))
+            .await
+            .expect("open_lazy");
+        assert!(r.fetch_id_sidecar().await.expect("fetch").is_none());
+        assert!(!r.id_sidecar_is_packed());
+    }
+
+    /// The raw layout (one little-endian `i128` per doc) decodes by offset; a
+    /// doc past the end is the caller's error, and a region shorter than its
+    /// doc count is malformed, not misread.
+    #[test]
+    fn raw_id_sidecar_decodes_by_offset_and_rejects_a_short_region() {
+        let ids: Vec<i128> = vec![7, -3, i128::MAX, 0];
+        let n_docs = ids.len() as u64;
+        let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let sidecar = IdSidecar {
+            bytes: Bytes::from(raw.clone()),
+            packed: false,
+            n_docs,
+        };
+        assert_eq!(
+            sidecar.ids(&[2, 0, 2]).expect("decode"),
+            vec![i128::MAX, 7, i128::MAX]
+        );
+        assert!(matches!(
+            sidecar.ids(&[4]),
+            Err(ReadError::DocIdOutOfRange { .. })
+        ));
+
+        let short = IdSidecar {
+            bytes: Bytes::from(raw[..raw.len() - 1].to_vec()),
+            packed: false,
+            n_docs,
+        };
+        assert!(matches!(short.ids(&[0]), Err(ReadError::MalformedKv(_))));
     }
 
     #[tokio::test]

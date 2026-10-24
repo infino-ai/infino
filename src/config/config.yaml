@@ -246,9 +246,24 @@ vector:
   global_fine_fanout: 1024
 
   # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
-  # for this path only (a caller-set rerank_mult still wins). Scoped here so
-  # tuning it never touches the ivf / filtered / user-table defaults.
-  global_fine_rerank_mult: 128
+  # (a caller-set rerank_mult still wins). With global_fine_per_cluster_budget
+  # on (default), applied PER FINE CLUSTER: each scanned cluster keeps
+  # k*rerank_mult candidates, pool = fanout*k*rerank_mult (grid-independent),
+  # all reranked. 12 => ~120/cluster (the 1B knee, recall@10 ~0.98). Scoped to
+  # this path only.
+  global_fine_rerank_mult: 12
+
+  # For ivf_router = centroid_graph: per-cluster rerank budget + rerank-all
+  # (grid-independent) vs the legacy per-cell budget + global 1-bit cut.
+  # On by default.
+  global_fine_per_cluster_budget: true
+
+  # For ivf_router = centroid_graph (per-cluster budget on): minimum pooled,
+  # fully reranked candidate count. Boosts the per-cluster budget at small N
+  # so recall does not turn depth-limited; a no-op at large N. Higher trades
+  # latency for recall, and the cost scales with the vector width (candidate
+  # count, not a byte budget).
+  global_fine_rerank_pool_floor: 30000
 
   # For ivf_router = centroid_graph: coalesce the selected clusters within
   # each cell into contiguous reads. Ignored under ivf_router = stamped.

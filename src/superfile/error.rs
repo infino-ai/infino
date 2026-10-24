@@ -184,6 +184,15 @@ pub enum ReadError {
     #[error("take-by-doc-id requires eager bytes; reader was opened via open_lazy")]
     LazyReaderUnsupported,
 
+    /// A range fetch from the superfile's byte source failed after open:
+    /// `what` names the part being read, and the storage error stays typed
+    /// under it, so a refused credential still reads as one.
+    #[error("{what}: {source}")]
+    RangeFetch {
+        what: &'static str,
+        source: LazyByteSourceError,
+    },
+
     #[error("columnar read error: {0}")]
     Columnar(String),
 }
