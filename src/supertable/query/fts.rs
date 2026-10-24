@@ -1208,6 +1208,10 @@ impl SupertableReader {
         // seeded a threshold the kernels prune against. What the policy
         // learns from, timing aside.
         let pruned = AtomicBool::new(false);
+        // Whether the merge declined before any read — a term with
+        // postings in a segment without a tier, a superfile the root does
+        // not list: the class learns there is nothing to merge here.
+        let declined = AtomicBool::new(false);
         let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
         let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
         let merge_kept: Vec<Arc<SuperfileEntry>> = match merge_now {
@@ -1887,6 +1891,9 @@ impl SupertableReader {
                     unreadable(e);
                     None
                 });
+            if prepared.is_none() {
+                declined.store(true, AtomicOrdering::Relaxed);
+            }
             match prepared {
                 Some(prepared) if prepared.resident => {
                     let selection = prepared.run().await.unwrap_or_else(|e| {
@@ -1976,11 +1983,20 @@ impl SupertableReader {
         // then ran: a shape it declines every time is thereby measured as
         // the cost of asking, and the class settles on not asking.
         if tiers_serve && learned {
-            let reported = selected.load(AtomicOrdering::Relaxed);
+            // A merge that reported says whether it did anything; one that
+            // declined did nothing by construction; one that did not get
+            // to report says nothing.
+            let outcome = if selected.load(AtomicOrdering::Relaxed) {
+                Some(pruned.load(AtomicOrdering::Relaxed))
+            } else if declined.load(AtomicOrdering::Relaxed) {
+                Some(false)
+            } else {
+                None
+            };
             self.tier_policy().note(
                 policy_class,
                 merge_now,
-                reported.then(|| pruned.load(AtomicOrdering::Relaxed)),
+                outcome,
                 ranked_started.elapsed().as_nanos() as u64,
             );
         }

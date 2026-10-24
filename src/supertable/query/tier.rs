@@ -587,6 +587,17 @@ pub(crate) async fn prepare_merge<'a>(
         };
         idf.push(idf_table);
     }
+    // The terms' runs first, and nothing more if a term has postings in a
+    // segment without a tier: no sound bound exists for it, and a table
+    // indexed before tiers would otherwise pay a slot per superfile on
+    // every query only to be declined.
+    let runs_per_term = index.runs_many(query.column, terms).await?;
+    if runs_per_term.iter().any(|runs| {
+        runs.iter()
+            .any(|r| r.run.tier.is_none() && !r.run.postings.is_empty())
+    }) {
+        return Ok(None);
+    }
     // Every kept superfile scores at the table's average length (its norm
     // table is rebuilt there when it records the average it was built at),
     // so a candidate's contribution is computed exactly as its kernel
@@ -619,18 +630,15 @@ pub(crate) async fn prepare_merge<'a>(
             .superfile_id(ordinal)
             .and_then(|id| slot_of.get(&id).copied())
     };
-    let runs_per_term = index.runs_many(query.column, terms).await?;
     let mut sources: Vec<Vec<Source>> = (0..nt).map(|_| Vec::new()).collect();
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     for (ti, runs) in runs_per_term.iter().enumerate() {
         let idf_table = idf[ti];
         for SliceRun { tier_object, run } in runs.iter() {
-            let tier = match &run.tier {
-                Some(t) => t,
-                // Postings without a tier: this segment predates tiers or
-                // kept none for the term; no sound bound exists for it.
-                None if run.postings.is_empty() => continue,
-                None => return Ok(None),
+            // Runs without a tier and without postings were passed over
+            // above; one with postings declined the merge there.
+            let Some(tier) = &run.tier else {
+                continue;
             };
             let chunked = !tier.chunks.is_empty();
             let source = if chunked {
