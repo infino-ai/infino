@@ -23,18 +23,22 @@
 //!      superfiles' Parquet bytes are exposed to a DataFusion
 //!      `ParquetSource` via an in-memory object store. DataFusion's
 //!      own filter pushdown hands the `FilterExec` predicate to that
-//!      source, where `PruningPredicate` prunes row groups and pages;
-//!      when the index could not bound the rows, [`scan`] also turns
-//!      on Parquet row filters so the same predicate decodes the
-//!      filter columns first and only surviving rows materialize.
+//!      source, where `PruningPredicate` prunes row groups and pages.
+//!      A predicate the index could not bound runs in DataFusion's
+//!      `FilterExec` above the scan, or as a Parquet row filter under
+//!      `ORDER BY ... LIMIT` (`RowFilterUnderTopK`).
 //!      We deliberately do **not** reimplement this commodity layer.
 //!
 //! Correctness is independent of either tier: every pushed filter
-//! is reported [`TableProviderFilterPushDown::Inexact`], so
-//! DataFusion always re-applies the full predicate in a
-//! `FilterExec` above the scan. Both skip tiers are pure
-//! *conservative* optimizations — they may keep a non-matching
-//! superfile/row group, never drop a matching one.
+//! but one shape is reported [`TableProviderFilterPushDown::Inexact`],
+//! so DataFusion re-applies it in a `FilterExec` above the scan. Both
+//! skip tiers are pure *conservative* optimizations — they may keep a
+//! non-matching superfile/row group, never drop a matching one.
+//!
+//! The one shape, `col ILIKE '%word%'` on a full-text column, is
+//! reported [`TableProviderFilterPushDown::Exact`]: the term dictionary
+//! decides its rows (see `candidate::exact_contains`), [`scan`] selects
+//! exactly those, and no `FilterExec` reads the column for it.
 //!
 //! ## Why an in-memory object store
 //!
@@ -47,9 +51,8 @@
 
 use std::{
     cmp,
-    collections::HashSet,
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
-    ops::Range,
     sync::{Arc, atomic},
     time::Instant,
 };
@@ -77,24 +80,19 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
-use futures::{
-    FutureExt,
-    future::{BoxFuture, try_join_all},
-};
+use futures::future::try_join_all;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
-        arrow_reader::{
-            ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
-        },
-        async_reader::{AsyncFileReader, ParquetObjectReader},
+        arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector},
+        async_reader::AsyncFileReader,
     },
-    errors,
     file::metadata::ParquetMetaData,
 };
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, Semaphore};
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
@@ -102,25 +100,35 @@ use crate::{
     superfile::{
         SuperfileReader,
         fts::{
-            reader::{BoolMode, MatchWork},
+            reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
     },
     supertable::{
         SuperfileEntry,
-        manifest::{ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts},
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
-        query::{
-            candidate::{CandidatePlan, like_prune_leaves},
-            df_object_store::SuperfileObjectStore,
-            exec::metered_exec::MeteredExec,
-            prune::{PruneLeaf, select_superfiles},
-            skip::{ScalarOp, ScalarPredicate},
-            superfile_reader::superfile_reader,
+        error::QueryError,
+        manifest::{
+            ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
         },
-        reader_cache::{DiskCacheStore, SuperfileReaderCache},
+        query::{
+            candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
+            df_object_store::SuperfileObjectStore,
+            exec::{
+                common::{BoundPredicate, PushedPredicate, take_rows},
+                metered_exec::MeteredExec,
+            },
+            fts::{memos_from_plan_locations, plan_locations_for},
+            prune::{PruneLeaf, select_superfiles},
+            read_ahead::ScanReadAhead,
+            schema_adapter::TableExprAdapterFactory,
+            skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
+            superfile_reader::{OpenTierCounts, superfile_reader_tiered},
+        },
+        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         tombstones::SidecarCache,
     },
+    utils::trace::{self, detail_span, tiered_span},
 };
 
 /// Logical name the supertable is registered under in the
@@ -159,6 +167,10 @@ struct PreparedScanFile {
     path: ObjPath,
     size: u64,
     row_counts: Arc<[u32]>,
+    /// Which cache tier the first open of this file was served from. A
+    /// later scan of the same provider reuses the prepared file and reports
+    /// the same tier: what it paid, not what it would pay now.
+    tier: OpenTier,
 }
 
 /// Concurrent first-open coalescing for one immutable superfile.
@@ -240,8 +252,8 @@ pub(crate) struct SupertableProvider {
     /// Prepared files populate it once; scans reuse it rather than rebuilding
     /// a path→source map for every SQL statement.
     scan_store: Arc<SuperfileObjectStore>,
-    /// Open-time Parquet metadata shared by every scan and residual provider.
-    scan_metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+    /// Open-time Parquet footers shared by every scan and residual provider.
+    scan_footers: Arc<ScanFooters>,
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
@@ -312,7 +324,7 @@ impl SupertableProvider {
             segment_filter: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
-            scan_metas: Arc::new(DashMap::new()),
+            scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
         }
     }
@@ -339,7 +351,7 @@ impl SupertableProvider {
         restricted.segment_filter = Some(segments);
         restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
         restricted.scan_store = Arc::clone(&self.scan_store);
-        restricted.scan_metas = Arc::clone(&self.scan_metas);
+        restricted.scan_footers = Arc::clone(&self.scan_footers);
         restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
         restricted
     }
@@ -379,11 +391,12 @@ impl SupertableProvider {
             .complete_flat_superfiles()
             .and_then(|entries| {
                 let mut merged: Option<ScalarValueCounts> = None;
+                let id = self.manifest.field_id(column)?;
                 for entry in entries {
-                    let counts = entry.scalar_stats.get(column)?.value_counts.as_ref()?;
+                    let counts = entry.scalar_stats.column(id)?.value_counts()?;
                     merged = Some(match merged {
-                        None => counts.clone(),
-                        Some(current) => current.merged_with(counts)?,
+                        None => counts,
+                        Some(current) => current.merged_with(&counts)?,
                     });
                 }
                 merged.map(Arc::new)
@@ -393,41 +406,6 @@ impl SupertableProvider {
         merged
     }
 
-    /// Lower scalar predicates to prune leaves. Each predicate yields a
-    /// `Scalar` leaf; additionally, an equality on an FTS-indexed text
-    /// column also yields a `TermPresence` leaf so the superfile's term
-    /// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
-    /// whose tokens include every token of the literal, so requiring all
-    /// of them possibly-present (`BoolMode::And`) never drops a match —
-    /// bloom false positives can only keep a superfile, never drop one.
-    fn predicates_to_prune_leaves(&self, predicates: Vec<ScalarPredicate>) -> Vec<PruneLeaf> {
-        let opts = &self.manifest.options;
-        let mut leaves = Vec::with_capacity(predicates.len());
-        for pred in predicates {
-            if pred.op == ScalarOp::Eq
-                && opts.fts_columns.iter().any(|c| c.column == pred.column)
-                && let Some(literal) = scalar_as_str(&pred.value)
-            {
-                // Per-column analyzer: prune with the tokenizer this column
-                // was indexed with, not a single table-wide default.
-                let Some(tok) = opts.try_fts_tokenizer_for(&pred.column) else {
-                    leaves.push(PruneLeaf::Scalar(pred));
-                    continue;
-                };
-                let terms: Vec<String> = tok.tokenize(literal).collect();
-                if !terms.is_empty() {
-                    leaves.push(PruneLeaf::TermPresence {
-                        column: pred.column.clone(),
-                        terms,
-                        mode: BoolMode::And,
-                    });
-                }
-            }
-            leaves.push(PruneLeaf::Scalar(pred));
-        }
-        leaves
-    }
-
     // Lower `filters` to prune leaves and select the superfiles that
     // survive the two-tier prune — per-part aggregates (ManifestPartEntry)
     // first, then per-superfile stats (SuperfileEntry).
@@ -435,28 +413,8 @@ impl SupertableProvider {
     // Pure manifest work: reads stats only, opens no superfile. Returns the
     // survivor entries; `scan` is what opens and reads them.
     async fn select_survivors(&self, filters: &[Expr]) -> DfResult<Vec<Arc<SuperfileEntry>>> {
-        let predicates = exprs_to_scalar_predicates(filters, &self.schema);
-        let mut leaves = self.predicates_to_prune_leaves(predicates);
-
-        let opts = &self.manifest.options;
-        leaves.extend(exprs_to_value_set_leaves(
-            filters,
-            &self.schema,
-            &self.fts_cols_set(),
-            &|col| opts.try_fts_tokenizer_for(col),
-        ));
-
-        // `LIKE` on an FTS column: a term bloom for the pattern's complete
-        // tokens and a lex-range check for a prefix token.
-        leaves.extend(like_prune_leaves(filters, &self.fts_cols_set(), &|col| {
-            opts.try_fts_tokenizer_for(col)
-        }));
-
-        leaves.extend(exprs_to_null_leaves(filters, &self.schema));
-
-        let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves)
-            .await
-            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        let leaves = prune_leaves_for_filters(&self.manifest, &self.schema, filters);
+        let mut survivors = select_superfiles(self.manifest.as_ref(), &leaves).await?;
 
         // Covered/residual residual scans read only their boundary
         // superfiles; everything else was answered from statistics.
@@ -477,6 +435,132 @@ impl SupertableProvider {
             .iter()
             .map(|c| c.column.as_str())
             .collect()
+    }
+
+    /// `filter` as a conjunct this provider answers exactly from the term
+    /// dictionary (see [`ExactFilter`]), or `None` for one the index only
+    /// bounds and DataFusion verifies. The one classification
+    /// [`supports_filters_pushdown`](TableProvider::supports_filters_pushdown),
+    /// [`scan`](TableProvider::scan) and the covered-aggregate rewrite
+    /// share, so what DataFusion is told is exact is what the scan answers
+    /// exactly. It reads only the expression and the table options, so a
+    /// cached plan stays valid.
+    fn exact_filter(&self, filter: &Expr, fts_cols: &HashSet<&str>) -> Option<ExactFilter> {
+        let manifest = &self.manifest;
+        exact_filter(filter, fts_cols, &|col| manifest.try_fts_tokenizer_for(col))
+    }
+
+    /// Whether this provider answers any of `filters` exactly
+    /// ([`Self::exact_filter`]): DataFusion then keeps no `Filter` node for
+    /// it, and a scan carrying it returns fewer rows than the manifest's
+    /// statistics describe.
+    pub(crate) fn has_exact_filter(&self, filters: &[Expr]) -> bool {
+        let fts_cols = self.fts_cols_set();
+        filters
+            .iter()
+            .any(|filter| self.exact_filter(filter, &fts_cols).is_some())
+    }
+
+    /// The rows of one superfile its exact conjuncts hold for, within
+    /// `bound` (the other conjuncts' candidate rows, when the index bounded
+    /// them). Every leaf's rows come from the dictionary
+    /// ([`SuperfileReader::contains_rows`]), each column walked once for
+    /// all its needles; the leaves combine through the conjuncts' `AND` /
+    /// `OR` tree ([`ExactFilter::rows`]), and the rows that leaves doubtful
+    /// are checked against their stored text, tombstoned ones left out
+    /// first since the scan skips them anyway.
+    ///
+    /// A `bound` of at most `gate` rows — the bounded path's own selection
+    /// limit — skips the dictionary: its rows are checked against their
+    /// text directly. That is exact too, and far cheaper than walking the
+    /// whole dictionary and unioning every covered term's postings only to
+    /// keep the few rows the bound allows.
+    async fn exact_rows(
+        &self,
+        prepared: &PreparedScanFile,
+        check: &ExactCheck,
+        bound: Option<&RoaringBitmap>,
+        gate: u64,
+        tombstones: &RoaringBitmap,
+        batch_size: usize,
+    ) -> DfResult<(RoaringBitmap, MatchWork)> {
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let mut work = MatchWork::default();
+        if let Some(bound) = bound.filter(|bound| bound.len() <= gate) {
+            let checked = bound - tombstones;
+            let verified = check
+                .rows_holding(&prepared.reader, &checked, pool, batch_size)
+                .await?;
+            self.count_rows_checked(checked.len(), verified.len());
+            return Ok((verified, work));
+        }
+        // Each column's distinct needles, in first-seen order.
+        let mut by_column: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for leaf in check.filter.leaves() {
+            let needles = by_column.entry(leaf.column.as_str()).or_default();
+            if !needles.contains(&leaf.needle.as_str()) {
+                needles.push(&leaf.needle);
+            }
+        }
+        let budget = &self.manifest.options.connection_memory_budget;
+        let mut leaf_rows: HashMap<(&str, &str), ContainsRows> = HashMap::new();
+        for (column, needles) in by_column {
+            let (rows, column_work) = prepared
+                .reader
+                .contains_rows(column, &needles, Some(pool), Some(budget))
+                .await
+                .map_err(QueryError::from)?;
+            // One result per needle, or the zip below would pair needles
+            // with another needle's rows.
+            if rows.len() != needles.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "exact rows of column {column:?}: {} results for {} needles",
+                    rows.len(),
+                    needles.len()
+                )));
+            }
+            work.merge(column_work);
+            leaf_rows.extend(needles.into_iter().map(|needle| (column, needle)).zip(rows));
+        }
+        // Every leaf the tree reads has its rows; checked up front so the
+        // lookup below cannot miss.
+        if let Some(leaf) = check
+            .filter
+            .leaves()
+            .into_iter()
+            .find(|leaf| !leaf_rows.contains_key(&(leaf.column.as_str(), leaf.needle.as_str())))
+        {
+            return Err(DataFusionError::Internal(format!(
+                "exact rows of column {:?}: no result for needle {:?}",
+                leaf.column, leaf.needle
+            )));
+        }
+        let mut rows = check.filter.rows(&|leaf| {
+            leaf_rows
+                .get(&(leaf.column.as_str(), leaf.needle.as_str()))
+                .cloned()
+                .unwrap_or_default()
+        });
+        if let Some(bound) = bound {
+            rows.proven &= bound;
+            rows.doubtful &= bound;
+        }
+        rows.doubtful -= tombstones;
+        let verified = check
+            .rows_holding(&prepared.reader, &rows.doubtful, pool, batch_size)
+            .await?;
+        self.count_rows_checked(rows.doubtful.len(), verified.len());
+        Ok((rows.proven | verified, work))
+    }
+
+    /// Count the rows an exact check decoded to read their text but the
+    /// scan will not emit (`checked` of them, `kept` passing). The ones it
+    /// keeps are counted once, when the scan emits them, so the total stays
+    /// rows decoded.
+    fn count_rows_checked(&self, checked: u64, kept: u64) {
+        if let Some(stats) = self.scan_store.op_stats() {
+            stats.add_rows_materialized(checked.saturating_sub(kept));
+        }
     }
 
     /// Open and prepare one superfile once for this pinned manifest.
@@ -500,21 +584,21 @@ impl SupertableProvider {
         let disk_cache = self.disk_cache.clone();
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
-        let scan_metas = Arc::clone(&self.scan_metas);
+        let scan_footers = Arc::clone(&self.scan_footers);
         let entry = Arc::clone(entry);
         let prepared = cell
             .get_or_try_init(|| async move {
-                let reader = superfile_reader(
+                let (reader, tier) = superfile_reader_tiered(
                     &store,
                     disk_cache.as_ref(),
                     storage.as_ref(),
                     &entry.uri,
                     &entry.storage_path(),
                     entry.subsection_offsets.as_ref(),
-                    true,
+                    ReadIntent::Warm,
                 )
                 .await
-                .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                .map_err(QueryError::store)?;
                 let path = ObjPath::from(entry.storage_path());
                 let source = reader.byte_source();
                 let size = source.size();
@@ -527,7 +611,7 @@ impl SupertableProvider {
                 let parquet_meta = reader
                     .parquet_metadata_with_page_index()
                     .await
-                    .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+                    .map_err(QueryError::from)?;
                 let row_counts: Arc<[u32]> = parquet_meta
                     .row_groups()
                     .iter()
@@ -535,12 +619,13 @@ impl SupertableProvider {
                     .collect::<Vec<_>>()
                     .into();
                 scan_store.insert_source(path.clone(), source);
-                scan_metas.insert(path.clone(), parquet_meta);
+                scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
                 Ok::<Arc<PreparedScanFile>, DataFusionError>(Arc::new(PreparedScanFile {
                     path,
                     size,
                     row_counts,
                     reader,
+                    tier,
                 }))
             })
             .await?;
@@ -571,7 +656,16 @@ impl SupertableProvider {
     /// Exact statistics let DataFusion's `AggregateStatistics` rule
     /// fold `COUNT(*)` / `MIN` / `MAX` into literals, eliminating the
     /// scan entirely; Inexact ones still feed planner estimates.
-    fn statistics_for(&self, entries: &[Arc<SuperfileEntry>]) -> Statistics {
+    ///
+    /// Column statistics are assembled for the columns `wanted` names;
+    /// the rest read as unknown. Every column's statistics cost a read per
+    /// column per superfile, and a table of thousands of columns is asked
+    /// about a few of them.
+    fn statistics_for(
+        &self,
+        entries: &[Arc<SuperfileEntry>],
+        wanted: &dyn Fn(&str) -> bool,
+    ) -> Statistics {
         let total_rows: u64 = entries.iter().map(|e| e.n_docs).sum();
         let now = Instant::now();
 
@@ -616,6 +710,9 @@ impl SupertableProvider {
             .iter()
             .map(|field| {
                 let name = field.name().as_str();
+                if !wanted(name) {
+                    return ColumnStatistics::new_unknown();
+                }
                 if name == id_column {
                     // `_id` is engine-injected: non-null and unique by
                     // construction, range tracked in the manifest.
@@ -629,25 +726,45 @@ impl SupertableProvider {
                     return stats;
                 }
                 let mut stats = ColumnStatistics::new_unknown();
+                let Some(column) = self.manifest.field_id(name) else {
+                    return stats;
+                };
+                // Every statistic below is value-derived, so each is only
+                // true while it describes the type the table reads the
+                // column as today. After a retype the recorded bounds are
+                // the old type's and do not survive the cast — a string
+                // column holding "7" and "10" records min "10", max "7" —
+                // and a sum or null count is no better. Report nothing
+                // rather than something false; the scan derives the answer
+                // from the data, and compaction re-derives the statistics
+                // in the new type when it rewrites the file.
+                let guard = ColumnTypeGuard::new(&self.manifest, column);
+                if guard.aggregates_mix_types() || entries.iter().any(|e| guard.stats_are_stale(e))
+                {
+                    return stats;
+                }
+                // One read of the column's statistics per superfile; the
+                // four folds below share it.
+                let reads = read_column(entries, column);
                 // A range covering the column type's whole domain is
                 // withheld rather than reported — see `spans_full_domain`.
-                if let Some((min, max)) = scalar_min_max(entries, name)
+                if let Some((min, max)) = scalar_min_max(&reads)
                     && !spans_full_domain(&min, &max)
                 {
                     stats.min_value = wrap(min);
                     stats.max_value = wrap(max);
                 }
-                if let Some(nulls) = scalar_null_count(entries, name) {
+                if let Some(nulls) = scalar_null_count(&reads) {
                     stats.null_count = if clean {
                         Precision::Exact(nulls as usize)
                     } else {
                         Precision::Inexact(nulls as usize)
                     };
                 }
-                if let Some(sum) = scalar_sum(entries, name) {
+                if let Some(sum) = scalar_sum(&reads) {
                     stats.sum_value = wrap(sum);
                 }
-                if let Some(distinct) = scalar_distinct(entries, name) {
+                if let Some(distinct) = scalar_distinct(&reads) {
                     // A sketch estimate — never exact.
                     stats.distinct_count = Precision::Inexact(distinct);
                 }
@@ -674,36 +791,64 @@ fn id_min_max(entries: &[Arc<SuperfileEntry>]) -> Option<(ScalarValue, ScalarVal
     ))
 }
 
-/// Total null count of column `name` across `entries`; `None` unless
-/// every entry carries the stat (a missing side makes the total
-/// unknowable).
-fn scalar_null_count(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<u64> {
-    entries.iter().try_fold(0u64, |acc, entry| {
-        acc.checked_add(entry.scalar_stats.get(name)?.null_count?)
+/// One column's statistics across `entries`, read once per superfile:
+/// what the folds below share, so a column costs one read per superfile
+/// however many statistics the planner asks for. `None` where a
+/// superfile carries nothing for the column.
+fn read_column(entries: &[Arc<SuperfileEntry>], column: FieldId) -> Vec<Option<ColumnStats<'_>>> {
+    entries
+        .iter()
+        .map(|entry| entry.scalar_stats.column(column))
+        .collect()
+}
+
+/// Total null count across the superfiles read; `None` unless every one
+/// carries the stat (a missing side makes the total unknowable).
+fn scalar_null_count(reads: &[Option<ColumnStats<'_>>]) -> Option<u64> {
+    reads.iter().try_fold(0u64, |acc, stats| {
+        acc.checked_add(stats.as_ref()?.null_count()?)
     })
 }
 
-/// Exact sum of column `name` across `entries`; `None` unless every
-/// entry carries it and the fold doesn't overflow.
-fn scalar_sum(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<ScalarValue> {
+/// Exact sum across the superfiles read; `None` unless every one carries
+/// it and the fold doesn't overflow.
+fn scalar_sum(reads: &[Option<ColumnStats<'_>>]) -> Option<ScalarValue> {
     let mut acc: Option<ArrayRef> = None;
-    for entry in entries {
-        let part = entry.scalar_stats.get(name)?.sum.as_ref()?;
+    for stats in reads {
+        let part = stats.as_ref()?.sum()?;
         acc = Some(match acc {
-            None => Arc::clone(part),
-            Some(total) => add_sum_arrays(&total, part)?,
+            None => part,
+            Some(total) => add_sum_arrays(&total, &part)?,
         });
     }
     ScalarValue::try_from_array(&acc?, 0).ok()
 }
 
-/// HLL distinct-count estimate for column `name` across `entries`;
-/// `None` unless every entry carries a sketch. Sketch unions are
-/// exact, so the merged estimate has single-sketch accuracy.
-fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize> {
+/// HLL distinct-count estimate across the superfiles read; `None` unless
+/// every one carries a sketch, an exact value table (a column counted
+/// exactly carries no sketch; its table's values are sketched in its
+/// place, hashed as the column sketch hashes them) or no value at all.
+/// Sketch unions are exact, so the merged estimate has single-sketch
+/// accuracy. A column null throughout every superfile has no distinct
+/// value: zero, not unknown.
+fn scalar_distinct(reads: &[Option<ColumnStats<'_>>]) -> Option<usize> {
     let mut merged: Option<HllSketch> = None;
-    for entry in entries {
-        let sketch = HllSketch::from_bytes(entry.scalar_stats.get(name)?.hll.as_ref()?)?;
+    let mut null_throughout = false;
+    for stats in reads {
+        let stats = stats.as_ref()?;
+        let sketch = match stats.sketch() {
+            Some(bytes) => HllSketch::from_bytes(bytes)?,
+            None => match stats.values_sketch() {
+                Some(sketch) => sketch,
+                // Null throughout the superfile: nothing to add to the
+                // estimate.
+                None if stats.all_null() => {
+                    null_throughout = true;
+                    continue;
+                }
+                None => return None,
+            },
+        };
         merged = Some(match merged {
             None => sketch,
             Some(mut acc) => {
@@ -712,18 +857,17 @@ fn scalar_distinct(entries: &[Arc<SuperfileEntry>], name: &str) -> Option<usize>
             }
         });
     }
-    Some(merged?.estimate().round() as usize)
+    match merged {
+        Some(sketch) => Some(sketch.estimate().round() as usize),
+        None if null_throughout => Some(0),
+        None => None,
+    }
 }
 
-fn scalar_min_max(
-    entries: &[Arc<SuperfileEntry>],
-    name: &str,
-) -> Option<(ScalarValue, ScalarValue)> {
+fn scalar_min_max(reads: &[Option<ColumnStats<'_>>]) -> Option<(ScalarValue, ScalarValue)> {
     let mut acc: Option<(ScalarValue, ScalarValue)> = None;
-    for entry in entries {
-        let agg = entry.scalar_stats.get(name)?;
-        let min = ScalarValue::try_from_array(&agg.min, 0).ok()?;
-        let max = ScalarValue::try_from_array(&agg.max, 0).ok()?;
+    for stats in reads {
+        let (min, max) = stats.as_ref()?.min_max_values()?;
         if min.is_null() || max.is_null() {
             return None;
         }
@@ -775,6 +919,94 @@ fn spans_full_domain(min: &ScalarValue, max: &ScalarValue) -> bool {
         && max.distance(min).map(|d| d as u64) == Some(FULL_DOMAIN_ENDPOINT_DISTANCE)
 }
 
+/// A scan's exact conjuncts ([`SupertableProvider::exact_filter`]),
+/// compiled once per scan together with the check their doubtful rows get.
+struct ExactCheck {
+    /// The conjunction as the dictionary answers it: an `AND` of the
+    /// conjuncts.
+    filter: ExactFilter,
+    /// The conjunction, bound to the columns it reads.
+    predicate: BoundPredicate,
+    /// Those columns' names, in the bound schema's order.
+    columns: Vec<String>,
+}
+
+impl ExactCheck {
+    /// `None` when there is no exact conjunct. `filters` and `conjuncts`
+    /// pair up: each filter is the expression its conjunct came from.
+    fn compile(
+        filters: &[Expr],
+        conjuncts: Vec<ExactFilter>,
+        schema: &SchemaRef,
+    ) -> DfResult<Option<Self>> {
+        if conjuncts.is_empty() {
+            return Ok(None);
+        }
+        // An exact conjunct reads one column of this table, so the
+        // compile can only fail on a bug; fail the scan rather than drop a
+        // filter DataFusion no longer applies.
+        let pushed = PushedPredicate::compile(filters, schema).ok_or_else(|| {
+            DataFusionError::Internal("an exact filter does not compile over its table".into())
+        })?;
+        let bound_schema = Arc::new(
+            schema
+                .project(pushed.columns())
+                .map_err(QueryError::internal)?,
+        );
+        let predicate = pushed.bind(&bound_schema).map_err(QueryError::internal)?;
+        let columns = bound_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        Ok(Some(Self {
+            filter: ExactFilter::And(conjuncts),
+            predicate,
+            columns,
+        }))
+    }
+
+    /// Of `rows` in `reader`'s superfile, the ones the conjunction holds
+    /// for, read from their stored text `batch_size` rows at a time. The
+    /// ids are drawn from `rows` one batch at a time, never copied out
+    /// whole.
+    async fn rows_holding(
+        &self,
+        reader: &Arc<SuperfileReader>,
+        rows: &RoaringBitmap,
+        pool: &ThreadPool,
+        batch_size: usize,
+    ) -> DfResult<RoaringBitmap> {
+        let names: Vec<&str> = self.columns.iter().map(String::as_str).collect();
+        let mut ids = rows.iter();
+        let mut kept = RoaringBitmap::new();
+        loop {
+            let chunk: Vec<u32> = ids.by_ref().take(batch_size.max(1)).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            let chunk = chunk.as_slice();
+            let batch = take_rows(reader, chunk, &names, pool).await?;
+            if batch.num_rows() != chunk.len() {
+                return Err(DataFusionError::Internal(format!(
+                    "read {} rows to check {} against their text",
+                    batch.num_rows(),
+                    chunk.len()
+                )));
+            }
+            let mask = self.predicate.mask(&batch)?;
+            kept.extend(
+                chunk
+                    .iter()
+                    .zip(mask.iter())
+                    .filter(|&(_, holds)| holds == Some(true))
+                    .map(|(&row, _)| row),
+            );
+        }
+        Ok(kept)
+    }
+}
+
 /// Whether walking a column's whole dictionary (`terms` distinct terms) is
 /// worth it against scanning its `bytes` of stored text — see
 /// [`LIKE_WALK_MIN_BYTES_PER_TERM`]. A missing term count (0) passes.
@@ -782,22 +1014,51 @@ fn full_walk_pays(terms: u64, bytes: u64) -> bool {
     terms == 0 || bytes / terms >= LIKE_WALK_MIN_BYTES_PER_TERM
 }
 
-/// Stored (uncompressed) bytes of `column`'s data pages across a
-/// superfile's row groups — the volume a scan of that column decodes.
-/// `None` when the footer has no leaf column of that name.
-fn column_stored_bytes(meta: &ParquetMetaData, column: &str) -> Option<u64> {
-    let index = meta
-        .file_metadata()
-        .schema_descr()
-        .columns()
-        .iter()
-        .position(|descr| descr.name() == column)?;
-    Some(
-        meta.row_groups()
+/// Footers of the files this table's scans have opened, by path.
+pub(crate) type ScanFooters = DashMap<ObjPath, Arc<ScanFooter>>;
+
+/// A file's Parquet footer, and how many bytes each column takes in it.
+#[derive(Debug)]
+pub(crate) struct ScanFooter {
+    meta: Arc<ParquetMetaData>,
+    /// Bytes per column before compression. Added up once when the file is
+    /// opened, so planning a query doesn't have to.
+    leaf_bytes: Box<[u64]>,
+}
+
+impl ScanFooter {
+    fn new(meta: Arc<ParquetMetaData>) -> Self {
+        let mut leaf_bytes = vec![0; meta.file_metadata().schema_descr().num_columns()];
+        for row_group in meta.row_groups() {
+            for (bytes, chunk) in leaf_bytes.iter_mut().zip(row_group.columns()) {
+                *bytes += chunk.uncompressed_size().max(0) as u64;
+            }
+        }
+        Self {
+            meta,
+            leaf_bytes: leaf_bytes.into(),
+        }
+    }
+
+    /// `(column name, bytes)` for each column in the file. A list or struct
+    /// column is stored in parts, and each part comes back under its name.
+    pub(crate) fn columns(&self) -> impl Iterator<Item = (&str, u64)> {
+        let leaves = self.meta.file_metadata().schema_descr().columns();
+        leaves
             .iter()
-            .map(|rg| rg.column(index).uncompressed_size().max(0) as u64)
-            .sum(),
-    )
+            .zip(&self.leaf_bytes)
+            .filter_map(|(leaf, &bytes)| Some((leaf.path().parts().first()?.as_str(), bytes)))
+    }
+
+    /// Bytes of `column` in this file, or `None` if the file doesn't have it.
+    fn column_bytes(&self, column: &str) -> Option<u64> {
+        let mut leaves = self
+            .columns()
+            .filter(|(name, _)| *name == column)
+            .peekable();
+        leaves.peek()?;
+        Some(leaves.map(|(_, bytes)| bytes).sum())
+    }
 }
 
 /// Extract a UTF-8 string literal from a scalar value, if it is one.
@@ -819,34 +1080,52 @@ impl TableProvider for SupertableProvider {
         TableType::Base
     }
 
-    /// Report every filter as `Inexact`: DataFusion hands us the
-    /// predicates (for the superfile skip and the index bound) **and**
-    /// keeps a `FilterExec` above the scan, so correctness never depends
-    /// on our conservative pruning. The `FilterExec` also does the
-    /// candidate-superset verification in the same scan pass as the
-    /// projection (one decode), which a self-verifying `exact_match`
-    /// candidate would split into an extra pass — measured slower.
-    /// Returning `Unsupported` (the default) would withhold the filters
-    /// from [`scan`] entirely, disabling superfile + row-group skip.
+    /// Report a filter the term dictionary answers exactly
+    /// ([`Self::exact_filter`]: `col ILIKE '%word%'` on a `standard` FTS
+    /// column) as `Exact`, and every other as `Inexact`.
+    ///
+    /// An `Inexact` filter is handed to [`scan`] (for the superfile skip
+    /// and the index bound) **and** kept in a `FilterExec` above it, so
+    /// correctness never depends on our conservative pruning. The
+    /// `FilterExec` also does the candidate-superset verification in the
+    /// same scan pass as the projection (one decode), which a
+    /// self-verifying `exact_match` candidate would split into an extra
+    /// pass — measured slower.
+    ///
+    /// An `Exact` filter gets no `FilterExec`: the scan's access plan
+    /// selects exactly its rows, so its column is never decoded for it —
+    /// a `COUNT(*)` reads no text at all. Returning `Unsupported` (the
+    /// default) would withhold the filters from [`scan`] entirely,
+    /// disabling superfile + row-group skip.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
+        let fts_cols = self.fts_cols_set();
+        Ok(filters
+            .iter()
+            .map(|filter| match self.exact_filter(filter, &fts_cols) {
+                Some(_) => TableProviderFilterPushDown::Exact,
+                None => TableProviderFilterPushDown::Inexact,
+            })
+            .collect())
     }
 
     /// Whole-table statistics from a complete resident manifest view (no I/O)
     /// — feeds logical planning; the physical fold reads the scan node's
-    /// statistics, attached in [`scan`](Self::scan).
+    /// statistics, attached in [`scan`](Self::scan). The row count and the
+    /// id column's range only: the planner asks before any column is
+    /// chosen, and the scan node carries the projected columns' statistics.
     fn statistics(&self) -> Option<Statistics> {
         // A persisted table often has already hydrated every part at open.
         // Expose exact stats in that case so DataFusion can fold unfiltered
-        // COUNT/MIN/MAX before it invokes `scan`. A genuinely lazy partial
-        // view still returns `None`; claiming whole-table stats there would
+        // COUNT before it invokes `scan`. A genuinely lazy partial view
+        // still returns `None`; claiming whole-table stats there would
         // silently under-count.
+        let id_column = self.manifest.options.id_column.as_str();
         self.manifest
             .complete_flat_superfiles()
-            .map(|entries| self.statistics_for(entries))
+            .map(|entries| self.statistics_for(entries, &|name| name == id_column))
     }
 
     async fn scan(
@@ -858,8 +1137,22 @@ impl TableProvider for SupertableProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // Superfile selection via the shared two-tier prune (the same
         // path FTS search uses); see `select_survivors`. Survivors go to
-        // DataFusion.
-        let survivor_entries = self.select_survivors(filters).await?;
+        // DataFusion. The span carries both counts, so a trace shows how
+        // much of the snapshot the statistics kept this query away from.
+        let select_span = detail_span!(
+            "scan.select_superfiles",
+            manifest_superfiles = self.manifest.superfiles.len(),
+            survivors = tracing::field::Empty,
+        );
+
+        let survivor_entries = self
+            .select_survivors(filters)
+            .instrument(select_span.clone())
+            .await?;
+
+        select_span.record("survivors", survivor_entries.len());
+        trace::end(select_span);
+
         let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
 
         // Nothing survived (empty table, or every superfile pruned):
@@ -871,7 +1164,10 @@ impl TableProvider for SupertableProvider {
         // one.
         if survivors.is_empty() {
             let projected = match projection {
-                Some(indices) => Arc::new(self.schema.project(indices)?),
+                // DataFusion projects only columns this table has.
+                Some(indices) => {
+                    Arc::new(self.schema.project(indices).map_err(QueryError::internal)?)
+                }
                 None => Arc::clone(&self.schema),
             };
             return Ok(Arc::new(EmptyExec::new(projected)));
@@ -891,20 +1187,64 @@ impl TableProvider for SupertableProvider {
             cache.prefetch(&ids, now).await;
         }
 
+        // Split the conjuncts into the ones the dictionary answers exactly
+        // (reported `Exact`: DataFusion applies them nowhere else) and the
+        // ones the index only bounds.
+        let fts_cols = self.fts_cols_set();
+        let mut exact_filters: Vec<Expr> = Vec::new();
+        let mut exact_conjuncts: Vec<ExactFilter> = Vec::new();
+        let mut bounded_filters: Vec<Expr> = Vec::new();
+        for filter in filters {
+            match self.exact_filter(filter, &fts_cols) {
+                Some(exact) => {
+                    exact_filters.push(filter.clone());
+                    exact_conjuncts.push(exact);
+                }
+                None => bounded_filters.push(filter.clone()),
+            }
+        }
+        let exact_check = ExactCheck::compile(&exact_filters, exact_conjuncts, &self.schema)?;
+        let exact_check = exact_check.as_ref();
+        let batch_size = state.config().batch_size();
+
         // Pass 1 — build the index candidate plan once for this scan. It
-        // lowers the FTS-resolvable part of the `WHERE` clause to a
+        // lowers the FTS-resolvable part of the bounded conjuncts to a
         // boolean tree over `token_match`; evaluated per superfile below
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
-        let opts = &self.manifest.options;
-        let candidate_plan = CandidatePlan::from_filters(filters, &self.fts_cols_set(), &|col| {
-            opts.try_fts_tokenizer_for(col)
+        let manifest = &self.manifest;
+        let candidate_plan = CandidatePlan::from_filters(&bounded_filters, &fts_cols, &|col| {
+            manifest.try_fts_tokenizer_for(col)
         });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
         let needs_expansion = candidate_plan.has_like();
+        // The term index's locations for the predicate's terms: each
+        // superfile then resolves them from its postings, not its dictionary.
+        let survivor_entries: Vec<Arc<SuperfileEntry>> =
+            survivors.iter().map(|e| Arc::clone(e)).collect();
+        let plan_locations =
+            plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
+        let plan_locations = &plan_locations;
+
+        // Opening every survivor: the part of a scan that pays for a cache
+        // miss. The span says how many files each tier served, so a cold
+        // scan is legible from one line.
+        let open_span = tiered_span!("scan.open_files", files = survivors.len());
         let prepared_files =
-            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry))).await?;
+            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
+                .instrument(open_span.clone())
+                .await?;
+        // The tally is a pass over the files; without the feature the span
+        // is `none` and would drop the counts, so skip the pass too.
+        if cfg!(feature = "detailed-tracing") {
+            let tiers = OpenTierCounts::default();
+            for file in &prepared_files {
+                tiers.add(file.tier);
+            }
+            tiers.record_on(&open_span);
+        }
+        trace::end(open_span);
 
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's
@@ -913,9 +1253,6 @@ impl TableProvider for SupertableProvider {
             prepared: Arc<PreparedScanFile>,
             candidates: Option<RoaringBitmap>,
             tombstones: Arc<RoaringBitmap>,
-            /// This superfile's plan came out `Unbounded` — the whole plan
-            /// is, or a `LIKE` token found no bound in its dictionary.
-            unbounded: bool,
             /// The pushdown predicate's df probes, dictionary walks and
             /// posting walks on this superfile.
             predicate_work: MatchWork,
@@ -924,6 +1261,12 @@ impl TableProvider for SupertableProvider {
         // work and run on the reader pool behind a oneshot; only their FST
         // fetches stay on this runtime.
         let reader_pool: &ThreadPool = &self.manifest.options.reader_pool;
+        // Superfiles answering exact conjuncts at once. Their walks and
+        // unions run on the reader pool, so more in flight than it has
+        // threads only queue there, each holding its fetched postings and
+        // bitsets; what they do hold is charged to the connection budget.
+        let exact_slots = Semaphore::new(reader_pool.current_num_threads());
+        let exact_slots = &exact_slots;
 
         // Pass 1 (per superfile), fanned out: every survivor resolves its
         // candidate rows in its own future and `try_join_all` drives them
@@ -964,18 +1307,19 @@ impl TableProvider for SupertableProvider {
                             // vocabulary; judged per column from the manifest's
                             // term count and the Parquet footer's column size,
                             // neither of which costs a read.
-                            let meta = self
-                                .scan_metas
+                            let footer = self
+                                .scan_footers
                                 .get(&prepared.path)
-                                .map(|m| Arc::clone(m.value()));
+                                .map(|f| Arc::clone(f.value()));
                             let full_walk_pays = |column: &str| {
-                                let terms = entry
-                                    .fts_summary
-                                    .get(column)
+                                let terms = self
+                                    .manifest
+                                    .field_id(column)
+                                    .and_then(|id| entry.fts_summary.get(&id))
                                     .map_or(0, |summary| summary.n_terms_distinct);
-                                let bytes = meta
+                                let bytes = footer
                                     .as_ref()
-                                    .and_then(|m| column_stored_bytes(m, column))
+                                    .and_then(|f| f.column_bytes(column))
                                     .unwrap_or(0);
                                 full_walk_pays(terms, bytes)
                             };
@@ -986,18 +1330,17 @@ impl TableProvider for SupertableProvider {
                                     Some(reader_pool),
                                 )
                                 .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                .map_err(QueryError::from)?;
                             predicate_work.merge(expand_work);
                             expanded = plan;
                             &expanded
                         } else {
                             candidate_plan
                         };
-                        let unbounded = matches!(plan, CandidatePlan::Unbounded);
                         let (est, est_work) = plan
                             .estimate(prepared.reader.as_ref(), Some(reader_pool))
                             .await
-                            .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                            .map_err(QueryError::from)?;
                         predicate_work.merge(est_work);
                         let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
                             as u64)
@@ -1007,10 +1350,16 @@ impl TableProvider for SupertableProvider {
                         let candidates = if est > gate || est >= density_cap {
                             None
                         } else {
+                            let memos = memos_from_plan_locations(
+                                prepared.reader.as_ref(),
+                                plan_locations,
+                                entry.superfile_id,
+                            )
+                            .await;
                             let (bitmap, eval_work) = plan
-                                .evaluate(prepared.reader.as_ref(), Some(reader_pool))
+                                .evaluate(prepared.reader.as_ref(), Some(reader_pool), &memos)
                                 .await
-                                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+                                .map_err(QueryError::from)?;
                             predicate_work.merge(eval_work);
                             bitmap
                         };
@@ -1019,30 +1368,58 @@ impl TableProvider for SupertableProvider {
                         // overlay); the batch prefetch above already resolved
                         // them, so this is a cache read.
                         let tombstones = match self.tombstone_cache.as_ref() {
-                            Some(cache) => {
-                                cache.bitmap_for(entry.superfile_id, now).map_err(|e| {
-                                    DataFusionError::Execution(format!("tombstone cache: {e}"))
-                                })?
-                            }
+                            Some(cache) => cache
+                                .bitmap_for(entry.superfile_id, now)
+                                .map_err(QueryError::tombstone_cache)?,
                             None => Arc::new(RoaringBitmap::new()),
+                        };
+
+                        // The exact conjuncts' rows, within whatever the
+                        // bounded ones kept. No selectivity gate sends them to
+                        // a scan: DataFusion no longer checks these
+                        // conjuncts, so the selection must be exactly their
+                        // rows however many there are. A bounded selection
+                        // within the gate is checked against its text instead
+                        // of the dictionary (see `exact_rows`).
+                        let candidates = match exact_check {
+                            Some(check) => {
+                                let _slot = exact_slots.acquire().await.map_err(|e| {
+                                    DataFusionError::Internal(format!("exact rows slot: {e}"))
+                                })?;
+                                let (rows, exact_work) = self
+                                    .exact_rows(
+                                        &prepared,
+                                        check,
+                                        candidates.as_ref(),
+                                        gate,
+                                        &tombstones,
+                                        batch_size,
+                                    )
+                                    .await?;
+                                predicate_work.merge(exact_work);
+                                Some(rows)
+                            }
+                            None => candidates,
                         };
 
                         Ok::<SuperfileScan, DataFusionError>(SuperfileScan {
                             prepared,
                             candidates,
                             tombstones,
-                            unbounded,
                             predicate_work,
                         })
                     }
                 }),
         )
+        // The per-superfile predicate work above: index candidate plans,
+        // their evaluation, and the tombstone overlay. Distinct from opening
+        // the files, which was paid for in `scan.open_files`.
+        .instrument(detail_span!(
+            "scan.index_predicates",
+            files = survivors.len()
+        ))
         .await?;
 
-        // Whether some superfile's plan came out `Unbounded`. Decides
-        // whether DataFusion's row filter is attached below; a superfile
-        // the selectivity gate sends to a scan is not counted (see there).
-        let any_plan_unbounded = superfiles.iter().any(|seg| seg.unbounded);
         // The pushdown predicates' df probes, dictionary walks and posting
         // walks, flushed through the same collector that meters this
         // scan's pages — once the fan-out is in, so the tallies land in
@@ -1055,7 +1432,8 @@ impl TableProvider for SupertableProvider {
             }
         }
 
-        // The single object store DataFusion reads every survivor through.
+        // The store DataFusion resolves the scan's URL to. Byte reads go
+        // through the reader factory below, which uses this same store.
         let store: Arc<dyn OsObjectStore> = self.scan_store.clone();
 
         // Build each superfile's PartitionedFile + access plan. An access
@@ -1085,62 +1463,52 @@ impl TableProvider for SupertableProvider {
             files.push(file);
         }
 
-        // Tier 2 - DataFusion-owned row-group / page pruning + row-level
-        // filter pushdown, used **only when the index could not bound the
-        // rows** of some superfile: an `Unbounded` candidate plan, or a
-        // `LIKE` token that found no bound in that superfile's dictionary.
-        // In that fallback the predicate becomes a Parquet `RowFilter`
-        // (`with_pushdown_filters`) so the predicate columns are decoded
-        // first and only surviving rows materialize.
-        //
-        // The predicate itself is not attached here. Every filter is
-        // reported `Inexact`, so DataFusion keeps a `FilterExec` above the
-        // scan, and its physical filter-pushdown rule then offers that
-        // node's predicate to the source: with row filters enabled the
-        // source accepts it once and the `FilterExec` is dropped; with them
-        // disabled the source still keeps it for statistics pruning and the
-        // node stays. Attaching our own copy of the same conjunction as
-        // well made the row filter `p AND p` — a second evaluation of the
-        // predicate over every row the first pass kept, which on a dense
-        // predicate is most of them.
-        //
-        // When the index *did* bound the rows, the per-superfile access plan
-        // already selects exactly the candidate rows and the `FilterExec`
-        // verifies the exact predicate over that tiny set, so row filters
-        // stay off. A superfile the selectivity gate sent to a scan
-        // deliberately gets none either: the gate fires when the predicate
-        // matches most rows, and a row filter that keeps most rows only adds
-        // its own decode pass on top of the scan — measured on the 1M-row
-        // SQL bench, `bucket IN (all)` and a majority `category` aggregate
-        // ran 1.6–3× slower with it attached.
-        // A scan with no filters at all also lowers to `Unbounded`; it has
-        // no predicate to filter rows by and gets no row filter — otherwise
-        // DataFusion's post-optimization dynamic filters (TopK, join probe
-        // side, aggregate) would start running as Parquet row filters on
-        // filter-less scans, a change nothing has measured.
-        let row_filter = !filters.is_empty() && any_plan_unbounded;
-
         // Only push the LIMIT into the scan when there are no filters:
         // with an `Inexact` filter re-applied above, a scan-level limit
-        // could stop before enough matching rows are produced. With no
-        // filters, DataFusion's own limit and a scan-level limit agree.
+        // could stop before enough matching rows are produced, and an exact
+        // filter's scan needs its row selections intact (see the meter
+        // below). With no filters, DataFusion's own limit and a scan-level
+        // limit agree.
         let effective_limit = if filters.is_empty() { limit } else { None };
 
+        // Tier 2 - DataFusion's row-group and page pruning. How a `WHERE`
+        // reaches the rows, per superfile:
+        //
+        //   exact predicates                  the rest
+        //   (`title ILIKE '%rust%'`)          (`title = 'rust'`, `price > 5`)
+        //          │                                  │
+        //   provider picks exactly           index narrows the rows enough?
+        //   their rows                         yes: only the candidate rows
+        //          │                           no:  every row the statistics keep
+        //          └──────────────┬───────────────────┘
+        //                         ▼
+        //               scan decodes those rows
+        //                         ▼
+        //               FilterExec checks the rest
+        //               (exact ones are not checked again)
+        //
+        // No predicate is attached to the source. DataFusion hands it the
+        // `FilterExec` predicate for statistics pruning, and as a row filter
+        // only under `ORDER BY ... LIMIT` (see `RowFilterUnderTopK`).
         let mut source = ParquetSource::new(Arc::clone(&self.schema));
-        if row_filter {
-            source = source
-                .with_pushdown_filters(true)
-                .with_reorder_filters(true);
-        }
         // Serve DataFusion's opener the index-complete footers the
         // readers already parsed — without this the opener re-reads +
         // re-parses every superfile's footer on every query (~half the
         // warm flat cost at 256 superfiles), and on predicated scans it
         // would fetch page-index bytes through the metered store for
         // lazily-opened readers (a cache-state-dependent priced counter).
-        source = source.with_parquet_file_reader_factory(Arc::new(CachedMetadataReaderFactory {
-            store: Arc::clone(&store),
-            metas: Arc::clone(&self.scan_metas),
+        //
+        // The factory also sends byte reads through read-ahead. The meter
+        // hands it the scan's final filter when the scan runs, and
+        // `ReadAheadOff` turns it off under a LIMIT that can stop the scan.
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::clone(&self.scan_store),
+            Arc::clone(&self.manifest.options.connection_memory_budget),
+            Arc::clone(&self.schema),
+        ));
+        source = source.with_parquet_file_reader_factory(Arc::new(ScanReaderFactory {
+            read_ahead: Arc::clone(&read_ahead),
+            footers: Arc::clone(&self.scan_footers),
         }));
 
         // ManifestSnapshot-derived statistics for the scan node. Exact only
@@ -1150,7 +1518,16 @@ impl TableProvider for SupertableProvider {
         // may emit fewer rows than the manifest totals, so everything
         // degrades to inexact estimates.
         let scan_stats = {
-            let stats = self.statistics_for(&survivor_entries);
+            // The projected columns, or every column when nothing is projected.
+            let projected: Option<HashSet<&str>> = projection.map(|indices| {
+                indices
+                    .iter()
+                    .filter_map(|i| self.schema.fields().get(*i))
+                    .map(|field| field.name().as_str())
+                    .collect()
+            });
+            let wanted = |name: &str| projected.as_ref().is_none_or(|set| set.contains(name));
+            let stats = self.statistics_for(&survivor_entries, &wanted);
             if filters.is_empty() {
                 stats
             } else {
@@ -1162,7 +1539,8 @@ impl TableProvider for SupertableProvider {
         state
             .runtime_env()
             .register_object_store(url.as_ref(), store);
-        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source));
+        let mut builder = FileScanConfigBuilder::new(url, Arc::new(source))
+            .with_expr_adapter(Some(Arc::new(TableExprAdapterFactory::new(&self.manifest))));
         for file in files {
             builder = builder.with_file(file);
         }
@@ -1184,11 +1562,16 @@ impl TableProvider for SupertableProvider {
         // when there are no filters, for the same reason.
         let scan = DataSourceExec::from_data_source(config);
         let op_stats = self.scan_store.op_stats();
-        Ok(if filters.is_empty() {
-            Arc::new(MeteredExec::new(scan, op_stats))
+        let meter = if filters.is_empty() {
+            MeteredExec::new(scan, op_stats)
         } else {
-            Arc::new(MeteredExec::without_limit_pushdown(scan, op_stats))
-        })
+            MeteredExec::without_limit_pushdown(scan, op_stats)
+        };
+        Ok(Arc::new(
+            meter
+                .with_footers(Arc::clone(&self.scan_footers))
+                .with_read_ahead(read_ahead),
+        ))
     }
 }
 
@@ -1291,7 +1674,7 @@ fn tombstone_access_plan_from_counts(
 /// batching and the resident-bytes unit tests.
 fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_bytes.clone())
-        .map_err(|e| DataFusionError::Execution(format!("parquet metadata: {e}")))?;
+        .map_err(|e| QueryError::Internal(format!("parquet metadata: {e}")))?;
     Ok(builder
         .metadata()
         .row_groups()
@@ -1300,60 +1683,29 @@ fn row_group_rows_from_bytes(parquet_bytes: &Bytes) -> DfResult<Vec<u32>> {
         .collect())
 }
 
-/// Serves DataFusion's parquet opener the footer metadata each
-/// segment's [`SuperfileReader`] parsed at open, so a scan never
-/// re-reads or re-parses footers. Byte ranges still flow through the
-/// unified [`SuperfileObjectStore`] (zero-copy slices on warm
-/// segments, range GETs on cold ones).
+/// Gives DataFusion's Parquet opener the footer each [`SuperfileReader`]
+/// parsed at open, so a scan never reads a footer twice. Byte reads go
+/// through a [`ReadAhead`] per file and partition, which reads the
+/// [`SuperfileObjectStore`] and downloads the next row groups on cold files.
 ///
 /// [`SuperfileReader`]: crate::superfile::SuperfileReader
-struct CachedMetadataReaderFactory {
-    store: Arc<dyn OsObjectStore>,
-    metas: Arc<DashMap<ObjPath, Arc<ParquetMetaData>>>,
+struct ScanReaderFactory {
+    /// The scan's store, budget and filter, shared by every reader.
+    read_ahead: Arc<ScanReadAhead>,
+    footers: Arc<ScanFooters>,
 }
 
-impl fmt::Debug for CachedMetadataReaderFactory {
+impl fmt::Debug for ScanReaderFactory {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CachedMetadataReaderFactory")
-            .field("superfiles", &self.metas.len())
+        f.debug_struct("ScanReaderFactory")
+            .field("superfiles", &self.footers.len())
             .finish()
     }
 }
 
-/// [`AsyncFileReader`] handed to DataFusion's opener: byte ranges
-/// delegate to the plain object-store reader; `get_metadata` returns
-/// the open-time parse instead of re-fetching the footer.
-struct CachedMetadataReader {
-    inner: ParquetObjectReader,
-    /// `None` only for a file outside the survivors loop (never
-    /// expected) — falls back to the inner reader's footer fetch.
-    meta: Option<Arc<ParquetMetaData>>,
-}
-
-impl AsyncFileReader for CachedMetadataReader {
-    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, errors::Result<Bytes>> {
-        self.inner.get_bytes(range)
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, errors::Result<Vec<Bytes>>> {
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, errors::Result<Arc<ParquetMetaData>>> {
-        match self.meta.clone() {
-            Some(meta) => async move { Ok(meta) }.boxed(),
-            None => self.inner.get_metadata(options),
-        }
-    }
-}
-
-impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
+impl ParquetFileReaderFactory for ScanReaderFactory {
+    /// Every file a scan reads had its footer cached when it was opened, so a
+    /// missing one is our bug.
     fn create_reader(
         &self,
         _partition_index: usize,
@@ -1362,18 +1714,19 @@ impl ParquetFileReaderFactory for CachedMetadataReaderFactory {
         _metrics: &ExecutionPlanMetricsSet,
     ) -> DfResult<Box<dyn AsyncFileReader + Send>> {
         let location = &partitioned_file.object_meta.location;
-        let mut inner = ParquetObjectReader::new(Arc::clone(&self.store), location.clone())
-            .with_file_size(partitioned_file.object_meta.size);
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint);
-        }
-        Ok(Box::new(CachedMetadataReader {
-            meta: self
-                .metas
-                .get(location)
-                .map(|meta| Arc::clone(meta.value())),
-            inner,
-        }))
+        let footer = self
+            .footers
+            .get(location)
+            .map(|footer| Arc::clone(&footer.meta));
+        Ok(match footer {
+            Some(meta) => Box::new(self.read_ahead.reader(partitioned_file, meta)),
+            // No footer from open: read it like DataFusion's own reader does.
+            // Without it there's no plan, so no read-ahead.
+            None => Box::new(
+                self.read_ahead
+                    .plain_reader(&partitioned_file, metadata_size_hint),
+            ),
+        })
     }
 }
 
@@ -1467,6 +1820,77 @@ fn selection_access_plan_from_counts(
         base += n;
     }
     plan
+}
+
+/// Lower scalar predicates to prune leaves. Each predicate yields a
+/// `Scalar` leaf; additionally, an equality on an FTS-indexed text
+/// column also yields a `TermPresence` leaf so the superfile's term
+/// bloom prunes it. Sound: a row matching `col = 'a b'` has a value
+/// whose tokens include every token of the literal, so requiring all
+/// of them possibly-present (`BoolMode::And`) never drops a match —
+/// bloom false positives can only keep a superfile, never drop one.
+fn scalar_predicates_to_prune_leaves(
+    manifest: &ManifestSnapshot,
+    predicates: Vec<ScalarPredicate>,
+) -> Vec<PruneLeaf> {
+    let mut leaves = Vec::with_capacity(predicates.len());
+    for pred in predicates {
+        if pred.op == ScalarOp::Eq
+            && manifest
+                .fts_configs()
+                .iter()
+                .any(|c| c.column == pred.column)
+            && let Some(literal) = scalar_as_str(&pred.value)
+        {
+            // Per-column analyzer: prune with the tokenizer this column
+            // was indexed with, not a single table-wide default.
+            let Some(tok) = manifest.try_fts_tokenizer_for(&pred.column) else {
+                leaves.push(PruneLeaf::Scalar(pred));
+                continue;
+            };
+            let terms: Vec<String> = tok.tokenize(literal).collect();
+            if !terms.is_empty() {
+                leaves.push(PruneLeaf::TermPresence {
+                    column: pred.column.clone(),
+                    terms,
+                    mode: BoolMode::And,
+                });
+            }
+        }
+        leaves.push(PruneLeaf::Scalar(pred));
+    }
+    leaves
+}
+
+/// Every manifest prune leaf a `WHERE` clause yields: scalar min/max for
+/// `column <op> literal` conjuncts (plus a term bloom when the column is
+/// FTS-indexed), value sets for `IN` and same-column `OR`s of equalities,
+/// term blooms and lex ranges for `LIKE`, and null counts for `IS [NOT]
+/// NULL`. `schema` is the table's scalar schema, which names the columns
+/// a predicate may prune on.
+///
+/// Shared by the SQL scan and the search table functions, so a
+/// `WHERE path = 'x'` skips the same superfiles whether it sits over a
+/// plain scan or over `bm25_search` / `hybrid_search`. Pure manifest
+/// work: reads statistics only, opens no superfile.
+pub(crate) fn prune_leaves_for_filters(
+    manifest: &ManifestSnapshot,
+    schema: &SchemaRef,
+    filters: &[Expr],
+) -> Vec<PruneLeaf> {
+    let fts_configs = manifest.fts_configs();
+    let fts_cols: HashSet<&str> = fts_configs.iter().map(|c| c.column.as_str()).collect();
+    let resolve = |col: &str| manifest.try_fts_tokenizer_for(col);
+    let mut leaves =
+        scalar_predicates_to_prune_leaves(manifest, exprs_to_scalar_predicates(filters, schema));
+    leaves.extend(exprs_to_value_set_leaves(
+        filters, schema, &fts_cols, &resolve,
+    ));
+    // `LIKE` on an FTS column: a term bloom for the pattern's complete
+    // tokens and a lex-range check for a prefix token.
+    leaves.extend(like_prune_leaves(filters, &fts_cols, &resolve));
+    leaves.extend(exprs_to_null_leaves(filters, schema));
+    leaves
 }
 
 /// Lower a conjunction of DataFusion filter `Expr`s into infino's
@@ -1748,35 +2172,52 @@ fn flip_op(op: ScalarOp) -> ScalarOp {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        hash::{DefaultHasher, Hash, Hasher},
+        slice::from_ref,
+        time::Duration,
+    };
 
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
     use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
-        prelude::{cast, col, lit},
+        common::DFSchema,
+        datasource::physical_plan::FileGroup,
+        execution::context::ExecutionProps,
+        physical_expr::create_physical_expr,
+        physical_plan::collect,
+        prelude::{SessionContext, cast, col, lit},
         scalar::ScalarValue,
     };
-    use object_store::memory::InMemory;
+    use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
     use tokio::runtime;
 
     use super::*;
     use crate::{
+        memory::ConnectionMemoryBudget,
         superfile::{
             builder::FtsConfig,
-            fts::tokenize::{AsciiLowerTokenizer, StandardTokenizer},
+            fts::{
+                analysis::{Stemmer, Stopwords, chain_tokenizer},
+                tokenize::StandardTokenizer,
+            },
             vector::layout::VectorLayout,
         },
         supertable::{
             Supertable, SupertableOptions,
-            manifest::{ScalarStatsAgg, SuperfileUri},
+            manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
+            query::read_ahead::fixture,
         },
-        test_helpers::default_tokenizer,
+        test_helpers::{default_tokenizer, fid},
     };
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
-    /// column resolves to the default ASCII-lower analyzer.
-    fn ascii_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
+    /// column resolves to the default `standard` analyzer.
+    fn standard_resolver(_col: &str) -> Option<Arc<dyn Tokenizer>> {
         Some(default_tokenizer())
     }
 
@@ -2039,7 +2480,7 @@ mod tests {
     /// extraction without matching on the full enum.
     fn value_set_leaves(filters: &[Expr], schema: &SchemaRef) -> Vec<(String, usize)> {
         // No FTS columns / tokenizer → only the scalar min/max leaf.
-        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), &ascii_resolver)
+        exprs_to_value_set_leaves(filters, schema, &HashSet::new(), &standard_resolver)
             .into_iter()
             .map(|l| match l {
                 PruneLeaf::ScalarValueSet { column, values } => (column, values.len()),
@@ -2119,7 +2560,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("y").eq(lit(2_i64)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2130,7 +2571,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").eq(lit(1_i64)).or(col("x").gt(lit(5_i64)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2144,7 +2585,7 @@ mod tests {
                 .eq(lit(1_i32))
                 .or(cast(col("x"), DataType::Int32).eq(lit(2_i32)));
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2156,7 +2597,7 @@ mod tests {
         let expr = col("title")
             .eq(lit("Foo Bar"))
             .or(col("title").eq(lit("Bar Baz")));
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
 
         assert!(
             leaves
@@ -2183,7 +2624,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("x").in_list(vec![lit(1_i64)], true);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2237,7 +2678,7 @@ mod tests {
         // `x IN (1, y)` — `y` is a column, not a literal; can't bound min/max.
         let expr = col("x").in_list(vec![lit(1_i64), col("y")], false);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2246,7 +2687,7 @@ mod tests {
         let s = schema_xy();
         let expr = col("z").in_list(vec![lit(1_i64)], false);
         assert!(
-            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &ascii_resolver).is_empty()
+            exprs_to_value_set_leaves(&[expr], &s, &HashSet::new(), &standard_resolver).is_empty()
         );
     }
 
@@ -2257,7 +2698,7 @@ mod tests {
         // 'Foo Bar' → [foo, bar]; 'Bar Baz' → [bar, baz]. The shared `bar`
         // is deduped, and the terms come out sorted-unique.
         let expr = col("title").in_list(vec![lit("Foo Bar"), lit("Bar Baz")], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
 
         assert!(
             leaves
@@ -2287,10 +2728,9 @@ mod tests {
 
     #[test]
     fn value_set_bloom_uses_the_per_column_tokenizer() {
-        // `title` is analyzed with the Unicode-aware standard tokenizer
-        // (keeps non-ASCII); `body` with ascii_lower (drops it). Bloom
-        // pruning must probe each column with its own tokenizer, else a
-        // standard-analyzed column is pruned against ascii_lower tokens.
+        // `title` is plain `standard`; `body` stems. Bloom pruning must
+        // probe each column with its own tokenizer, else a stemmed column
+        // is pruned against unstemmed tokens.
         let s = Arc::new(Schema::new(vec![
             Field::new("title", DataType::Utf8, true),
             Field::new("body", DataType::Utf8, true),
@@ -2300,40 +2740,33 @@ mod tests {
             if c == "title" {
                 Some(Arc::new(StandardTokenizer))
             } else {
-                Some(Arc::new(AsciiLowerTokenizer))
+                Some(chain_tokenizer(Stopwords::None, Stemmer::English))
             }
         };
-
-        // Standard column: the non-ASCII term survives tokenization, so a
-        // TermPresence bloom leaf is emitted carrying the folded token.
-        let title_leaves = exprs_to_value_set_leaves(
-            &[col("title").in_list(vec![lit("Süd")], false)],
-            &s,
-            &fts,
-            &resolve,
+        let terms_for = |column: &str| {
+            exprs_to_value_set_leaves(
+                &[col(column).in_list(vec![lit("Running")], false)],
+                &s,
+                &fts,
+                &resolve,
+            )
+            .into_iter()
+            .find_map(|l| match l {
+                PruneLeaf::TermPresence {
+                    column: c, terms, ..
+                } if c == column => Some(terms),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            terms_for("title"),
+            Some(vec!["running".to_string()]),
+            "the plain column probes the unstemmed token"
         );
-        assert!(
-            title_leaves.iter().any(|l| matches!(
-                l,
-                PruneLeaf::TermPresence { column, terms, .. }
-                    if column == "title" && terms == &vec!["süd".to_string()]
-            )),
-            "standard-analyzed column keeps the non-ASCII token"
-        );
-
-        // ascii_lower column: the same literal drops to zero tokens, so no
-        // TermPresence leaf is emitted — only the scalar value-set leaf.
-        let body_leaves = exprs_to_value_set_leaves(
-            &[col("body").in_list(vec![lit("Süd")], false)],
-            &s,
-            &fts,
-            &resolve,
-        );
-        assert!(
-            !body_leaves
-                .iter()
-                .any(|l| matches!(l, PruneLeaf::TermPresence { .. })),
-            "ascii_lower column drops the non-ASCII token — no bloom leaf"
+        assert_eq!(
+            terms_for("body"),
+            Some(vec!["run".to_string()]),
+            "the stemmed column probes the stem"
         );
     }
 
@@ -2342,7 +2775,7 @@ mod tests {
         let s = schema_xy();
         let fts = HashSet::from(["title"]); // "x" not in the set
         let expr = col("x").in_list(vec![lit(1_i64), lit(2_i64), lit(3_i64), lit(4_i64)], false);
-        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &ascii_resolver);
+        let leaves = exprs_to_value_set_leaves(&[expr], &s, &fts, &standard_resolver);
         assert_eq!(leaves.len(), 1);
         assert!(matches!(leaves[0], PruneLeaf::ScalarValueSet { .. }));
     }
@@ -2422,7 +2855,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -2527,7 +2960,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -2704,7 +3137,7 @@ mod tests {
 
         let reader = st.reader().expect("reader");
         let provider = SupertableProvider::new(
-            st.options().scalar_schema(),
+            reader.manifest().scalar_schema(),
             reader.manifest().clone(),
             st.options().store.clone(),
             st.options().disk_cache.clone(),
@@ -2713,6 +3146,16 @@ mod tests {
 
         let stats = provider.statistics().expect("statistics");
         // 6 rows total across both superfiles, clean view → Exact.
+        assert!(matches!(stats.num_rows, Precision::Exact(6)));
+
+        // The planner-level call stops at the row count and the id column;
+        // the scan node carries the projected columns' statistics, from the
+        // same fold over the entries.
+        let entries = reader
+            .manifest()
+            .complete_flat_superfiles()
+            .expect("complete");
+        let stats = provider.statistics_for(entries, &|_| true);
         assert!(matches!(stats.num_rows, Precision::Exact(6)));
 
         // Find the `n` column's statistics and assert aggregated min/max.
@@ -2777,14 +3220,11 @@ mod tests {
         }
     }
 
-    /// A superfile entry carrying only min/max for `col` (no null count,
-    /// sum, or HLL) — the shape a non-summable column (e.g. Utf8) produces.
-    fn entry_minmax_only(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
-        let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
-        let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
-        let mut scalar_stats = HashMap::new();
-        scalar_stats.insert(col.to_string(), ScalarStatsAgg::from_min_max(mn, mx));
+    /// A one-document superfile entry carrying `scalar_stats` and nothing
+    /// else.
+    fn entry_with_stats(scalar_stats: HashMap<FieldId, ScalarStatsAgg>) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -2792,7 +3232,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats,
+            scalar_stats: scalar_stats.into(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -2802,45 +3242,641 @@ mod tests {
         })
     }
 
+    /// A superfile entry carrying only min/max for `col` (no null count,
+    /// sum, or HLL) — the shape a non-summable column (e.g. Utf8) produces.
+    fn entry_minmax_only(col: &str, min: &str, max: &str) -> Arc<SuperfileEntry> {
+        let mn: ArrayRef = Arc::new(LargeStringArray::from(vec![min]));
+        let mx: ArrayRef = Arc::new(LargeStringArray::from(vec![max]));
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(fid(col), ScalarStatsAgg::from_min_max(mn, mx));
+        entry_with_stats(scalar_stats)
+    }
+
+    /// A superfile entry carrying the statistics `from_column` computes for
+    /// `col` over `column`.
+    fn entry_from_column(col: &str, column: &ArrayRef) -> Arc<SuperfileEntry> {
+        let mut scalar_stats = HashMap::new();
+        scalar_stats.insert(
+            fid(col),
+            ScalarStatsAgg::from_column(column).expect("a column with statistics"),
+        );
+        entry_with_stats(scalar_stats)
+    }
+
+    /// A column counted exactly by its value table carries no sketch; the
+    /// distinct estimate sketches the table's values in its place and
+    /// merges them across superfiles as it merges sketches, so the estimate
+    /// is the one a sketch over the same values gives.
+    #[test]
+    fn scalar_distinct_counts_a_column_through_its_value_table() {
+        let first: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10]));
+        let second: ArrayRef = Arc::new(Int64Array::from(vec![5, 30, 50]));
+        let entries = vec![
+            entry_from_column("n", &first),
+            entry_from_column("n", &second),
+        ];
+        for entry in &entries {
+            let stats = entry.scalar_stats.get(fid("n")).expect("stats");
+            assert!(stats.hll.is_none(), "counted exactly, so no sketch");
+            assert!(stats.value_counts.is_some());
+        }
+        let all: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10, 5, 30, 50]));
+        let want = column_hll(from_ref(&all))
+            .expect("sketchable")
+            .estimate()
+            .round() as usize;
+        assert_eq!(
+            scalar_distinct(&read_column(&entries, fid("n"))),
+            Some(want)
+        );
+    }
+
+    /// A superfile in which the column is null throughout carries neither
+    /// sketch nor table; it adds nothing to the estimate and withholds
+    /// nothing. Null throughout every superfile, the column has no
+    /// distinct value at all.
+    #[test]
+    fn scalar_distinct_skips_a_superfile_where_the_column_is_null_throughout() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![10, 50, 10]));
+        let nulls: ArrayRef = Arc::new(Int64Array::from(vec![None::<i64>, None]));
+        let entries = vec![
+            entry_from_column("n", &values),
+            entry_from_column("n", &nulls),
+        ];
+        let want = column_hll(from_ref(&values))
+            .expect("sketchable")
+            .estimate()
+            .round() as usize;
+        assert_eq!(
+            scalar_distinct(&read_column(&entries, fid("n"))),
+            Some(want)
+        );
+
+        let only_nulls = vec![
+            entry_from_column("n", &nulls),
+            entry_from_column("n", &nulls),
+        ];
+        assert_eq!(
+            scalar_distinct(&read_column(&only_nulls, fid("n"))),
+            Some(0)
+        );
+    }
+
     /// The statistics fold helpers return `None` when a column carries no
     /// usable stat — both when the column has min/max only (no additive
-    /// stat) and when it's absent entirely. Exercises the `get(col)?` and
-    /// `.<stat>.as_ref()?` short-circuit branches of the new map-based access.
+    /// stat) and when it's absent entirely. Exercises the `?` short-circuit
+    /// branches of each fold over the one read per superfile.
     #[test]
     fn scalar_statistics_helpers_return_none_when_stat_absent() {
         let entries = vec![entry_minmax_only("s", "alpha", "omega")];
+        let present = read_column(&entries, fid("s"));
         // Column present, but the additive stats are absent → None.
-        assert!(scalar_sum(&entries, "s").is_none(), "no sum stat → None");
+        assert!(scalar_sum(&present).is_none(), "no sum stat → None");
+        assert!(scalar_distinct(&present).is_none(), "no hll stat → None");
         assert!(
-            scalar_distinct(&entries, "s").is_none(),
-            "no hll stat → None"
-        );
-        assert!(
-            scalar_null_count(&entries, "s").is_none(),
+            scalar_null_count(&present).is_none(),
             "no null_count stat → None"
         );
         // min/max IS present for the column.
-        assert!(scalar_min_max(&entries, "s").is_some());
+        assert!(scalar_min_max(&present).is_some());
         // A column absent from every entry yields None for all helpers.
-        assert!(scalar_sum(&entries, "missing").is_none());
-        assert!(scalar_min_max(&entries, "missing").is_none());
-        assert!(scalar_null_count(&entries, "missing").is_none());
+        let missing = read_column(&entries, fid("missing"));
+        assert!(scalar_sum(&missing).is_none());
+        assert!(scalar_min_max(&missing).is_none());
+        assert!(scalar_null_count(&missing).is_none());
     }
 
-    /// `CachedMetadataReaderFactory`'s `Debug` reports the superfile
-    /// (cached-meta) count and is otherwise unreachable from a normal
-    /// scan. Build one with an empty meta map over an in-memory store
-    /// and render it.
+    /// How a test scan reads a wide file: its projection, filter (a row filter
+    /// when `row_filter`), access plan, number of partitions, and which row
+    /// groups are already cached.
+    #[derive(Debug)]
+    struct ScanShape {
+        name: &'static str,
+        projection: Option<Vec<usize>>,
+        filter: Option<Expr>,
+        row_filter: bool,
+        plan: Option<ParquetAccessPlan>,
+        partitions: u64,
+        cached_row_groups: Vec<usize>,
+    }
+
+    /// What one scan returned and cost.
+    #[derive(Debug)]
+    struct ScanRun {
+        rows: usize,
+        /// Every value of every row, see [`answer_of`].
+        answer: u64,
+        /// Bytes the scan downloaded from object storage, through the cache.
+        fetched: u64,
+        /// GETs the cache made to object storage.
+        gets: usize,
+    }
+
+    impl ScanRun {
+        /// What must not change with read-ahead: the answer and the bytes
+        /// downloaded.
+        fn answer_and_bytes(&self) -> (usize, u64, u64) {
+            (self.rows, self.answer, self.fetched)
+        }
+    }
+
+    /// A fingerprint of every value of every row in `batches`, whatever order
+    /// the partitions return them in: each row's values are hashed, and the
+    /// row hashes added up.
+    fn answer_of(batches: &[RecordBatch]) -> u64 {
+        let options = FormatOptions::default();
+        let mut answer = 0u64;
+        for batch in batches {
+            let columns: Vec<ArrayFormatter> = batch
+                .columns()
+                .iter()
+                .map(|c| ArrayFormatter::try_new(c.as_ref(), &options).expect("formatter"))
+                .collect();
+            for row in 0..batch.num_rows() {
+                let mut hasher = DefaultHasher::new();
+                for column in &columns {
+                    column.value(row).to_string().hash(&mut hasher);
+                }
+                answer = answer.wrapping_add(hasher.finish());
+            }
+        }
+        answer
+    }
+
+    /// A wide test file: its bytes and footer.
+    type WideFile = (Bytes, Arc<ParquetMetaData>);
+
+    /// Rows per row group in the wide file, enough to cross the cache's blocks.
+    const WIDE_ROWS_PER_GROUP: usize = 20_000;
+    /// Rows per page in the wide file, so the page index can narrow a chunk.
+    const WIDE_PAGE_ROWS: usize = 2_000;
+    /// Where the page-index test's range starts and ends, in tenths of a row
+    /// group: the last tenth of row group 1 to the first tenth of row group 5,
+    /// so most of both is left unread.
+    const NARROWED_TENTHS: (i64, i64) = (9, 1);
+    /// Percent of rows the row-filter test's filter on `a` keeps: most row
+    /// groups, so batches run, but not the last ones.
+    const ROW_FILTER_KEPT_PERCENT: i64 = 85;
+    /// How long each read from object storage takes, so reads in flight
+    /// together overlap like GETs do.
+    const GET_LATENCY: Duration = Duration::from_millis(20);
+    /// Random shapes the randomized contract test checks.
+    const RANDOM_SHAPES: u64 = 48;
+    /// Rows per row group and per page of the random test's files: row groups
+    /// inside one cache block, a few blocks wide, many blocks wide, and many
+    /// blocks with one page per column.
+    const RANDOM_LAYOUTS: [(usize, usize); 4] = [
+        (2_000, 500),
+        (8_000, 2_000),
+        (20_000, 2_000),
+        (20_000, 20_000),
+    ];
+    /// Odds and choices for [`random_shape`]: projecting some columns, keeping
+    /// each one, a row filter, an access plan, a cached row group, and how
+    /// many kinds of filter and row-group access it picks from.
+    const RANDOM_PROJECTION_ODDS: f64 = 0.6;
+    const RANDOM_COLUMN_ODDS: f64 = 0.5;
+    const RANDOM_ROW_FILTER_ODDS: f64 = 0.5;
+    const RANDOM_PLAN_ODDS: f64 = 0.4;
+    const RANDOM_CACHED_ODDS: f64 = 0.15;
+    const RANDOM_FILTER_KINDS: u32 = 4;
+    const RANDOM_ACCESS_KINDS: u32 = 5;
+    /// Latency of each read in the random test: enough for reads to overlap,
+    /// small enough to run many shapes.
+    const RANDOM_GET_LATENCY: Duration = Duration::from_millis(2);
+    /// Size of the file the no-footer test opens; it's never read.
+    const FOOTERLESS_FILE_BYTES: u64 = 1024;
+    /// Extra GETs one shape may take: read-ahead downloads the same blocks,
+    /// but groups them into GETs its own way.
+    const GET_SLACK: usize = 2;
+    /// The smallest download the fixture's cache makes. A short miss
+    /// downloads this much, and where the extra bytes land depends on which
+    /// read misses first.
+    const CACHE_MIN_GET: u64 = 512 * 1024;
+
+    /// Scan `file` cold through DataFusion's own Parquet opener and the disk
+    /// cache, as in production, with each read taking `latency`. Returns the
+    /// run and the most bytes read-ahead held.
+    async fn scan_through_the_cache(
+        read_ahead: bool,
+        shape: &ScanShape,
+        file: &WideFile,
+        latency: Duration,
+    ) -> (ScanRun, usize) {
+        let (bytes, meta) = (file.0.clone(), Arc::clone(&file.1));
+        let size = bytes.len() as u64;
+        let superfile = fixture::Superfile::with_latency(bytes, latency);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_cache, source) = fixture::block_cached(&superfile, dir.path());
+        for &rg in &shape.cached_row_groups {
+            let (start, len) = (0..meta.row_group(rg).num_columns())
+                .map(|c| meta.row_group(rg).column(c).byte_range())
+                .fold((u64::MAX, 0), |(s, e), (cs, cl)| {
+                    (s.min(cs), e.max(cs + cl))
+                });
+            source.range(start, len - start).await.expect("warm");
+        }
+        superfile.clear();
+
+        let path = ObjPath::from("t/sf.parquet");
+        let store = Arc::new(SuperfileObjectStore::new());
+        store.insert_source(path.clone(), source);
+        let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
+        footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
+        let schema = fixture::schema();
+        let budget = ConnectionMemoryBudget::measured();
+        let read_ahead_state = Arc::new(ScanReadAhead::new(
+            Arc::clone(&store),
+            Arc::clone(&budget),
+            Arc::clone(&schema),
+        ));
+        if !read_ahead {
+            read_ahead_state.disable();
+        }
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::clone(&read_ahead_state),
+            footers,
+        };
+        let mut parquet = ParquetSource::new(Arc::clone(&schema))
+            .with_parquet_file_reader_factory(Arc::new(factory));
+        if let Some(filter) = &shape.filter {
+            let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+            let predicate = create_physical_expr(filter, &df_schema, &ExecutionProps::new())
+                .expect("predicate");
+            // The way the meter hands it over when the scan runs.
+            read_ahead_state.set_predicate(Arc::clone(&predicate), None);
+            parquet = parquet
+                .with_predicate(predicate)
+                .with_pushdown_filters(shape.row_filter)
+                .with_reorder_filters(shape.row_filter);
+        }
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let mut builder = FileScanConfigBuilder::new(url.clone(), Arc::new(parquet));
+        for p in 0..shape.partitions {
+            let (start, end) = (
+                size * p / shape.partitions,
+                size * (p + 1) / shape.partitions,
+            );
+            let mut file =
+                PartitionedFile::new_with_range(path.to_string(), size, start as i64, end as i64);
+            if let Some(plan) = &shape.plan {
+                file = file.with_extension(plan.clone());
+            }
+            builder = builder.with_file_group(FileGroup::new(vec![file]));
+        }
+        let builder = builder
+            .with_projection_indices(shape.projection.clone())
+            .expect("projection");
+        let scan = DataSourceExec::from_data_source(builder.build());
+        let ctx = SessionContext::new();
+        ctx.runtime_env().register_object_store(url.as_ref(), store);
+        let batches = collect(scan, ctx.task_ctx()).await.expect("scan");
+
+        let run = ScanRun {
+            rows: batches.iter().map(|b| b.num_rows()).sum(),
+            answer: answer_of(&batches),
+            fetched: superfile.fetched_bytes(),
+            gets: superfile.reads().len(),
+        };
+        assert_eq!(budget.used(), 0, "every byte held ahead is given back");
+        (run, budget.peak())
+    }
+
+    // Several workers, so a download ahead starts as soon as it's spawned and
+    // races the scan's own reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_ahead_fetches_only_what_the_scan_would_through_the_cache() {
+        // Each shape below is scanned twice, read-ahead off and on, through
+        // DataFusion's own opener and the real disk cache:
+        //  - the rows must match;
+        //  - the bytes downloaded must match, within the cache's own slack;
+        //  - the GETs must not grow beyond `GET_SLACK`.
+        // This test pins that read-ahead downloads nothing the scan wouldn't.
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let group = WIDE_ROWS_PER_GROUP as i64;
+        let mut plan = ParquetAccessPlan::new_all(fixture::GROUPS);
+        plan.skip(2);
+        // The last rows of 4: the scan's own read of them ends next to 5.
+        plan.scan_selection(
+            4,
+            RowSelection::from(vec![
+                RowSelector::skip(WIDE_ROWS_PER_GROUP - 100),
+                RowSelector::select(100),
+            ]),
+        );
+        let every = |name| ScanShape {
+            name,
+            projection: None,
+            filter: None,
+            row_filter: false,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: Vec::new(),
+        };
+        let shapes = [
+            every("every column"),
+            ScanShape {
+                projection: Some(vec![0, 2]),
+                ..every("two columns, one unread between")
+            },
+            ScanShape {
+                // See `NARROWED_TENTHS`.
+                filter: Some(
+                    col("a")
+                        .gt_eq(lit(group + NARROWED_TENTHS.0 * group / 10))
+                        .and(col("a").lt(lit(5 * group + NARROWED_TENTHS.1 * group / 10))),
+                ),
+                ..every("a range the page index narrows")
+            },
+            ScanShape {
+                filter: Some(col("c").gt(lit(0i64))),
+                row_filter: true,
+                ..every("a row filter")
+            },
+            ScanShape {
+                plan: Some(plan),
+                ..every("a plan that skips and selects")
+            },
+            ScanShape {
+                partitions: 2,
+                ..every("two partitions")
+            },
+            ScanShape {
+                cached_row_groups: vec![0, 1],
+                ..every("the first row groups already cached")
+            },
+        ];
+        for shape in &shapes {
+            let (off, _) = scan_through_the_cache(false, shape, &file, GET_LATENCY).await;
+            let (on, held) = scan_through_the_cache(true, shape, &file, GET_LATENCY).await;
+            let name = shape.name;
+            assert_eq!(
+                (on.rows, on.answer),
+                (off.rows, off.answer),
+                "{name}: same rows"
+            );
+            assert!(
+                on.fetched.abs_diff(off.fetched) <= partition_slack(shape.partitions),
+                "{name}: same bytes from storage: {on:?} vs {off:?}"
+            );
+            assert!(
+                on.gets <= off.gets + GET_SLACK,
+                "{name}: GETs: {on:?} vs {off:?}"
+            );
+            assert!(held > 0, "{name}: reads ahead");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_row_filter_reading_in_turns_downloads_each_block_once() {
+        // Under a row filter the scan reads a row group's columns in turns:
+        //  - a batch starts on the first of those reads;
+        //  - the scan's later reads of that row group can share a cache block
+        //    with the batch's first column (one page per column here, so
+        //    adjacent row groups meet inside a block).
+        // This test pins that shared block being downloaded once.
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_ROWS_PER_GROUP);
+        let rows = (WIDE_ROWS_PER_GROUP * fixture::GROUPS) as i64;
+        let shape = ScanShape {
+            name: "a row filter reading in turns",
+            projection: None,
+            filter: Some(
+                col("a")
+                    .lt(lit(rows * ROW_FILTER_KEPT_PERCENT / 100))
+                    .and(col("c").lt(lit(0i64))),
+            ),
+            row_filter: true,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: vec![1, 4],
+        };
+        let (off, _) = scan_through_the_cache(false, &shape, &file, GET_LATENCY).await;
+        let (on, held) = scan_through_the_cache(true, &shape, &file, GET_LATENCY).await;
+        assert_eq!(
+            on.answer_and_bytes(),
+            off.answer_and_bytes(),
+            "same rows and bytes"
+        );
+        assert!(on.gets <= off.gets + GET_SLACK, "GETs: {on:?} vs {off:?}");
+        assert!(held > 0, "reads ahead");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn random_scan_shapes_return_the_same_rows_and_bytes_with_read_ahead() {
+        // The same check over random shapes: file layouts, projections,
+        // filters, row filters, access plans, up to three partitions, and row
+        // groups already cached. Read-ahead off vs on:
+        //  - every shape returns the same rows;
+        //  - bytes differ at most by where a short miss's window lands, and by
+        //    partitions that meet inside a block each downloading it;
+        //  - GETs can differ by one per shape, but not in total;
+        //  - bytes don't grow in total over one-partition shapes. With more
+        //    partitions, which one downloads a shared block first changes from
+        //    run to run even without read-ahead, so they keep only their own
+        //    bound.
+        // This test pins read-ahead staying cost-neutral across shapes.
+        let files: Vec<WideFile> = RANDOM_LAYOUTS
+            .iter()
+            .map(|&(rows, page_rows)| fixture::wide_file(rows, page_rows))
+            .collect();
+        let (mut gets_on, mut gets_off, mut read_ahead) = (0, 0, 0);
+        let (mut bytes_on, mut bytes_off) = (0, 0);
+        for seed in 0..RANDOM_SHAPES {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let layout = rng.random_range(0..files.len());
+            let shape = random_shape(&mut rng, RANDOM_LAYOUTS[layout].0);
+            let file = &files[layout];
+            let (off, _) = scan_through_the_cache(false, &shape, file, RANDOM_GET_LATENCY).await;
+            let (on, held) = scan_through_the_cache(true, &shape, file, RANDOM_GET_LATENCY).await;
+            let case = format!(
+                "seed {seed}, layout {:?}, {shape:?}",
+                RANDOM_LAYOUTS[layout]
+            );
+            assert_eq!(
+                (on.rows, on.answer),
+                (off.rows, off.answer),
+                "same rows: {case}"
+            );
+            assert!(
+                on.fetched.abs_diff(off.fetched)
+                    <= CACHE_MIN_GET + partition_slack(shape.partitions),
+                "bytes differ at most by where a download's minimum lands ({on:?} vs {off:?}): {case}"
+            );
+            if shape.partitions == 1 {
+                bytes_on += on.fetched;
+                bytes_off += off.fetched;
+            }
+            assert!(
+                on.gets <= off.gets + GET_SLACK,
+                "GETs ({on:?} vs {off:?}): {case}"
+            );
+            gets_on += on.gets;
+            gets_off += off.gets;
+            read_ahead += usize::from(held > 0);
+        }
+        assert!(
+            gets_on <= gets_off,
+            "no more GETs in all: {gets_on} vs {gets_off}"
+        );
+        assert!(
+            bytes_on <= bytes_off + CACHE_MIN_GET,
+            "no more bytes in all one-partition shapes: {bytes_on} vs {bytes_off}"
+        );
+        assert!(read_ahead > 0, "some shapes read ahead");
+    }
+
+    /// How much a scan with `partitions` partitions can download differently
+    /// from run to run, with or without read-ahead: partitions that meet
+    /// inside a cache block can each download it.
+    fn partition_slack(partitions: u64) -> u64 {
+        2 * (partitions - 1) * CACHE_MIN_GET
+    }
+
+    /// A random scan of a wide file with `rows_per_group` rows per row group.
+    fn random_shape(rng: &mut StdRng, rows_per_group: usize) -> ScanShape {
+        let rows = (rows_per_group * fixture::GROUPS) as i64;
+        let column_count = fixture::schema().fields().len();
+        let projection = rng.random_bool(RANDOM_PROJECTION_ODDS).then(|| {
+            let columns: Vec<usize> = (0..column_count)
+                .filter(|_| rng.random_bool(RANDOM_COLUMN_ODDS))
+                .collect();
+            if columns.is_empty() {
+                vec![rng.random_range(0..column_count)]
+            } else {
+                columns
+            }
+        });
+        let filter = match rng.random_range(0..RANDOM_FILTER_KINDS) {
+            // A range on `a`, which counts up, so statistics and the page index
+            // prune around it.
+            0 => {
+                let lo = rng.random_range(0..rows);
+                let hi = rng.random_range(lo..=rows);
+                Some(col("a").gt_eq(lit(lo)).and(col("a").lt(lit(hi))))
+            }
+            // On scrambled `c`: nothing prunes.
+            1 => Some(col("c").gt(lit(rng.random_range(i64::MIN / 2..i64::MAX / 2)))),
+            // Both.
+            2 => Some(
+                col("a")
+                    .lt(lit(rng.random_range(0..rows)))
+                    .and(col("c").lt(lit(0i64))),
+            ),
+            _ => None,
+        };
+        let row_filter = filter.is_some() && rng.random_bool(RANDOM_ROW_FILTER_ODDS);
+        let plan = rng.random_bool(RANDOM_PLAN_ODDS).then(|| {
+            let mut plan = ParquetAccessPlan::new_all(fixture::GROUPS);
+            for rg in 0..fixture::GROUPS {
+                match rng.random_range(0..RANDOM_ACCESS_KINDS) {
+                    0 => plan.skip(rg),
+                    1 => {
+                        let skip = rng.random_range(0..rows_per_group);
+                        let select = rng.random_range(1..=rows_per_group - skip);
+                        plan.scan_selection(
+                            rg,
+                            RowSelection::from(vec![
+                                RowSelector::skip(skip),
+                                RowSelector::select(select),
+                                RowSelector::skip(rows_per_group - skip - select),
+                            ]),
+                        );
+                    }
+                    // Every row: what page pruning leaves when it rules out nothing.
+                    2 => plan.scan_selection(
+                        rg,
+                        RowSelection::from(vec![RowSelector::select(rows_per_group)]),
+                    ),
+                    _ => {}
+                }
+            }
+            plan
+        });
+        ScanShape {
+            name: "random",
+            projection,
+            filter,
+            row_filter,
+            plan,
+            partitions: rng.random_range(1..=3),
+            cached_row_groups: (0..fixture::GROUPS)
+                .filter(|_| rng.random_bool(RANDOM_CACHED_ODDS))
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_meter_hands_read_ahead_the_predicate_its_scan_runs_with() {
+        // DataFusion's filter pushdown puts the filter on the scan after the
+        // provider built it, so read-ahead gets it from the meter when the
+        // scan runs. This test pins that handover.
+        let schema = fixture::schema();
+        let read_ahead = Arc::new(ScanReadAhead::new(
+            Arc::new(SuperfileObjectStore::new()),
+            ConnectionMemoryBudget::measured(),
+            Arc::clone(&schema),
+        ));
+        let df_schema = DFSchema::try_from(Arc::clone(&schema)).expect("schema");
+        let predicate =
+            create_physical_expr(&col("a").lt(lit(5i64)), &df_schema, &ExecutionProps::new())
+                .expect("predicate");
+        let source = ParquetSource::new(Arc::clone(&schema)).with_predicate(Arc::clone(&predicate));
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let config = FileScanConfigBuilder::new(url.clone(), Arc::new(source))
+            .with_file_group(FileGroup::new(Vec::new()))
+            .build();
+        let meter = MeteredExec::new(DataSourceExec::from_data_source(config), None)
+            .with_read_ahead(Arc::clone(&read_ahead));
+        assert!(
+            read_ahead.predicate().is_none(),
+            "nothing before the scan runs"
+        );
+        let ctx = SessionContext::new();
+        ctx.runtime_env()
+            .register_object_store(url.as_ref(), Arc::new(SuperfileObjectStore::new()));
+        meter.execute(0, ctx.task_ctx()).expect("execute");
+        assert_eq!(
+            read_ahead.predicate().map(|p| p.to_string()),
+            Some(predicate.to_string())
+        );
+    }
+
     #[test]
-    fn cached_metadata_reader_factory_debug_reports_superfile_count() {
-        let store: Arc<dyn OsObjectStore> = Arc::new(InMemory::new());
-        let factory = CachedMetadataReaderFactory {
-            store,
-            metas: Arc::new(DashMap::new()),
+    fn a_file_without_a_cached_footer_gets_a_plain_reader() {
+        // A file whose footer wasn't parsed at open gets a reader that reads
+        // the footer itself, instead of failing the scan.
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::new(ScanReadAhead::new(
+                Arc::new(SuperfileObjectStore::new()),
+                ConnectionMemoryBudget::measured(),
+                Arc::new(Schema::empty()),
+            )),
+            footers: Arc::new(DashMap::new()),
+        };
+        let file = PartitionedFile::new("t/missing.parquet", FOOTERLESS_FILE_BYTES);
+        assert!(
+            factory
+                .create_reader(0, file, None, &ExecutionPlanMetricsSet::new())
+                .is_ok()
+        );
+    }
+
+    /// `ScanReaderFactory`'s `Debug` reports the superfile
+    /// (cached-meta) count and is otherwise unreachable from a normal
+    /// scan. Build one with an empty meta map and render it.
+    #[test]
+    fn scan_reader_factory_debug_reports_superfile_count() {
+        let factory = ScanReaderFactory {
+            read_ahead: Arc::new(ScanReadAhead::new(
+                Arc::new(SuperfileObjectStore::new()),
+                ConnectionMemoryBudget::measured(),
+                Arc::new(Schema::empty()),
+            )),
+            footers: Arc::new(DashMap::new()),
         };
         let dbg = format!("{factory:?}");
         assert!(
-            dbg.contains("CachedMetadataReaderFactory") && dbg.contains("superfiles: 0"),
+            dbg.contains("ScanReaderFactory") && dbg.contains("superfiles: 0"),
             "Debug missing fields: {dbg}"
         );
     }

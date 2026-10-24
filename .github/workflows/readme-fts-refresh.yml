@@ -1,0 +1,62 @@
+name: Refresh README full-text comparison chart
+
+# Keeps the README's full-text comparison chart (compare-fts.svg) in step
+# with the published Search Benchmark, the Game results. The chart's rows
+# live in scripts/readme_charts/bench_data.py; this recomputes them from
+# the latest published run and redraws the SVG. If anything changed, it
+# opens a PR — a human merges the refresh, so a bad run never lands
+# unreviewed.
+
+on:
+  schedule:
+    - cron: "0 8 * * 1" # weekly, after the nightly runs have settled
+  workflow_dispatch:
+    inputs:
+      results_url:
+        description: "Benchmark results.json URL to fetch"
+        default: "https://infino-ai.github.io/search-benchmark-game/results.json"
+
+# The push and PR use RELEASE_PAT (same fine-grained token release-prep
+# uses): a PR created with the default GITHUB_TOKEN triggers no workflows,
+# so CI would never run on the refresh.
+permissions:
+  contents: read
+
+concurrency:
+  group: readme-fts-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # Only on the canonical repo — forks have no reason to refresh.
+    if: github.repository == 'infino-ai/infino'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Recompute the chart rows and redraw the SVG
+        run: |
+          URL="${{ github.event.inputs.results_url || 'https://infino-ai.github.io/search-benchmark-game/results.json' }}"
+          python3 scripts/readme_charts/refresh_fts.py "$URL"
+          python3 scripts/readme_charts/generate.py
+
+      - name: Open a refresh PR if the chart changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.RELEASE_PAT }}
+          add-paths: |
+            scripts/readme_charts/bench_data.py
+            docs/assets/readme/compare-fts.svg
+          branch: bot/readme-fts-refresh
+          commit-message: "docs: refresh the full-text comparison chart from the latest run"
+          title: "Refresh the README full-text comparison chart"
+          body: |
+            Automated refresh of the README's full-text comparison chart from
+            the latest published [Search Benchmark, the Game](https://infino-ai.github.io/search-benchmark-game/)
+            run: `scripts/readme_charts/refresh_fts.py` recomputed the rows in
+            `bench_data.py` and `generate.py` redrew `compare-fts.svg`.
+
+            Review the new ratios against the dashboard before merging. No-op
+            if the published numbers are unchanged.

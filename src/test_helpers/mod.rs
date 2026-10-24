@@ -88,21 +88,34 @@ pub mod served_shortlist_probe {
     }
 }
 
-use std::{collections::HashSet, path::Path, sync::Arc};
+use std::{
+    collections::HashSet,
+    fs::{copy as copy_file, create_dir_all, read_dir},
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+#[cfg(test)]
+use std::{io, sync::Mutex};
 
 use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
+#[cfg(test)]
+use tracing::{Level, subscriber::with_default};
+#[cfg(test)]
+use tracing_subscriber::fmt;
 
 use crate::{
-    storage::StorageProvider,
+    config::CrcVerification,
+    storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
         fts::tokenize::{StandardTokenizer, Tokenizer},
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
-        SupertableOptions,
+        Supertable, SupertableOptions,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
     },
 };
@@ -132,11 +145,36 @@ pub fn default_disk_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     DiskCacheStore::new(storage, cfg, pinned).expect("test disk cache")
+}
+
+/// [`lazy_foreground_disk_cache`] whose background fill never promotes a
+/// superfile while its reader is held, so a test's reads all take the cold,
+/// lazy path: a test that pins what a cold read fetches uses it, where the
+/// default fill could swap in resident bytes between two of its reads.
+pub fn lazy_disk_cache_without_promotion(
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &Path,
+) -> Arc<DiskCacheStore> {
+    let cfg = DiskCacheConfig {
+        cache_root: cache_root.to_path_buf(),
+        disk_budget_bytes: TEST_DISK_CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+        cold_fetch_streams: TEST_COLD_FETCH_STREAMS,
+        cold_fetch_chunk_bytes: TEST_COLD_FETCH_CHUNK_BYTES,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        promotion_defer_timeout: Duration::MAX,
+        eviction: Box::new(LruPolicy::new()),
+        crc_verification: CrcVerification::Always,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    DiskCacheStore::new(storage, cfg, pinned).expect("test lazy disk cache without promotion")
 }
 
 /// A `DiskCacheStore` in `LazyForegroundWithBackgroundFill`: the foreground
@@ -159,7 +197,7 @@ pub fn lazy_foreground_disk_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
@@ -191,9 +229,7 @@ pub fn decimal128_id_field(name: &str) -> Field {
 }
 
 /// The engine's default tokenizer, for tests + benches:
-/// `StandardTokenizer` wrapped in `Arc<dyn Tokenizer>`. A fixture that
-/// exercises ASCII-only tokenization names `AsciiLowerTokenizer`
-/// itself rather than relying on this.
+/// `StandardTokenizer` wrapped in `Arc<dyn Tokenizer>`.
 ///
 /// Callers passing this into `BuilderOptions::new` wrap in
 /// `Some(...)` at the call site:
@@ -287,6 +323,49 @@ pub fn distinct_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
 /// / `.with_*(...)` for whatever the specific test needs.
 /// Returning the un-storage-d shape lets each test decide
 /// explicitly whether to attach storage.
+/// Copy a directory tree, so a test can work on a writable copy of a
+/// committed fixture rather than the checkout.
+pub fn copy_dir_recursive(from: &Path, to: &Path) {
+    create_dir_all(to).expect("create fixture copy dir");
+    for entry in read_dir(from).expect("read fixture dir") {
+        let entry = entry.expect("fixture dir entry");
+        let dest = to.join(entry.file_name());
+        match entry.file_type().expect("fixture entry type").is_dir() {
+            true => copy_dir_recursive(&entry.path(), &dest),
+            false => {
+                copy_file(entry.path(), dest).expect("copy fixture file");
+            }
+        }
+    }
+}
+
+/// The committed three-superfile FTS table, written by `infino/0.8.6` —
+/// an engine that recorded no analysis revision. See the fixture's
+/// `README.md`.
+pub fn old_format_fts_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/old_format_fts_table")
+}
+
+/// Open a copy of [`old_format_fts_fixture`] sitting at `dir`, with its
+/// options adjusted by `customize`.
+///
+/// The fixture's shape is one `LargeUtf8` FTS column named `title`, no
+/// positions. Copying is the caller's ([`copy_dir_recursive`]) so one
+/// copy can be opened more than once — which is how a test reaches the
+/// lazy manifest path on a table another handle just wrote.
+pub fn open_old_format_fts_fixture(
+    dir: &Path,
+    customize: impl FnOnce(SupertableOptions) -> SupertableOptions,
+) -> (Arc<dyn StorageProvider>, Supertable) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir).expect("local fs over the fixture copy"));
+    let options = customize(default_supertable_options().with_storage(Arc::clone(&storage)));
+    (
+        storage,
+        Supertable::open(options).expect("open fixture table"),
+    )
+}
+
 pub fn default_supertable_options() -> SupertableOptions {
     let pool = Arc::new(
         ThreadPoolBuilder::new()
@@ -297,4 +376,51 @@ pub fn default_supertable_options() -> SupertableOptions {
     SupertableOptions::new(schema_id_title(), vec![FtsConfig::new("title")], vec![])
         .expect("SupertableOptions::new with default test fixture args")
         .with_writer_pool(pool)
+}
+
+/// A stable field id for a test column name. Real tables mint ids by
+/// position; tests that build manifest entries by hand only need a key that
+/// is the same wherever the same name is used, which a hash of the name
+/// gives without a schema. Never the reserved ids (`0`, `u32::MAX`).
+pub fn fid(name: &str) -> crate::supertable::schema::FieldId {
+    let mut h: u32 = 2_166_136_261;
+    for b in name.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(16_777_619);
+    }
+    let h = h % (u32::MAX - 2) + 1;
+    crate::supertable::schema::FieldId(h)
+}
+
+/// Every line a test's subscriber formats, so an assertion can read what was logged.
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("log buffer").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Runs `f` and returns its result with every line it logged at `level` and above.
+/// The subscriber is this thread's only, so `f` must log from this thread.
+#[cfg(test)]
+pub(crate) fn capture_logs<R>(level: Level, f: impl FnOnce() -> R) -> (R, String) {
+    let logs = CapturedLogs::default();
+    let writer = logs.clone();
+    let subscriber = fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(level)
+        .finish();
+    let out = with_default(subscriber, f);
+    let text = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
+    (out, text)
 }

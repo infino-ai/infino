@@ -54,14 +54,14 @@ use infino::{
     CompactionSettings, OptimizeOptions,
     supertable::{
         Supertable,
-        manifest::{ClusterCentroids, SuperfileEntry},
+        manifest::{ClusterCentroids, ManifestSnapshot, SuperfileEntry},
         writer::maintenance_pool_width,
     },
 };
 
 use crate::{
     cold_store::{self, ColdStoreMeasurement, STEADY_COLD_SAMPLES},
-    corpus::dim,
+    corpus::{self, dim},
     cost, cpu,
     executors::p50,
     ingest::supertable::{self, Modality, modality_label},
@@ -214,6 +214,16 @@ fn run_child_shape(key: &str) {
             std::process::exit(2);
         }
     };
+    // The child is re-executed with its parent's `corpus=` tokens (see
+    // `build_shape_isolated`) and resolves the corpus the same way; the
+    // FTS shape takes the FTS cells' realistic default.
+    if let Err(err) = corpus::install_source_from_args(std::env::args().skip(1)) {
+        eprintln!("[supertable] child process: {err}");
+        std::process::exit(2);
+    }
+    if modality == Modality::Fts {
+        corpus::default_text_flavor_for_fts();
+    }
 
     eprintln!(
         "[supertable] child process: ingesting {} shape ({} docs)...",
@@ -262,6 +272,14 @@ fn build_shape_isolated(key: &str) -> Option<ShapeMetrics> {
     // Forward a CLI-set dataset prefix; the child only inherits the env.
     if let Some(prefix) = crate::dataset::dataset_prefix() {
         cmd.env(crate::dataset::PREFIX_ENV, prefix);
+    }
+    // The corpus selector is process-wide state installed from the
+    // arguments; a child that did not receive it would silently ingest
+    // the default corpus under the parent's label.
+    for arg in std::env::args().skip(1) {
+        if arg.starts_with("corpus=") || arg.starts_with("corpus-dir=") {
+            cmd.arg(arg);
+        }
     }
     let output = cmd
         .stdout(Stdio::piped())
@@ -391,24 +409,28 @@ pub fn ingest_row(n_docs: usize, label: &str, m: &ShapeMetrics) -> Vec<Cell> {
     ]
 }
 
-/// Visit committed superfiles through the flat eager view, or through manifest
-/// parts when the manifest is lazy and the flat view is empty.
-fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
-    let reader = table.reader().expect("reader");
-    let manifest = reader.manifest();
+/// Every committed superfile of `manifest`, from the flat eager view or,
+/// when the manifest is lazy and that view is empty, by loading its parts.
+/// The one place that knows the manifest exposes its entries two ways.
+pub(crate) fn collect_manifest_superfiles(manifest: &ManifestSnapshot) -> Vec<Arc<SuperfileEntry>> {
     let flat_superfiles = manifest.get_all_superfiles();
     if !flat_superfiles.is_empty() {
-        for entry in flat_superfiles {
-            visit(entry);
-        }
-        return;
+        return flat_superfiles.to_vec();
     }
+    let mut entries = Vec::new();
     for part_entry in manifest.get_all_list_entries() {
         let part = tiers::block_on(manifest.get_part_by_id(part_entry.part_id))
             .expect("load manifest part for bench metadata");
-        for entry in part.superfiles.iter() {
-            visit(entry);
-        }
+        entries.extend(part.superfiles.iter().cloned());
+    }
+    entries
+}
+
+/// Visit committed superfiles; see [`collect_manifest_superfiles`].
+fn visit_manifest_superfiles(table: &Supertable, mut visit: impl FnMut(&SuperfileEntry)) {
+    let reader = table.reader().expect("reader");
+    for entry in collect_manifest_superfiles(reader.manifest()) {
+        visit(&entry);
     }
 }
 
@@ -625,6 +647,51 @@ fn store_phases_from_measurement(measured: Option<ColdStoreMeasurement>) -> cost
 /// `(wall_s, io, peak_rss_bytes, cpu_s)` for one metered `optimize()` pass.
 type CompactionStats = (f64, storage_meter::ObjectStoreMeter, u64, Option<f64>);
 
+/// Docs a compacted superfile holds under the lifecycle's compaction target.
+///
+/// Compaction packs inputs by bytes, but a query runs one thread per
+/// superfile, so post-compaction latency is bound by the doc count of the
+/// largest superfile, not its size. Sizing the target from the table's own
+/// bytes per doc pins that count: two builds of the same corpus compact to
+/// the same shape even when one stores its index far denser, and the warm
+/// rows then compare readers rather than how many docs a 1 GiB output
+/// happened to absorb. Chosen to match what the default 1 GiB target yields
+/// on the realistic FTS corpus, so the shape the gates have always measured
+/// is preserved.
+const COMPACTION_DOCS_PER_SUPERFILE: u64 = 200_000;
+
+/// Headroom on the derived target so per-superfile size variance around the
+/// mean cannot drop the last input of a job and shift the whole shape.
+const COMPACTION_TARGET_HEADROOM_PERCENT: u64 = 5;
+
+/// Compaction settings whose byte target holds
+/// [`COMPACTION_DOCS_PER_SUPERFILE`] docs of this table.
+fn shape_pinned_compaction(table: &Supertable) -> CompactionSettings {
+    let (mut docs, mut bytes) = (0u64, 0u64);
+    visit_manifest_superfiles(table, |entry| {
+        docs = docs.saturating_add(entry.n_docs);
+        if let Some(offsets) = entry.subsection_offsets.as_ref() {
+            bytes = bytes.saturating_add(offsets.total_size);
+        }
+    });
+    let bytes_per_superfile =
+        (bytes as u128 * COMPACTION_DOCS_PER_SUPERFILE as u128 / docs.max(1) as u128) as u64;
+    let with_headroom =
+        bytes_per_superfile.saturating_mul(100 + COMPACTION_TARGET_HEADROOM_PERCENT) / 100;
+    let target_superfile_size_mb = with_headroom.div_ceil(1 << 20).max(1);
+    let defaults = CompactionSettings::default();
+    CompactionSettings {
+        target_superfile_size_mb,
+        // Keep the merge's memory ceiling the same distance above the target
+        // as the defaults keep it, so a denser table's smaller target never
+        // tightens it and a larger one is never capped below a full output.
+        max_memory_mb: defaults.max_memory_mb.max(
+            target_superfile_size_mb + (defaults.max_memory_mb - defaults.target_superfile_size_mb),
+        ),
+        ..defaults
+    }
+}
+
 /// Metered [`Supertable::optimize`] — same shape as the vector compaction
 /// window (wall / CPU / RSS / UsageMeter delta), without drain/delta.
 fn run_metered_optimize(
@@ -636,10 +703,15 @@ fn run_metered_optimize(
         "[{label}] before optimize: {} superfiles",
         consumer.reader().expect("reader").n_superfiles()
     );
-    eprintln!("[{label}] compacting (optimize)...");
+    let compaction = shape_pinned_compaction(consumer);
+    eprintln!(
+        "[{label}] compacting (optimize; target {} MiB ≈ {} docs per superfile)...",
+        compaction.target_superfile_size_mb, COMPACTION_DOCS_PER_SUPERFILE
+    );
     let before = meter.snapshot();
     let sampler = PeakSampler::start_default();
-    let (result, wall, cpu_s) = cpu::timed(|| consumer.optimize(&OptimizeOptions::default()));
+    let (result, wall, cpu_s) =
+        cpu::timed(|| consumer.optimize(&OptimizeOptions::compact(compaction)));
     result.expect("optimize (compaction)");
     let wall_s = wall.as_secs_f64();
     let rss_stats = sampler.stop_stats();
@@ -1703,6 +1775,9 @@ pub mod fts {
             eprintln!("[supertable_fts] skipped: {reason}");
             return;
         }
+        // Before any corpus is generated: BM25 is measured on text-shaped
+        // distributions unless the command line says `corpus=synthetic`.
+        corpus::default_text_flavor_for_fts();
 
         let n_docs = supertable::n_docs();
         let mut report = Report::load("supertable_fts");
@@ -1734,23 +1809,21 @@ pub mod fts {
             emit_ingest(&mut report, n_docs, metrics);
         }
 
-        // Maintenance parity for the global-stats default: publish the
-        // term-stats sidecar over the fresh fragmented layout via a
-        // stats-only optimize (both merge triggers disabled, so the
-        // superfile layout is untouched). The read phases then measure
-        // the maintained shape a production table sits in. On an engine
-        // without the sidecar this is a no-op maintenance pass.
+        // Fold the term index over the fresh fragmented layout with a
+        // maintenance-only optimize (both merge triggers disabled, so the
+        // superfile layout is untouched). The read phases then measure the
+        // maintained shape a production table sits in.
         if corpus.is_some() && phases.reads() {
             let (cache_dir, admin) = open_consumer(Modality::Fts, &built);
-            let stats_only = OptimizeOptions::compact(CompactionSettings {
+            let maintenance_only = OptimizeOptions::compact(CompactionSettings {
                 min_fill_percent: 100,
                 min_superfiles_for_merge: u64::MAX,
                 ..CompactionSettings::default()
             });
-            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&stats_only));
-            result.expect("stats-only optimize");
+            let (result, wall, _cpu) = cpu::timed(|| admin.optimize(&maintenance_only));
+            result.expect("maintenance-only optimize");
             eprintln!(
-                "[supertable_fts] term-stats maintenance (stats-only optimize): {:.1}s, {} superfiles",
+                "[supertable_fts] term-index maintenance: {:.1}s, {} superfiles",
                 wall.as_secs_f64(),
                 admin.reader().expect("reader").n_superfiles()
             );
@@ -3704,8 +3777,8 @@ pub mod vector {
                         .expect("routing-state warm vector search"),
                 );
             },
-            // Vector consumers open with allow_background_fill =
-            // false (block cache only) — no fills to settle.
+            // Vector consumers open with ReadIntent::Stream
+            // (block cache only), so there are no fills to settle.
             &|| {},
             &|| {
                 measure_cold_store(

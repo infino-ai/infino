@@ -34,7 +34,9 @@ SQL across them. The handle's public operations are **synchronous
 methods on the supertable itself**: `append`, `update`, `delete`, the
 search methods (`bm25_search` / `vector_search` / `hybrid_search`,
 returning Arrow rows; the unranked `token_match` / `exact_match`), and
-`schema`.
+`schema`. Alongside them sit the maintenance operations, which an
+operator drives rather than an application: `optimize`, `gc`, and the
+index repair described below.
 
 Internally those methods drive a **reader** (a pinned, consistent
 snapshot) for queries and a single **writer** (staged changes published
@@ -101,10 +103,9 @@ the term dictionary (each literal fragment of the pattern is tokenized;
 a token the fragment closes on both sides is required as itself, and a
 token bordering a wildcard is widened to the indexed terms it heads,
 tails, or sits inside) — with the exact predicate re-checked over the
-candidate rows. The `ascii_lower` analyzer drops any token holding a
-non-ASCII byte, so under it only tokens the pattern closes on both
-sides can be required; the default `standard` analyzer supports prefix,
-suffix, and substring patterns. A suffix or substring token needs a walk
+candidate rows. A plain `standard` column supports prefix, suffix, and
+substring patterns; a column with a stopword set or stemmer leaves
+`LIKE` to the scan, since its terms are not substrings of the text. A suffix or substring token needs a walk
 of the column's whole dictionary, taken only where the superfile's
 stored text is large against its vocabulary; otherwise that token is
 left to the scan. `ILIKE` is bounded the same way for ASCII tokens,
@@ -199,11 +200,43 @@ reading the superfile bytes:
 - **Location.** A storage-backend identifier for the superfile's bytes.
 - **Row range.** The superfile's document count and the range of primary
 identifiers it covers.
-- **Scalar statistics.** Per-column minimum and maximum values for the
-scalar columns, used to skip superfiles for predicate queries.
-- **Full-text summary.** Per text column, a term presence filter (a
-bloom filter over the superfile's terms) and the lexicographic range of
-its terms, used to skip superfiles for term and prefix queries.
+- **Scalar statistics.** Per-column minimum and maximum values, null
+count, exact sum, and either an exact table of the column's values (at
+most a few hundred distinct) or a distinct-count sketch, used to skip
+superfiles for predicate queries and to feed the SQL planner. On a
+persisted table these do not sit in the entry: each manifest part has a
+summaries section beside it (one content-addressed object holding every
+superfile's statistics, one Arrow batch per column type, with a
+directory from column to its rows), and an entry holds its row of that
+section. A query decodes the columns it asks about: reading one column
+decodes the type group it sits in, every same-typed column's rows with
+it, once per handle for as long as the part is cached, so a handle's
+statistics cost grows with the column types its queries touch and stops
+at twice the section's bytes. A table of thousands of columns costs a
+handle no more per superfile than a table of ten. A
+section that cannot be read, or that is not its part's, leaves the
+part's superfiles without statistics for that handle: every prune keeps
+them, which is correct, and the load goes on. Such a handle never
+writes those statistics anew from the nothing it sees: an append goes
+to a part of its own, and a commit that would rewrite the part is
+refused, so the statistics wait in the section for a handle that reads
+it. The section's size counts with the part's toward the split cap,
+since a commit to the part rewrites both; the rewrite carries the old
+section's rows over as they are.
+
+The list's major version moved with the section. The first commit by
+this engine on any table, including a maintenance publish that adds no
+data and the hidden vector index's sibling, writes the list at the new
+major, and an engine from before the section refuses it rather than
+fold a part's rollups from its own appends alone. So a deployment that
+has committed cannot be rolled back to an engine from before the
+section; it reads nothing of that table.
+- **Full-text summary.** Per text column, the lexicographic range of
+its terms and the length statistics BM25 scores with. Which superfiles
+hold a given term is not recorded here: that is the table-level term
+index's job (below). A table with no storage attached has no term
+index and records a term presence filter (a bloom filter over the
+superfile's terms) in its place.
 - **Vector summary.** Per vector column, a representative centroid and
 radius, used to order and route vector queries.
 
@@ -234,6 +267,76 @@ on first access, so opening a large table does not pull every part
 into memory. Coalesced loading ensures concurrent readers of a cold
 part share a single fetch.
 
+### The term index
+
+Which superfiles contain a term is answered by one table-level
+structure rather than by anything carried per superfile. For every
+`(column, term)` the term index records the superfiles that hold it and,
+for each, the term's document frequency there, an upper bound on the
+BM25 score the term can reach there, and where the term's postings sit
+in that superfile's bytes. One artifact therefore answers three
+questions: where a term lives, how often it occurs table-wide, and where
+its postings are. Per-superfile bloom filters would saturate on a large
+table and then prune nothing, and inlining every superfile's term
+dictionary into its manifest entry would make it most of a decoded
+manifest's bytes; the term index keeps both out of the manifest.
+
+The index is looked into, not loaded. A small *root* stays resident: the
+superfiles it covers, each with its smallest document id, and per
+*segment* the key range and content hash of every *slice*. A slice is a
+few megabytes covering one contiguous range of `column`-and-term keys —
+a front-coded block dictionary over a postings region — so a lookup
+binary-searches the root for the one slice that can hold the key,
+fetches it, and reads one block; a prefix scan touches one slice or a
+few adjacent ones. Root and slices are content-addressed and immutable,
+cached on local disk like manifest parts, and kept live by garbage
+collection for as long as a manifest names them.
+
+Every commit publishes its superfiles' postings in the same atomic
+step as their entries: the writer already holds each new superfile's
+terms in memory when it finishes building it, spills them, merges the
+batch into a *delta* segment, writes the slices and a new root, and
+stamps the root's reference on the manifest before the pointer swap.
+So a visible superfile always has postings, a crash between the writes
+and the swap leaves only orphans for garbage collection, and a lost
+race is retried against the winner with re-puts of already-written
+slices as no-ops. A maintenance pass folds every delta into one base
+segment. Deltas committed while it runs stay after that base, padded so
+their ordinals hold; when they cannot (an incomplete or replaced prior
+index, or one that cannot be read), their superfiles are re-indexed on
+top of the base instead. The next pass folds either. A posting is
+followed only if its superfile is still live in the reader's manifest,
+so a removal never invalidates the index.
+
+Queries use it at every tier. Superfile selection for a term or prefix
+is exact for every superfile the index lists. The choice of which
+manifest parts to load goes through it too: routed superfiles' smallest
+ids are matched against each part's recorded id range, so a term in one
+part loads one part and a term in no part loads none. A ranked query
+takes each candidate superfile's score ceiling from the index, opens
+superfiles in descending ceiling order through a window the width of the
+reader pool, and never opens one whose ceiling is below the running
+k-th score — the in-superfile block-max reasoning lifted one level. And
+its cursors are built from the index's recorded postings locations, so
+the superfile's own dictionary is not read on that path.
+
+A table whose term index is absent or incomplete routes by its entries'
+blooms, and its next commit publishes an index that covers only the new
+superfiles — the manifest marks it incomplete, and part loading keeps
+the summary-based choice until a maintenance pass rebuilds the index
+over every superfile. Nothing requires old code to read a new manifest.
+
+A query that needs a term index the manifest names, and cannot use it,
+fails: with `Unsupported` when the root or a slice is in a layout this
+engine no longer reads (the message says to run `optimize()` or
+`reindex()`, which rebuild it), `Io` when the read failed and may
+succeed next time, and `Backend` when the object is gone or corrupt.
+Maintenance repairs the first and last kinds by rebuilding from the
+superfiles, and a commit on top of them restarts the index from its own
+superfiles, marked incomplete. A read that failed for now fails the
+optimize too. A failure that every retry would repeat is remembered per
+root, so a broken root is fetched once.
+
 ## Commit pipeline
 
 A commit turns staged record batches into new superfiles and a new
@@ -252,6 +355,49 @@ range, scalar statistics, and the full-text and vector summaries.
 - **Publish.** The superfile bytes are written to the storage backend and
 a successor manifest containing the existing and new entries is
 published atomically.
+
+## Index repair
+
+A superfile's indexes can fall behind what the engine writes today on two
+independent axes, and they need different repairs:
+
+- **The layout** — the index blob's version, or a footer that stores a
+region key more than once. A blob below the current version, or with a
+duplicated key, is rewritten by copying its postings into a current blob;
+the terms themselves are fine. Every blob version the engine reads is
+current, so a stale version arises only once the current version moves
+past one the engine still reads. A blob older than the oldest version the
+engine reads is not repaired: it fails to open, with an error that names
+the release to reindex it with.
+- **The analysis** — which revision of a named analysis chain produced the
+terms. Copying postings cannot fix this, so only re-analyzing the stored
+text does, and a column whose text was never stored cannot be repaired at
+all.
+
+A repair is planned from the files rather than from a journal, so an
+interrupted run resumes by re-planning: the superfiles already repaired
+are no longer behind and drop out. Each superfile is repaired on its own
+and published on its own, so a reader sees either the old file or its
+replacement, never a half-repaired table.
+
+The invariants a repair holds to:
+
+- **One in, one out.** A repair never merges or splits, so it leaves the
+table's layout exactly as it found it. Reshaping is compaction's job.
+- **Rows and ids are unchanged**, tombstoned rows included. Dropping dead
+rows would renumber the survivors, so every doc id in the vector blob and
+the id sidecar would have to be rewritten.
+- **Only the index is rebuilt.** The Parquet body and the vector blob are
+copied as raw byte ranges, so a repair never re-encodes a row or decodes
+a vector.
+- **Deletions survive.** The input's tombstones are carried onto the
+output and registered in the same manifest that publishes it — either
+step later would leave the file live with its deletions invisible.
+
+Because a repair is planned off one manifest snapshot, a concurrent
+compaction can merge a superfile the plan named; that job then finds its
+input gone and does nothing, and the merged output is picked up by the
+next run rather than this one.
 
 ## Storage
 
@@ -298,6 +444,8 @@ resident it is served from a local memory-mapped file. The cache tracks
 residency per superfile and is bounded by a configurable budget, evicting
 cold superfiles when the budget is reached.
 
+Between those two states, the ranges a cold query reads are kept in a sparse local block file, in 512 KiB blocks, so reading them again is local. The query gets its bytes as soon as they are fetched; writing them to the block file happens afterwards, off the query's thread, so a query doesn't wait on a disk busy with background downloads. The block file's index lists only blocks already safely on disk, so after a restart the cache reuses them and fetches only what was not written yet.
+
 The cache distinguishes on-disk residency from memory residency. An
 optional memory budget bounds the mapped working set rather than the
 on-disk set: when the resident pages exceed the budget, the oldest
@@ -323,8 +471,13 @@ Skip pruning reads only the manifest summaries, never the superfile
 bytes, and is always conservative: when the manifest cannot prove a
 superfile is irrelevant, the superfile is kept. The pruning inputs are:
 
-- **Term queries** use each superfile's term presence filter.
-- **Prefix queries** use each superfile's lexicographic term range.
+- **Term queries** use the table-level term index, which names the
+  superfiles holding each term exactly (a superfile the index does not
+  list — on an incomplete index, or on a table with no storage —
+  is tested against its own term presence filter instead).
+- **Prefix queries** scan the term index's slices for the prefix; a
+  superfile the index does not list is tested against its lexicographic
+  term range.
 - **Predicate (SQL) queries** use the per-column scalar statistics
   (min/max and null count). `=` / `IN` / same-column `OR` prune on
   min/max; `IS NULL` / `IS NOT NULL` prune on the null count — an
@@ -363,6 +516,29 @@ the two rankings with reciprocal-rank fusion, so a row surfaced by both
 retrievers ranks above one surfaced by a single retriever. It is a
 SQL-level fusion, not a separate engine kernel.
 
+A `WHERE` over a search table function means *the top k among rows
+satisfying the predicate* — never the predicate applied to a global
+top-k, which for a selective predicate returns a fraction of k or
+nothing. The functions report their filters as inexact, so the
+planner both hands them the predicate and re-checks it above them,
+and each function narrows its search in three tiers. The manifest
+statistics prune superfiles first, with the same leaves a plain scan
+uses (scalar min/max, value sets, term-index routing, null counts), so
+`WHERE path = 'x'` on a column with no full-text index still opens
+only the superfiles whose `path` range can hold `x`. Where the
+predicate is on an FTS-indexed column, the candidate plan resolves it
+per superfile to the rows that can match, and the kernel admits only
+those rows into its top-k heap — `hybrid_search` hands one such scope
+to both of its retrievers, so they rank within the same rows before
+fusion. Whatever the index could not bound (a scalar column, a
+negation, a token superset that the exact predicate trims), the
+function makes up by applying the exact predicate to its own resolved
+rows and widening the search — doubling k each round — until k rows
+survive or the table is exhausted; the cost is proportional to the
+predicate's selectivity, never to a fixed over-fetch. Prefix search
+takes only that last tier: its term set is known per superfile, not
+per query.
+
 ## Concurrency
 
 - **Reader/writer isolation.** Reads and writes do not block each
@@ -370,7 +546,9 @@ other. A reader holds an immutable manifest snapshot; a writer builds
 new superfiles and a new manifest independently.
 - **Atomic publication.** A reader sees either the manifest before a
 commit or the manifest after it, never an intermediate state.
-- **Single writer.** One writer is active per table at a time.
+- **Writers.** Appends that keep the table's schema build in parallel and
+publish one at a time; updates, deletes and schema changes take the table's
+writer exclusively, waiting for appends in flight to finish.
 - **Separate pools.** Query fan-out and superfile builds use separate
 worker pools, so background writes do not starve foreground reads.
 
@@ -378,6 +556,7 @@ worker pools, so background writes do not starve foreground reads.
 
 - Superfiles are immutable; updates are expressed by publishing a new
 manifest over different superfiles.
-- One writer is active per table at a time.
+- Within one process, commits to a table publish one at a time;
+appends that keep the schema build in parallel before publishing.
 - Full-text and vector search are distinct query paths; combined
 relevance scoring is left to the caller.

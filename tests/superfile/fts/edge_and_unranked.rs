@@ -22,18 +22,11 @@ use infino::{
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
+use super::corpus_truth::docs_with;
 use crate::fts::brute_force_oracle::{build_infino_superfile, corpus};
 
 const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 const K_ALL: usize = 64;
-
-/// Doc-ids whose text contains `term` as a whitespace token.
-fn docs_with(corp: &[(u64, &str)], term: &str) -> HashSet<u64> {
-    corp.iter()
-        .filter(|(_, t)| t.split_whitespace().any(|w| w == term))
-        .map(|(i, _)| *i)
-        .collect()
-}
 
 async fn ranked_ids(reader: &SuperfileReader, query: &str, k: usize, mode: BoolMode) -> Vec<u64> {
     reader
@@ -41,7 +34,7 @@ async fn ranked_ids(reader: &SuperfileReader, query: &str, k: usize, mode: BoolM
         .await
         .expect("bm25 search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect()
 }
 
@@ -93,7 +86,7 @@ async fn reader_score(reader: &SuperfileReader, query: &str, doc: u64) -> f32 {
         .await
         .expect("search")
         .into_iter()
-        .find(|(d, _)| *d as u64 == doc)
+        .find(|(d, _)| u64::from(d.get()) == doc)
         .map(|(_, s)| s)
         .expect("doc present")
 }
@@ -206,7 +199,7 @@ async fn ranked_hits(reader: &SuperfileReader, query: &str, k: usize) -> Vec<(u6
         .await
         .expect("search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect()
 }
 
@@ -228,7 +221,10 @@ async fn token_match_matches_corpus_truth() {
         .copied()
         .collect();
     assert_eq!(
-        or_ids.iter().map(|d| *d as u64).collect::<HashSet<_>>(),
+        or_ids
+            .iter()
+            .map(|d| u64::from(d.get()))
+            .collect::<HashSet<_>>(),
         or_want,
         "token_match OR"
     );
@@ -248,7 +244,10 @@ async fn token_match_matches_corpus_truth() {
         .copied()
         .collect();
     assert_eq!(
-        and_ids.iter().map(|d| *d as u64).collect::<HashSet<_>>(),
+        and_ids
+            .iter()
+            .map(|d| u64::from(d.get()))
+            .collect::<HashSet<_>>(),
         and_want,
         "token_match AND"
     );

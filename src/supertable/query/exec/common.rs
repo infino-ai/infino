@@ -15,16 +15,37 @@
 //!
 //! [`SuperfileReader::take_by_local_doc_ids`]: crate::superfile::SuperfileReader::take_by_local_doc_ids
 
-use std::{collections::HashSet, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt,
+    future::Future,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-use arrow::compute::{concat_batches, interleave_record_batch, take};
-use arrow_array::{ArrayRef, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions};
+use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
+use arrow_array::{
+    ArrayRef, BooleanArray, Decimal128Array, Float32Array, RecordBatch, RecordBatchOptions,
+};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
+    catalog::{Session, TableProvider},
+    common::{
+        Column, DFSchema, TableReference,
+        runtime::SpawnedTask,
+        tree_node::{Transformed, TreeNode},
+    },
+    datasource::provider_as_source,
     error::{DataFusionError, Result as DfResult},
-    execution::TaskContext,
-    logical_expr::Expr,
+    execution::{TaskContext, context::ExecutionProps},
+    logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableType},
+    physical_expr::{PhysicalExpr, create_physical_expr},
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
@@ -42,44 +63,185 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::ParquetMetaData,
 };
-use rayon::prelude::*;
+use rayon::{ThreadPool, prelude::*};
+use tracing::{Instrument, Span};
 
 use crate::{
+    memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats::{OpStatsCollector, timed_section},
     superfile::{
-        SuperfileReader,
+        ReadError, SuperfileReader,
         lazy_source::Source,
         reader::{rank_back_indices, row_selection_for_ids},
     },
     supertable::{
         error::QueryError,
-        handle::SupertableReader,
-        manifest::SuperfileUri,
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        handle::{SupertableReader, WeakReader},
+        manifest::{ManifestSnapshot, SuperfileUri},
         query::{
-            SuperfileHit, exec::metered_exec::MeteredExec, superfile_reader::superfile_reader,
-            vector::row_id_from_manifest_entry,
+            SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
+            superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
+        reader_cache::ReadIntent,
+        schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
     },
+    utils::trace::record,
 };
 
-/// Map a search TVF's `QueryError` into a DataFusion error at the
-/// execution-node boundary.
+/// A table function's search, run under `span` with the batch's row count
+/// recorded as its `rows_out`. `execute` makes the span under `sql.execute`,
+/// so the search kernel's phase spans nest beneath it.
+pub(crate) fn traced_tvf<F>(span: Span, search: F) -> impl Future<Output = F::Output>
+where
+    F: Future<Output = DfResult<RecordBatch>>,
+{
+    async move {
+        let out = search.await;
+        if let Ok(batch) = &out {
+            record("rows_out", batch.num_rows());
+        }
+        out
+    }
+    .instrument(span)
+}
+
+/// Catalog the per-call scans of [`scope_to_call`] are named under. No
+/// user table lives in it, so a call's scan can never share a name — and
+/// with it plan equality — with a scan of a real table.
+const CALL_SCOPE_CATALOG: &str = "__infino_internal";
+
+/// Schema, inside [`CALL_SCOPE_CATALOG`], of the per-call scans.
+const CALL_SCOPE_SCHEMA: &str = "search_tvf_call";
+
+/// Numbers the search table-function calls, so each call's scan gets a
+/// name no other call shares (see [`scope_to_call`]).
+static SEARCH_CALL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Multiply a search's `k` by this each time the exact predicate leaves
+/// fewer than `k` rows standing (see [`fill_top_k`]). Doubling bounds the
+/// total work at about twice the final round's, whatever the predicate's
+/// selectivity turns out to be.
+const OVER_FETCH_GROWTH: usize = 2;
+
+/// How many times `k` a fill may grow to before it gives up and returns
+/// what it has (see [`over_fetch_ceiling`]). Without a ceiling the growth
+/// runs to the table's row count, so a predicate the index cannot bound
+/// and that almost nothing satisfies ends by asking the kernel for a heap
+/// the size of the table and resolving every match into one batch — an
+/// out-of-memory risk on a query that is cheap to state.
+const OVER_FETCH_MAX_K_MULTIPLE: usize = 64;
+
+/// The smallest ceiling a fill will use, whatever `k` is. A multiple
+/// alone would give a small `k` a tiny budget — 64 hits at `k = 1` — and
+/// a selective predicate needs to look past that before concluding its
+/// rows are not there.
+const OVER_FETCH_MIN_CEILING: usize = 10_000;
+
+/// The absolute ceiling on one fill's hit count, bounding the rows any
+/// single round resolves into memory. A caller asking for more than this
+/// still gets its `k`: [`over_fetch_ceiling`] never returns less.
+const OVER_FETCH_MAX_HITS: usize = 100_000;
+
+/// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
+/// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
+/// [`OVER_FETCH_MAX_HITS`], never below the `k` actually asked for, and
+/// never above the table's row count.
+fn over_fetch_ceiling(k: usize, total: usize) -> usize {
+    k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
+        .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
+        .max(k)
+        .min(total)
+}
+
+/// The reader a search table function captured, still alive when the query
+/// runs. The function holds it weakly; finding it gone means the table handle
+/// was dropped under a running plan, which is ours, not the query's.
+pub(crate) fn live_reader(reader: &WeakReader, function: &str) -> DfResult<Arc<SupertableReader>> {
+    reader.upgrade().ok_or_else(|| {
+        QueryError::Internal(format!(
+            "{function}: supertable consumer dropped before execution"
+        ))
+        .into()
+    })
+}
+
+/// Give one search table-function call a scan name of its own, so
+/// DataFusion never merges two calls.
 ///
-/// The kNN runs off-SQL (in a custom `ExecutionPlan`), so its error must cross
-/// back into DataFusion to bubble up through `collect()`. A connection-memory
-/// budget refusal has to re-enter as `ResourcesExhausted`, the same channel
-/// DataFusion's own memory pool uses, so the SQL error classifier routes it to
-/// `InfinoError::OverBudget` rather than flattening it to a generic query
-/// error. Every other failure is a plain execution error.
-///
-/// Shared by the `vector_search` and `hybrid_search` nodes; without it a hybrid
-/// query would flatten the budget refusal that the plain vector query preserves.
-pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
-    match e.over_budget() {
-        Some(msg) => DataFusionError::ResourcesExhausted(msg.to_string()),
-        None => DataFusionError::Execution(e.to_string()),
+/// - DataFusion names every table-function scan after the function alone
+///   (`token_match()`) and compares scans without their arguments, so two
+///   calls with different arguments looked equal and both returned the
+///   first call's rows.
+/// - The returned provider swaps in a scan of `provider` named
+///   `__infino_internal.search_tvf_call.token_match#7`, unique per call,
+///   under the function's own alias, so column names don't change.
+/// - Identical calls are not merged either; they now run twice.
+pub(crate) fn scope_to_call(
+    function: &str,
+    provider: Arc<dyn TableProvider>,
+) -> DfResult<Arc<dyn TableProvider>> {
+    let seq = SEARCH_CALL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let plan = LogicalPlanBuilder::scan(
+        TableReference::full(
+            CALL_SCOPE_CATALOG,
+            CALL_SCOPE_SCHEMA,
+            format!("{function}#{seq}"),
+        ),
+        provider_as_source(Arc::clone(&provider)),
+        None,
+    )?
+    .build()?;
+    Ok(Arc::new(CallScopedTable {
+        inner: provider,
+        plan,
+    }))
+}
+
+/// One search table-function call with a scan of its own; built by
+/// [`scope_to_call`]. Everything but the logical plan is the wrapped
+/// call's, so a planner that scans this provider directly instead of
+/// inlining its plan still runs the same search.
+struct CallScopedTable {
+    inner: Arc<dyn TableProvider>,
+    plan: LogicalPlan,
+}
+
+impl fmt::Debug for CallScopedTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+#[async_trait]
+impl TableProvider for CallScopedTable {
+    fn schema(&self) -> SchemaRef {
+        self.inner.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
+    }
+
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
+        Some(Cow::Borrowed(&self.plan))
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        self.inner.scan(state, projection, filters, limit).await
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
     }
 }
 
@@ -92,6 +254,10 @@ pub(crate) fn search_query_df_error(e: QueryError) -> DataFusionError {
 /// SQL execution site (catalog, reader-level, predicate resolve) goes
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
+///
+/// When the process has a memory limit (see `memory::resident`), the collect
+/// races it, and a process past the limit ends the statement with a
+/// `ResourcesExhausted` refusal.
 pub(crate) async fn collect_plan_metered(
     plan: &Arc<dyn ExecutionPlan>,
     task_ctx: Arc<TaskContext>,
@@ -99,7 +265,37 @@ pub(crate) async fn collect_plan_metered(
 ) -> DfResult<Vec<RecordBatch>> {
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let batches = collect(metered, task_ctx).await?;
+    let collected = collect(metered, task_ctx);
+    let batches = match process_limit() {
+        None => collected.await?,
+        // With a process limit, run the collect as its own task and race it
+        // against the sampler. The streamed batches are never reserved, so
+        // this is the only bound on them.
+        //  - over the limit before we start: refuse without spawning anything.
+        //  - own task, because a plan over cached data can finish all its work
+        //    in one poll, so a check in the same task would only run once the
+        //    result is ready.
+        //  - limit wins: dropping the task stops DataFusion's partition tasks
+        //    and the search functions' fan-out. A batch already being
+        //    processed still finishes first.
+        //  - `biased` checks the limit first, so a reading over it wins even if
+        //    the result lands in the same wakeup.
+        Some(limit) => {
+            if let Some(anon) = process_over_limit(limit) {
+                return Err(over_process_limit(anon, limit));
+            }
+            let collecting = SpawnedTask::spawn(collected);
+            tokio::select! {
+                biased;
+                anon = process_limit_exceeded(limit) => {
+                    return Err(over_process_limit(anon, limit));
+                }
+                joined = collecting => {
+                    joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??
+                }
+            }
+        }
+    };
     // Harvesting the unwrapped plan and the wrapped one reach the same
     // leaves — the walk dedupes by node identity and sums childless nodes
     // only, and the meter delegates `execute` to this same tree.
@@ -164,7 +360,7 @@ pub(crate) async fn resolve_hits_named(
 ) -> Result<RecordBatch, QueryError> {
     // Stored shape: an index-only FTS column has no Parquet data to
     // project, so its name is rejected up front like any unknown column.
-    let scalar_schema = reader.options().stored_schema();
+    let scalar_schema = reader.manifest().stored_schema();
     let output_schema = output_schema_with_score(&scalar_schema);
     // `None` is the engine-native result: `_id` + `score` only.
     // `_id` decodes from its own dedicated id pages (cheap by
@@ -172,29 +368,53 @@ pub(crate) async fn resolve_hits_named(
     // bare call never touches user-column data pages — projecting
     // those is an explicit opt-in by name.
     let id_column = reader.options().id_column.clone();
-    let bare: [&str; 2] = [id_column.as_str(), SCORE_COLUMN];
-    let names: &[&str] = match projection {
-        Some(names) => names,
-        None => &bare,
-    };
     // Resolving a projected name to a column is caller-input validation, not
     // query execution: the single-table search methods run their own kernels
     // (no SQL engine involved), so an unknown column must read as a bad request
     // that names the column and the valid set — never as an internal execution
-    // failure.
-    let indices: Vec<usize> = names
+    // failure. The same check runs early (before any search I/O) at the search
+    // entry points via [`validate_projection`]; this call is the one source of
+    // truth so the two never drift.
+    let indices = validate_projection(projection, id_column.as_str(), &output_schema)?;
+    // Past name resolution, a failure is ours reading the projected columns;
+    // keep it typed so a storage fault or budget refusal keeps its class.
+    resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
+        .await
+        .map_err(QueryError::DataFusion)
+}
+
+/// Resolve each projected column name to its index in the search output
+/// schema, erroring with [`unknown_column_message`] on the first name the
+/// output does not carry. `projection` of `None` is the engine-native
+/// `_id` + `score` result, whose names are always resolvable.
+///
+/// This is the single source of truth for projection-name validation. It
+/// runs at output-materialization time inside [`resolve_hits_named`], and —
+/// for the row-returning search entry points — early, before any search or
+/// placement I/O, so a projection naming a nonexistent column fails fast
+/// instead of after a full (at billion scale, multi-gigabyte) search whose
+/// result is then thrown away. `output_schema` is resident
+/// ([`output_schema_with_score`] over the stored scalar schema), so the
+/// early check touches no object storage.
+pub(crate) fn validate_projection(
+    projection: Option<&[&str]>,
+    id_column: &str,
+    output_schema: &SchemaRef,
+) -> Result<Vec<usize>, QueryError> {
+    // `None` decodes `_id` + `score` only; both are always resolvable.
+    let bare: [&str; 2] = [id_column, SCORE_COLUMN];
+    let names: &[&str] = match projection {
+        Some(names) => names,
+        None => &bare,
+    };
+    names
         .iter()
         .map(|name| {
             output_schema
                 .index_of(name)
-                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, &output_schema)))
+                .map_err(|_| QueryError::InvalidQuery(unknown_column_message(name, output_schema)))
         })
-        .collect::<Result<_, _>>()?;
-    // Past name resolution, any failure is a store/decode fault reading the
-    // projected columns — not the caller's mistake.
-    resolve_hits(reader, hits, &scalar_schema, &output_schema, Some(&indices))
-        .await
-        .map_err(|e| QueryError::Store(e.to_string()))
+        .collect()
 }
 
 /// Message for a projection naming a column the search output does not
@@ -208,6 +428,247 @@ fn unknown_column_message(name: &str, output_schema: &SchemaRef) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("unknown column {name:?} in projection; valid columns: {available}")
+}
+
+impl SupertableReader {
+    /// Reject a projection naming a column the search output does not carry,
+    /// before any search or placement I/O. Resident-only: the stored scalar
+    /// schema plus the synthesized `score`, no object storage touched. Every
+    /// row-returning search entry point calls this at its top so a doomed
+    /// projection fails fast instead of after a full (at billion scale,
+    /// multi-gigabyte) search whose result is then thrown away. The valid set
+    /// is the same one [`resolve_hits_named`] checks at output materialization,
+    /// so the two share one source of truth and the error message is identical.
+    pub(crate) fn check_projection(&self, projection: Option<&[&str]>) -> Result<(), QueryError> {
+        let output_schema = output_schema_with_score(&self.manifest().stored_schema());
+        validate_projection(
+            projection,
+            self.options().id_column.as_str(),
+            &output_schema,
+        )?;
+        Ok(())
+    }
+}
+
+/// Lower a search table function's pushed-down `WHERE` filters to the
+/// candidate plan its kernel ranks within: a token-match superset over
+/// the FTS-indexed columns, [`Unbounded`](CandidatePlan::Unbounded) when
+/// no filter is index-resolvable. One lowering for all three search
+/// functions, so a predicate bounds `vector_search`, `bm25_search` and
+/// `hybrid_search` identically.
+pub(crate) fn candidate_plan_for_filters(
+    manifest: &ManifestSnapshot,
+    filters: &[Expr],
+) -> CandidatePlan {
+    let fts_cols: HashSet<&str> = manifest
+        .options
+        .fts_columns
+        .iter()
+        .map(|c| c.column.as_str())
+        .collect();
+    CandidatePlan::from_filters(filters, &fts_cols, &|col| {
+        manifest.try_fts_tokenizer_for(col)
+    })
+}
+
+/// The exact `WHERE` a search table function was handed, ready to run
+/// over the function's own resolved rows.
+///
+/// What a kernel ranks within is a superset of the predicate: a token
+/// match stands in for a string equality, and a column with no full-text
+/// index bounds nothing at all. DataFusion's `FilterExec` above the
+/// function re-applies the exact predicate, so a function that returned
+/// exactly `k` rows can come out under `k` — silently, since the function
+/// never sees what the filter dropped. This is the same predicate compiled
+/// for the function to apply itself, so it can count the survivors and
+/// fetch more until `k` stand (see [`fill_top_k`]).
+pub(crate) struct PushedPredicate {
+    /// Indices into the function's output schema of the columns the
+    /// predicate reads.
+    columns: Vec<usize>,
+    /// The conjunction of the pushed filters, column references stripped
+    /// of their table qualifier so they resolve against the function's
+    /// own (unqualified) output schema.
+    conjunction: Expr,
+}
+
+impl PushedPredicate {
+    /// `None` when nothing was pushed, or when the predicate reads a
+    /// column the function's output does not carry — nothing here could
+    /// evaluate it, and the `FilterExec` above still applies it, exactly
+    /// as before the pushdown existed.
+    pub(crate) fn compile(filters: &[Expr], output_schema: &SchemaRef) -> Option<Self> {
+        let conjunction = unqualified(filters.iter().cloned().reduce(Expr::and)?).ok()?;
+        let mut columns = Vec::new();
+        for column in conjunction.column_refs() {
+            let index = output_schema.index_of(&column.name).ok()?;
+            if !columns.contains(&index) {
+                columns.push(index);
+            }
+        }
+        Some(Self {
+            columns,
+            conjunction,
+        })
+    }
+
+    /// Indices into the output schema of the columns the predicate reads,
+    /// in first-seen order.
+    pub(crate) fn columns(&self) -> &[usize] {
+        &self.columns
+    }
+
+    /// Bind the predicate to `schema`, a projection of the output schema
+    /// that carries every column in `self.columns`.
+    pub(crate) fn bind(&self, schema: &SchemaRef) -> DfResult<BoundPredicate> {
+        let df_schema = DFSchema::try_from(Arc::clone(schema))?;
+        create_physical_expr(&self.conjunction, &df_schema, &ExecutionProps::new())
+            .map(BoundPredicate)
+    }
+}
+
+/// A [`PushedPredicate`] bound to the schema of the batches it checks.
+pub(crate) struct BoundPredicate(Arc<dyn PhysicalExpr>);
+
+impl BoundPredicate {
+    /// One boolean per row of `batch`: whether the predicate holds there.
+    /// A null result is kept as null; like SQL's `WHERE`, every caller
+    /// keeps only the rows that are `true`.
+    pub(crate) fn mask(&self, batch: &RecordBatch) -> DfResult<BooleanArray> {
+        let mask = self.0.evaluate(batch)?.into_array(batch.num_rows())?;
+        mask.as_any()
+            .downcast_ref::<BooleanArray>()
+            .cloned()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "a pushed-down predicate did not evaluate to a boolean".into(),
+                )
+            })
+    }
+}
+
+/// `expr` with every column reference stripped of its table qualifier.
+/// DataFusion hands a table function its filters as the planner wrote
+/// them — `t.category = 'x'` under `FROM bm25_search(...) AS t` — while
+/// the function's output schema names bare columns.
+fn unqualified(expr: Expr) -> DfResult<Expr> {
+    expr.transform(|e| {
+        Ok(match e {
+            Expr::Column(c) if c.relation.is_some() => {
+                Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+            }
+            other => Transformed::no(other),
+        })
+    })
+    .map(|t| t.data)
+}
+
+/// Resolve a search table function's top-`k` under its pushed-down
+/// `WHERE`, so the rows it emits are the `k` best *among rows satisfying
+/// the predicate*.
+///
+/// `search(want)` runs the kernel for `want` hits, already scoped to
+/// whatever the index could bound. Without a predicate that is the whole
+/// job: search `k`, resolve, done. With one, the resolved rows are
+/// checked against the exact predicate; when fewer than `k` survive and
+/// the kernel had more to give, the search is rerun for
+/// [`OVER_FETCH_GROWTH`] times as many hits, until `k` survive, the
+/// kernel runs dry, or the fill hits its ceiling. The survivors, in
+/// kernel rank order and cut to `k`, are the result — the `FilterExec`
+/// above re-checks them and drops nothing. Cost scales with the
+/// predicate's selectivity: an exact pushdown pays one round, a bare
+/// scalar predicate on a row in a million pays the log₂ of that.
+///
+/// **The fill is bounded, so it may return fewer than `k` rows even
+/// though more satisfy the predicate.** Growth stops at
+/// [`over_fetch_ceiling`]; past that the survivors so
+/// far are the answer. The alternative is unbounded: a predicate no index
+/// can bound and almost no row satisfies would otherwise grow `want` to
+/// the table's row count and resolve every match into a single batch.
+/// Returning short is the deliberate trade, and it is still strictly more
+/// than the caller used to get — before the pushdown, `k` was applied
+/// table-wide and the `WHERE` ran afterwards, so the same query returned
+/// only whatever survived from one unfiltered top-`k`.
+///
+/// **The ceiling is the only stopping condition besides finding `k`, and
+/// that is deliberate: the hit count carries no exhaustion signal.** A
+/// round can come back short, or no longer than the round before it,
+/// without the kernel having run out — tombstones are subtracted after
+/// each unit's `k`-sized heap (`dispatch::fanout_local_hits`), and fusion
+/// and stable-id de-duplication shrink a round too. Reading either as
+/// exhaustion returns early while matching rows remain, which is the
+/// underflow this function exists to prevent, reached through the delete
+/// path instead of the ranking one. So the fill keeps widening until `k`
+/// survive or the ceiling stops it, and pays extra rounds on a query that
+/// was going to come up short anyway. The signal that would end those
+/// rounds honestly is the kernel reporting its own saturation, before
+/// tombstones and fusion touch the hits; that is not plumbed today.
+///
+/// The predicate's columns are decoded alongside the requested ones for
+/// the check and projected away before the batch is returned.
+pub(crate) async fn fill_top_k<F, Fut>(
+    reader: &SupertableReader,
+    k: usize,
+    predicate: Option<&PushedPredicate>,
+    scalar_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    search: F,
+) -> DfResult<RecordBatch>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
+{
+    let Some(predicate) = predicate else {
+        let hits = search(k).await?;
+        return resolve_hits(reader, &hits, scalar_schema, output_schema, projection).await;
+    };
+    let requested: Vec<usize> = match projection {
+        Some(indices) => indices.to_vec(),
+        None => (0..output_schema.fields().len()).collect(),
+    };
+    // Decode the requested columns first, in order, then whatever else the
+    // predicate reads — so the requested projection is a prefix of the
+    // decoded batch and comes back out as its first columns.
+    let mut decoded = requested.clone();
+    for &column in &predicate.columns {
+        if !decoded.contains(&column) {
+            decoded.push(column);
+        }
+    }
+    let decoded_schema = Arc::new(
+        output_schema
+            .project(&decoded)
+            .map_err(QueryError::internal)?,
+    );
+    let bound = predicate.bind(&decoded_schema)?;
+    let requested_positions: Vec<usize> = (0..requested.len()).collect();
+    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+    let ceiling = over_fetch_ceiling(k, total);
+    let mut want = k.min(ceiling);
+    loop {
+        let hits = search(want).await?;
+        let batch =
+            resolve_hits(reader, &hits, scalar_schema, output_schema, Some(&decoded)).await?;
+        let mask = bound.mask(&batch)?;
+        let kept = filter_record_batch(&batch, &mask).map_err(QueryError::internal)?;
+        // The ceiling is the only stopping condition other than finding `k`.
+        // Nothing observable here distinguishes a kernel that is out of
+        // candidates from one whose hits were thinned after it ran: tombstones
+        // are subtracted after each unit's heap, and fusion and stable-id
+        // de-duplication also shrink a round. So neither a short round nor a
+        // round that returned no more than the last one is evidence, and
+        // treating either as exhaustion under-returns.
+        let exhausted = want >= ceiling;
+        if kept.num_rows() >= k || exhausted {
+            let rows = kept.num_rows().min(k);
+            return kept
+                .slice(0, rows)
+                .project(&requested_positions)
+                .map_err(|e| QueryError::internal(e).into());
+        }
+        want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
+    }
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -252,7 +713,7 @@ pub(crate) async fn resolve_hits(
         Some(indices) => Arc::new(
             output_schema
                 .project(indices)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                .map_err(QueryError::internal)?,
         ),
         None => Arc::clone(output_schema),
     };
@@ -304,7 +765,7 @@ pub(crate) async fn resolve_hits(
             .collect();
         let other_batch = resolve_columns(reader, hits, &other).await?;
         let id_batch = resolve_ids_arithmetic(reader, hits).ok_or_else(|| {
-            DataFusionError::Execution(
+            QueryError::Internal(
                 "resolve_hits: hit set missing stable _id and span arithmetic \
                  (cell-packed hits must carry stable_id from the search wave)"
                     .into(),
@@ -322,7 +783,7 @@ pub(crate) async fn resolve_hits(
         columns.extend(other_batch.columns().iter().map(Arc::clone));
         Some(
             RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
+                .map_err(QueryError::internal)?,
         )
     } else {
         Some(resolve_columns(reader, hits, &needed).await?)
@@ -340,10 +801,7 @@ pub(crate) async fn resolve_hits(
             let rb = resolved
                 .as_ref()
                 .expect("a scalar column is projected => columns resolved");
-            let idx = rb
-                .schema()
-                .index_of(name)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+            let idx = rb.schema().index_of(name).map_err(QueryError::internal)?;
             columns.push(Arc::clone(rb.column(idx)));
         }
     }
@@ -356,7 +814,7 @@ pub(crate) async fn resolve_hits(
         columns,
         &RecordBatchOptions::new().with_row_count(Some(hits.len())),
     )
-    .map_err(|e| DataFusionError::Execution(e.to_string()))
+    .map_err(|e| QueryError::internal(e).into())
 }
 
 /// Hit → stable-`_id` translation by manifest arithmetic — the
@@ -404,7 +862,11 @@ fn resolve_ids_arithmetic(
         .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
     {
         Ok(a) => a,
-        Err(e) => return Some(Err(DataFusionError::Execution(e.to_string()))),
+        Err(e) => {
+            return Some(Err(DataFusionError::from(QueryError::Internal(
+                e.to_string(),
+            ))));
+        }
     };
     let schema = Arc::new(Schema::new(vec![Field::new(
         reader.options().id_column.clone(),
@@ -413,7 +875,7 @@ fn resolve_ids_arithmetic(
     )]));
     Some(
         RecordBatch::try_new(schema, vec![Arc::new(array) as ArrayRef])
-            .map_err(|e| DataFusionError::Execution(e.to_string())),
+            .map_err(|e| QueryError::internal(e).into()),
     )
 }
 
@@ -448,7 +910,7 @@ pub(crate) async fn stamp_stable_ids(
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .ok_or_else(|| {
-            DataFusionError::Execution("stamp_stable_ids: _id column not Decimal128".into())
+            QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into())
         })?;
     for (hit, id) in hits.iter_mut().zip(ids.values()) {
         hit.stable_id = Some(*id);
@@ -470,7 +932,7 @@ pub(crate) fn id_score_batch(
 ) -> DfResult<RecordBatch> {
     let id_array = Decimal128Array::from_iter_values(ids.iter().copied())
         .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::internal)?;
     let score_array = Float32Array::from_iter_values(scores.iter().copied());
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -487,7 +949,7 @@ pub(crate) fn id_score_batch(
             Arc::new(score_array) as ArrayRef,
         ],
     )
-    .map_err(|e| DataFusionError::Execution(e.to_string()))
+    .map_err(|e| QueryError::internal(e).into())
 }
 
 /// Read `names` (scalar columns) at the `hits`' `(superfile,
@@ -531,11 +993,15 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
+    let table = manifest.table_schema();
+    let legacy = manifest.options.legacy_names();
+    let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
+    let schema_id = manifest.table_schema().schema_id();
     let mut slots: Vec<Option<RecordBatch>> = vec![None; seg_order.len()];
     let mut misses = Vec::new();
     for (index, (&uri, locals)) in seg_order.iter().zip(&seg_locals).enumerate() {
-        if let Some(batch) = decoded_cache.get(uri, locals, names) {
+        if let Some(batch) = decoded_cache.get(uri, schema_id, locals, names) {
             slots[index] = Some(batch);
         } else {
             misses.push((index, uri));
@@ -546,9 +1012,9 @@ async fn resolve_columns(
         let entry = manifest
             .lookup_superfile_entry(uri)
             .await
-            .map_err(|error| DataFusionError::Execution(error.to_string()))?
+            .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
-                DataFusionError::Execution(format!(
+                QueryError::Internal(format!(
                     "resolve_hits: superfile {uri:?} missing from manifest"
                 ))
             })?;
@@ -559,11 +1025,11 @@ async fn resolve_columns(
             &entry.uri,
             &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
-            true,
+            ReadIntent::Warm,
         )
         .await
         .map(|reader| (index, reader))
-        .map_err(|error| DataFusionError::Execution(error.to_string()))
+        .map_err(|error| DataFusionError::from(QueryError::store(error)))
     }))
     .await?;
 
@@ -583,14 +1049,28 @@ async fn resolve_columns(
     // Both waves run concurrently and stitch back in `seg_order`
     // order. Superfile count here is bounded by the global top-k (one
     // entry per distinct hit-bearing superfile), so the fan-out is small.
-    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>)> = Vec::new();
-    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32])> = Vec::new();
+    // A file whose columns match the table's reads by name as it always
+    // has; any other file reads through its map: the table's columns are
+    // projected under the file's names and reshaped to the table's.
+    let adapter_for = |rd: &SuperfileReader| -> Option<FileSchemaMap> {
+        let map = FileSchemaMap::new(
+            &table,
+            &manifest.options.id_column,
+            &PhysicalSchema::of_reader(rd, &legacy),
+        );
+        (!map.is_identity()).then_some(map)
+    };
+    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
+        Vec::new();
+    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32], Option<FileSchemaMap>)> =
+        Vec::new();
     for (i, rd) in &opened {
         let locals = &seg_locals[*i];
+        let adapter = adapter_for(rd);
         if rd.can_take_by_local_doc_ids() {
-            warm_inputs.push((*i, Arc::clone(rd), locals.clone()));
+            warm_inputs.push((*i, Arc::clone(rd), locals.clone(), adapter));
         } else {
-            cold_units.push((*i, rd, locals.as_slice()));
+            cold_units.push((*i, rd, locals.as_slice(), adapter));
         }
     }
 
@@ -602,6 +1082,7 @@ async fn resolve_columns(
         let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let pool = Arc::clone(&manifest.options.reader_pool);
         let inputs = warm_inputs;
+        let out_schema = Arc::clone(&out_schema);
         run_on_pool(
             Some(&pool),
             "resolve decode: reader pool dropped result",
@@ -609,11 +1090,18 @@ async fn resolve_columns(
                 let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
                 let result: Result<Vec<((usize, RecordBatch), u64)>, _> = inputs
                     .into_par_iter()
-                    .map(|(i, sf, locals)| {
+                    .map(|(i, sf, locals, adapter)| {
                         // Per-superfile bracket: the resident decode is
                         // this wave's kernel section, one chunk per file.
-                        let (batch, ns) =
-                            timed_section(|| sf.take_by_local_doc_ids(&locals, &name_refs));
+                        let (batch, ns) = timed_section(|| match &adapter {
+                            None => sf.take_by_local_doc_ids(&locals, &name_refs),
+                            Some(map) => {
+                                let physical = map.stored_names(&name_refs);
+                                let read = sf.take_by_local_doc_ids(&locals, &physical)?;
+                                map.adapt(&read, &out_schema)
+                                    .map_err(|e| ReadError::Columnar(e.to_string()))
+                            }
+                        });
                         batch.map(|batch| ((i, batch), ns))
                     })
                     .collect();
@@ -621,15 +1109,25 @@ async fn resolve_columns(
             },
         )
         .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?
-        .map_err(|e| DataFusionError::Execution(e.to_string()))
+        .map_err(QueryError::internal)?
+        .map_err(|e| QueryError::from(e).into())
     };
 
-    let cold_wave = try_join_all(cold_units.into_iter().map(|(i, rd, locals)| async move {
-        take_rows_byte_source(rd, locals, names)
-            .await
-            .map(|batch| (i, batch))
-    }));
+    let out_schema_ref = &out_schema;
+    let cold_wave = try_join_all(cold_units.into_iter().map(
+        |(i, rd, locals, adapter)| async move {
+            let batch = match &adapter {
+                None => take_rows_byte_source(rd, locals, names).await?,
+                Some(map) => {
+                    let physical = map.stored_names(names);
+                    let read = take_rows_byte_source(rd, locals, &physical).await?;
+                    map.adapt(&read, out_schema_ref)
+                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
+                }
+            };
+            Ok::<_, DataFusionError>((i, batch))
+        },
+    ));
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
     let warm_done = warm_done?;
@@ -641,7 +1139,13 @@ async fn resolve_columns(
         .map(|(item, _)| item)
         .chain(cold_done?)
     {
-        decoded_cache.insert(seg_order[i], &seg_locals[i], names, batch.clone());
+        decoded_cache.insert(
+            seg_order[i],
+            schema_id,
+            &seg_locals[i],
+            names,
+            batch.clone(),
+        );
         slots[i] = Some(batch);
     }
     let per_superfile: Vec<RecordBatch> = slots
@@ -660,12 +1164,27 @@ async fn resolve_columns(
     }
     let batches: Vec<&RecordBatch> = per_superfile.iter().collect();
     interleave_record_batch(&batches, &placement)
-        .map_err(|error| DataFusionError::Execution(error.to_string()))
+        .map_err(|error| QueryError::internal(error).into())
 }
 
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
 /// For disk-cache readers this preserves the block-cache layer instead of
 /// bypassing it with a new object-store handle on every scalar projection.
+/// The fields a hit batch carries for `names`, in that order: the table's
+/// stored columns, which is the shape every adapted file reads into.
+fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
+    let fields = names
+        .iter()
+        .map(|name| {
+            stored
+                .field_with_name(name)
+                .map(|f| Arc::new(f.clone()))
+                .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))
+        })
+        .collect::<DfResult<Vec<_>>>()?;
+    Ok(Arc::new(Schema::new(fields)))
+}
+
 struct ByteSourceAsyncReader {
     source: Source,
     metadata: Arc<ParquetMetaData>,
@@ -683,7 +1202,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
             source
                 .range_async(range)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -704,7 +1223,7 @@ impl AsyncFileReader for ByteSourceAsyncReader {
             source
                 .get_ranges_parallel_async(&ranges)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -716,6 +1235,35 @@ impl AsyncFileReader for ByteSourceAsyncReader {
         let metadata = Arc::clone(&self.metadata);
         async move { Ok(metadata) }.boxed()
     }
+}
+
+/// The `names` columns at `local_doc_ids` of one superfile, in that order:
+/// decoded on `pool` when its Parquet bytes are resident, streamed through
+/// its byte source otherwise. The split [`resolve_hits`] makes across many
+/// superfiles at once, for a caller holding one.
+pub(crate) async fn take_rows(
+    reader: &Arc<SuperfileReader>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+    pool: &ThreadPool,
+) -> DfResult<RecordBatch> {
+    if !reader.can_take_by_local_doc_ids() {
+        return take_rows_byte_source(reader, local_doc_ids, names).await;
+    }
+    let owned_reader = Arc::clone(reader);
+    let ids = local_doc_ids.to_vec();
+    let owned_names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    run_on_pool(
+        Some(pool),
+        "take rows: reader pool dropped result",
+        move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            owned_reader.take_by_local_doc_ids(&ids, &name_refs)
+        },
+    )
+    .await
+    .map_err(QueryError::internal)?
+    .map_err(|e| DataFusionError::from(QueryError::from(e)))
 }
 
 /// Stream projected rows through a reader's cache-aware byte source.
@@ -733,7 +1281,7 @@ pub(crate) async fn take_rows_byte_source(
     let metadata = reader
         .parquet_metadata_with_page_index()
         .await
-        .map_err(|error| DataFusionError::Execution(error.to_string()))?;
+        .map_err(QueryError::from)?;
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata,
@@ -786,7 +1334,7 @@ where
     for &name in names {
         let idx = file_schema
             .index_of(name)
-            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
+            .map_err(|_| QueryError::Internal(format!("unknown column {name}")))?;
         col_indices.push(idx);
         out_fields.push(file_schema.field(idx).clone());
     }
@@ -797,10 +1345,23 @@ where
     }
     for &d in local_doc_ids {
         if u64::from(d) >= n_docs {
-            return Err(DataFusionError::Execution(format!(
+            return Err(DataFusionError::from(QueryError::Internal(format!(
                 "doc id {d} out of range (n_docs={n_docs})"
-            )));
+            ))));
         }
+    }
+
+    // A projection resolves to no columns at all when every name it asks
+    // for belongs to a column this file predates. There is nothing to read,
+    // but the row count still has to be right: the caller null-fills to it,
+    // and a batch reporting no rows would drop the hits instead.
+    if names.is_empty() {
+        return RecordBatch::try_new_with_options(
+            out_schema,
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+        )
+        .map_err(|e| QueryError::internal(e).into());
     }
 
     // Distinct, sorted ids → monotonic skip/select runs (decode only the
@@ -811,23 +1372,19 @@ where
 
     let builder = ParquetRecordBatchStreamBuilder::new(input)
         .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::store)?;
     let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
     let stream = builder
         .with_projection(mask)
         .with_row_selection(selection)
         .build()
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
-    let batches: Vec<RecordBatch> = stream
-        .try_collect()
-        .await
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+        .map_err(QueryError::store)?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(out_schema));
     }
     let read_schema = batches[0].schema();
-    let selected = concat_batches(&read_schema, &batches)
-        .map_err(|e| DataFusionError::Execution(e.to_string()))?;
+    let selected = concat_batches(&read_schema, &batches).map_err(QueryError::internal)?;
 
     // Rank back into the caller's (possibly duplicated) order.
     let indices = rank_back_indices(local_doc_ids, &sorted);
@@ -838,13 +1395,10 @@ where
         let idx = selected
             .schema()
             .index_of(name)
-            .map_err(|_| DataFusionError::Execution(format!("unknown column {name}")))?;
-        columns.push(
-            take(selected.column(idx), &indices, None)
-                .map_err(|e| DataFusionError::Execution(e.to_string()))?,
-        );
+            .map_err(|_| QueryError::Internal(format!("unknown column {name}")))?;
+        columns.push(take(selected.column(idx), &indices, None).map_err(QueryError::internal)?);
     }
-    RecordBatch::try_new(out_schema, columns).map_err(|e| DataFusionError::Execution(e.to_string()))
+    RecordBatch::try_new(out_schema, columns).map_err(|e| QueryError::internal(e).into())
 }
 
 /// Extract a string literal argument (a column name, query text, ...).
@@ -887,6 +1441,8 @@ pub(crate) mod test_support {
         prelude::SessionContext,
     };
 
+    use super::CallScopedTable;
+
     /// Invoke a table function's `call_with_args` with a throwaway session.
     /// The search TVFs read only the argument exprs, not the session, so a
     /// fresh empty context is enough to satisfy the DataFusion 54 signature.
@@ -898,16 +1454,26 @@ pub(crate) mod test_support {
         let state = ctx.state();
         func.call_with_args(TableFunctionArgs::new(exprs, &state))
     }
+
+    /// The call's own provider beneath the per-call scope every search
+    /// table function returns (see [`super::scope_to_call`]).
+    pub(crate) fn scoped_inner(table: &Arc<dyn TableProvider>) -> &dyn TableProvider {
+        table
+            .downcast_ref::<CallScopedTable>()
+            .expect("search table functions return a call-scoped provider")
+            .inner
+            .as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{thread::sleep, time::Duration};
 
-    use arrow_array::{Array, FixedSizeListArray, LargeStringArray};
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray};
     use arrow_schema::Field;
     use bytes::Bytes;
-    use datafusion::prelude::lit;
+    use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -917,7 +1483,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
-            fts::reader::{Bm25SearchOptions, Bm25Stats, BoolMode},
+            fts::reader::{Bm25SearchOptions, BoolMode},
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
@@ -932,6 +1498,33 @@ mod tests {
     /// Force Snowflake ids in one committed superfile across an ms boundary.
     const ID_GAP_WAIT: Duration = Duration::from_millis(20);
 
+    /// A table far larger than any ceiling, so `total` is never the binding
+    /// limit in the ceiling tests below.
+    const HUGE_TABLE: usize = 100_000_000;
+
+    /// The over-fetch ceiling is bounded from above in every direction a
+    /// caller can push it, and never below the `k` that was asked for.
+    /// Before it existed the fill grew to the table's row count, so an
+    /// unbounded predicate that almost nothing satisfies ended by asking
+    /// the kernel for a table-sized heap.
+    #[test]
+    fn over_fetch_ceiling_is_bounded_and_never_below_k() {
+        // A small k takes the floor, not the (tiny) multiple.
+        assert_eq!(over_fetch_ceiling(1, HUGE_TABLE), OVER_FETCH_MIN_CEILING);
+        assert_eq!(over_fetch_ceiling(10, HUGE_TABLE), OVER_FETCH_MIN_CEILING);
+        // Once the multiple clears the floor it governs.
+        assert_eq!(over_fetch_ceiling(1_000, HUGE_TABLE), 64_000);
+        // ... until the absolute cap does.
+        assert_eq!(over_fetch_ceiling(5_000, HUGE_TABLE), OVER_FETCH_MAX_HITS);
+        // A caller asking for more than the cap still gets its own k: the
+        // ceiling bounds the over-fetch, never the request.
+        let big = OVER_FETCH_MAX_HITS * 2;
+        assert_eq!(over_fetch_ceiling(big, HUGE_TABLE), big);
+        // The table is always the last word.
+        assert_eq!(over_fetch_ceiling(10, 7), 7);
+        assert_eq!(over_fetch_ceiling(0, 0), 0);
+    }
+
     #[test]
     fn arg_to_string_accepts_utf8_literal_rejects_int() {
         assert_eq!(
@@ -939,21 +1532,6 @@ mod tests {
             "emb"
         );
         assert!(arg_to_string(&lit(3_i64), "column").is_err());
-    }
-
-    #[test]
-    fn search_query_df_error_maps_over_budget_to_resources_exhausted() {
-        // Pins the boundary contract both search nodes depend on: a budget
-        // refusal maps to ResourcesExhausted (the shape the SQL classifier
-        // routes back to OverBudget), any other failure to Execution.
-        assert!(matches!(
-            search_query_df_error(QueryError::OverBudget("vector search, over".into())),
-            DataFusionError::ResourcesExhausted(_)
-        ));
-        assert!(matches!(
-            search_query_df_error(QueryError::Plan("boom".into())),
-            DataFusionError::Execution(_)
-        ));
     }
 
     #[test]
@@ -988,6 +1566,101 @@ mod tests {
         assert_eq!(out.fields().len(), 2);
         assert_eq!(out.field(1).name(), "score");
         assert_eq!(out.field(1).data_type(), &DataType::Float32);
+    }
+
+    /// [`validate_projection`] is the shared, resident-only (no I/O)
+    /// projection-name check the search entry points run *before* any search,
+    /// so a doomed projection fails fast. It resolves known names to output
+    /// indices, defaults `None` to `_id` + `score`, and rejects an unknown
+    /// name with the exact `unknown column … in projection` message
+    /// `resolve_hits_named` produces at materialization.
+    #[test]
+    fn validate_projection_rejects_unknown_and_resolves_known() {
+        let output_schema = output_schema_with_score(&Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ])));
+        // score is appended after _id (0) and title (1).
+        assert_eq!(
+            validate_projection(None, "_id", &output_schema).expect("default is valid"),
+            vec![0, 2],
+            "None resolves to the engine-native _id + score pair"
+        );
+        assert_eq!(
+            validate_projection(Some(&["title", "_id", "score"]), "_id", &output_schema)
+                .expect("known columns resolve"),
+            vec![1, 0, 2],
+            "known names resolve to their output-schema indices in order"
+        );
+        let err = validate_projection(Some(&["title", "nope"]), "_id", &output_schema)
+            .expect_err("an unknown projected column must error");
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "expected InvalidQuery, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown column") && msg.contains("in projection"),
+            "message must name the unknown column and the projection, got {msg:?}"
+        );
+    }
+
+    /// The pushed predicate binds to the function's output by bare column
+    /// name — a table alias on the reference is dropped — and reports the
+    /// columns it reads; a reference to a column the output lacks, or no
+    /// filter at all, compiles to nothing.
+    #[test]
+    fn pushed_predicate_compiles_against_the_output_schema() {
+        let out = output_schema_with_score(&Arc::new(Schema::new(vec![
+            Field::new("_id", DataType::Int64, false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ])));
+        // Literals arrive type-coerced from the planner (a `LargeUtf8`
+        // column compares against a `LargeUtf8` literal), so the test hands
+        // over the same shape.
+        let qualified = [
+            col("t.bucket").eq(lit(1_i64)),
+            col("t.title").eq(lit(ScalarValue::LargeUtf8(Some("x".into())))),
+        ];
+        let predicate = PushedPredicate::compile(&qualified, &out).expect("compiles");
+        let mut columns = predicate.columns.clone();
+        columns.sort_unstable();
+        assert_eq!(columns, vec![1, 2], "title and bucket, by output index");
+        assert!(
+            predicate
+                .conjunction
+                .column_refs()
+                .iter()
+                .all(|c| c.relation.is_none()),
+            "qualifiers are stripped: {:?}",
+            predicate.conjunction
+        );
+        // Bound to a projection carrying its columns, it evaluates.
+        let projected = Arc::new(out.project(&[2, 1]).expect("project"));
+        let bound = predicate.bind(&projected).expect("binds");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&projected),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 1])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec!["x", "x", "y"])) as ArrayRef,
+            ],
+        )
+        .expect("batch");
+        let mask = bound.mask(&batch).expect("mask");
+        assert_eq!(
+            (0..3).map(|i| mask.value(i)).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+
+        assert!(
+            PushedPredicate::compile(&[], &out).is_none(),
+            "nothing pushed"
+        );
+        assert!(
+            PushedPredicate::compile(&[col("elsewhere").eq(lit(1_i64))], &out).is_none(),
+            "a column the output lacks cannot be checked here"
+        );
     }
 
     // ---- harness exercising resolve_hits_named / resolve_ids_arithmetic /
@@ -1073,9 +1746,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["_id"]),
             )
             .expect("bm25_search _id");
@@ -1096,9 +1767,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bm25_search default");
@@ -1120,9 +1789,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["_id", "title", "score"]),
             )
             .expect("bm25_search title");
@@ -1145,9 +1812,7 @@ mod tests {
             "title",
             "rust",
             10,
-            Bm25SearchOptions::new()
-                .with_mode(BoolMode::Or)
-                .with_stats(Bm25Stats::Global),
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
             Some(&["nope"]),
         );
         assert!(res.is_err(), "unknown projected column must error");
@@ -1163,9 +1828,7 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["_id"]),
             )
             .expect("bm25_search empty");
@@ -1204,7 +1867,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
         let score_idx = scalar_schema.fields().len();
 
@@ -1243,7 +1906,7 @@ mod tests {
                 crate::supertable::query::dispatch::attach_stable_ids_to_hits(&reader, &mut hits),
             )
             .expect("stamp stable ids before scalar resolution");
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader
@@ -1271,7 +1934,7 @@ mod tests {
         let st = demo(16);
         let reader = st.reader().expect("reader");
         let hits = two_hits(&reader);
-        let scalar_schema = reader.options().scalar_schema();
+        let scalar_schema = reader.manifest().scalar_schema();
         let output_schema = output_schema_with_score(&scalar_schema);
 
         let batch = reader
@@ -1541,6 +2204,43 @@ mod tests {
         assert_eq!(batch.schema().field(0).name(), "title");
     }
 
+    /// A projection naming only columns this file predates resolves to no
+    /// columns at all. There is nothing to read, but the batch still has to
+    /// report the rows the caller asked for: it null-fills to that count, and
+    /// a batch saying it has none drops the hits instead.
+    ///
+    /// On the cold path specifically. The resident reader has its own arm for
+    /// this, and a `memory://` table only ever takes that one, so a search
+    /// through the public API cannot reach here — this is the path an
+    /// object-store or cache-cold read uses, which is the one production
+    /// takes.
+    #[tokio::test]
+    async fn take_rows_object_store_empty_projection_keeps_the_row_count() {
+        let bytes = titled_superfile_bytes();
+        let (schema, n_docs) = schema_and_n_docs(&bytes);
+        let (store, path) = object_store_with(&bytes).await;
+        let ids: Vec<u32> = (0..n_docs as u32).collect();
+
+        let batch = take_rows_object_store(
+            store,
+            path,
+            Some(bytes.len() as u64),
+            &schema,
+            n_docs,
+            &ids,
+            &[],
+        )
+        .await
+        .expect("a projection of no columns is a batch of no columns");
+
+        assert_eq!(batch.num_columns(), 0, "nothing was asked for");
+        assert_eq!(
+            batch.num_rows(),
+            ids.len(),
+            "the rows asked for are still counted, so the caller null-fills them"
+        );
+    }
+
     #[tokio::test]
     async fn take_rows_object_store_out_of_range_id_errors() {
         let bytes = titled_superfile_bytes();
@@ -1682,9 +2382,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with scalar projection");
@@ -1723,9 +2421,7 @@ mod tests {
                 "title",
                 "rust",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["_id", "title", "score"]),
             )
             .expect("cold bm25 with id and scalar projection");
@@ -1751,9 +2447,7 @@ mod tests {
                 "title",
                 "nonexistentterm",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["title", "score"]),
             )
             .expect("cold bm25 with no matches");

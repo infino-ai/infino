@@ -1,0 +1,27 @@
+{
+  "format_version": "1.0",
+  "manifest_id": 0,
+  "options_hash": "blake3:0727d3b2480e70ca40c98db2d8645548ebe220da36f0c677bf0464526fa78d5d",
+  "schema": "",
+  "id_column": "_id",
+  "fts_columns": [
+    {
+      "column": "title"
+    }
+  ],
+  "vector_columns": [],
+  "vector_index_storage_prefix": null,
+  "deleted_user_ids_inline_b64": null,
+  "slow_vector_state_uri": null,
+  "slow_vector_state_content_hash": null,
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "global_vector_index": null,
+  "drained_ranges": [],
+  "parts": [],
+  "tombstone_seqs": {},
+  "superseded_cells": {},
+  "split_checks": {}
+}

@@ -5,7 +5,7 @@
 //!
 //! Measures sustained reader latency and throughput under two conditions:
 //! - **baseline**: N readers per table firing queries in a tight loop, no writers.
-//! - **contention**: same readers + 1 writer per table committing continuously.
+//! - **contention**: same readers + `WRITERS` writers per table appending continuously.
 //!
 //! All `TENANTS` tables are built up front and stay open, with default pool
 //! construction, so the process thread inventory grows with the tenant count
@@ -22,6 +22,7 @@
 //! Knobs (env vars):
 //!   INFINO_BENCH_CONCURRENT_DOCS      corpus size per table (default 200_000)
 //!   INFINO_BENCH_CONCURRENT_READERS   reader tasks per modality per table (default 8)
+//!   INFINO_BENCH_CONCURRENT_WRITERS   appending writers per table (default 1)
 //!   INFINO_BENCH_CONCURRENT_TENANTS   tables open + loaded simultaneously (default 1)
 //!   INFINO_BENCH_CONCURRENT_DURATION  measurement window in seconds (default 15)
 //!   INFINO_BENCH_CONCURRENT_WARMUP    warmup seconds to discard (default 3)
@@ -60,6 +61,7 @@ use crate::{
 
 const DEFAULT_DOCS: usize = 200_000;
 const DEFAULT_READERS: usize = 8;
+const DEFAULT_WRITERS: usize = 1;
 const DEFAULT_TENANTS: usize = 1;
 const DEFAULT_DURATION_SECS: u64 = 15;
 const DEFAULT_WARMUP_SECS: u64 = 3;
@@ -98,6 +100,10 @@ fn n_docs() -> usize {
 
 fn n_readers() -> usize {
     env_usize("INFINO_BENCH_CONCURRENT_READERS", DEFAULT_READERS)
+}
+
+fn n_writers() -> usize {
+    env_usize("INFINO_BENCH_CONCURRENT_WRITERS", DEFAULT_WRITERS)
 }
 
 fn n_tenants() -> usize {
@@ -339,17 +345,16 @@ async fn reader_loop(
 }
 
 // Writer loop: continuous append+commit for the entire phase window.
-// Single-writer slot is fine — in production each table has one writer.
-async fn writer_loop(st: Supertable, stop: Arc<AtomicBool>) -> usize {
+// Counts only the appends that committed; a refused one yields and retries.
+fn writer_loop(st: Supertable, stop: Arc<AtomicBool>) -> usize {
     let mut commits = 0usize;
     let mut batch_start = 1_000_000usize;
     while !stop.load(Ordering::Relaxed) {
-        if let Ok(mut w) = st.writer() {
-            let batch = build_batch(batch_start, WRITER_BATCH);
-            let _ = w.append(&batch);
-            let _ = w.commit();
+        if st.append(&build_batch(batch_start, WRITER_BATCH)).is_ok() {
             batch_start += WRITER_BATCH;
             commits += 1;
+        } else {
+            thread::yield_now();
         }
     }
     commits
@@ -398,7 +403,8 @@ struct PhaseResult {
 }
 
 // Drives n_readers fts + n_readers vec tasks per table on all tables at
-// once, plus one writer per table when `with_writer`.
+// once, plus `n_writers()` writers per table when `with_writer`. Writers run
+// on blocking threads, the way async code should call `append`.
 fn run_phase(
     tables: &[Supertable],
     n_readers: usize,
@@ -414,10 +420,11 @@ fn run_phase(
     let writers: Vec<_> = if with_writer {
         tables
             .iter()
+            .flat_map(|st| (0..n_writers()).map(move |_| st))
             .map(|st| {
                 let st_w = st.clone();
                 let stop_w = Arc::clone(&stop);
-                rt.spawn(async move { writer_loop(st_w, stop_w).await })
+                rt.spawn_blocking(move || writer_loop(st_w, stop_w))
             })
             .collect()
     } else {
@@ -628,7 +635,7 @@ pub fn run() {
         };
         rows.push(vec![
             text(format!("{label} / {modality}")),
-            text(format!("{readers}r+1w")),
+            text(format!("{readers}r+{}w", n_writers())),
             metric(cp50, fmt_time(cp50), Better::Lower),
             metric(cp95, fmt_time(cp95), Better::Lower),
             metric(cp99, fmt_time(cp99), Better::Lower),

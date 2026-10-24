@@ -31,7 +31,30 @@
 //! engine-side code. The engine's job is only to never orphan the chain
 //! — see the thread hand-off helpers in `runtime_bridge`.
 
+use std::sync::Arc;
+#[cfg(feature = "detailed-tracing")]
+use std::{any::Any, sync::Once};
+
+use arrow_array::RecordBatch;
+#[cfg(feature = "detailed-tracing")]
+use datafusion::common::runtime::{JoinSetTracer, set_join_set_tracer};
+#[cfg(feature = "detailed-tracing")]
+use futures::{FutureExt, future::BoxFuture};
+#[cfg(feature = "detailed-tracing")]
+use tracing::Instrument;
 use tracing::{Span, field::Value};
+
+use crate::runtime_metrics::{
+    cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+    io::{UsageMeter, UsageSnapshot},
+    op_stats::OpStatsCollector,
+    rss::{available_memory_bytes, status_anon_rss_bytes},
+};
+
+/// Bytes in a MiB, for the memory fields [`RegionUsage`] records.
+const BYTES_PER_MIB: u64 = 1 << 20;
+/// Nanoseconds in a millisecond, for [`RegionUsage`]'s `cpu_ms`.
+const NS_PER_MS: u64 = 1_000_000;
 
 /// What kind of operation a span's work is being done for.
 ///
@@ -93,6 +116,9 @@ pub(crate) enum TableRole {
     /// The derived, cell-ordered vector index that accelerates vector
     /// search over [`Self::User`].
     VectorIndex,
+    /// A hidden companion table a caller declared beside a [`Self::User`]
+    /// table, with its own schema and indexes.
+    Companion,
 }
 
 impl TableRole {
@@ -103,6 +129,7 @@ impl TableRole {
         match self {
             Self::User => "user",
             Self::VectorIndex => "vector_index",
+            Self::Companion => "companion",
         }
     }
 }
@@ -126,6 +153,97 @@ pub(crate) fn detached(span: Span) -> Span {
     span
 }
 
+/// Create an `info` span, or nothing at all without `detailed-tracing`.
+///
+/// The inline counterpart to `#[cfg_attr(feature = "detailed-tracing",
+/// tracing::instrument(...))]`, for work that is a region inside a
+/// function rather than a whole function. Feature off, this expands to
+/// [`Span::none()`], and the field expressions are not compiled at all
+/// — so a field naming a variable that only exists for the span will
+/// fail the `detailed-tracing` build while the default build stays
+/// green. That is what `make check`'s `cargo check --features
+/// metering,detailed-tracing` line is there to catch.
+///
+/// Entering a `Span::none()` is a genuine no-op: it never touches the
+/// dispatcher's span stack, so spans created inside the guard's scope
+/// keep the ambient parent rather than being orphaned. That makes the
+/// guard safe to hold across arbitrary nested work in either build.
+///
+/// Fields are `name = value` pairs only. `tracing`'s own sigils (`?x`,
+/// `%x`) and dotted field names are not expressible here: for the
+/// sigils use `tracing::field::debug(&x)` / `display(&x)`, and for a
+/// dotted name reach for `info_span!` under a `cfg_attr`.
+///
+/// `parent: span` sets the parent explicitly, for work a rayon pool fans out:
+/// a `par_iter` task does not run inside the span that started it, so a span
+/// made there would otherwise start a trace of its own.
+macro_rules! detail_span {
+    ($name:literal, parent: $parent:expr $(, $field:ident = $value:expr)* $(,)?) => {{
+        #[cfg(feature = "detailed-tracing")]
+        {
+            ::tracing::info_span!(parent: $parent, $name $(, $field = $value)*)
+        }
+        #[cfg(not(feature = "detailed-tracing"))]
+        {
+            let _ = &$parent;
+            ::tracing::Span::none()
+        }
+    }};
+    ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {{
+        #[cfg(feature = "detailed-tracing")]
+        {
+            ::tracing::info_span!($name $(, $field = $value)*)
+        }
+        #[cfg(not(feature = "detailed-tracing"))]
+        {
+            ::tracing::Span::none()
+        }
+    }};
+}
+pub(crate) use detail_span;
+
+/// A [`detail_span!`] for a phase that opens superfiles. It also declares the
+/// fields `OpenTierCounts::record_on` fills (`memory`, `disk`, `lazy`,
+/// `source`, `coalesced`, `streamed`): how many of the phase's opens each
+/// cache tier served, as one line of counts rather than a span per file.
+macro_rules! tiered_span {
+    ($name:literal $(, $field:ident = $value:expr)* $(,)?) => {
+        $crate::utils::trace::detail_span!(
+            $name
+            $(, $field = $value)*,
+            memory = ::tracing::field::Empty,
+            disk = ::tracing::field::Empty,
+            lazy = ::tracing::field::Empty,
+            source = ::tracing::field::Empty,
+            coalesced = ::tracing::field::Empty,
+            streamed = ::tracing::field::Empty,
+        )
+    };
+}
+pub(crate) use tiered_span;
+
+/// A search's phase span, or [`Span::none()`] when `on` is false.
+///
+/// Every exported span costs the query a few microseconds, so a search only
+/// splits into phases when there is something to split: see
+/// `SupertableReader::phase_spans`. `span` is only called when `on`, so its
+/// field expressions cost nothing otherwise. A child of a skipped phase
+/// nests under the nearest span that was made.
+pub(crate) fn phase(on: bool, span: impl FnOnce() -> Span) -> Span {
+    if on { span() } else { Span::none() }
+}
+
+/// End `span` here, for every consumer.
+///
+/// An OpenTelemetry exporter dates a span's end from its last exit, and a
+/// log layer from its close. A phase span that only instruments some of its
+/// awaits would end at the last of those in one and wherever the handle is
+/// dropped in the other. One empty enter and exit, then the drop, puts both
+/// at this line.
+pub(crate) fn end(span: Span) {
+    span.in_scope(|| {});
+}
+
 /// Record `value` into `field` on the currently-entered span.
 ///
 /// For the outcome of an operation — a cache hit, a byte count, which of
@@ -144,6 +262,175 @@ pub(crate) fn detached(span: Span) -> Span {
 pub(crate) fn record<V: Value>(field: &'static str, value: V) {
     if cfg!(feature = "detailed-tracing") {
         Span::current().record(field, value);
+    }
+}
+
+/// Carry the current span into the tasks DataFusion spawns, so a query's
+/// spans stay in its trace whatever plan DataFusion runs.
+///
+/// DataFusion executes an operator's input on a spawned task when it
+/// repartitions, merges partitions or builds a join side. Without this, a
+/// search table function planned under such an operator would open its span
+/// on that task with no parent and start a trace of its own. Installed once
+/// per process, and only with `detailed-tracing`. The tracer is
+/// process-wide: if the embedding application has installed one, that one
+/// stays.
+pub(crate) fn follow_spans_into_datafusion_tasks() {
+    #[cfg(feature = "detailed-tracing")]
+    {
+        static INSTALLED: Once = Once::new();
+        INSTALLED.call_once(|| {
+            // Already set by the application: theirs is the one to keep.
+            let _ = set_join_set_tracer(&CurrentSpanTracer);
+        });
+    }
+}
+
+/// Runs each spawned DataFusion task in the span that spawned it.
+#[cfg(feature = "detailed-tracing")]
+struct CurrentSpanTracer;
+
+#[cfg(feature = "detailed-tracing")]
+impl JoinSetTracer for CurrentSpanTracer {
+    fn trace_future(
+        &self,
+        fut: BoxFuture<'static, Box<dyn Any + Send>>,
+    ) -> BoxFuture<'static, Box<dyn Any + Send>> {
+        fut.in_current_span().boxed()
+    }
+
+    fn trace_block(
+        &self,
+        f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
+    ) -> Box<dyn FnOnce() -> Box<dyn Any + Send> + Send> {
+        let span = Span::current();
+        Box::new(move || span.in_scope(f))
+    }
+}
+
+/// What a read's root span records once the read has run: the rows it
+/// returned, the counters of the op-stats collector it ran under, and the
+/// object-store requests and bytes issued meanwhile.
+///
+/// The store numbers are a delta from [`Self::begin`]. The ledger is the
+/// connection's, not the read's, so a second read on the same connection at
+/// the same time lands in it too. The op-stats numbers are the collector's
+/// totals, so they are the read's own only when its `with_op_stats` scope
+/// wraps just this read.
+///
+/// Fields the span does not declare are ignored, so a root declares the ones
+/// it wants as `tracing::field::Empty`; [`Self::finish`] lists them all.
+pub(crate) struct CloseOut {
+    op_stats: Option<Arc<OpStatsCollector>>,
+    store: Option<(Arc<UsageMeter>, UsageSnapshot)>,
+}
+
+impl CloseOut {
+    /// Snapshot what [`Self::finish`] subtracts from. Without
+    /// `detailed-tracing` neither input is called, so a read pays nothing.
+    pub(crate) fn begin(
+        op_stats: impl FnOnce() -> Option<Arc<OpStatsCollector>>,
+        meter: impl FnOnce() -> Option<Arc<UsageMeter>>,
+    ) -> Self {
+        if !cfg!(feature = "detailed-tracing") {
+            return Self {
+                op_stats: None,
+                store: None,
+            };
+        }
+        Self {
+            op_stats: op_stats(),
+            store: meter().map(|meter| {
+                let before = meter.snapshot();
+                (meter, before)
+            }),
+        }
+    }
+
+    /// Record the read's outcome on the current span.
+    pub(crate) fn finish(self, rows_out: u64) {
+        if !cfg!(feature = "detailed-tracing") {
+            return;
+        }
+        let span = Span::current();
+        span.record("rows_out", rows_out);
+        if let Some(stats) = self.op_stats {
+            let stats = stats.snapshot();
+            span.record("sql_page_bytes", stats.sql_page_bytes);
+            span.record("planned_read_ranges", stats.planned_read_ranges);
+            span.record("rows_materialized", stats.rows_materialized);
+            span.record("kernel_cpu_ns", stats.kernel_cpu_ns);
+            span.record("fts_postings_bytes", stats.fts_postings_bytes);
+            span.record("vector_cells_scanned", stats.vector_cells_scanned);
+            span.record("vector_candidates_scanned", stats.vector_candidates_scanned);
+            span.record("vector_rows_reranked", stats.vector_rows_reranked);
+        }
+        if let Some((meter, before)) = self.store {
+            let used = meter.snapshot().since(&before);
+            span.record("store_heads", used.head_count);
+            span.record("store_gets", used.get_count);
+            span.record("store_get_bytes", used.get_bytes);
+            span.record("store_bg_gets", used.bg_get_count);
+            span.record("store_bg_get_bytes", used.bg_get_bytes);
+        }
+    }
+
+    /// [`Self::finish`] with `rows_out` counted from the read's batches.
+    pub(crate) fn finish_batches(self, batches: &[RecordBatch]) {
+        self.finish(batches.iter().map(|b| b.num_rows() as u64).sum());
+    }
+}
+
+/// What a long, single-threaded region records on its span: memory when it
+/// starts and ends, and the CPU time its thread spent in it.
+///
+/// Read next to the span's wall time, `cpu_ms` says whether the region was
+/// computing or stalled (page faults, swap, a full disk). The memory pair says
+/// how much the region held and how close the host was to running out. Only
+/// the current thread's CPU is counted, so a region that fans out to a pool
+/// under-reports.
+///
+/// The span declares `cpu_ms`, `rss_anon_mb_before`, `rss_anon_mb_after`,
+/// `mem_available_mb_before` and `mem_available_mb_after` as
+/// `tracing::field::Empty`, and both calls run inside it. Without
+/// `detailed-tracing` nothing is read.
+pub(crate) struct RegionUsage {
+    cpu_start: Option<u128>,
+}
+
+impl RegionUsage {
+    /// Record the starting memory and take the CPU reading to subtract from.
+    pub(crate) fn begin() -> Self {
+        if !cfg!(feature = "detailed-tracing") {
+            return Self { cpu_start: None };
+        }
+        record_memory("rss_anon_mb_before", "mem_available_mb_before");
+        Self {
+            cpu_start: thread_cpu_ns(),
+        }
+    }
+
+    /// Record the CPU time since [`Self::begin`] and the ending memory. Must run
+    /// on the thread that called `begin`.
+    pub(crate) fn finish(self) {
+        if !cfg!(feature = "detailed-tracing") {
+            return;
+        }
+        // No CPU clock on this platform: leave `cpu_ms` empty rather than 0.
+        if self.cpu_start.is_some() {
+            record("cpu_ms", thread_cpu_delta_ns(self.cpu_start) / NS_PER_MS);
+        }
+        record_memory("rss_anon_mb_after", "mem_available_mb_after");
+    }
+}
+
+/// Record this process's anonymous RSS and the memory still available, in MiB.
+fn record_memory(rss_field: &'static str, available_field: &'static str) {
+    if let Some(rss) = status_anon_rss_bytes() {
+        record(rss_field, rss / BYTES_PER_MIB);
+    }
+    if let Some(available) = available_memory_bytes() {
+        record(available_field, available / BYTES_PER_MIB);
     }
 }
 
@@ -166,5 +453,6 @@ mod tests {
         assert_eq!(OpOrigin::Open.as_str(), "open");
         assert_eq!(TableRole::User.as_str(), "user");
         assert_eq!(TableRole::VectorIndex.as_str(), "vector_index");
+        assert_eq!(TableRole::Companion.as_str(), "companion");
     }
 }

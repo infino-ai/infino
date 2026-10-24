@@ -27,14 +27,17 @@
 //! re-spliced with [`encode_encoded_rows`], never decoded to full fp32 corpora.
 
 use std::{
-    cmp::Ordering,
-    collections::HashMap,
+    cmp::{Ordering, Reverse},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{
         Mutex, PoisonError,
         atomic::{AtomicU32, Ordering as AtomicOrdering},
     },
 };
 
+// Re-exported for the drain caller (`writer.rs`), which owns the coarse
+// router across the batch loop and so must name these types.
+pub(crate) use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw};
 use crate::{
     config,
     superfile::vector::{
@@ -43,10 +46,13 @@ use crate::{
             Metric, distance, nearest_k_centroids_bytes, nearest_k_centroids_transposed, normalize,
             relative_score_window,
         },
+        hnsw::HnswParams,
         kmeans::{kmeans, kmeans_pp},
-        quant::BitQuantizer,
+        quant::{
+            BitQuantizer, LutQuery, build_transposed_code_cache, for_each_code_block_scores,
+            lut_scan_supported,
+        },
         reader::CellFineCalibrationView,
-        reservoir::Reservoir,
         rotation::RandomRotation,
         spill::SpilledCellRows,
     },
@@ -283,10 +289,150 @@ pub(crate) fn boundary_assignment_fp32(
     boundary_from_ranked(clusters, metric, &ranked)
 }
 
-/// Shared closure tail: primary = best-ranked cell; replicas = ranked
-/// cells within the closure distance ratio, carrying their margin to the
-/// shared Voronoi boundary.
-fn boundary_from_ranked(
+/// Grid sizes at or below this cell count take the exact/shortlist assign
+/// path, not the graph. Below ~64 cells the centroid HNSW's build and walk
+/// overhead outweighs the exact scan it replaces (the exact scan already
+/// covers the whole grid in one blocked-SIMD pass), and the shortlist window
+/// floor already means small grids scan exactly. The graph pays off only as
+/// the grid grows (the kernel bench crosses over well above this).
+pub(crate) const GRAPH_ASSIGN_MIN_N_CENT: usize = 64;
+
+/// Search beam width for the coarse centroid router as a function of grid size:
+/// `ef = max(16, round(sqrt(n_cent) / 4))`. Monotonic in `n_cent`; `sqrt` tracks
+/// the graph's diameter growth (a fixed ef under-serves a large grid and
+/// over-serves a small one). Cosine yields 16@256, 16@1024, 16@4096, 32@16384.
+///
+/// Graph-routed assign is cosine-gated at the drain caller (non-cosine metrics
+/// take the exact path — their centroid HNSW is hub-dominated and collapses the
+/// grid), so this is the cosine beam. The `_metric` parameter is retained for
+/// when a metric-robust coarse router re-enables non-cosine.
+///
+/// The floor is 16, not the graph's nominal minimum: at small grids a bare
+/// `sqrt(n)/4` beam (4-8) leaves ~0.994 primary parity vs the exact path, which
+/// does not hurt recall but shifts post-drain cell membership enough to perturb
+/// the cold-read block layout; a floor of 16 lifts small-grid parity back to the
+/// exact path's footprint, and the graph is cheap at those sizes anyway.
+pub(crate) fn coarse_router_ef(n_cent: usize, _metric: Metric) -> usize {
+    (((n_cent as f64).sqrt() / 4.0).round() as usize).max(16)
+}
+
+/// Graph-routed variant of [`boundary_assignment_fp32`]. Instead of the
+/// 1-bit admit shortlist + windowed exact rescore, route the row through a
+/// centroid HNSW built ONCE over the coarse cell centroids (caller-owned,
+/// live-built — not rebuilt per row) to surface the `top_k` nearest cells,
+/// then re-score exactly those cells with [`ClusterCentroids::score_one`]
+/// — the identical score orientation [`boundary_assignment_fp32`] feeds —
+/// and run the shared [`boundary_from_ranked`] closure unchanged. `ef` is
+/// the graph's search beam width (see [`coarse_router_ef`]).
+///
+/// The graph is built only over POPULATED cells (count-0 cells are skipped,
+/// matching the production shortlist path), so graph node ids are dense and
+/// do NOT equal cell ids. `node_to_cell` (from [`build_coarse_router`]) maps
+/// each returned node back to its cell id before scoring; scoring and
+/// [`boundary_from_ranked`] then run entirely in cell-id space.
+///
+/// Re-scoring the returned cells with `score_one` (rather than trusting the
+/// graph's own returned scores) keeps the number fed to `boundary_from_ranked`
+/// bit-identical to the current path, so any placement difference measures
+/// the graph's candidate recall, never a score-space mismatch. The cost is
+/// `top_k` extra exact centroid scores per row — negligible beside the walk.
+pub(crate) fn boundary_assignment_graph(
+    graph: &Hnsw,
+    scorer: &Fp32Scorer,
+    node_to_cell: &[u32],
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    row_fp: &[f32],
+    ef: usize,
+) -> BoundaryAssignment {
+    let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
+    // The scorer ranks in the metric's prepared space (unit-normalized for
+    // cosine, as build does via the same normalize); prepare the query the
+    // same way before the walk. `score_one` below still sees the raw
+    // `row_fp`, exactly as `boundary_assignment_fp32` does.
+    let mut query = row_fp.to_vec();
+    if metric == Metric::Cosine {
+        normalize(&mut query);
+    }
+    let mut exact: Vec<(u32, f32)> = graph
+        .search(scorer, &query, top_k, ef)
+        .into_iter()
+        .map(|(node, _)| {
+            let cell = node_to_cell[node as usize];
+            (cell, clusters.score_one(metric, cell as usize, row_fp))
+        })
+        .collect();
+    exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    exact.truncate(top_k);
+    boundary_from_ranked(clusters, metric, &exact)
+}
+
+/// Build the coarse centroid router used by the graph-routed drain assign:
+/// one HNSW over the fp32 centroids of the POPULATED cells plus the matching
+/// fp32 scorer, built ONCE per drain by the caller. Count-0 cells are skipped
+/// so the graph never surfaces an unpopulated cell the production shortlist
+/// path (`admit_shortlist` / `estimate_admit_scores_into`, both of which skip
+/// count-0) would not — a split that empties a cell would otherwise let the
+/// graph route a row into it and diverge from the exact path. Because empty
+/// cells are dropped, node id != cell id; the returned `node_to_cell` maps
+/// dense node ids back to cell ids. For cosine the centroids are
+/// unit-normalized into the graph's prepared space (queries are normalized in
+/// [`boundary_assignment_graph`]); other metrics build over the raw
+/// centroids. The returned scorer must outlive every search on the graph.
+pub(crate) fn build_coarse_router(
+    clusters: &ClusterCentroids,
+    metric: Metric,
+) -> (Fp32Scorer, Hnsw, Vec<u32>) {
+    let dim = clusters.dim as usize;
+    let n_cent = clusters.n_cent as usize;
+    let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+    let mut node_to_cell: Vec<u32> = Vec::with_capacity(n_cent);
+    for c in 0..n_cent {
+        if clusters.counts[c] == 0 {
+            continue;
+        }
+        let mut v = clusters.centroid(c).to_vec();
+        if metric == Metric::Cosine {
+            normalize(&mut v);
+        }
+        centroids.push(v);
+        node_to_cell.push(c as u32);
+    }
+    let scorer = Fp32Scorer::from_vectors(&centroids, dim, metric);
+    // Serial (deterministic) build: the coarse router decides drain-assign cell
+    // membership, and the parallel build's concurrent insert reordering shifts
+    // membership for a thin tail of boundary rows run to run, perturbing the
+    // post-drain cold-read block layout. A serial build over these few thousand
+    // centroids is negligible and makes placement reproducible.
+    let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+    (scorer, graph, node_to_cell)
+}
+
+/// Graph-routed drain assign for an encoded row: decode the Sq8+ε row once,
+/// then route through the caller-owned centroid HNSW. Same result type and
+/// placement semantics as [`boundary_assignment_encoded`], differing only in
+/// how the candidate cells are surfaced (graph walk vs. 1-bit shortlist).
+pub(crate) fn boundary_assignment_graph_encoded(
+    graph: &Hnsw,
+    scorer: &Fp32Scorer,
+    node_to_cell: &[u32],
+    clusters: &ClusterCentroids,
+    metric: Metric,
+    row: &EncodedCellRow,
+    ef: usize,
+) -> BoundaryAssignment {
+    let row_fp = dequantize_row(row, clusters.dim as usize);
+    boundary_assignment_graph(graph, scorer, node_to_cell, clusters, metric, &row_fp, ef)
+}
+
+/// Shared closure tail: primary = the FIRST ranked cell; replicas = the ranked
+/// cells within the closure distance ratio, carrying their margin to the shared
+/// Voronoi boundary. `ranked[0]` is taken as the primary verbatim (callers that
+/// want the nearest-by-score primary sort before calling); the tail after it
+/// MUST be ascending by score, since the closure loop breaks at the first cell
+/// outside the window, and MUST be at most [`REPLICA_CLOSURE_MAX_REPLICAS`]
+/// entries past the primary (the fixed replica array is not grown).
+pub(crate) fn boundary_from_ranked(
     clusters: &ClusterCentroids,
     metric: Metric,
     ranked: &[(u32, f32)],
@@ -318,7 +464,7 @@ fn boundary_from_ranked(
 }
 
 /// Dequantize one Sq8+ε residual row to fp32.
-fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
+pub(crate) fn dequantize_row(row: &EncodedCellRow, dim: usize) -> Vec<f32> {
     let mut out = vec![0f32; dim];
     dequantize_row_into(row, &mut out);
     out
@@ -809,6 +955,14 @@ pub(crate) fn fanout_prior_for_k(
     out
 }
 
+/// How far under a `k`'s own measured recall ceiling the parity-relaxed
+/// acceptance bar sits, so the knee lands on the SMALLEST near-plateau fanout
+/// rather than the widest rung (grading against the exact ceiling would only be
+/// cleared by the fanout that produced it). Small: the router's recall curve is
+/// near-flat at the plateau, so a 1pt margin distinguishes the knee from the
+/// tail without demanding the ceiling exactly.
+const PARITY_KNEE_SLACK: f64 = 0.01;
+
 /// Pick the per-`k` router fanout from a MEASURED-recall ladder — the third
 /// calibration stage's core policy, mirroring the HNSW `ef` calibrator's knee
 /// rule (`hnsw::calibrate_ef_curve`). `ladder` is a set of `(fanout, recall@k
@@ -827,20 +981,31 @@ pub(crate) fn fanout_prior_for_k(
 /// noise near the floor can otherwise invert two adjacent anchors). The ladder
 /// is expected ASCENDING in fanout; it is sorted defensively.
 ///
-/// The bar is `register_floor` (default 0.98) by design, NOT the full
+/// The starting bar is `register_floor` (default 0.98), NOT the full
 /// `target_recall`: the global-fine path's recall ceiling sits around 0.99, so
 /// grading each rung against the full target would leave every fanout short of
-/// the bar, stamp the sentinel `0` everywhere, and keep `auto` from ever
-/// engaging the graph. Whether 0.98 leaves the graph at recall parity with the
-/// stamped grid is a tracked follow-up (infino#714); this policy deliberately
-/// keeps the 0.98 acceptance bar until then.
+/// the bar and stamp the sentinel everywhere. But an absolute bar over-rejects
+/// on its own: the router reads the SAME Sq16 codes as the stamped grid, so it
+/// shares the grid's within-cell recall ceiling, and on hard/high-dim data that
+/// ceiling sits below 0.98 (measured laion-100M: the router plateaus ~0.973,
+/// the grid it replaces serves ~0.975). Grading the router against a bar its
+/// shared codec cannot reach would reject it AT PARITY with the grid. So the
+/// per-`k` bar relaxes toward that `k`'s OWN measured ceiling (its widest-rung
+/// recall, minus [`PARITY_KNEE_SLACK`] so the smallest near-plateau fanout is
+/// taken, not the widest), bounded to at most `parity_gap` below
+/// `register_floor` — a genuinely collapsed router (ceiling far under the floor)
+/// still fails to clear the bounded bar and stays the sentinel. `parity_gap = 0`
+/// restores the pre-parity absolute-floor behaviour. This is the same
+/// codec-set-ceiling reasoning that gives the flat plane its own lower floor.
 ///
 /// [`CellRoutingParams::fanout_for_k_at`]: crate::supertable::manifest::list::CellRoutingParams::fanout_for_k_at
 pub(crate) fn fanout_knee_from_recalls(
     ladder: &[(u32, [f64; WIDTH_LAW_KS.len()])],
     register_floor: f64,
+    parity_gap: f64,
 ) -> [u32; WIDTH_LAW_KS.len()] {
     let floor = register_floor.max(0.0);
+    let gap = parity_gap.max(0.0);
     let mut rungs: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder.to_vec();
     rungs.sort_by_key(|(f, _)| *f);
     let mut out = [0u32; WIDTH_LAW_KS.len()];
@@ -858,15 +1023,19 @@ pub(crate) fn fanout_knee_from_recalls(
             *slot = 0;
             continue;
         }
-        // Smallest fanout whose measured recall@k clears the graceful floor.
         // A finite floor of 0 is cleared by the first rung.
         if floor <= 0.0 {
             *slot = rungs.first().map(|(f, _)| *f).unwrap_or(0);
             continue;
         }
+        // Parity-relaxed bar: drop toward this `k`'s own ceiling (`best`), a
+        // knee-slack under it, but never more than `gap` below the absolute
+        // floor. With `gap == 0` this is exactly `floor` (the old behaviour).
+        let eff_floor = floor.min(best - PARITY_KNEE_SLACK).max(floor - gap);
+        // Smallest fanout whose measured recall@k clears the (relaxed) bar.
         *slot = rungs
             .iter()
-            .find(|(_, recall_by_k)| recall_by_k[ki] >= floor)
+            .find(|(_, recall_by_k)| recall_by_k[ki] >= eff_floor)
             .map(|(f, _)| *f)
             .unwrap_or(0);
     }
@@ -880,11 +1049,67 @@ pub(crate) fn fanout_knee_from_recalls(
 /// the prefix INCLUDING its own bin — rank error is bounded by one bin's
 /// occupancy and always over-counts (a wider law, never a narrower one).
 const RERANK_LAW_EST_BINS: usize = 4096;
-/// Fixed seed for the calibration reservoir, so a re-drained identical
+/// Fixed seed for the calibration query min-hash, so a re-drained identical
 /// corpus stamps an identical law.
 const WIDTH_LAW_SAMPLE_SEED: u64 = 0x51ED_CA1B;
 /// Rows decoded per chunk while scoring a spilled cell.
 const WIDTH_LAW_SCORE_CHUNK: usize = 1024;
+/// Per-query survivor cap for the 1-bit-gated width sweep's pass-1 shortlist.
+/// Pass 1 keeps the top-CAP rows by 1-bit estimate per query; pass 2 exact-
+/// rescores only those. The cap must comfortably exceed each query's exact
+/// top-`WIDTH_LAW_MAX_K` survivor budget (the measured `rerank_for_k`, which
+/// grows ~sqrt(N)); set generously here and validated by law-parity against
+/// the exhaustive sweep. Bounds pass-1 memory at `Q * CAP` candidates.
+const WIDTH_LAW_SHORTLIST_CAP: usize = 8192;
+
+/// Deterministic content hash of a decoded query vector — FNV-1a over the
+/// float bits, salted by [`WIDTH_LAW_SAMPLE_SEED`]. Depends only on the
+/// vector's contents, so it is invariant to the order rows are offered.
+fn width_law_query_hash(vec: &[f32]) -> u64 {
+    let mut h = WIDTH_LAW_SAMPLE_SEED ^ 0x1405_7B7E_F767_814F;
+    for &v in vec {
+        h = (h ^ v.to_bits() as u64).wrapping_mul(0x0100_0000_01B3);
+    }
+    h ^ (h >> 29)
+}
+
+/// One calibration-query candidate, kept by content min-hash so the sampled
+/// query set is a deterministic function of the offered rows' CONTENT — not
+/// of the order they were offered. The drain streams rows to the calibrator
+/// in an order that varies run to run (materialization/enumeration is not
+/// order-stable), which shifts a position-based reservoir sample and
+/// destabilizes the stamped law even though the corpus is identical.
+/// [`WidthLawCalibration`] keeps the [`WIDTH_LAW_QUERY_SAMPLE`] smallest-hash
+/// candidates in a bounded max-heap (each `pop` evicts the largest hash).
+/// Ties break on the vector bytes so distinct vectors that collide stay
+/// deterministic; the stable id is NOT a tie-break — it is a per-run
+/// snowflake, and two content-identical rows are interchangeable as queries.
+struct QueryCand {
+    hash: u64,
+    vec: Vec<f32>,
+    id: i128,
+}
+impl PartialEq for QueryCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for QueryCand {}
+impl PartialOrd for QueryCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for QueryCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.hash.cmp(&other.hash).then_with(|| {
+            self.vec
+                .iter()
+                .map(|v| v.to_bits())
+                .cmp(other.vec.iter().map(|v| v.to_bits()))
+        })
+    }
+}
 
 /// Frozen query sample: dequantized fp32 vectors + their stable ids
 /// (self-hit exclusion while scoring).
@@ -922,10 +1147,10 @@ struct WidthLawQueries {
 pub(crate) struct WidthLawCalibration {
     dim: usize,
     metric: Metric,
-    reservoir: Reservoir,
-    /// Stable id of each reservoir slot, kept in lockstep through
-    /// [`Reservoir::update_traced`].
-    slot_ids: Vec<i128>,
+    /// Bounded content min-hash of offered rows: the [`WIDTH_LAW_QUERY_SAMPLE`]
+    /// smallest-hash candidates (see [`QueryCand`]). Order-independent, so the
+    /// sampled query set — and the stamped law — is reproducible run to run.
+    query_cands: std::collections::BinaryHeap<QueryCand>,
     dequant_scratch: Vec<f32>,
     frozen: Option<WidthLawQueries>,
     /// Per-query `(score, cell, stable id)` candidates, truncated to the
@@ -936,6 +1161,13 @@ pub(crate) struct WidthLawCalibration {
     /// propagated: each merge is an atomic append+truncate, so a panicked
     /// pack worker leaves the held data usable.
     tops: Mutex<Vec<Vec<(f32, u32, i128, f32)>>>,
+    /// 1-bit-gated width sweep, pass-1 shortlist: per query, the top
+    /// `WIDTH_LAW_SHORTLIST_CAP` `(estimate, cell, stable id)` candidates by
+    /// 1-bit estimate. Pass 2 ([`Self::score_survivors`]) exact-rescores only
+    /// these into `tops`, so the exhaustive O(N * Q) fp32 sweep collapses to a
+    /// cheap O(N * Q) estimate pass plus an O(shortlist * Q) exact pass. Empty
+    /// unless the gated path is armed; the exact path leaves it untouched.
+    est_tops: Mutex<Vec<BinaryHeap<Reverse<EstCand>>>>,
     /// `(query index, stable id, cell) -> fine-centroid rank` of that
     /// candidate's fine cluster within THAT cell, recorded by
     /// [`Self::observe_shard_views`] after each shard is packed (fine
@@ -966,6 +1198,14 @@ pub(crate) struct WidthLawCalibration {
     /// Rerank-law observation state, armed by [`Self::freeze`]; `None`
     /// (e.g. planted test fixtures) measures no rerank law.
     rerank: Option<RerankLawObservation>,
+    /// Per-query centroid-router prefix pools — the nearest SELECTED rows
+    /// (each tagged with its fine cluster's router selection rank), filled by
+    /// [`Self::score_slice`] on the SAME scan that measures width/fine/rerank
+    /// and read by [`Self::finish`] to derive the fanout law. Only the
+    /// compaction recalibration arms these (via a [`FanoutScoreCtx`] passed to
+    /// [`Self::score_rows`]); the drain leaves them empty. Lock poisoning is
+    /// recovered like [`Self::tops`].
+    prefix_pools: Mutex<Vec<BinaryHeap<PrefixCand>>>,
 }
 
 /// Streaming state for the rerank law: per query, the 1-bit-encoded query
@@ -976,6 +1216,12 @@ pub(crate) struct WidthLawCalibration {
 /// [`finish`]: WidthLawCalibration::finish
 struct RerankLawObservation {
     quant: BitQuantizer,
+    /// One FastScan LUT per query (folded from `q_rot`), so the 1-bit-gated
+    /// width sweep's pass-1 shortlist scores 64 rows per SIMD permute instead
+    /// of one scalar estimate per (row, query). Empty when the FastScan path is
+    /// unsupported on this target, or a query's LUT overflows i16 — the pass-1
+    /// scalar fallback covers both.
+    luts: Vec<LutQuery>,
     /// Flat `n_queries x dim` rotated queries.
     q_rot: Vec<f32>,
     /// Per query `Σ q_rot[d]` — the estimator's per-query identity term.
@@ -1018,6 +1264,11 @@ pub(crate) struct CalibratedLaws {
     /// against — the stamp records it so a later, wider law knows
     /// whether the budget's evidence still covers it.
     pub(crate) pool_cells: u32,
+    /// Centroid-router per-`k` fanout knee, measured by real recall on the
+    /// SAME scan (prefix pools) when a [`FanoutCalibCtx`] is supplied to
+    /// [`WidthLawCalibration::finish`]; all-zero (sentinel) otherwise — the
+    /// drain leaves it uncalibrated and the recalibration stamps it.
+    pub(crate) fanout_for_k: [u32; WIDTH_LAW_KS.len()],
 }
 
 #[cfg(test)]
@@ -1092,7 +1343,10 @@ mod pool_hint_tests {
         // (0.985); k=1000 never clears (max 0.97 < 0.98) → sentinel 0. The
         // monotone floor then lifts nothing (0 stays 0; the sequence is
         // already non-decreasing 64,256,1024).
-        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [64, 256, 1024, 0]);
+        assert_eq!(
+            fanout_knee_from_recalls(&ladder, 0.98, 0.0),
+            [64, 256, 1024, 0]
+        );
     }
 
     /// A ladder whose recall plateaus below the floor at every anchor — even at
@@ -1107,7 +1361,7 @@ mod pool_hint_tests {
             // Widest rung still short of floor 0.98 at every anchor.
             (512, [0.94, 0.92, 0.88, 0.70]),
         ];
-        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98), [0, 0, 0, 0]);
+        assert_eq!(fanout_knee_from_recalls(&ladder, 0.98, 0.0), [0, 0, 0, 0]);
     }
 
     /// The stamped knee may EXCEED the old `width × fine` prior — reading more
@@ -1123,7 +1377,7 @@ mod pool_hint_tests {
             (32u32, [0.99, 0.90, 0.80, 0.70]),
             (512, [0.999, 0.99, 0.95, 0.90]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
         assert_eq!(knee[1], 512, "measured recall pushes k=10 well past W×F=32");
         assert!(
             knee[1] > prior[1],
@@ -1141,7 +1395,7 @@ mod pool_hint_tests {
             (64u32, [0.99, 0.97, 0.99, 0.60]),
             (256, [0.999, 0.99, 0.995, 0.75]),
         ];
-        let knee = fanout_knee_from_recalls(&ladder, 0.98);
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
         // k=1→64, k=10→256, k=100 measured 64 but floored up to 256, k=1000→0.
         assert_eq!(knee, [64, 256, 256, 0]);
     }
@@ -1158,10 +1412,152 @@ mod pool_hint_tests {
             (64, [0.999, 0.99, 0.0, 0.0]),
         ];
         // Degenerate floor: a register floor of 0 clears the first supported rung.
-        let knee = fanout_knee_from_recalls(&ladder, 0.0);
+        let knee = fanout_knee_from_recalls(&ladder, 0.0, 0.0);
         // Supported anchors clear at the first rung (floor 0); unsupported ones
         // (all-zero recall) stay 0 despite the collapsed floor.
         assert_eq!(knee, [16, 16, 0, 0]);
+    }
+
+    /// The measured laion-100M ladder: the router's recall@10 plateaus at
+    /// ~0.973, BELOW the absolute 0.98 floor, because it shares the stamped
+    /// grid's within-cell Sq16 ceiling (the grid it replaces serves ~0.975).
+    /// The parity relaxation drops the k=10 bar toward that ceiling, so the
+    /// knee stamps a real fanout (~1024) instead of the sentinel — the graph
+    /// engages at parity with the grid.
+    #[test]
+    fn fanout_knee_parity_engages_at_codec_ceiling() {
+        // recall@10 column = the measured laion-100M sweep: 512→0.9521,
+        // 1024→0.9655, 2048→0.9713, 4096→0.9732 (all < 0.98).
+        let ladder = [
+            (512u32, [0.970, 0.9521, 0.930, 0.0]),
+            (1024, [0.980, 0.9655, 0.945, 0.0]),
+            (2048, [0.985, 0.9713, 0.955, 0.0]),
+            (4096, [0.988, 0.9732, 0.960, 0.0]),
+        ];
+        // Absolute floor 0.98, parity gap 0.03 (the shipped default).
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.03);
+        // k=10 relaxes to ~0.9632 (ceiling 0.9732 − 0.01 slack) and stamps the
+        // smallest fanout clearing it, 1024 (0.9655). k=100 relaxes to 0.95 and
+        // stamps 2048; k=1 clears near the absolute floor at 1024; k=1000 stays
+        // the sentinel.
+        assert_eq!(knee, [1024, 1024, 2048, 0]);
+    }
+
+    /// `parity_gap = 0` is the pre-parity behaviour: the same below-floor laion
+    /// ladder stamps the sentinel at k=10 (recall never reaches the absolute
+    /// 0.98), so `auto` would decline the graph — the exact gap the parity
+    /// relaxation closes.
+    #[test]
+    fn fanout_knee_parity_gap_zero_keeps_absolute_floor() {
+        let ladder = [
+            (512u32, [0.970, 0.9521, 0.930, 0.0]),
+            (1024, [0.980, 0.9655, 0.945, 0.0]),
+            (2048, [0.985, 0.9713, 0.955, 0.0]),
+            (4096, [0.988, 0.9732, 0.960, 0.0]),
+        ];
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.0);
+        // Only k=1 (0.980 at 1024) clears the absolute floor; k=10/k=100 plateau
+        // below it and stay the sentinel.
+        assert_eq!(knee, [1024, 0, 0, 0]);
+    }
+
+    /// The parity relaxation is bounded: a router whose recall COLLAPSES far
+    /// below the floor (a broken graph, not a codec ceiling) still fails to
+    /// clear `floor − parity_gap` at every rung and stays the sentinel, so
+    /// `auto` declines it.
+    #[test]
+    fn fanout_knee_parity_still_rejects_collapsed_router() {
+        let ladder = [
+            (64u32, [0.70, 0.60, 0.50, 0.0]),
+            (512, [0.85, 0.80, 0.70, 0.0]),
+        ];
+        // Even with the parity gap, the ceiling (~0.85) is far under
+        // `floor − gap` (0.95), so nothing clears and every anchor is sentinel.
+        let knee = fanout_knee_from_recalls(&ladder, 0.98, 0.03);
+        assert_eq!(knee, [0, 0, 0, 0]);
+    }
+
+    /// The nested-prefix evaluation ([`recall_by_fanout_for_query`]) gives the
+    /// SAME per-fanout recall as re-selecting + reading each fanout separately:
+    /// recall at fanout `F` uses exactly the pool rows whose cluster rank `< F`
+    /// (a prefix of one ranked read), takes the `k` nearest DISTINCT, and
+    /// intersects the truth. This is the crux of the scale-safe redesign — one
+    /// read, all rungs — so it is checked against a hand-computed reference AND
+    /// an independent "separate reads" reference on the same fixture.
+    #[test]
+    fn nested_prefix_recall_matches_separate_per_fanout() {
+        let pc = |dist: f32, rank: u32, sid: i128| PrefixCand { dist, rank, sid };
+        // Rows tagged (dist, cluster rank, stable id). Ranks: cluster 0 nearest.
+        // sid 11 is a false positive (not in the truth); sid 1 also appears as a
+        // boundary REPLICA at rank 2 (must collapse to one truth slot).
+        let pool = vec![
+            pc(0.10, 0, 1),
+            pc(0.20, 0, 2),
+            pc(0.30, 1, 3),
+            pc(0.35, 1, 11),
+            pc(0.40, 2, 4),
+            pc(0.15, 2, 1), // replica of sid 1, farther-ranked cluster
+        ];
+        // Exact top-10 truth (nearest first); sids 1..=10 are the true neighbours.
+        let gt: Vec<i128> = (1..=10).collect();
+        let ladder = [1u32, 2, 3];
+
+        // Reference: "run each fanout separately" — for fanout F, take only rows
+        // from clusters with rank < F, dedup by stable id keeping the nearest,
+        // sort by distance, take k, intersect the truth.
+        let separate = |fanout: u32, k: usize| -> f64 {
+            let mut rows: Vec<PrefixCand> =
+                pool.iter().copied().filter(|c| c.rank < fanout).collect();
+            rows.sort_by(|a, b| a.dist.total_cmp(&b.dist));
+            let mut seen = HashSet::new();
+            let got: HashSet<i128> = rows
+                .iter()
+                .filter(|c| seen.insert(c.sid))
+                .take(k)
+                .map(|c| c.sid)
+                .collect();
+            let truth: HashSet<i128> = gt[..k].iter().copied().collect();
+            truth.iter().filter(|t| got.contains(t)).count() as f64 / k as f64
+        };
+
+        let got = recall_by_fanout_for_query(&pool, &gt, &ladder, 100);
+        let k1 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 1)
+            .expect("k=1 anchor");
+        let k10 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 10)
+            .expect("k=10 anchor");
+        // Hand-computed expectations.
+        //   F=1 (rank<1 → {1,2}):        recall@1 = 1.0,  recall@10 = 2/10
+        //   F=2 (rank<2 → {1,2,3,11}):   recall@1 = 1.0,  recall@10 = 3/10 (11 excluded)
+        //   F=3 (rank<3 → {1,2,3,11,4}): recall@1 = 1.0,  recall@10 = 4/10 (replica of 1 collapses)
+        let expect = [(1.0, 0.2), (1.0, 0.3), (1.0, 0.4)];
+        for (fi, &fanout) in ladder.iter().enumerate() {
+            let r1 = got[fi][k1].expect("recall@1 measured");
+            let r10 = got[fi][k10].expect("recall@10 measured");
+            assert!((r1 - expect[fi].0).abs() < 1e-9, "F={fanout} recall@1");
+            assert!((r10 - expect[fi].1).abs() < 1e-9, "F={fanout} recall@10");
+            // Prefix evaluation == independent per-fanout evaluation.
+            assert!(
+                (r1 - separate(fanout, 1)).abs() < 1e-9,
+                "F={fanout} k=1 vs separate"
+            );
+            assert!(
+                (r10 - separate(fanout, 10)).abs() < 1e-9,
+                "F={fanout} k=10 vs separate"
+            );
+        }
+        // Anchors deeper than the measured max stay unmeasured (→ sentinel).
+        let k1000 = WIDTH_LAW_KS
+            .iter()
+            .position(|&k| k == 1000)
+            .expect("k=1000 anchor");
+        assert!(
+            got.iter().all(|arr| arr[k1000].is_none()),
+            "k=1000 is never measured (> ROUTER_CALIB_MAX_ANCHOR)"
+        );
     }
 }
 
@@ -1223,6 +1619,204 @@ fn floor_monotone(law: &mut [u32; WIDTH_LAW_KS.len()]) {
     }
 }
 
+// ---------- Centroid-router fanout law (measured on the SAME scan) ----------
+
+/// Deepest `k` the router fanout is calibrated at. Anchors above this (only
+/// `k = 1000` in [`WIDTH_LAW_KS`]) stay the sentinel `0`: the fanout to serve
+/// recall@1000 would be near the whole corpus, and computing a top-1000 ground
+/// truth over the full plane deepens the exact scan for a `k` the router does
+/// not usefully serve. So the fanout is measured at `k ∈ {1, 10, 100}` and the
+/// deepest anchor is left uncalibrated (the reader falls back to the constant
+/// there).
+pub(crate) const ROUTER_CALIB_MAX_ANCHOR: usize = 100;
+
+/// Headroom over the calibrated depth for the per-query PREFIX candidate pool:
+/// enough of each query's nearest SELECTED rows are kept (by exact distance,
+/// tagged with their cluster's selection rank) that the top-`k` distinct
+/// survivors of every fanout prefix — the nearest clusters dominate, so their
+/// rows sit at the front of this pool — are retained before the stable-id dedup.
+pub(crate) const PREFIX_POOL_HEADROOM: usize = 16;
+
+/// A PREFIX candidate: a selected row's exact distance, the SELECTION RANK of
+/// the fine cluster it came from (0 = the query's nearest selected centroid),
+/// and its stable id. Recall at fanout `F` uses only the rows whose cluster
+/// rank is `< F` — a prefix over the one ranked read. Ordered by distance so a
+/// bounded max-heap keeps the nearest and evicts the farthest.
+#[derive(Clone, Copy)]
+pub(crate) struct PrefixCand {
+    pub(crate) dist: f32,
+    pub(crate) rank: u32,
+    pub(crate) sid: i128,
+}
+impl PartialEq for PrefixCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for PrefixCand {}
+impl PartialOrd for PrefixCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for PrefixCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then(self.rank.cmp(&other.rank))
+            .then(self.sid.cmp(&other.sid))
+    }
+}
+
+/// Push `cand` into a bounded max-heap that keeps the `cap` NEAREST prefix
+/// candidates: grow until full, then replace the current farthest only when
+/// `cand` ranks ahead of it. The comparison is the full [`PrefixCand`] order
+/// (`dist`, then `rank`, then `sid`), not `dist` alone, so a distance tie at
+/// the cap boundary resolves deterministically — the parallel per-cell merge
+/// reaches this in nondeterministic order, and a `dist`-only test would keep
+/// whichever replica arrived first. On a tie it keeps the smaller-`rank`
+/// replica: the fanout at which the router first surfaces that row.
+fn prefix_push(heap: &mut BinaryHeap<PrefixCand>, cand: PrefixCand, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if heap.len() < cap {
+        heap.push(cand);
+    } else if let Some(top) = heap.peek()
+        && cand < *top
+    {
+        heap.pop();
+        heap.push(cand);
+    }
+}
+
+/// Keep the ascending-best `cap` prefix candidates in place.
+fn truncate_prefix_ascending(cand: &mut Vec<PrefixCand>, cap: usize) {
+    if cand.len() > cap {
+        cand.sort_unstable();
+        cand.truncate(cap);
+    }
+}
+
+/// Ascending candidate fanouts to measure recall at, seeded around the grid's
+/// `width × fine` prior but NOT capped by it — a doubling ladder from 1 up to
+/// (and including) `max_fanout`, with the prior and its neighbours injected for
+/// resolution near the expected knee. `max_fanout` (the calibration ceiling,
+/// `centroid_graph_max_fanout`, NOT the total cluster count) is the last rung:
+/// if recall does not clear the target by it, the calibration stamps the
+/// sentinel. Reading more fine clusters than the grid's `W × F` is still
+/// cheaper than the grid's whole-cell reads, so the ladder deliberately climbs
+/// past the prior (the old proxy's cap under-stamped exactly here).
+fn router_fanout_ladder(prior_max: usize, max_fanout: usize) -> Vec<usize> {
+    let total = max_fanout.max(1);
+    let mut rungs: Vec<usize> = Vec::new();
+    let mut f = 1usize;
+    while f < total {
+        rungs.push(f);
+        f = f.saturating_mul(2);
+    }
+    rungs.push(total);
+    for extra in [prior_max / 2, prior_max, prior_max.saturating_mul(2)] {
+        if (1..=total).contains(&extra) {
+            rungs.push(extra);
+        }
+    }
+    rungs.sort_unstable();
+    rungs.dedup();
+    rungs.retain(|&r| (1..=total).contains(&r));
+    rungs
+}
+
+/// Recall@`k` at each fanout for ONE query, evaluated as nested PREFIXES over a
+/// single ranked read — this is the crux of the scale-safe design. `pool` holds
+/// the query's nearest selected rows, each tagged with its fine cluster's
+/// selection rank; `gt[..k]` is the exact top-`k` truth. For fanout `F` the
+/// served path would read only the top-`F` clusters, so recall at `F` uses only
+/// pool rows with `rank < F` (a prefix), takes the `k` nearest DISTINCT of
+/// those (stable-id dedup, matching the served collapse), and intersects the
+/// truth. Reading once and cutting prefixes gives the SAME per-fanout recall as
+/// re-selecting + re-reading each fanout separately, without the per-rung cold
+/// re-read that made the sweep non-terminating at 100M. Anchors deeper than
+/// `measured_anchor_max` (or than the computed truth) return `None`
+/// (uncalibrated → sentinel).
+fn recall_by_fanout_for_query(
+    pool: &[PrefixCand],
+    gt: &[i128],
+    ladder: &[u32],
+    measured_anchor_max: usize,
+) -> Vec<[Option<f64>; WIDTH_LAW_KS.len()]> {
+    // One ascending-by-distance ordering of the pool, reused for every fanout.
+    let mut ordered: Vec<PrefixCand> = pool.to_vec();
+    ordered.sort_unstable();
+    ladder
+        .iter()
+        .map(|&fanout| {
+            // Prefix: distinct nearest stable ids whose cluster rank < fanout.
+            let mut seen: HashSet<i128> = HashSet::new();
+            let mut ranked_ids: Vec<i128> = Vec::new();
+            for c in &ordered {
+                if c.rank < fanout && seen.insert(c.sid) {
+                    ranked_ids.push(c.sid);
+                }
+            }
+            let mut out = [None; WIDTH_LAW_KS.len()];
+            for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
+                if k > measured_anchor_max || k > gt.len() {
+                    continue;
+                }
+                let truth: HashSet<i128> = gt[..k].iter().copied().collect();
+                let got: HashSet<i128> = ranked_ids.iter().copied().take(k).collect();
+                let hit = truth.iter().filter(|t| got.contains(t)).count();
+                out[ki] = Some(hit as f64 / k as f64);
+            }
+            out
+        })
+        .collect()
+}
+
+/// Everything [`WidthLawCalibration::finish`] needs to also derive the
+/// centroid-router fanout law from the prefix pools filled during the shared
+/// scan. Absent (`None`) on the drain path, which does not calibrate the router
+/// fanout — only the compaction recalibration (where the router graph is cheap
+/// to build over the settled fine centroids) passes it.
+pub(crate) struct FanoutCalibCtx {
+    /// Router node count = the total selectable fine clusters (the prior clamp
+    /// and the fanout ceiling both key off it).
+    pub(crate) total_fine: u32,
+    /// Ladder ceiling (`centroid_graph_max_fanout`, clamped to `total_fine`) —
+    /// the deepest fanout rung measured.
+    pub(crate) max_fanout: usize,
+    /// Router acceptance floor (`hnsw_register_floor`).
+    pub(crate) register_floor: f64,
+    /// Parity relaxation below the floor (`centroid_graph_parity_gap`).
+    pub(crate) parity_gap: f64,
+    /// Corpus rows the scan covered — caps the deepest calibrated anchor.
+    pub(crate) n_rows: usize,
+}
+
+/// Per-scoring-call fanout inputs threaded into [`WidthLawCalibration::score_rows`]:
+/// the cell's global flat-cluster base (so `flat = flat_base + row.cluster`),
+/// the per-query selected-cluster → rank map for THIS superfile, and the prefix
+/// pool cap. `None` on the drain / width-only path.
+pub(crate) struct FanoutScoreCtx<'a> {
+    pub(crate) flat_base: u32,
+    /// `selection[qi]` maps this superfile's selected flat clusters → the
+    /// router's ascending-distance selection rank for query `qi`.
+    pub(crate) selection: &'a [HashMap<u32, u32>],
+    pub(crate) prefix_cap: usize,
+}
+
+/// The mutable per-cell accumulators [`WidthLawCalibration::score_slice`]
+/// appends into: the width/rerank candidate partials, the estimate-histogram
+/// deltas, and (only when the fanout is being calibrated) the prefix-pool
+/// partials. Bundled so the scoring core stays under the argument limit.
+struct ScoreSink<'a> {
+    partial: &'a mut [Vec<(f32, u32, i128, f32)>],
+    hist_local: &'a mut HashMap<usize, Vec<u64>>,
+    /// Empty when the fanout is not being calibrated.
+    prefix_partial: &'a mut [Vec<PrefixCand>],
+}
+
 impl WidthLawCalibration {
     pub(crate) fn new(dim: usize, metric: Metric, target_recall: f64) -> Self {
         // The target arrives from user YAML, so validate it here rather than
@@ -1255,29 +1849,48 @@ impl WidthLawCalibration {
         Self {
             dim,
             metric,
-            reservoir: Reservoir::new(WIDTH_LAW_QUERY_SAMPLE, dim, WIDTH_LAW_SAMPLE_SEED),
-            slot_ids: Vec::with_capacity(WIDTH_LAW_QUERY_SAMPLE),
+            query_cands: std::collections::BinaryHeap::with_capacity(WIDTH_LAW_QUERY_SAMPLE + 1),
             dequant_scratch: vec![0f32; dim],
             frozen: None,
             tops: Mutex::new(Vec::new()),
+            est_tops: Mutex::new(Vec::new()),
             fine_ranks: Mutex::new(HashMap::new()),
             max_fine: AtomicU32::new(0),
             pool_cells: RERANK_LAW_POOL_CELLS,
             target_recall,
             rerank: None,
+            prefix_pools: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The frozen calibration queries as a flat `n_queries × dim` fp32 buffer
+    /// (raw dequantized reservoir rows), or `None` before [`Self::freeze`]. The
+    /// recalibration uses these to build the router's per-query fine-cluster
+    /// selection (on jittered copies) without re-sampling the corpus.
+    pub(crate) fn frozen_queries(&self) -> Option<&[f32]> {
+        self.frozen.as_ref().map(|f| f.queries.as_slice())
     }
 
     /// Offer one spilled row as a calibration-query candidate.
     pub(crate) fn offer(&mut self, row: &MaterializedIvfRow) {
         debug_assert!(self.frozen.is_none(), "offer after freeze");
         dequantize_row_into(&row.encoded, &mut self.dequant_scratch);
-        if let Some(slot) = self.reservoir.update_traced(&self.dequant_scratch) {
-            if slot == self.slot_ids.len() {
-                self.slot_ids.push(row.stable_id);
-            } else {
-                self.slot_ids[slot] = row.stable_id;
-            }
+        let hash = width_law_query_hash(&self.dequant_scratch);
+        // Keep the WIDTH_LAW_QUERY_SAMPLE smallest-hash candidates. Skip the
+        // clone when the heap is full and this row's hash can't beat the
+        // current largest (its top); otherwise push and evict the max.
+        if self.query_cands.len() >= WIDTH_LAW_QUERY_SAMPLE
+            && self.query_cands.peek().map(|t| t.hash).unwrap_or(u64::MAX) < hash
+        {
+            return;
+        }
+        self.query_cands.push(QueryCand {
+            hash,
+            vec: self.dequant_scratch.clone(),
+            id: row.stable_id,
+        });
+        if self.query_cands.len() > WIDTH_LAW_QUERY_SAMPLE {
+            self.query_cands.pop();
         }
     }
 
@@ -1294,10 +1907,26 @@ impl WidthLawCalibration {
         self.pool_cells = pool_cells
             .max(RERANK_LAW_POOL_CELLS)
             .min((grid.n_cent as usize).max(1));
-        let queries = self.reservoir.sample().to_vec();
-        let ids = self.slot_ids.clone();
+        // Drain the min-hash candidates in ascending (hash, bytes) order — an
+        // order-independent query set the sampler produces identically for any
+        // offer order over the same rows.
+        let mut cands: Vec<QueryCand> = std::mem::take(&mut self.query_cands).into_vec();
+        cands.sort_unstable();
+        let mut queries: Vec<f32> = Vec::with_capacity(cands.len() * self.dim);
+        let mut ids: Vec<i128> = Vec::with_capacity(cands.len());
+        for c in &cands {
+            queries.extend_from_slice(&c.vec);
+            ids.push(c.id);
+        }
         let n_queries = ids.len();
         *self.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![Vec::new(); n_queries];
+        *self.est_tops.lock().unwrap_or_else(PoisonError::into_inner) =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
+        *self
+            .prefix_pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
         if n_queries > 0 && grid.n_cent > 0 {
             let rotation = RandomRotation::new(self.dim, rot_seed);
             let mut q_rot = vec![0f32; n_queries * self.dim];
@@ -1318,8 +1947,19 @@ impl WidthLawCalibration {
                 pool.sort_unstable();
                 pools.push(pool);
             }
+            // Fold each rotated query into a FastScan LUT once (pass-1 shortlist
+            // scores 64 rows/permute against these). Empty when unsupported on
+            // this target; the scalar pass-1 fallback covers that.
+            let luts: Vec<LutQuery> = if lut_scan_supported() {
+                (0..n_queries)
+                    .map(|qi| LutQuery::new(&q_rot[qi * self.dim..(qi + 1) * self.dim]))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             self.rerank = Some(RerankLawObservation {
                 quant: BitQuantizer::new(self.dim),
+                luts,
                 q_rot,
                 q_total,
                 q_l1,
@@ -1346,33 +1986,45 @@ impl WidthLawCalibration {
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        // The drain never calibrates the router fanout (no `FanoutScoreCtx`),
+        // so the prefix partials stay empty here.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = Vec::new();
         let mut reader = spill.reader()?;
         let mut remaining = spill.n_rows();
         let mut scratch = vec![0f32; self.dim];
         while remaining > 0 {
             let chunk = reader.next_chunk(WIDTH_LAW_SCORE_CHUNK.min(remaining))?;
             remaining -= chunk.len();
+            let mut sink = ScoreSink {
+                partial: &mut partial,
+                hist_local: &mut hist_local,
+                prefix_partial: &mut prefix_partial,
+            };
             self.score_slice(
                 frozen,
                 cell,
                 &chunk,
                 &members,
                 &mut scratch,
-                &mut partial,
-                &mut hist_local,
+                &mut sink,
+                None,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(partial, hist_local, None);
         Ok(())
     }
 
-    /// [`Self::score_cell`] for already-materialized rows: the compaction
-    /// recalibration pass reads live rows back from stored superfiles
-    /// (no spill exists), then scores them through the same core.
+    /// [`Self::score_cell`] for already-materialized rows: an exhaustive fp32
+    /// score of every row through the same core. The recalibration sweep now
+    /// gates with the cheap 1-bit estimate (`shortlist_rows` + `score_survivors`)
+    /// instead; this exhaustive path is retained as the reference oracle the
+    /// gate's law-parity test scores against.
+    #[cfg(test)]
     pub(crate) fn score_rows(
         &self,
         cell: u32,
         rows: &[MaterializedIvfRow],
+        fanout: Option<&FanoutScoreCtx>,
     ) -> Result<(), BuildError> {
         let Some(frozen) = self.frozen.as_ref() else {
             return Err(BuildError::Store(
@@ -1386,20 +2038,363 @@ impl WidthLawCalibration {
         let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
         let members = self.pool_members(cell);
         let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        // Prefix pools are collected only when the caller calibrates the router
+        // fanout on this scan; otherwise the slice never touches them.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = if fanout.is_some() {
+            vec![Vec::new(); n_queries]
+        } else {
+            Vec::new()
+        };
         let mut scratch = vec![0f32; self.dim];
         for chunk in rows.chunks(WIDTH_LAW_SCORE_CHUNK) {
+            let mut sink = ScoreSink {
+                partial: &mut partial,
+                hist_local: &mut hist_local,
+                prefix_partial: &mut prefix_partial,
+            };
             self.score_slice(
                 frozen,
                 cell,
                 chunk,
                 &members,
                 &mut scratch,
-                &mut partial,
-                &mut hist_local,
+                &mut sink,
+                fanout,
             );
         }
-        self.merge_partial(partial, hist_local);
+        self.merge_partial(
+            partial,
+            hist_local,
+            fanout.map(|ctx| (prefix_partial, ctx.prefix_cap)),
+        );
         Ok(())
+    }
+
+    /// Pass 1 of the 1-bit-gated width sweep: score every row's 1-bit estimate
+    /// against ALL frozen queries (cheap XOR+popcount, no fp32 rescore) and
+    /// keep, per query, the top-[`WIDTH_LAW_SHORTLIST_CAP`] `(estimate, cell,
+    /// stable id)` survivors. Also feeds the rerank-law histogram over pooled
+    /// queries, exactly as [`Self::score_slice`] does, so the rerank budget is
+    /// measured on the full estimate distribution (not just survivors). The
+    /// exact top-k the width law needs is produced by [`Self::score_survivors`]
+    /// (pass 2) rescoring only the survivors. Requires the rerank machinery
+    /// (rotated queries + quantizer); with it absent the caller must use the
+    /// exhaustive [`Self::score_rows`] path instead.
+    ///
+    /// A row whose 1-bit code is missing or yields a non-finite estimate is
+    /// admitted to every query's shortlist with an `INFINITY` key
+    /// (conservative — pass 2 places it by exact distance): such unrankable
+    /// rows sort ahead of every finite estimate and so survive eviction as
+    /// long as a query's unrankable count stays within
+    /// `WIDTH_LAW_SHORTLIST_CAP`. Only if a single query accumulates more than
+    /// CAP unrankable candidates (pervasive code corruption) can the cap-bounded
+    /// heap evict some by their `(cell, id)` tie-break — the one case the gate
+    /// can drop a row the exhaustive path would have scored; the wide CAP keeps
+    /// this far outside normal corpora.
+    pub(crate) fn shortlist_rows(&self, cell: u32, rows: &[MaterializedIvfRow]) {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let n_queries = frozen.ids.len();
+        let Some(rl) = self.rerank.as_ref() else {
+            return;
+        };
+        if n_queries == 0 {
+            return;
+        }
+        let members = self.pool_members(cell);
+        let mut hist_local: HashMap<usize, Vec<u64>> = HashMap::new();
+        let mut local: Vec<BinaryHeap<Reverse<EstCand>>> =
+            (0..n_queries).map(|_| BinaryHeap::new()).collect();
+        let code_bytes = rl.quant.code_bytes();
+        let cnt = rows.len();
+        // FastScan LUT path: fold each query once (done at freeze), transpose
+        // this cell's codes once, then score 64 rows per SIMD permute per query
+        // — vastly cheaper than one scalar estimate per (row, query). Requires
+        // the LUTs built (target-supported) and every row carrying a code.
+        //
+        // The choice is per cell, so a query's global shortlist can mix
+        // FastScan (LUT-quantized) estimates from all-coded cells with scalar
+        // estimates from cells that fell back (a missing code). Both approximate
+        // the same dot; the divergence is bounded by LUT quantization and only
+        // affects which candidates survive eviction near the (wide) cap — never
+        // the pass-2 exact rescore, and so never the laws while survivors cover
+        // the deepest law k.
+        let use_fast =
+            !rl.luts.is_empty() && rows.iter().all(|r| r.rabitq_code.len() == code_bytes);
+        if use_fast {
+            let mut codes = Vec::with_capacity(cnt * code_bytes);
+            for r in rows {
+                codes.extend_from_slice(&r.rabitq_code);
+            }
+            let cache = build_transposed_code_cache(&codes, cnt, code_bytes);
+            for (qi, local_q) in local.iter_mut().enumerate() {
+                let self_id = frozen.ids[qi];
+                let is_member = members.binary_search(&qi).is_ok();
+                if rl.luts[qi].fits_i16() {
+                    let out = &mut *local_q;
+                    let mut bins = is_member.then(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                    for_each_code_block_scores(&cache, code_bytes, &rl.luts[qi], |base, scores| {
+                        let n = (cnt - base).min(scores.len());
+                        for (lane, &fs_est) in scores.iter().enumerate().take(n) {
+                            let row = &rows[base + lane];
+                            if row.stable_id == self_id {
+                                continue;
+                            }
+                            // Shortlist selection ranks by the cheap FastScan
+                            // estimate (higher = nearer; INFINITY = unrankable,
+                            // admitted conservatively).
+                            let short_est = if fs_est.is_finite() {
+                                fs_est
+                            } else {
+                                f32::INFINITY
+                            };
+                            push_bounded(
+                                out,
+                                EstCand {
+                                    est: short_est,
+                                    cell,
+                                    id: row.stable_id,
+                                },
+                                WIDTH_LAW_SHORTLIST_CAP,
+                            );
+                            // The rerank histogram bins the SCALAR estimate — the
+                            // same estimator the pass-2 candidate carries and the
+                            // exhaustive path uses — so finish()'s survivor-rank
+                            // lookup is consistent (FastScan's i8-quantized bins
+                            // would diverge). Members-only (bins is Some).
+                            if let Some(b) = bins.as_mut() {
+                                let s = rl.quant.estimate_dot_rotated_with_total(
+                                    &rl.q_rot[qi * self.dim..(qi + 1) * self.dim],
+                                    &row.rabitq_code,
+                                    rl.q_total[qi],
+                                );
+                                if s.is_finite() {
+                                    let bin = rl.bin(qi, s);
+                                    b[bin] = b[bin].saturating_add(1);
+                                }
+                            }
+                        }
+                    });
+                    if let Some(b) = bins {
+                        hist_local.insert(qi, b);
+                    }
+                } else {
+                    // Rare: this query's folded LUT overflows i16 — scalar for it.
+                    let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
+                    let mut bins = is_member.then(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                    for row in rows {
+                        if row.stable_id == self_id {
+                            continue;
+                        }
+                        let raw = rl.quant.estimate_dot_rotated_with_total(
+                            q_rot,
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        let est = if raw.is_finite() {
+                            if let Some(b) = bins.as_mut() {
+                                let bin = rl.bin(qi, raw);
+                                b[bin] = b[bin].saturating_add(1);
+                            }
+                            raw
+                        } else {
+                            f32::INFINITY
+                        };
+                        push_bounded(
+                            local_q,
+                            EstCand {
+                                est,
+                                cell,
+                                id: row.stable_id,
+                            },
+                            WIDTH_LAW_SHORTLIST_CAP,
+                        );
+                    }
+                    if let Some(b) = bins {
+                        hist_local.insert(qi, b);
+                    }
+                }
+            }
+        } else {
+            // Scalar fallback (LUTs unbuilt on this target, or a row lacks a
+            // code): row-major, one estimate per (row, query).
+            for row in rows.iter() {
+                let has_code = row.rabitq_code.len() == code_bytes;
+                for (qi, local_q) in local.iter_mut().enumerate() {
+                    if row.stable_id == frozen.ids[qi] {
+                        continue;
+                    }
+                    let est = if !has_code {
+                        f32::INFINITY
+                    } else {
+                        let raw = rl.quant.estimate_dot_rotated_with_total(
+                            &rl.q_rot[qi * self.dim..(qi + 1) * self.dim],
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        if raw.is_finite() {
+                            if members.binary_search(&qi).is_ok() {
+                                let bins = hist_local
+                                    .entry(qi)
+                                    .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
+                                let bin = rl.bin(qi, raw);
+                                bins[bin] = bins[bin].saturating_add(1);
+                            }
+                            raw
+                        } else {
+                            f32::INFINITY
+                        }
+                    };
+                    push_bounded(
+                        local_q,
+                        EstCand {
+                            est,
+                            cell,
+                            id: row.stable_id,
+                        },
+                        WIDTH_LAW_SHORTLIST_CAP,
+                    );
+                }
+            }
+        }
+        // Drain the per-cell bounded heaps into the global per-query shortlists
+        // (also bounded) — O(cap log cap) per query, no sorts.
+        {
+            let mut tops = self.est_tops.lock().unwrap_or_else(PoisonError::into_inner);
+            for (qi, heap) in local.into_iter().enumerate() {
+                for Reverse(cand) in heap {
+                    push_bounded(&mut tops[qi], cand, WIDTH_LAW_SHORTLIST_CAP);
+                }
+            }
+        }
+        if !hist_local.is_empty() {
+            let mut hist = rl.hist.lock().unwrap_or_else(PoisonError::into_inner);
+            for (qi, delta) in hist_local {
+                let slot = &mut hist[qi];
+                if slot.is_empty() {
+                    *slot = delta;
+                } else {
+                    for (a, b) in slot.iter_mut().zip(delta) {
+                        *a = a.saturating_add(b);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pass-1 survivor set, reorganized by cell: `cell -> stable id -> the
+    /// queries that shortlisted it`. Consumed once between the two passes;
+    /// pass 2 loads each cell and exact-rescores only the rows named here.
+    pub(crate) fn survivors_by_cell(&self) -> HashMap<u32, HashMap<i128, Vec<usize>>> {
+        let est_tops = self.est_tops.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut out: HashMap<u32, HashMap<i128, Vec<usize>>> = HashMap::new();
+        for (qi, heap) in est_tops.iter().enumerate() {
+            for Reverse(cand) in heap.iter() {
+                out.entry(cand.cell)
+                    .or_default()
+                    .entry(cand.id)
+                    .or_default()
+                    .push(qi);
+            }
+        }
+        out
+    }
+
+    /// Pass 2 of the 1-bit-gated width sweep: exact-rescore only the pass-1
+    /// survivors of one cell into `tops`, so `finish` derives every law from
+    /// exhaustive-quality exact distances over a candidate set the cheap
+    /// estimate pass pre-narrowed. `survivors` is the entry for this cell from
+    /// [`Self::survivors_by_cell`]. Scores each surviving row exactly against
+    /// only the queries that shortlisted it; the shared [`merge_candidates`]
+    /// then dedups boundary replicas by stable id to their best exact copy,
+    /// identical to the exhaustive path's merge.
+    pub(crate) fn score_survivors(
+        &self,
+        cell: u32,
+        rows: &[MaterializedIvfRow],
+        survivors: &HashMap<i128, Vec<usize>>,
+        fanout: Option<&FanoutScoreCtx>,
+    ) {
+        let Some(frozen) = self.frozen.as_ref() else {
+            return;
+        };
+        let n_queries = frozen.ids.len();
+        if n_queries == 0 || survivors.is_empty() {
+            return;
+        }
+        let mut partial: Vec<Vec<(f32, u32, i128, f32)>> = vec![Vec::new(); n_queries];
+        // Router prefix candidates, collected only when this scan calibrates
+        // the router fanout (see `score_slice`). The survivors carry the exact
+        // top-k NNs the fanout law reads, so the survivor-only prefix pool is
+        // equivalent to the exhaustive one for the law's per-query knee.
+        let mut prefix_partial: Vec<Vec<PrefixCand>> = if fanout.is_some() {
+            vec![Vec::new(); n_queries]
+        } else {
+            Vec::new()
+        };
+        let mut scratch = vec![0f32; self.dim];
+        // Each candidate carries its own 1-bit estimate so `finish` can read
+        // its survivor rank — but ONLY for queries whose distractor pool
+        // contains this cell (the exhaustive `score_slice` leaves all others
+        // NEG_INFINITY, unrankable-conservative); the est field must match
+        // that exactly or the rerank law diverges from the exhaustive sweep.
+        let members = self.pool_members(cell);
+        let rl = self.rerank.as_ref();
+        for row in rows {
+            let Some(query_indices) = survivors.get(&row.stable_id) else {
+                continue;
+            };
+            let has_code = rl.is_some_and(|r| row.rabitq_code.len() == r.quant.code_bytes());
+            dequantize_row_into(&row.encoded, &mut scratch);
+            if self.metric == Metric::Cosine {
+                normalize(&mut scratch);
+            }
+            // Router prefix tag (see `score_slice`): the row's global flat
+            // cluster, matched against each query's router selection below.
+            let flat = fanout.map(|ctx| ctx.flat_base + row.cluster);
+            for &qi in query_indices {
+                // Self-hit already excluded from the shortlist, but guard again
+                // so a stale id can never occupy a query's own slot.
+                if row.stable_id == frozen.ids[qi] {
+                    continue;
+                }
+                let est = match (has_code, rl) {
+                    (true, Some(rl)) if members.binary_search(&qi).is_ok() => {
+                        let q_rot = &rl.q_rot[qi * self.dim..(qi + 1) * self.dim];
+                        let e = rl.quant.estimate_dot_rotated_with_total(
+                            q_rot,
+                            &row.rabitq_code,
+                            rl.q_total[qi],
+                        );
+                        if e.is_finite() { e } else { f32::NEG_INFINITY }
+                    }
+                    _ => f32::NEG_INFINITY,
+                };
+                let q = &frozen.queries[qi * self.dim..(qi + 1) * self.dim];
+                let dist = distance(self.metric, q, &scratch);
+                partial[qi].push((dist, cell, row.stable_id, est));
+                // Same raw-query distance feeds the router prefix pool, so the
+                // GT/prefix ordering matches the width walk's.
+                if let (Some(ctx), Some(flat)) = (fanout, flat)
+                    && let Some(&rank) = ctx.selection[qi].get(&flat)
+                {
+                    prefix_partial[qi].push(PrefixCand {
+                        dist,
+                        rank,
+                        sid: row.stable_id,
+                    });
+                }
+            }
+        }
+        // The gated path derives the rerank histogram in pass 1, so pass 2
+        // merges only the exact top-k candidates (empty histogram delta) plus
+        // the router prefix pool when the fanout law is being calibrated.
+        self.merge_partial(
+            partial,
+            HashMap::new(),
+            fanout.map(|ctx| (prefix_partial, ctx.prefix_cap)),
+        );
     }
 
     /// One-lock merge of a cell's scored partials into the per-query
@@ -1410,6 +2405,7 @@ impl WidthLawCalibration {
         &self,
         partial: Vec<Vec<(f32, u32, i128, f32)>>,
         hist_local: HashMap<usize, Vec<u64>>,
+        prefix: Option<(Vec<Vec<PrefixCand>>, usize)>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let mut tops = self.tops.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1417,6 +2413,20 @@ impl WidthLawCalibration {
             merge_candidates(&mut tops[qi], cand, k_max);
         }
         drop(tops);
+        if let Some((prefix_partial, prefix_cap)) = prefix {
+            let mut pools = self
+                .prefix_pools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (qi, cands) in prefix_partial.into_iter().enumerate() {
+                let Some(heap) = pools.get_mut(qi) else {
+                    continue;
+                };
+                for cand in cands {
+                    prefix_push(heap, cand, prefix_cap);
+                }
+            }
+        }
         if let Some(rl) = self.rerank.as_ref()
             && !hist_local.is_empty()
         {
@@ -1459,8 +2469,8 @@ impl WidthLawCalibration {
         rows: &[MaterializedIvfRow],
         members: &[usize],
         scratch: &mut [f32],
-        partial: &mut [Vec<(f32, u32, i128, f32)>],
-        hist_local: &mut HashMap<usize, Vec<u64>>,
+        sink: &mut ScoreSink,
+        fanout: Option<&FanoutScoreCtx>,
     ) {
         let k_max = WIDTH_LAW_MAX_K;
         let rl = self.rerank.as_ref();
@@ -1491,7 +2501,8 @@ impl WidthLawCalibration {
                     // the dedup tie-break already treat conservatively.
                     if est.is_finite() {
                         est_of[qi] = est;
-                        let bins = hist_local
+                        let bins = sink
+                            .hist_local
                             .entry(qi)
                             .or_insert_with(|| vec![0u64; RERANK_LAW_EST_BINS]);
                         let bin = rl.bin(qi, est);
@@ -1508,17 +2519,33 @@ impl WidthLawCalibration {
                 // monotone and cannot reorder its candidates.
                 normalize(scratch);
             }
+            // Router prefix tag: the global flat cluster this row lives in, so a
+            // selected row can be attributed to the fine cluster the router
+            // picked (by its selection rank). `flat = flat_base + row.cluster`
+            // matches the router node map's numbering exactly.
+            let flat = fanout.map(|ctx| ctx.flat_base + row.cluster);
             for (qi, q) in frozen.queries.chunks_exact(self.dim).enumerate() {
                 // Self-hit: a sampled query trivially covers itself.
                 if row.stable_id == frozen.ids[qi] {
                     continue;
                 }
-                partial[qi].push((
-                    distance(self.metric, q, scratch),
-                    cell,
-                    row.stable_id,
-                    est_of[qi],
-                ));
+                // The exact distance is computed ONCE and shared by the width
+                // walk and the router prefix pool: the fanout selection is
+                // measured on a norm-relative-jittered COPY of the query, but
+                // the GT/prefix ordering reuses this raw-query distance (the
+                // self-hit exclusion above is the guard that keeps the query's
+                // own row out of both).
+                let dist = distance(self.metric, q, scratch);
+                sink.partial[qi].push((dist, cell, row.stable_id, est_of[qi]));
+                if let (Some(ctx), Some(flat)) = (fanout, flat)
+                    && let Some(&rank) = ctx.selection[qi].get(&flat)
+                {
+                    sink.prefix_partial[qi].push(PrefixCand {
+                        dist,
+                        rank,
+                        sid: row.stable_id,
+                    });
+                }
             }
             if rl.is_some() {
                 for &qi in members {
@@ -1527,8 +2554,13 @@ impl WidthLawCalibration {
             }
         }
         // Bound the per-cell partials the same way the merge does.
-        for cand in partial.iter_mut() {
+        for cand in sink.partial.iter_mut() {
             truncate_ascending(cand, k_max);
+        }
+        if let Some(ctx) = fanout {
+            for cand in sink.prefix_partial.iter_mut() {
+                truncate_prefix_ascending(cand, ctx.prefix_cap);
+            }
         }
     }
 
@@ -1613,7 +2645,16 @@ impl WidthLawCalibration {
     /// query excludes itself, not the whole sample. Points NO query can
     /// support stay `0` (uncalibrated). Measured points are floored to be
     /// monotone in `k`. `None` when nothing was sampled.
-    pub(crate) fn finish(self, grid: &ClusterCentroids) -> Option<CalibratedLaws> {
+    ///
+    /// When `fanout` is `Some`, the centroid-router per-`k` fanout law is also
+    /// derived from the prefix pools filled on this same scan — one shared
+    /// ground-truth pass instead of a second corpus scan. `None` (the drain
+    /// path) leaves `fanout_for_k` the all-zero sentinel.
+    pub(crate) fn finish(
+        self,
+        grid: &ClusterCentroids,
+        fanout: Option<FanoutCalibCtx>,
+    ) -> Option<CalibratedLaws> {
         let frozen = self.frozen?;
         let n_queries = frozen.ids.len();
         if n_queries == 0 || grid.n_cent == 0 {
@@ -1803,22 +2844,110 @@ impl WidthLawCalibration {
         floor_monotone(&mut law);
         floor_monotone(&mut fine_law);
         floor_monotone(&mut rerank_law);
-        // The centroid-graph router fanout is NOT calibrated here. Its coverage
-        // proxy (home-cluster within the top-fanout centroids) is an upper bound
-        // on real recall — it ignores the within-cluster Sq16 + shortlist +
-        // rerank loss — so it under-stamps the fanout. The fanout is now measured
-        // by real recall at the router's post-commit build stage (see
-        // `crate::supertable::query::vector::calibrate_centroid_router_fanout`),
-        // which runs the actual selection → per-cluster scan → shortlist →
-        // rerank the reader serves and stamps the knee into
-        // `CellRoutingParams::fanout_for_k`.
+        // The centroid-graph router fanout is measured by REAL recall on the
+        // SAME scan: `tops` already holds each query's exact top-k truth (raw
+        // distance, self-hit excluded), and the prefix pools hold its nearest
+        // SELECTED rows tagged with their fine cluster's router selection rank.
+        // Recall at fanout `F` is a prefix of that one ranked read, so the knee
+        // is derived here without a second corpus scan. The old coverage proxy
+        // (home-cluster within the top-fanout centroids) over-counted real
+        // recall (ignoring the within-cluster Sq16 + shortlist + rerank loss)
+        // and its `width × fine` cap under-stamped; this measures the actual
+        // selection → scan → shortlist → rerank the reader serves.
+        let fanout_for_k = match fanout {
+            Some(ctx) => {
+                let prefix_pools = self
+                    .prefix_pools
+                    .into_inner()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .into_iter()
+                    .map(BinaryHeap::into_vec)
+                    .collect::<Vec<_>>();
+                router_fanout_law(&law, &fine_law, &tops, &prefix_pools, &ctx)
+            }
+            None => [0u32; WIDTH_LAW_KS.len()],
+        };
         (law.iter().any(|&w| w > 0)).then_some(CalibratedLaws {
             width_for_k: law,
             fine_for_k: fine_law,
             rerank_for_k: rerank_law,
             pool_cells: self.pool_cells as u32,
+            fanout_for_k,
         })
     }
+}
+
+/// Derive the centroid-router per-`k` fanout knee from the shared scan's
+/// accumulators: `tops[qi]` is query `qi`'s exact top-k truth (nearest
+/// first once sorted by distance) and `prefix_pools[qi]` its nearest
+/// SELECTED rows tagged with router rank. Seeds the fanout ladder around
+/// the freshly measured `width × fine` prior (a start, not a cap) up to
+/// `ctx.max_fanout`, averages each rung's per-query prefix recall, and
+/// stamps the smallest fanout clearing the parity-relaxed floor
+/// ([`fanout_knee_from_recalls`]). All-zero when nothing is calibratable.
+fn router_fanout_law(
+    width_for_k: &[u32; WIDTH_LAW_KS.len()],
+    fine_for_k: &[u32; WIDTH_LAW_KS.len()],
+    tops: &[Vec<(f32, u32, i128, f32)>],
+    prefix_pools: &[Vec<PrefixCand>],
+    ctx: &FanoutCalibCtx,
+) -> [u32; WIDTH_LAW_KS.len()] {
+    let sentinel = [0u32; WIDTH_LAW_KS.len()];
+    // Deepest anchor the corpus supports and the router usefully serves.
+    let calib_k = WIDTH_LAW_KS
+        .iter()
+        .copied()
+        .filter(|&k| k <= ctx.n_rows && k <= ROUTER_CALIB_MAX_ANCHOR)
+        .max()
+        .unwrap_or(0);
+    if calib_k == 0 {
+        return sentinel;
+    }
+    // Ladder seeded around the grid's `width × fine` prior (a start, not a
+    // cap), capped at `max_fanout`.
+    let prior = fanout_prior_for_k(width_for_k, fine_for_k, ctx.total_fine);
+    let prior_max = prior.iter().copied().max().unwrap_or(0) as usize;
+    let ladder: Vec<u32> = router_fanout_ladder(prior_max, ctx.max_fanout)
+        .into_iter()
+        .map(|f| f as u32)
+        .collect();
+    if ladder.is_empty() {
+        return sentinel;
+    }
+    // Average the per-query prefix recalls into the ladder the knee reads.
+    let mut sum = vec![[0f64; WIDTH_LAW_KS.len()]; ladder.len()];
+    let mut cnt = vec![[0usize; WIDTH_LAW_KS.len()]; ladder.len()];
+    for (qi, pool) in prefix_pools.iter().enumerate() {
+        // GT ids: the query's exact top-k, nearest first. `tops` already
+        // holds one entry per stable id (merge dedups), so ordering by
+        // distance yields the distinct-neighbour truth.
+        let mut gt_sorted = tops.get(qi).cloned().unwrap_or_default();
+        gt_sorted.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let gt_ids: Vec<i128> = gt_sorted.iter().map(|c| c.2).collect();
+        let per_fanout = recall_by_fanout_for_query(pool, &gt_ids, &ladder, calib_k);
+        for (fi, arr) in per_fanout.iter().enumerate() {
+            for ki in 0..WIDTH_LAW_KS.len() {
+                if let Some(r) = arr[ki] {
+                    sum[fi][ki] += r;
+                    cnt[fi][ki] += 1;
+                }
+            }
+        }
+    }
+    let recall_ladder: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder
+        .iter()
+        .enumerate()
+        .map(|(fi, &f)| {
+            let mut rk = [0f64; WIDTH_LAW_KS.len()];
+            for ki in 0..WIDTH_LAW_KS.len() {
+                if cnt[fi][ki] > 0 {
+                    rk[ki] = sum[fi][ki] / cnt[fi][ki] as f64;
+                }
+            }
+            (f, rk)
+        })
+        .collect();
+    fanout_knee_from_recalls(&recall_ladder, ctx.register_floor, ctx.parity_gap)
 }
 
 /// Merge one cell's candidates into a query's accumulator: collapse to the
@@ -1857,6 +2986,55 @@ fn truncate_ascending(cand: &mut Vec<(f32, u32, i128, f32)>, cap: usize) {
     if cand.len() > cap {
         cand.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         cand.truncate(cap);
+    }
+}
+
+/// One pass-1 shortlist candidate, ordered by 1-bit estimate (higher = nearer).
+/// Total order (`total_cmp` then cell then id) so the bounded shortlist heap is
+/// deterministic across runs. `INFINITY` (unrankable/conservative admit) sorts
+/// to the top and is therefore always retained.
+#[derive(Clone, Copy)]
+pub(crate) struct EstCand {
+    est: f32,
+    cell: u32,
+    id: i128,
+}
+
+impl PartialEq for EstCand {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for EstCand {}
+impl PartialOrd for EstCand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for EstCand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.est
+            .total_cmp(&other.est)
+            .then_with(|| self.cell.cmp(&other.cell))
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+/// Bounded top-`cap`-by-estimate shortlist, held as a min-heap (`Reverse`) so
+/// the smallest kept estimate is at the top and evicted first. O(log cap) per
+/// candidate, no sorting — replaces the sort-truncate that profiled as 98% of
+/// the gate's cost.
+fn push_bounded(heap: &mut BinaryHeap<Reverse<EstCand>>, cand: EstCand, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    if heap.len() < cap {
+        heap.push(Reverse(cand));
+    } else if let Some(Reverse(min)) = heap.peek()
+        && cand > *min
+    {
+        heap.pop();
+        heap.push(Reverse(cand));
     }
 }
 
@@ -2104,7 +3282,7 @@ mod tests {
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
         let law = cal
-            .finish(&grid)
+            .finish(&grid, None)
             .expect("law from planted candidates")
             .width_for_k;
         // k=1: the best copy of id 1 sits in the top-ranked cell.
@@ -2166,7 +3344,9 @@ mod tests {
         };
         cal.observe_shard_views(&[view]);
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(laws.width_for_k[..2], [1, 1], "one cell holds everything");
         assert_eq!(
             laws.fine_for_k[0], 2,
@@ -2177,6 +3357,191 @@ mod tests {
             "top-10 coverage needs the rank-2 cluster"
         );
         assert_eq!(&laws.fine_for_k[2..], &[0, 0], "unsupported points stay 0");
+    }
+
+    /// The 1-bit-gated width sweep (pass 1 `shortlist_rows` + pass 2
+    /// `score_survivors`) must produce laws byte-identical to the exhaustive
+    /// `score_rows` sweep whenever the shortlist cap exceeds the row count —
+    /// then every row is admitted, so pass 2 exact-rescores exactly the set the
+    /// exhaustive path scored. Runs every metric: the estimate orientation and
+    /// the exact rescore both differ by metric, so parity must hold for each.
+    #[test]
+    fn one_bit_gate_matches_exhaustive_when_cap_covers_all_rows() {
+        const DIM: usize = 8;
+        const N_CELLS: usize = 4;
+        const ROWS_PER_CELL: usize = 30; // 120 rows << WIDTH_LAW_SHORTLIST_CAP
+        const { assert!(N_CELLS * ROWS_PER_CELL < WIDTH_LAW_SHORTLIST_CAP) };
+
+        // A grid whose centroids point along rotating axis pairs, so
+        // `rank_cells` gives every query a non-trivial cell order.
+        let mut cents = vec![0f32; N_CELLS * DIM];
+        for c in 0..N_CELLS {
+            cents[c * DIM + c] = 1.0;
+            cents[c * DIM + (c + 1) % DIM] = 0.5;
+        }
+        let grid = ClusterCentroids::from_fp32(
+            N_CELLS as u32,
+            DIM as u32,
+            &cents,
+            vec![ROWS_PER_CELL as u32; N_CELLS],
+        );
+
+        let scale: Arc<[f32]> = Arc::from(vec![1.0f32; DIM]);
+        let offset: Arc<[f32]> = Arc::from(vec![0.0f32; DIM]);
+        let make_row = |stable_id: i128, cell: u32, seed: u32| {
+            let codes: Vec<u8> = (0..DIM)
+                .map(|d| ((seed.wrapping_mul(131).wrapping_add(d as u32 * 17)) % 200 + 20) as u8)
+                .collect();
+            MaterializedIvfRow {
+                local_doc_id: stable_id as u32,
+                stable_id,
+                cluster: cell,
+                // code_bytes = DIM/8 = 1; a varied byte gives varied estimates.
+                rabitq_code: vec![(seed % 251) as u8],
+                encoded: EncodedCellRow {
+                    stable_id,
+                    rerank_codec: RerankCodec::Sq8FixedResidual,
+                    scale: Arc::clone(&scale),
+                    offset: Arc::clone(&offset),
+                    codes,
+                    residuals: vec![0u8; DIM],
+                    norm_sq: Some(1.0),
+                },
+            }
+        };
+
+        // Scored rows, grouped by cell; distinct ids from the query ids below.
+        let per_cell: Vec<(u32, Vec<MaterializedIvfRow>)> = (0..N_CELLS)
+            .map(|c| {
+                let rows = (0..ROWS_PER_CELL)
+                    .map(|i| {
+                        let id = (c * 1000 + i + 1) as i128;
+                        make_row(id, c as u32, (c * 1000 + i + 1) as u32)
+                    })
+                    .collect();
+                (c as u32, rows)
+            })
+            .collect();
+        // A handful of query rows (offered → frozen queries), ids well clear of
+        // the scored ids so no self-hit masks a candidate.
+        let query_rows: Vec<MaterializedIvfRow> = (0..6)
+            .map(|q| {
+                make_row(
+                    (900_000 + q) as i128,
+                    (q % N_CELLS) as u32,
+                    (7 + q * 1000) as u32,
+                )
+            })
+            .collect();
+
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let build = || {
+                let mut cal = WidthLawCalibration::new(DIM, metric, shipped_target_recall());
+                for qr in &query_rows {
+                    cal.offer(qr);
+                }
+                cal.freeze(&grid, 0x1234_5678, RERANK_LAW_POOL_CELLS);
+                cal
+            };
+
+            // Exhaustive path.
+            let cal_a = build();
+            for (cell, rows) in &per_cell {
+                cal_a
+                    .score_rows(*cell, rows, None)
+                    .expect("exhaustive score_rows");
+            }
+            let laws_a = cal_a.finish(&grid, None).expect("exhaustive laws");
+
+            // Gated two-pass path.
+            let cal_b = build();
+            for (cell, rows) in &per_cell {
+                cal_b.shortlist_rows(*cell, rows);
+            }
+            let survivors = cal_b.survivors_by_cell();
+            for (cell, rows) in &per_cell {
+                if let Some(s) = survivors.get(cell) {
+                    cal_b.score_survivors(*cell, rows, s, None);
+                }
+            }
+            let laws_b = cal_b.finish(&grid, None).expect("gated laws");
+
+            assert_eq!(
+                laws_a.width_for_k, laws_b.width_for_k,
+                "width law diverged under the gate ({metric:?})"
+            );
+            assert_eq!(
+                laws_a.rerank_for_k, laws_b.rerank_for_k,
+                "rerank law diverged under the gate ({metric:?})"
+            );
+            assert_eq!(
+                laws_a.fine_for_k, laws_b.fine_for_k,
+                "fine law diverged under the gate ({metric:?})"
+            );
+        }
+    }
+
+    /// The bounded-heap shortlist keeps exactly the top-`cap` candidates by
+    /// estimate, evicting the smallest — the eviction the parity test can't
+    /// reach (it runs with the cap above the row count so nothing is dropped).
+    /// A cap smaller than the input forces eviction; the survivors must be the
+    /// true top-`cap` an exact sort would keep, and `INFINITY` admits (missing
+    /// codes) must outrank every finite estimate.
+    #[test]
+    fn push_bounded_keeps_top_cap_and_retains_infinity() {
+        const CAP: usize = 5;
+        // Estimates in shuffled order, plus two INFINITY (unrankable) admits.
+        let ests = [
+            0.10f32,
+            0.90,
+            f32::INFINITY,
+            0.30,
+            0.70,
+            0.50,
+            0.20,
+            f32::INFINITY,
+            0.80,
+            0.40,
+        ];
+        let mut heap: BinaryHeap<Reverse<EstCand>> = BinaryHeap::new();
+        for (i, &est) in ests.iter().enumerate() {
+            push_bounded(
+                &mut heap,
+                EstCand {
+                    est,
+                    cell: 0,
+                    id: i as i128,
+                },
+                CAP,
+            );
+        }
+        assert_eq!(heap.len(), CAP, "heap must be bounded to the cap");
+
+        // Reference: the true top-CAP by the same total order.
+        let mut all: Vec<EstCand> = ests
+            .iter()
+            .enumerate()
+            .map(|(i, &est)| EstCand {
+                est,
+                cell: 0,
+                id: i as i128,
+            })
+            .collect();
+        all.sort_by(|a, b| b.cmp(a)); // descending
+        let expected: Vec<i128> = all[..CAP].iter().map(|c| c.id).collect();
+
+        let mut got: Vec<EstCand> = heap.into_iter().map(|Reverse(c)| c).collect();
+        got.sort_by(|a, b| b.cmp(a));
+        let got_ids: Vec<i128> = got.iter().map(|c| c.id).collect();
+        assert_eq!(got_ids, expected, "survivors must be the exact top-cap");
+
+        // Both INFINITY admits (ids 2 and 7) survived.
+        assert!(
+            got_ids.contains(&2) && got_ids.contains(&7),
+            "INFINITY admits must always be retained: {got_ids:?}"
+        );
+        // The largest finite estimate kept alongside them is 0.90 (id 1).
+        assert!(got_ids.contains(&1), "top finite estimate must survive");
     }
 
     /// A stamped width beyond the calibration pool clears the rerank
@@ -2222,6 +3587,7 @@ mod tests {
         // 0.5 (53 rows at-or-better). q_l1 = 1.0 makes bin() exact.
         let rl = RerankLawObservation {
             quant: BitQuantizer::new(DIM),
+            luts: Vec::new(),
             q_rot: vec![0.0; DIM],
             q_total: vec![0.0],
             q_l1: vec![1.0],
@@ -2243,7 +3609,9 @@ mod tests {
         merge_candidates(&mut acc, cands, WIDTH_LAW_MAX_K);
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(
             laws.rerank_for_k[0], 3,
             "k=1 budget = the best candidate's distractor count"
@@ -2298,7 +3666,9 @@ mod tests {
         };
         cal.observe_shard_views(&[view]);
 
-        let laws = cal.finish(&grid).expect("laws from planted candidates");
+        let laws = cal
+            .finish(&grid, None)
+            .expect("laws from planted candidates");
         assert_eq!(laws.fine_for_k[0], 1, "top-1 was observed at rank 0");
         assert_eq!(
             laws.fine_for_k[1], 0,
@@ -2359,7 +3729,7 @@ mod tests {
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc_a, acc_b];
 
         let law = cal
-            .finish(&grid)
+            .finish(&grid, None)
             .expect("law from planted candidates")
             .width_for_k;
         assert_eq!(law[0], 1, "top-1: both queries covered by the nearest cell");
@@ -2406,7 +3776,7 @@ mod tests {
         );
         *cal.tops.lock().unwrap_or_else(PoisonError::into_inner) = vec![acc];
         assert!(
-            cal.finish(&grid).is_none(),
+            cal.finish(&grid, None).is_none(),
             "inconsistent calibration input must abandon the law, not panic"
         );
     }
@@ -2907,5 +4277,505 @@ mod tests {
             populated >= 2,
             "at least 2 sub-cells populated, got {populated}"
         );
+    }
+
+    /// Deterministic xorshift64* → f32 in `[-1, 1)`. No `rand` dependency, no
+    /// wall-clock: fixed seed in, fixed grid out, so the bench is reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn unit_f32(&mut self) -> f32 {
+            // 24-bit mantissa → [0,1), then map to [-1,1).
+            let u = (self.next_u64() >> 40) as f32 / (1u64 << 24) as f32;
+            u * 2.0 - 1.0
+        }
+    }
+
+    fn unit_normalize(v: &mut [f32]) {
+        let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            for x in v.iter_mut() {
+                *x /= n;
+            }
+        }
+    }
+
+    /// Standalone isolation micro-bench for the graph-routed drain assignment.
+    /// Synthetic well-separated unit centroids + clustered query rows; no
+    /// ingest, no storage. Compares [`boundary_assignment_fp32`] (current) to
+    /// [`boundary_assignment_graph`] on placement parity and per-row speed
+    /// across grid sizes, sweeping `ef` to find the smallest that reaches 0.99
+    /// primary parity. Run with:
+    ///   cargo test --release -p infino graph_routed_assignment_microbench -- --nocapture --ignored
+    #[test]
+    #[ignore = "micro-bench: run explicitly with --release --nocapture --ignored"]
+    fn graph_routed_assignment_microbench() {
+        use std::{hint::black_box, time::Instant};
+
+        const DIM: usize = 768;
+        const QUERY_ROWS: usize = 5000;
+        const METRIC: Metric = Metric::Cosine;
+        let grids = [256usize, 1024, 4096, 16384];
+        let efs = [8usize, 16, 32];
+
+        eprintln!(
+            "\n=== graph-routed drain assignment micro-bench (dim={DIM}, rows={QUERY_ROWS}, metric={METRIC:?}) ===\n"
+        );
+        eprintln!(
+            "{:>7} | {:>11} | {:>11} | {:>8} | {:>8} | {:>10} | {:>10} | {:>9}",
+            "n_cent",
+            "current-ns",
+            "graph-ns",
+            "speedup",
+            "formula-ef",
+            "prim-parity",
+            "repl-parity",
+            "build-ms"
+        );
+        eprintln!("{}", "-".repeat(92));
+
+        for &n_cent in &grids {
+            // --- Synthetic well-separated unit centroids (random high-dim
+            // Gaussian-ish vectors are near-orthogonal at dim=768). ---
+            let mut rng = Rng(0x1234_5678_9abc_def0 ^ (n_cent as u64).wrapping_mul(0x9E37_79B9));
+            let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+            for _ in 0..n_cent {
+                let mut v = vec![0f32; DIM];
+                for x in v.iter_mut() {
+                    *x = rng.unit_f32();
+                }
+                unit_normalize(&mut v);
+                centroids.push(v);
+            }
+            let flat: Vec<f32> = centroids.iter().flatten().copied().collect();
+            let counts = vec![1u32; n_cent];
+            let clusters =
+                ClusterCentroids::from_fp32(n_cent as u32, DIM as u32, &flat, counts.clone());
+            let admit_ctx = RabitqAdmitContext::new(DIM, 0xA5A5_5A5A_1234_9876);
+            let window = assignment_shortlist_window(n_cent);
+
+            // --- Clustered query rows: pick a centroid, add per-component
+            // noise, normalize. Noise magnitude is kept well below the unit
+            // signal (per-component in [-EPS, EPS]; at dim=768 the noise vector
+            // norm is ~EPS*16, so EPS=0.02 => noise norm ~0.3, a clean 3:1
+            // signal:noise). This is the "well-separated clusters" regime: each
+            // row has an unambiguous nearest cell, with a thin tail of genuine
+            // boundary rows that exercise the replica closure. ---
+            const EPS: f32 = 0.02;
+            let mut queries: Vec<Vec<f32>> = Vec::with_capacity(QUERY_ROWS);
+            for _ in 0..QUERY_ROWS {
+                let t = (rng.next_u64() as usize) % n_cent;
+                let mut q = centroids[t].clone();
+                for x in q.iter_mut() {
+                    *x += EPS * rng.unit_f32();
+                }
+                unit_normalize(&mut q);
+                queries.push(q);
+            }
+
+            // --- Build the coarse centroid router ONCE (the same builder the
+            // drain uses, so the node_to_cell mapping and cosine normalization
+            // are exercised here too), timed separately from per-row assign. ---
+            let t0 = Instant::now();
+            let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, METRIC);
+            let build_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+            // --- Reference assignments via the current path (ef-independent),
+            // computed once. ---
+            let fp32_assign: Vec<BoundaryAssignment> = queries
+                .iter()
+                .map(|q| boundary_assignment_fp32(&clusters, METRIC, q, &admit_ctx, window))
+                .collect();
+
+            // Comparable key: primary + sorted replica cell ids.
+            let key = |a: &BoundaryAssignment| -> (u32, Vec<u32>) {
+                let mut reps: Vec<u32> = a
+                    .replicas
+                    .iter()
+                    .filter_map(|r| r.map(|(c, _)| c))
+                    .collect();
+                reps.sort_unstable();
+                (a.primary, reps)
+            };
+            let fp32_keys: Vec<(u32, Vec<u32>)> = fp32_assign.iter().map(key).collect();
+
+            // --- Sweep ef for parity, plus the production formula's own ef so
+            // the shipped `coarse_router_ef(n_cent)` is measured directly. ---
+            let formula_ef = coarse_router_ef(n_cent, METRIC);
+            let mut sweep: Vec<usize> = efs.to_vec();
+            if !sweep.contains(&formula_ef) {
+                sweep.push(formula_ef);
+            }
+            sweep.sort_unstable();
+            let mut min_ef_099: Option<usize> = None;
+            let mut parity_at: Vec<(usize, f64, f64)> = Vec::new();
+            for &ef in &sweep {
+                let mut prim_ok = 0usize;
+                let mut repl_ok = 0usize;
+                for (q, fk) in queries.iter().zip(fp32_keys.iter()) {
+                    let g = boundary_assignment_graph(
+                        &graph,
+                        &scorer,
+                        &node_to_cell,
+                        &clusters,
+                        METRIC,
+                        q,
+                        ef,
+                    );
+                    let gk = key(&g);
+                    if gk.0 == fk.0 {
+                        prim_ok += 1;
+                    }
+                    if gk == *fk {
+                        repl_ok += 1;
+                    }
+                }
+                let pp = prim_ok as f64 / QUERY_ROWS as f64;
+                let rp = repl_ok as f64 / QUERY_ROWS as f64;
+                parity_at.push((ef, pp, rp));
+                if pp >= 0.99 && min_ef_099.is_none() {
+                    min_ef_099 = Some(ef);
+                }
+            }
+            // Report at the production formula's ef (not the swept minimum): it
+            // is what the drain actually uses, and it must clear 0.99 primary.
+            let chosen_ef = formula_ef;
+            let (_, chosen_pp, chosen_rp) = *parity_at
+                .iter()
+                .find(|(e, _, _)| *e == chosen_ef)
+                .expect("formula ef was measured in the sweep");
+
+            // --- Speed: mean per-row ns, current vs graph at chosen ef. ---
+            let t_cur = Instant::now();
+            for q in &queries {
+                black_box(boundary_assignment_fp32(
+                    &clusters, METRIC, q, &admit_ctx, window,
+                ));
+            }
+            let cur_ns = t_cur.elapsed().as_nanos() as f64 / QUERY_ROWS as f64;
+
+            let t_g = Instant::now();
+            for q in &queries {
+                black_box(boundary_assignment_graph(
+                    &graph,
+                    &scorer,
+                    &node_to_cell,
+                    &clusters,
+                    METRIC,
+                    q,
+                    chosen_ef,
+                ));
+            }
+            let g_ns = t_g.elapsed().as_nanos() as f64 / QUERY_ROWS as f64;
+
+            eprintln!(
+                "{:>7} | {:>11.0} | {:>11.0} | {:>7.2}x | {:>8} | {:>10.4} | {:>10.4} | {:>9.1}",
+                n_cent,
+                cur_ns,
+                g_ns,
+                cur_ns / g_ns,
+                chosen_ef,
+                chosen_pp,
+                chosen_rp,
+                build_ms
+            );
+            for (ef, pp, rp) in &parity_at {
+                eprintln!("          ef={ef:>2}: primary={pp:.4} replica={rp:.4}");
+            }
+
+            // The SHIPPED formula ef must clear 0.99 primary parity at this
+            // grid — this is the acceptance bar for `coarse_router_ef`.
+            assert!(
+                chosen_pp >= 0.99,
+                "n_cent={n_cent}: formula ef={chosen_ef} gave primary parity {chosen_pp:.4} < 0.99"
+            );
+            // Sanity: 0.99 was reachable somewhere in the sweep.
+            assert!(
+                min_ef_099.is_some(),
+                "n_cent={n_cent}: graph never reached 0.99 primary parity across ef {sweep:?}"
+            );
+        }
+        eprintln!("\n=== end micro-bench ===\n");
+    }
+
+    /// Comparable placement key: primary cell + its sorted replica cell ids.
+    fn assignment_key(a: &BoundaryAssignment) -> (u32, Vec<u32>) {
+        let mut reps: Vec<u32> = a
+            .replicas
+            .iter()
+            .filter_map(|r| r.map(|(c, _)| c))
+            .collect();
+        reps.sort_unstable();
+        (a.primary, reps)
+    }
+
+    /// Ground-truth boundary assignment: an EXACT full scan over every
+    /// POPULATED cell (skipping count-0, as the production shortlist does),
+    /// fed through the same [`boundary_from_ranked`] closure. This is the true
+    /// placement the graph approximates — comparing the graph to THIS (rather
+    /// than to the 1-bit shortlist, which carries its own estimator error)
+    /// isolates the graph's candidate recall, the only thing under test.
+    fn exact_reference(
+        clusters: &ClusterCentroids,
+        metric: Metric,
+        counts: &[u32],
+        q: &[f32],
+    ) -> BoundaryAssignment {
+        let top_k = REPLICA_CLOSURE_MAX_REPLICAS + 1;
+        let mut ranked: Vec<(u32, f32)> = (0..clusters.n_cent as usize)
+            .filter(|&c| counts[c] > 0)
+            .map(|c| (c as u32, clusters.score_one(metric, c, q)))
+            .collect();
+        ranked.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(top_k);
+        boundary_from_ranked(clusters, metric, &ranked)
+    }
+
+    /// Build a well-separated synthetic grid (`n_cent` unit centroids at
+    /// `dim`) with the given per-cell counts, plus `n_rows` clustered query
+    /// rows (each a populated centroid + small noise). Returns
+    /// `(clusters, counts, queries)`. Deterministic (fixed seed).
+    fn synthetic_grid(
+        n_cent: usize,
+        dim: usize,
+        counts: Vec<u32>,
+        n_rows: usize,
+        metric: Metric,
+        seed: u64,
+    ) -> (ClusterCentroids, Vec<u32>, Vec<Vec<f32>>) {
+        let mut rng = Rng(seed);
+        let mut centroids: Vec<Vec<f32>> = Vec::with_capacity(n_cent);
+        for _ in 0..n_cent {
+            let mut v = vec![0f32; dim];
+            for x in v.iter_mut() {
+                *x = rng.unit_f32();
+            }
+            unit_normalize(&mut v);
+            centroids.push(v);
+        }
+        let flat: Vec<f32> = centroids.iter().flatten().copied().collect();
+        let clusters =
+            ClusterCentroids::from_fp32(n_cent as u32, dim as u32, &flat, counts.clone());
+        // Query rows only from POPULATED centroids (empty cells hold no rows).
+        let populated: Vec<usize> = (0..n_cent).filter(|&c| counts[c] > 0).collect();
+        assert!(!populated.is_empty(), "grid must have a populated cell");
+        // Per-component noise moves rows off their centroid so the
+        // closure/rescore code runs, with a thin tail of genuine boundary rows.
+        const EPS: f32 = 0.02;
+        let mut queries: Vec<Vec<f32>> = Vec::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let t = populated[(rng.next_u64() as usize) % populated.len()];
+            let mut q = centroids[t].clone();
+            for x in q.iter_mut() {
+                *x += EPS * rng.unit_f32();
+            }
+            if metric == Metric::Cosine {
+                unit_normalize(&mut q);
+            }
+            queries.push(q);
+        }
+        (clusters, counts, queries)
+    }
+
+    /// Graph-routed placement must match the exact scan for EVERY metric.
+    /// Cosine, L2Sq and NegDot all re-score candidates with the SAME
+    /// `score_one` and run the SAME `boundary_from_ranked`, so once the graph
+    /// surfaces the true candidate set the placement is identical — this test
+    /// locks that score-orientation wiring per metric (the bug it guards is a
+    /// metric fed to the graph in one space and re-scored in another). It runs
+    /// the graph at a wide, near-exhaustive `ef` so graph candidate recall is
+    /// ~1.0 and any residual would be a wiring error, not a beam-width miss;
+    /// the shipped `coarse_router_ef` beam is validated separately by the
+    /// micro-bench and `coarse_router_ef_hits_parity_knees`. The reference is
+    /// the exact full scan over populated cells.
+    #[test]
+    fn graph_assign_matches_exact_across_metrics() {
+        const DIM: usize = 768;
+        const N_CENT: usize = 128;
+        const N_ROWS: usize = 400;
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let counts = vec![1u32; N_CENT];
+            let (clusters, counts, queries) = synthetic_grid(
+                N_CENT,
+                DIM,
+                counts,
+                N_ROWS,
+                metric,
+                0xC0FFEE ^ metric as u64,
+            );
+            const { assert!(N_CENT >= GRAPH_ASSIGN_MIN_N_CENT) };
+            let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, metric);
+            // Near-exhaustive beam: isolate wiring from beam-width recall.
+            let ef = N_CENT;
+            let mut primary_ok = 0usize;
+            let mut full_ok = 0usize;
+            for q in &queries {
+                let exact = exact_reference(&clusters, metric, &counts, q);
+                let g = boundary_assignment_graph(
+                    &graph,
+                    &scorer,
+                    &node_to_cell,
+                    &clusters,
+                    metric,
+                    q,
+                    ef,
+                );
+                if exact.primary == g.primary {
+                    primary_ok += 1;
+                }
+                if assignment_key(&exact) == assignment_key(&g) {
+                    full_ok += 1;
+                }
+            }
+            // Primary and full placement track the exact scan at or above the
+            // acceptance bar. The graph is an approximate index, so the residual
+            // (a handful of genuine near-tie rows) is graph candidate recall —
+            // the same >=0.99 bar `coarse_router_ef` is calibrated to.
+            let primary_parity = primary_ok as f64 / N_ROWS as f64;
+            let full_parity = full_ok as f64 / N_ROWS as f64;
+            assert!(
+                primary_parity >= 0.99,
+                "metric={metric:?}: primary parity {primary_parity:.4} < 0.99 \
+                 ({}/{N_ROWS} differ from the exact scan)",
+                N_ROWS - primary_ok
+            );
+            assert!(
+                full_parity >= 0.99,
+                "metric={metric:?}: full placement parity {full_parity:.4} < 0.99 \
+                 ({}/{N_ROWS} differ)",
+                N_ROWS - full_ok
+            );
+        }
+    }
+
+    /// Count-0 cells present: the graph is built only over populated cells, so
+    /// it can never route a primary or replica into an empty cell — matching
+    /// the exact shortlist path, which also skips count-0. Regression for the
+    /// parity break a split (which empties a parent cell) would otherwise
+    /// introduce. Every empty cell keeps a stored centroid (deliberately
+    /// placed near a query cluster so a naive all-cells graph WOULD pick it).
+    #[test]
+    fn graph_assign_skips_count_zero_cells() {
+        const DIM: usize = 768;
+        const N_CENT: usize = 128;
+        const N_ROWS: usize = 400;
+        let metric = Metric::Cosine;
+        // Half the cells empty, interleaved, so empty and populated centroids
+        // are thoroughly mixed in id space.
+        let counts: Vec<u32> = (0..N_CENT)
+            .map(|c| if c % 2 == 0 { 1 } else { 0 })
+            .collect();
+        let empty: std::collections::HashSet<u32> = counts
+            .iter()
+            .enumerate()
+            .filter_map(|(c, &n)| (n == 0).then_some(c as u32))
+            .collect();
+        assert!(!empty.is_empty(), "test must have count-0 cells");
+        let (clusters, counts, queries) =
+            synthetic_grid(N_CENT, DIM, counts, N_ROWS, metric, 0xBADF00D);
+        let (scorer, graph, node_to_cell) = build_coarse_router(&clusters, metric);
+        // The router graph must hold exactly the populated cells.
+        assert_eq!(
+            node_to_cell.len(),
+            N_CENT - empty.len(),
+            "router must drop every count-0 cell"
+        );
+        for &cell in &node_to_cell {
+            assert!(
+                !empty.contains(&cell),
+                "router node maps to an empty cell {cell}"
+            );
+        }
+        // Beam = N_CENT (exhaustive over the populated nodes): this test asserts
+        // the count-0 SKIP invariant (ef-independent — the graph holds no empty
+        // node), so its secondary parity floor should be deterministic, not
+        // subject to HNSW-build nondeterminism at a narrow production beam.
+        // Walk recall at the production ef is covered by
+        // `graph_assign_matches_exact_across_metrics`.
+        let ef = N_CENT;
+        let mut primary_ok = 0usize;
+        let mut full_ok = 0usize;
+        for q in &queries {
+            let exact = exact_reference(&clusters, metric, &counts, q);
+            let g =
+                boundary_assignment_graph(&graph, &scorer, &node_to_cell, &clusters, metric, q, ef);
+            // The load-bearing invariant: the graph NEVER places into an empty
+            // cell (this is exactly what a naive all-cells graph would break).
+            assert!(
+                !empty.contains(&g.primary),
+                "graph primary is an empty cell"
+            );
+            for r in g.replicas.iter().flatten() {
+                assert!(!empty.contains(&r.0), "graph replica is an empty cell");
+            }
+            if exact.primary == g.primary {
+                primary_ok += 1;
+            }
+            if assignment_key(&exact) == assignment_key(&g) {
+                full_ok += 1;
+            }
+        }
+        // With empty cells dropped from the graph, placement still tracks the
+        // exact scan over populated cells at or above the parity bar.
+        let primary_parity = primary_ok as f64 / N_ROWS as f64;
+        let full_parity = full_ok as f64 / N_ROWS as f64;
+        assert!(
+            primary_parity >= 0.99,
+            "primary parity {primary_parity:.4} < 0.99 with count-0 cells present \
+             ({}/{N_ROWS} differ from the exact scan)",
+            N_ROWS - primary_ok
+        );
+        assert!(
+            full_parity >= 0.99,
+            "full placement parity {full_parity:.4} < 0.99 with count-0 cells present \
+             ({}/{N_ROWS} differ)",
+            N_ROWS - full_ok
+        );
+    }
+
+    /// `coarse_router_ef` is monotonic and clears the bench parity knees per
+    /// metric: cosine 8@256, 8@1024, 16@4096, 32@16384; L2Sq and NegDot get
+    /// the 2x beam — 8@256, 16@1024, 32@4096, 64@16384. Locks the shipped
+    /// formula so a refactor can't silently drop the beam below a validated
+    /// point.
+    #[test]
+    fn coarse_router_ef_hits_parity_knees() {
+        // Cosine beam, floor 16: max(16, round(sqrt(n)/4)).
+        assert_eq!(coarse_router_ef(256, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(1024, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(4096, Metric::Cosine), 16);
+        assert_eq!(coarse_router_ef(16384, Metric::Cosine), 32);
+        // Metric-independent now (graph-assign is cosine-gated; the parameter is
+        // retained but ignored): every metric gets the cosine beam.
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            for n in [256usize, 1024, 4096, 16384] {
+                assert_eq!(
+                    coarse_router_ef(n, metric),
+                    coarse_router_ef(n, Metric::Cosine),
+                    "metric={metric:?} n={n}"
+                );
+            }
+        }
+        // Monotonic non-decreasing across the full range, with the floor of 16,
+        // for every metric.
+        for metric in [Metric::Cosine, Metric::L2Sq, Metric::NegDot] {
+            let mut prev = 0usize;
+            for n in [1usize, 64, 256, 1024, 4096, 16384, 65536, 262144] {
+                let ef = coarse_router_ef(n, metric);
+                assert!(
+                    ef >= prev,
+                    "ef must be monotonic: ef({n},{metric:?})={ef} < {prev}"
+                );
+                assert!(ef >= 16, "ef floor is 16: ef({n},{metric:?})={ef}");
+                prev = ef;
+            }
+        }
     }
 }

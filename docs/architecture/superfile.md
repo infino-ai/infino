@@ -14,8 +14,10 @@ that composes many superfiles into one queryable table is described in
 ## Design
 
 - **Single file.** One superfile is one superfile: the columnar data and
-  its search indexes live in the same file, with no sidecars to keep
-  in sync.
+  its search indexes live in the same file, with no per-file sidecars to
+  keep in sync. (The *table* keeps a derived term index over its
+  superfiles, but it is recomputable from the superfiles and never needed
+  to read one.)
 - **Parquet-compatible.** A superfile is a standards-compliant Parquet
   file. Any Parquet reader can open it and read the columnar data with
   no infino-specific support.
@@ -73,6 +75,34 @@ flowchart TD
     inf --> infout["Columnar data + embedded<br/>full-text and vector search"]
 ```
 
+## Column encoding
+
+Row groups hold 64Ki rows, and every column chunk is compressed with
+zstd. Whether a column is dictionary-encoded is decided per superfile,
+per column, by measuring:
+
+- A **dictionary** stores each distinct value once and each row as a
+  small index into it. It pays off on a column that repeats values
+  (a status, a country, a URL): a row costs a few bits.
+- On a column of mostly distinct values (keys, prices, timestamps) the
+  dictionary holds nearly every value once more, zstd compresses the
+  plain values about as well, and the column grows. Every read that
+  touches a row group also decodes its dictionary page first, so a
+  point read pays for the whole page to return one row.
+
+The Parquet writer's default is a dictionary on every column, which
+falls back to plain values only once a chunk's dictionary page fills.
+Instead, the builder encodes the first row group of each superfile both
+ways and keeps the dictionary only for the columns where it is smaller.
+Nested columns keep the default.
+
+The choice is made wherever rows are encoded: a fresh build, a
+compaction merge (from the merged rows, so a compacted superfile is
+decided on its own data), and a bulk load. A reindex that rebuilds
+only the search indexes carries the column data over unchanged. Each
+column chunk records its own encoding, so superfiles written either way
+read the same, in infino and in any Parquet reader.
+
 ## Full-text index
 
 The full-text index is an inverted index supporting
@@ -82,10 +112,12 @@ more text columns. It is built in the following stages:
 - **Tokenization.** Each indexed text value is tokenized into terms,
   and the per-document term frequencies and document lengths that BM25
   needs are accumulated as documents are added.
-- **Term dictionary.** Indexed terms are stored in a
-  [finite-state transducer](https://blog.burntsushi.net/transducers/),
-  a compact, ordered dictionary that maps each term to its postings and
-  supports prefix lookups.
+- **Term dictionary.** Indexed terms are stored sorted in small
+  front-coded blocks (each term recorded as the suffix it does not
+  share with the one before), behind an index of one full key per
+  block. The dictionary maps each term to its postings and supports
+  exact and prefix lookups by locating one block and decoding it
+  sequentially.
 - **Posting lists.** For each term, the documents that contain it are
   stored as a delta- and bit-packed posting list together with the
   per-document term frequencies, kept in document order.

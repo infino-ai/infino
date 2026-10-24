@@ -20,11 +20,22 @@
 //! single-superfile SuperfileReader does no I/O after `open()`; a
 //! storage layer can layer cold-fetch heuristics on top.
 
-use std::{borrow::Cow, collections::HashMap, fmt, io, ops::Range, str, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt, io,
+    ops::{Deref, Range},
+    str,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use arrow::compute::{concat_batches, take};
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader, UInt32Array,
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
+    RecordBatchReader, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
@@ -33,8 +44,8 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
-            RowSelector,
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+            ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
         async_reader::MetadataFetch,
         parquet_to_arrow_schema,
@@ -45,32 +56,46 @@ use parquet::{
 use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
+use tracing::warn;
 
+#[cfg(test)]
+use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
     memory::ConnectionMemoryBudget,
     superfile::{
-        BytesLazyByteSource, LazyByteSource, LazySubSource, ReadError,
+        BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
+        error::FtsError,
         format::{self, footer, kv},
         fts::{
             bm25::Bm25Params,
             reader::{
-                self as fts_reader, BoolMode, ClauseLists, FtsReader, MatchWork, OrCursorSet,
-                PreparedClauses, TermPattern,
+                self as fts_reader, BoolMode, ClauseLists, ContainsRows, FetchedTermMemo,
+                FtsReader, MatchWork, OrCursorSet, PreparedClauses, ScoringView, TermPattern,
             },
             tokenize::{Phrase, Tokenizer},
         },
+        id_space::RowId,
+        ids::PackedIds,
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::query::provider::tombstone_access_plan,
+    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
+    utils::terms::DictEntry,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
 const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+
+/// A cold `_id` read takes the whole stable-id sidecar once it asks for at
+/// least one distinct row in this many. At half the rows nearly every page of
+/// the `_id` column is touched, so reading the pages costs more GETs and more
+/// bytes than the sidecar's few bytes a row; below it the column's page index
+/// reads less.
+const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
@@ -86,7 +111,7 @@ pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorL
 pub struct OpenOptions {
     /// Verify all CRC32C checksums on open: the embedded
     /// vector blob's whole-blob + per-subsection CRCs, and
-    /// the embedded FTS blob's four per-section CRCs (FST,
+    /// the embedded FTS blob's four per-section CRCs (term dictionary,
     /// postings region, doc-lengths directory, per-column
     /// doc-lengths arrays). Defaults to `true`; the
     /// argumentless [`SuperfileReader::open`] uses this
@@ -100,6 +125,53 @@ pub struct OpenOptions {
 impl Default for OpenOptions {
     fn default() -> Self {
         Self { verify_crc: true }
+    }
+}
+
+/// A [`ScoringView`] owned, as the scored-view memo keys on it.
+#[derive(Debug)]
+struct ScoringKey {
+    params: Option<Bm25Params>,
+    avgdl: Option<(String, f32)>,
+}
+
+impl ScoringKey {
+    /// Whether this key is `scoring`'s, compared without allocating.
+    fn matches(&self, scoring: &ScoringView<'_>) -> bool {
+        self.params == scoring.params
+            && self
+                .avgdl
+                .as_ref()
+                .map(|(column, avgdl)| (column.as_str(), *avgdl))
+                == scoring.avgdl
+    }
+
+    fn of(scoring: &ScoringView<'_>) -> Self {
+        Self {
+            params: scoring.params,
+            avgdl: scoring
+                .avgdl
+                .map(|(column, avgdl)| (column.to_owned(), avgdl)),
+        }
+    }
+}
+
+/// The FTS reader a scored query reads through: the one the file baked,
+/// or a shared view of it scoring against something else. Derefs to
+/// [`FtsReader`] so call sites do not care which they hold.
+enum ScoredFts<'a> {
+    Baked(&'a FtsReader),
+    Derived(Arc<FtsReader>),
+}
+
+impl Deref for ScoredFts<'_> {
+    type Target = FtsReader;
+
+    fn deref(&self) -> &FtsReader {
+        match self {
+            ScoredFts::Baked(r) => r,
+            ScoredFts::Derived(r) => r,
+        }
     }
 }
 
@@ -140,15 +212,228 @@ pub struct SuperfileReader {
     id_column: String,
     n_docs: u64,
     fts: Option<FtsReader>,
+    /// The most recently derived scored FTS view, kept so a query that
+    /// scores against anything other than what the file baked in does
+    /// not rebuild one per call.
+    ///
+    /// Rebuilding is not free: it clones the column metadata and builds
+    /// a fresh 256-entry decode table per column, and the scored path
+    /// asks for a view more than once per superfile per query. Since
+    /// table-wide statistics became the default that happens on every
+    /// query rather than only on an explicit override, so a common term
+    /// touching every superfile paid it once per superfile per call.
+    ///
+    /// One slot rather than a map: within a manifest generation every
+    /// query on a column asks for the same override, so a single entry
+    /// hits on all but the first. A table alternating between two FTS
+    /// columns thrashes it and simply pays what it paid before.
+    scored_fts: RwLock<Option<(ScoringKey, Arc<FtsReader>)>>,
     vec: Option<VectorReader>,
-    /// Byte range of the stable-id sidecar within `bytes` (a packed
-    /// little-endian `i128` per local doc id), when the superfile carries
-    /// one. Lets `take_by_local_doc_ids` resolve `_id` from a fixed-width
-    /// slice instead of decompressing the Parquet id pages. `None` on
-    /// superfiles written before the sidecar existed, or when there are no
-    /// resident bytes to slice (lazy path) — both fall back to the Parquet
-    /// id column.
-    id_sidecar: Option<Range<usize>>,
+    /// Where the stable-id sidecar sits in the file, when the superfile
+    /// carries one (absent on superfiles written before it existed). The
+    /// sidecar holds every row's `_id` in row order, so it answers `_id`
+    /// without decoding Parquet pages: a fully resident reader slices it
+    /// ([`resident_id_sidecar`](Self::resident_id_sidecar)), and any reader
+    /// can fetch it whole in one read
+    /// ([`fetch_id_sidecar`](Self::fetch_id_sidecar)).
+    id_sidecar: Option<IdSidecarLocation>,
+    /// Set by the first read that finds a bad block in the sidecar. Later
+    /// reads take `_id` from Parquet, so the sidecar is not retried or warned
+    /// about again.
+    id_sidecar_broken: AtomicBool,
+    /// The `(offset, len)` the resident bytes do not hold, when they are a
+    /// local copy with a hole ([`install_resident_parquet`]); every other byte
+    /// of them is the file's own.
+    ///
+    /// [`install_resident_parquet`]: Self::install_resident_parquet
+    resident_hole: Option<(u64, u64)>,
+}
+
+/// Where a superfile's stable-id sidecar lives and how it is laid out, from
+/// the footer key-values. Its range was checked against the file length when
+/// it was parsed ([`id_sidecar_location`]).
+#[derive(Debug, Clone, Copy)]
+struct IdSidecarLocation {
+    offset: u64,
+    len: u64,
+    /// The packed layout (`superfile::ids`) rather than the raw `i128` array.
+    packed: bool,
+}
+
+impl IdSidecarLocation {
+    /// The sidecar, given its bytes.
+    fn with_bytes(self, bytes: Bytes, n_docs: u64) -> IdSidecar {
+        IdSidecar {
+            bytes,
+            packed: self.packed,
+            n_docs,
+        }
+    }
+
+    /// The sidecar cut from the whole file's `bytes`.
+    fn slice(self, file: &Bytes, n_docs: u64) -> IdSidecar {
+        let start = self.offset as usize;
+        self.with_bytes(file.slice(start..start + self.len as usize), n_docs)
+    }
+}
+
+/// A superfile's whole stable-id sidecar: one `_id` per local doc, in
+/// Parquet row order (every writer builds it from the same rows, in the same
+/// order, as the Parquet body). Decoding it is CPU over the rows asked for,
+/// so it is a step of its own that the caller runs where CPU work belongs.
+#[derive(Debug)]
+pub(crate) struct IdSidecar {
+    bytes: Bytes,
+    packed: bool,
+    n_docs: u64,
+}
+
+impl IdSidecar {
+    /// Check the sidecar's shape without decoding it: a packed one's header,
+    /// a raw one's length (sixteen bytes per doc). An eager open checks this
+    /// much; [`ids`](Self::ids) also checks each block it reads.
+    fn check(&self) -> Result<(), ReadError> {
+        if self.packed {
+            return PackedIds::open(&self.bytes, self.n_docs as usize)
+                .map(|_| ())
+                .map_err(ReadError::MalformedKv);
+        }
+        let expected = self.n_docs as usize * format::ID_SIDECAR_ENTRY_BYTES;
+        if self.bytes.len() != expected {
+            return Err(ReadError::MalformedKv(format!(
+                "stable-id sidecar length {} != {expected} (16 x n_docs)",
+                self.bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The `_id` of each of `local_doc_ids`, in caller order; repeats and any
+    /// order are fine. A doc past the end is the caller's mistake
+    /// ([`ReadError::DocIdOutOfRange`]); a sidecar that does not decode is
+    /// [`ReadError::MalformedKv`], and the caller can read the same ids from
+    /// the Parquet `_id` column instead.
+    pub(crate) fn ids(&self, local_doc_ids: &[u32]) -> Result<Vec<i128>, ReadError> {
+        /// Width of one raw id, aliased from the format const for the
+        /// fixed-size `from_le_bytes` decode.
+        const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
+        if let Some(&doc_id) = local_doc_ids
+            .iter()
+            .find(|&&doc| u64::from(doc) >= self.n_docs)
+        {
+            return Err(ReadError::DocIdOutOfRange {
+                doc_id,
+                n_docs: self.n_docs,
+            });
+        }
+        let mut out: Vec<i128> = Vec::with_capacity(local_doc_ids.len());
+        if self.packed {
+            // Opening the packed layout is its check. A block walk hands its
+            // docs over ascending, so a large resolve unpacks each block's two
+            // streams once instead of reading two bit fields per doc.
+            PackedIds::open(&self.bytes, self.n_docs as usize)
+                .map_err(ReadError::MalformedKv)?
+                .get_many(local_doc_ids, &mut out)
+                .ok_or_else(|| {
+                    ReadError::MalformedKv("a block of the stable-id sidecar is malformed".into())
+                })?;
+            return Ok(out);
+        }
+        self.check()?;
+        // In bounds: every doc is below `n_docs`, and the length is
+        // `n_docs * ENTRY`.
+        out.extend(local_doc_ids.iter().map(|&doc_id| {
+            let start = doc_id as usize * ENTRY;
+            let raw: [u8; ENTRY] = self.bytes[start..start + ENTRY]
+                .try_into()
+                .expect("a raw sidecar entry is ENTRY bytes");
+            i128::from_le_bytes(raw)
+        }));
+        Ok(out)
+    }
+
+    /// Every row's `_id`, in row order, checked against what the footer
+    /// already records about them. The sidecar carries no checksum, so a
+    /// damaged block that still decodes would hand back wrong ids; these
+    /// checks catch that before the ids place a hit or a delete:
+    ///
+    ///   - the ids span exactly `id_range`, the file's lowest and highest
+    ///     `_id` as the table recorded them;
+    ///   - each row group's ids have that group's `_id` column minimum and
+    ///     maximum, where the footer carries them.
+    ///
+    /// A mismatch is [`ReadError::MalformedKv`], like a block that does not
+    /// decode, so the caller reads the column instead.
+    pub(crate) fn verified_ids(
+        &self,
+        metadata: &ParquetMetaData,
+        id_column: &str,
+        id_range: (i128, i128),
+    ) -> Result<Vec<i128>, ReadError> {
+        let every: Vec<u32> = (0..self.n_docs as u32).collect();
+        let ids = self.ids(&every)?;
+        let span = ids.iter().min().zip(ids.iter().max());
+        if span.is_some_and(|(&lo, &hi)| (lo, hi) != id_range) {
+            return Err(ReadError::MalformedKv(
+                "the stable-id sidecar's ids do not span the file's id range".into(),
+            ));
+        }
+        let Some(column) = metadata
+            .file_metadata()
+            .schema_descr()
+            .columns()
+            .iter()
+            .position(|c| c.name() == id_column)
+        else {
+            return Ok(ids);
+        };
+        let mut start = 0usize;
+        for (group, row_group) in metadata.row_groups().iter().enumerate() {
+            let rows = usize::try_from(row_group.num_rows()).unwrap_or(0);
+            let end = start.saturating_add(rows).min(ids.len());
+            let slice = &ids[start..end];
+            start = end;
+            let Some((stat_min, stat_max)) = row_group.column(column).statistics().and_then(|s| {
+                Some((
+                    decimal_stat(s.min_bytes_opt()?)?,
+                    decimal_stat(s.max_bytes_opt()?)?,
+                ))
+            }) else {
+                continue;
+            };
+            let found = slice.iter().min().zip(slice.iter().max());
+            if found != Some((&stat_min, &stat_max)) {
+                return Err(ReadError::MalformedKv(format!(
+                    "the stable-id sidecar disagrees with row group {group}'s `_id` statistics"
+                )));
+            }
+        }
+        Ok(ids)
+    }
+}
+
+/// Whether `local_doc_ids` names at least one distinct row of a file of
+/// `n_docs` in every [`SIDECAR_MIN_ROW_SHARE`]. Counts distinct rows, so a
+/// list with repeats is not mistaken for coverage, and rows past the end do
+/// not count.
+fn covers_row_share(local_doc_ids: &[u32], n_docs: u64) -> bool {
+    let needed = n_docs.div_ceil(SIDECAR_MIN_ROW_SHARE);
+    if n_docs == 0 || (local_doc_ids.len() as u64) < needed {
+        return false;
+    }
+    let distinct: RoaringBitmap = local_doc_ids
+        .iter()
+        .copied()
+        .filter(|&doc| u64::from(doc) < n_docs)
+        .collect();
+    distinct.len() >= needed
+}
+
+/// A `Decimal128` column statistic as stored in the footer: sixteen
+/// big-endian bytes. `None` for any other width (a truncated statistic says
+/// nothing exact).
+fn decimal_stat(bytes: &[u8]) -> Option<i128> {
+    Some(i128::from_be_bytes(bytes.try_into().ok()?))
 }
 
 struct LazyMetadataFetch {
@@ -165,7 +450,7 @@ impl MetadataFetch for &mut LazyMetadataFetch {
             source
                 .range(range.start, len)
                 .await
-                .map_err(|error| ParquetError::General(error.to_string()))
+                .map_err(|error| ParquetError::External(Box::new(error)))
         }
         .boxed()
     }
@@ -202,9 +487,11 @@ impl SuperfileReader {
     /// 2. **3-4 GETs** for the embedded vector subsection, via
     ///    `VectorReader::open_lazy` (outer header, directory + CRC,
     ///    subsection headers, and Sq8 codec_meta when present).
-    /// 3. **3 GETs** for the embedded FTS subsection, via
-    ///    `FtsReader::open_lazy` (header, FST dictionary, doc-length
-    ///    tail; postings stay lazy until search).
+    /// 3. **2-3 GETs** for the embedded FTS subsection, via
+    ///    `FtsReader::open_lazy` (header, doc-lengths directory, and the
+    ///    doc-id map when the file has one; the dictionary, each column's
+    ///    length array and the postings stay lazy until a query needs
+    ///    them).
     ///
     /// Total open budget is small exact metadata ranges rather than
     /// whole-subsection/speculative slabs. Subsequent vector queries
@@ -260,8 +547,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -350,6 +638,13 @@ impl SuperfileReader {
         };
 
         let (vec, fts) = futures::try_join!(vec_fut, fts_fut)?;
+        // Lazy reads use the sidecar only to fetch every `_id` at once, a
+        // shortcut with the Parquet column behind it, so a malformed location
+        // switches the shortcut off rather than failing the open.
+        let id_sidecar = id_sidecar_location(&kv_map, source.size()).unwrap_or_else(|error| {
+            warn!(%error, "ignoring the stable-id sidecar of a lazily opened superfile");
+            None
+        });
 
         Ok(Self {
             bytes: None,
@@ -361,10 +656,14 @@ impl SuperfileReader {
             id_column,
             n_docs,
             fts,
+            scored_fts: RwLock::new(None),
             vec,
-            // No resident bytes to slice on the lazy path; `_id` resolution
-            // there goes through the Parquet id column.
-            id_sidecar: None,
+            // No resident bytes to slice on the lazy path; a read of a few
+            // `_id`s goes through the Parquet id column, and a read of every
+            // one fetches the sidecar through `fetch_id_sidecar`.
+            id_sidecar,
+            id_sidecar_broken: AtomicBool::new(false),
+            resident_hole: None,
         })
     }
 
@@ -393,8 +692,9 @@ impl SuperfileReader {
             )));
         }
         let version_str = kv_map.get(kv::FORMAT_VERSION).expect("checked above");
-        let version = format::Version::parse(version_str)
-            .ok_or_else(|| ReadError::MalformedVersion(version_str.clone()))?;
+        let version = format::Version::parse(version_str).ok_or_else(|| {
+            ReadError::Malformed(format!("format-version {version_str:?} does not parse"))
+        })?;
         if !version.is_compatible_with_current() {
             return Err(ReadError::UnsupportedVersion(version_str.clone()));
         }
@@ -406,17 +706,24 @@ impl SuperfileReader {
             .parse()
             .map_err(|_| ReadError::MalformedKv(format!("{} not a u64", kv::N_DOCS)))?;
 
-        // 3. Parse the Parquet metadata once, with the page index, and
-        //    cache it on the reader. `Bytes` implements `ChunkReader`
-        //    directly so this is zero-copy, and every later
-        //    `take_by_local_doc_ids` reuses this `ArrowReaderMetadata`
-        //    instead of re-parsing the footer per call. The page index
-        //    lets `RowSelection` skip whole pages on targeted reads.
-        let arrow_meta = ArrowReaderMetadata::load(
-            &bytes,
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-        )
-        .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+        // 3. Parse the Parquet metadata once and cache it on the reader.
+        //    `Bytes` implements `ChunkReader` directly so this is
+        //    zero-copy, and every later `take_by_local_doc_ids` reuses
+        //    this `ArrowReaderMetadata` instead of re-parsing the footer
+        //    per call.
+        //
+        //    The page index — a decoded min/max pair per page, per column,
+        //    per row group — is deliberately NOT parsed here. It exists to
+        //    let `RowSelection` skip pages on targeted reads, and only the
+        //    take and SQL-scan paths use it; BM25 and COUNT never touch it.
+        //    Parsing it at open put tens of MiB on the heap per superfile
+        //    for every reader, including the fan-out readers that will
+        //    only ever count. `parquet_metadata_with_page_index` parses it
+        //    on first use instead, from these same resident bytes, so the
+        //    paths that need it see identical metadata and pay no I/O for
+        //    it either way.
+        let arrow_meta = ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::new())
+            .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
         let schema = arrow_meta.schema().clone();
 
         // 4. If FTS keys present, slice + open FtsReader.
@@ -466,46 +773,34 @@ impl SuperfileReader {
             None
         };
 
-        // 6. Stable-id sidecar (optional): a packed little-endian `i128` per
-        //    local doc id. Record its byte range so `take_by_local_doc_ids`
-        //    resolves `_id` from a fixed-width slice instead of the Parquet
-        //    id pages. Absent on pre-sidecar superfiles → Parquet fallback.
-        let id_sidecar = if all_present(&kv_map, kv::IDS_KEYS) {
-            let off = parse_u64(&kv_map, kv::IDS_OFFSET)? as usize;
-            let len = parse_u64(&kv_map, kv::IDS_LENGTH)? as usize;
-            let expected = (n_docs as usize) * format::ID_SIDECAR_ENTRY_BYTES;
-            if len != expected {
-                return Err(ReadError::MalformedKv(format!(
-                    "stable-id sidecar length {len} != {expected} (16 x n_docs)"
-                )));
-            }
-            let end = off
-                .checked_add(len)
-                .filter(|&end| end <= bytes.len())
-                .ok_or_else(|| {
-                    ReadError::MalformedKv("stable-id sidecar range out of bounds".into())
-                })?;
-            Some(off..end)
-        } else if any_present(&kv_map, kv::IDS_KEYS) {
-            return Err(ReadError::MalformedKv(
-                "partial inf.ids.* keys present".into(),
-            ));
-        } else {
-            None
-        };
+        // 6. Stable-id sidecar (optional): every row's `_id` in row order,
+        //    packed (`superfile::ids`) or raw (a little-endian `i128` per
+        //    doc). Recorded so `take_by_local_doc_ids` answers `_id` without
+        //    decoding the Parquet id pages. Absent on superfiles written
+        //    before it existed, which then read the Parquet column. Only its
+        //    shape is checked here (a packed header, or a raw length); each
+        //    packed block is checked when it is read.
+        let id_sidecar = id_sidecar_location(&kv_map, bytes.len() as u64)?;
+        if let Some(loc) = id_sidecar {
+            loc.slice(&bytes, n_docs).check()?;
+        }
 
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
-            page_index_meta: OnceCell::new_with(Some(Arc::clone(arrow_meta.metadata()))),
+            // Filled by `parquet_metadata_with_page_index` on first use.
+            page_index_meta: OnceCell::new(),
             arrow_meta: Some(arrow_meta),
             source: None,
             schema,
             id_column,
             n_docs,
             fts,
+            scored_fts: RwLock::new(None),
             vec,
             id_sidecar,
+            id_sidecar_broken: AtomicBool::new(false),
+            resident_hole: None,
         })
     }
 
@@ -539,11 +834,27 @@ impl SuperfileReader {
             return Ok(Arc::clone(&self.parquet_meta));
         }
         let source = self.source.as_ref().map(Arc::clone);
+        let bytes = self.bytes.clone();
         let metadata = self
             .page_index_meta
             .get_or_try_init(|| async move {
                 let Some(source) = source else {
-                    return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(&self.parquet_meta));
+                    // Eager / mmap reader: the whole file is already
+                    // resident, so parse the index straight out of it
+                    // rather than going back to storage. Keeping this off
+                    // the metered DataFusion store is what makes page-byte
+                    // accounting independent of how the reader was opened.
+                    let Some(bytes) = bytes else {
+                        return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(
+                            &self.parquet_meta,
+                        ));
+                    };
+                    let indexed = ArrowReaderMetadata::load(
+                        &bytes,
+                        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
+                    )
+                    .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
+                    return Ok(Arc::clone(indexed.metadata()));
                 };
                 let mut fetch = LazyMetadataFetch { source };
                 let mut loader =
@@ -579,6 +890,32 @@ impl SuperfileReader {
     }
 
     /// FTS column names in declaration order, or empty.
+    /// The name this file knows the column `id` by, for a caller holding
+    /// the table's current name for it. A file written before a rename
+    /// carries the old label in its FTS and vector blobs, which key their
+    /// columns by name; the id is what identifies the column across both.
+    /// Falls back to `name` for a file written before ids, whose labels
+    /// were the table's at the time.
+    pub(crate) fn column_alias<'a>(&'a self, id: Option<FieldId>, name: &'a str) -> &'a str {
+        let Some(id) = id else {
+            return name;
+        };
+        let fts = self
+            .fts()
+            .into_iter()
+            .flat_map(|fts| fts.fts_columns_config())
+            .find(|c| c.field_id == Some(id))
+            .map(|c| c.name.as_str());
+        fts.or_else(|| {
+            self.vec()
+                .into_iter()
+                .flat_map(|vec| vec.vector_columns_config())
+                .find(|c| c.field_id == Some(id))
+                .map(|c| c.name.as_str())
+        })
+        .unwrap_or(name)
+    }
+
     pub fn fts_columns(&self) -> Vec<&str> {
         match &self.fts {
             Some(r) => r.fts_columns().collect(),
@@ -589,6 +926,54 @@ impl SuperfileReader {
     /// Underlying FTS reader. `None` if this superfile has no FTS index.
     pub fn fts(&self) -> Option<&FtsReader> {
         self.fts.as_ref()
+    }
+
+    /// Attribute every byte of a resident superfile to a region — the
+    /// Parquet row groups (per column), the `_id` sidecar, the vector
+    /// index, the FTS blob (itself broken down per term band by
+    /// [`FtsReader::size_breakdown`]) and the footer. A report over the
+    /// whole file, never a query path; `None` when the reader is not
+    /// fully resident (a lazy object-store open), since the total is the
+    /// resident length.
+    pub fn size_breakdown(&self) -> Result<Option<SuperfileSizeBreakdown>, ReadError> {
+        let Some(bytes) = self.bytes.as_ref() else {
+            return Ok(None);
+        };
+        let kv_map = footer::extract_kv_map(&self.parquet_meta).map_err(ReadError::Footer)?;
+        let kv_len = |key: &str| -> u64 {
+            kv_map
+                .get(key)
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let mut columns: Vec<(String, u64)> = Vec::new();
+        let mut row_group_bytes = 0u64;
+        for rg in self.parquet_meta.row_groups() {
+            for c in rg.columns() {
+                let size = c.compressed_size().max(0) as u64;
+                row_group_bytes += size;
+                let name = c.column_path().string();
+                match columns.iter_mut().find(|(n, _)| *n == name) {
+                    Some((_, b)) => *b += size,
+                    None => columns.push((name, size)),
+                }
+            }
+        }
+        let fts = match &self.fts {
+            Some(r) => Some(r.size_breakdown().map_err(fts_reader_error_to_read)?),
+            None => None,
+        };
+        Ok(Some(SuperfileSizeBreakdown {
+            total_bytes: bytes.len() as u64,
+            n_docs: self.n_docs,
+            row_groups: self.parquet_meta.row_groups().len() as u64,
+            row_group_bytes,
+            columns,
+            id_sidecar_bytes: self.id_sidecar.map_or(0, |loc| loc.len),
+            vec_bytes: kv_len(kv::VEC_LENGTH),
+            fts_bytes: kv_len(kv::FTS_LENGTH),
+            fts,
+        }))
     }
 
     /// Vector column names in declaration order, or empty.
@@ -648,19 +1033,39 @@ impl SuperfileReader {
         self.bytes.is_some() && self.source.is_none()
     }
 
+    /// Whether the stable-id sidecar is in the packed layout.
+    pub(crate) fn id_sidecar_is_packed(&self) -> bool {
+        self.id_sidecar.is_some_and(|loc| loc.packed)
+    }
+
+    /// Whole-file bytes, but only when every region of them is valid.
+    ///
+    /// `bytes` alone is not enough: a hybrid-promoted reader carries a
+    /// fill-file mmap whose vector region is left sparse, so a caller
+    /// copying blob ranges out of it would copy zeros. Gated on
+    /// [`Self::is_fully_resident`], which that promotion never satisfies.
+    pub(crate) fn whole_file_bytes(&self) -> Option<&Bytes> {
+        self.is_fully_resident().then_some(self.bytes.as_ref())?
+    }
+
     /// Install resident whole-file bytes on a lazily-opened reader so the
     /// synchronous parquet paths (`take_by_local_doc_ids`,
     /// `get_record_batch`, `id_lookup`) run main-style sync decodes instead
     /// of the async stream machinery. Used by the disk cache's hybrid mmap
     /// promotion, where `bytes` is the fill-file mmap with the **vector blob
-    /// left sparse** — valid for every parquet-referenced byte (data pages,
-    /// footer) and for the FTS subsection, but NOT for the vector region.
-    /// The FTS/vector sub-readers keep the sources they were opened over;
-    /// [`byte_source`] keeps preferring the reader's lazy source, so no
-    /// consumer can reach the sparse region through this reader.
+    /// left sparse**: `hole` is that blob's `(offset, len)`, and every byte
+    /// outside it is the file's own. The FTS/vector sub-readers keep the
+    /// sources they were opened over; [`byte_source`] keeps preferring the
+    /// reader's lazy source, so no consumer can reach the sparse region
+    /// through this reader.
     ///
     /// [`byte_source`]: SuperfileReader::byte_source
-    pub(crate) fn install_resident_parquet(&mut self, bytes: Bytes) -> Result<(), ReadError> {
+    pub(crate) fn install_resident_parquet(
+        &mut self,
+        bytes: Bytes,
+        hole: (u64, u64),
+    ) -> Result<(), ReadError> {
+        self.resident_hole = Some(hole);
         let arrow_meta = ArrowReaderMetadata::load(
             &bytes,
             ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
@@ -673,11 +1078,32 @@ impl SuperfileReader {
         self.bytes = Some(bytes);
         Ok(())
     }
-    /// Returns a record batch containing all documents with all columns
+    /// Returns a record batch containing all documents with all columns.
+    /// Test-only: joining the batches overflows a `Utf8` column past 2 GiB,
+    /// so production code reads with `record_batches`.
+    #[cfg(test)]
     pub fn get_record_batch(
         &self,
         deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
     ) -> Result<RecordBatch, ReadError> {
+        let reader = self.record_batches(deleted_docs_bitmap)?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let record_batch = concat_batches(&read_schema, &batches)
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+
+        Ok(record_batch)
+    }
+
+    /// All documents (minus `deleted_docs_bitmap`) with all columns, one
+    /// decoded batch at a time. The batches are never joined, so a string column past 2 GiB, more than
+    /// one `Utf8` array's 32-bit offsets can hold, still reads.
+    pub(crate) fn record_batches(
+        &self,
+        deleted_docs_bitmap: Option<Arc<RoaringBitmap>>,
+    ) -> Result<ParquetRecordBatchReader, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -707,17 +1133,74 @@ impl SuperfileReader {
                 builder = builder.with_row_selection(selection);
             }
         }
-        let reader = builder
+        builder
             .build()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let read_schema = reader.schema();
-        let batches = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
-        let record_batch = concat_batches(&read_schema, &batches)
-            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+            .map_err(|e| ReadError::Columnar(e.to_string()))
+    }
 
-        Ok(record_batch)
+    /// The whole stable-id sidecar, fetched with one ranged read through
+    /// [`byte_source`](Self::byte_source). On a cold reader that is one
+    /// request for a few bytes per row, where reading every `_id` from the
+    /// Parquet column costs a request per column chunk. `None` when the
+    /// superfile carries no sidecar (written before it existed) or an earlier
+    /// read found it does not decode
+    /// ([`mark_id_sidecar_broken`](Self::mark_id_sidecar_broken)); the caller
+    /// then reads `_id` from the Parquet column, which holds the same ids.
+    pub(crate) async fn fetch_id_sidecar(&self) -> Result<Option<IdSidecar>, ReadError> {
+        let Some(loc) = self.id_sidecar else {
+            return Ok(None);
+        };
+        if self.id_sidecar_broken.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let bytes = self
+            .byte_source()
+            .range(loc.offset, loc.len)
+            .await
+            .map_err(|source| ReadError::RangeFetch {
+                what: "stable-id sidecar fetch",
+                source,
+            })?;
+        // A short buffer is a failed read, not a damaged sidecar: it must
+        // stay in the fetch class, so the caller retries the sidecar on a
+        // later read instead of marking a healthy one broken.
+        if bytes.len() as u64 != loc.len {
+            return Err(ReadError::RangeFetch {
+                what: "stable-id sidecar fetch",
+                source: LazyByteSourceError::ShortRead {
+                    start: loc.offset,
+                    requested: loc.len,
+                    got: bytes.len() as u64,
+                },
+            });
+        }
+        Ok(Some(loc.with_bytes(bytes, self.n_docs)))
+    }
+
+    /// Whether a read of `local_doc_ids` from `id_column` should fetch the
+    /// stable-id sidecar whole ([`fetch_id_sidecar`](Self::fetch_id_sidecar))
+    /// rather than read the Parquet column or the vector blob's inline ids.
+    /// All four must hold:
+    ///
+    ///   - no resident Parquet: a resident reader answers without any read;
+    ///   - at least one distinct row in [`SIDECAR_MIN_ROW_SHARE`] of the file
+    ///     asked for: the sidecar is fetched whole, while a smaller subset
+    ///     reads only its own pages through the column's page index, and at
+    ///     that share those pages are nearly all of the column;
+    ///   - the table's id column: the only column the sidecar holds;
+    ///   - the packed layout: a raw sidecar is sixteen bytes a row, more than
+    ///     the compressed column it would replace.
+    pub(crate) fn id_sidecar_serves(&self, local_doc_ids: &[u32], id_column: &str) -> bool {
+        self.bytes.is_none()
+            && id_column == self.id_column
+            && self.id_sidecar_is_packed()
+            && covers_row_share(local_doc_ids, self.n_docs)
+    }
+
+    /// Record that this superfile's sidecar does not decode, so later reads
+    /// take `_id` from another source without fetching it again.
+    pub(crate) fn mark_id_sidecar_broken(&self) {
+        self.id_sidecar_broken.store(true, Ordering::Relaxed);
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
@@ -781,6 +1264,29 @@ impl SuperfileReader {
         local_doc_ids: &[u32],
         projection: &[&str],
     ) -> Result<RecordBatch, ReadError> {
+        self.take_rows(local_doc_ids, projection, true)
+    }
+
+    /// [`take_by_local_doc_ids`](Self::take_by_local_doc_ids) with `_id`
+    /// decoded from the Parquet column even where the stable-id sidecar could
+    /// answer, for a caller rebuilding that sidecar: its ids must come from
+    /// the column, not from the copy being replaced.
+    pub(crate) fn take_by_local_doc_ids_from_parquet(
+        &self,
+        local_doc_ids: &[u32],
+        projection: &[&str],
+    ) -> Result<RecordBatch, ReadError> {
+        self.take_rows(local_doc_ids, projection, false)
+    }
+
+    /// The rows behind both takes; `id_from_sidecar` lets the stable-id
+    /// sidecar answer `_id` when the reader holds it.
+    fn take_rows(
+        &self,
+        local_doc_ids: &[u32],
+        projection: &[&str],
+        id_from_sidecar: bool,
+    ) -> Result<RecordBatch, ReadError> {
         let bytes = self
             .bytes
             .as_ref()
@@ -825,18 +1331,35 @@ impl SuperfileReader {
             return Ok(RecordBatch::new_empty(out_schema));
         }
 
-        // The `_id` column resolves from the fixed-width stable-id sidecar
-        // when the superfile carries one — a direct slice, no Parquet decode.
+        // On a fully resident reader, `_id` resolves from the stable-id
+        // sidecar when the superfile carries one: a slice, no Parquet decode.
         // Every other column still comes from the id-selected Parquet read;
         // when `_id` is the only projection, that read is skipped entirely.
-        let use_sidecar_for_id =
-            self.id_sidecar.is_some() && projection.iter().any(|&n| n == self.id_column);
-        let sidecar_id = if use_sidecar_for_id {
-            let range = self.id_sidecar.clone().expect("checked");
-            Some(self.id_array_from_sidecar(&bytes, range, local_doc_ids)?)
-        } else {
-            None
+        // A sidecar that can't be read (a bad block) falls back to the Parquet
+        // `_id` column, which holds the same ids, so the read still answers.
+        // The first failure marks the sidecar broken, so later reads skip it and
+        // it warns once. `Relaxed` is enough: a read that misses the mark only
+        // retries the sidecar and falls back the same way.
+        let resident_sidecar = id_from_sidecar
+            .then(|| self.resident_id_sidecar())
+            .flatten();
+        let sidecar_id = match resident_sidecar {
+            Some(sidecar)
+                if projection.iter().any(|&n| n == self.id_column)
+                    && !self.id_sidecar_broken.load(Ordering::Relaxed) =>
+            {
+                match self.id_array_from_sidecar(&sidecar, local_doc_ids) {
+                    Ok(ids) => Some(ids),
+                    Err(error) => {
+                        self.mark_id_sidecar_broken();
+                        warn!(%error, "reading _id from Parquet, the id sidecar is unreadable");
+                        None
+                    }
+                }
+            }
+            _ => None,
         };
+        let use_sidecar_for_id = sidecar_id.is_some();
 
         // Columns Parquet must serve: the projection minus the sidecar-served
         // `_id`, deduped in first-seen order for the ProjectionMask. The
@@ -919,32 +1442,49 @@ impl SuperfileReader {
                 .map_err(|e| ReadError::Columnar(e.to_string()))?;
             columns.push(taken);
         }
-        RecordBatch::try_new(out_schema, columns).map_err(|e| ReadError::Columnar(e.to_string()))
+        // The row count is carried explicitly rather than inferred from the
+        // columns: a projection can legitimately resolve to no columns at
+        // all — a caller naming only columns this file predates — and a
+        // batch with neither columns nor a stated row count cannot say how
+        // many rows it has. The caller null-fills from this count.
+        RecordBatch::try_new_with_options(
+            out_schema,
+            columns,
+            &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
+        )
+        .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
-    /// Build the `_id` column for `local_doc_ids` (in caller order) from the
-    /// stable-id sidecar `range` within `bytes`: each id is a little-endian
-    /// `i128` at `local_doc_id * ENTRY`. Direct indexing, so duplicates and
-    /// ordering need no rank-back. Bounds are guaranteed by the doc-id
-    /// bounds-check in [`take_by_local_doc_ids`] and the sidecar-length check
-    /// at open, so the fixed-width reads cannot overrun the region.
+    /// The stable-id sidecar sliced from resident bytes, without a read: on a
+    /// [fully resident](Self::is_fully_resident) reader, and on a promoted one
+    /// whose missing range ([`install_resident_parquet`]) does not overlap
+    /// the sidecar. The promotion leaves out only the vector blob, which ends
+    /// before the sidecar starts, so a promoted reader's sidecar bytes are the
+    /// file's own; the overlap check keeps that true should the hole move.
+    ///
+    /// [`install_resident_parquet`]: Self::install_resident_parquet
+    fn resident_id_sidecar(&self) -> Option<IdSidecar> {
+        let loc = self.id_sidecar?;
+        let bytes = self.bytes.as_ref()?;
+        let holds_sidecar = match self.resident_hole {
+            None => self.is_fully_resident(),
+            Some((hole, hole_len)) => {
+                loc.offset.saturating_add(loc.len) <= hole
+                    || loc.offset >= hole.saturating_add(hole_len)
+            }
+        };
+        holds_sidecar.then(|| loc.slice(bytes, self.n_docs))
+    }
+
+    /// Build the `_id` column for `local_doc_ids` (in caller order) from
+    /// `sidecar`, through [`IdSidecar::ids`]. Direct indexing, so duplicates
+    /// and ordering need no rank-back.
     fn id_array_from_sidecar(
         &self,
-        bytes: &Bytes,
-        range: Range<usize>,
+        sidecar: &IdSidecar,
         local_doc_ids: &[u32],
     ) -> Result<ArrayRef, ReadError> {
-        /// Width of one packed id, aliased from the format const for the
-        /// fixed-size `from_le_bytes` decode.
-        const ENTRY: usize = format::ID_SIDECAR_ENTRY_BYTES;
-        let region = &bytes[range];
-        let ids = local_doc_ids.iter().map(|&doc_id| {
-            let start = doc_id as usize * ENTRY;
-            let raw: [u8; ENTRY] = region[start..start + ENTRY]
-                .try_into()
-                .expect("sidecar entry within bounds");
-            i128::from_le_bytes(raw)
-        });
+        let ids = sidecar.ids(local_doc_ids)?;
         let id_idx = self
             .schema
             .index_of(&self.id_column)
@@ -1095,9 +1635,9 @@ impl SuperfileReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         // Tokenize with the target column's configured tokenizer so query
-        // terms match how the column was indexed (ascii_lower / standard).
+        // terms match how the column was indexed (its analysis chain).
         // A column this superfile has no full-text index for fails here,
         // where the reason is still nameable, rather than after a pass with
         // some other column's analyzer.
@@ -1131,9 +1671,11 @@ impl SuperfileReader {
                 must_phrases: &must_phrases,
                 should_phrases: &should_phrases,
                 negative_phrases: &negative_phrases,
-                global_idf: None,
+                idf: fts_reader::QueryIdf::ThisFile,
                 prefetched: None,
                 live_floor: None,
+                allow: None,
+                exact_count: false,
             },
             k,
             f32::NEG_INFINITY,
@@ -1143,7 +1685,7 @@ impl SuperfileReader {
 
     /// Pre-tokenized variant of [`Self::bm25_hits_async`] — the caller
     /// supplies the already-tokenized term slice and we skip the
-    /// `AsciiLowerTokenizer` pass.
+    /// tokenizer pass.
     ///
     /// Used by the supertable layer's fan-out: the cross-superfile
     /// search tokenizes the query once at the orchestrator (to
@@ -1152,17 +1694,16 @@ impl SuperfileReader {
     /// `(N+1)·T` redundant tokenizations across N superfiles and
     /// a T-token query.
     ///
-    /// Terms must already be tokenized to the column's FST key form —
-    /// e.g. `AsciiLowerTokenizer.tokenize(query)` for an `ascii_lower`
-    /// column (already-lowercased ASCII alphanumerics) or
-    /// `StandardTokenizer.tokenize(query)` for a `standard` column.
+    /// Terms must already be tokenized to the column's dictionary key form —
+    /// the column's own tokenizer, e.g. `StandardTokenizer.tokenize(query)`
+    /// for a plain `standard` column.
     pub async fn bm25_search_pretokenized(
         &self,
         column: &str,
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         self.bm25_search_pretokenized_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
             .await
     }
@@ -1180,7 +1721,7 @@ impl SuperfileReader {
         k: usize,
         mode: BoolMode,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1196,11 +1737,30 @@ impl SuperfileReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         Ok(fts.token_match(column, tokens, mode).await?)
+    }
+
+    /// [`Self::token_match`] with terms a table-level term index already
+    /// resolved served from `prefetched`, so the dictionary is read only
+    /// for tokens the memo lacks. Delegates to
+    /// [`FtsReader::token_match_prefetched`].
+    pub(crate) async fn token_match_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_prefetched(column, tokens, mode, prefetched)
+            .await?)
     }
 
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
@@ -1225,6 +1785,24 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// For each of `needles`, the rows of `column` an `ILIKE '%needle%'`
+    /// matches, decided from the dictionary and postings in one walk but
+    /// for the rows it marks doubtful; every needle meets the exact rule.
+    /// What it holds meanwhile is charged to `budget`. Delegates to
+    /// [`FtsReader::contains_rows`].
+    pub(crate) async fn contains_rows(
+        &self,
+        column: &str,
+        needles: &[&str],
+        pool: Option<&ThreadPool>,
+        budget: Option<&Arc<ConnectionMemoryBudget>>,
+    ) -> Result<(Vec<ContainsRows>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.contains_rows(column, needles, pool, budget).await?)
+    }
+
     /// Unranked token-match **count**: the number of `local_doc_id`s
     /// [`token_match`](Self::token_match) would return under `mode`,
     /// without materializing the id `Vec`. Delegates to
@@ -1241,6 +1819,23 @@ impl SuperfileReader {
         Ok(fts.token_match_count(column, tokens, mode).await?)
     }
 
+    /// [`Self::token_match_count`] served from `prefetched`; see
+    /// [`Self::token_match_prefetched`].
+    pub(crate) async fn token_match_count_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts
+            .token_match_count_prefetched(column, tokens, mode, prefetched)
+            .await?)
+    }
+
     /// Phrase-aware unranked match: `local_doc_id`s whose `column`
     /// matches the `terms` and exact `phrases` under `mode`,
     /// ascending. Used by the table layer whenever the match set
@@ -1252,7 +1847,7 @@ impl SuperfileReader {
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1292,10 +1887,38 @@ impl SuperfileReader {
         Ok(fts.term_df(column, token).await?)
     }
 
-    /// Document frequency of each of `tokens` in `column`, in input order
-    /// (0 for any absent token). Batched sibling of [`Self::term_df`]:
-    /// resolves the whole set with one FST parse and one coalesced header
-    /// fetch. Delegates to [`FtsReader::term_dfs`].
+    /// A prefetched-term memo for terms whose dictionary values are already
+    /// known, fetching only their postings. Delegates to
+    /// [`FtsReader::memo_from_dict_values`].
+    pub(crate) async fn term_memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, DictEntry)],
+    ) -> Result<FetchedTermMemo, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.memo_from_dict_values(terms).await?)
+    }
+
+    /// What a table-level term index records about each of `tokens` in
+    /// `column`, in input order (`None` for an absent token). Delegates to
+    /// [`FtsReader::term_index_facts`].
+    #[cfg(test)]
+    pub(crate) async fn term_index_facts(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.term_index_facts(column, tokens).await?)
+    }
+
+    /// Document frequency of each of `tokens` in `column`, in input order (0
+    /// for any absent token). Batched sibling of [`Self::term_df`]: resolves
+    /// the whole set with one dictionary parse and one coalesced header fetch.
+    /// Delegates to [`FtsReader::term_dfs`].
     pub async fn term_dfs(
         &self,
         column: &str,
@@ -1341,7 +1964,7 @@ impl SuperfileReader {
         &self,
         column: &str,
         value: &str,
-    ) -> Result<(Vec<u32>, MatchWork), ReadError> {
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
         // Pass 1 — candidate rows via the index: the term-AND of the
         // string's tokens (a superset of the exact matches). Tokenize
         // with the column's configured tokenizer to match the index; a
@@ -1352,9 +1975,12 @@ impl SuperfileReader {
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
         let tok: Arc<dyn Tokenizer> = fts.column_tokenizer(column)?;
         let tokens: Vec<String> = tok.tokenize(value).collect();
-        let (candidates, work): (Vec<u32>, MatchWork) = if tokens.is_empty() {
+        let (candidates, work): (Vec<RowId>, MatchWork) = if tokens.is_empty() {
             // No tokens to prune with: every row is a candidate.
-            ((0..self.n_docs() as u32).collect(), MatchWork::default())
+            (
+                (0..self.n_docs() as u32).map(RowId::new).collect(),
+                MatchWork::default(),
+            )
         } else {
             let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
             self.token_match(column, &refs, BoolMode::And).await?
@@ -1364,7 +1990,8 @@ impl SuperfileReader {
         }
 
         // Pass 2 — verify raw-string equality on the decoded text.
-        let batch = self.take_by_local_doc_ids(&candidates, &[column])?;
+        let candidate_rows: Vec<u32> = candidates.iter().copied().map(RowId::get).collect();
+        let batch = self.take_by_local_doc_ids(&candidate_rows, &[column])?;
         let col = batch
             .column(0)
             .as_any()
@@ -1400,7 +2027,7 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1415,9 +2042,9 @@ impl SuperfileReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-        bm25: Option<Bm25Params>,
+        scoring: &ScoringView<'_>,
     ) -> Result<PreparedClauses, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.prepare_clauses(column, lists, k, floor).await?)
     }
 
@@ -1425,86 +2052,58 @@ impl SuperfileReader {
     /// cursors it fetched.
     ///
     /// `bm25` must be the same override the paired `prepare_clauses`
-    /// was given: the cursors carry `idf · (k1 + 1)` from the pair they
-    /// were built with, and scoring divides by a norm table derived
-    /// from the same pair. `with_bm25_override` is deterministic, so
-    /// two separately-derived views of one pair agree bit for bit.
+    /// was given: the cursors carry the bounds they were built with, and
+    /// scoring divides by a norm table derived from that same override.
+    /// `with_bm25_override` is deterministic, so two separately-derived
+    /// views of one pair agree bit for bit.
     pub(crate) fn run_prepared(
         &self,
         prep: PreparedClauses,
-        bm25: Option<Bm25Params>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        scoring: &ScoringView<'_>,
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.run_prepared(prep)?)
     }
 
+    /// [`Self::run_prepared`] for clauses prepared with
+    /// `ClauseLists::exact_count`: the top-k plus the exact match count.
+    pub(crate) fn run_prepared_with_count(
+        &self,
+        prep: PreparedClauses,
+        scoring: &ScoringView<'_>,
+    ) -> Result<(Vec<(RowId, f32)>, u64), ReadError> {
+        let fts = self.fts_scored(scoring)?;
+        Ok(fts.run_prepared_with_count(prep)?)
+    }
+
     /// The FTS reader a scored query should read through: this
-    /// superfile's own, or a view of it that scores with `bm25`
-    /// instead of what each column declared.
+    /// superfile's own, or a view of it that scores with `scoring`
+    /// instead of what each column baked in.
     ///
     /// Borrowed when there is no override, which is the default path
     /// and costs nothing. An override clones the reader — an `Arc` bump
-    /// for the blob plus one 1 KiB decode table per column whose pair
-    /// actually differs — and records the factor that keeps each
-    /// column's stored bounds upper bounds under the new pair.
-    fn fts_scored(&self, bm25: Option<Bm25Params>) -> Result<Cow<'_, FtsReader>, ReadError> {
+    /// for the blob plus one 1 KiB decode table per column that
+    /// actually moves — and records the factor that keeps each column's
+    /// stored bounds upper bounds under what is being scored.
+    fn fts_scored(&self, scoring: &ScoringView<'_>) -> Result<ScoredFts<'_>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        Ok(match bm25 {
-            Some(params) => Cow::Owned(fts.with_bm25_override(params)),
-            None => Cow::Borrowed(fts),
-        })
-    }
-
-    /// Prefix-expanded BM25 search.
-    ///
-    /// Expands `prefix` to the lex-ordered list of indexed terms
-    /// in `column` whose tokenized form begins with `prefix`,
-    /// then runs `BoolMode::Or` BM25 over that term set. Matches
-    /// the v1 tokenizer convention: the FST stores
-    /// AsciiLowerTokenizer-tokenized terms, so the prefix is
-    /// ASCII-lowercased before expansion. Whitespace inside
-    /// `prefix` is **not** split — prefix search is a single
-    /// term-level prefix, not a query parser.
-    ///
-    /// Returns an empty `Vec` if no indexed term begins with
-    /// `prefix` or if `k == 0`.
-    /// Returns the hits plus the expansion's posting + kernel work, so
-    /// a prefix expanding to thousands of terms carries its cost like
-    /// any other query shape.
-    pub async fn bm25_search_prefix(
-        &self,
-        column: &str,
-        prefix: &str,
-        k: usize,
-        pool: Option<&ThreadPool>,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork), ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        if k == 0 {
-            return Ok((Vec::new(), MatchWork::default()));
+        if let Some((cached, view)) = self.scored_fts.read().expect("scored fts memo").as_ref()
+            && cached.matches(scoring)
+        {
+            return Ok(ScoredFts::Derived(Arc::clone(view)));
         }
-        let lowered = prefix.to_ascii_lowercase();
-        // The dictionary walk is CPU work and runs on the reader pool; the
-        // FST fetch it needs stays on this runtime.
-        let term_bytes = fts
-            .terms_with_prefix(column, lowered.as_bytes(), pool)
-            .await?;
-        if term_bytes.is_empty() {
-            return Ok((Vec::new(), MatchWork::default()));
-        }
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .search_with_work(column, &term_strings, k, BoolMode::Or)
-            .await?)
+        let Some(view) = fts.with_scoring(scoring) else {
+            return Ok(ScoredFts::Baked(fts));
+        };
+        let view = Arc::new(view);
+        // Last writer wins. Two queries racing here derive the same view
+        // from the same inputs — `with_scoring` is deterministic — so which
+        // one lands is immaterial.
+        *self.scored_fts.write().expect("scored fts memo") =
+            Some((ScoringKey::of(scoring), Arc::clone(&view)));
+        Ok(ScoredFts::Derived(view))
     }
 
     /// Multi-term OR BM25 search restricted to a doc_id sub-range.
@@ -1528,7 +2127,7 @@ impl SuperfileReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         self.bm25_search_or_range_pretokenized_with_floor(
             column,
             terms,
@@ -1536,14 +2135,14 @@ impl SuperfileReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
-            None,
+            fts_reader::QueryIdf::ThisFile,
         )
         .await
     }
 
     /// [`Self::bm25_search_or_range_pretokenized`] with a score floor —
     /// same contract as [`Self::bm25_search_pretokenized_with_floor`].
-    pub async fn bm25_search_or_range_pretokenized_with_floor(
+    pub(crate) async fn bm25_search_or_range_pretokenized_with_floor(
         &self,
         column: &str,
         terms: &[&str],
@@ -1551,8 +2150,8 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        global_idf: Option<&fts_reader::GlobalTermIdf>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+        idf: fts_reader::QueryIdf<'_>,
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1564,7 +2163,7 @@ impl SuperfileReader {
                 doc_id_start,
                 doc_id_end,
                 floor,
-                global_idf,
+                idf,
             )
             .await?)
     }
@@ -1576,42 +2175,15 @@ impl SuperfileReader {
         &self,
         column: &str,
         terms: &[&str],
-        global_idf: Option<&fts_reader::GlobalTermIdf>,
+        idf: fts_reader::QueryIdf<'_>,
         prefetched: Option<&fts_reader::FetchedTermMemo>,
+        scoring: &ScoringView<'_>,
     ) -> Result<OrCursorSet, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        // Built through the same view the set is scored through, so its
+        // stored bounds carry that view's scale.
+        let fts = self.fts_scored(scoring)?;
         Ok(fts
-            .build_or_cursor_set(column, terms, global_idf, prefetched)
-            .await?)
-    }
-
-    /// Expand `prefix` via the FST and build its OR cursor set, for
-    /// reuse across this superfile's doc-id sub-ranges via
-    /// [`Self::bm25_search_or_range_prebuilt`].
-    pub(crate) async fn bm25_prefix_cursor_set(
-        &self,
-        column: &str,
-        prefix: &str,
-        pool: Option<&ThreadPool>,
-    ) -> Result<OrCursorSet, ReadError> {
-        let fts = self
-            .fts()
-            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
-        let lowered = prefix.to_ascii_lowercase();
-        let term_bytes = fts
-            .terms_with_prefix(column, lowered.as_bytes(), pool)
-            .await?;
-        // FST keys are valid UTF-8 by construction (AsciiLower
-        // tokenizer only emits ASCII bytes); the from_utf8 below
-        // is a typed pass-through, not a re-validation cost.
-        let term_strings: Vec<&str> = term_bytes
-            .iter()
-            .filter_map(|b| str::from_utf8(b).ok())
-            .collect();
-        Ok(fts
-            .build_or_cursor_set(column, &term_strings, None, None)
+            .build_or_cursor_set(column, terms, idf, prefetched)
             .await?)
     }
 
@@ -1625,43 +2197,10 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        bm25: Option<Bm25Params>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
-        let fts = self.fts_scored(bm25)?;
+        scoring: &ScoringView<'_>,
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
+        let fts = self.fts_scored(scoring)?;
         Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
-    }
-
-    /// Prefix-expanded BM25 search restricted to a doc_id sub-range.
-    ///
-    /// Same expansion logic as [`Self::bm25_search_prefix`] —
-    /// AsciiLower the prefix, walk the FST for matching terms, run
-    /// BM25 OR over the term set — but only docs in
-    /// `[doc_id_start, doc_id_end)` are eligible. A single-call wrapper
-    /// around [`Self::bm25_prefix_cursor_set`] +
-    /// [`Self::bm25_search_or_range_prebuilt`].
-    pub async fn bm25_search_prefix_range(
-        &self,
-        column: &str,
-        prefix: &str,
-        k: usize,
-        doc_id_start: u32,
-        doc_id_end: u32,
-        pool: Option<&ThreadPool>,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
-        if k == 0 || doc_id_start >= doc_id_end {
-            return Ok(Vec::new());
-        }
-        let set = self.bm25_prefix_cursor_set(column, prefix, pool).await?;
-        // Prefix search has no search-options surface, so columns score
-        // with the pair they declared.
-        self.bm25_search_or_range_prebuilt(
-            &set,
-            k,
-            doc_id_start,
-            doc_id_end,
-            f32::NEG_INFINITY,
-            None,
-        )
     }
 
     /// Multi-column BM25 search with per-column weights ("most
@@ -1672,7 +2211,7 @@ impl SuperfileReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, ReadError> {
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self
             .fts()
             .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
@@ -1840,8 +2379,10 @@ impl SuperfileReader {
             query,
             k,
             clusters,
+            None,
             rerank_mult,
             cold_rerank_mult,
+            false,
             allow,
             deny,
             pool,
@@ -1952,6 +2493,36 @@ impl VectorSearchOptions {
     }
 }
 
+/// The stable-id sidecar's location from the footer key-values, `None` on a
+/// superfile written before the sidecar existed. Partial keys, or a range
+/// past `file_len`, are malformed.
+fn id_sidecar_location(
+    kv_map: &footer::KvMap,
+    file_len: u64,
+) -> Result<Option<IdSidecarLocation>, ReadError> {
+    if !all_present(kv_map, kv::IDS_KEYS) {
+        if any_present(kv_map, kv::IDS_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.ids.* keys present".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let offset = parse_u64(kv_map, kv::IDS_OFFSET)?;
+    let len = parse_u64(kv_map, kv::IDS_LENGTH)?;
+    if offset.checked_add(len).is_none_or(|end| end > file_len) {
+        return Err(ReadError::MalformedKv(
+            "stable-id sidecar range out of bounds".into(),
+        ));
+    }
+    let packed = kv_map.get(kv::IDS_LAYOUT).map(String::as_str) == Some(kv::IDS_LAYOUT_PACKED);
+    Ok(Some(IdSidecarLocation {
+        offset,
+        len,
+        packed,
+    }))
+}
+
 fn all_present(map: &footer::KvMap, keys: &[&str]) -> bool {
     keys.iter().all(|k| map.contains_key(*k))
 }
@@ -2029,20 +2600,118 @@ pub(crate) fn rank_back_indices(ids: &[u32], sorted: &[u32]) -> UInt32Array {
     builder.finish()
 }
 
+/// Whole-file byte attribution; see [`SuperfileReader::size_breakdown`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperfileSizeBreakdown {
+    pub total_bytes: u64,
+    pub n_docs: u64,
+    pub row_groups: u64,
+    /// Compressed bytes of every Parquet column chunk, and per column.
+    pub row_group_bytes: u64,
+    pub columns: Vec<(String, u64)>,
+    pub id_sidecar_bytes: u64,
+    pub vec_bytes: u64,
+    pub fts_bytes: u64,
+    pub fts: Option<fts_reader::FtsSizeBreakdown>,
+}
+
+impl SuperfileSizeBreakdown {
+    /// Bytes not covered by any region above: the Parquet footer, page
+    /// indexes and region trailers.
+    pub fn other_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(
+            self.row_group_bytes + self.id_sidecar_bytes + self.vec_bytes + self.fts_bytes,
+        )
+    }
+}
+
+/// Bytes per mebibyte, for the report.
+const SIZE_REPORT_BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+impl fmt::Display for SuperfileSizeBreakdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mib = |b: u64| b as f64 / SIZE_REPORT_BYTES_PER_MIB;
+        writeln!(
+            f,
+            "superfile: {} docs, {} B ({:.2} MiB)",
+            self.n_docs,
+            self.total_bytes,
+            mib(self.total_bytes)
+        )?;
+        writeln!(
+            f,
+            "  parquet row groups ({})  {:>12} B  {:>9.2} MiB",
+            self.row_groups,
+            self.row_group_bytes,
+            mib(self.row_group_bytes)
+        )?;
+        for (name, b) in &self.columns {
+            writeln!(
+                f,
+                "    column {:<18} {:>12} B  {:>9.2} MiB",
+                name,
+                b,
+                mib(*b)
+            )?;
+        }
+        writeln!(
+            f,
+            "  id sidecar              {:>12} B  {:>9.2} MiB",
+            self.id_sidecar_bytes,
+            mib(self.id_sidecar_bytes)
+        )?;
+        writeln!(
+            f,
+            "  vector index            {:>12} B  {:>9.2} MiB",
+            self.vec_bytes,
+            mib(self.vec_bytes)
+        )?;
+        writeln!(
+            f,
+            "  fts blob                {:>12} B  {:>9.2} MiB",
+            self.fts_bytes,
+            mib(self.fts_bytes)
+        )?;
+        writeln!(
+            f,
+            "  footer + trailers       {:>12} B  {:>9.2} MiB",
+            self.other_bytes(),
+            mib(self.other_bytes())
+        )?;
+        if let Some(fts) = &self.fts {
+            write!(f, "{fts}")?;
+        }
+        Ok(())
+    }
+}
+
+/// An FTS read error surfaced by the size report is a read error of the
+/// file it was read from; any other FTS error stays typed under it.
+fn fts_reader_error_to_read(e: FtsError) -> ReadError {
+    match e {
+        FtsError::Read(r) => r,
+        other => ReadError::Fts(Box::new(other)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
+    use async_trait::async_trait;
+    use tracing::Level;
 
     use super::*;
     use crate::{
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+            format::footer::with_forged_footer_kv,
+            ids,
             vector::distance::normalize,
         },
-        test_helpers::{decimal128_ids, default_vector_config},
+        test_helpers::{capture_logs, decimal128_ids, default_vector_config},
     };
 
     fn schema_with_text() -> Arc<Schema> {
@@ -2132,8 +2801,21 @@ mod tests {
     /// superfiles don't guarantee it). Returns the bytes alongside the ids
     /// in row order, which is the oracle's ground truth.
     fn build_shuffled_id_superfile() -> (Bytes, Vec<i128>) {
+        let opts = BuilderOptions::new(schema_with_text(), "doc_id", vec![], vec![]);
+        build_shuffled_id_superfile_with(opts)
+    }
+
+    /// [`build_shuffled_id_superfile`] in row groups of `rows` rows.
+    fn build_shuffled_id_superfile_in_row_groups(rows: usize) -> (Bytes, Vec<i128>) {
+        let opts = BuilderOptions::new(schema_with_text(), "doc_id", vec![], vec![]);
+        build_shuffled_id_superfile_with(BuilderOptions {
+            row_group_size: rows,
+            ..opts
+        })
+    }
+
+    fn build_shuffled_id_superfile_with(opts: BuilderOptions) -> (Bytes, Vec<i128>) {
         let schema = schema_with_text();
-        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
         let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
 
         let ids: Vec<i128> = (0..SHUFFLED_ID_ROWS)
@@ -2329,14 +3011,19 @@ mod tests {
     fn stable_id_sidecar_serves_id_and_matches_parquet_fallback() {
         let (bytes, ids) = build_shuffled_id_superfile();
 
-        // The sidecar KV is present, sized to one packed i128 per row.
+        // The sidecar KVs are present and name the packed layout, which
+        // never costs more than one raw i128 per row plus its headers.
         let kvs = footer::read_kv_metadata(&bytes).expect("kv metadata");
         let len: usize = kvs
             .get(kv::IDS_LENGTH)
             .expect("sidecar length present")
             .parse()
             .expect("length is a usize");
-        assert_eq!(len, ids.len() * format::ID_SIDECAR_ENTRY_BYTES);
+        assert_eq!(
+            kvs.get(kv::IDS_LAYOUT).map(String::as_str),
+            Some(kv::IDS_LAYOUT_PACKED)
+        );
+        assert!(len <= ids.len() * format::ID_SIDECAR_ENTRY_BYTES + 4096);
 
         let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
@@ -2397,6 +3084,53 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_id_sidecar_block_opens_and_reads_id_from_parquet() {
+        // A 5,000-row superfile with the last block of its id sidecar broken.
+        //  - `open` succeeds, since it checks only the sidecar's header.
+        //  - `_id` for a doc in a good block comes from the sidecar.
+        //  - `_id` for a doc in the broken block comes from Parquet instead, and
+        //    marks the sidecar broken.
+        //  - Once marked, every read takes `_id` from Parquet, still right, and
+        //    the warning is logged only once.
+        // This test pins that a bad block costs neither the open nor the answer.
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
+        let damaged = ids::with_damaged_id_block(&bytes, last_block);
+        let r = SuperfileReader::open(Bytes::from(damaged)).expect("open reads only the header");
+        let read_ids = |docs: &[u32], projection: &[&str]| -> Vec<i128> {
+            let batch = r.take_by_local_doc_ids(docs, projection).expect("take");
+            let at = projection
+                .iter()
+                .position(|&n| n == "doc_id")
+                .expect("doc_id projected");
+            let col = batch
+                .column(at)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal ids");
+            col.values().to_vec()
+        };
+        let bad = SHUFFLED_ID_ROWS - 1;
+
+        let ((), logs) = capture_logs(Level::WARN, || {
+            assert_eq!(read_ids(&[0], &["doc_id"]), [ids[0]]);
+            assert!(!r.id_sidecar_broken.load(Ordering::Relaxed));
+            assert_eq!(
+                read_ids(&[0, bad as u32], &["title", "doc_id"]),
+                [ids[0], ids[bad]]
+            );
+            assert!(r.id_sidecar_broken.load(Ordering::Relaxed));
+            assert_eq!(read_ids(&[bad as u32], &["doc_id"]), [ids[bad]]);
+            assert_eq!(read_ids(&[0], &["doc_id"]), [ids[0]]);
+        });
+        assert_eq!(
+            logs.matches("the id sidecar is unreadable").count(),
+            1,
+            "{logs}"
+        );
+    }
+
+    #[test]
     fn row_selection_and_rank_back_honor_duplicates_and_gaps() {
         // Caller order with a duplicate and out-of-order ids.
         let ids = [7u32, 2, 7, 0];
@@ -2448,6 +3182,36 @@ mod tests {
         ));
     }
 
+    /// The page index is tens of MiB per superfile and only the take /
+    /// SQL-scan paths read it, so an eager open must not parse it. It must
+    /// still be available, and identical, on first demand — parsed from the
+    /// resident bytes, not fetched.
+    #[tokio::test]
+    async fn eager_open_defers_the_page_index_until_something_asks_for_it() {
+        let bytes = build_simple_fts_only_superfile();
+        let r = SuperfileReader::open_with(bytes, OpenOptions { verify_crc: false })
+            .expect("open eager");
+        assert!(
+            r.parquet_meta.offset_index().is_none(),
+            "an eager open must not parse the page index"
+        );
+        let indexed = r
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("page index on demand");
+        assert_eq!(
+            indexed.num_row_groups(),
+            r.parquet_meta.num_row_groups(),
+            "the on-demand parse must describe the same file"
+        );
+        // Cached: a second call returns the same allocation.
+        let again = r
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("page index cached");
+        assert!(Arc::ptr_eq(&indexed, &again), "the parse must happen once");
+    }
+
     #[tokio::test]
     async fn bm25_search_finds_matching_docs() {
         let bytes = build_simple_fts_only_superfile();
@@ -2457,7 +3221,7 @@ mod tests {
             .await
             .expect("BM25 search");
         // docs 0 and 2 contain "rust"; both should appear.
-        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&2));
     }
@@ -2652,12 +3416,86 @@ mod tests {
             .await
             .expect("BM25 multi-column search");
         // Both doc 0 (title:rust) and doc 1 (body:rust) hit.
-        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let doc_ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(doc_ids.contains(&0));
         assert!(doc_ids.contains(&1));
     }
 
     // ── Additional coverage ───────────────────────────────────────────
+
+    #[test]
+    fn a_scored_view_is_memoized_per_parameter_pair() {
+        // No override borrows the baked reader; an override derives a view
+        // once and hands the same one back while the pair is unchanged,
+        // and a different pair replaces it — the memo is last-writer-wins
+        // and never keeps a stale pair.
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        assert!(matches!(
+            r.fts_scored(&ScoringView::default()).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+        let a = Bm25Params::new(1.4, 0.6);
+        let b = Bm25Params::new(0.9, 0.4);
+        let at = |params| ScoringView {
+            params: Some(params),
+            avgdl: None,
+        };
+        let first = match r.fts_scored(&at(a)).expect("derive") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        let again = match r.fts_scored(&at(a)).expect("reuse") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same pair: the memoized view is reused"
+        );
+        let other = match r.fts_scored(&at(b)).expect("derive another") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("an override must derive a view"),
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "a different pair derives a different view"
+        );
+        assert_eq!(other.fts_columns_config().next().expect("column").params, b);
+        assert!(matches!(
+            r.fts_scored(&ScoringView::default()).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+    }
+
+    /// A view at the average a column was built at changes nothing, so the
+    /// baked reader serves it; another average derives a view that rescores
+    /// that column alone and widens its stored bounds.
+    #[test]
+    fn a_scored_view_moves_only_the_named_column_average() {
+        let r = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open");
+        let fts = r.fts().expect("fts");
+        let column = fts.fts_columns_config().next().expect("column");
+        let (name, baked) = (column.name.clone(), column.avgdl());
+        let at = |avgdl| ScoringView {
+            params: None,
+            avgdl: Some((name.as_str(), avgdl)),
+        };
+        assert!(matches!(
+            r.fts_scored(&at(baked)).expect("baked"),
+            ScoredFts::Baked(_)
+        ));
+        let wider = 2.0 * baked;
+        let view = match r.fts_scored(&at(wider)).expect("derive") {
+            ScoredFts::Derived(v) => v,
+            ScoredFts::Baked(_) => panic!("another average must derive a view"),
+        };
+        let col = view
+            .fts_columns_config()
+            .find(|c| c.name == name)
+            .expect("column");
+        assert_eq!(col.avgdl(), wider);
+        assert!(col.bound_scale() > 1.0, "a longer average raises scores");
+    }
 
     #[test]
     fn open_with_verify_crc_off_succeeds() {
@@ -2757,7 +3595,7 @@ mod tests {
             .bm25_search_pretokenized("title", &["rust"], 5, BoolMode::Or)
             .await
             .expect("pretokenized search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&2));
     }
@@ -2783,7 +3621,7 @@ mod tests {
             .bm25_hits_async("title", "rust -embedded", 5, BoolMode::Or)
             .await
             .expect("negated search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
     }
@@ -2833,40 +3671,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bm25_search_prefix_expands_terms() {
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        // "rust" is a prefix of "rust" (docs 0,2); "ru" expands to it too.
-        let (hits, work) = r
-            .bm25_search_prefix("title", "ru", 5, None)
-            .await
-            .expect("prefix search");
-        assert!(
-            work.postings_bytes > 0 && work.planned_ranges > 0,
-            "a matching prefix expansion reports its posting work"
-        );
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(ids.contains(&0));
-        assert!(ids.contains(&2));
-        // No indexed term begins with "zz".
-        assert!(
-            r.bm25_search_prefix("title", "zz", 5, None)
-                .await
-                .expect("prefix")
-                .0
-                .is_empty()
-        );
-        // k == 0 short-circuits.
-        assert!(
-            r.bm25_search_prefix("title", "ru", 0, None)
-                .await
-                .expect("zero k")
-                .0
-                .is_empty()
-        );
-    }
-
-    #[tokio::test]
     async fn bm25_search_or_range_restricts_window() {
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
@@ -2875,7 +3679,7 @@ mod tests {
             .bm25_search_or_range_pretokenized("title", &["rust", "embedded"], 10, 0, 2)
             .await
             .expect("ranged search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(!ids.contains(&2));
     }
@@ -2892,38 +3696,11 @@ mod tests {
                 0,
                 4,
                 1e9,
-                None,
+                fts_reader::QueryIdf::ThisFile,
             )
             .await
             .expect("floored ranged search");
         assert!(hits.is_empty());
-    }
-
-    #[tokio::test]
-    async fn bm25_search_prefix_range_restricts_window() {
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        // "ru" expands to "rust" (docs 0,2); restrict to [0,2) ⇒ doc 0.
-        let hits = r
-            .bm25_search_prefix_range("title", "ru", 10, 0, 2, None)
-            .await
-            .expect("prefix range");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
-        assert!(ids.contains(&0));
-        assert!(!ids.contains(&2));
-        // Degenerate range / k short-circuits.
-        assert!(
-            r.bm25_search_prefix_range("title", "ru", 0, 0, 2, None)
-                .await
-                .expect("zero k")
-                .is_empty()
-        );
-        assert!(
-            r.bm25_search_prefix_range("title", "ru", 10, 2, 2, None)
-                .await
-                .expect("empty range")
-                .is_empty()
-        );
     }
 
     #[tokio::test]
@@ -2953,6 +3730,326 @@ mod tests {
             .await
             .expect_err("expected error");
         assert!(matches!(err, ReadError::MissingKv(_)));
+    }
+
+    /// The lazy reader of [`build_shuffled_id_superfile`], whose ids are
+    /// out of row order, so a decode that loses the order cannot pass.
+    async fn lazy_shuffled_id_reader(bytes: Bytes) -> SuperfileReader {
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        SuperfileReader::open_lazy(src).await.expect("open_lazy")
+    }
+
+    /// A lazily opened reader keeps the sidecar's location and fetches it
+    /// whole: every id it decodes is the id the superfile was built with, in
+    /// row order, for any request order and with repeats.
+    #[tokio::test]
+    async fn lazy_reader_fetches_the_id_sidecar_in_row_order() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let lazy = lazy_shuffled_id_reader(bytes).await;
+        assert!(lazy.parquet_bytes().is_none());
+
+        let sidecar = lazy
+            .fetch_id_sidecar()
+            .await
+            .expect("fetch")
+            .expect("the superfile carries a sidecar");
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        assert_eq!(sidecar.ids(&every).expect("decode"), ids);
+
+        let last = SHUFFLED_ID_ROWS as u32 - 1;
+        let locals = [last, 0, 37, last, last / 2];
+        let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+        assert_eq!(sidecar.ids(&locals).expect("decode"), expected);
+        assert!(matches!(
+            sidecar.ids(&[last + 1]),
+            Err(ReadError::DocIdOutOfRange { .. })
+        ));
+    }
+
+    /// A sidecar that does not decode on the cold path is marked broken, and
+    /// a marked sidecar is not fetched again: the caller reads `_id` from
+    /// another source once, not once per query.
+    #[tokio::test]
+    async fn a_lazy_reader_does_not_refetch_a_sidecar_marked_broken() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
+        let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));
+        let lazy = lazy_shuffled_id_reader(damaged).await;
+        let sidecar = lazy
+            .fetch_id_sidecar()
+            .await
+            .expect("fetch")
+            .expect("the header is fine, so the fetch is");
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        assert!(matches!(
+            sidecar.ids(&every),
+            Err(ReadError::MalformedKv(_))
+        ));
+        lazy.mark_id_sidecar_broken();
+        assert!(lazy.fetch_id_sidecar().await.expect("fetch").is_none());
+    }
+
+    /// A promoted reader (opened lazily, then given the disk cache's fill
+    /// file) slices the sidecar from its local copy when the copy's hole
+    /// leaves the sidecar out, as the promotion's vector-blob hole does, and
+    /// not when the hole reaches into it; `_id` is right either way.
+    #[tokio::test]
+    async fn a_promoted_reader_slices_its_sidecar_unless_the_hole_covers_it() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let every: Vec<u32> = (0..SHUFFLED_ID_ROWS as u32).collect();
+        let loc = lazy_shuffled_id_reader(bytes.clone())
+            .await
+            .id_sidecar
+            .expect("the superfile carries a sidecar");
+
+        let mut beside = lazy_shuffled_id_reader(bytes.clone()).await;
+        beside
+            .install_resident_parquet(bytes.clone(), (loc.offset - 1, 1))
+            .expect("promote with a hole ending where the sidecar starts");
+        let sliced = beside
+            .resident_id_sidecar()
+            .expect("the local copy holds the whole sidecar");
+        assert_eq!(sliced.ids(&every).expect("decode"), ids);
+
+        let mut over = lazy_shuffled_id_reader(bytes.clone()).await;
+        over.install_resident_parquet(bytes, (loc.offset + loc.len - 1, 1))
+            .expect("promote with a hole over the sidecar's last byte");
+        assert!(over.resident_id_sidecar().is_none());
+        let last = SHUFFLED_ID_ROWS as u32 - 1;
+        let batch = over
+            .take_by_local_doc_ids(&[last, 0], &["doc_id"])
+            .expect("take _id from resident Parquet");
+        let got = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal _id");
+        assert_eq!(got.values().to_vec(), vec![ids[last as usize], ids[0]]);
+        assert!(over.fetch_id_sidecar().await.expect("fetch").is_some());
+    }
+
+    /// The sidecar serves a cold read of the id column that names at least
+    /// half the file's rows, counted once each, and only a packed sidecar:
+    /// a resident reader, a smaller subset, another column or a raw sidecar
+    /// keep their own source.
+    #[tokio::test]
+    async fn the_sidecar_serves_cold_reads_of_half_the_rows_or_more() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let rows = SHUFFLED_ID_ROWS as u32;
+        let every: Vec<u32> = (0..rows).collect();
+        let half = (SHUFFLED_ID_ROWS as u64).div_ceil(SIDECAR_MIN_ROW_SHARE) as usize;
+        let lazy = lazy_shuffled_id_reader(bytes.clone()).await;
+        assert!(lazy.id_sidecar_serves(&every, "doc_id"));
+        assert!(
+            lazy.id_sidecar_serves(&every[1..], "doc_id"),
+            "one row short of every row, as an allow-set missing a deleted row"
+        );
+        assert!(lazy.id_sidecar_serves(&every[..half], "doc_id"));
+        assert!(!lazy.id_sidecar_serves(&every[..half - 1], "doc_id"));
+        assert!(
+            !lazy.id_sidecar_serves(&vec![last_row(rows); rows as usize], "doc_id"),
+            "as many entries as rows, all one row, is one row"
+        );
+        assert!(!lazy.id_sidecar_serves(&every, "title"));
+
+        let mut raw = lazy_shuffled_id_reader(bytes.clone()).await;
+        raw.id_sidecar = raw.id_sidecar.map(|loc| IdSidecarLocation {
+            packed: false,
+            ..loc
+        });
+        assert!(
+            !raw.id_sidecar_serves(&every, "doc_id"),
+            "a raw sidecar is sixteen bytes a row, more than the column"
+        );
+
+        let eager = SuperfileReader::open(bytes.clone()).expect("open");
+        assert!(!eager.id_sidecar_serves(&every, "doc_id"));
+    }
+
+    /// The last row of a file of `rows` rows.
+    fn last_row(rows: u32) -> u32 {
+        rows - 1
+    }
+
+    /// A source that hands back one byte short of any read starting at `at`,
+    /// as a storage backend that clamps a range without an error would.
+    struct ShortAt {
+        inner: BytesLazyByteSource,
+        at: u64,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for ShortAt {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let bytes = self.inner.range(start, len).await?;
+            Ok(match start == self.at {
+                true => bytes.slice(..bytes.len() - 1),
+                false => bytes,
+            })
+        }
+    }
+
+    /// A sidecar read that comes back short is a failed read, not a damaged
+    /// sidecar: it errors as a fetch, leaves the sidecar unmarked, and the
+    /// next read tries the sidecar again.
+    #[tokio::test]
+    async fn a_short_sidecar_read_is_a_failed_fetch_not_a_damaged_sidecar() {
+        let (bytes, _) = build_shuffled_id_superfile();
+        let loc = lazy_shuffled_id_reader(bytes.clone())
+            .await
+            .id_sidecar
+            .expect("the superfile carries a sidecar");
+        let src: Arc<dyn LazyByteSource> = Arc::new(ShortAt {
+            inner: BytesLazyByteSource::new(bytes),
+            at: loc.offset,
+        });
+        let lazy = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+        for attempt in 0..2 {
+            assert!(
+                matches!(
+                    lazy.fetch_id_sidecar().await,
+                    Err(ReadError::RangeFetch {
+                        source: LazyByteSourceError::ShortRead { .. },
+                        ..
+                    })
+                ),
+                "attempt {attempt}: a short read is a fetch error"
+            );
+            assert!(!lazy.id_sidecar_broken.load(Ordering::Relaxed));
+        }
+    }
+
+    /// Rows per row group in the footer-check test, so the file has several.
+    const VERIFY_ROW_GROUP_ROWS: usize = 1_250;
+
+    /// The footer holds the sidecar to account: ids that still span the
+    /// file's id range but sit in the wrong row group fail the row groups'
+    /// `_id` statistics, and ids outside the range fail the range.
+    #[test]
+    fn verified_ids_hold_the_sidecar_to_the_footer() {
+        let (bytes, ids) = build_shuffled_id_superfile_in_row_groups(VERIFY_ROW_GROUP_ROWS);
+        let reader = SuperfileReader::open(bytes.clone()).expect("open");
+        assert!(reader.parquet_metadata().num_row_groups() > 1);
+        let loc = reader.id_sidecar.expect("the superfile carries a sidecar");
+        let id_range = (
+            *ids.iter().min().expect("rows"),
+            *ids.iter().max().expect("rows"),
+        );
+        let verify = |ids: &[i128]| {
+            let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+            IdSidecar {
+                bytes: Bytes::from(ids::encode_packed(&raw)),
+                packed: true,
+                n_docs: ids.len() as u64,
+            }
+            .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+        };
+        assert_eq!(
+            loc.slice(&bytes, SHUFFLED_ID_ROWS as u64)
+                .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+                .expect("the written sidecar passes"),
+            ids
+        );
+
+        // Move the file's highest id into another row group: the span is
+        // unchanged, but its own row group's maximum is not.
+        let top = ids
+            .iter()
+            .position(|&id| id == id_range.1)
+            .expect("max row");
+        let other = match top / VERIFY_ROW_GROUP_ROWS {
+            0 => ids.len() - 1,
+            _ => 0,
+        };
+        let mut moved = ids.clone();
+        moved.swap(top, other);
+        assert!(matches!(verify(&moved), Err(ReadError::MalformedKv(_))));
+
+        let mut outside = ids.clone();
+        outside[0] = id_range.1 + 1;
+        assert!(matches!(verify(&outside), Err(ReadError::MalformedKv(_))));
+
+        // Without the footer's `_id` statistics, the range alone still
+        // catches ids outside it.
+        let raw: Vec<u8> = outside.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let no_stats = IdSidecar {
+            bytes: Bytes::from(ids::encode_packed(&raw)),
+            packed: true,
+            n_docs: outside.len() as u64,
+        }
+        .verified_ids(
+            reader.parquet_metadata(),
+            "a column with no statistics",
+            id_range,
+        );
+        assert!(matches!(no_stats, Err(ReadError::MalformedKv(_))));
+    }
+
+    /// A malformed sidecar location fails an eager open, as it always has, but
+    /// only switches the sidecar off on a lazy open: the lazy path uses it as
+    /// a shortcut with the Parquet column behind it. A superfile written before
+    /// the sidecar existed has none either way.
+    #[tokio::test]
+    async fn a_malformed_sidecar_location_fails_eager_and_is_ignored_lazily() {
+        let lazy =
+            |bytes: Bytes| -> Arc<dyn LazyByteSource> { Arc::new(BytesLazyByteSource::new(bytes)) };
+        let mut partial = required_kv();
+        partial.push((kv::IDS_OFFSET.into(), "0".into()));
+        let mut out_of_bounds = required_kv();
+        out_of_bounds.push((kv::IDS_OFFSET.into(), u64::MAX.to_string()));
+        out_of_bounds.push((kv::IDS_LENGTH.into(), "16".into()));
+        for kvs in [partial, out_of_bounds] {
+            let bytes = superfile_with_kv(&kvs);
+            assert!(matches!(
+                SuperfileReader::open(bytes.clone()),
+                Err(ReadError::MalformedKv(_))
+            ));
+            let r = SuperfileReader::open_lazy(lazy(bytes))
+                .await
+                .expect("a lazy open ignores the location");
+            assert!(r.fetch_id_sidecar().await.expect("fetch").is_none());
+        }
+
+        let pre_sidecar = superfile_with_kv(&required_kv());
+        let r = SuperfileReader::open_lazy(lazy(pre_sidecar))
+            .await
+            .expect("open_lazy");
+        assert!(r.fetch_id_sidecar().await.expect("fetch").is_none());
+        assert!(!r.id_sidecar_is_packed());
+    }
+
+    /// The raw layout (one little-endian `i128` per doc) decodes by offset; a
+    /// doc past the end is the caller's error, and a region shorter than its
+    /// doc count is malformed, not misread.
+    #[test]
+    fn raw_id_sidecar_decodes_by_offset_and_rejects_a_short_region() {
+        let ids: Vec<i128> = vec![7, -3, i128::MAX, 0];
+        let n_docs = ids.len() as u64;
+        let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let sidecar = IdSidecar {
+            bytes: Bytes::from(raw.clone()),
+            packed: false,
+            n_docs,
+        };
+        assert_eq!(
+            sidecar.ids(&[2, 0, 2]).expect("decode"),
+            vec![i128::MAX, 7, i128::MAX]
+        );
+        assert!(matches!(
+            sidecar.ids(&[4]),
+            Err(ReadError::DocIdOutOfRange { .. })
+        ));
+
+        let short = IdSidecar {
+            bytes: Bytes::from(raw[..raw.len() - 1].to_vec()),
+            packed: false,
+            n_docs,
+        };
+        assert!(matches!(short.ids(&[0]), Err(ReadError::MalformedKv(_))));
     }
 
     #[tokio::test]
@@ -3043,8 +4140,18 @@ mod tests {
             .expect("build RecordBatch");
         let body = encode_parquet_body(&schema, &[batch], Compression::SNAPPY, ROW_GROUP_SIZE, &[])
             .expect("encode parquet body");
-        let parts = splice_index_blobs(body, &[], &[], &[], extra_kv).expect("splice index blobs");
-        Bytes::from(parts.bytes)
+        // The splice writes region keys itself and drops a caller's, so the
+        // malformed ones these tests need are forged onto the footer after.
+        let (region, rest): (Vec<_>, Vec<_>) = extra_kv
+            .iter()
+            .cloned()
+            .partition(|(k, _)| kv::REGION_KEYS.contains(&k.as_str()));
+        let parts = splice_index_blobs(body, &[], &[], &[], &rest).expect("splice index blobs");
+        let region: Vec<(&str, &str)> = region
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        with_forged_footer_kv(&parts.bytes, &region)
     }
 
     /// The five always-required KV entries, with a correct format value
@@ -3079,6 +4186,19 @@ mod tests {
         let bytes = superfile_with_kv(&kvs);
         let err = SuperfileReader::open(bytes).expect_err("expected error");
         assert!(matches!(err, ReadError::UnsupportedVersion(_)));
+    }
+
+    #[test]
+    fn open_with_rejects_a_format_version_that_does_not_parse() {
+        // Not a version at all: a malformed file, not one from another version.
+        let mut kvs = required_kv();
+        kvs[1] = (kv::FORMAT_VERSION.into(), "not-a-version".into());
+        let bytes = superfile_with_kv(&kvs);
+        let err = SuperfileReader::open(bytes).expect_err("expected error");
+        assert!(
+            matches!(&err, ReadError::Malformed(m) if m.contains("not-a-version")),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -3210,25 +4330,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bm25_search_prefix_range_unmatched_prefix_is_empty() {
-        // A valid (non-degenerate) range with a prefix no term begins
-        // with drives the empty-term-expansion short-circuit.
-        let bytes = build_simple_fts_only_superfile();
-        let r = SuperfileReader::open(bytes).expect("open");
-        let hits = r
-            .bm25_search_prefix_range("title", "zz", 10, 0, 4, None)
-            .await
-            .expect("prefix range");
-        assert!(hits.is_empty());
-    }
-
-    #[tokio::test]
     async fn exact_match_on_a_column_without_a_full_text_index_errors() {
         // `exact_match` prunes through the column's own term dictionary,
         // so a column with no full-text index — here the Decimal128
-        // `doc_id` — is rejected by name. It used to tokenize the value
-        // with a fallback analyzer and fail later on the text downcast,
-        // which said nothing about the real problem.
+        // `doc_id` — is rejected by name rather than failing later on a
+        // text downcast that says nothing about the real problem.
         let bytes = build_simple_fts_only_superfile();
         let r = SuperfileReader::open(bytes).expect("open");
         let err = r

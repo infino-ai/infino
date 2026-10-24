@@ -84,8 +84,13 @@ async fn commit_manifest(
     new_list: &Manifest,
     parts: &[&ManifestPart],
 ) -> Result<PointerFile, CommitError> {
-    let encoded: Vec<Vec<u8>> = parts.iter().map(|p| part_mod::encode(p)).collect();
-    let encoded_refs: Vec<&[u8]> = encoded.iter().map(|b| b.as_slice()).collect();
+    let encoded: Vec<(String, Bytes)> = parts
+        .iter()
+        .map(|p| {
+            let bytes = Bytes::from(part_mod::encode(p));
+            (part_uri(&ContentHash::of(&bytes)), bytes)
+        })
+        .collect();
 
     // Start from an empty manifest (no superfiles) carrying the
     // new list, then commit it via the production persistence
@@ -101,7 +106,7 @@ async fn commit_manifest(
         Some(new_list.clone()),
     );
     manifest
-        .write(storage.as_ref(), expected_prev_etag, &encoded_refs)
+        .write(storage.as_ref(), expected_prev_etag, &encoded)
         .await?;
 
     // Hand back the pointer the commit just published.
@@ -170,25 +175,27 @@ fn empty_list(manifest_id: u64, parts: Vec<ManifestPartEntry>) -> Manifest {
         global_vector_index: None,
         tombstone_seqs: Default::default(),
         superseded_cells: Default::default(),
+        split_checks: Default::default(),
         format_version: LIST_FORMAT_VERSION.into(),
         manifest_id,
         options_hash: ContentHash([0u8; 32]),
-        schema: Vec::new(),
+        schema: None,
         id_column: "doc_id".into(),
-        fts_columns: vec![],
-        vector_columns: vec![],
+        commit_token: Uuid::nil(),
         partition_strategy: PartitionStrategy::Hash {
             column: "doc_id".into(),
             n_buckets: DEFAULT_HASH_N_BUCKETS,
         },
         vector_index_storage_prefix: None,
+        companions: Default::default(),
         deleted_user_ids_inline: None,
         slow_vector_state_uri: None,
         slow_vector_state_content_hash: None,
         slow_vector_state_centroids: None,
         slow_vector_state_graphs: None,
         slow_vector_state_centroid_graph: None,
-        term_stats: None,
+        term_index: None,
+        term_index_complete: false,
         parts,
     }
 }
@@ -212,6 +219,8 @@ fn entry_for(part: &ManifestPart) -> ManifestPartEntry {
         id_range: (0, 0),
         scalar_stats_agg: Default::default(),
         fts_summary_agg: Default::default(),
+        fts_length_totals: None,
+        summaries: None,
     }
 }
 
@@ -482,6 +491,14 @@ impl StorageProvider for BarrierMockStorage {
         Ok(Some("mock-etag".into()))
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let prior = self.put_calls.fetch_add(1, Ordering::AcqRel);
+        if prior < PARALLEL_PUT_COUNT_BEFORE_POINTER {
+            self.barrier.wait().await;
+        }
+        self.objects.lock().await.insert(uri.into(), bytes);
+        Ok(())
+    }
     async fn put_if_match(
         &self,
         uri: &str,

@@ -6,19 +6,28 @@
 //! [`Connection::create_table`](crate::Connection::create_table) alongside
 //! the Arrow schema.
 
-use crate::superfile::{
-    builder::FtsConfig,
-    fts::{
-        analysis::{Stemmer, Stopwords},
-        bm25::Bm25Params,
-        tokenize::STANDARD_TOKENIZER,
+use std::{collections::HashSet, sync::Arc};
+
+use arrow_schema::SchemaRef;
+
+use crate::{
+    InfinoError,
+    catalog::validate_schema,
+    superfile::{
+        builder::FtsConfig,
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25::Bm25Params,
+            tokenize::STANDARD_TOKENIZER,
+        },
+        vector::{builder::VectorConfig, distance::Metric, rerank_codec::RerankCodec},
     },
-    vector::{builder::VectorConfig, distance::Metric},
+    supertable::companion::{CompanionSpec, check_purpose},
 };
 
 /// Default rotation-matrix RNG seed for vector columns. The seed only
 /// has to be stable for a given table; the public API does not vary it.
-const DEFAULT_ROT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
+pub(crate) const DEFAULT_ROT_SEED: u64 = 0x5EED_5EED_5EED_5EED;
 
 /// A vector index declaration: column, dimensionality, and distance metric.
 #[derive(Debug, Clone)]
@@ -26,28 +35,31 @@ struct VectorIndex {
     column: String,
     dim: usize,
     metric: Metric,
+    /// The rotation seed, which the public builder does not vary: it is
+    /// [`DEFAULT_ROT_SEED`] unless a schema document being replayed onto a
+    /// new table carried another, in which case the table has to be built
+    /// with the one the document named.
+    rot_seed: u64,
+    /// Likewise the rerank codec; `None` leaves the engine's default.
+    rerank_codec: Option<RerankCodec>,
 }
 
 /// One full-text (BM25) indexed column, with its per-column options.
 ///
 /// Passed to [`IndexSpec::fts`]. A plain column name converts with all
-/// defaults (`standard` analyzer, stored text), so the common case
+/// defaults (the `standard` analyzer, stored text), so the common case
 /// stays `.fts("body")`; build a `FtsField` to change an option:
 ///
 /// ```
-/// use infino::{FtsField, IndexSpec};
+/// use infino::{FtsField, IndexSpec, Stemmer};
 /// let spec = IndexSpec::new()
 ///     .fts("title")
-///     .fts(FtsField::new("body").analyzer("ascii_lower").stored(false));
+///     .fts(FtsField::new("body").stemmer(Stemmer::English).stored(false));
 /// # let _ = spec;
 /// ```
 #[derive(Debug, Clone)]
 pub struct FtsField {
     column: String,
-    /// The **base tokenizer** name. Called `analyzer` because that is
-    /// what the option is named on the public builder, but the value is
-    /// a tokenizer: the column's *analyzer* is this tokenizer plus the
-    /// two filters below, each of which is carried as its own option.
     analyzer: String,
     stopwords: Stopwords,
     stemmer: Stemmer,
@@ -73,19 +85,8 @@ impl FtsField {
         }
     }
 
-    /// Pick the column's analyzer by name — `"standard"` (the default)
-    /// or `"ascii_lower"`, which splits on ASCII alphanumerics and
-    /// drops every non-ASCII token. The analyzer is per column: each
-    /// FTS column is tokenized with its own, so columns in one table
-    /// may use different analyzers. It is recorded with the table and
-    /// cannot be changed afterwards.
-    ///
-    /// This names the *base* tokenizer. [`FtsField::stopwords`] and
-    /// [`FtsField::stemmer`] add filters on top of it, and each is
-    /// recorded as its own option — so the three setters are
-    /// independent and may be called in any order.
-    ///
-    /// Validated at `create_table`, with the column named in the error.
+    /// Name the column's base tokenizer. `"standard"`, the default, is the
+    /// only one; any other name is refused at `create_table`.
     pub fn analyzer(mut self, name: impl Into<String>) -> Self {
         self.analyzer = name.into();
         self
@@ -233,6 +234,16 @@ impl From<String> for FtsField {
 pub struct IndexSpec {
     fts: Vec<FtsField>,
     vectors: Vec<VectorIndex>,
+    companions: Vec<Companion>,
+}
+
+/// A hidden companion table declared on a table: its purpose, its Arrow
+/// schema and the indexes over it. See [`IndexSpec::companion`].
+#[derive(Debug, Clone)]
+struct Companion {
+    purpose: String,
+    schema: SchemaRef,
+    indexes: IndexSpec,
 }
 
 impl IndexSpec {
@@ -242,14 +253,14 @@ impl IndexSpec {
     }
 
     /// Mark a column as full-text (BM25) indexed. Takes a plain column
-    /// name for the defaults, or an [`FtsField`] to set the analyzer
-    /// and whether the raw text is stored:
+    /// name for the defaults, or an [`FtsField`] to set the analysis
+    /// filters and whether the raw text is stored:
     ///
     /// ```
-    /// use infino::{FtsField, IndexSpec};
+    /// use infino::{FtsField, IndexSpec, Stopwords};
     /// let spec = IndexSpec::new()
     ///     .fts("title")
-    ///     .fts(FtsField::new("body").analyzer("ascii_lower").stored(false));
+    ///     .fts(FtsField::new("body").stopwords(Stopwords::English).stored(false));
     /// # let _ = spec;
     /// ```
     pub fn fts(mut self, field: impl Into<FtsField>) -> Self {
@@ -266,22 +277,167 @@ impl IndexSpec {
             column: column.into(),
             dim,
             metric,
+            rot_seed: DEFAULT_ROT_SEED,
+            rerank_codec: None,
         });
         self
+    }
+
+    /// Create the table with a hidden companion table beside it: a second
+    /// table with its own Arrow `schema` and its own full-text and vector
+    /// `indexes`, for state the caller keeps about the table — a ledger of
+    /// what has been loaded into it, say — that should live and die with
+    /// the table but never be mistaken for one of the catalog's tables.
+    ///
+    /// `purpose` names the companion: reach it with
+    /// [`Supertable::companion`] by the same name. It must be non-empty, at
+    /// most 64 characters of `[a-z0-9_]`, unique on the table, and not
+    /// `vector_index`, which the table's own hidden vector index uses.
+    /// `indexes` may not declare companions of its own. Declare several
+    /// companions with several calls.
+    ///
+    /// The companion is stored under the table's location and recorded on
+    /// its manifest, is never listed by
+    /// [`Connection::list_tables`](crate::Connection::list_tables), and is
+    /// removed with the table by
+    /// [`Connection::drop_table`](crate::Connection::drop_table) with
+    /// `purge`. It is an ordinary table otherwise: append, update, delete,
+    /// search and optimize it through the handle, and change its schema
+    /// with [`Supertable::apply_schema`]. Companions are declared at
+    /// `create_table` only; one cannot be added to an existing table.
+    /// A `memory://` or hosted connection refuses a spec with companions.
+    ///
+    /// A companion is strictly optional, and the engine never interprets
+    /// what it holds. The engine guarantees three things: the companion is
+    /// hidden from the catalog, it shares the table's lifecycle, and it
+    /// keeps the schema it was declared or patched with. Everything else
+    /// belongs to the component that creates it: what its purpose means,
+    /// what its rows say, when they are written, and any consistency it
+    /// keeps with the table's own rows (writing the table's new rows before
+    /// it removes old ones, say). No engine operation reads a companion or
+    /// depends on its contents.
+    ///
+    /// Every engine that writes the table must be at least the version
+    /// that created it. An older one does not know the manifest field
+    /// naming the companions and drops it on its next commit; the
+    /// companion's data is untouched, and [`Supertable::companion`]
+    /// re-attaches it from its storage location.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// use infino::IndexSpec;
+    ///
+    /// let ledger = Arc::new(Schema::new(vec![
+    ///     Field::new("key", DataType::LargeUtf8, false),
+    ///     Field::new("rows", DataType::UInt64, true),
+    /// ]));
+    /// let spec = IndexSpec::new()
+    ///     .fts("body")
+    ///     .companion("ledger", ledger, IndexSpec::new().fts("key"));
+    /// # let _ = spec;
+    /// ```
+    ///
+    /// [`Supertable::companion`]: crate::Supertable::companion
+    /// [`Supertable::apply_schema`]: crate::Supertable::apply_schema
+    pub fn companion(
+        mut self,
+        purpose: impl Into<String>,
+        schema: SchemaRef,
+        indexes: IndexSpec,
+    ) -> Self {
+        self.companions.push(Companion {
+            purpose: purpose.into(),
+            schema,
+            indexes,
+        });
+        self
+    }
+
+    /// Whether the spec declares any companion.
+    pub(crate) fn has_companions(&self) -> bool {
+        !self.companions.is_empty()
+    }
+
+    /// Refuses companions a table cannot be created with: a purpose
+    /// [`check_purpose`] refuses, a purpose declared twice, a companion
+    /// declaring companions of its own, or a companion whose schema or
+    /// analyzers a table would be refused for.
+    pub(crate) fn check_companions(&self) -> Result<(), InfinoError> {
+        let mut purposes = HashSet::new();
+        for companion in &self.companions {
+            check_purpose(&companion.purpose).map_err(InfinoError::Config)?;
+            if !purposes.insert(companion.purpose.as_str()) {
+                return Err(InfinoError::Config(format!(
+                    "companion purpose {:?} is declared twice",
+                    companion.purpose
+                )));
+            }
+            if companion.indexes.has_companions() {
+                return Err(InfinoError::Config(format!(
+                    "companion {:?} declares companions of its own; a companion cannot have any",
+                    companion.purpose
+                )));
+            }
+            validate_schema(&companion.schema)?;
+            companion.indexes.check_analyzers()?;
+        }
+        Ok(())
+    }
+
+    /// The declared companions, lowered to what the table options carry.
+    pub(crate) fn companion_specs(&self) -> Vec<CompanionSpec> {
+        self.companions
+            .iter()
+            .map(|companion| {
+                let (fts_columns, vector_columns) = companion.indexes.to_configs();
+                CompanionSpec {
+                    purpose: companion.purpose.clone(),
+                    schema: Arc::clone(&companion.schema),
+                    fts_columns,
+                    vector_columns,
+                }
+            })
+            .collect()
+    }
+
+    /// The same declaration, carrying a seed and codec a schema document
+    /// already fixed. Not public: a caller declaring a new table does not
+    /// choose these, but a table created from another's document must be
+    /// built with what that document said rather than silently taking the
+    /// defaults.
+    pub(crate) fn vector_as_recorded(
+        mut self,
+        column: impl Into<String>,
+        dim: usize,
+        metric: Metric,
+        rot_seed: u64,
+        rerank_codec: RerankCodec,
+    ) -> Self {
+        self.vectors.push(VectorIndex {
+            column: column.into(),
+            dim,
+            metric,
+            rot_seed,
+            rerank_codec: Some(rerank_codec),
+        });
+        self
+    }
+
+    /// Refuses an FTS column that names an analyzer other than `standard`.
+    pub(crate) fn check_analyzers(&self) -> Result<(), InfinoError> {
+        match self.fts.iter().find(|f| f.analyzer != STANDARD_TOKENIZER) {
+            Some(f) => Err(InfinoError::Config(format!(
+                "FTS column {:?}: unsupported analyzer {:?}; the only analyzer is {STANDARD_TOKENIZER:?}",
+                f.column, f.analyzer
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// FTS column names, in declaration order.
     pub(crate) fn fts_columns(&self) -> Vec<String> {
         self.fts.iter().map(|f| f.column.clone()).collect()
-    }
-
-    /// FTS **base tokenizer** names, in declaration order (parallel to
-    /// [`fts_columns`](Self::fts_columns)) — a column's analyzer is one
-    /// of these plus its filters, which are carried separately by
-    /// [`fts_stopwords`](Self::fts_stopwords) and
-    /// [`fts_stemmers`](Self::fts_stemmers).
-    pub(crate) fn fts_analyzers(&self) -> Vec<String> {
-        self.fts.iter().map(|f| f.analyzer.clone()).collect()
     }
 
     /// FTS stopword sets, in declaration order (parallel to
@@ -324,15 +480,16 @@ impl IndexSpec {
     }
 
     /// Lower to the internal `(FtsConfig, VectorConfig)` lists the
-    /// supertable options take. `rot_seed` / `rerank_codec` are not part
-    /// of the public spec — defaults are applied here.
+    /// supertable options take. `rot_seed` / `rerank_codec` are not part of
+    /// the public spec, so a column declared through [`Self::vector`]
+    /// carries the defaults; one replayed from a schema document carries
+    /// what that document recorded.
     pub(crate) fn to_configs(&self) -> (Vec<FtsConfig>, Vec<VectorConfig>) {
         let fts = self
             .fts
             .iter()
             .map(|f| {
                 FtsConfig::new(f.column.clone())
-                    .analyzer(f.analyzer.clone())
                     .stopwords(f.stopwords)
                     .stemmer(f.stemmer)
                     .positions(f.positions)
@@ -343,7 +500,13 @@ impl IndexSpec {
         let vectors = self
             .vectors
             .iter()
-            .map(|v| VectorConfig::new(v.column.clone(), v.dim, DEFAULT_ROT_SEED, v.metric))
+            .map(|v| {
+                let config = VectorConfig::new(v.column.clone(), v.dim, v.rot_seed, v.metric);
+                match v.rerank_codec {
+                    Some(codec) => config.with_rerank_codec(codec),
+                    None => config,
+                }
+            })
             .collect();
         (fts, vectors)
     }
@@ -353,34 +516,24 @@ impl IndexSpec {
 mod tests {
     use super::*;
 
-    /// What a single declared column lowers to on each of the three
-    /// independent analysis surfaces.
-    fn analysis_of(field: FtsField) -> (String, Stopwords, Stemmer) {
+    /// What a single declared column lowers to on each analysis surface.
+    fn analysis_of(field: FtsField) -> (Stopwords, Stemmer) {
         let spec = IndexSpec::new().fts(field);
         (
-            spec.fts_analyzers().remove(0),
             spec.fts_stopwords().remove(0),
             spec.fts_stemmers().remove(0),
         )
     }
 
-    /// The three analysis setters are independent: each carries its own
-    /// option through to its own persisted field, so they commute and
-    /// none can clobber another. Worth pinning even though it now falls
-    /// out of the representation — an earlier version composed them
-    /// into one string, where declaring the base last silently dropped
-    /// the filters.
+    /// The analysis setters are independent: each carries its own option
+    /// through to its own persisted field, so they commute and neither
+    /// can clobber the other.
     #[test]
     fn the_analysis_setters_commute() {
-        let want = (
-            "ascii_lower".to_string(),
-            Stopwords::English,
-            Stemmer::English,
-        );
+        let want = (Stopwords::English, Stemmer::English);
         assert_eq!(
             analysis_of(
                 FtsField::new("t")
-                    .analyzer("ascii_lower")
                     .stopwords(Stopwords::English)
                     .stemmer(Stemmer::English)
             ),
@@ -391,69 +544,27 @@ mod tests {
                 FtsField::new("t")
                     .stemmer(Stemmer::English)
                     .stopwords(Stopwords::English)
-                    .analyzer("ascii_lower")
             ),
             want
         );
-        assert_eq!(
-            analysis_of(
-                FtsField::new("t")
-                    .stopwords(Stopwords::English)
-                    .analyzer("ascii_lower")
-                    .stemmer(Stemmer::English)
-            ),
-            want
-        );
-    }
-
-    /// `.analyzer()` names the base tokenizer and nothing else. A
-    /// caller who passes a chain-shaped string gets it treated as an
-    /// tokenizer name — which does not resolve, so `create_table`
-    /// rejects it naming what they wrote, rather than silently
-    /// interpreting it.
-    #[test]
-    fn the_analyzer_setter_names_only_the_base() {
-        let (analyzer, stop, stem) =
-            analysis_of(FtsField::new("t").analyzer("standard+stop=english"));
-        assert_eq!(analyzer, "standard+stop=english");
-        assert_eq!(
-            (stop, stem),
-            (Stopwords::None, Stemmer::None),
-            "a chain-shaped string must not be silently decomposed"
-        );
-        // Turning a filter off is explicit, and independent of the base.
+        // Turning a filter off is explicit.
         assert_eq!(
             analysis_of(
                 FtsField::new("t")
                     .stopwords(Stopwords::English)
                     .stopwords(Stopwords::None)
             ),
-            (
-                STANDARD_TOKENIZER.to_string(),
-                Stopwords::None,
-                Stemmer::None
-            )
+            (Stopwords::None, Stemmer::None)
         );
     }
 
-    /// An unresolvable analyzer passes through untouched, so
-    /// `create_table`'s error can name what the caller actually wrote
-    /// rather than a normalized form of it.
-    #[test]
-    fn an_unresolvable_analyzer_is_lowered_verbatim() {
-        for name in ["nonesuch", "STANDARD"] {
-            assert_eq!(analysis_of(FtsField::new("t").analyzer(name)).0, name);
-        }
-    }
-
-    /// The defaults, asserted where they are declared: `standard`, no
-    /// filters, no positions. A default column's recorded tokenizer is
-    /// the bare base name, which is what keeps it byte-identical on
-    /// disk to one declared before the filters existed.
+    /// The defaults, asserted where they are declared: no filters, no
+    /// positions, text stored.
     #[test]
     fn a_bare_declaration_takes_the_plain_standard_analyzer() {
         let spec = IndexSpec::new().fts("body");
-        assert_eq!(spec.fts_analyzers(), vec![STANDARD_TOKENIZER.to_string()]);
+        assert_eq!(spec.fts_stopwords(), vec![Stopwords::None]);
+        assert_eq!(spec.fts_stemmers(), vec![Stemmer::None]);
         assert_eq!(spec.fts_positions(), vec![false]);
         assert_eq!(spec.fts_stored(), vec![true]);
     }

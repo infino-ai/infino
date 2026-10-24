@@ -54,32 +54,41 @@
 //! step-4 PUT is overwrite-safe and the step-5 manifest swap can
 //! short-circuit via the idempotency probe in step 1.
 
-use std::{collections::HashMap, io::Cursor, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    io::Cursor,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use arrow::ipc::reader::StreamReader;
-use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+use arrow_array::RecordBatch;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use roaring::RoaringBitmap;
 use tokio::time::sleep;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
     runtime_bridge::{bridge_sync_to_async, run_on_pool},
     runtime_metrics::op_stats::{OpStatsCollector, timed_kernel},
-    storage::StorageError,
+    storage::{StorageError, StorageProvider},
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
-        ManifestSnapshot, SupertableOptions,
+        ManifestSnapshot,
         error::CommitError as ManifestCommitError,
         handle::{Supertable, SupertableInner},
-        manifest::{
-            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-            bloom::BloomBuilder,
-        },
-        options::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+        manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
         query::superfile_reader::superfile_reader,
-        utils::vector_split::split_vectors,
+        reader_cache::ReadIntent,
+        schema::{
+            PhysicalSchema,
+            error::SchemaError,
+            resolve::{conform, resolve_batch, union_schema},
+        },
+        utils::{idgen, vector_split::split_vectors},
         wal::{
             persistence::{Etag, WalStore, WalStoreError},
             state_doc::{
@@ -89,9 +98,10 @@ use crate::{
             tombstones_codec::TombstonesSidecar,
         },
         writer::{
-            CommitListMetadata, build_column_vector_summary, build_packed_update_superfile,
-            build_subsection_offsets, owned_vector_arrays, persist_commit,
-            read_vector_layout_from_bytes, stamp_tombstone_seqs,
+            CommitListMetadata, build_fts_summary, build_packed_update_superfile,
+            build_subsection_offsets, build_term_contribution, build_vector_summary,
+            builder_options_of, owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
+            stamp_tombstone_seqs, with_id_column,
         },
     },
 };
@@ -173,10 +183,10 @@ pub enum AppendPhaseError {
     #[error("superfile build failed: {message}")]
     SuperfileBuild { message: String },
 
-    /// Opening the just-built bytes as a `SuperfileReader` to
-    /// extract FTS / vector summaries failed.
-    #[error("superfile open for summary failed: {message}")]
-    SuperfileOpenForSummary { message: String },
+    /// Opening the just-built bytes as a `SuperfileReader`, or reading the
+    /// FTS / vector summaries from it, failed.
+    #[error("summarizing the superfile failed: {message}")]
+    SuperfileSummary { message: String },
 
     /// The manifest-commit machinery failed. Surfaces both the
     /// "I lost the pointer CAS" path (which the inner code
@@ -390,21 +400,93 @@ async fn do_apply(
             expected: user_batch.num_rows() as u32,
         });
     }
-    // Split scalars from vectors once; downstream consumes both
-    // halves. `split_vectors` runs the schema-equality check +
-    // per-vector null sweep, so this is the single validation
-    // gate for the append batch.
-    //
-    // Vector slices are zero-copy views into `user_batch`'s
-    // buffers; we hold `user_batch` alive across the
-    // `builder.add_batch` call below.
-    let (scalar_no_id, vector_slices) =
-        split_vectors(&user_batch, &inner.options).map_err(|e| {
-            AppendPhaseError::SuperfileBuild {
-                message: format!("vector_split: {e}"),
+    let attempts = inner.options.max_commit_retries.max(1);
+    let mut attempt = 0;
+    let (uri, bytes) = loop {
+        match append_replacement_rows(
+            inner,
+            Arc::clone(&storage),
+            &user_batch,
+            &flat_ids,
+            preallocated_superfile_id,
+            &op_stats,
+        )
+        .await
+        {
+            Err(AppendPhaseError::ManifestCommit(e))
+                if matches!(*e, ManifestCommitError::SchemaMoved { .. })
+                    && attempt + 1 < attempts =>
+            {
+                attempt += 1;
+                warn!(error = %e, "schema moved under the update's append; rebuilding against the current one");
             }
+            other => break other?,
+        }
+    };
+
+    // Warm the in-memory reader cache with the freshly-published
+    // bytes so this process's later reads (queries, tombstone
+    // resolves) don't take the cold-fetch round-trip back to
+    // storage. Mirrors the synchronous writer's pattern in
+    // `commit`; a failure here is non-fatal because the bytes
+    // are durable in storage and a subsequent read can refetch
+    // them.
+    let _ = inner.options.store.insert(uri, bytes);
+
+    // ---- Step 7: Advance WAL state to Appended ----
+    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
+}
+
+/// Flatten the WAL's persisted `IdSpan`s into the implied sequence of
+/// `i128` ids in order, with the same expansion an append uses.
+fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
+    let spans: Vec<(i128, i128)> = spans.iter().map(|s| (s.first.0, s.last.0)).collect();
+    idgen::flatten_spans(&spans)
+}
+
+/// Decode the WAL's IPC sidecar back to the user-shape
+/// `RecordBatch`. The sidecar contains exactly one batch (the
+/// `new_rows` argument the caller passed to `update()`); we read
+/// the first and verify there isn't a second.
+/// Build and commit the superfile carrying `user_batch` under `ids`. The
+/// rows were resolved when the update was buffered; the table may have
+/// moved since, so they are resolved again against the current schema and
+/// the superfile lands with the schema it was built under or not at all —
+/// a commit the schema moved under is refused, and the caller rebuilds.
+async fn append_replacement_rows(
+    inner: &Arc<SupertableInner>,
+    storage: Arc<dyn StorageProvider>,
+    user_batch: &RecordBatch,
+    flat_ids: &[i128],
+    preallocated_superfile_id: Uuid,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<(SuperfileUri, Bytes), AppendPhaseError> {
+    let base = inner.manifest.load_full();
+    let built_against = base.table_schema().schema_id();
+    let id_column = inner.options.id_column.as_str();
+    let schema_error = |e: SchemaError| AppendPhaseError::SuperfileBuild {
+        message: e.to_string(),
+    };
+    let rows = resolve_batch(user_batch, &base.table_schema(), id_column)
+        .map_err(schema_error)?
+        .batch;
+    let schema_change = union_schema(&base.table_schema(), [&rows], id_column)
+        .map_err(schema_error)?
+        .map(Arc::new);
+    let manifest = match &schema_change {
+        Some(schema) => Arc::new(base.with_schema(Arc::clone(schema))),
+        None => base,
+    };
+    // Vector slices are zero-copy views into `rows`' buffers, alive across
+    // the `builder.add_batch` call below.
+    let (scalar_no_id, vector_slices) =
+        split_vectors(&rows, &manifest).map_err(|e| AppendPhaseError::SuperfileBuild {
+            message: format!("vector_split: {e}"),
         })?;
-    let scalar_with_id = prepend_id_column(&scalar_no_id, &flat_ids, &inner.options)?;
+    let scalar_with_id = conform(
+        &with_id_column(&scalar_no_id, flat_ids.to_vec(), id_column),
+        &manifest.scalar_schema(),
+    );
 
     // ---- Step 4: Build the superfile bytes ----
     //
@@ -426,10 +508,10 @@ async fn do_apply(
     // carries the collector into `fanout_shards_metered`, which already
     // brackets each shard on its own pool worker — bracketing the pool
     // closure as well would count that CPU twice.
-    let bytes = if inner.options.vector_columns.is_empty() {
-        timed_kernel(&op_stats, || {
+    let bytes = if manifest.vector_configs().is_empty() {
+        timed_kernel(op_stats, || {
             let mut builder =
-                SuperfileBuilder::new(inner.options.builder_options()).map_err(|e| {
+                SuperfileBuilder::new(builder_options_of(&manifest)).map_err(|e| {
                     AppendPhaseError::SuperfileBuild {
                         message: format!("builder construction: {e}"),
                     }
@@ -447,18 +529,27 @@ async fn do_apply(
             Ok::<_, AppendPhaseError>(Bytes::from(raw))
         })?
     } else {
-        let vectors = owned_vector_arrays(&user_batch, &inner.options).map_err(|e| {
+        let vectors = owned_vector_arrays(&rows, &manifest).map_err(|e| {
             AppendPhaseError::SuperfileBuild {
                 message: format!("vector handles: {e}"),
             }
         })?;
         let pool_inner = Arc::clone(inner);
+        let pool_manifest = Arc::clone(&manifest);
         let pool_batch = scalar_with_id.clone();
         let pool_stats = op_stats.clone();
         run_on_pool(
             Some(&inner.options.writer_pool),
             "update packed superfile build",
-            move || build_packed_update_superfile(&pool_inner, pool_batch, vectors, &pool_stats),
+            move || {
+                build_packed_update_superfile(
+                    &pool_inner,
+                    &pool_manifest,
+                    pool_batch,
+                    vectors,
+                    &pool_stats,
+                )
+            },
         )
         .await
         .map_err(|e| AppendPhaseError::SuperfileBuild {
@@ -477,13 +568,26 @@ async fn do_apply(
     // the in-memory `RecordBatch` directly; nothing needs to
     // round-trip through Parquet.
     let reader = SuperfileReader::open_with(bytes.clone(), inner.options.superfile_open_options())
-        .map_err(|e| AppendPhaseError::SuperfileOpenForSummary {
+        .map_err(|e| AppendPhaseError::SuperfileSummary {
             message: e.to_string(),
         })?;
-    let fts_summary = build_fts_summary(&reader, &inner.options);
-    let vector_summary = build_vector_summary(&reader, &inner.options);
-    let scalar_stats =
-        ScalarStatsAgg::from_batches(&inner.options.scalar_schema(), &[&scalar_with_id]);
+    let fts_summary =
+        build_fts_summary(&reader, &manifest).map_err(|e| AppendPhaseError::SuperfileSummary {
+            message: e.to_string(),
+        })?;
+    let vector_summary = build_vector_summary(&reader, &manifest);
+    // The replacement superfile's postings go into the term index in the
+    // same commit as its entry, exactly as an appended superfile's do.
+    let term_contribution = build_term_contribution(
+        &reader,
+        &manifest,
+        preallocated_superfile_id,
+        if flat_ids.is_empty() { 0 } else { flat_ids[0] },
+    )
+    .map_err(|e| AppendPhaseError::SuperfileBuild {
+        message: format!("term index contribution: {e}"),
+    })?;
+    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &[&scalar_with_id]);
 
     let (id_min, id_max) = if flat_ids.is_empty() {
         (0, 0)
@@ -494,6 +598,10 @@ async fn do_apply(
     let uri = SuperfileUri(preallocated_superfile_id);
     let entry = Arc::new(SuperfileEntry {
         stem: None,
+        physical_schema: Some(Arc::new(PhysicalSchema::of_reader(
+            &reader,
+            &manifest.options.legacy_names(),
+        ))),
         // Stamped to the winning commit version later, in `ManifestSnapshot::update`.
         birth_version: 0,
         superfile_id: preallocated_superfile_id,
@@ -501,7 +609,7 @@ async fn do_apply(
         n_docs: flat_ids.len() as u64,
         id_min,
         id_max,
-        scalar_stats,
+        scalar_stats: scalar_stats.into(),
         fts_summary,
         vector_summary,
         // Unpartitioned default: the supertable's partition
@@ -541,44 +649,17 @@ async fn do_apply(
         &[],
         vec![(storage_key, bytes.clone())],
         Vec::new(),
-        CommitListMetadata::empty(),
+        CommitListMetadata {
+            schema: schema_change,
+            expected_schema_id: Some(built_against),
+            ..CommitListMetadata::empty()
+        },
+        term_contribution.into_iter().collect(),
     )
     .map_err(|e| AppendPhaseError::ManifestCommit(Box::new(e)))?;
-
-    // Warm the in-memory reader cache with the freshly-published
-    // bytes so this process's later reads (queries, tombstone
-    // resolves) don't take the cold-fetch round-trip back to
-    // storage. Mirrors the synchronous writer's pattern in
-    // `commit`; a failure here is non-fatal because the bytes
-    // are durable in storage and a subsequent read can refetch
-    // them.
-    let _ = inner.options.store.insert(uri, bytes);
-
-    // ---- Step 7: Advance WAL state to Appended ----
-    advance_to_appended_if_needed(wal_store, wal_doc, wal_etag).await
+    Ok((uri, bytes))
 }
 
-/// Flatten a `Vec<IdSpan>` into the implied sequence of `i128`
-/// ids in order. Total cost is O(n) in the flattened count;
-/// allocated once per append-phase invocation.
-///
-/// Uses `extend(Range)` rather than a `push` loop: `Vec::extend`
-/// specializes on `TrustedLen` iterators (which `Range<i128>` is),
-/// emitting one bulk copy instead of N bounds-checked pushes —
-/// ~6× faster at the 1M-id scale a delete/update batch can hit.
-fn flatten_spans(spans: &[IdSpan]) -> Vec<i128> {
-    let total: usize = spans.iter().map(|s| s.len() as usize).sum();
-    let mut out = Vec::with_capacity(total);
-    for span in spans {
-        out.extend(span.first.0..=span.last.0);
-    }
-    out
-}
-
-/// Decode the WAL's IPC sidecar back to the user-shape
-/// `RecordBatch`. The sidecar contains exactly one batch (the
-/// `new_rows` argument the caller passed to `update()`); we read
-/// the first and verify there isn't a second.
 fn decode_ipc_batch(
     ipc_bytes: &Bytes,
     wal_doc: &WalStateDoc,
@@ -606,95 +687,6 @@ fn decode_ipc_batch(
         });
     }
     Ok(batch)
-}
-
-/// Construct a new `RecordBatch` matching the supertable's
-/// `scalar_schema()` shape — `_id` column prepended, followed by
-/// `scalar_no_id`'s columns (the scalar-only output of
-/// `split_vectors`). Vector columns are NOT in this batch; they
-/// get passed alongside to `SuperfileBuilder::add_batch`.
-///
-/// Caller must have already run `split_vectors` for schema +
-/// null validation — this function trusts its input.
-fn prepend_id_column(
-    scalar_no_id: &RecordBatch,
-    flat_ids: &[i128],
-    options: &SupertableOptions,
-) -> Result<RecordBatch, AppendPhaseError> {
-    let id_values: Vec<i128> = flat_ids.to_vec();
-    let id_array = Decimal128Array::from(id_values)
-        .with_precision_and_scale(DECIMAL128_PRECISION, DECIMAL128_SCALE)
-        .map_err(|e| AppendPhaseError::SuperfileBuild {
-            message: format!("Decimal128 precision/scale: {e}"),
-        })?;
-
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(scalar_no_id.num_columns() + 1);
-    columns.push(Arc::new(id_array));
-    columns.extend(scalar_no_id.columns().iter().cloned());
-
-    RecordBatch::try_new(options.scalar_schema(), columns).map_err(|e| {
-        AppendPhaseError::SuperfileBuild {
-            message: format!("RecordBatch::try_new with _id prepended: {e}"),
-        }
-    })
-}
-
-/// Per-FTS-column bloom + range summary derived from the
-/// just-built superfile's `SuperfileReader`. Mirrors the shape
-/// the writer's `prepare_superfile` builds so summaries match
-/// regardless of which code path produced the superfile.
-fn build_fts_summary(
-    reader: &SuperfileReader,
-    options: &SupertableOptions,
-) -> HashMap<String, FtsSummaryAgg> {
-    let mut out: HashMap<String, FtsSummaryAgg> = HashMap::new();
-    let Some(fts_reader) = reader.fts() else {
-        return out;
-    };
-    for fc in &options.fts_columns {
-        let terms = fts_reader
-            .iter_column_terms(&fc.column)
-            .expect("FST bytes valid: superfile just built");
-        let n_terms_distinct = terms.len() as u32;
-        let (min_term, max_term) = match (terms.first(), terms.last()) {
-            (Some(min), Some(max)) => (min.clone(), max.clone()),
-            _ => (Vec::new(), Vec::new()),
-        };
-        // Size the bloom to this superfile's distinct-term count rather than a
-        // fixed 64 KiB. Readers derive the block count from the byte length.
-        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
-        for term in &terms {
-            bloom_builder.insert(term);
-        }
-        out.insert(
-            fc.column.clone(),
-            FtsSummaryAgg::new_with_params(
-                bloom_builder.finish(),
-                n_terms_distinct,
-                (min_term, max_term),
-            ),
-        );
-    }
-    out
-}
-
-/// Per-vector-column centroid summary (fp32 + 1-bit admit slab; see
-/// [`build_column_vector_summary`]). `None` from the reader → column
-/// absent from this superfile's vector blob → no entry in the map.
-fn build_vector_summary(
-    reader: &SuperfileReader,
-    options: &SupertableOptions,
-) -> HashMap<String, VectorSummary> {
-    let mut out: HashMap<String, VectorSummary> = HashMap::new();
-    let Some(vec_reader) = reader.vec() else {
-        return out;
-    };
-    for vc in &options.vector_columns {
-        if let Some(summary) = build_column_vector_summary(vec_reader, vc) {
-            out.insert(vc.column.clone(), summary);
-        }
-    }
-    out
 }
 
 // ============================================================
@@ -954,14 +946,54 @@ const MAX_CAS_RETRIES: u32 = 10;
 /// for why the pre-backoff write is exempt.
 const LEASE_RENEW_FRACTION: i32 = 3;
 
-/// Bounded sealed-sidecar retry budget. Architecturally this
+/// Default bounded sealed-sidecar retry budget, overridable per table with
+/// [`SupertableOptions::with_max_sealed_retries`]. Architecturally this
 /// loop should be unbounded — the writer blocks until
 /// compaction's forward progress publishes a merged target and
 /// our re-resolve routes there. We bound it so a stuck
 /// supertable surfaces a typed error rather than hanging the
 /// test process. The budget is high enough that a healthy
 /// compactor never exhausts it under realistic loads.
-const MAX_SEALED_RETRIES: u32 = 16;
+pub(crate) const DEFAULT_MAX_SEALED_RETRIES: u32 = 16;
+
+/// Whether a sealed-retry attempt earns its budget back.
+///
+/// Two kinds of progress count. Ours: we landed a bit somewhere, so the batch
+/// is working through its targets. And the compactor's: the manifest lost a
+/// superfile it listed at our last attempt, which only a compaction commit
+/// does. That keeps a delete alive against a pass running several merges at
+/// once, since such a pass seals every input together and a batch whose
+/// targets all sit in that set has nothing of its own to show until the pass
+/// commits.
+///
+/// Read from this handle's in-memory manifest, so the compactor it can see is
+/// one sharing this process. A delete driven from another process waits out
+/// its budget and then takes the seal over once it goes stale, which is the
+/// same path a dead compactor's seals take.
+///
+/// A removal, not a generation bump: an append commits too, and moves the
+/// generation while removing nothing. Crediting that would refund a delete
+/// parked behind an abandoned seal on every unrelated write, so a table that
+/// really is stuck would spin instead of surfacing its typed error — which is
+/// the only reason the budget is bounded at all.
+fn refunds_sealed_budget(
+    landed_any: bool,
+    listed_before: &HashSet<Uuid>,
+    listed_now: &HashSet<Uuid>,
+) -> bool {
+    landed_any || listed_before.iter().any(|id| !listed_now.contains(id))
+}
+
+/// The superfile ids a manifest lists, for the refund comparison above.
+fn listed_superfile_ids(inner: &SupertableInner) -> HashSet<Uuid> {
+    inner
+        .manifest
+        .load()
+        .get_all_superfiles()
+        .iter()
+        .map(|e| e.superfile_id)
+        .collect()
+}
 
 /// Backoff floor between sealed-sidecar retries. Doubles per
 /// attempt, capped at [`SEALED_RETRY_CAP_MS`].
@@ -977,6 +1009,77 @@ const SEALED_RETRY_CAP_MS: u64 = 30_000;
 /// plateaus (before [`SEALED_RETRY_CAP_MS`] clamps the result)
 /// rather than overflowing on a high attempt count.
 const SEALED_RETRY_MAX_SHIFT: u32 = 8;
+
+/// Total backoff a mutation spends before `retries` sealed attempts are up.
+const fn sealed_retry_span_ms(retries: u32) -> u64 {
+    let mut total = 0;
+    let mut attempt = 0;
+    while attempt < retries {
+        let shift = if attempt < SEALED_RETRY_MAX_SHIFT {
+            attempt
+        } else {
+            SEALED_RETRY_MAX_SHIFT
+        };
+        let step = SEALED_RETRY_BASE_MS * (1u64 << shift);
+        total += if step < SEALED_RETRY_CAP_MS {
+            step
+        } else {
+            SEALED_RETRY_CAP_MS
+        };
+        attempt += 1;
+    }
+    total
+}
+
+// The two timeouts are ordered, and the order is what keeps a delete alive
+// through a compaction merge longer than a seal lives. A writer waits on a
+// fresh seal and steals a stale one, so it needs budget enough to reach the
+// staleness threshold: the moment the budget is the shorter of the two, every
+// delete landing on a sealed input during a long merge fails with
+// `SealedSidecarRetryExhausted` instead of taking the seal over. Raising the
+// staleness threshold — which its own doc-comment invites for large targets —
+// is the edit this catches.
+//
+// This guards the SHIPPED pair only. Both sides are configurable — `max_sealed_retries` per table
+// and `compaction.stale_seal_timeout_ms` per config — so the pair actually in force is checked at
+// runtime by [`warn_if_budget_cannot_outlast_seal`].
+const _: () = assert!(
+    sealed_retry_span_ms(DEFAULT_MAX_SEALED_RETRIES) > DEFAULT_STALE_SEAL_TIMEOUT_MS,
+    "the sealed-retry budget must outlast the seal staleness threshold, or a \
+     delete exhausts its retries before it is allowed to steal an abandoned seal"
+);
+
+/// Warn once when the configured retry budget cannot outlast the configured staleness threshold.
+///
+/// A delete that meets a live seal waits for it to go stale and then takes it over. If its budget
+/// runs out first it fails with `SealedSidecarRetryExhausted` instead, so every delete landing on
+/// an input of a long merge fails while the table is perfectly healthy. The knobs are left
+/// authoritative rather than clamped: lowering the budget to reach the exhausted path in bounded
+/// time is exactly what the tests do, and a clamp would take that away.
+fn warn_if_budget_cannot_outlast_seal(max_sealed_retries: u32, stale_seal_timeout: Duration) {
+    static WARNED: OnceLock<()> = OnceLock::new();
+
+    let budget_ms = sealed_retry_span_ms(max_sealed_retries);
+    let timeout_ms = stale_seal_timeout.as_millis() as u64;
+    if budget_outlasts_seal(max_sealed_retries, stale_seal_timeout) || WARNED.set(()).is_err() {
+        return;
+    }
+    warn!(
+        budget_ms,
+        timeout_ms,
+        max_sealed_retries,
+        "sealed-retry budget is shorter than the seal staleness threshold; a delete meeting a \
+         live seal will exhaust its retries instead of taking the seal over"
+    );
+}
+
+/// Whether a delete can wait a live seal out before its retries run out.
+///
+/// The same ordering the const assert above pins for the shipped values, as a predicate over the
+/// pair actually in force.
+fn budget_outlasts_seal(max_sealed_retries: u32, stale_seal_timeout: Duration) -> bool {
+    sealed_retry_span_ms(max_sealed_retries) > stale_seal_timeout.as_millis() as u64
+}
 
 /// The lease span the current driver was granted, or `None` when the WAL
 /// carries no lease. Read once per phase, before any renewal moves
@@ -1100,7 +1203,7 @@ async fn do_tombstone_apply(
     // superfile, and the target's `(superfile_id, doc_id)` moves with
     // it — so those targets must be re-resolved against a fresh
     // manifest rather than retried at the old coordinates. Bounded by
-    // `MAX_SEALED_RETRIES` with exponential backoff.
+    // the sealed-retry budget with exponential backoff.
     let mut pending: Vec<(usize, RowId)> = wal_cur
         .tombstone_progress
         .iter()
@@ -1115,6 +1218,18 @@ async fn do_tombstone_apply(
     );
 
     let mut sealed_attempts = 0u32;
+    let max_sealed_retries = inner.options.max_sealed_retries.max(1);
+    // The threshold a seal is judged stale by, from the one place that answers
+    // it: the compactor's re-stamp decision reads the same helper, and the gap
+    // between two different readings is a window where a delete lands a bit on
+    // a superfile about to be removed.
+    let stale_seal_timeout = tombstones_admin::writer_steal_timeout();
+    warn_if_budget_cannot_outlast_seal(max_sealed_retries, stale_seal_timeout);
+    // What the manifest listed at the last sealed attempt, so a superfile
+    // disappearing can refund the budget below. Seeded with the current
+    // listing: a compaction that committed before this loop even started is
+    // not evidence of progress during it.
+    let mut listed_at_last_attempt = listed_superfile_ids(inner);
     while !pending.is_empty() {
         let pending_ids: Vec<RowId> = pending.iter().map(|(_, target_id)| *target_id).collect();
 
@@ -1142,7 +1257,7 @@ async fn do_tombstone_apply(
         let mut landed_any = false;
         for (superfile_id, hits) in doc_ids_in_superfile_map {
             let doc_ids: Vec<u32> = hits.iter().map(|&(doc_id, _)| doc_id).collect();
-            match cas_tombstone_bits(wal_store, superfile_id, &doc_ids).await? {
+            match cas_tombstone_bits(wal_store, superfile_id, &doc_ids, stale_seal_timeout).await? {
                 SidecarCasOutcome::Landed => {
                     landed_any = true;
                     for (_, idx) in hits {
@@ -1175,11 +1290,19 @@ async fn do_tombstone_apply(
         // Forward progress refunds the budget: a batch spanning several
         // concurrently-compacting superfiles would otherwise burn one
         // shared allowance on seals it is steadily working through.
-        if landed_any {
+        //
+        // The compactor's progress counts as well as ours. A pass running
+        // several merges at once holds all of their inputs sealed together, so
+        // a batch whose targets sit entirely inside that set lands nothing
+        // until the pass commits. A superfile leaving the manifest is that
+        // pass publishing: it is working through its merges and will reach ours.
+        let listed_now = listed_superfile_ids(inner);
+        if refunds_sealed_budget(landed_any, &listed_at_last_attempt, &listed_now) {
             sealed_attempts = 0;
         }
+        listed_at_last_attempt = listed_now;
         sealed_attempts += 1;
-        if sealed_attempts > MAX_SEALED_RETRIES {
+        if sealed_attempts > max_sealed_retries {
             return Err(TombstonePhaseError::SealedSidecarRetryExhausted {
                 targets: pending_batch_label(&sealed),
             });
@@ -1301,6 +1424,7 @@ async fn cas_tombstone_bits(
     wal_store: &WalStore,
     superfile_id: Uuid,
     doc_ids: &[u32],
+    stale_seal_timeout: Duration,
 ) -> Result<SidecarCasOutcome, TombstonePhaseError> {
     for _attempt in 0..MAX_CAS_RETRIES {
         // Read the current sidecar (None ↔ no tombstones yet).
@@ -1319,11 +1443,7 @@ async fn cas_tombstone_bits(
         // bit with `seal: None` below, clearing the dead seal too.
         if let Some(sc) = &existing
             && let Some(seal) = sc.seal.as_ref()
-            && !tombstones_admin::is_seal_stale(
-                seal.sealed_at,
-                Utc::now(),
-                Duration::from_millis(tombstones_admin::DEFAULT_STALE_SEAL_TIMEOUT_MS),
-            )
+            && !tombstones_admin::is_seal_stale(seal.sealed_at, Utc::now(), stale_seal_timeout)
         {
             return Ok(SidecarCasOutcome::Sealed);
         }
@@ -1459,7 +1579,7 @@ fn lookup_ids_in_superfile(
         &entry.uri,
         &entry.storage_path(),
         entry.subsection_offsets.as_ref(),
-        true,
+        ReadIntent::Warm,
     )) {
         Ok(r) => r,
         Err(e) => {
@@ -1620,6 +1740,82 @@ mod tests {
         test_helpers::{build_title_batch, default_supertable_options},
     };
 
+    /// A manifest listing, for the refund tests below.
+    fn listing(ids: &[u128]) -> HashSet<Uuid> {
+        ids.iter().copied().map(Uuid::from_u128).collect()
+    }
+
+    /// The shipped pair is ordered, and both knobs can break it.
+    ///
+    /// A delete that meets a live seal waits for it to go stale and takes it
+    /// over; if its budget runs out first it fails instead, on a table that is
+    /// working perfectly. Both sides are configurable, so the ordering is a
+    /// property of the pair in force, not of the defaults the const assert
+    /// above pins.
+    #[test]
+    fn a_delete_must_outlast_the_seal_it_waits_on() {
+        let shipped = Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+        assert!(
+            budget_outlasts_seal(DEFAULT_MAX_SEALED_RETRIES, shipped),
+            "the shipped pair must be ordered"
+        );
+        // A budget lowered to reach the exhausted path, as the tests do.
+        assert!(!budget_outlasts_seal(3, shipped));
+        // A threshold raised for large targets, which its doc-comment invites.
+        assert!(!budget_outlasts_seal(
+            DEFAULT_MAX_SEALED_RETRIES,
+            Duration::from_secs(600)
+        ));
+    }
+
+    /// Landing a bit is progress, whatever the compactor is doing.
+    #[test]
+    fn landing_a_tombstone_refunds_the_sealed_budget() {
+        assert!(refunds_sealed_budget(
+            true,
+            &listing(&[1, 2]),
+            &listing(&[1, 2])
+        ));
+    }
+
+    /// The case a concurrent compaction pass creates: the batch lands nothing,
+    /// because every superfile holding its targets is sealed by merges running
+    /// together. A superfile leaving the listing is that pass publishing, so
+    /// it is working through its merges and the wait was not wasted.
+    #[test]
+    fn a_compactor_publishing_refunds_the_sealed_budget() {
+        assert!(refunds_sealed_budget(
+            false,
+            &listing(&[1, 2, 3]),
+            &listing(&[3, 4])
+        ));
+    }
+
+    /// An append adds a superfile and removes none. It commits, so it moves
+    /// the manifest generation, but it frees nothing this batch is waiting on
+    /// — crediting it would refund a delete parked behind an abandoned seal on
+    /// every unrelated write, and the typed error would never surface.
+    #[test]
+    fn an_append_does_not_refund_the_sealed_budget() {
+        assert!(!refunds_sealed_budget(
+            false,
+            &listing(&[1, 2]),
+            &listing(&[1, 2, 3])
+        ));
+    }
+
+    /// Nothing landed and nothing left the listing: this attempt bought
+    /// nothing, so it must cost budget. Otherwise a genuinely stuck table
+    /// would spin forever instead of surfacing a typed error.
+    #[test]
+    fn a_wasted_attempt_spends_the_sealed_budget() {
+        assert!(!refunds_sealed_budget(
+            false,
+            &listing(&[1, 2]),
+            &listing(&[1, 2])
+        ));
+    }
+
     /// Construct a Supertable + a fresh WAL state doc + the WAL's
     /// etag, all backed by the same LocalFs storage so an
     /// orchestrator call against this supertable sees the WAL
@@ -1655,6 +1851,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = wal_store.create(&wal_doc).await.expect("wal create");
         (dir, supertable, wal_store, wal_doc, etag)
@@ -1816,6 +2013,7 @@ mod tests {
             target_ids: (0..n).map(|i| RowId(1000 + i as i128)).collect(),
             new_row_count: Some(n),
             new_row_content_hash: Some(content_hash),
+            schema_id: None,
             preallocated_superfile_id: Some(superfile_id),
             minted_id_spans: vec![IdSpan {
                 first: RowId(minted_first),
@@ -2061,6 +2259,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("create");
         let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
@@ -2161,6 +2360,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("create");
         let err = run_append_phase(&st, &ws, &wal_doc, &etag, None)
@@ -2437,6 +2637,7 @@ mod tests {
                     tombstoned_in_superfile: None,
                 })
                 .collect(),
+            schema_id: None,
         };
         let etag = ws.create(&wal_doc).await.expect("wal create");
         (wal_doc, etag)
@@ -2539,6 +2740,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         }
     }
 
@@ -2702,6 +2904,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         };
 
         let granted = granted_lease_span(&doc).expect("leased doc has a span");
@@ -2748,6 +2951,7 @@ mod tests {
             preallocated_superfile_id: None,
             minted_id_spans: Vec::new(),
             tombstone_progress: Vec::new(),
+            schema_id: None,
         };
         assert!(granted_lease_span(&doc).is_none());
         renew_lease(&mut doc, None, Utc::now());

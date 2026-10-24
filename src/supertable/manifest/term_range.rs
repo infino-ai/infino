@@ -7,7 +7,7 @@
 //! contain term X?"), the term range drives **prefix-query** skip
 //! ("could this superfile contain any term starting with prefix P?").
 //! Stored on `FtsSummaryAgg` as `term_range` — the lex-smallest and
-//! lex-largest terms in the superfile's FST for that column.
+//! lex-largest terms in the superfile's term dictionary for that column.
 //!
 //! A prefix `p` matches some term in the superfile iff the half-open
 //! lex interval `[p, prefix_upper_bound(p))` overlaps the

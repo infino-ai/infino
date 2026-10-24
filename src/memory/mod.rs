@@ -17,7 +17,9 @@
 //! reserves the bytes *before* it allocates them — so the budget can say no in
 //! advance:
 //!   - the vector shortlist fetched for a search,
-//!   - SQL result / intermediate batches,
+//!   - the working state of the SQL operators that buffer — sorts, aggregates,
+//!     joins, repartitions — which DataFusion reserves through the pool in
+//!     `datafusion_pool`,
 //!   - ingest buffers.
 //!
 //! # What we don't
@@ -32,11 +34,29 @@
 //! untracked allocations. We trade exact accounting for far less plumbing, the
 //! same bargain the query engines make.
 //!
+//! Nor the batches a SQL plan streams between its operators — a scan's decoded
+//! pages, a filter's or projection's output, the rows an `unnest` repeats, the
+//! result as it is collected. DataFusion reserves none of them, and a streaming
+//! scan runs even at a zero gate. They are bounded per batch, not by the
+//! budget, and a batch is only as small as its rows: one that repeats a long
+//! text column many times over can be larger than the whole budget.
+//!
+//! # Process memory limit
+//!
+//! What bounds those batches is a process-wide limit on SQL (`resident`): a
+//! running statement is refused once the process's anonymous resident memory
+//! passes it. It reads the process, not the reservations, so it sees every
+//! batch whichever operator allocated it. The limit is 90% of the process's
+//! cgroup memory limit, or `memory.process_limit_bytes` in config; with
+//! neither, there is none.
+//!
 //! # When the budget is full
 //!
-//! A reservation that would cross the limit fails with [`OverBudget`]. The
-//! caller turns that into a normal query error — one query fails cleanly,
-//! instead of the whole process running out of memory.
+//! A reservation that would cross the limit first asks the holders of memory
+//! that can be given back (see [`Reclaim`]) to give it back, and tries once
+//! more. If it still doesn't fit, it fails with [`OverBudget`]. The caller
+//! turns that into a normal query error — one query fails cleanly, instead of
+//! the whole process running out of memory.
 //!
 //! # Two modes
 //!
@@ -86,14 +106,27 @@ use std::{
     error::Error,
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 mod datafusion_pool;
+mod resident;
 
 pub(crate) use datafusion_pool::budgeted_session_context;
+pub(crate) use resident::{
+    over_process_limit, process_limit, process_limit_exceeded, process_over_limit,
+};
+
+test_visible! {
+    /// Replace this process's SQL memory limit — resolved from config or the
+    /// cgroup on first use — with `limit` (`None`: no limit). Process-wide, so
+    /// only a test binary of its own may call it.
+    fn set_process_memory_limit(limit: Option<u64>) {
+        resident::set_process_limit(limit)
+    }
+}
 
 /// The fraction of a configured budget we actually enforce: gate at 9/10 and
 /// leave the final 1/10 as headroom for allocations too small to track. Applied
@@ -128,6 +161,16 @@ pub struct ConnectionMemoryBudget {
     // Count of refused reservations (a count, not bytes); observability only,
     // never affects gating.
     denials: AtomicU64,
+    // Holders that give memory back when a reservation doesn't fit.
+    reclaimers: Mutex<Vec<Weak<dyn Reclaim>>>,
+}
+
+/// Memory a holder can give back when the connection needs it for something
+/// else: bytes it keeps only to save work later, like read-ahead's downloads,
+/// which the scan can read again.
+pub(crate) trait Reclaim: Send + Sync {
+    /// Give back everything held, and hold nothing more.
+    fn reclaim(&self);
 }
 
 impl ConnectionMemoryBudget {
@@ -139,6 +182,7 @@ impl ConnectionMemoryBudget {
             used: AtomicUsize::new(0),
             peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
+            reclaimers: Mutex::new(Vec::new()),
         })
     }
 
@@ -164,6 +208,7 @@ impl ConnectionMemoryBudget {
             used: AtomicUsize::new(0),
             peak_used: AtomicUsize::new(0),
             denials: AtomicU64::new(0),
+            reclaimers: Mutex::new(Vec::new()),
         })
     }
 
@@ -192,11 +237,65 @@ impl ConnectionMemoryBudget {
         })
     }
 
-    /// Charge `n` bytes to the counter, refusing if that would cross the
-    /// ceiling. On refusal the counter is left unchanged. Backs
-    /// [`Self::try_reserve`], [`Reservation::try_grow`], and the DataFusion
-    /// pool adapter's `try_grow`.
+    /// Charge `n` bytes to the counter. If that would cross the ceiling, ask
+    /// every [`Reclaim`] holder to give its memory back and try once more; on
+    /// refusal the counter is left unchanged. Backs [`Self::try_reserve`],
+    /// [`Reservation::try_grow`], and the DataFusion pool adapter's `try_grow`.
     pub(crate) fn try_grow(&self, n: usize) -> Result<(), OverBudget> {
+        self.grow_within_limit(n)
+            .or_else(|_| {
+                self.reclaim();
+                self.grow_within_limit(n)
+            })
+            .inspect_err(|_| {
+                self.denials.fetch_add(1, Ordering::Relaxed);
+            })
+    }
+
+    /// [`Self::try_reserve`] for a [`Reclaim`] holder: it never asks the
+    /// others to give memory back, so one holder can't take another's.
+    pub(crate) fn try_reserve_without_reclaim(
+        self: &Arc<Self>,
+        n: usize,
+    ) -> Result<Reservation, OverBudget> {
+        self.grow_within_limit(n).inspect_err(|_| {
+            self.denials.fetch_add(1, Ordering::Relaxed);
+        })?;
+        Ok(Reservation {
+            budget: Arc::clone(self),
+            size: n,
+        })
+    }
+
+    /// Ask `holder` to give its memory back whenever a reservation doesn't
+    /// fit, for as long as it lives.
+    pub(crate) fn register_reclaim(&self, holder: Weak<dyn Reclaim>) {
+        let mut reclaimers = self
+            .reclaimers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        reclaimers.retain(|r| r.strong_count() > 0);
+        reclaimers.push(holder);
+    }
+
+    /// Ask every live holder to give its memory back. Called outside the
+    /// registry's lock, since giving memory back drops reservations.
+    fn reclaim(&self) {
+        let holders: Vec<Arc<dyn Reclaim>> = self
+            .reclaimers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for holder in holders {
+            holder.reclaim();
+        }
+    }
+
+    /// Charge `n` bytes if that stays under the ceiling; a measured budget
+    /// always does. On refusal the counter is left unchanged.
+    fn grow_within_limit(&self, n: usize) -> Result<(), OverBudget> {
         match self.limit {
             // Unbounded
             None => {
@@ -211,15 +310,10 @@ impl ConnectionMemoryBudget {
                     used.checked_add(n).filter(|next| *next <= limit)
                 })
                 .map(|prev| self.record_peak(prev.saturating_add(n)))
-                .map_err(|used| {
-                    // Budget exceeded
-                    self.denials.fetch_add(1, Ordering::Relaxed);
-
-                    OverBudget {
-                        requested: n,
-                        used,
-                        limit,
-                    }
+                .map_err(|used| OverBudget {
+                    requested: n,
+                    used,
+                    limit,
                 }),
         }
     }
@@ -248,6 +342,11 @@ impl ConnectionMemoryBudget {
     /// Bytes currently reserved.
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
+    }
+
+    /// Bytes still free under the ceiling, or `None` for a measure-only budget.
+    pub(crate) fn remaining(&self) -> Option<usize> {
+        self.limit.map(|limit| limit.saturating_sub(self.used()))
     }
 
     test_visible! {
@@ -556,5 +655,156 @@ mod tests {
             0,
             "every reservation released; nothing leaked"
         );
+    }
+
+    // -- Giving memory back --------------------------------------------------
+
+    /// The configured budget; the gate is 9/10 of it.
+    const RECLAIM_BUDGET: u64 = 1000;
+    /// What the gate lets through.
+    const RECLAIM_GATE: usize = 900;
+    /// What the holder keeps.
+    const HELD: usize = 600;
+
+    /// A holder of memory it gives back on request, counting the requests.
+    pub(super) struct Holder {
+        reservation: Mutex<Option<Reservation>>,
+        asked: AtomicUsize,
+    }
+
+    impl Holder {
+        /// A holder keeping `bytes` of `budget`, registered with it.
+        pub(super) fn holding(budget: &Arc<ConnectionMemoryBudget>, bytes: usize) -> Arc<Self> {
+            let holder = Arc::new(Self {
+                reservation: Mutex::new(Some(budget.try_reserve(bytes).expect("fits"))),
+                asked: AtomicUsize::new(0),
+            });
+            let weak: Weak<Holder> = Arc::downgrade(&holder);
+            budget.register_reclaim(weak);
+            holder
+        }
+
+        pub(super) fn asked(&self) -> usize {
+            self.asked.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Reclaim for Holder {
+        fn reclaim(&self) {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            self.reservation
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+        }
+    }
+
+    #[test]
+    fn a_reservation_that_does_not_fit_takes_back_what_a_holder_keeps() {
+        // The holder keeps 600 of 900; a 500 reservation fits only once it
+        // gives them back.
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let holder = Holder::holding(&budget, HELD);
+        let wanted = RECLAIM_GATE - HELD + 1;
+        let reservation = budget.try_reserve(wanted).expect("fits after giving back");
+        assert_eq!(holder.asked(), 1);
+        assert_eq!(budget.used(), wanted);
+        assert_eq!(
+            budget.denials(),
+            0,
+            "a reservation that fit is not a denial"
+        );
+        drop(reservation);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn a_reservation_that_fits_asks_nobody() {
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let holder = Holder::holding(&budget, HELD);
+        let _fits = budget.try_reserve(RECLAIM_GATE - HELD).expect("fits");
+        assert_eq!(holder.asked(), 0);
+        assert_eq!(budget.used(), RECLAIM_GATE);
+    }
+
+    #[test]
+    fn a_reservation_too_big_even_after_giving_back_is_refused_as_before() {
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let holder = Holder::holding(&budget, HELD);
+        let err = budget
+            .try_reserve(RECLAIM_GATE + 1)
+            .expect_err("bigger than the whole gate");
+        assert_eq!(
+            err,
+            OverBudget {
+                requested: RECLAIM_GATE + 1,
+                used: 0,
+                limit: RECLAIM_GATE
+            }
+        );
+        assert_eq!(holder.asked(), 1);
+        assert_eq!(budget.denials(), 1, "counted once, not once per try");
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn growing_a_reservation_takes_back_too() {
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let holder = Holder::holding(&budget, HELD);
+        let mut reservation = budget.try_reserve(0).expect("empty");
+        reservation
+            .try_grow(RECLAIM_GATE - HELD + 1)
+            .expect("fits after giving back");
+        assert_eq!(holder.asked(), 1);
+    }
+
+    #[test]
+    fn every_holder_gives_back() {
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let a = Holder::holding(&budget, HELD / 2);
+        let b = Holder::holding(&budget, HELD / 2);
+        let _wanted = budget
+            .try_reserve(RECLAIM_GATE)
+            .expect("fits after both give back");
+        assert_eq!((a.asked(), b.asked()), (1, 1));
+    }
+
+    #[test]
+    fn a_holders_own_reservation_never_takes_back() {
+        // One holder must not take another's memory.
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        let holder = Holder::holding(&budget, HELD);
+        budget
+            .try_reserve_without_reclaim(RECLAIM_GATE - HELD + 1)
+            .expect_err("does not fit");
+        assert_eq!(holder.asked(), 0);
+        assert_eq!(budget.used(), HELD);
+        assert_eq!(budget.denials(), 1);
+    }
+
+    #[test]
+    fn a_measured_budget_never_asks() {
+        let budget = ConnectionMemoryBudget::measured();
+        let holder = Holder::holding(&budget, HELD);
+        let _huge = budget
+            .try_reserve(usize::MAX / 2)
+            .expect("measured never denies");
+        assert_eq!(holder.asked(), 0);
+    }
+
+    #[test]
+    fn a_dropped_holder_is_skipped_and_forgotten() {
+        let budget = ConnectionMemoryBudget::with_limit(RECLAIM_BUDGET);
+        drop(Holder::holding(&budget, HELD));
+        budget
+            .try_reserve(RECLAIM_GATE + 1)
+            .expect_err("nothing to give back");
+        // The next holder to register clears it out.
+        let _holder = Holder::holding(&budget, HELD);
+        let reclaimers = budget
+            .reclaimers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(reclaimers.len(), 1);
     }
 }

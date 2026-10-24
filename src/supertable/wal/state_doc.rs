@@ -269,11 +269,10 @@ pub struct SealRecord {
 /// equals `new_row_count`.
 ///
 /// Multiple spans appear when `IdGenerator::reserve_range`
-/// crossed a ferroid sequence ms boundary mid-call: the
-/// generator's 24-bit sequence per ms could be exhausted mid-
-/// reservation under contention, so it returns the contiguous
-/// prefix and starts a fresh span in the next ms. Single-span
-/// is the typical case.
+/// crossed a ms boundary mid-call: the generator's 24-bit
+/// sequence per ms ran out before the reservation was filled,
+/// so it took the contiguous rest of that ms and started a
+/// fresh span in the next one. Single-span is the typical case.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdSpan {
     pub first: RowId,
@@ -353,6 +352,12 @@ pub struct WalStateDoc {
     /// corruption.
     #[serde(default)]
     pub new_row_content_hash: Option<String>,
+
+    /// The `schema_id` the sidecar's rows were resolved against when the
+    /// update was buffered. Replay resolves them again against the schema
+    /// it finds, so this records provenance; it decides nothing.
+    #[serde(default)]
+    pub schema_id: Option<u32>,
 
     /// UUID v4 minted at the caller's `update()` entry; the
     /// dedicated superfile the UPDATE's new rows will land in.
@@ -542,6 +547,7 @@ mod tests {
                     tombstoned_in_superfile: None,
                 },
             ],
+            schema_id: None,
         }
     }
 

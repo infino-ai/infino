@@ -14,10 +14,14 @@
 //!      path; no syscalls.
 //!   2. **Disk cache fallback.** Miss in the in-memory tier
 //!      AND a `DiskCacheStore` is attached →
-//!      `DiskCacheStore::reader(uri)` (`await`ed directly).
+//!      `DiskCacheStore::open_for_query(uri, ...)` (`await`ed directly).
 //!      The cache itself handles cold-fetch from object
 //!      storage, pwrite to the local cache directory, and
-//!      mmap.
+//!      mmap. A lazy open past the budget is kept as a lazy
+//!      entry that charges only the blocks it reads; a
+//!      whole-file fetch that cannot be admitted (larger than
+//!      the whole budget) degrades to an uncached range-only
+//!      reader, so a budget miss never fails the query.
 //!   3. **No cache.** Miss in the in-memory tier and no
 //!      cache attached → surface the in-memory tier's
 //!      `ReaderCacheError::NotFound`. The in-process-only
@@ -31,7 +35,16 @@
 //! bridge, no throwaway `current_thread` runtime, and
 //! object-store retries fire correctly.
 
-use std::{io, sync::Arc};
+use std::{
+    error::Error,
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use tracing::Span;
 
 use crate::{
     storage::StorageProvider,
@@ -39,7 +52,8 @@ use crate::{
     supertable::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
-            DiskCacheStore, ReaderCacheError, SuperfileReaderCache, disk::DiskCacheError,
+            DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
+            disk::DiskCacheError,
         },
     },
 };
@@ -49,11 +63,9 @@ use crate::{
 /// configured. See the module-level docs for the precise
 /// policy.
 ///
-/// `storage_key` is the object key the superfile's bytes live at — the
-/// manifest entry's `storage_path()`, which carries a source stem when the
-/// superfile was ingested with one. It is passed alongside `uri` rather
-/// than re-derived from it because a named superfile's key is not a
-/// function of its uuid; `uri` still keys every cache tier.
+/// `storage_key` is the object key the bytes live at (the manifest entry's
+/// `storage_path()`); [`DiskCacheStore::open_for_query`] says why it travels
+/// beside `uri`.
 ///
 /// `offsets` is an optional pre-known layout hint
 /// pulled from the manifest's [`SubsectionOffsets`]. When `Some`
@@ -62,6 +74,8 @@ use crate::{
 /// (1 RTT cold open) instead of doing the parquet footer first
 /// and the subsection fetches second (2 RTTs). `None` falls back
 /// to the 2-RTT path — same shape, slower.
+///
+/// `intent` is the read policy; see [`ReadIntent`].
 pub async fn superfile_reader(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -69,35 +83,50 @@ pub async fn superfile_reader(
     uri: &SuperfileUri,
     storage_key: &str,
     offsets: Option<&SubsectionOffsets>,
-    allow_background_fill: bool,
+    intent: ReadIntent,
 ) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+    superfile_reader_tiered(
+        store,
+        disk_cache,
+        storage,
+        uri,
+        storage_key,
+        offsets,
+        intent,
+    )
+    .await
+    .map(|(reader, _)| reader)
+}
+
+/// [`superfile_reader`], also saying which tier served the file: the
+/// in-memory tier is [`OpenTier::Memory`], the disk cache reports its own
+/// walk, and the storage-only fallback is a whole-object GET, so
+/// [`OpenTier::Source`]. For a scan that counts where its files came from.
+pub async fn superfile_reader_tiered(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    uri: &SuperfileUri,
+    storage_key: &str,
+    offsets: Option<&SubsectionOffsets>,
+    intent: ReadIntent,
+) -> Result<(Arc<SuperfileReader>, OpenTier), ReaderCacheError> {
     // 1. In-memory tier.
     match store.reader(uri) {
-        Ok(r) => return Ok(r),
+        Ok(r) => return Ok((r, OpenTier::Memory)),
         Err(ReaderCacheError::NotFound { .. }) => {
             // Fall through to the cache.
         }
         Err(other) => return Err(other),
     }
 
-    // 2. Disk cache fallback (when attached).
+    // 2. Disk cache, when attached. It streams uncached when it cannot admit
+    //    the file, so a budget miss never fails here.
     if let Some(cache) = disk_cache {
-        match cache
-            .reader_with_hints(uri, storage_key, offsets, storage, allow_background_fill)
+        return cache
+            .open_for_query_tiered(uri, storage_key, offsets, storage, intent)
             .await
-        {
-            Ok(reader) => return Ok(reader),
-            // Cache can't admit this superfile (e.g. it's larger than the
-            // whole budget). Stream it directly via range GETs instead
-            // of failing the query.
-            Err(DiskCacheError::BudgetExceeded) => {
-                return cache
-                    .open_range_only(storage_key, offsets, storage)
-                    .await
-                    .map_err(cache_open_failed);
-            }
-            Err(e) => return Err(cache_open_failed(e)),
-        }
+            .map_err(cache_open_failed);
     }
 
     // 3. Storage-only fallback. This covers reopened LocalFs/S3
@@ -110,22 +139,115 @@ pub async fn superfile_reader(
                 .get(storage_key)
                 .await
                 .map_err(|e| ReaderCacheError::OpenFailed {
-                    source: ReadError::Io(io::Error::other(format!(
-                        "storage fetch {storage_key}: {e}"
-                    ))),
+                    source: fetch_failed(format!("storage fetch {storage_key}"), e),
                 })?;
         let reader = SuperfileReader::open(bytes)
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok(Arc::new(reader));
+        return Ok((Arc::new(reader), OpenTier::Source));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
 }
 
+/// How many of a read's opens each cache tier served. One line of counts on the
+/// span that opened them instead of a span per file: enough for a trace to say
+/// whether a slow read was a cold one, at a cost that does not grow with the
+/// table. Counted with relaxed atomics, so the concurrent opens of a fan-out
+/// can share one tally.
+///
+/// A fan-out counts one open per work unit, and a ranged search can split one
+/// superfile into several units, so the counts add up to the phase's `units`,
+/// not its superfiles. The repeats show as `memory` or `coalesced`.
+#[derive(Debug, Default)]
+pub(crate) struct OpenTierCounts {
+    memory: AtomicU64,
+    disk: AtomicU64,
+    lazy: AtomicU64,
+    source: AtomicU64,
+    coalesced: AtomicU64,
+    streamed: AtomicU64,
+}
+
+impl OpenTierCounts {
+    /// A tally for the opens `span` will report, or `None` when there is
+    /// nowhere to put them: tracing is off, the span is disabled, or it does
+    /// not declare the tier fields (made by `tiered_span!`).
+    pub(crate) fn for_span(span: &Span) -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        span.metadata()
+            .is_some_and(|meta| meta.fields().field("memory").is_some())
+            .then(Arc::default)
+    }
+
+    /// [`Self::for_span`] on the current span, looked up only with
+    /// `detailed-tracing`.
+    pub(crate) fn for_current_span() -> Option<Arc<Self>> {
+        if !cfg!(feature = "detailed-tracing") {
+            return None;
+        }
+        Self::for_span(&Span::current())
+    }
+
+    pub(crate) fn add(&self, tier: OpenTier) {
+        let slot = match tier {
+            OpenTier::Memory => &self.memory,
+            OpenTier::Disk => &self.disk,
+            OpenTier::Lazy => &self.lazy,
+            OpenTier::Source => &self.source,
+            OpenTier::Coalesced => &self.coalesced,
+            OpenTier::Streamed => &self.streamed,
+        };
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The counts in `[memory, disk, lazy, source, coalesced, streamed]` order.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> [u64; 6] {
+        [
+            self.memory.load(Ordering::Relaxed),
+            self.disk.load(Ordering::Relaxed),
+            self.lazy.load(Ordering::Relaxed),
+            self.source.load(Ordering::Relaxed),
+            self.coalesced.load(Ordering::Relaxed),
+            self.streamed.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Record the counts on `span`, into the `memory`, `disk`, `lazy`,
+    /// `source`, `coalesced` and `streamed` fields it declares.
+    pub(crate) fn record_on(&self, span: &Span) {
+        span.record("memory", self.memory.load(Ordering::Relaxed));
+        span.record("disk", self.disk.load(Ordering::Relaxed));
+        span.record("lazy", self.lazy.load(Ordering::Relaxed));
+        span.record("source", self.source.load(Ordering::Relaxed));
+        span.record("coalesced", self.coalesced.load(Ordering::Relaxed));
+        span.record("streamed", self.streamed.load(Ordering::Relaxed));
+    }
+}
+
 fn cache_open_failed(e: DiskCacheError) -> ReaderCacheError {
     ReaderCacheError::OpenFailed {
-        source: ReadError::Io(io::Error::other(format!("disk cache fetch: {e}"))),
+        source: fetch_failed("disk cache fetch".to_string(), e),
     }
+}
+
+/// A fetch of a superfile's bytes that failed, read as `{label}: {source}`.
+/// The store's error stays typed underneath, so a refused credential is still
+/// found under the read error rather than lost in its text.
+#[derive(Debug, thiserror::Error)]
+#[error("{label}: {source}")]
+struct FetchFailed {
+    label: String,
+    source: Box<dyn Error + Send + Sync>,
+}
+
+fn fetch_failed(label: String, source: impl Error + Send + Sync + 'static) -> ReadError {
+    ReadError::Io(io::Error::other(FetchFailed {
+        label,
+        source: Box::new(source),
+    }))
 }
 
 #[cfg(test)]
@@ -137,12 +259,15 @@ mod tests {
 
     use super::*;
     use crate::{
-        storage::LocalFsStorageProvider,
+        storage::{LocalFsStorageProvider, StorageError},
         superfile::{
-            ReadError,
+            FtsError, ReadError,
             builder::{BuilderOptions, SuperfileBuilder},
         },
-        supertable::reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        supertable::{
+            QueryError,
+            reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
+        },
         test_helpers::{decimal128_id_field, decimal128_ids},
     };
 
@@ -151,8 +276,7 @@ mod tests {
     const N_DOCS: u64 = 3;
 
     /// A `disk_budget_bytes` smaller than any real superfile, so the
-    /// disk cache rejects admission with `BudgetExceeded` and the
-    /// caller is forced down the `open_range_only` fallback.
+    /// disk cache cannot hold one whole and a Warm open stays lazy.
     const TINY_BUDGET_BYTES: u64 = 4;
 
     /// Build minimal valid superfile bytes (parquet body + KV metadata
@@ -219,10 +343,60 @@ mod tests {
 
         // No disk cache, no storage attached: if the in-memory tier is
         // consulted first (it is), neither fallback is needed.
-        let reader = superfile_reader(&store, None, None, &uri, &uri.storage_path(), None, true)
-            .await
-            .expect("in-memory hit");
+        let reader = superfile_reader(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
         assert_eq!(reader.n_docs(), N_DOCS);
+    }
+
+    /// The tiered accessor names where the reader came from: the in-memory
+    /// tier is `Memory`, and the storage-only fallback, a whole-object GET
+    /// with no cache attached, is `Source`.
+    #[tokio::test]
+    async fn tiered_accessor_reports_memory_and_source() {
+        let store = empty_store();
+        let uri = SuperfileUri::new_v4();
+        store
+            .insert(uri, minimal_superfile_bytes())
+            .expect("insert into in-memory tier");
+        let (_, tier) = superfile_reader_tiered(
+            &store,
+            None,
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("in-memory hit");
+        assert_eq!(tier, OpenTier::Memory);
+
+        let dir = TempDir::new().expect("tempdir");
+        let storage = local_storage(&dir);
+        let cold = SuperfileUri::new_v4();
+        put_at_storage(&storage, &cold, minimal_superfile_bytes()).await;
+        let (reader, tier) = superfile_reader_tiered(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &cold,
+            &cold.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("storage-only fallback");
+        assert_eq!(reader.n_docs(), N_DOCS);
+        assert_eq!(tier, OpenTier::Source);
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------
@@ -263,7 +437,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("in-memory error must propagate");
@@ -290,37 +464,54 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect("disk cache cold fetch");
         assert_eq!(reader.n_docs(), N_DOCS);
     }
 
+    /// A budget too small to hold the superfile whole still serves it: the
+    /// Warm open stays a lazy cache entry, and the next open of the file
+    /// rides it instead of opening the file again.
     #[tokio::test]
-    async fn disk_cache_budget_exceeded_falls_back_to_range_only() {
+    async fn disk_cache_budget_too_small_for_the_file_keeps_a_lazy_entry() {
         let dir = TempDir::new().expect("tempdir");
         let storage = local_storage(&dir);
         let uri = SuperfileUri::new_v4();
         put_at_storage(&storage, &uri, minimal_superfile_bytes()).await;
-        // Budget too small to admit the superfile → BudgetExceeded →
-        // the accessor streams it via range GETs instead of failing.
         let cache = disk_cache(&dir, &storage, |cfg| {
             cfg.disk_budget_bytes = TINY_BUDGET_BYTES;
         });
 
-        let reader = superfile_reader(
+        let (reader, tier) = superfile_reader_tiered(
             &empty_store(),
             Some(&cache),
             None,
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
-        .expect("range-only fallback on budget exceeded");
+        .expect("served past the budget");
         assert_eq!(reader.n_docs(), N_DOCS);
+        assert_eq!(tier, OpenTier::Source);
+        assert!(cache.is_cached(&uri), "kept as a lazy entry");
+
+        let (again, tier) = superfile_reader_tiered(
+            &empty_store(),
+            Some(&cache),
+            None,
+            &uri,
+            &uri.storage_path(),
+            None,
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("served again");
+        assert_eq!(tier, OpenTier::Lazy, "the next open rides the entry");
+        assert!(Arc::ptr_eq(&reader, &again), "the same reader");
     }
 
     #[tokio::test]
@@ -338,7 +529,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("missing storage object must error");
@@ -365,7 +556,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect("storage-only fallback");
@@ -386,7 +577,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("missing object must error");
@@ -408,7 +599,7 @@ mod tests {
             &uri,
             &uri.storage_path(),
             None,
-            true,
+            ReadIntent::Warm,
         )
         .await
         .expect_err("in-process-only miss must be NotFound");
@@ -432,6 +623,37 @@ mod tests {
                 );
             }
             other => panic!("expected OpenFailed, got {other:?}"),
+        }
+    }
+
+    /// A cold fetch the disk cache could not make keeps the store's error
+    /// typed under the read error, so a refused credential is still one; the
+    /// message reads as it always has.
+    #[test]
+    fn a_failed_cold_fetch_keeps_the_stores_error_under_its_label() {
+        let refused = cache_open_failed(DiskCacheError::Storage(StorageError::PermissionDenied {
+            uri: "u".into(),
+        }));
+        assert_eq!(
+            refused.to_string(),
+            "failed to open superfile bytes: io error during read: disk cache fetch: storage error during cold fetch"
+        );
+        assert!(matches!(
+            QueryError::store(refused),
+            QueryError::PermissionDenied(_)
+        ));
+    }
+
+    /// A superfile the disk cache could not open because its index is too
+    /// old to read stays `Unsupported` under the cache's own wrapping, with
+    /// the message that says to reindex.
+    #[test]
+    fn an_index_too_old_under_the_disk_cache_stays_unsupported() {
+        let too_old = ReadError::Fts(Box::new(FtsError::IndexTooOld { version: 6 }));
+        let wrapped = cache_open_failed(DiskCacheError::SuperfileOpenRead(too_old));
+        match QueryError::store(wrapped) {
+            QueryError::Unsupported(m) => assert!(m.contains("reindex"), "{m}"),
+            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
 }

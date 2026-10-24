@@ -16,149 +16,97 @@ use super::{
 use crate::superfile::{
     ReadError,
     error::FtsError,
-    fts::{
-        bm25,
-        positions::{decode_run, skip_run},
-    },
+    fts::{bm25, positions::GroupIndex},
 };
 
 /// One member term of a [`PhraseCursor`]: its posting cursor, its
-/// fetched position runs, and a lazily-built per-block cache of each
-/// pair's run offset.
+/// fetched position groups, and the current block's group located for
+/// per-pair access.
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
-    /// The term's complete position runs (empty for an inline df=1
+    /// A second cursor over the same postings for the block-at-a-time
+    /// alignment: it filters a whole block of the rarest member's docs
+    /// ([`TermCursor::retain_contained`]) and so runs ahead of `cursor`,
+    /// which only ever moves to the docs that survive, for their tf and
+    /// positions.
+    pub(super) probe: TermCursor,
+    /// The term's complete position groups (empty for an inline df=1
     /// member, whose single position is `inline_position`).
     pub(super) positions: Bytes,
     /// The term's parsed metadata header, re-parsed from the cursor's
     /// own bytes at member build — the source of the per-block
-    /// position-run offsets. `None` for an inline member (no postings
+    /// position-group offsets. `None` for an inline member (no postings
     /// bytes). Kept here, not on [`TermCursor`] or [`BlockMeta`]:
     /// plain term queries never touch positions, and their hot
     /// structures must not grow for the phrase path's benefit.
     pub(super) term_meta: Option<TermMeta>,
     /// The single position of an inline (df=1, tf=1) member — the
-    /// inline FST value's slot carries it instead of a tf. `None` for
+    /// inline dictionary entry's slot carries it instead of a tf. `None` for
     /// PFOR members.
     pub(super) inline_position: Option<u32>,
-    /// The member's bare idf (the cursor stores only `idf × (K1+1)`).
-    pub(super) idf: f32,
-    /// Byte offset of each decoded-block pair's run within
-    /// `positions`, valid for `run_offsets_block`. Rebuilt on block
-    /// crossings by one `skip_run` walk over the block's runs. Used by
-    /// the `V1`/`V2` fallback decode (no sub-index).
-    pub(super) run_offsets: Vec<u32>,
-    /// Which block index `run_offsets` / the sub-index cache covers
-    /// (`usize::MAX` = none).
-    pub(super) run_offsets_block: usize,
-    /// Sub-index decode (`V3`) cache: the last pair whose run offset was
-    /// resolved in `run_offsets_block`, and that run's byte offset. Pairs
-    /// are visited in ascending order within a block, so the next decode
-    /// skips from `max(this cached pair, the sub-index checkpoint)` —
-    /// dense reuse costs ~one `skip_run`, sparse access at most
-    /// `POSITION_SUBINDEX_STRIDE - 1`. `usize::MAX` = nothing cached.
-    pub(super) cached_pair: usize,
-    pub(super) cached_run_offset: u32,
     /// Scratch for the member's decoded positions at the aligned doc.
     pub(super) pos_scratch: Vec<u32>,
+    /// The current block's position group located for per-run access,
+    /// and which block it belongs to (`usize::MAX` = none). Reused
+    /// across blocks, so a block crossing allocates nothing.
+    pub(super) group_index: GroupIndex,
+    pub(super) group_block: usize,
 }
 
-/// Sentinel for [`PhraseMember::run_offsets_block`]: no block cached.
+/// Sentinel for [`PhraseMember::group_block`]: no block located.
 const NO_BLOCK_CACHED: usize = usize::MAX;
 
 impl PhraseMember {
     /// The member's positions at its cursor's current doc, decoded
     /// into `pos_scratch`. The cursor must be positioned on a doc
-    /// (not exhausted).
+    /// (not exhausted) **with its whole block decoded**: `pos` is read as
+    /// the pair index within the block and `block_tfs[..block_n]` as the
+    /// block's tf run. A cursor that reached the doc by a skip into a
+    /// bitset block holds only that one doc (`block_n == 1`, `pos == 0`)
+    /// and would read the wrong run; `materialize_at` expands it first,
+    /// which is why every caller goes through it.
     pub(super) fn decode_current_positions(&mut self) -> Result<(), FtsError> {
         self.pos_scratch.clear();
         if let Some(p) = self.inline_position {
             self.pos_scratch.push(p);
             return Ok(());
         }
+        debug_assert_eq!(
+            self.cursor.decoded_block, self.cursor.current_block,
+            "positions need the whole block decoded; call materialize_at first"
+        );
         let block = self.cursor.current_block;
         let pair = self.cursor.pos;
+        let term_meta = *self.term_meta.as_ref().expect("PFOR member has term meta");
 
-        // Fast path (VERSION_V3): the run-offset sub-index gives the
-        // nearest checkpoint at or before `pair`. Start the skip from
-        // whichever is closer to `pair` — that checkpoint, or the pair we
-        // resolved last in this same block (pairs are visited ascending,
-        // so the last one is `<= pair`). Dense reuse then costs ~one
-        // `skip_run`; sparse access at most `STRIDE - 1`. Returns an owned
-        // tuple, so no `term_meta` borrow is held across the decode below.
-        let subindex = self
-            .term_meta
-            .as_ref()
-            .expect("PFOR member has term meta")
-            .positions_subindex_offset(self.cursor.bytes.as_ref(), block, pair);
-        if let Some((checkpoint, runs_to_skip)) = subindex {
-            let checkpoint_pair = pair - runs_to_skip;
-            let (mut from_pair, mut at) = (checkpoint_pair, checkpoint as usize);
-            if self.run_offsets_block == block
-                && self.cached_pair >= checkpoint_pair
-                && self.cached_pair <= pair
-            {
-                from_pair = self.cached_pair;
-                at = self.cached_run_offset as usize;
-            }
-            for p in from_pair..pair {
-                skip_run(&self.positions, &mut at, self.cursor.block_tfs[p]).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
-                        "position runs truncated within block".into(),
+        // The block's runs are one group. It is located once per block and
+        // each pair's run read on its own — no run walk, and no decode of
+        // the runs a phrase never visits.
+        if self.group_block != block {
+            let mut at =
+                term_meta.positions_block_offset(self.cursor.bytes.as_ref(), block) as usize;
+            let tfs = &self.cursor.block_tfs[..self.cursor.block_n];
+            self.group_index
+                .locate(&self.positions, &mut at, tfs)
+                .ok_or_else(|| {
+                    FtsError::Read(ReadError::Malformed(
+                        "position group truncated or undecodable".into(),
                     ))
                 })?;
-            }
-            // Cache this pair's run start for the next (higher) pair.
-            self.run_offsets_block = block;
-            self.cached_pair = pair;
-            self.cached_run_offset = at as u32;
-            decode_run(
+            self.group_block = block;
+        }
+        self.group_index
+            .run_positions(
                 &self.positions,
-                &mut at,
+                pair,
                 self.cursor.block_tfs[pair],
                 &mut self.pos_scratch,
             )
             .ok_or_else(|| {
-                FtsError::Read(ReadError::MalformedVersion(
+                FtsError::Read(ReadError::Malformed(
                     "position run truncated or overflowing".into(),
                 ))
             })?;
-            return Ok(());
-        }
-
-        // Fallback (V1/V2, no sub-index): build the block's run offsets by
-        // walking every run from the block's recorded first-run offset.
-        if self.run_offsets_block != block {
-            self.run_offsets.clear();
-            let block_first = self
-                .term_meta
-                .as_ref()
-                .expect("PFOR member has term meta")
-                .positions_block_offset(self.cursor.bytes.as_ref(), block)
-                as usize;
-            let mut at = block_first;
-            for i in 0..self.cursor.block_n {
-                self.run_offsets.push(at as u32);
-                skip_run(&self.positions, &mut at, self.cursor.block_tfs[i]).ok_or_else(|| {
-                    FtsError::Read(ReadError::MalformedVersion(
-                        "position runs truncated within block".into(),
-                    ))
-                })?;
-            }
-            self.run_offsets_block = block;
-        }
-        let mut at = self.run_offsets[pair] as usize;
-        decode_run(
-            &self.positions,
-            &mut at,
-            self.cursor.block_tfs[pair],
-            &mut self.pos_scratch,
-        )
-        .ok_or_else(|| {
-            FtsError::Read(ReadError::MalformedVersion(
-                "position run truncated or overflowing".into(),
-            ))
-        })?;
         Ok(())
     }
 }
@@ -179,10 +127,9 @@ pub(super) struct PhraseCursor {
     /// member, in `members` (query) order — strictly ascending, first
     /// entry `0`.
     ///
-    /// Named for the unit on purpose: [`PhraseMember`] also carries
-    /// `run_offsets` and `cached_run_offset`, which are **byte** offsets
-    /// into a term's positions blob. Confusing the two would be a
-    /// correctness bug, not a type error.
+    /// Named for the unit on purpose: a member's positions are addressed
+    /// by **byte** offsets into its positions blob. Confusing the two
+    /// would be a correctness bug, not a type error.
     ///
     /// Plain `0..n` for a phrase whose words were adjacent in the
     /// query, which is every phrase on a column with no analysis
@@ -200,13 +147,9 @@ pub(super) struct PhraseCursor {
     /// Positional verification still runs in query order (`members`
     /// order), which the phrase adjacency check requires.
     pub(super) align_order: Vec<usize>,
-    /// Σ member idf × (k1 + 1) — the phrase's scoring constant, built
-    /// with the parameters this query scores with.
-    pub(super) idf_x_k1p1: f32,
-    /// Σ member idf, kept so a bound in the "scaled" form can be
-    /// recovered without dividing `idf_x_k1p1` by a `(k1 + 1)` the
-    /// cursor would have to guess.
-    pub(super) idf_sum: f32,
+    /// Σ member idf — the phrase's scoring constant, and the factor a
+    /// bound in the "scaled" form is multiplied back up by.
+    pub(super) idf_weight: f32,
     /// Phrase-scaled term-level upper bound (see type docs).
     pub(super) term_max_bm25: f32,
     /// Aligned-and-verified doc, or `u32::MAX` when exhausted.
@@ -217,6 +160,15 @@ pub(super) struct PhraseCursor {
     /// phrase-start positions as they are filtered member by member —
     /// avoids a per-doc allocation on the hot verify path.
     pub(super) verify_scratch: Vec<u32>,
+    /// Docs of the rarest member's current block that every other member
+    /// contains, awaiting the ranked bound and adjacency verification;
+    /// `cand_next` is the first not yet served. Filled a block at a time
+    /// by [`Self::seek_match`].
+    cands: Vec<u32>,
+    cand_next: usize,
+    /// Where the next block refill starts: one past the last block
+    /// batched. `None` once the rarest member's last block is batched.
+    refill_from: Option<u32>,
 }
 
 impl PhraseCursor {
@@ -229,7 +181,6 @@ impl PhraseCursor {
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
         offsets: Vec<u32>,
-        params: bm25::Bm25Params,
     ) -> Result<Self, FtsError> {
         debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
         debug_assert_eq!(cursors.len(), positions.len());
@@ -247,24 +198,22 @@ impl PhraseCursor {
             .zip(positions)
             .zip(positional)
             .map(|((cursor, positions), (term_meta, inline_position))| {
-                // The member's own idf, not `idf_x_k1p1 / (K1 + 1)`:
-                // dividing by the crate constant would recover the wrong
-                // value for a column scoring at a declared or overridden
-                // pair.
-                let idf = cursor.idf;
-                min_scaled_bound = min_scaled_bound.min(cursor.term_max_bm25 / idf);
-                idf_sum += idf;
+                // An unscored member (built to match, not rank) has no idf
+                // and no bound to scale.
+                if cursor.idf_weight > 0.0 {
+                    min_scaled_bound =
+                        min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
+                }
+                idf_sum += cursor.idf_weight;
                 PhraseMember {
+                    probe: cursor.clone(),
                     cursor,
                     positions,
                     term_meta,
                     inline_position,
-                    idf,
-                    run_offsets: Vec::new(),
-                    run_offsets_block: NO_BLOCK_CACHED,
-                    cached_pair: NO_BLOCK_CACHED,
-                    cached_run_offset: 0,
                     pos_scratch: Vec::new(),
+                    group_index: GroupIndex::default(),
+                    group_block: NO_BLOCK_CACHED,
                 }
             })
             .collect();
@@ -273,15 +222,21 @@ impl PhraseCursor {
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
         let mut cursor = Self {
-            idf_x_k1p1: params.idf_x_k1p1(idf_sum),
-            idf_sum,
-            term_max_bm25: idf_sum * min_scaled_bound,
+            idf_weight: idf_sum,
+            // An unscored phrase has no idf, so no bound either.
+            term_max_bm25: match idf_sum > 0.0 {
+                true => idf_sum * min_scaled_bound,
+                false => 0.0,
+            },
             members,
             position_offsets: offsets,
             align_order,
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
+            cands: Vec::new(),
+            cand_next: 0,
+            refill_from: Some(0),
         };
         cursor.seek_match_unranked(0)?;
         Ok(cursor)
@@ -322,7 +277,7 @@ impl PhraseCursor {
         if self.is_exhausted() || self.current_doc >= target {
             return Ok(());
         }
-        self.seek_match(target, bar, dl_norm_k1)
+        self.seek_match(target, bar, Some(dl_norm_k1))
     }
 
     /// Approximate seek (the cheap half of a two-phase phrase): advance to the
@@ -376,113 +331,116 @@ impl PhraseCursor {
         }
     }
 
-    /// Unranked (match/count) doc alignment to the next *verified* phrase match
-    /// ≥ `from`: the approximate member-intersection ([`Self::approx_seek`])
-    /// followed by adjacency verification, retrying at the next candidate until
-    /// one verifies or the members exhaust. The count-path twin of the ranked
-    /// [`Self::seek_match`], which must keep decoding tfs for its score bar.
-    pub(super) fn seek_match_unranked(&mut self, mut from: u32) -> Result<(), FtsError> {
-        loop {
-            self.approx_seek(from);
-            if self.current_doc == u32::MAX {
-                return Ok(());
-            }
-            let aligned = self.current_doc;
-            // Verify adjacency; the probed members are decoded here, lazily.
-            let tf = self.verify_at_aligned(aligned)?;
-            if tf > 0 {
-                self.current_tf = tf;
-                return Ok(());
-            }
-            match aligned.checked_add(1) {
-                Some(next) => from = next,
-                None => {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
-                    return Ok(());
-                }
-            }
-        }
+    /// Unranked (match/count) alignment to the next *verified* phrase match
+    /// ≥ `from`: the block-batched walk of [`Self::seek_match`] with no bar,
+    /// so no tf is compared and no doc is pre-screened.
+    pub(super) fn seek_match_unranked(&mut self, from: u32) -> Result<(), FtsError> {
+        self.seek_match(from, f32::NEG_INFINITY, None)
     }
 
-    /// Leapfrog the members to their next common doc ≥ `from`, verify
-    /// adjacency there, and repeat until a match or exhaustion. When
-    /// `bar` is finite, aligned docs are pre-screened without touching
-    /// positions: the phrase tf can't exceed any member's tf, so the
-    /// BM25 score at the members' minimum tf bounds the phrase's
-    /// contribution, and a doc strictly below `bar` is skipped before
-    /// the run decode. (`<`, not `<=`: a doc exactly at the bar can
-    /// still displace the incumbent kth-best on the ascending-doc-id
-    /// tie-break, so it must be verified.)
+    /// Advance to the first verified phrase match at doc ≥ `from`, a block
+    /// of the rarest member at a time. The rarest member's current block
+    /// is the candidate list; every other member filters it in one pass
+    /// ([`TermCursor::retain_contained`]: bit-tests on a bitset block, one
+    /// decode and a merge on a packed block) and only the survivors are
+    /// aligned doc by doc for their tf and positions. The candidates left
+    /// over after a match are kept for the next call. When `bar` is
+    /// finite, a block whose phrase bound is under the bar is skipped
+    /// before it is filtered, and a survivor is pre-screened without
+    /// touching positions: the phrase tf can't exceed any member's tf, so
+    /// the BM25 score at the members' minimum tf bounds its contribution,
+    /// and a doc strictly below `bar` is passed over. (`<`, not `<=`: a doc
+    /// exactly at the bar can still displace the incumbent kth-best on the
+    /// ascending-doc-id tie-break, so it must be verified.)
     pub(super) fn seek_match(
         &mut self,
-        mut from: u32,
+        from: u32,
         bar: f32,
-        dl_norm_k1: &NormTable,
+        dl_norm_k1: Option<&NormTable>,
     ) -> Result<(), FtsError> {
-        'docs: loop {
-            // Align every member to the same doc ≥ `from`, probing
-            // rarest-first so a common member is skip-confirmed last
-            // rather than re-skipped on every rare-member advance.
-            let mut aligned = from;
-            let mut oi = 0usize;
-            while oi < self.align_order.len() {
-                let mi = self.align_order[oi];
-                let c = &mut self.members[mi].cursor;
-                c.skip_to(aligned);
-                if c.is_exhausted() {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
+        debug_assert!(
+            bar == f32::NEG_INFINITY || dl_norm_k1.is_some(),
+            "a finite bar needs the norms"
+        );
+        let bar_norm = dl_norm_k1.filter(|_| bar > f32::NEG_INFINITY);
+        while self.cand_next < self.cands.len() && self.cands[self.cand_next] < from {
+            self.cand_next += 1;
+        }
+        let driver = self.align_order[0];
+        loop {
+            while self.cand_next < self.cands.len() {
+                let s = self.cands[self.cand_next];
+                self.cand_next += 1;
+                // Every member holds `s`: move each walk cursor's block to it
+                // without a decode (the verification materializes the block
+                // it lands in, and a skip would publish a dense block lazily
+                // only to expand it right after).
+                for &mi in &self.align_order {
+                    self.members[mi].cursor.seek_block(s);
+                }
+                if let Some(norm) = bar_norm {
+                    let min_tf = self
+                        .members
+                        .iter_mut()
+                        .map(|m| m.cursor.tf_at_contained(s))
+                        .min()
+                        .expect("members >= 2");
+                    let ub = bm25::score_with_dl_norm_k1(self.idf_weight, min_tf, norm.get(s));
+                    if ub < bar {
+                        continue;
+                    }
+                }
+                let tf = self.verify_at_aligned(s)?;
+                if tf > 0 {
+                    self.current_doc = s;
+                    self.current_tf = tf;
                     return Ok(());
                 }
-                let here = c.current_doc_id();
-                if here > aligned {
-                    // Restart alignment at the higher doc.
-                    aligned = here;
-                    oi = 0;
-                    continue;
-                }
-                oi += 1;
             }
 
-            if bar > f32::NEG_INFINITY {
-                let min_tf = self
-                    .members
-                    .iter()
-                    .map(|m| m.cursor.current_tf())
-                    .min()
-                    .expect("members >= 2");
-                let ub =
-                    bm25::score_with_dl_norm_k1(self.idf_x_k1p1, min_tf, dl_norm_k1.get(aligned));
-                if ub < bar {
-                    from = match aligned.checked_add(1) {
-                        Some(next) => next,
-                        None => {
-                            self.current_doc = u32::MAX;
-                            self.current_tf = 0;
-                            return Ok(());
-                        }
-                    };
-                    continue 'docs;
-                }
-            }
-
-            // Verify adjacency at the aligned doc.
-            let tf = self.verify_at_aligned(aligned)?;
-            if tf > 0 {
-                self.current_doc = aligned;
-                self.current_tf = tf;
+            // Refill from the rarest member's next block at or after `from`.
+            let Some(refill) = self.refill_from else {
+                self.current_doc = u32::MAX;
+                self.current_tf = 0;
+                return Ok(());
+            };
+            let start = refill.max(from);
+            let d = &mut self.members[driver].cursor;
+            d.skip_to(start);
+            if d.is_exhausted() {
+                self.refill_from = None;
+                self.current_doc = u32::MAX;
+                self.current_tf = 0;
                 return Ok(());
             }
-            from = match aligned.checked_add(1) {
-                Some(next) => next,
-                None => {
-                    self.current_doc = u32::MAX;
-                    self.current_tf = 0;
-                    return Ok(());
+            // A skip into a dense block may hold just the one doc it landed
+            // on; the batch needs the whole block.
+            if d.decoded_block != d.current_block {
+                d.decode_current_block();
+                d.materialize_at(start);
+            }
+            let first = d.current_doc_id();
+            let block_last = d.current_block_last_doc_id();
+            self.refill_from = block_last.checked_add(1);
+            // Block-level bound: no doc of this block can score above the
+            // smallest member block max over its range scaled to the
+            // phrase idf. Under the bar, the block is skipped whole before
+            // any of its docs is aligned or its positions read.
+            if bar_norm.is_some() && self.block_max_in_range(first, block_last) < bar {
+                continue;
+            }
+            let d = &self.members[driver].cursor;
+            self.cands.clear();
+            self.cands
+                .extend_from_slice(&d.block_doc_ids[d.pos..d.block_n]);
+            self.cand_next = 0;
+            for oi in 1..self.align_order.len() {
+                if self.cands.is_empty() {
+                    break;
                 }
-            };
-            continue 'docs;
+                let mi = self.align_order[oi];
+                self.members[mi].probe.retain_contained(&mut self.cands);
+            }
         }
     }
 
@@ -511,8 +469,11 @@ impl PhraseCursor {
         //
         // `materialize_at` decodes each member's block only now: on the
         // unranked path a common member reached `aligned` by a `contains`
-        // bit-test and its block is not yet decoded; on the ranked path it
-        // was already decoded by `skip_to`, so this is a no-op there.
+        // bit-test and its block is not yet decoded; on the ranked path a
+        // `skip_to` into a bitset block holds just the one doc it landed on,
+        // and `decode_current_positions` needs the whole block (its pair
+        // index and tf run). Only a plain walk leaves the block decoded,
+        // so these calls are not optional.
         let anchor = self.align_order[0];
         let anchor_off = self.position_offsets[anchor];
         self.members[anchor].cursor.materialize_at(aligned);
@@ -558,19 +519,24 @@ impl PhraseCursor {
     /// per-doc BM25 normalization.
     #[inline]
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
-        bm25::score_with_dl_norm_k1(self.idf_x_k1p1, self.current_tf, dl_norm_k1)
+        bm25::score_with_dl_norm_k1(self.idf_weight, self.current_tf, dl_norm_k1)
     }
 
     /// Phrase-scaled block-level upper bound over `[range_start,
     /// range_end]` — the block analog of `term_max_bm25`.
     pub(super) fn block_max_in_range(&mut self, range_start: u32, range_end: u32) -> f32 {
+        // Each member's bound is divided by its idf, which an unscored
+        // phrase does not have; only ranked walks ask for this bound.
+        debug_assert!(
+            self.idf_weight > 0.0,
+            "an unscored phrase has no block bound"
+        );
         let mut min_scaled = f32::INFINITY;
         for m in self.members.iter_mut() {
             let b = m.cursor.block_max_in_range(range_start, range_end);
-            min_scaled = min_scaled.min(b / m.idf);
+            min_scaled = min_scaled.min(b / m.cursor.idf_weight);
         }
-        let idf_sum = self.idf_sum;
-        idf_sum * min_scaled
+        self.idf_weight * min_scaled
     }
 }
 
@@ -674,7 +640,7 @@ impl AnyCursor {
     pub(super) fn score_current(&self, dl_norm_k1: f32) -> f32 {
         match self {
             AnyCursor::Term(c) => {
-                bm25::score_with_dl_norm_k1(c.idf_x_k1p1, c.current_tf(), dl_norm_k1)
+                bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), dl_norm_k1)
             }
             AnyCursor::Phrase(c) => c.score_current(dl_norm_k1),
         }
@@ -701,16 +667,387 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
+
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        reader::{FtsReader, core::ClauseLists},
-        tokenize::Phrase,
+    use crate::superfile::{
+        fts::{
+            builder::FtsBuilder,
+            reader::{FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
+            tokenize::Phrase,
+        },
+        id_space::FtsDocId,
     };
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
         vec![Phrase::adjacent(
             terms.iter().map(|t| t.to_string()).collect(),
         )]
+    }
+
+    /// A multi-block positional term's groups are decoded whole and
+    /// indexed by tf prefix sums. Plant a phrase in every one of 300 docs
+    /// at varying in-block pair slots (three blocks, tf varying so the
+    /// runs differ in length) and verify every doc through the phrase
+    /// path.
+    #[tokio::test]
+    async fn grouped_positions_reach_every_pair_across_blocks() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        let n_docs = 300u32;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for i in 0..n_docs {
+            let text = format!(
+                "{}{}alpha beta",
+                "alpha ".repeat((i % 7) as usize),
+                "filler ".repeat((i % 50) as usize)
+            );
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["alpha", "beta"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                n_docs as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            (0..n_docs).collect::<Vec<_>>(),
+            "every doc holds the phrase"
+        );
+        // No doc holds "beta alpha".
+        let reversed = phrase(&["beta", "alpha"]);
+        let none = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &reversed,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        assert!(none.is_empty());
+    }
+
+    /// Position groups pick packed or LEB128 per block by size. Plant a
+    /// term whose first block has small gaps (packed) and whose second
+    /// block carries an outlier gap (LEB128 wins), plus a short-form
+    /// member with tf > 1 (one packed group), and verify the phrase in
+    /// every doc through both decode paths.
+    #[tokio::test]
+    async fn position_groups_verify_phrases_in_long_and_short_terms() {
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
+        const N_DOCS: u32 = 200;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let alpha: Vec<u32> = match d < BLOCK_LEN as u32 {
+                true => vec![0, 5, 10],
+                false => vec![0, 1 << 20],
+            };
+            let beta: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), alpha.len() as u32, &alpha)
+                .expect("alpha");
+            b.add_prebuilt_term_posting(0, "beta", FtsDocId::new(d), beta.len() as u32, &beta)
+                .expect("beta");
+            if d < 3 {
+                // Short-form member (df = 3) with two positions each.
+                let rare = [beta[0] + 1, beta[0] + 7];
+                b.add_prebuilt_term_posting(0, "rare", FtsDocId::new(d), 2, &rare)
+                    .expect("rare");
+            }
+        }
+        b.append_prebuilt_doc_lengths(0, &vec![(1 << 20) + 8; N_DOCS as usize]);
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrase(&["alpha", "beta"]),
+                    ..ClauseLists::default()
+                },
+                N_DOCS as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
+
+        let rare_hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrase(&["beta", "rare"]),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = rare_hits.iter().map(|(d, _)| d.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2], "short-form member's packed group");
+    }
+
+    /// Ranked phrase walks prune whole blocks of the rarest member whose
+    /// block-level phrase bound is under the bar. Plant "the movement" in
+    /// every 13th doc, twice per doc in every fifth run of eight blocks
+    /// and once elsewhere, so a small k fills the heap from the doubled
+    /// runs and the rarest member's blocks inside the single-occurrence
+    /// runs fall under the bar; near-misses
+    /// ("movement the") keep the members aligning on docs that fail to
+    /// verify. Every k must match the unpruned walk's top-k.
+    #[tokio::test]
+    async fn ranked_phrase_block_pruning_agrees_with_the_unpruned_walk() {
+        use crate::superfile::fts::{builder::FtsBuilder, posting::BLOCK_LEN};
+        const N_DOCS: u32 = BLOCK_LEN as u32 * 40;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let hot = (d / (8 * BLOCK_LEN as u32)).is_multiple_of(5);
+            let text = match (d % 13, hot) {
+                (0, true) => "the movement of the movement",
+                (0, false) => "the movement of the people",
+                (5, _) => "movement the people of",
+                _ => "the people of the town",
+            };
+            b.add_doc(0, d, text).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["the", "movement"]);
+        let clauses = || ClauseLists {
+            should_phrases: &phrases,
+            ..ClauseLists::default()
+        };
+        // With k above the match count the heap never fills, so the bar
+        // stays at negative infinity and nothing is pruned: the oracle.
+        let mut all = r
+            .search_excluding("title", clauses(), N_DOCS as usize + 1, f32::NEG_INFINITY)
+            .await
+            .expect("unpruned");
+        assert_eq!(
+            all.len(),
+            (N_DOCS as usize).div_ceil(13),
+            "every 13th doc matches"
+        );
+        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        for k in [1usize, 3, 10, 50, 100, 200] {
+            let pruned = r
+                .search_excluding("title", clauses(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned");
+            assert_eq!(pruned.len(), k, "k={k}");
+            for (i, ((dp, sp), (da, sa))) in pruned.iter().zip(all.iter()).enumerate() {
+                assert_eq!(
+                    dp, da,
+                    "doc mismatch k={k} rank {i}: pruned={dp} oracle={da}"
+                );
+                assert!(
+                    (sp - sa).abs() < 1e-4,
+                    "score mismatch k={k} rank {i}: {sp} vs {sa}"
+                );
+            }
+        }
+    }
+
+    /// The block-batched ranked walk and the doc-at-a-time unranked walk
+    /// must visit the same verified matches with the same tfs, from any
+    /// mix of consecutive advances and skips. The rarest member's blocks
+    /// each span dozens of the other members' blocks (a bitset one and a
+    /// packed one), so a batch is filtered across many member blocks and
+    /// its survivors are verified in blocks the probe has long left. With
+    /// a finite bar the ranked walk must still yield every match at or
+    /// above it.
+    #[tokio::test]
+    async fn batched_ranked_phrase_walk_matches_the_unranked_walk() {
+        use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+        use crate::superfile::fts::{bm25, builder::FtsBuilder, posting::BLOCK_LEN};
+        const N_DOCS: u32 = BLOCK_LEN as u32 * 60;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for d in 0..N_DOCS {
+            let text = match (d % 53, d % 2, d % 3) {
+                (0, 0, _) if d.is_multiple_of(5) => "the mid rare the mid rare",
+                (0, 0, _) => "the mid rare",
+                (0, _, _) => "rare the mid",
+                (_, _, 0) => "the mid",
+                _ => "the x",
+            };
+            b.add_doc(0, d, text).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["the", "mid", "rare"]);
+        let build = || async {
+            let (mut atoms, _) = r
+                .build_atom_cursors(0, &[], &phrases, QueryIdf::ThisFile, None, CursorUse::Score)
+                .await
+                .expect("atoms");
+            match atoms.remove(0).expect("phrase present") {
+                AnyCursor::Phrase(c) => c,
+                AnyCursor::Term(_) => unreachable!("a phrase atom"),
+            }
+        };
+        let dl_norm = r.columns[0].dl_norm_k1();
+
+        // Every match, by both walks, consecutively.
+        let mut unranked = build().await;
+        let mut expected = Vec::new();
+        while !unranked.is_exhausted() {
+            expected.push((unranked.current_doc_id(), unranked.current_tf));
+            unranked
+                .skip_to(unranked.current_doc_id() + 1)
+                .expect("skip");
+        }
+        assert_eq!(
+            expected.len(),
+            (N_DOCS as usize).div_ceil(106),
+            "every 106th doc matches"
+        );
+        let mut ranked = build().await;
+        let mut got = Vec::new();
+        while !ranked.is_exhausted() {
+            got.push((ranked.current_doc_id(), ranked.current_tf));
+            ranked
+                .skip_to_pruned(ranked.current_doc_id() + 1, f32::NEG_INFINITY, dl_norm)
+                .expect("skip");
+        }
+        assert_eq!(got, expected, "consecutive ranked walk");
+
+        // Random skips: both walks land on the same next match.
+        let mut rng = StdRng::seed_from_u64(7);
+        for trial in 0..20 {
+            let mut a = build().await;
+            let mut bb = build().await;
+            let mut target = 0u32;
+            while !a.is_exhausted() {
+                assert_eq!(
+                    (a.current_doc_id(), a.current_tf),
+                    (bb.current_doc_id(), bb.current_tf),
+                    "trial {trial} target {target}"
+                );
+                target = a.current_doc_id() + 1 + rng.random_range(0..700u32);
+                a.skip_to(target).expect("skip");
+                bb.skip_to_pruned(target, f32::NEG_INFINITY, dl_norm)
+                    .expect("skip");
+            }
+            assert!(
+                bb.is_exhausted(),
+                "trial {trial}: ranked walk must exhaust too"
+            );
+        }
+
+        // With a bar, the ranked walk yields exactly the matches whose
+        // score is not below it (the tf-2 docs), in order.
+        let bar_doc = expected
+            .iter()
+            .find(|(_, tf)| *tf == 2)
+            .map(|(d, _)| *d)
+            .expect("a tf-2 match");
+        let mut pruned = build().await;
+        let bar = bm25::score_with_dl_norm_k1(pruned.idf_weight, 2, dl_norm.get(bar_doc));
+        let above: Vec<(u32, u32)> = expected
+            .iter()
+            .copied()
+            .filter(|(d, tf)| {
+                bm25::score_with_dl_norm_k1(pruned.idf_weight, *tf, dl_norm.get(*d)) >= bar
+            })
+            .collect();
+        assert!(
+            above.len() >= 5 && above.len() < expected.len(),
+            "the bar splits the matches"
+        );
+        let mut got = Vec::new();
+        pruned.skip_to_pruned(0, bar, dl_norm).expect("seek");
+        // The constructor's initial seek is unranked; re-seek from 0 with the bar.
+        if !pruned.is_exhausted() {
+            let first = pruned.current_doc_id();
+            if bm25::score_with_dl_norm_k1(pruned.idf_weight, pruned.current_tf, dl_norm.get(first))
+                >= bar
+            {
+                got.push((first, pruned.current_tf));
+            }
+        }
+        while !pruned.is_exhausted() {
+            let next = pruned.current_doc_id() + 1;
+            pruned.skip_to_pruned(next, bar, dl_norm).expect("skip");
+            if !pruned.is_exhausted() {
+                got.push((pruned.current_doc_id(), pruned.current_tf));
+            }
+        }
+        assert_eq!(got, above, "ranked walk under a bar");
+    }
+
+    /// A block whose position runs are very long (600 occurrences per doc,
+    /// 599 unit gaps then one huge one that becomes a stream exception)
+    /// still packs as one group and verifies. Postings are planted
+    /// directly so the fixture costs no tokenization.
+    #[tokio::test]
+    async fn a_block_with_very_long_runs_verifies_phrases() {
+        use crate::superfile::fts::builder::FtsBuilder;
+        const N_DOCS: u32 = 129;
+        const TF: u32 = 600;
+        const OUTLIER_GAP: u32 = 1 << 25;
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        let alpha: Vec<u32> = (0..TF)
+            .map(|j| match j + 1 == TF {
+                true => 2 * j + OUTLIER_GAP,
+                false => 2 * j,
+            })
+            .collect();
+        let filler: Vec<u32> = alpha.iter().map(|p| p + 1).collect();
+        for d in 0..N_DOCS {
+            b.add_prebuilt_term_posting(0, "alpha", FtsDocId::new(d), TF, &alpha)
+                .expect("alpha");
+            b.add_prebuilt_term_posting(0, "filler", FtsDocId::new(d), TF, &filler)
+                .expect("filler");
+        }
+        b.append_prebuilt_doc_lengths(0, &vec![2 * TF + OUTLIER_GAP; N_DOCS as usize]);
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+
+        let phrases = phrase(&["alpha", "filler"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                N_DOCS as usize + 1,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..N_DOCS).collect::<Vec<_>>());
     }
 
     #[tokio::test]
@@ -730,7 +1067,7 @@ mod tests {
             )
             .await
             .expect("phrase search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, vec![0, 2, 4], "adjacency in order only");
@@ -738,6 +1075,47 @@ mod tests {
         // doc lengths in play its score must strictly exceed doc 0's
         // (same length, tf 1... doc 0 len 3, doc 4 len 4; tf=2 wins).
         assert_eq!(hits[0].0, 4, "double occurrence ranks first");
+    }
+
+    /// An emoji is a token under `standard`, so it occupies a position
+    /// and breaks adjacency: `"cat dog"` must not match `cat 🙂 dog`.
+    #[tokio::test]
+    async fn an_emoji_between_two_words_breaks_the_phrase() {
+        use crate::superfile::fts::{builder::FtsBuilder, reader::BoolMode};
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        b.add_doc(0, 0, "cat 🙂 dog").expect("doc 0");
+        b.add_doc(0, 1, "cat dog").expect("doc 1");
+        b.add_doc(0, 2, "cat, dog").expect("doc 2");
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let phrases = phrase(&["cat", "dog"]);
+        let hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "punctuation takes no position; an emoji does"
+        );
+        // And the emoji itself is searchable.
+        let emoji = r
+            .search("title", &["🙂"], 10, BoolMode::Or)
+            .await
+            .expect("search");
+        assert_eq!(emoji.iter().map(|(d, _)| *d).collect::<Vec<_>>(), vec![0]);
     }
 
     #[tokio::test]
@@ -761,7 +1139,7 @@ mod tests {
             .await
             .expect("must phrase + term");
         assert_eq!(
-            hits.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+            hits.iter().map(|(d, _)| d.get()).collect::<Vec<_>>(),
             vec![2],
             "+\"new york\" +the"
         );
@@ -780,7 +1158,7 @@ mod tests {
             )
             .await
             .expect("negated phrase");
-        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 3], "haven docs don't contain the phrase");
     }
@@ -808,12 +1186,15 @@ mod tests {
     #[tokio::test]
     async fn phrase_on_positionless_column_is_typed_error() {
         use crate::superfile::fts::builder::FtsBuilder;
-        let mut b = FtsBuilder::new(crate::test_helpers::default_tokenizer());
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false).expect("register");
         b.add_doc(0, 0, "new york").expect("add doc");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let r =
-            FtsReader::open(blob, r#"[{"name":"title","tokenizer":"ascii_lower"}]"#).expect("open");
+        let r = FtsReader::open(
+            blob,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
+        )
+        .expect("open");
         let phrases = phrase(&["new", "york"]);
         let err = r
             .search_excluding(
@@ -828,5 +1209,129 @@ mod tests {
             .await
             .expect_err("must be a typed error");
         assert!(matches!(err, FtsError::PositionsUnavailable { .. }));
+    }
+
+    // ── Cursor-level phrase seeks ─────────────────────────────────────
+
+    /// Rows in the seek corpus: the common member spans a dozen blocks.
+    const SEEK_DOCS: u32 = 1500;
+    /// Rows holding the rare member. The first holds the words reversed;
+    /// the other two hold the phrase, hundreds of docs (several of the
+    /// common member's blocks) apart.
+    const RARE_REVERSED: u32 = 5;
+    const RARE_MATCH_FIRST: u32 = 700;
+    const RARE_MATCH_SECOND: u32 = 1400;
+
+    /// The one phrase cursor `terms` builds on `r`'s first column, for
+    /// `purpose`.
+    async fn phrase_cursor(r: &FtsReader, terms: &[&str], purpose: CursorUse) -> PhraseCursor {
+        let (atoms, _) = r
+            .build_atom_cursors(0, &[], &phrase(terms), QueryIdf::ThisFile, None, purpose)
+            .await
+            .expect("build atoms");
+        match atoms.into_iter().next().flatten() {
+            Some(AnyCursor::Phrase(pc)) => pc,
+            _ => panic!("expected one phrase atom"),
+        }
+    }
+
+    fn open_positional(docs: impl Iterator<Item = String>) -> FtsReader {
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), true).expect("register");
+        for (i, text) in docs.enumerate() {
+            b.add_doc(0, i as u32, &text).expect("add doc");
+        }
+        let json =
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// A phrase built to match, not rank, carries no idf and a 0 bound:
+    /// dividing its members' bounds by their 0 idf would make the bound NaN.
+    #[tokio::test]
+    async fn an_unscored_phrase_has_no_idf_and_a_zero_bound() {
+        let r = open_positional(["x y", "y x", "x y z"].into_iter().map(String::from));
+        let pc = phrase_cursor(&r, &["x", "y"], CursorUse::Match).await;
+        assert_eq!(pc.idf_weight, 0.0);
+        assert_eq!(pc.term_max_bm25, 0.0);
+    }
+
+    /// A phrase whose rare member drives the alignment and whose common
+    /// member must be seeked several blocks forward per candidate: the
+    /// cursor lands on each verified match and skips the reversed
+    /// co-occurrence. A member positioned by its own block scan rather
+    /// than a seek to the driver's doc would verify positions against
+    /// the wrong block and either miss the match or report a false one.
+    #[tokio::test]
+    async fn seek_match_positions_a_far_member_by_block_seek() {
+        let r = open_positional((0..SEEK_DOCS).map(|d| match d {
+            RARE_REVERSED => "y x".to_string(),
+            RARE_MATCH_FIRST | RARE_MATCH_SECOND => "x y".to_string(),
+            _ => "x".to_string(),
+        }));
+        let norms = r.columns[0].dl_norm_k1();
+        let mut pc = phrase_cursor(&r, &["x", "y"], CursorUse::Score).await;
+        assert!(
+            pc.members[0].cursor.block_count() > 8,
+            "premise: the common member spans many blocks"
+        );
+        assert_eq!(pc.align_order[0], 1, "premise: the rare member drives");
+        assert_eq!(
+            pc.current_doc_id(),
+            RARE_MATCH_FIRST,
+            "construction seeks past the reversed doc"
+        );
+        assert_eq!(pc.current_tf, 1);
+        pc.seek_match(RARE_MATCH_FIRST + 1, f32::NEG_INFINITY, Some(norms))
+            .expect("seek");
+        assert_eq!(pc.current_doc_id(), RARE_MATCH_SECOND);
+        assert_eq!(pc.current_tf, 1);
+        pc.skip_to(RARE_MATCH_SECOND + 1).expect("skip");
+        assert!(pc.is_exhausted(), "no third match");
+    }
+
+    /// A repeated-word phrase counts every occurrence start, overlapping
+    /// ones included: `"a a"` has two starts in `a a a`, one in `a a`,
+    /// none in `a b a`. Counting non-overlapping runs would report one
+    /// for the first doc and misrank it.
+    #[tokio::test]
+    async fn seek_match_counts_overlapping_starts_of_a_repeated_word() {
+        let r = open_positional(
+            ["a a a", "a b a", "a a", "b b", "a a a a"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = r.columns[0].dl_norm_k1();
+        let mut pc = phrase_cursor(&r, &["a", "a"], CursorUse::Score).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 2), (2, 1), (4, 3)]);
+    }
+
+    /// A three-member phrase matches only where all three are adjacent in
+    /// order: a doc missing the last member is never a candidate, a doc
+    /// holding all three out of order is aligned but fails verification.
+    #[tokio::test]
+    async fn three_member_phrase_rejects_a_missing_or_misplaced_member() {
+        let r = open_positional(
+            ["p q r", "p q s", "p r q", "q r p q r", "p q"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        let norms = r.columns[0].dl_norm_k1();
+        let mut pc = phrase_cursor(&r, &["p", "q", "r"], CursorUse::Score).await;
+        let mut seen: Vec<(u32, u32)> = Vec::new();
+        while !pc.is_exhausted() {
+            seen.push((pc.current_doc_id(), pc.current_tf));
+            let next = pc.current_doc_id() + 1;
+            pc.seek_match(next, f32::NEG_INFINITY, Some(norms))
+                .expect("seek");
+        }
+        assert_eq!(seen, vec![(0, 1), (3, 1)]);
     }
 }

@@ -13,8 +13,9 @@ use bytes::Bytes;
 use rustc_hash::FxHashMap;
 
 use super::{
+    bounds::BoundDecoder,
     core::*,
-    cursor::{TermCursor, TermMeta},
+    cursor::{CursorUse, TermCursor, TermMeta},
     filter::{AtomExcludeFilter, ExcludeFilter},
     options::BoolMode,
     phrase::AnyCursor,
@@ -26,18 +27,20 @@ use super::{
 use crate::{
     runtime_metrics::{
         cpu::{thread_cpu_delta_ns, thread_cpu_ns},
-        op_stats::{metering_active, timed_section},
+        op_stats::metering_active,
     },
     superfile::{
+        ReadError,
         error::FtsError,
         format,
         fts::{
             bm25,
-            dict::make_key,
-            fst_value::FstValue,
-            posting::{BLOCK_LEN, decode_block},
+            posting::{BLOCK_LEN, BlockHeader, decode_block},
+            short::{decode_short, short_df},
         },
+        id_space::{FtsDocId, RowId, RowSet},
     },
+    utils::terms::{DictEntry, make_key},
 };
 
 /// One scored term's open-wave fetch result: the dictionary resolution
@@ -47,15 +50,10 @@ use crate::{
 pub(crate) enum FetchedTermSlot {
     /// df=1 inline dictionary slot (no postings-region bytes exist).
     Inline { doc_id: u32, tf: u32 },
-    /// PFOR term: the fetched metadata+skip+blocks range and its df.
-    Pfor {
-        bytes: Bytes,
-        /// The dictionary slot carried no length hint, so the fetch paid
-        /// a header probe before the body — two planned ranges, which
-        /// the cursor built from these bytes must keep reporting.
-        header_probed: bool,
-        df: u64,
-    },
+    /// Postings-form term: the fetched range and its df. `short` says
+    /// whether the range is a short-form body or the long form's
+    /// metadata + skip table + blocks.
+    Pfor { bytes: Bytes, df: u64, short: bool },
 }
 
 /// One superfile's open-wave fetches for a global-stats query's scored
@@ -69,6 +67,17 @@ pub(crate) struct FetchedTermMemo {
 }
 
 impl FetchedTermMemo {
+    /// A memo from slots resolved elsewhere — by the open wave, or from a
+    /// table-level term index that already knows where each term's
+    /// postings sit, so the cursor build needs no dictionary at all.
+    pub(crate) fn from_slots(
+        slots: impl IntoIterator<Item = (Box<str>, Option<FetchedTermSlot>)>,
+    ) -> Self {
+        Self {
+            map: slots.into_iter().collect(),
+        }
+    }
+
     /// `Some(entry)` when the open wave resolved this term (entry `None`
     /// = absent from this superfile); `None` when the term was not part
     /// of the fetch (e.g. a negated term — unscored, never gathered).
@@ -78,6 +87,20 @@ impl FetchedTermMemo {
 
     fn contains(&self, term: &str) -> bool {
         self.map.contains_key(term)
+    }
+
+    /// Whether every one of `terms` was resolved into this memo — the
+    /// condition under which a cursor build needs no dictionary at all.
+    pub(crate) fn covers(&self, terms: &[&str]) -> bool {
+        terms.iter().all(|t| self.contains(t))
+    }
+
+    /// Record `term` as resolved absent from this superfile, unless the
+    /// memo already holds it: a caller that knows the term has no postings
+    /// here (a table-level term index lists none) spares the cursor build
+    /// a dictionary read that would only confirm the absence.
+    pub(crate) fn note_absent(&mut self, term: &str) {
+        self.map.entry(Box::from(term)).or_insert(None);
     }
 
     /// This superfile's df contribution per term (0 for a miss or an
@@ -121,6 +144,45 @@ fn seed_blocks_for(k: usize) -> usize {
 }
 
 impl FtsReader {
+    /// Build a [`FetchedTermMemo`] for `terms` whose dictionary values are
+    /// already known — from a table-level term index — fetching only the
+    /// postings ranges those values name, never the dictionary.
+    pub(crate) async fn memo_from_dict_values(
+        &self,
+        terms: &[(&str, u64, DictEntry)],
+    ) -> Result<FetchedTermMemo, FtsError> {
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut order: Vec<(usize, u64, bool)> = Vec::new();
+        let mut slots: Vec<(Box<str>, Option<FetchedTermSlot>)> = Vec::with_capacity(terms.len());
+        for (i, (term, df, value)) in terms.iter().enumerate() {
+            match value {
+                DictEntry::Inline { doc_id, tf } => slots.push((
+                    Box::from(*term),
+                    Some(FetchedTermSlot::Inline {
+                        doc_id: *doc_id,
+                        tf: *tf,
+                    }),
+                )),
+                DictEntry::Pfor {
+                    metadata_offset,
+                    postings_length,
+                    short,
+                } => {
+                    ranges.push((*metadata_offset as usize, *postings_length as usize));
+                    order.push((i, *df, *short));
+                }
+            }
+        }
+        let fetched = self.fetch_term_postings(&ranges).await?;
+        for ((i, df, short), bytes) in order.into_iter().zip(fetched) {
+            slots.push((
+                Box::from(terms[i].0),
+                Some(FetchedTermSlot::Pfor { bytes, df, short }),
+            ));
+        }
+        Ok(FetchedTermMemo::from_slots(slots))
+    }
+
     /// Ranked search over heterogeneous atoms — the walk every
     /// phrase-bearing query takes. With musts, the match set is their
     /// intersection and shoulds are scoring-only (the clause model);
@@ -145,10 +207,16 @@ impl FtsReader {
         mut filter: Option<AtomExcludeFilter>,
         floor_eff: f32,
         live_floor: Option<&LiveFloor>,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1;
+        exact_count: bool,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        debug_assert!(
+            !exact_count || (floor_eff == f32::NEG_INFINITY && live_floor.is_none()),
+            "an exact count takes no floor"
+        );
+        let dl_norm_k1 = &self.columns[column_id as usize].dl_norm_k1();
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
+        let mut count = 0u64;
         // The strict-below admission cutoff, refreshed from the live
         // floor: everything published there is a real kth-best, so the
         // same `next_down` the caller applied to its snapshot keeps
@@ -196,6 +264,7 @@ impl FtsReader {
                 };
                 let floor_live = floor_now();
                 if admitted {
+                    count += 1;
                     let norm = dl_norm_k1.get(doc);
                     let score: f32 = shoulds
                         .iter()
@@ -210,7 +279,7 @@ impl FtsReader {
                 let Some(next) = doc.checked_add(1) else {
                     break;
                 };
-                let bar = match heap.len() >= k {
+                let bar = match !exact_count && heap.len() >= k {
                     true => heap.peek().expect("heap len == k").0.max(floor_live),
                     false => floor_live,
                 };
@@ -220,7 +289,7 @@ impl FtsReader {
                     }
                 }
             }
-            return Ok(drain_top_k_desc(heap));
+            return Ok((drain_top_k_desc(heap), count));
         }
 
         // Must-driven walk, two-phase per candidate: (1) align every must by its
@@ -238,7 +307,7 @@ impl FtsReader {
         let mut target = 0u32;
         'docs: loop {
             let floor_live = floor_now();
-            let bar = match heap.len() >= k {
+            let bar = match !exact_count && heap.len() >= k {
                 true => heap.peek().expect("heap len == k").0.max(floor_live),
                 false => floor_live,
             };
@@ -291,6 +360,7 @@ impl FtsReader {
                         None => true,
                     };
                 if admitted {
+                    count += 1;
                     let norm = dl_norm_k1.get(aligned);
                     let mut score: f32 = musts.iter().map(|a| a.score_current(norm)).sum();
                     for (sh, &others) in shoulds.iter_mut().zip(&should_others_ub) {
@@ -310,7 +380,7 @@ impl FtsReader {
             };
             target = next;
         }
-        Ok(drain_top_k_desc(heap))
+        Ok((drain_top_k_desc(heap), count))
     }
 
     /// Single-column BM25 search.
@@ -325,7 +395,7 @@ impl FtsReader {
         terms: &[&str],
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.search_with_floor(column, terms, k, mode, f32::NEG_INFINITY)
             .await
     }
@@ -346,7 +416,7 @@ impl FtsReader {
         k: usize,
         mode: BoolMode,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         // A flat term list under one mode is the degenerate clause
         // shape: `And` makes every term a must, `Or` a should.
         // `prepare_clauses` resolves the column and, on the `<= threshold`
@@ -363,6 +433,7 @@ impl FtsReader {
                 ClauseLists {
                     musts,
                     shoulds,
+                    idf: QueryIdf::ThisFile,
                     ..ClauseLists::default()
                 },
                 k,
@@ -370,51 +441,6 @@ impl FtsReader {
             )
             .await?;
         self.run_prepared(prep)
-    }
-
-    /// [`Self::search`] that also returns the walk's work — posting
-    /// bytes, planned ranges, and the bracketed kernel on-CPU ns
-    /// (`prepare_clauses`' inline walks plus the `run_prepared`
-    /// section), all carried on the one [`MatchWork`]. Prefix search
-    /// reports through this so an expansion to thousands of terms
-    /// carries its cost like any other query shape.
-    pub(crate) async fn search_with_work(
-        &self,
-        column: &str,
-        terms: &[&str],
-        k: usize,
-        mode: BoolMode,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork), FtsError> {
-        let (musts, shoulds): (&[&str], &[&str]) = match mode {
-            BoolMode::And => (terms, &[]),
-            BoolMode::Or => (&[], terms),
-        };
-        let prep = self
-            .prepare_clauses(
-                column,
-                ClauseLists {
-                    musts,
-                    shoulds,
-                    ..ClauseLists::default()
-                },
-                k,
-                f32::NEG_INFINITY,
-            )
-            .await?;
-        let mut work = MatchWork {
-            postings_bytes: prep.postings_bytes(),
-            planned_ranges: prep.planned_ranges(),
-            kernel_cpu_ns: prep.inline_kernel_cpu_ns(),
-        };
-        let hits = match prep {
-            PreparedClauses::Done { hits, .. } => hits,
-            prep => {
-                let (hits, run_ns) = timed_section(|| self.run_prepared(prep));
-                work.kernel_cpu_ns += run_ns;
-                hits?
-            }
-        };
-        Ok((hits, work))
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -437,7 +463,7 @@ impl FtsReader {
         lists: ClauseLists<'_>,
         k: usize,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let prep = self.prepare_clauses(column, lists, k, floor).await?;
         self.run_prepared(prep)
     }
@@ -478,6 +504,8 @@ impl FtsReader {
         if k == 0 {
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
+                count: 0,
+                exact_count: lists.exact_count,
                 postings_bytes: 0,
                 planned_ranges: 0,
                 kernel_cpu_ns: 0,
@@ -487,6 +515,8 @@ impl FtsReader {
             if lists.no_negative_atoms() {
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes: 0,
                     planned_ranges: 0,
                     kernel_cpu_ns: 0,
@@ -503,8 +533,9 @@ impl FtsReader {
                     column_id,
                     lists.musts,
                     lists.must_phrases,
-                    lists.global_idf,
+                    lists.idf,
                     lists.prefetched,
+                    CursorUse::Score,
                 )
                 .await?;
             if must_atoms.iter().any(Option::is_none) {
@@ -513,6 +544,8 @@ impl FtsReader {
                 let built: Vec<AnyCursor> = must_atoms.into_iter().flatten().collect();
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes: atom_cursor_bytes(&built),
                     planned_ranges: atom_planned_ranges(&built) + must_dict,
                     kernel_cpu_ns: 0,
@@ -524,8 +557,9 @@ impl FtsReader {
                     column_id,
                     lists.shoulds,
                     lists.should_phrases,
-                    lists.global_idf,
+                    lists.idf,
                     lists.prefetched,
+                    CursorUse::Score,
                 )
                 .await?;
             let should_atoms: Vec<AnyCursor> = should_built.into_iter().flatten().collect();
@@ -536,8 +570,9 @@ impl FtsReader {
                     column_id,
                     lists.negatives,
                     lists.negative_phrases,
+                    QueryIdf::ThisFile,
                     None,
-                    None,
+                    CursorUse::Match,
                 )
                 .await?;
             let negative_atoms: Vec<AnyCursor> = negative_built.into_iter().flatten().collect();
@@ -550,16 +585,22 @@ impl FtsReader {
                 + must_dict
                 + should_dict
                 + negative_dict;
-            let filter = match negative_atoms.is_empty() {
-                true => None,
-                false => Some(AtomExcludeFilter::new(negative_atoms)),
+            // The gate exists when there is anything to gate on: a negated
+            // atom, or a pushed-down row set.
+            let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
+                (true, None) => None,
+                (_, allow) => Some(AtomExcludeFilter::with_allow(
+                    negative_atoms,
+                    allow.map(RowSet::new),
+                    self.doc_map.clone(),
+                )),
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
             // its on-CPU time here (sync section, no awaits inside).
             // Gated: an unmetered process must not pay the procfs reads.
             let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-            let result = self.run_atoms_search(
+            let (hits, count) = self.run_atoms_search(
                 column_id,
                 must_atoms,
                 should_atoms,
@@ -567,32 +608,52 @@ impl FtsReader {
                 filter,
                 floor_eff,
                 lists.live_floor,
+                lists.exact_count,
             )?;
             return Ok(PreparedClauses::Done {
-                hits: result,
+                hits,
+                count,
+                exact_count: lists.exact_count,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: thread_cpu_delta_ns(kernel_start),
             });
         }
 
-        let neg_filter = match lists.negatives {
-            [] => None,
-            // Negatives are a hard exclusion filter, not scored, so their
-            // idf is irrelevant — always build them with local stats.
-            _ => Some(ExcludeFilter::new(
-                self.build_term_cursors(column_id, lists.negatives, None, false, None, None)
-                    .await?,
-            )),
+        // Negatives are a hard exclusion filter that only seeks doc ids, so
+        // they are built to count: no tfs, idf or bounds.
+        let neg_cursors = match lists.negatives {
+            [] => Vec::new(),
+            negatives => {
+                self.build_term_cursors(
+                    column_id,
+                    negatives,
+                    QueryIdf::ThisFile,
+                    CursorUse::Count,
+                    None,
+                    None,
+                )
+                .await?
+            }
         };
-        // FST-dictionary ranges the builds below request — one per
+        // term-dictionary ranges the builds below request — one per
         // `build_term_cursors` call (the dictionary fetch is a real
         // byte-source range on every query, warm or cold).
-        let mut dict_ranges = u64::from(neg_filter.is_some());
+        let mut dict_ranges = u64::from(!lists.negatives.is_empty());
+        // The gate exists when there is anything to gate on: a negated
+        // term present in this superfile, or a pushed-down row set.
+        let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
+            (true, None) => None,
+            (_, allow) => Some(ExcludeFilter::with_allow(
+                neg_cursors,
+                allow.map(RowSet::new),
+                self.doc_map.clone(),
+            )),
+        };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
         // repeat count becomes a query-term-frequency multiplier on the term's
-        // idf. BM25 is linear in `idf_x_k1p1`, so this scores identically to N
+        // idf. BM25 is linear in `idf_weight`, so this scores identically to N
         // duplicate cursors at 1/N the cursor + scan cost — e.g. `+to +be +or
         // +not +to +be` builds 4 cursors, not 6. A no-op for distinct-term
         // queries. The single-term fast path below gates on the pre-dedup count,
@@ -603,18 +664,18 @@ impl FtsReader {
         // Single-atom fast path: BlockMaxWAND-driven block skipping.
         // One term scores identically whichever clause list it sits
         // in (a lone must and a lone should both rank that term's
-        // postings), so both shapes take it. A global-idf override rides
-        // along: the walk scores with it and rescales its stored bounds
-        // by the exact linear ratio, so the skip decisions stay as tight
-        // as the per-superfile path's.
-        if lists.musts.len() + lists.shoulds.len() == 1 {
+        // postings), so both shapes take it. The walk scores with the
+        // query's idf and rescales its stored bounds by the exact linear
+        // ratio to it, so the skip decisions stay as tight as they would
+        // be at the idf the bounds were stored at.
+        if !lists.exact_count && lists.musts.len() + lists.shoulds.len() == 1 {
             let term = lists
                 .musts
                 .iter()
                 .chain(lists.shoulds)
                 .next()
                 .expect("one atom");
-            let gidf = lists.global_idf.and_then(|m| m.get(*term).copied());
+            let gidf = lists.idf.term(term);
             let mut filter = neg_filter;
             let filter_postings_bytes = filter.as_ref().map_or(0, ExcludeFilter::postings_bytes);
             let filter_ranges = filter.as_ref().map_or(0, ExcludeFilter::planned_ranges);
@@ -635,6 +696,8 @@ impl FtsReader {
             dict_ranges += 1;
             return Ok(PreparedClauses::Done {
                 hits: result,
+                count: 0,
+                exact_count: false,
                 postings_bytes: term_work.postings_bytes + filter_postings_bytes,
                 planned_ranges: term_work.planned_ranges + filter_ranges + dict_ranges,
                 kernel_cpu_ns,
@@ -646,8 +709,8 @@ impl FtsReader {
                 .build_term_cursors(
                     column_id,
                     &shoulds,
-                    lists.global_idf,
-                    false,
+                    lists.idf,
+                    CursorUse::Score,
                     Some(&should_qtf),
                     lists.prefetched,
                 )
@@ -659,6 +722,8 @@ impl FtsReader {
                     neg_filter.as_ref().map_or(0, ExcludeFilter::planned_ranges) + dict_ranges;
                 return Ok(PreparedClauses::Done {
                     hits: Vec::new(),
+                    count: 0,
+                    exact_count: lists.exact_count,
                     postings_bytes,
                     planned_ranges,
                     kernel_cpu_ns: 0,
@@ -671,6 +736,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         // Build must cursors; if any must is missing, the
@@ -679,8 +745,8 @@ impl FtsReader {
             .build_term_cursors(
                 column_id,
                 &musts,
-                lists.global_idf,
-                false,
+                lists.idf,
+                CursorUse::Score,
                 Some(&must_qtf),
                 lists.prefetched,
             )
@@ -694,6 +760,8 @@ impl FtsReader {
                 + dict_ranges;
             return Ok(PreparedClauses::Done {
                 hits: Vec::new(),
+                count: 0,
+                exact_count: lists.exact_count,
                 postings_bytes,
                 planned_ranges,
                 kernel_cpu_ns: 0,
@@ -707,6 +775,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         // Shoulds absent from this superfile contribute nothing;
@@ -715,8 +784,8 @@ impl FtsReader {
             .build_term_cursors(
                 column_id,
                 &shoulds,
-                lists.global_idf,
-                false,
+                lists.idf,
+                CursorUse::Score,
                 Some(&should_qtf),
                 lists.prefetched,
             )
@@ -730,6 +799,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges,
+                exact_count: lists.exact_count,
             });
         }
         Ok(PreparedClauses::MustShould {
@@ -740,12 +810,135 @@ impl FtsReader {
             k,
             floor_eff,
             dict_ranges,
+            exact_count: lists.exact_count,
         })
     }
 
     /// CPU half paired with [`Self::prepare_clauses`] — scores the
     /// cursors it fetched. No I/O, so it can run on the reader pool.
-    pub(crate) fn run_prepared(&self, prep: PreparedClauses) -> Result<Vec<(u32, f32)>, FtsError> {
+    /// Translate a ranked kernel's doc ids into Parquet rows.
+    ///
+    /// The kernels work in the blob's own id space from end to end, so
+    /// anything handing hits to a caller passes them through here, once.
+    /// A no-op on any blob without a doc-id map, which is every blob
+    /// through `V7`.
+    ///
+    /// Order is left alone: a ranked result is ordered by score, and
+    /// translating ids does not disturb that. The unranked siblings
+    /// promise ascending ids instead, which translation *does* disturb,
+    /// so they use [`Self::ids_to_rows`].
+    #[inline]
+    pub(super) fn hits_to_rows(&self, hits: Vec<(FtsDocId, f32)>) -> Vec<(RowId, f32)> {
+        hits.into_iter()
+            .map(|(doc, score)| (self.row_of(doc), score))
+            .collect()
+    }
+
+    /// Translate an unranked kernel's doc ids into Parquet rows, kept
+    /// ascending.
+    ///
+    /// The unranked walks emit ids in blob order, which callers read as
+    /// ascending row order: a row-keyed bitmap is built from them, a
+    /// membership filter is probed with them, and the exact-match second
+    /// pass decodes them in order. On a blob storing its documents in an
+    /// order of its own those are different orders, so this re-sorts;
+    /// there is nothing to re-sort when there is no map.
+    #[inline]
+    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Vec<RowId> {
+        let mut rows: Vec<RowId> = ids.into_iter().map(|id| self.row_of(id)).collect();
+        if self.has_doc_map() {
+            rows.sort_unstable();
+        }
+        rows
+    }
+
+    pub(crate) fn run_prepared(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        self.run_prepared_in_blob_ids(prep)
+            .map(|h| self.hits_to_rows(h))
+    }
+
+    /// [`Self::search_excluding`] scoring every match in one pass: the
+    /// top-k plus the exact match count. Nothing is pruned, so this does
+    /// more work than the ranked search. The supertable fan-out pairs
+    /// `prepare_clauses` with `run_prepared_with_count` itself; this
+    /// single-call form is what the kernel tests drive.
+    #[cfg(test)]
+    pub(crate) async fn search_excluding_with_count(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+    ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        let lists = ClauseLists {
+            exact_count: true,
+            live_floor: None,
+            ..lists
+        };
+        let prep = self
+            .prepare_clauses(column, lists, k, f32::NEG_INFINITY)
+            .await?;
+        self.run_prepared_with_count(prep)
+    }
+
+    /// [`Self::run_prepared`] for clauses prepared with
+    /// `ClauseLists::exact_count`: scores every match and returns the
+    /// top-k with the exact match count.
+    ///
+    /// The top-k is the ranked search's up to float summation order: the
+    /// exhaustive walks add a doc's term scores in a different order than
+    /// the pruned kernels, so a total can differ in its last bits, and two
+    /// docs tied at the k-th score within that error may swap.
+    pub(crate) fn run_prepared_with_count(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        debug_assert!(
+            prep.exact_count(),
+            "run_prepared_with_count takes clauses prepared with exact_count"
+        );
+        let (hits, count) = match prep {
+            PreparedClauses::Done { hits, count, .. } => (hits, count),
+            PreparedClauses::Must {
+                column_id,
+                must_cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_and_intersect_counted(column_id, must_cursors, k, filter.as_mut())?,
+            PreparedClauses::MustShould {
+                column_id,
+                must_cursors,
+                should_cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_must_should_counted(
+                column_id,
+                must_cursors,
+                should_cursors,
+                k,
+                filter.as_mut(),
+            )?,
+            PreparedClauses::Or {
+                column_id,
+                cursors,
+                mut filter,
+                k,
+                ..
+            } => self.run_exhaustive_union(column_id, cursors, k, filter.as_mut())?,
+        };
+        Ok((self.hits_to_rows(hits), count))
+    }
+
+    /// [`Self::run_prepared`] without the translation, for the one caller
+    /// that reports work alongside the hits and does its own.
+    fn run_prepared_in_blob_ids(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         match prep {
             PreparedClauses::Done { hits, .. } => Ok(hits),
             PreparedClauses::Must {
@@ -753,6 +946,7 @@ impl FtsReader {
                 must_cursors,
                 mut filter,
                 dict_ranges: _,
+                exact_count: _,
                 k,
                 floor_eff,
             } => self.run_and_intersect(column_id, must_cursors, k, filter.as_mut(), floor_eff),
@@ -764,6 +958,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges: _,
+                exact_count: _,
             } => self.run_must_should(
                 column_id,
                 must_cursors,
@@ -779,6 +974,7 @@ impl FtsReader {
                 k,
                 floor_eff,
                 dict_ranges: _,
+                exact_count: _,
             } => self.dispatch_or_algo(column_id, cursors, k, filter.as_mut(), floor_eff),
         }
     }
@@ -812,7 +1008,7 @@ impl FtsReader {
         k: usize,
         doc_id_start: u32,
         doc_id_end: u32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.search_or_range_pretokenized_with_floor(
             column,
             terms,
@@ -820,14 +1016,14 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
             f32::NEG_INFINITY,
-            None,
+            QueryIdf::ThisFile,
         )
         .await
     }
 
     /// [`Self::search_or_range_pretokenized`] with a score floor — see
     /// [`Self::search_with_floor`] for the floor contract.
-    pub async fn search_or_range_pretokenized_with_floor(
+    pub(crate) async fn search_or_range_pretokenized_with_floor(
         &self,
         column: &str,
         terms: &[&str],
@@ -835,11 +1031,9 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-        global_idf: Option<&GlobalTermIdf>,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
-        let set = self
-            .build_or_cursor_set(column, terms, global_idf, None)
-            .await?;
+        idf: QueryIdf<'_>,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        let set = self.build_or_cursor_set(column, terms, idf, None).await?;
         self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
     }
 
@@ -851,21 +1045,21 @@ impl FtsReader {
     /// cold bytes when slicing widened); clones of these cursors share
     /// `bytes` and the `Arc` skip table instead.
     ///
-    /// `global_idf` is baked into the cursors here (see
+    /// `idf` is baked into the cursors here (see
     /// [`Self::build_term_cursors`]), so every sub-range sharing a set
     /// must want the same override — it does: one gather per query.
     pub(crate) async fn build_or_cursor_set(
         &self,
         column: &str,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
+        idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, global_idf, false, None, prefetched)
+            self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
                 .await?
         };
         Ok(OrCursorSet { column_id, cursors })
@@ -887,11 +1081,14 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
+        // The range is a slice of the blob's id space, taken to split one
+        // superfile across threads; it carries no row meaning, so a
+        // reordered blob slices exactly as an unreordered one does.
         self.run_windowed_maxscore(
             set.column_id,
             cursors,
@@ -901,6 +1098,7 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
+        .map(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -912,21 +1110,23 @@ impl FtsReader {
         query: &str,
         k: usize,
         mode: BoolMode,
-    ) -> Result<Vec<(u32, f32)>, FtsError> {
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
         // Tokenize the query with each column's configured tokenizer so
         // per-column analyzers are honored — a table may index different
         // columns with different analyzers.
         // FxHashMap: the combine does a per-doc insert across columns; the
         // default SipHash is needless work for small integer (doc-id) keys.
-        let mut combined: FxHashMap<u32, f32> = FxHashMap::default();
+        // Each column's hits come back already translated into rows, so
+        // the cross-column merge is keyed by rows, not blob ids.
+        let mut combined: FxHashMap<RowId, f32> = FxHashMap::default();
         for (col_name, weight) in columns {
             let col_id = self.resolve_column_id(col_name)?;
             let tok = &self.columns[col_id as usize].tokenizer;
             let term_strings: Vec<String> = tok.tokenize(query).collect();
             let term_refs: Vec<&str> = term_strings.iter().map(|s| s.as_str()).collect();
             let per_col = self.search(col_name, &term_refs, usize::MAX, mode).await?;
-            for (doc_id, s) in per_col {
-                *combined.entry(doc_id).or_insert(0.0) += s * weight;
+            for (row, s) in per_col {
+                *combined.entry(row).or_insert(0.0) += s * weight;
             }
         }
         Ok(top_k(combined, k))
@@ -960,9 +1160,9 @@ impl FtsReader {
         k: usize,
         mut filter: Option<&mut ExcludeFilter>,
         floor_eff: f32,
-        global_idf: Option<f32>,
+        idf: TermIdf,
         prefetched: Option<&FetchedTermMemo>,
-    ) -> Result<(Vec<(u32, f32)>, MatchWork, u64), FtsError> {
+    ) -> Result<(Vec<(FtsDocId, f32)>, MatchWork, u64), FtsError> {
         let col_meta = &self.columns[column_id as usize];
         // Resolve the term: from the open-wave memo when the df gather
         // prefetched it (global stats — the bytes below are the ones that
@@ -970,32 +1170,28 @@ impl FtsReader {
         enum SingleSource {
             Absent,
             Inline { doc_id: u32, tf: u32 },
-            Bytes { bytes: Bytes, header_probed: bool },
+            Bytes { bytes: Bytes, short: bool },
         }
         let source = if let Some(entry) = prefetched.and_then(|m| m.lookup(term)) {
             match entry {
                 None => SingleSource::Absent,
                 Some(FetchedTermSlot::Inline { doc_id, tf }) => SingleSource::Inline { doc_id, tf },
-                Some(FetchedTermSlot::Pfor {
-                    bytes,
-                    header_probed,
-                    ..
-                }) => SingleSource::Bytes {
-                    bytes,
-                    header_probed,
-                },
+                Some(FetchedTermSlot::Pfor { bytes, short, .. }) => {
+                    SingleSource::Bytes { bytes, short }
+                }
             }
         } else {
-            let fst_bytes = self.dict_bytes_async().await?;
-            let dict = Self::open_dict(&fst_bytes)?;
+            let dict_bytes = self.dict_bytes_async().await?;
+            let dict = Self::open_dict(&dict_bytes)?;
             let key = make_key(&col_meta.name, term);
             match dict.lookup(&key) {
                 None => SingleSource::Absent,
-                Some(packed) => match FstValue::unpack(packed) {
-                    FstValue::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
-                    FstValue::Pfor {
+                Some(packed) => match packed {
+                    DictEntry::Inline { doc_id, tf } => SingleSource::Inline { doc_id, tf },
+                    DictEntry::Pfor {
                         metadata_offset,
-                        postings_length_hint,
+                        postings_length,
+                        short,
                     } => {
                         // Fetch only this term's byte range (metadata header
                         // + skip table + blocks). The returned buffer starts
@@ -1004,18 +1200,35 @@ impl FtsReader {
                         let mut fetched = self
                             .fetch_term_postings(&[(
                                 metadata_offset as usize,
-                                postings_length_hint.map(|len| len as usize),
+                                postings_length as usize,
                             )])
                             .await?;
                         SingleSource::Bytes {
                             bytes: fetched.pop().expect("one fetched range for one PFOR term"),
-                            header_probed: postings_length_hint.is_none(),
+                            short,
                         }
                     }
                 },
             }
         };
-        let (term_bytes, header_probed) = match source {
+        if matches!(source, SingleSource::Absent) {
+            // No norms are read for a term this superfile does not hold:
+            // the fan-out reaches every superfile, and one without the term
+            // costs no length-array bytes.
+            return Ok((Vec::new(), MatchWork::default(), 0));
+        }
+        // Every scoring branch below reads the column's norms. Load them
+        // here, on the caller's runtime — the prewarm every other scoring
+        // shape makes in its cursor build — so no kernel reaches the
+        // synchronous fallback in `ColumnMeta::norms`: on a lazy source that
+        // fallback fetches the length array through the sync bridge from
+        // whatever thread the kernel is on, and on an `infino-io` worker
+        // that parks the runtime's own core on a storage read. This path had
+        // no prewarm of its own, and two cold scored queries racing on one
+        // column could park every core with nothing left to drive the read
+        // that would release them.
+        self.ensure_norms(column_id).await?;
+        let term_bytes = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
                 // df=1 inline path: no postings-region read, no
@@ -1030,8 +1243,8 @@ impl FtsReader {
                     true => 1,
                     false => tf,
                 };
-                let idf_t = global_idf.unwrap_or_else(|| bm25::idf(self.n_docs as u64, 1));
-                let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
+                let idf_t = idf.resolve(col_meta, 1)?;
+                let idf_weight = idf_t;
                 // Drop the lone match if a negated term excludes it.
                 // The inline slot read no postings-region bytes; the
                 // work-stats byte count for this path is genuinely zero.
@@ -1040,17 +1253,68 @@ impl FtsReader {
                 {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1);
+                let dl_norm_k1 = col_meta.dl_norm_k1().get(doc_id);
+                let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1);
                 if score <= floor_eff {
                     return Ok((Vec::new(), MatchWork::default(), 0));
                 }
-                return Ok((vec![(doc_id, score)], MatchWork::default(), 0));
+                return Ok((
+                    vec![(FtsDocId::new(doc_id), score)],
+                    MatchWork::default(),
+                    0,
+                ));
+            }
+            SingleSource::Bytes { bytes, short: true } => {
+                // Short-form term: one block already, so there is nothing
+                // to skip — decode the body and score every posting.
+                let kernel_start = metering_active().then(thread_cpu_ns).flatten();
+                let mut buf_d = [0u32; BLOCK_LEN];
+                let mut buf_t = [0u32; BLOCK_LEN];
+                let decoded =
+                    decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
+                        .ok_or_else(|| {
+                            FtsError::Read(ReadError::Malformed(
+                                "short-form term body does not decode".into(),
+                            ))
+                        })?;
+                let idf_weight = idf.resolve(col_meta, decoded.n as u64)?;
+                let dl_norm_k1 = col_meta.dl_norm_k1();
+                let mut heap: BinaryHeap<TopKEntry> =
+                    BinaryHeap::with_capacity(k.min(decoded.n).max(1));
+                for j in 0..decoded.n {
+                    let doc_id = buf_d[j];
+                    if let Some(f) = filter.as_deref_mut()
+                        && !f.admits(doc_id)
+                    {
+                        continue;
+                    }
+                    let score =
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(doc_id));
+                    if score <= floor_eff {
+                        continue;
+                    }
+                    if heap.len() < k {
+                        heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
+                    } else if let Some(mut worst) = heap.peek_mut()
+                        && score > worst.0
+                    {
+                        *worst = TopKEntry(score, FtsDocId::new(doc_id));
+                    }
+                }
+                return Ok((
+                    drain_top_k_desc(heap),
+                    MatchWork {
+                        postings_bytes: bytes.len() as u64,
+                        planned_ranges: 1,
+                        kernel_cpu_ns: 0,
+                    },
+                    thread_cpu_delta_ns(kernel_start),
+                ));
             }
             SingleSource::Bytes {
                 bytes,
-                header_probed,
-            } => (bytes, header_probed),
+                short: false,
+            } => bytes,
         };
         let postings = term_bytes.as_ref();
         let metadata_offset = 0usize;
@@ -1060,36 +1324,16 @@ impl FtsReader {
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(
-            postings,
-            metadata_offset,
-            col_meta.positions,
-            false,
-            self.has_coarse_block_max,
-        )?;
+        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
 
-        let local_idf = bm25::idf(self.n_docs as u64, term_meta.df);
-        let idf_t = global_idf.unwrap_or(local_idf);
-        let idf_x_k1p1 = col_meta.params.idf_x_k1p1(idf_t);
-        // Stored block-max and coarse entries bake in the LOCAL idf. Scores
-        // below use the (possibly overridden) effective idf, and the score
-        // is linear in idf, so rescaling every stored bound by the ratio
-        // keeps bounds exactly as tight as the per-superfile path — the
-        // same exact rescale `TermCursor::new` applies (see cursor.rs).
-        let bound_rescale = match local_idf > 0.0 && idf_t != local_idf {
-            true => idf_t / local_idf,
-            false => 1.0,
-        }
-        // And the same again for a parameter override: the stored bounds
-        // were baked at the column's declared pair, so scoring at
-        // another needs them inflated by the supremum of the ratio
-        // between the two. Both factors are linear multipliers on a
-        // stored bound, so they compose; both are 1.0 on the default
-        // path. See `ColumnMeta::bound_scale` and `TermCursor::new`,
-        // which does the identical composition for the multi-term
-        // kernels.
-        * col_meta.bound_scale;
-        let dl_norm_k1 = &col_meta.dl_norm_k1;
+        let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
+        let idf_t = idf.resolve(col_meta, term_meta.df)?;
+        let idf_weight = idf_t;
+        // Every stored bound — per block and per span — is decoded at the
+        // same idf and statistics the scores below use, so the skip tests
+        // compare like with like. See `BoundDecoder`.
+        let bounds = BoundDecoder::new(col_meta, idf_t, local_idf);
+        let dl_norm_k1 = col_meta.dl_norm_k1();
 
         // Top-k min-heap; see `TopKEntry` for the reversed ordering
         // that makes `peek()` the current kth-best score.
@@ -1103,8 +1347,7 @@ impl FtsReader {
         let mut buf_t = [0u32; BLOCK_LEN];
 
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
-        // The coarse block-max table exists only on V5 blobs; on V1–V4 the
-        // walk falls back to the flat per-block skip (and no seed).
+        // Every long-form term carries a coarse block-max table.
         let coarse_enabled = term_meta.has_coarse;
 
         // Threshold-first seed. The doc-id-order walk below fills `heap_min`
@@ -1136,7 +1379,7 @@ impl FtsReader {
             // Gather enough top spans to contain the top `m_want` blocks
             // (over-cover: worst case each is in its own span).
             let mut spans: Vec<(f32, usize)> = (0..num_coarse)
-                .map(|g| (term_meta.coarse_entry(postings, g) * bound_rescale, g))
+                .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
                 .collect();
             let s = m_want.max(seed::TOP_SPANS).min(spans.len());
             spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
@@ -1147,8 +1390,8 @@ impl FtsReader {
                 let start = g * coarse_span;
                 let end = (start + coarse_span).min(term_meta.num_blocks);
                 for bi in start..end {
-                    let (_, _, bm) = term_meta.skip_entry(postings, bi);
-                    cand.push((bm * bound_rescale, bi));
+                    let (_, raw) = term_meta.skip_entry(postings, bi);
+                    cand.push((bounds.bound(raw), bi));
                 }
             }
             let m = m_want.min(cand.len());
@@ -1161,23 +1404,22 @@ impl FtsReader {
             let mut seed_heap: BinaryHeap<TopKEntry> =
                 BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
             for &(_, bi) in &cand[..m] {
-                let (_, off, _) = term_meta.skip_entry(postings, bi);
-                let end = term_meta.block_end_in_term(postings, bi);
-                let bytes = &postings[metadata_offset + off..metadata_offset + end];
-                let n = decode_block(bytes, &mut buf_d, &mut buf_t);
+                let range = term_meta.block_range_in_term(postings, bi, None);
+                let bytes = &postings[metadata_offset + range.start..metadata_offset + range.end];
+                let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
+                let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
                 for j in 0..n {
                     let score =
-                        bm25::score_with_dl_norm_k1(idf_x_k1p1, buf_t[j], dl_norm_k1.get(buf_d[j]));
+                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
                     if score <= floor_eff {
                         continue;
                     }
                     if seed_heap.len() < k {
-                        seed_heap.push(TopKEntry(score, buf_d[j]));
-                    } else if let Some(TopKEntry(mn, _)) = seed_heap.peek()
-                        && score > *mn
+                        seed_heap.push(TopKEntry(score, FtsDocId::new(buf_d[j])));
+                    } else if let Some(mut worst) = seed_heap.peek_mut()
+                        && score > worst.0
                     {
-                        seed_heap.pop();
-                        seed_heap.push(TopKEntry(score, buf_d[j]));
+                        *worst = TopKEntry(score, FtsDocId::new(buf_d[j]));
                     }
                 }
             }
@@ -1202,9 +1444,12 @@ impl FtsReader {
         // it. Inside a span that might qualify, the walk falls back to
         // the per-block bar — identical decisions, identical top-k.
         let mut i = 0usize;
+        // Where the previous block ended, so the length-coded skip table
+        // yields this block's range in one read; `None` after a span jump.
+        let mut prev_end: Option<usize> = None;
         while i < term_meta.num_blocks {
             if coarse_enabled && i.is_multiple_of(coarse_span) {
-                let coarse_max = term_meta.coarse_entry(postings, i / coarse_span) * bound_rescale;
+                let coarse_max = bounds.bound(term_meta.coarse_slot(postings, i / coarse_span));
                 let span_end = (i + coarse_span).min(term_meta.num_blocks);
                 // Seed skip, span-wide (strict): no block in the span can
                 // reach the seeded lower bound on the k-th, so none can be
@@ -1212,12 +1457,14 @@ impl FtsReader {
                 // play, preserving the tie-break.
                 if coarse_max < seed_threshold {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
                 // Floor skip, span-wide: nothing in the span reaches the
                 // caller's floor.
                 if coarse_max <= floor_eff {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
                 // BMW skip, span-wide: heap full AND no block in the span
@@ -1227,14 +1474,17 @@ impl FtsReader {
                     && coarse_max <= *min_score
                 {
                     i = span_end;
+                    prev_end = None;
                     continue;
                 }
             }
 
             // last_doc_id (first tuple slot) is unused here — it serves
             // AND-merge seeks, which single-term never does.
-            let (_, block_offset_in_term, raw_block_max) = term_meta.skip_entry(postings, i);
-            let block_max_bm25 = raw_block_max * bound_rescale;
+            let (_, raw) = term_meta.skip_entry(postings, i);
+            let block_max_bm25 = bounds.bound(raw);
+            let range = term_meta.block_range_in_term(postings, i, prev_end);
+            prev_end = Some(range.end);
 
             // Seed skip (strict): block can't reach the seeded lower bound
             // on the k-th, so it holds no top-k doc.
@@ -1258,12 +1508,11 @@ impl FtsReader {
             }
 
             // Locate the block's bytes.
-            let block_end_in_term = term_meta.block_end_in_term(postings, i);
-            let block_bytes = &postings
-                [metadata_offset + block_offset_in_term..metadata_offset + block_end_in_term];
+            let block_bytes = &postings[metadata_offset + range.start..metadata_offset + range.end];
+            let hdr = BlockHeader::parse(block_bytes, term_meta.prev_last_doc_id(postings, i));
 
             //  Actual number of real docs in that block.
-            let n = decode_block(block_bytes, &mut buf_d, &mut buf_t);
+            let n = decode_block(block_bytes, &hdr, &mut buf_d, &mut buf_t);
 
             for j in 0..n {
                 let doc_id = buf_d[j];
@@ -1274,7 +1523,7 @@ impl FtsReader {
                     continue;
                 }
                 let tf = buf_t[j];
-                let score = bm25::score_with_dl_norm_k1(idf_x_k1p1, tf, dl_norm_k1.get(doc_id));
+                let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1.get(doc_id));
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.
@@ -1282,12 +1531,11 @@ impl FtsReader {
                     continue;
                 }
                 if heap.len() < k {
-                    heap.push(TopKEntry(score, doc_id));
-                } else if let Some(TopKEntry(min_score, _)) = heap.peek()
-                    && score > *min_score
+                    heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
+                } else if let Some(mut worst) = heap.peek_mut()
+                    && score > worst.0
                 {
-                    heap.pop();
-                    heap.push(TopKEntry(score, doc_id));
+                    *worst = TopKEntry(score, FtsDocId::new(doc_id));
                 }
             }
             i += 1;
@@ -1297,9 +1545,7 @@ impl FtsReader {
             drain_top_k_desc(heap),
             MatchWork {
                 postings_bytes: term_bytes.len() as u64,
-                // A hint-less slot costs a header probe before the body
-                // fetch — two planned ranges instead of one.
-                planned_ranges: 1 + u64::from(header_probed),
+                planned_ranges: 1,
                 // The walk's ns travel in the tuple's third element.
                 kernel_cpu_ns: 0,
             },
@@ -1307,8 +1553,8 @@ impl FtsReader {
         ))
     }
 
-    /// Build one `TermCursor` per term that resolves in the FST.
-    /// Missing terms (FST miss) are silently dropped — fine for OR
+    /// Build one `TermCursor` per term that resolves in the term dictionary.
+    /// Missing terms (dictionary miss) are silently dropped — fine for OR
     /// semantics where a missing term contributes nothing. Returned
     /// `Vec` may be empty (all terms missed) or shorter than `terms`.
     ///
@@ -1320,20 +1566,20 @@ impl FtsReader {
         &self,
         column_id: u32,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
-        count_only: bool,
+        idf: QueryIdf<'_>,
+        purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<Vec<TermCursor>, FtsError> {
         Ok(self
-            .build_term_cursors_opt(column_id, terms, global_idf, count_only, qtf, prefetched)
+            .build_term_cursors_opt(column_id, terms, idf, purpose, qtf, prefetched, None)
             .await?
             .into_iter()
             .flatten()
             .collect())
     }
 
-    /// Open-wave fetch for `Bm25Stats::Global`: resolve `terms` in this
+    /// Open-wave fetch for table-wide idf: resolve `terms` in this
     /// superfile's dictionary and fetch each PFOR term's full postings
     /// range — exactly the reads the cursor build performs — recording
     /// df per term so the caller can aggregate corpus-wide idf BEFORE
@@ -1354,36 +1600,30 @@ impl FtsReader {
     ) -> Result<FetchedTermMemo, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let col_meta = &self.columns[column_id as usize];
-        let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict_bytes = self.dict_bytes_async().await?;
+        let dict = Self::open_dict(&dict_bytes)?;
 
         // Resolve every term, collecting the PFOR ranges for one
         // coalesced fetch (mirrors `build_term_cursors_opt`).
         enum Pre {
             Inline { doc_id: u32, tf: u32 },
-            Pfor { header_probed: bool },
+            Pfor { short: bool },
         }
         let mut resolved: Vec<(Box<str>, Option<Pre>)> = Vec::with_capacity(terms.len());
-        let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
         for term in terms {
             let key = make_key(&col_meta.name, term);
-            let pre = dict
-                .lookup(&key)
-                .map(|packed| match FstValue::unpack(packed) {
-                    FstValue::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
-                    FstValue::Pfor {
-                        metadata_offset,
-                        postings_length_hint,
-                    } => {
-                        pfor_offsets.push((
-                            metadata_offset as usize,
-                            postings_length_hint.map(|len| len as usize),
-                        ));
-                        Pre::Pfor {
-                            header_probed: postings_length_hint.is_none(),
-                        }
-                    }
-                });
+            let pre = dict.lookup(&key).map(|packed| match packed {
+                DictEntry::Inline { doc_id, tf } => Pre::Inline { doc_id, tf },
+                DictEntry::Pfor {
+                    metadata_offset,
+                    postings_length,
+                    short,
+                } => {
+                    pfor_offsets.push((metadata_offset as usize, postings_length as usize));
+                    Pre::Pfor { short }
+                }
+            });
             resolved.push((Box::from(*term), pre));
         }
         let pfor_bytes = self.fetch_term_postings(&pfor_offsets).await?;
@@ -1395,23 +1635,20 @@ impl FtsReader {
             let slot = match pre {
                 None => None,
                 Some(Pre::Inline { doc_id, tf }) => Some(FetchedTermSlot::Inline { doc_id, tf }),
-                Some(Pre::Pfor { header_probed }) => {
+                Some(Pre::Pfor { short }) => {
                     let bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    // df sits in the term's metadata header at the head of
-                    // the fetched range — the same parse the cursor build
-                    // repeats (CPU-only, no extra read).
-                    let term_meta = TermMeta::parse(
-                        bytes.as_ref(),
-                        0,
-                        col_meta.positions,
-                        false,
-                        self.has_coarse_block_max,
-                    )?;
-                    Some(FetchedTermSlot::Pfor {
-                        bytes,
-                        header_probed,
-                        df: term_meta.df,
-                    })
+                    // df heads the fetched range in either form — the long
+                    // form's metadata header, the short body's leading
+                    // varint (CPU-only, no extra read).
+                    let df = match short {
+                        true => u64::from(short_df(bytes.as_ref()).ok_or_else(|| {
+                            FtsError::Read(ReadError::Malformed(
+                                "short-form term body does not decode".into(),
+                            ))
+                        })?),
+                        false => TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?.df,
+                    };
+                    Some(FetchedTermSlot::Pfor { bytes, df, short })
                 }
             };
             map.insert(term, slot);
@@ -1420,26 +1657,34 @@ impl FtsReader {
     }
 
     /// Build a `TermCursor` for every term, **preserving input order and
-    /// arity**: the result has one slot per input term, `None` where the
-    /// term is absent from the FST. One FST open and one parallel postings
-    /// fan-out for the whole batch — so a multi-term build costs a single
-    /// dictionary fetch and a single overlapped range wave, not one of each
-    /// per term.
-    /// `qtf`, when present, is a per-term query-term-frequency weight (parallel to
-    /// `terms`): each built cursor folds its weight into the effective idf, which
-    /// scales both the score and the BlockMaxWAND skip ceilings, so a deduplicated
-    /// repeated term ranks identically to the duplicates it replaced (BM25 is
-    /// linear in idf). `None` leaves idf unweighted.
+    /// arity**: the result has one slot per input term, `None` where the term
+    /// is absent from the term dictionary. One dictionary open and one parallel
+    /// postings fan-out for the whole batch — so a multi-term build costs a
+    /// single dictionary fetch and a single overlapped range wave, not one of
+    /// each per term. `qtf`, when present, is a per-term query-term-frequency
+    /// weight (parallel to `terms`): each built cursor folds its weight into
+    /// the effective idf, which scales both the score and the BlockMaxWAND skip
+    /// ceilings, so a deduplicated repeated term ranks identically to the
+    /// duplicates it replaced (BM25 is linear in idf). `None` leaves idf
+    /// unweighted. `dict_bytes`, when present, is this reader's dictionary
+    /// already fetched by the caller, so it is not fetched again.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn build_term_cursors_opt(
         &self,
         column_id: u32,
         terms: &[&str],
-        global_idf: Option<&GlobalTermIdf>,
-        count_only: bool,
+        idf: QueryIdf<'_>,
+        purpose: CursorUse,
         qtf: Option<&[u32]>,
         prefetched: Option<&FetchedTermMemo>,
+        dict_bytes: Option<&[u8]>,
     ) -> Result<Vec<Option<TermCursor>>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
+        // Scoring needs the column's norms; an unscored build does not,
+        // and must not read the length array for them.
+        if purpose.scores() {
+            self.ensure_norms(column_id).await?;
+        }
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
         // offset, or a miss — preserving query order and arity (a miss is a
@@ -1448,37 +1693,37 @@ impl FtsReader {
         // it — its bytes were fetched when its df was gathered — so the
         // dictionary is opened, and the PFOR fan below issued, only for the
         // terms the memo does not cover (all of them on the single-pass
-        // path). Each resolved entry carries its term's global idf (when in
-        // `Bm25Stats::Global`) so the cursor is built with the global value;
-        // `None` per term falls back to this superfile's local idf.
+        // path). Each resolved entry carries its term's idf source, which the
+        // cursor resolves when it scores.
         enum Resolved {
             Memo {
                 slot: FetchedTermSlot,
-                gidf: Option<f32>,
+                gidf: TermIdf,
             },
             Inline {
                 doc_id: u32,
                 tf: u32,
-                gidf: Option<f32>,
+                gidf: TermIdf,
             },
             Pfor {
-                gidf: Option<f32>,
-                header_probed: bool,
+                gidf: TermIdf,
+                short: bool,
             },
         }
         let all_prefetched = prefetched.is_some_and(|m| terms.iter().all(|t| m.contains(t)));
-        let dict_bytes = match all_prefetched {
-            true => None,
-            false => Some(self.dict_bytes_async().await?),
-        };
-        let dict = match dict_bytes.as_ref() {
-            Some(b) => Some(Self::open_dict(b)?),
-            None => None,
+        let fetched;
+        let dict = match (all_prefetched, dict_bytes) {
+            (true, _) => None,
+            (false, Some(b)) => Some(Self::open_dict(b)?),
+            (false, None) => {
+                fetched = self.dict_bytes_async().await?;
+                Some(Self::open_dict(&fetched)?)
+            }
         };
         let mut resolved: Vec<Option<Resolved>> = Vec::with_capacity(terms.len());
-        let mut pfor_offsets: Vec<(usize, Option<usize>)> = Vec::new();
+        let mut pfor_offsets: Vec<(usize, usize)> = Vec::new();
         for term in terms {
-            let gidf = global_idf.and_then(|m| m.get(*term).copied());
+            let gidf = idf.term(term);
             if let Some(entry) = prefetched.and_then(|m| m.lookup(term)) {
                 resolved.push(entry.map(|slot| Resolved::Memo { slot, gidf }));
                 continue;
@@ -1491,25 +1736,17 @@ impl FtsReader {
                 resolved.push(None);
                 continue;
             };
-            match FstValue::unpack(packed) {
-                FstValue::Inline { doc_id, tf } => {
+            match packed {
+                DictEntry::Inline { doc_id, tf } => {
                     resolved.push(Some(Resolved::Inline { doc_id, tf, gidf }));
                 }
-                FstValue::Pfor {
+                DictEntry::Pfor {
                     metadata_offset,
-                    postings_length_hint,
+                    postings_length,
+                    short,
                 } => {
-                    pfor_offsets.push((
-                        metadata_offset as usize,
-                        postings_length_hint.map(|len| len as usize),
-                    ));
-                    // A hint-less slot (21-bit length overflow) costs a
-                    // header probe BEFORE the body fetch — two planned
-                    // ranges, recorded on the cursor for the tallies.
-                    resolved.push(Some(Resolved::Pfor {
-                        gidf,
-                        header_probed: postings_length_hint.is_none(),
-                    }));
+                    pfor_offsets.push((metadata_offset as usize, postings_length as usize));
+                    resolved.push(Some(Resolved::Pfor { gidf, short }));
                 }
             }
         }
@@ -1532,85 +1769,33 @@ impl FtsReader {
                     slot: FetchedTermSlot::Inline { doc_id, tf },
                     gidf,
                 }) => {
-                    let tf = match col_meta.positions {
-                        true => 1,
-                        false => tf,
-                    };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
+                    let tf = col_meta.inline_tf(tf);
                     cursors.push(Some(TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        self.n_docs as u64,
-                        dl_norm_k1,
-                        gidf,
-                        weight,
-                        col_meta.params,
-                    )));
+                        doc_id, tf, col_meta, gidf, weight, purpose,
+                    )?));
                 }
                 Some(Resolved::Memo {
-                    slot:
-                        FetchedTermSlot::Pfor {
-                            bytes,
-                            header_probed,
-                            ..
-                        },
+                    slot: FetchedTermSlot::Pfor { bytes, short, .. },
                     gidf,
                 }) => {
-                    let cursor = TermCursor::new(
-                        bytes,
-                        self.n_docs as u64,
-                        col_meta.positions,
-                        gidf,
-                        weight,
-                        header_probed,
-                        count_only,
-                        self.has_coarse_block_max,
-                        col_meta.params,
-                        col_meta.bound_scale,
-                    )?;
-                    cursors.push(Some(cursor));
+                    cursors.push(Some(TermCursor::for_body(
+                        bytes, short, col_meta, gidf, weight, purpose,
+                    )?));
                 }
                 Some(Resolved::Inline { doc_id, tf, gidf }) => {
-                    // On a positional column the inline slot carries
-                    // the term's single position, tf implied 1 — the
-                    // builder only inlines tf == 1 postings there.
-                    // Scoring must use the implied tf, never the slot.
-                    // (Phrase members recover the position itself with
-                    // their own FST lookup — see `build_atom_cursors`.)
-                    let tf = match col_meta.positions {
-                        true => 1,
-                        false => tf,
-                    };
-                    let dl_norm_k1 = col_meta.dl_norm_k1.get(doc_id);
-                    let cursor = TermCursor::new_inline(
-                        doc_id,
-                        tf,
-                        self.n_docs as u64,
-                        dl_norm_k1,
-                        gidf,
-                        weight,
-                        col_meta.params,
-                    );
+                    // Scoring must use the implied tf, never the slot. (Phrase
+                    // members recover the position itself with their own
+                    // dictionary lookup — see `build_atom_cursors`.)
+                    let tf = col_meta.inline_tf(tf);
+                    let cursor =
+                        TermCursor::new_inline(doc_id, tf, col_meta, gidf, weight, purpose)?;
                     cursors.push(Some(cursor));
                 }
-                Some(Resolved::Pfor {
-                    gidf,
-                    header_probed,
-                }) => {
+                Some(Resolved::Pfor { gidf, short }) => {
                     let term_bytes = pfor_iter.next().expect("one fetched range per PFOR term");
-                    let cursor = TermCursor::new(
-                        term_bytes,
-                        self.n_docs as u64,
-                        col_meta.positions,
-                        gidf,
-                        weight,
-                        header_probed,
-                        count_only,
-                        self.has_coarse_block_max,
-                        col_meta.params,
-                        col_meta.bound_scale,
-                    )?;
-                    cursors.push(Some(cursor));
+                    cursors.push(Some(TermCursor::for_body(
+                        term_bytes, short, col_meta, gidf, weight, purpose,
+                    )?));
                 }
             }
         }
@@ -1620,12 +1805,317 @@ impl FtsReader {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    };
 
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{builder::FtsBuilder, tokenize::AsciiLowerTokenizer};
+    use crate::superfile::fts::{builder::FtsBuilder, tokenize::Phrase};
+
+    /// A `k` above the fixture's match count.
+    const TABLE_IDF_K: usize = 10;
+    /// An arbitrary table-wide idf to score with.
+    const TABLE_IDF: f32 = 1.5;
+    /// Score slack between the ranked and the exact-count walks: they add
+    /// a doc's term scores in different orders.
+    const SUM_ORDER_EPS: f32 = 1e-4;
+
+    /// The two walks return the same top-k up to float summation order:
+    /// every doc's score agrees within `SUM_ORDER_EPS`, and a doc may be
+    /// on one side only when it ties the k-th score within that slack.
+    fn assert_same_top_k(counted: &[(RowId, f32)], pruned: &[(RowId, f32)], label: &str) {
+        assert_eq!(counted.len(), pruned.len(), "len for {label}");
+        let kth = pruned.last().map_or(f32::NEG_INFINITY, |h| h.1);
+        let scores = |hits: &[(RowId, f32)]| hits.iter().copied().collect::<HashMap<RowId, f32>>();
+        let (a, b) = (scores(counted), scores(pruned));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            for (doc, s) in x {
+                match y.get(doc) {
+                    Some(t) => assert!(
+                        (s - t).abs() < SUM_ORDER_EPS,
+                        "score of {doc:?} for {label}: {s} vs {t}"
+                    ),
+                    None => assert!(
+                        (s - kth).abs() < SUM_ORDER_EPS,
+                        "{doc:?} on one side only and not a k-th tie for {label}: {s} vs {kth}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Many-term ORs, where the ranked and exact-count walks add a doc's
+    /// term scores in different orders: the top-k must agree up to that
+    /// order, and the count must be exact.
+    #[tokio::test]
+    async fn exact_count_matches_ranked_on_random_many_term_ors() {
+        let mut seed = 7u64;
+        let mut rng = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        let vocab: Vec<String> = (0..24).map(|i| format!("w{i}")).collect();
+        for trial in 0..6u32 {
+            let n_docs = 1500 + (rng() % 2000) as u32;
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..n_docs {
+                let mut text = String::new();
+                // Early terms are common, late ones rare.
+                for (t, term) in vocab.iter().enumerate() {
+                    if rng().is_multiple_of(3 + t as u64) {
+                        for _ in 0..1 + rng() % 3 {
+                            text.push_str(term);
+                            text.push(' ');
+                        }
+                    }
+                }
+                if text.is_empty() {
+                    text.push_str(&vocab[0]);
+                }
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
+            for q in 0..25u32 {
+                let n_terms = 2 + (rng() % 19) as usize;
+                let shoulds: Vec<&str> = (0..n_terms)
+                    .map(|_| vocab[(rng() % 24) as usize].as_str())
+                    .collect();
+                let negatives: Vec<&str> = match rng() % 3 {
+                    0 => vec![vocab[(rng() % 24) as usize].as_str()],
+                    _ => Vec::new(),
+                };
+                let lists = || ClauseLists {
+                    shoulds: &shoulds,
+                    negatives: &negatives,
+                    ..ClauseLists::default()
+                };
+                let label = format!("trial {trial} q {q} {shoulds:?} -{negatives:?}");
+                let matches = r
+                    .search_excluding("body", lists(), n_docs as usize, f32::NEG_INFINITY)
+                    .await
+                    .expect("every match")
+                    .len() as u64;
+                for k in [1usize, 10, 100] {
+                    let pruned = r
+                        .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                        .await
+                        .expect("pruned search");
+                    let (hits, count) = r
+                        .search_excluding_with_count("body", lists(), k)
+                        .await
+                        .expect("counted search");
+                    assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
+                    assert_eq!(count, matches, "count for {label} k={k}");
+                }
+            }
+        }
+    }
+
+    /// For every term clause shape, the exact-count walk returns the
+    /// pruned search's top-k, and a count equal both to the number of
+    /// matches and to the unranked count path's answer.
+    #[tokio::test]
+    async fn exact_count_matches_pruned_hits_and_unranked_count() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        // (musts, shoulds, negatives) over the 3-doc `body` corpus.
+        let shapes: &[(&[&str], &[&str], &[&str])] = &[
+            (&[], &["rust"], &[]),
+            (&["rust"], &[], &[]),
+            (&[], &["rust", "java"], &[]),
+            (&["rust", "runtime"], &[], &[]),
+            (&["rust"], &["tokio"], &[]),
+            (&[], &["rust", "java"], &["tokio"]),
+            (&["rust"], &[], &["tokio"]),
+            (&["rust", "zzz"], &[], &[]),
+            (&[], &["zzz"], &[]),
+        ];
+        for &(musts, shoulds, negatives) in shapes {
+            let lists = || ClauseLists {
+                musts,
+                shoulds,
+                negatives,
+                ..ClauseLists::default()
+            };
+            let label = format!("{musts:?} {shoulds:?} {negatives:?}");
+            let matches = r
+                .search_excluding("body", lists(), TABLE_IDF_K, f32::NEG_INFINITY)
+                .await
+                .expect("every match")
+                .len() as u64;
+            let (terms, mode) = match musts.is_empty() {
+                true => (shoulds, BoolMode::Or),
+                false => (musts, BoolMode::And),
+            };
+            let unranked = r
+                .atoms_match_count("body", terms, &[], mode, negatives, &[])
+                .await
+                .expect("unranked count")
+                .0;
+            for k in [1usize, 2, TABLE_IDF_K] {
+                let pruned = r
+                    .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                    .await
+                    .expect("pruned search");
+                let (hits, count) = r
+                    .search_excluding_with_count("body", lists(), k)
+                    .await
+                    .expect("counted search");
+                assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
+                assert_eq!(count, matches, "count for {label} k={k}");
+                assert_eq!(count, unranked, "unranked count for {label} k={k}");
+            }
+        }
+    }
+
+    /// Phrase shapes take the atom walk; with pruning off it must still
+    /// return the pruned walk's top-k and the match walk's count.
+    #[tokio::test]
+    async fn exact_count_matches_on_phrase_shapes() {
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open phrase blob");
+        let phrase = |a: &str, b: &str| vec![Phrase::adjacent(vec![a.to_string(), b.to_string()])];
+        let new_york = phrase("new", "york");
+        let new_haven = phrase("new", "haven");
+        // (must terms, must phrases, should phrases, negative phrases)
+        let shapes: &[(
+            &[&str],
+            &[Phrase<String>],
+            &[Phrase<String>],
+            &[Phrase<String>],
+        )] = &[
+            (&[], &[], &new_york, &[]),
+            (&[], &new_york, &[], &[]),
+            (&["city"], &new_york, &[], &[]),
+            (&[], &new_york, &new_haven, &[]),
+            (&[], &[], &new_york, &new_haven),
+            (&["york"], &[], &[], &new_york),
+        ];
+        for &(musts, must_phrases, should_phrases, negative_phrases) in shapes {
+            let lists = || ClauseLists {
+                musts,
+                must_phrases,
+                should_phrases,
+                negative_phrases,
+                ..ClauseLists::default()
+            };
+            let label =
+                format!("{musts:?} {must_phrases:?} {should_phrases:?} {negative_phrases:?}");
+            let matches = r
+                .search_excluding("title", lists(), TABLE_IDF_K, f32::NEG_INFINITY)
+                .await
+                .expect("every match")
+                .len() as u64;
+            let (phrases, mode) = match musts.is_empty() && must_phrases.is_empty() {
+                true => (should_phrases, BoolMode::Or),
+                false => (must_phrases, BoolMode::And),
+            };
+            let unranked = r
+                .atoms_match_count("title", musts, phrases, mode, &[], negative_phrases)
+                .await
+                .expect("unranked count")
+                .0;
+            for k in [1usize, 2, TABLE_IDF_K] {
+                let pruned = r
+                    .search_excluding("title", lists(), k, f32::NEG_INFINITY)
+                    .await
+                    .expect("pruned search");
+                let (hits, count) = r
+                    .search_excluding_with_count("title", lists(), k)
+                    .await
+                    .expect("counted search");
+                assert_same_top_k(&hits, &pruned, &format!("{label} k={k}"));
+                assert_eq!(count, matches, "count for {label} k={k}");
+                assert_eq!(count, unranked, "unranked count for {label} k={k}");
+            }
+        }
+    }
+
+    /// A pushed-down row set bounds the count as it bounds the hits.
+    #[tokio::test]
+    async fn exact_count_honours_the_allow_set() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let allow: Arc<RoaringBitmap> = Arc::new([0u32, 2].into_iter().collect());
+        let lists = || ClauseLists {
+            shoulds: &["rust", "java"],
+            allow: Some(Arc::clone(&allow)),
+            ..ClauseLists::default()
+        };
+        let pruned = r
+            .search_excluding("body", lists(), 1, f32::NEG_INFINITY)
+            .await
+            .expect("pruned search");
+        let (hits, count) = r
+            .search_excluding_with_count("body", lists(), 1)
+            .await
+            .expect("counted search");
+        assert_same_top_k(&hits, &pruned, "allow-set");
+        assert_eq!(count, 2, "docs 0 and 2 are allowed and match");
+    }
+
+    /// A table-wide search scores with its map's idf alone: a scored term
+    /// the map leaves out is an error, never this superfile's own idf.
+    #[tokio::test]
+    async fn a_scored_term_missing_from_the_table_idf_is_an_error() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let table = GlobalTermIdf::new();
+        let clauses = ClauseLists {
+            musts: &["rust"],
+            idf: QueryIdf::Table(&table),
+            ..ClauseLists::default()
+        };
+        let err = r
+            .search_excluding("body", clauses, TABLE_IDF_K, f32::NEG_INFINITY)
+            .await
+            .expect_err("no idf for `rust`");
+        assert!(matches!(err, FtsError::MissingIdf), "{err:?}");
+    }
+
+    /// The table's idf is the one scored with: doubling it doubles every
+    /// score, which a fallback to this superfile's own idf would not do.
+    #[tokio::test]
+    async fn the_table_idf_is_what_scores() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open FtsReader");
+        let scores = |idf: f32| {
+            let table = GlobalTermIdf::from([("rust".to_owned(), idf)]);
+            let r = &r;
+            async move {
+                let clauses = ClauseLists {
+                    musts: &["rust"],
+                    idf: QueryIdf::Table(&table),
+                    ..ClauseLists::default()
+                };
+                let mut hits = r
+                    .search_excluding("body", clauses, TABLE_IDF_K, f32::NEG_INFINITY)
+                    .await
+                    .expect("search");
+                hits.sort_by_key(|(d, _)| d.get());
+                hits
+            }
+        };
+        let once = scores(TABLE_IDF).await;
+        let twice = scores(2.0 * TABLE_IDF).await;
+        assert!(!once.is_empty());
+        for ((d1, s1), (d2, s2)) in once.iter().zip(&twice) {
+            assert_eq!(d1, d2);
+            assert!(
+                (s2 - 2.0 * s1).abs() <= f32::EPSILON * s2.abs(),
+                "{s1} {s2}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn search_returns_exact_doc_ids_for_known_term() {
@@ -1636,7 +2126,7 @@ mod tests {
             .await
             .expect("FTS search");
         // "rust" appears in doc 0 and doc 1.
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0), "doc 0 should match");
         assert!(ids.contains(&1), "doc 1 should match");
         assert!(!ids.contains(&2), "doc 2 should not match");
@@ -1673,7 +2163,7 @@ mod tests {
             .search("body", &["rust", "runtime"], 10, BoolMode::And)
             .await
             .expect("search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -1758,7 +2248,7 @@ mod tests {
             .await
             .expect("FTS search");
         // uniqtwo → doc 2; rust → docs 0, 1.
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(ids.contains(&2));
@@ -1773,7 +2263,7 @@ mod tests {
             .search("body", &["uniqzero", "rust"], 10, BoolMode::And)
             .await
             .expect("FTS search");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids, vec![0]);
         // uniqzero ∩ uniqtwo = ∅ (different docs).
         let hits = r
@@ -1812,8 +2302,129 @@ mod tests {
             )
             .await
             .expect("search excluding");
-        let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(ids, vec![1], "doc 0 excluded by negated 'async'");
+    }
+
+    /// A pushed-down allow-set bounds every clause shape the same way: the
+    /// single-term BMW fast path, a multi-term union, a must intersection,
+    /// and the phrase walk each rank only the allowed docs, and an
+    /// allow-set composes with a negated term.
+    #[tokio::test]
+    async fn allow_set_bounds_every_clause_shape() {
+        let (blob, json) = build_blob();
+        let r = FtsReader::open(blob, &json).expect("open");
+        let ids = |hits: &[(RowId, f32)]| {
+            let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+            ids.sort_unstable();
+            ids
+        };
+        // "rust" is in docs 0 and 1; allow doc 1 only.
+        let only_one: Option<Arc<RoaringBitmap>> = Some(Arc::new([1u32].into_iter().collect()));
+        let single = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust"],
+                    allow: only_one.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("single-term search");
+        assert_eq!(ids(&single), vec![1], "single-term path honours the set");
+
+        // "rust" OR "spring": docs 0, 1, 2 match; allow docs 0 and 2.
+        let zero_two: Option<Arc<RoaringBitmap>> = Some(Arc::new([0u32, 2].into_iter().collect()));
+        let union = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust", "spring"],
+                    allow: zero_two.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("union search");
+        assert_eq!(ids(&union), vec![0, 2], "union path honours the set");
+
+        // "rust" AND "runtime": docs 0 and 1 match; allow docs 0 and 2.
+        let intersection = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    musts: &["rust", "runtime"],
+                    allow: zero_two.clone(),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("intersection search");
+        assert_eq!(ids(&intersection), vec![0], "must path honours the set");
+
+        // Allow-set plus a negated term: "rust" in docs 0, 1; allow 0 and
+        // 2; negate "async" (doc 0) — nothing survives both gates.
+        let gated = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["rust"],
+                    negatives: &["async"],
+                    allow: zero_two,
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("gated search");
+        assert!(gated.is_empty(), "allow-set and negation both apply");
+
+        // Phrase walk: "new york" matches docs 0, 2, 4 of the phrase
+        // corpus; allow docs 2 and 3.
+        let (blob, json) = build_phrase_blob();
+        let r = FtsReader::open(blob, json).expect("open phrase blob");
+        let phrases = vec![Phrase::adjacent(vec![
+            "new".to_string(),
+            "york".to_string(),
+        ])];
+        let phrase_hits = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    should_phrases: &phrases,
+                    allow: Some(Arc::new([2u32, 3].into_iter().collect())),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("phrase search");
+        assert_eq!(ids(&phrase_hits), vec![2], "phrase walk honours the set");
+
+        // An empty allow-set ranks nothing, whatever matches.
+        let none = r
+            .search_excluding(
+                "title",
+                ClauseLists {
+                    shoulds: &["new"],
+                    allow: Some(Arc::new(RoaringBitmap::new())),
+                    ..ClauseLists::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("empty-set search");
+        assert!(none.is_empty());
     }
 
     #[tokio::test]
@@ -1860,8 +2471,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_multi_weights_and_combines_columns() {
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("title".into(), false).expect("register");
         b.register_column("body".into(), false).expect("register");
         // doc 0: title "rust"; doc 1: body "rust"; doc 2: neither.
@@ -1872,13 +2482,13 @@ mod tests {
         b.add_doc(0, 2, "go").expect("add");
         b.add_doc(1, 2, "concurrency").expect("add");
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_multi(&[("title", 1.0), ("body", 1.0)], "rust", 10, BoolMode::Or)
             .await
             .expect("multi");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0));
         assert!(ids.contains(&1));
         assert!(!ids.contains(&2));
@@ -1888,21 +2498,20 @@ mod tests {
     async fn search_or_range_restricts_to_doc_id_window() {
         // Larger corpus so an OR query spans several doc ids and the
         // ranged path actually clips some out.
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         // Restrict to [2, 5): only docs 2,3,4 are eligible.
         let hits = r
             .search_or_range_pretokenized("body", &["alpha", "beta"], 100, 2, 5)
             .await
             .expect("ranged search");
-        let ids: HashSet<u32> = hits.iter().map(|(d, _)| *d).collect();
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert_eq!(
             ids,
             [2u32, 3, 4].into_iter().collect(),
@@ -1926,8 +2535,7 @@ mod tests {
         /// Top-k size for the truncated comparison.
         const K_TOP: usize = 10;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             // Deterministic mixed-df corpus: four uniform terms with
@@ -1950,7 +2558,7 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Two shapes through the one ranged union kernel: a uniform OR
@@ -1975,11 +2583,11 @@ mod tests {
                 .await
                 .expect("un-ranged search");
             let mut full_sorted: Vec<(u32, u32)> =
-                full.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                full.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             full_sorted.sort_unstable();
 
             for cuts in partitions {
-                let mut merged: Vec<(u32, f32)> = Vec::new();
+                let mut merged: Vec<(RowId, f32)> = Vec::new();
                 for &(lo, hi) in cuts {
                     merged.extend(
                         r.search_or_range_pretokenized("body", terms, K_ALL, lo, hi)
@@ -1987,8 +2595,10 @@ mod tests {
                             .expect("ranged search"),
                     );
                 }
-                let mut merged_sorted: Vec<(u32, u32)> =
-                    merged.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let mut merged_sorted: Vec<(u32, u32)> = merged
+                    .iter()
+                    .map(|&(d, s)| (d.get(), s.to_bits()))
+                    .collect();
                 merged_sorted.sort_unstable();
                 assert_eq!(
                     merged_sorted, full_sorted,
@@ -2005,11 +2615,12 @@ mod tests {
                         .then(a.0.cmp(&b.0))
                 });
                 pool.truncate(K_TOP);
-                let top: Vec<(u32, u32)> = pool.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                let top: Vec<(u32, u32)> =
+                    pool.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
                 let full_top: Vec<(u32, u32)> = full
                     .iter()
                     .take(K_TOP)
-                    .map(|&(d, s)| (d, s.to_bits()))
+                    .map(|&(d, s)| (d.get(), s.to_bits()))
                     .collect();
                 assert_eq!(
                     top, full_top,
@@ -2032,8 +2643,7 @@ mod tests {
         /// Ask for every match so whole result sets are compared.
         const K_ALL: usize = N_DOCS as usize;
 
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
@@ -2050,12 +2660,12 @@ mod tests {
             b.add_doc(0, i, &text).expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
         let set = r
-            .build_or_cursor_set("body", terms, None, None)
+            .build_or_cursor_set("body", terms, QueryIdf::ThisFile, None)
             .await
             .expect("set");
         let windows = [
@@ -2074,8 +2684,9 @@ mod tests {
                 .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
                 .expect("prebuilt ranged search");
             let fresh_bits: Vec<(u32, u32)> =
-                fresh.iter().map(|&(d, s)| (d, s.to_bits())).collect();
-            let pre_bits: Vec<(u32, u32)> = pre.iter().map(|&(d, s)| (d, s.to_bits())).collect();
+                fresh.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
+            let pre_bits: Vec<(u32, u32)> =
+                pre.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
         }
     }
@@ -2107,14 +2718,13 @@ mod tests {
 
     #[tokio::test]
     async fn search_or_range_with_floor_prunes() {
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..8u32 {
             b.add_doc(0, i, "alpha beta").expect("add");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
         let hits = r
             .search_or_range_pretokenized_with_floor(
@@ -2124,7 +2734,7 @@ mod tests {
                 0,
                 8,
                 1e9,
-                None,
+                QueryIdf::ThisFile,
             )
             .await
             .expect("floored ranged search");

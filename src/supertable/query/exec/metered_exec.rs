@@ -49,9 +49,11 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::{
     common::{Statistics, config::ConfigOptions},
+    datasource::{physical_plan::FileScanConfig, source::DataSourceExec},
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
     physical_expr::{PhysicalExpr, PhysicalSortExpr},
+    physical_expr_adapter::PhysicalExprAdapterFactory,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, RecordBatchStream,
         SendableRecordBatchStream, SortOrderPushdownResult,
@@ -64,9 +66,12 @@ use datafusion::{
 };
 use futures::Stream;
 
-use crate::runtime_metrics::{
-    cpu,
-    op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
+use crate::{
+    runtime_metrics::{
+        cpu,
+        op_stats::{OpStatsCollector, OuterBracketGuard, metering_active, outer_bracket_active},
+    },
+    supertable::query::{provider::ScanFooters, read_ahead::ScanReadAhead},
 };
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
@@ -74,6 +79,12 @@ use crate::runtime_metrics::{
 pub(crate) struct MeteredExec {
     input: Arc<dyn ExecutionPlan>,
     op_stats: Option<Arc<OpStatsCollector>>,
+    /// Footers of the scan below, when it is a table scan. `RowFilterUnderTopK`
+    /// reads column sizes from them.
+    footers: Option<Arc<ScanFooters>>,
+    /// Read-ahead for the table scan below, if it is one. `ReadAheadOff`
+    /// turns it off under a `LIMIT`.
+    read_ahead: Option<Arc<ScanReadAhead>>,
     /// Whether the planner may carry a `LIMIT` fetch past this node into
     /// the child. The one place this is `false` is the meter the table
     /// provider wraps around a scan that carries filters — see
@@ -93,6 +104,8 @@ impl MeteredExec {
         Self {
             input,
             op_stats,
+            footers: None,
+            read_ahead: None,
             limit_pushdown: true,
         }
     }
@@ -103,11 +116,11 @@ impl MeteredExec {
     /// selections, and a scan-level limit lets the Parquet opener's limit
     /// pruning replace those selections with whole row groups that the
     /// predicate's statistics prove "fully matching" — returning deleted
-    /// rows. With the `FilterExec` folded into the scan as a row filter,
-    /// nothing else above the scan would hold the fetch, so this node
-    /// refuses it and DataFusion keeps a limit node above instead. The
-    /// provider pushes its own scan-level limit only for filter-less
-    /// scans, where no predicate can mark a row group fully matching.
+    /// rows. With a `FilterExec` above the scan the fetch lives there. An
+    /// exact filter leaves no `FilterExec`, so this node refuses the fetch
+    /// and the limit node above keeps it. The provider pushes its own
+    /// scan-level limit only for filter-less scans, where no predicate can
+    /// mark a row group fully matching.
     pub(crate) fn without_limit_pushdown(
         input: Arc<dyn ExecutionPlan>,
         op_stats: Option<Arc<OpStatsCollector>>,
@@ -115,8 +128,37 @@ impl MeteredExec {
         Self {
             input,
             op_stats,
+            footers: None,
+            read_ahead: None,
             limit_pushdown: false,
         }
+    }
+
+    /// This meter with the footers of the table scan it wraps.
+    pub(crate) fn with_footers(mut self, footers: Arc<ScanFooters>) -> Self {
+        self.footers = Some(footers);
+        self
+    }
+
+    /// This meter, with read-ahead for the table scan it wraps.
+    pub(crate) fn with_read_ahead(mut self, read_ahead: Arc<ScanReadAhead>) -> Self {
+        self.read_ahead = Some(read_ahead);
+        self
+    }
+
+    /// Read-ahead for the table scan this meter wraps, if any.
+    pub(crate) fn read_ahead(&self) -> Option<&Arc<ScanReadAhead>> {
+        self.read_ahead.as_ref()
+    }
+
+    /// The node this meter wraps.
+    pub(crate) fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    /// Footers of the table scan this meter wraps, if any.
+    pub(crate) fn footers(&self) -> Option<&ScanFooters> {
+        self.footers.as_deref()
     }
 
     /// A meter over `input` with this node's collector and limit policy.
@@ -124,6 +166,8 @@ impl MeteredExec {
         Arc::new(MeteredExec {
             input,
             op_stats: self.op_stats.clone(),
+            footers: self.footers.clone(),
+            read_ahead: self.read_ahead.clone(),
             limit_pushdown: self.limit_pushdown,
         })
     }
@@ -297,6 +341,13 @@ impl ExecutionPlan for MeteredExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
+        // The plan is final now, so hand read-ahead the filter the scan prunes
+        // row groups with (join filters included).
+        if let Some(read_ahead) = &self.read_ahead
+            && let Some((predicate, adapter)) = scan_predicate(&self.input)
+        {
+            read_ahead.set_predicate(predicate, adapter);
+        }
         let inner = self.input.execute(partition, context)?;
         Ok(Box::pin(MeteredStream {
             schema: inner.schema(),
@@ -304,6 +355,20 @@ impl ExecutionPlan for MeteredExec {
             op_stats: self.op_stats.clone(),
         }))
     }
+}
+
+/// The filter of the file scan `plan`, if it is one and has a filter, with the
+/// scan's adapter from the table's schema to a file's.
+fn scan_predicate(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Option<(
+    Arc<dyn PhysicalExpr>,
+    Option<Arc<dyn PhysicalExprAdapterFactory>>,
+)> {
+    let scan = plan.downcast_ref::<DataSourceExec>()?;
+    let config = scan.data_source().downcast_ref::<FileScanConfig>()?;
+    let predicate = config.file_source().filter()?;
+    Some((predicate, config.expr_adapter_factory.clone()))
 }
 
 /// Per-poll CPU bracket around one partition's stream.

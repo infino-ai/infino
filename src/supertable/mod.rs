@@ -24,11 +24,14 @@
 //!   `SupertableReader` (snapshot-pinned reader).
 
 pub(crate) mod build;
-pub(crate) mod compaction;
+pub(crate) mod companion;
 pub mod error;
 pub(crate) mod gc;
+#[cfg(feature = "graph-index")]
+pub(crate) mod graph_index;
 pub mod handle;
 pub(crate) mod hidden_deleted;
+pub(crate) mod hydrate;
 pub mod lazy_source;
 pub mod manifest;
 pub mod mutations;
@@ -37,6 +40,8 @@ pub(crate) mod optimize;
 pub mod options;
 pub mod query;
 pub mod reader_cache;
+pub(crate) mod reindex;
+pub mod schema;
 pub(crate) mod slow_vector_state;
 pub mod stats;
 pub mod tombstones;
@@ -44,7 +49,9 @@ pub mod utils;
 pub mod wal;
 pub mod writer;
 
-pub use error::{BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError};
+pub use error::{
+    BuildError, CommitError, GcError, OpenError, OptimizeError, QueryError, ReindexError,
+};
 pub use gc::GcReport;
 pub use handle::{Supertable, SupertableReader};
 pub use lazy_source::StorageRangeSource;

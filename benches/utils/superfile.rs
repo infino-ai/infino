@@ -121,16 +121,20 @@ pub mod fts {
     //! Every phase uses the production path: [`SuperfileBuilder`] → unified
     //! `.parquet` → [`SuperfileReader`].
     //!
-    //! Pinned to 1M-doc Zipfian (200 tokens/doc, 10K vocab). The
-    //! single-superfile shape is rarely much larger in production — the
-    //! supertable bench covers the 10M+ scale.
+    //! Pinned to 1M docs of the realistic text flavour (log-normal lengths,
+    //! open Zipf vocabulary, within-doc burstiness); `corpus=synthetic`
+    //! selects the uniform historical corpus (200 tokens/doc, 10K vocab).
+    //! The single-superfile shape is rarely much larger in production —
+    //! the supertable bench covers the 10M+ scale.
     //!
     //! ## Invocation
     //!
     //! ```text
-    //! cargo bench -- superfile fts                 # build + search
+    //! cargo bench -- superfile fts                 # build + search + quality
     //! cargo bench -- superfile fts build           # ingest only
-    //! cargo bench -- superfile fts search          # search only
+    //! cargo bench -- superfile fts search          # search + quality, no build rows
+    //! cargo bench -- superfile fts quality         # BM25 top-k parity vs oracle
+    //! cargo bench -- superfile fts corpus=synthetic  # the uniform historical corpus
     //! INFINO_BENCH_UPDATE_README=1 cargo bench -- superfile fts
     //! ```
 
@@ -145,6 +149,7 @@ pub mod fts {
     use infino::superfile::{
         SuperfileReader,
         fts::reader::{BoolMode as InfinoBoolMode, OrAlgo},
+        id_space::RowId,
     };
 
     use crate::{
@@ -171,6 +176,9 @@ pub mod fts {
     // (`corpus::superfile_docs()`, default 1M, env-overridable). Captured
     // once per run into a local `n_docs`.
     pub const FTS_COLUMN: &str = "title";
+    /// Seed of the generated text corpus this cell builds from; the quality
+    /// oracle re-derives the corpus from the same seed.
+    const FTS_CORPUS_SEED: u64 = 1;
 
     /// Top-k for every search.
     pub const K: usize = 10;
@@ -281,7 +289,8 @@ pub mod fts {
                 .expect("search df=1");
         assert_eq!(hits.len(), 1, "df=1 term should return exactly one hit");
         assert_eq!(
-            hits[0].0 as usize, probe_doc_id,
+            hits[0].0.get() as usize,
+            probe_doc_id,
             "{probe_token} should match doc_id {probe_doc_id}"
         );
 
@@ -335,7 +344,7 @@ pub mod fts {
         const SCORE_EPSILON: f32 = 1e-4;
 
         for (label, terms) in battery {
-            let bmw_top10: Vec<(u32, f32)> = block_on_inmem(reader.bm25_search_pretokenized(
+            let bmw_top10: Vec<(RowId, f32)> = block_on_inmem(reader.bm25_search_pretokenized(
                 FTS_COLUMN,
                 terms,
                 K,
@@ -354,7 +363,7 @@ pub mod fts {
                     .unwrap_or(std::cmp::Ordering::Equal)
                     .then(a.0.cmp(&b.0))
             });
-            let brute_top10: Vec<(u32, f32)> = brute_full.into_iter().take(K).collect();
+            let brute_top10: Vec<(RowId, f32)> = brute_full.into_iter().take(K).collect();
 
             assert_eq!(
                 bmw_top10.len(),
@@ -441,11 +450,12 @@ pub mod fts {
                 .expect("negation oracle search");
             assert!(!hits.is_empty(), "{name}: no hits");
             for (doc_id, _) in &hits {
-                let text = docs[*doc_id as usize].1;
+                let text = docs[doc_id.get() as usize].1;
                 for neg in &negated {
                     assert!(
                         !text.split_whitespace().any(|w| w == *neg),
-                        "{name}: doc {doc_id} contains negated term {neg:?}"
+                        "{name}: doc {} contains negated term {neg:?}",
+                        doc_id.get()
                     );
                 }
             }
@@ -456,13 +466,17 @@ pub mod fts {
 
     /// Bench entry point. Invoked by `benches/fts/main.rs`.
     pub fn run(phases: Phases) {
+        // Before any corpus is generated: BM25 is measured on text-shaped
+        // distributions unless the command line says `corpus=synthetic`.
+        corpus::default_text_flavor_for_fts();
         let n_docs = corpus::superfile_docs();
         eprintln!(
-            "[superfile_fts] starting {} docs (build={}, warm={}, cold={})",
+            "[superfile_fts] starting {} docs (build={}, warm={}, cold={}, quality={})",
             fmt_count(n_docs),
             phases.build,
             phases.warm,
             phases.cold,
+            phases.quality,
         );
         let (corpus, result, index) = build_warm_artifact(n_docs, phases);
 
@@ -480,6 +494,20 @@ pub mod fts {
                 &result,
                 index.bytes().len() as u64,
             );
+        }
+
+        if phases.quality {
+            // Grades the exact artifact the speed rows search: one file,
+            // so the oracle's engine model is exact by construction.
+            crate::fts_quality::run_superfile(
+                &mut report,
+                index.reader(),
+                FTS_COLUMN,
+                n_docs,
+                FTS_CORPUS_SEED,
+                "superfile_fts",
+            );
+            report.save();
         }
 
         if phases.warm || phases.cold {
@@ -662,11 +690,13 @@ pub mod fts {
         // door, which is schema-driven. Refuse `corpus=` loudly rather than
         // silently measuring generated text under the real corpus's label.
         corpus::require_synthetic("superfile fts");
+        let flavor = corpus::text_flavor();
         eprintln!(
-            "[superfile_fts] generating {}-doc Zipfian corpus...",
-            fmt_count(n_docs)
+            "[superfile_fts] generating {}-doc {} corpus...",
+            fmt_count(n_docs),
+            flavor.label()
         );
-        let corpus = MmapTextCorpus::generate(n_docs, 1);
+        let corpus = MmapTextCorpus::generate_flavor(n_docs, FTS_CORPUS_SEED, flavor);
         let docs = corpus.rows();
 
         let run_warm_search = phases.warm;
@@ -956,8 +986,9 @@ pub mod fts {
         report.emit(&Section {
             anchor: "bench/fts/superfile/ingest".into(),
             title: format!(
-                "Superfile FTS — ingest, single-superfile / in-memory ({} docs, Zipfian, 200 tokens/doc, 10K vocab)",
-                fmt_count(n_docs)
+                "Superfile FTS — ingest, single-superfile / in-memory ({} docs, {} corpus)",
+                fmt_count(n_docs),
+                corpus::text_flavor().label()
             ),
             note: "Build path: `SuperfileBuilder` → unified `.parquet` (same as production supertable \
                    commit), through the engine-generic `run_fts` driver the cross-engine comparison also \

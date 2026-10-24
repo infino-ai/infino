@@ -11,22 +11,25 @@
 //!
 //! ```text
 //!   idf(t)      = ln(1 + (N - df(t) + 0.5) / (df(t) + 0.5))
-//!   tf_factor   = tf · (K1 + 1) / (tf + K1 · (1 - B + B · dl/avgdl))
+//!   tf_factor   = tf / (tf + K1 · (1 - B + B · dl/avgdl))
 //!   score(d, q) = Σ_{t ∈ q} idf(t) · tf_factor(tf(t, d), dl(d), avgdl)
 //!
 //!   K1 = 1.2,  B = 0.75            (standard BM25 defaults)
 //! ```
 //!
 //! Tokenization runs through whatever `Tokenizer` the caller
-//! supplies — pass [`crate::superfile::fts::tokenize::AsciiLowerTokenizer`]
+//! supplies — pass [`crate::superfile::fts::tokenize::StandardTokenizer`]
 //! to match the production pipeline.
 //!
 //! Result invariants match the optimized search path:
 //! top-k by descending score, ties broken by ascending doc_id.
 
-use std::{cmp::Ordering, collections::HashMap};
+use std::{borrow::Cow, cmp::Ordering, collections::HashMap};
 
-use crate::superfile::fts::tokenize::{Phrase, Tokenizer};
+use crate::superfile::fts::{
+    reader::BoolMode,
+    tokenize::{Phrase, Tokenizer},
+};
 
 /// Standard BM25 default parameters. Match the constants used by
 /// the production scoring path.
@@ -153,7 +156,13 @@ impl BruteForceBm25 {
             });
         }
 
-        let n = docs.len() as u32;
+        // Corpus statistics are defined over the documents that carry
+        // tokens, not over every row handed in. A document whose text
+        // analyzes to nothing — trivially, one that is all stopwords
+        // once the chain has run — cannot match any term, so counting
+        // it would deflate the average length and inflate the
+        // collection size for every term in the column.
+        let n = docs.iter().filter(|d| d.dl > 0).count() as u32;
         let avgdl = if n == 0 {
             0.0
         } else {
@@ -175,6 +184,45 @@ impl BruteForceBm25 {
     pub fn with_params(mut self, params: OracleBm25Params) -> Self {
         self.params = params;
         self
+    }
+
+    /// Normalize lengths with `avgdl` instead of this corpus's own
+    /// average. The engine scores every document of a superfile at the
+    /// average that file declares — the table-wide average as of the
+    /// file's commit — while idf stays table-wide; an oracle indexed
+    /// over the whole table and re-pointed at one file's average scores
+    /// that file's documents exactly as the engine does.
+    pub fn with_avgdl(mut self, avgdl: f32) -> Self {
+        self.avgdl = avgdl;
+        self
+    }
+
+    /// Top-k for `query` under the clause model, split into clauses by
+    /// `tokenizer` exactly as the reader splits it — so a difference in
+    /// how a query parses can never masquerade as a scoring difference.
+    /// `Phrase::map` carries each member's offset across, so a phrase is
+    /// graded at the spacing the parser derived.
+    pub fn top_k_query(
+        &self,
+        query: &str,
+        mode: BoolMode,
+        tokenizer: &dyn Tokenizer,
+        k: usize,
+    ) -> Vec<(u64, f32)> {
+        let clauses = tokenizer.parse(query).into_clauses(mode);
+        let own = |v: &[Cow<'_, str>]| -> Vec<String> { v.iter().map(|c| c.to_string()).collect() };
+        let own_ph = |v: &[Phrase<Cow<'_, str>>]| -> Vec<Phrase<String>> {
+            v.iter().map(|p| p.map(|t| t.to_string())).collect()
+        };
+        self.top_k_atoms(
+            &own(&clauses.musts),
+            &own_ph(&clauses.must_phrases),
+            &own(&clauses.shoulds),
+            &own_ph(&clauses.should_phrases),
+            &own(&clauses.negatives),
+            &own_ph(&clauses.negative_phrases),
+            k,
+        )
     }
 
     /// Brute-force top-k for a multi-term OR-mode BM25 query.
@@ -220,7 +268,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             if score > 0.0 {
                 scored.push((doc.doc_id, score));
@@ -285,7 +333,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             // With musts, every surviving doc matches (score > 0 since
             // idf is always positive); with none, only docs hit by at
@@ -369,7 +417,7 @@ impl BruteForceBm25 {
             let dl = doc.dl as f32;
             let (k1, b) = (self.params.k1, self.params.b);
             let dl_norm = k1 * (1.0 - b + b * dl / avgdl.max(f32::MIN_POSITIVE));
-            let tf_factor = |tf: u32| -> f32 { tf as f32 * (k1 + 1.0) / (tf as f32 + dl_norm) };
+            let tf_factor = |tf: u32| -> f32 { tf as f32 / (tf as f32 + dl_norm) };
 
             let mut score: f32 = 0.0;
             let mut matched_any_should = false;
@@ -438,7 +486,7 @@ impl BruteForceBm25 {
                 }
                 let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
                 let tf_f = tf as f32;
-                score += idf * tf_f * (k1 + 1.0) / (tf_f + dl_norm);
+                score += idf * tf_f / (tf_f + dl_norm);
             }
             scored.push((doc.doc_id, score));
         }

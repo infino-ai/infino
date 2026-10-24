@@ -5,15 +5,32 @@
 //! table ([`NormTable`]), per-column metadata ([`ColumnMeta`]) and its
 //! JSON config ([`FtsColumnConfig`]), and the reader [`OpenOptions`].
 
-use std::{ops::Range, sync::Arc};
+use std::{
+    fmt,
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use serde::Deserialize;
 
-use crate::superfile::fts::{
-    analysis::{Base, Stemmer, Stopwords},
-    bm25,
-    tokenize::Tokenizer,
+use crate::{
+    superfile::{
+        ReadError,
+        error::FtsError,
+        format::{CRC_BYTES, checksum::crc32c},
+        fts::{
+            analysis::{Stemmer, Stopwords},
+            bm25,
+            reader::core::read_doc_length,
+            tokenize::Tokenizer,
+        },
+        lazy_source::Source,
+    },
+    supertable::schema::FieldId,
 };
+
+/// The section a column's length array is read as, in a failed read's error.
+pub(super) const LENGTH_ARRAY: &str = "fts/doc_lengths_array";
 
 /// Per-doc BM25 length normalizer, quantized to one byte per doc.
 ///
@@ -31,8 +48,17 @@ use crate::superfile::fts::{
 pub struct NormTable {
     /// Per-doc quantized length bucket. Empty for a column with no docs.
     /// Parameter-free — the buckets are lengths, not norms — and shared
-    /// rather than copied so [`NormTable::rescored`] costs one `Arc`
+    /// rather than copied so [`NormTable::rescored`] costs one refcount
     /// bump plus a 1 KiB table instead of a pass over every doc.
+    ///
+    /// Owned, and deliberately so. A blob that stores its buckets hands the
+    /// reader the region directly, and holding it would cost no heap at all,
+    /// but scoring out of the mapping measured about 1.3 percent slower on a
+    /// large union over 5M documents: the mapped region does not have the
+    /// page locality of an array just written. Copying the stored bytes here
+    /// keeps the shape the scorer is tuned for, and what the stored buckets
+    /// are for survives the copy, since the expensive part of the load was
+    /// the per-document pass that derived them, not the allocation.
     bytes: Arc<[u8]>,
     /// Bucket → `k1·(1 - b + b·dequantize_len(bucket)/avgdl)`. A fixed
     /// 256-entry table, boxed so `ColumnMeta` stays pointer-sized (it is
@@ -46,41 +72,156 @@ pub struct NormTable {
     /// its supremum over lengths that occur rather than over all 256
     /// representable ones. `(0, 0)` for an empty column.
     occupied: (u8, u8),
+    /// The average document length `lut` was built at. Kept because it
+    /// is the other half of what determines the table — two tables can
+    /// share a parameter pair and still decode differently — so
+    /// [`NormTable::bound_scale`] can tell "nothing changed" from "the
+    /// average moved" without walking 256 buckets to find out.
+    avgdl: f32,
+}
+
+/// A column's document-length totals, summed over the stored
+/// doc-lengths array when the reader opens.
+///
+/// Both numbers are counted over the documents BM25's corpus
+/// statistics are actually defined over — the ones carrying at least
+/// one indexed token. A row whose cell was null occupies a slot in the
+/// doc-lengths array (the array is indexed by local doc id, so it
+/// cannot skip rows) with a length of zero, and a row whose text
+/// produced no tokens is indistinguishable from it; neither can match
+/// a term, and counting either would deflate the average and inflate
+/// the collection size for every term in the column.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ColumnLengthStats {
+    /// Exact sum of every document's token count in this column.
+    pub total_tokens: u64,
+    /// Documents carrying at least one indexed token in this column.
+    pub n_scored_docs: u64,
+}
+
+impl ColumnLengthStats {
+    /// Average length over the documents that carry tokens. `0.0` for a
+    /// column no document contributes to, which is the value
+    /// [`NormTable::new`] reads as "never scored".
+    pub fn avgdl(&self) -> f32 {
+        if self.n_scored_docs == 0 {
+            return 0.0;
+        }
+        (self.total_tokens as f64 / self.n_scored_docs as f64) as f32
+    }
+
+    /// Fold another column's totals in — the sum across superfiles that
+    /// turns per-file totals into table-wide ones.
+    pub fn merge_with(&mut self, other: &ColumnLengthStats) {
+        self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+        self.n_scored_docs = self.n_scored_docs.saturating_add(other.n_scored_docs);
+    }
+
+    /// These totals with `part`'s taken out; `None` when `part` holds more
+    /// than these do, so it cannot be a part of them.
+    pub fn without(&self, part: &ColumnLengthStats) -> Option<Self> {
+        Some(Self {
+            total_tokens: self.total_tokens.checked_sub(part.total_tokens)?,
+            n_scored_docs: self.n_scored_docs.checked_sub(part.n_scored_docs)?,
+        })
+    }
+
+    /// Count one document of `dl` tokens. A zero-length document — a null
+    /// or empty cell indexed to keep the per-doc arrays row-aligned — is
+    /// not a document this column has and contributes to neither total.
+    #[inline]
+    pub fn add(&mut self, dl: u32) {
+        if dl > 0 {
+            self.total_tokens += u64::from(dl);
+            self.n_scored_docs += 1;
+        }
+    }
+
+    /// The statistics of a column whose per-doc lengths are `lengths`.
+    pub fn from_lengths(lengths: impl IntoIterator<Item = u32>) -> Self {
+        let mut stats = Self::default();
+        for dl in lengths {
+            stats.add(dl);
+        }
+        stats
+    }
+
+    /// Fold two contributions where either may be unknown. Statistics
+    /// exist to be summed — the whole point of rolling them up is that
+    /// the table's average and collection size come out as they would
+    /// for one unfragmented file — and folding an unknown contributor in
+    /// as zero would silently shrink both. So an unknown side makes the
+    /// result unknown.
+    pub fn fold(acc: Option<Self>, next: Option<Self>) -> Option<Self> {
+        let (mut acc, next) = (acc?, next?);
+        acc.merge_with(&next);
+        Some(acc)
+    }
 }
 
 impl NormTable {
-    /// Build from a column's per-doc lengths and average length. An
-    /// `avgdl` of `0.0` (empty column) yields an empty table; it is
-    /// never indexed because `search` short-circuits on empty columns.
+    /// Build from a column's per-doc lengths, returning the table
+    /// alongside the totals the pass produced.
+    ///
+    /// The same pass that quantizes each length sums them, so the
+    /// column's statistics cost nothing extra; the table decodes at
+    /// `avgdl`, the average the file declares. A column no document
+    /// contributes to yields an empty table; it is never indexed because
+    /// `search` short-circuits on empty columns.
     pub(super) fn new(
         doc_lengths: impl Iterator<Item = u32>,
         n_docs: usize,
-        avgdl: f32,
         params: bm25::Bm25Params,
-    ) -> Self {
-        if avgdl <= 0.0 {
-            return Self::empty();
-        }
+        avgdl: f32,
+    ) -> (Self, ColumnLengthStats) {
         let mut bytes = Vec::with_capacity(n_docs);
         let mut lo = u8::MAX;
         let mut hi = u8::MIN;
+        let mut stats = ColumnLengthStats::default();
         for dl in doc_lengths {
             let bucket = bm25::quantize_len(dl);
             lo = lo.min(bucket);
             hi = hi.max(bucket);
             bytes.push(bucket);
+            stats.add(dl);
         }
-        let occupied = if bytes.is_empty() { (0, 0) } else { (lo, hi) };
-        Self {
+        if stats.n_scored_docs == 0 {
+            return (Self::empty(), stats);
+        }
+        let table = Self {
             bytes: Arc::from(bytes),
             lut: build_lut(avgdl, params),
+            occupied: (lo, hi),
+            avgdl,
+        };
+        (table, stats)
+    }
+
+    /// A table over buckets the blob already holds, with the occupied range
+    /// the writer recorded. Nothing is derived: the caller hands over the
+    /// bucket array it copied out of the region, and the only work here is
+    /// the 256-entry lookup table.
+    pub(super) fn from_stored(
+        bytes: Arc<[u8]>,
+        occupied: (u8, u8),
+        avgdl: f32,
+        params: bm25::Bm25Params,
+    ) -> Self {
+        if bytes.is_empty() {
+            return Self::empty();
+        }
+        Self {
+            bytes,
+            lut: build_lut(avgdl, params),
             occupied,
+            avgdl,
         }
     }
 
-    /// The same per-doc buckets decoded at different parameters — for a
-    /// query that overrides what its column declared. Shares `bytes`,
-    /// so the cost is one 256-entry table.
+    /// The same per-doc buckets decoded at a different average length
+    /// and/or parameter pair — for a query that overrides what the
+    /// column declared. Shares `bytes`, so the cost is one 256-entry
+    /// table.
     pub(super) fn rescored(&self, avgdl: f32, params: bm25::Bm25Params) -> Self {
         if self.bytes.is_empty() {
             return Self::empty();
@@ -89,7 +230,13 @@ impl NormTable {
             bytes: Arc::clone(&self.bytes),
             lut: build_lut(avgdl, params),
             occupied: self.occupied,
+            avgdl,
         }
+    }
+
+    /// The average document length this table decodes at.
+    pub(super) fn avgdl(&self) -> f32 {
+        self.avgdl
     }
 
     /// The factor `R >= 1` by which every bound built at `baked` must be
@@ -98,11 +245,11 @@ impl NormTable {
     /// `query`.
     ///
     /// The stored per-block bound is the block's true max of
-    /// `idf·tf·(k1+1) / (tf + dl_norm_k1)`. Between two parameter sets
-    /// the per-doc ratio is
+    /// `idf·tf / (tf + dl_norm_k1)`. Between two parameter sets the
+    /// per-doc ratio is
     ///
     /// ```text
-    ///   (k1'+1)/(k1+1) · (tf + A) / (tf + B),
+    ///   (tf + A) / (tf + B),
     ///       A = lut_baked[bucket],  B = lut_query[bucket]
     /// ```
     ///
@@ -111,14 +258,21 @@ impl NormTable {
     /// over `tf >= 1` is `max(1, (1+A)/(1+B))`; taking the max over the
     /// buckets docs actually occupy gives the supremum over the column.
     /// Loosening, never under-bounding, and exactly `1.0` when the two
-    /// parameter sets agree.
+    /// tables decode identically.
+    ///
+    /// The short-circuit tests the average as well as the parameters,
+    /// because either one moves the `lut` on its own: two tables at the
+    /// same `k1`/`b` but different averages produce different norms for
+    /// every bucket, and returning `1.0` for that pair would leave the
+    /// stored bounds below the scores they are supposed to cap — which
+    /// prunes documents out of the top-k with nothing to show for it.
     pub(super) fn bound_scale(
         &self,
         other: &NormTable,
         baked: bm25::Bm25Params,
         query: bm25::Bm25Params,
     ) -> f32 {
-        if baked == query || self.bytes.is_empty() {
+        if (baked == query && self.avgdl == other.avgdl) || self.bytes.is_empty() {
             return 1.0;
         }
         let (lo, hi) = self.occupied;
@@ -128,7 +282,7 @@ impl NormTable {
             let b = other.lut[bucket as usize];
             worst = worst.max((1.0 + a) / (1.0 + b));
         }
-        worst * (query.k1 + 1.0) / (baked.k1 + 1.0)
+        worst
     }
 
     /// `dl_norm_k1` for a doc (length quantized): one per-doc byte load
@@ -136,6 +290,13 @@ impl NormTable {
     #[inline(always)]
     pub(super) fn get(&self, doc: u32) -> f32 {
         self.lut[self.bytes[doc as usize] as usize]
+    }
+
+    /// The buckets this table scores by. Test-only: the query path indexes
+    /// them and never needs the slice.
+    #[cfg(test)]
+    pub(super) fn buckets(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Number of docs in the table. Test-only: the query path indexes
@@ -155,6 +316,7 @@ impl NormTable {
             bytes: Arc::from(Vec::new()),
             lut: Arc::new([0.0; 256]),
             occupied: (0, 0),
+            avgdl: 0.0,
         }
     }
 }
@@ -172,58 +334,401 @@ fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
 }
 
 /// Per-column metadata, indexed by column_id (declaration order).
+/// What scoring needs from a column's per-document length array: the
+/// norm table, the length statistics it was computed from, and the factor
+/// that keeps the stored bounds upper bounds. Built on first scored use —
+/// see [`ColumnMeta::norms`] — so a query that only matches, or that a
+/// table-level term index resolves without this superfile's dictionary,
+/// never reads the array.
 #[derive(Debug, Clone)]
+pub struct ColumnNorms {
+    pub dl_norm_k1: NormTable,
+    pub length_stats: ColumnLengthStats,
+    /// `1.0` at the declared parameters, whose stored bounds are exact;
+    /// the override factor when the column is scored at other parameters.
+    pub bound_scale: f32,
+}
+
+impl ColumnNorms {
+    /// Build from a column's length array, at `params` (the pair the stored
+    /// bounds were baked at) and the average the file declares, at which
+    /// the stored bounds are exact.
+    pub(super) fn from_array(
+        array: &[u8],
+        n_docs: usize,
+        params: bm25::Bm25Params,
+        baked_avgdl: f32,
+    ) -> Self {
+        let (dl_norm_k1, length_stats) = NormTable::new(
+            (0..n_docs).map(|d| read_doc_length(array, d)),
+            n_docs,
+            params,
+            baked_avgdl,
+        );
+        Self {
+            dl_norm_k1,
+            length_stats,
+            bound_scale: 1.0,
+        }
+    }
+
+    /// Build from the buckets the blob stores, with the statistics and
+    /// occupied range it recorded beside them, so no document is touched.
+    pub(super) fn from_stored(
+        buckets: Arc<[u8]>,
+        stored: &StoredNorms,
+        params: bm25::Bm25Params,
+        baked_avgdl: f32,
+    ) -> Self {
+        if stored.stats.n_scored_docs == 0 {
+            return Self::empty();
+        }
+        Self {
+            dl_norm_k1: NormTable::from_stored(buckets, stored.occupied, baked_avgdl, params),
+            length_stats: stored.stats,
+            bound_scale: 1.0,
+        }
+    }
+
+    /// The norms for a column that has none to read (a failed or empty
+    /// array): every score computes against an empty table.
+    fn empty() -> Self {
+        Self {
+            dl_norm_k1: NormTable::empty(),
+            length_stats: ColumnLengthStats::default(),
+            bound_scale: 1.0,
+        }
+    }
+}
+
+/// The one empty table a failed read scores against, shared by every
+/// column in the process: it belongs to no column, so it is never put in a
+/// column's cell, which stays empty for the next read to fill.
+fn empty_norms() -> &'static ColumnNorms {
+    static EMPTY: OnceLock<ColumnNorms> = OnceLock::new();
+    EMPTY.get_or_init(ColumnNorms::empty)
+}
+
+/// The norm table a merge that never scores is handed: its sink never asks
+/// for a score, so the table is never indexed, and passing this one keeps an
+/// unranked match from reading the column's length array for nothing.
+pub(super) fn unscored_norm_table() -> &'static NormTable {
+    &empty_norms().dl_norm_k1
+}
+
+impl ColumnNorms {
+    /// These norms re-derived at `params` and `avgdl`, for a view that
+    /// scores with other parameters than `declared` (the ones the stored
+    /// bounds were baked at) or another average length. The per-doc length
+    /// buckets are shared, not copied.
+    fn rescored(&self, declared: bm25::Bm25Params, params: bm25::Bm25Params, avgdl: f32) -> Self {
+        let dl_norm_k1 = self.dl_norm_k1.rescored(avgdl, params);
+        Self {
+            bound_scale: self.bound_scale
+                * self.dl_norm_k1.bound_scale(&dl_norm_k1, declared, params),
+            dl_norm_k1,
+            length_stats: self.length_stats,
+        }
+    }
+}
+
+/// What a [`crate::superfile::format::fts::VERSION_V9`] blob records for a
+/// column so that opening it costs no pass over its documents: where the
+/// stored bucket array lies, the column's totals, and the lowest and highest
+/// bucket its documents occupy.
+#[derive(Clone, Debug)]
+pub(super) struct StoredNorms {
+    pub(super) buckets: Range<usize>,
+    pub(super) stats: ColumnLengthStats,
+    pub(super) occupied: (u8, u8),
+}
+
+/// One FTS column as the reader sees it: its configuration, where its
+/// length array sits, and the norms scoring needs — built lazily, see
+/// [`Self::norms`].
+#[derive(Clone)]
 pub struct ColumnMeta {
     pub name: String,
-    /// Byte range into [`FtsReader::blob`] holding this column's
-    /// `u32` doc-lengths array (4 bytes per doc, length × n_docs).
+    /// The column's stable id, when the writer stamped one.
+    pub field_id: Option<FieldId>,
     pub doc_lengths_range: Range<usize>,
-    /// Average doc length across this column. `0.0` if the column has
-    /// no docs.
-    pub avgdl: f32,
-    /// Per-doc BM25 length normalizer, byte-quantized — see
-    /// [`NormTable`]. Computed once per reader at `open` time from the
-    /// column's on-disk doc-lengths array. The hot scoring loop reads
-    /// `dl_norm_k1.get(d)` and multiplies-out to `idf · tf · (K1+1) /
-    /// (tf + dl_norm_k1.get(d))`.
-    pub dl_norm_k1: NormTable,
-    /// The parameters this column is being *scored* with. Equal to the
-    /// pair recorded in the KV entry unless the query overrode it, in
-    /// which case `dl_norm_k1` has been re-decoded to match and
-    /// `bound_scale` carries the correction for the stored bounds.
+    /// The parameters this column is scored at: the declared pair, or an
+    /// override's (see `FtsReader::with_bm25_override`).
     pub params: bm25::Bm25Params,
-    /// Factor to apply to every bound read out of the skip table or the
-    /// coarse table before comparing it against a score. `1.0` unless
-    /// the query overrode this column's parameters, in which case it is
-    /// [`NormTable::bound_scale`] between the baked pair and the
-    /// query's — the stored bounds belong to the baked pair, and
-    /// inflating them by this keeps them upper bounds under the pair
-    /// actually being scored.
-    pub bound_scale: f32,
-    /// Whether this column's index carries token positions (from
-    /// `inf.fts.columns`); phrase queries require it.
     pub positions: bool,
-    /// Tokenizer for this column, reconstructed at open time from the
-    /// `tokenizer` name in `inf.fts.columns` plus its `stopwords` /
-    /// `stemmer` fields. Query terms for this column must be tokenized
-    /// with it to match how the column was indexed.
     pub tokenizer: Arc<dyn Tokenizer>,
-    /// The column's base tokenizer, kept beside the assembled
-    /// [`ColumnMeta::tokenizer`] so a rebuild can reconstruct the same
-    /// chain from its components. `Tokenizer::name` reports the chain's
-    /// derived identity, which is not a name any lookup accepts back.
-    pub(crate) base: Base,
-    /// The column's stopword set, kept for the same reason as
-    /// [`ColumnMeta::base`].
     pub stopwords: Stopwords,
-    /// The column's stemmer, kept for the same reason as
-    /// [`ColumnMeta::base`].
     pub stemmer: Stemmer,
-    /// Whether the column's raw text is kept in the Parquet body (from
-    /// `inf.fts.columns`). Index-only columns (`false`) are searchable
-    /// but absent from the stored schema, so they cannot be read back;
-    /// a rebuild carries their postings across instead of re-tokenizing.
     pub stored: bool,
+    /// Revision of the analysis that produced this column's terms (from
+    /// `inf.fts.columns`), or `None` when the file records no revision
+    /// (always stale).
+    ///
+    /// Below what this engine's chain emits, the column's terms and a
+    /// query's terms can disagree for the same text, so the column is
+    /// stale and a reindex must re-analyze it. Carried across a rewrite
+    /// unchanged: copying postings does not re-analyze them.
+    ///
+    /// `None` is not `Some(0)`. A recorded zero is a known-stale carry; an
+    /// absent field is an unknown, and only a caller that can rule out a
+    /// carry may credit it with the writer's revision — see
+    /// [`FtsReader::staleness`](crate::superfile::fts::reader::FtsReader).
+    pub analysis_revision: Option<u32>,
+    /// Where the length array is read from when the norms are first needed.
+    pub(super) source: Source,
+    pub(super) n_docs: u32,
+    pub(super) baked_avgdl: f32,
+    /// The average length this column is scored at: the baked one, or a
+    /// scoring view's (see `FtsReader::with_scoring`).
+    pub(super) score_avgdl: f32,
+    /// The pair the stored bounds were baked at.
+    pub(super) declared_params: bm25::Bm25Params,
+    /// Whether the length array's CRC is checked when it is read.
+    pub(super) verify_crc: bool,
+    /// Present when the blob stores its buckets; absent on an older blob,
+    /// which quantizes its lengths on first scored use instead.
+    ///
+    /// Boxed to keep [`ColumnMeta`] the width it was. The summary is read
+    /// once, on the column's first scored use; the struct holding it is
+    /// walked by paths that do no scoring at all, and this file already
+    /// boxes the scorer's lookup table for the same reason.
+    pub(super) stored_norms: Option<Box<StoredNorms>>,
+    /// Norms at the declared parameters, shared by every view of the reader.
+    pub(super) base_norms: Arc<OnceLock<ColumnNorms>>,
+    /// Norms at `params` when they differ from the declared pair, derived
+    /// from the base on first use; each override view has its own.
+    pub(super) view_norms: Arc<OnceLock<ColumnNorms>>,
+}
+
+impl fmt::Debug for ColumnMeta {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnMeta")
+            .field("name", &self.name)
+            .field("doc_lengths_range", &self.doc_lengths_range)
+            .field("params", &self.params)
+            .field("positions", &self.positions)
+            .field("stored", &self.stored)
+            .field("norms_loaded", &self.base_norms.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ColumnMeta {
+    /// The norms at the declared parameters, reading the length array now
+    /// if no scoring entry point has done so yet. The entry points prewarm
+    /// through `FtsReader::ensure_norms` on the async path, which fails the
+    /// query on a read that fails; this synchronous fallback exists so a
+    /// kernel can never find the norms absent. A read that fails here logs
+    /// and scores against an empty table rather than aborting mid-kernel,
+    /// and leaves the cell empty, so the next prewarm reads again. A caller
+    /// that must not count a failure as an empty column (the commit path's
+    /// length totals) reads through [`Self::try_length_stats`] instead.
+    fn base_norms(&self) -> &ColumnNorms {
+        if let Some(norms) = self.base_norms.get() {
+            return norms;
+        }
+        self.try_base_norms().unwrap_or_else(|error| {
+            tracing::error!(column = %self.name, %error, "doc-length array unreadable; scoring against empty norms");
+            // A racing reader may have set the cell meanwhile; its table is
+            // the real one.
+            match self.base_norms.get() {
+                Some(norms) => norms,
+                None => empty_norms(),
+            }
+        })
+    }
+
+    /// The norms at the declared parameters, reading and checking the length
+    /// array now if the cell is empty; a read that fails is returned and
+    /// leaves the cell empty.
+    ///
+    /// The read runs outside the cell rather than inside `get_or_init`. An
+    /// initializer that fetches holds the cell's lock across the fetch, and
+    /// every other thread reaching the same cold column then parks on that
+    /// lock with no way to yield: on an `infino-io` worker that is the
+    /// runtime's own core, and the fetch that would release it is driven by
+    /// that runtime. Two threads racing here may both read the array; the
+    /// first to set wins and either is the same table, the trade the async
+    /// prewarm already makes.
+    fn try_base_norms(&self) -> Result<&ColumnNorms, FtsError> {
+        if let Some(norms) = self.base_norms.get() {
+            return Ok(norms);
+        }
+        let array = self
+            .source
+            .get_range(self.array_with_crc_range())
+            .map_err(|e| FtsError::RangeFetch {
+                what: LENGTH_ARRAY,
+                source: e,
+            })?;
+        self.install_norms(&array)
+    }
+
+    /// Check `array_with_crc` (the length array and its CRC, as read) and
+    /// build the declared-parameter norms from it into the cell: the one way
+    /// a read of the array becomes norms, whichever path read it. A racing
+    /// reader may have filled the cell first; either is the same table.
+    pub(super) fn install_norms(&self, array_with_crc: &[u8]) -> Result<&ColumnNorms, FtsError> {
+        self.check_array_crc(array_with_crc)?;
+        let norms = match &self.stored_norms {
+            // The buckets are already in the region, so this copies them
+            // rather than deriving them: one memcpy in place of a pass that
+            // quantized every document and summed its length. The copy is
+            // what keeps the scorer's memory shape unchanged.
+            Some(stored) => {
+                let lengths_len = self.doc_lengths_range.len();
+                let buckets =
+                    Arc::from(&array_with_crc[lengths_len..lengths_len + stored.buckets.len()]);
+                ColumnNorms::from_stored(buckets, stored, self.declared_params, self.baked_avgdl)
+            }
+            None => self.norms_from_array(&array_with_crc[..self.doc_lengths_range.len()]),
+        };
+        Ok(self.base_norms.get_or_init(|| norms))
+    }
+
+    /// The bytes a column's trailing CRC covers: its length array, and the
+    /// bucket array beside it when the blob stores one. Read off the ranges
+    /// the open path computed and bounded against the blob, so no reader of
+    /// the region carries arithmetic of its own.
+    pub(super) fn array_len(&self) -> usize {
+        self.doc_lengths_range.len()
+            + self
+                .stored_norms
+                .as_ref()
+                .map_or(0, |stored| stored.buckets.len())
+    }
+
+    /// The length array with the CRC that trails it: what a reader fetches.
+    /// The open path refused a column whose array plus CRC ran past the
+    /// source, so this end is within the blob, and the sum cannot overflow.
+    pub(super) fn array_with_crc_range(&self) -> Range<usize> {
+        let start = self.doc_lengths_range.start;
+        start..start + self.array_len() + CRC_BYTES
+    }
+
+    /// Check the CRC that trails the length array in `array_with_crc`, when
+    /// verification is on. The array is `n_docs × DOC_LENGTH_BYTES` long
+    /// and its CRC32C follows it.
+    pub(super) fn check_array_crc(&self, array_with_crc: &[u8]) -> Result<(), FtsError> {
+        if !self.verify_crc {
+            return Ok(());
+        }
+        let len = self.array_len();
+        let Some(crc_bytes) = array_with_crc.get(len..len + CRC_BYTES) else {
+            return Err(FtsError::Read(ReadError::Malformed(
+                "doc-lengths array shorter than its CRC".into(),
+            )));
+        };
+        let expected = u32::from_le_bytes([crc_bytes[0], crc_bytes[1], crc_bytes[2], crc_bytes[3]]);
+        if expected != crc32c(&array_with_crc[..len]) {
+            return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                section: LENGTH_ARRAY,
+                column: format!(" (column '{}')", self.name),
+            }));
+        }
+        Ok(())
+    }
+
+    /// Build the declared-parameter norms from the column's length array.
+    pub(super) fn norms_from_array(&self, array: &[u8]) -> ColumnNorms {
+        ColumnNorms::from_array(
+            array,
+            self.n_docs as usize,
+            self.declared_params,
+            self.baked_avgdl,
+        )
+    }
+
+    /// The norms this column scores with: the declared ones, or the
+    /// override view's, derived from them on first use. A view is derived
+    /// only from the base in the cell, never from what [`Self::base_norms`]
+    /// returned: that may be the empty fallback of a read that failed, and
+    /// a racing reader may fill the cell between the fallback and here — a
+    /// view cached from the fallback would outlive the failure it stood in
+    /// for, and its empty table is one `get` must never see.
+    pub(super) fn norms(&self) -> &ColumnNorms {
+        let base = self.base_norms();
+        if self.scores_as_declared() {
+            return base;
+        }
+        let Some(base) = self.base_norms.get() else {
+            return base;
+        };
+        self.view_norms
+            .get_or_init(|| base.rescored(self.declared_params, self.params, self.score_avgdl))
+    }
+
+    /// Whether this column scores at what its file declares, so the stored
+    /// bounds hold as they are.
+    fn scores_as_declared(&self) -> bool {
+        self.params == self.declared_params && self.score_avgdl == self.baked_avgdl
+    }
+
+    /// Whether the declared-parameter norms have been built.
+    pub(super) fn norms_loaded(&self) -> bool {
+        self.base_norms.get().is_some()
+    }
+
+    /// The BM25 length-normalization table; see [`Self::norms`].
+    pub fn dl_norm_k1(&self) -> &NormTable {
+        &self.norms().dl_norm_k1
+    }
+
+    /// The length statistics the norms were computed from.
+    pub fn length_stats(&self) -> ColumnLengthStats {
+        self.norms().length_stats
+    }
+
+    /// [`Self::length_stats`] for a caller that records them: a length array
+    /// that cannot be read is returned as the error, never counted as a
+    /// column with no tokens. The same at any parameters: rescoring keeps
+    /// the lengths.
+    pub(super) fn try_length_stats(&self) -> Result<ColumnLengthStats, FtsError> {
+        Ok(self.try_base_norms()?.length_stats)
+    }
+
+    /// The factor that keeps this column's stored bounds upper bounds under
+    /// the parameters it is scored at. Exactly `1.0` when scored at the
+    /// declared parameters, known without reading anything.
+    pub fn bound_scale(&self) -> f32 {
+        if self.scores_as_declared() {
+            return 1.0;
+        }
+        self.norms().bound_scale
+    }
+}
+
+impl ColumnMeta {
+    /// The collection size this column's inverse document frequency is
+    /// computed against: the documents that carry tokens here, not the
+    /// superfile's row count.
+    ///
+    /// The two differ by however many rows are null for this column,
+    /// and using the row count does not merely shift every term's
+    /// weight by a constant — the document frequency it is compared
+    /// against is not rescaled with it, so a column that is null for
+    /// most rows ends up weighting its common terms too heavily against
+    /// its rare ones. Counting only documents that could match keeps
+    /// each column's weighting independent of how often it is filled.
+    pub fn scored_doc_count(&self) -> u64 {
+        self.length_stats().n_scored_docs
+    }
+
+    /// The tf a df=1 inline dictionary slot scores with. On a positional
+    /// column the slot carries the term's single position, tf implied 1:
+    /// the builder only inlines tf == 1 postings there.
+    pub(super) fn inline_tf(&self, slot: u32) -> u32 {
+        match self.positions {
+            true => 1,
+            false => slot,
+        }
+    }
+
+    /// The average document length this column is scored at — the one
+    /// its norm table decodes with.
+    pub fn avgdl(&self) -> f32 {
+        self.dl_norm_k1().avgdl()
+    }
 }
 
 /// JSON-deserialized form of one entry in `inf.fts.columns`. The KV
@@ -231,40 +736,29 @@ pub struct ColumnMeta {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FtsColumnConfig {
     pub name: String,
-    /// The column's analyzer name: `"ascii_lower"` or `"standard"`.
-    /// Required — the builder has always emitted it, so a column entry
-    /// without it is a malformed footer and open fails rather than
-    /// guessing which analyzer produced the postings.
-    pub tokenizer: String,
+    /// The column's stable id, when the writer stamped one.
+    #[serde(default)]
+    pub field_id: Option<u32>,
+    /// Base tokenizer name. Absent or `"standard"` opens; any other name
+    /// refuses the file (see `check_recorded_tokenizer`).
+    #[serde(default)]
+    pub tokenizer: Option<String>,
     /// Whether this column's index records token positions (phrase
-    /// support). Files written before positions existed lack the
-    /// field, which can only mean no positions — so a missing field
-    /// deserializes to `false`.
+    /// support). Absent means `false`.
     #[serde(default)]
     pub positions: bool,
-    /// Whether the raw text is kept in the Parquet body. Files written
-    /// before index-only columns existed lack the field, which can only
-    /// mean the text is stored — so a missing field deserializes to
-    /// `true` (the writer emits it only when `false`).
+    /// Whether the raw text is kept in the Parquet body. Absent means
+    /// `true`; the writer emits it only when `false`.
     #[serde(default = "default_stored")]
     pub stored: bool,
     /// BM25 term-frequency saturation this column's stored block-max
-    /// bounds were built with. Files written before the parameters were
-    /// recordable lack the field, and can only have been built with the
-    /// standard value — so the default here is frozen at
-    /// [`bm25::K1`] and must not follow a change to what the API
-    /// recommends. The writer emits it unconditionally, defaults
-    /// included, so no reader of a current file has to fall back on
-    /// this.
-    #[serde(default = "default_k1")]
+    /// bounds were built with. Required: the writer always records it.
     pub k1: f32,
-    /// BM25 length normalization, same provenance and same frozen
-    /// default ([`bm25::B`]) as [`FtsColumnConfig::k1`].
-    #[serde(default = "default_b")]
+    /// BM25 length normalization the bounds were built with; required
+    /// like [`FtsColumnConfig::k1`].
     pub b: f32,
     /// Stopword set applied to this column, by name. Absent means no
-    /// set — the one thing a file written before the filter existed can
-    /// mean, so a missing field needs no guess. A *present* name this
+    /// set. A *present* name this
     /// engine does not ship is a different matter and fails the open:
     /// there is no sound way to analyze without a set the index was
     /// built with.
@@ -274,6 +768,28 @@ pub struct FtsColumnConfig {
     /// and unknown-name-fails rules as [`FtsColumnConfig::stopwords`].
     #[serde(default)]
     pub stemmer: Option<String>,
+    /// Revision of the analysis that produced this column's terms.
+    ///
+    /// Per column rather than per file, for two reasons. It is derived
+    /// from [`Self::stopwords`] and [`Self::stemmer`], which a caller
+    /// sets per column — two columns of
+    /// one table can be analyzed by different chains and so sit at
+    /// different revisions. And a re-analysis can only rebuild columns
+    /// whose text was stored, carrying the rest across untouched, so it
+    /// leaves a file holding both the new revision and the old one. A
+    /// file-level field would have to claim one of them for columns it
+    /// did not repair.
+    ///
+    /// `None` only when the file records no revision: the writer emits
+    /// the field unconditionally, zero included, so "unrecorded" stays
+    /// distinguishable from "recorded as stale".
+    ///
+    /// Unlike the other defaults here, a missing field is not "the
+    /// feature was off": it is "unknown". Treating it as the oldest
+    /// revision is the only reading that cannot make a stale column look
+    /// current.
+    #[serde(default)]
+    pub analysis_revision: Option<u32>,
 }
 
 impl FtsColumnConfig {
@@ -303,21 +819,13 @@ pub(super) fn default_stored() -> bool {
     true
 }
 
-pub(super) fn default_k1() -> f32 {
-    bm25::K1
-}
-
-pub(super) fn default_b() -> f32 {
-    bm25::B
-}
-
 /// Per-open knobs for [`FtsReader::open_with`]. Mirrors the
 /// vector reader's `OpenOptions` so the superfile layer can
 /// pass a single `verify_crc` flag through to both
 /// sub-readers.
 #[derive(Debug, Clone, Copy)]
 pub struct OpenOptions {
-    /// Verify the four per-section CRC32C checks (FST,
+    /// Verify the four per-section CRC32C checks (term dictionary,
     /// postings region, doc-lengths directory, per-column
     /// doc-lengths arrays). Defaults to `true`; flip to
     /// `false` only when the underlying storage already
@@ -346,16 +854,16 @@ mod tests {
     /// the deserializer directly because both are invisible in a
     /// round-trip through our own writer.
     ///
-    /// Absent means off: a file written before the filters existed has
-    /// no such field, and that can only mean it was built unfiltered —
-    /// so a current reader infers the right analysis with no guess. An
+    /// Absent means off: a file with no such field was built
+    /// unfiltered. An
     /// unrecognized *value* is the opposite case and must not be
     /// tolerated: analyzing without a set the postings were built with
     /// is a different index, not a degraded one.
     #[test]
     fn absent_analysis_fields_mean_off_and_unknown_values_are_refused() {
         let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard"}"#).expect("parse");
+            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}"#)
+                .expect("parse");
         assert_eq!(entry.stopwords, None);
         assert_eq!(entry.stemmer, None);
         assert_eq!(
@@ -364,7 +872,7 @@ mod tests {
         );
 
         let entry: FtsColumnConfig = serde_json::from_str(
-            r#"{"name":"body","tokenizer":"standard","stopwords":"english","stemmer":"english"}"#,
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"english","stemmer":"english"}"#,
         )
         .expect("parse");
         assert_eq!(
@@ -373,20 +881,197 @@ mod tests {
         );
 
         // A filter this engine does not ship, in either field.
-        let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stopwords":"german"}"#)
-                .expect("the field parses; resolving it is what fails");
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stopwords":"german"}"#,
+        )
+        .expect("the field parses; resolving it is what fails");
         assert_eq!(entry.filters(), Err(("stopwords", "german")));
-        let entry: FtsColumnConfig =
-            serde_json::from_str(r#"{"name":"body","tokenizer":"standard","stemmer":"porter"}"#)
-                .expect("parse");
+        let entry: FtsColumnConfig = serde_json::from_str(
+            r#"{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"stemmer":"porter"}"#,
+        )
+        .expect("parse");
         assert_eq!(entry.filters(), Err(("stemmer", "porter")));
     }
 
     use super::{super::test_util::*, *};
-    use crate::superfile::fts::{
-        builder::FtsBuilder, reader::FtsReader, tokenize::AsciiLowerTokenizer,
-    };
+    use crate::superfile::fts::{builder::FtsBuilder, reader::FtsReader};
+
+    // ── Column length totals ──────────────────────────────────────────
+
+    #[test]
+    fn length_totals_sum_and_average_over_documents_that_carry_tokens() {
+        let mut a = ColumnLengthStats {
+            total_tokens: 40,
+            n_scored_docs: 4,
+        };
+        assert_eq!(a.avgdl(), 10.0);
+        a.merge_with(&ColumnLengthStats {
+            total_tokens: 20,
+            n_scored_docs: 1,
+        });
+        // 60 tokens over 5 documents — the fold is a plain sum, which is
+        // what makes a fragmented table average the same as one file.
+        assert_eq!(a.total_tokens, 60);
+        assert_eq!(a.n_scored_docs, 5);
+        assert_eq!(a.avgdl(), 12.0);
+    }
+
+    #[test]
+    fn a_column_no_document_contributes_to_has_no_average() {
+        // Not a division by zero and not a 1.0 default: zero is the value
+        // `NormTable::new` reads as "never scored", which keeps an empty
+        // column off the scoring path entirely.
+        let empty = ColumnLengthStats::default();
+        assert_eq!(empty.avgdl(), 0.0);
+        let mut a = empty;
+        a.merge_with(&empty);
+        assert_eq!(a.avgdl(), 0.0);
+    }
+
+    #[test]
+    fn merging_an_empty_contributor_changes_nothing() {
+        // A superfile that indexes the column but holds no document with
+        // tokens in it must leave the table-wide average alone rather
+        // than pulling it toward zero.
+        let mut a = ColumnLengthStats {
+            total_tokens: 99,
+            n_scored_docs: 9,
+        };
+        let before = a.avgdl();
+        a.merge_with(&ColumnLengthStats::default());
+        assert_eq!(a.avgdl(), before);
+        assert_eq!(a.n_scored_docs, 9);
+    }
+
+    // ── Corpus statistics over a sparse column ────────────────────────
+
+    /// Number of rows carrying text in the sparse fixture below.
+    const SPARSE_FILLED_ROWS: u32 = 2;
+    const SPARSE_EMPTY_ROWS: u32 = 6;
+
+    /// Two documents of two tokens each, then rows this column is null
+    /// for: four tokens over two documents, eight rows.
+    fn sparse_builder() -> FtsBuilder {
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        b.add_doc(0, 0, "alpha beta").expect("doc 0");
+        b.add_doc(0, 1, "alpha gamma").expect("doc 1");
+        for row in 0..SPARSE_EMPTY_ROWS {
+            b.add_doc(0, SPARSE_FILLED_ROWS + row, "")
+                .expect("null row");
+        }
+        b
+    }
+
+    fn sparse_reader() -> FtsReader {
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        FtsReader::open(
+            Bytes::from(sparse_builder().finish().expect("finish")),
+            json,
+        )
+        .expect("open")
+    }
+
+    #[test]
+    fn folding_an_unknown_contributor_makes_the_total_unknown() {
+        let known = Some(ColumnLengthStats {
+            total_tokens: 100,
+            n_scored_docs: 10,
+        });
+        let more = Some(ColumnLengthStats {
+            total_tokens: 50,
+            n_scored_docs: 15,
+        });
+        assert_eq!(
+            ColumnLengthStats::fold(known, more),
+            Some(ColumnLengthStats {
+                total_tokens: 150,
+                n_scored_docs: 25,
+            })
+        );
+        assert_eq!(ColumnLengthStats::fold(known, None), None);
+        assert_eq!(ColumnLengthStats::fold(None, more), None);
+        assert_eq!(
+            ColumnLengthStats::from_lengths([3, 0, 1, 0]),
+            ColumnLengthStats {
+                total_tokens: 4,
+                n_scored_docs: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn statistics_count_documents_with_tokens_not_rows() {
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        // Four tokens over the two documents that have any.
+        assert_eq!(col.length_stats().total_tokens, 4);
+        assert_eq!(
+            col.length_stats().n_scored_docs,
+            u64::from(SPARSE_FILLED_ROWS),
+            "empty rows are not documents this column has"
+        );
+        assert_eq!(col.scored_doc_count(), u64::from(SPARSE_FILLED_ROWS));
+        // 4 / 2, not 4 / 8 — dividing by the row count would deflate the
+        // average by the fill rate and over-reward short documents.
+        assert_eq!(col.avgdl(), 2.0);
+        // The doc-lengths array still has one slot per row: the array is
+        // indexed by local doc id and cannot skip rows.
+        assert_eq!(
+            col.dl_norm_k1().len(),
+            (SPARSE_FILLED_ROWS + SPARSE_EMPTY_ROWS) as usize
+        );
+    }
+
+    #[test]
+    fn a_sparse_column_declares_the_average_over_its_documents() {
+        // The builder divides by the documents that carry tokens, so the
+        // file declares the corrected average and its bounds — exact
+        // scores at that average — need no inflation.
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        assert_eq!(col.avgdl(), 2.0);
+        assert_eq!(col.bound_scale(), 1.0);
+    }
+
+    #[test]
+    fn bound_scale_reacts_to_the_average_alone() {
+        // Two tables at the same k1/b but different averages need an
+        // inflation factor; comparing only the parameter pair would return
+        // 1.0 and under-bound every score.
+        let r = sparse_reader();
+        let col = &r.columns[0];
+        let wider = col.dl_norm_k1().rescored(col.avgdl() * 2.0, col.params);
+        let factor = col.dl_norm_k1().bound_scale(&wider, col.params, col.params);
+        assert!(
+            factor > 1.0,
+            "same parameters, larger average: expected an inflation factor, got {factor}"
+        );
+        // And it is still exactly 1.0 when nothing moves at all.
+        let same = col.dl_norm_k1().rescored(col.avgdl(), col.params);
+        assert_eq!(
+            col.dl_norm_k1().bound_scale(&same, col.params, col.params),
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_column_with_no_text_is_never_scored() {
+        // Every row null: no document carries a token, so there is no
+        // average to normalize against and the table stays empty rather
+        // than dividing by zero.
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for row in 0..4 {
+            b.add_doc(0, row, "").expect("null row");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let col = &r.columns[0];
+        assert_eq!(col.length_stats().n_scored_docs, 0);
+        assert_eq!(col.avgdl(), 0.0);
+        assert_eq!(col.dl_norm_k1().len(), 0);
+    }
 
     // ── Additional coverage ───────────────────────────────────────────
 
@@ -417,21 +1102,6 @@ mod tests {
     }
 
     #[test]
-    fn fts_column_config_without_tokenizer_is_rejected() {
-        // The analyzer name is load-bearing: query terms must be
-        // tokenized the way the postings were. A column entry missing it
-        // is a malformed footer, so open fails instead of picking an
-        // analyzer for the caller.
-        let (blob, _) = build_blob();
-        let json = r#"[{"name":"body"}]"#;
-        let err = FtsReader::open(blob, json).expect_err("missing tokenizer must fail open");
-        assert!(
-            err.to_string().contains("tokenizer"),
-            "error should name the missing field: {err}"
-        );
-    }
-
-    #[test]
     fn fts_columns_config_exposes_per_column_metadata() {
         let (blob, json) = build_blob();
         let r = FtsReader::open(blob, &json).expect("open");
@@ -440,8 +1110,8 @@ mod tests {
         assert_eq!(cols[0].name, "body");
         // Three non-empty docs ⇒ a positive average doc length and a
         // populated per-doc normalization table.
-        assert!(cols[0].avgdl > 0.0);
-        assert_eq!(cols[0].dl_norm_k1.len(), 3);
+        assert!(cols[0].avgdl() > 0.0);
+        assert_eq!(cols[0].dl_norm_k1().len(), 3);
     }
 
     #[test]
@@ -451,8 +1121,7 @@ mod tests {
         // 4-byte-per-doc `f32` table it replaced. Build enough
         // varied-length docs that the per-doc term dominates the LUT.
         const N: u32 = 5_000;
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
             .expect("register column");
         for d in 0..N {
@@ -463,9 +1132,9 @@ mod tests {
             b.add_doc(0, d, text.trim()).expect("add doc");
         }
         let bytes = b.finish().expect("finish");
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
-        let nt = &r.columns[0].dl_norm_k1;
+        let nt = r.columns[0].dl_norm_k1();
 
         let per_doc = nt.bytes.len(); // 1 byte/doc
         let lut = std::mem::size_of_val(&*nt.lut); // 256 * 4 = 1 KiB

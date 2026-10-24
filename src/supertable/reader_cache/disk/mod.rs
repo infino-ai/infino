@@ -5,6 +5,8 @@
 //! eviction. Split across sibling files: `read` (open a superfile), `fetch` (cold-fetch it in), `budget`
 //! (reserve and evict), `store_files` (the on-disk directory), and `sources` (mmap).
 
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashSet,
     fmt, fs,
@@ -57,6 +59,20 @@ const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Yield cadence while a background fill waits for its foreground reader.
 const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
+/// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
+/// not memory or query time.
+pub(super) const WRITE_BEHIND_CAP_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Share of [`WRITE_BEHIND_CAP_BYTES`], in percent, that downloads ahead of reads may use. The
+/// rest is left for reads' own downloads.
+pub(super) const AHEAD_WRITE_BEHIND_PERCENT: u64 = 50;
+
+/// Block-file writes a store runs at once. Each one holds a thread of the blocking pool, which a
+/// query also needs to hand off its worker in `block_in_place`; more writers would not write faster
+/// anyway, since they wait on the same disk.
+pub(super) const BLOCK_WRITERS: usize = 4;
 
 /// Filename suffix for per-superfile sparse block-cache files.
 const BLOCKS_FILE_SUFFIX: &str = ".blocks";
@@ -118,14 +134,13 @@ fn file_mtime_us(meta: &fs::Metadata) -> u64 {
         .unwrap_or(0)
 }
 
-/// Pause this URI's background full-object fill while a caller besides the
-/// cache entry holds its lazy reader (`strong_count > 1`). Unrelated URIs
-/// are unaffected — that is the per-URI quiescence contract.
+/// Pause this URI's background fill while a caller besides the cache entry holds its lazy reader
+/// (`strong_count > 1`). Other URIs are unaffected.
 fn reader_blocks_background_fill(reader: &Weak<SuperfileReader>) -> bool {
     reader.strong_count() > 1
 }
 
-/// Errors surfaced by [`DiskCacheStore::reader`].
+/// Errors surfaced by [`DiskCacheStore::open_for_query`] and its sibling reader entry points.
 #[derive(Debug, Error)]
 pub enum DiskCacheError {
     #[error("storage error during cold fetch")]
@@ -138,14 +153,12 @@ pub enum DiskCacheError {
     /// parse. The source [`crate::superfile::ReadError`] chain is
     /// preserved so callers that want variant-level detail can
     /// match on it instead of a stringified message.
-    #[error("superfile reader failed to open bytes")]
+    #[error("superfile reader failed to open bytes: {0}")]
     SuperfileOpenRead(#[from] crate::superfile::ReadError),
-    /// Eviction couldn't free enough space because every
-    /// cached entry was pinned (or there were no cached
-    /// entries and the incoming superfile alone exceeds the
-    /// disk budget). The query layer can fall back to a
-    /// `RangeOnly` path on this error; the cache itself just
-    /// surfaces it as a typed error.
+    /// Eviction could not free enough space: every cached entry is pinned, or the incoming
+    /// superfile alone exceeds the budget. Raised by whole-file reads (a `Load`, the hybrid
+    /// fetch); [`DiskCacheStore::open_for_query`] degrades to an uncached range-only reader on it.
+    /// A lazy open never raises it: past the budget it stays a lazy entry.
     #[error("disk cache budget exceeded with no eligible victims")]
     BudgetExceeded,
     /// An invalid or conflicting configuration was supplied.
@@ -171,16 +184,51 @@ pub(crate) struct CachedEntry {
     last_access_us: AtomicU64,
 }
 
-/// Where a cached entry's bytes currently live. Lines up with the three tiers
-/// [`DiskCacheStore::reader`] checks in order: memory, disk, then object store.
+/// Which tier of the cache's walk served an open. Returned beside the reader so a scan can say
+/// how much of it was local, as counts, rather than tracing every file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenTier {
+    /// The whole file was already mmapped or buffered in this process. No I/O.
+    Memory,
+    /// The whole file was on local disk from a prior run or a finished fill; mmapped, no GETs.
+    Disk,
+    /// A lazy reader was already open for the file; the read rides its block cache.
+    Lazy,
+    /// Nothing was local: opened against the object store.
+    Source,
+    /// Another caller's walk for the same file was in flight, and this open waited on it.
+    Coalesced,
+    /// The file could not be admitted to the cache (the hybrid fetch's whole-file download), so
+    /// it is read uncached, range by range.
+    Streamed,
+}
+
+/// What a read needs locally. It decides two things: whether a cached entry is a hit (a whole
+/// file serves every intent, a lazy [`Residency::Paged`] entry serves `Stream` and `Warm` but not
+/// `Load`), and how a miss is fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadIntent {
+    /// Read ranges on demand through the block cache and never download the whole file. A whole
+    /// file already on local disk is still used, since it costs no GETs. Vector search.
+    Stream,
+    /// Serve now from ranges, and download the whole file in the background toward a local mmap
+    /// when the budget can hold it; otherwise the entry stays lazy, as a `Stream` read's does.
+    /// FTS and SQL queries, and other non-vector reads.
+    Warm,
+    /// Download the whole file and mmap it before serving; a lazy entry is never enough. Every
+    /// compaction input, user table or hidden index, since the merge reads all of it.
+    Load,
+}
+
+/// Where a cached entry's bytes live. `Mapped` and `Buffered` hold the whole file; `Paged` holds
+/// only the ranges read so far.
 enum Residency {
     /// Whole superfile in an anonymous heap buffer, and the only copy. A background task writes it
     /// to disk and promotes it to [`Residency::Mapped`].
     Buffered,
-    /// Superfile mmapped from the local cache file. Usually the whole object; `vector_source` is
-    /// `Some` when the vector blob was deliberately left out of the file (vector search reads only
-    /// a few clusters, so downloading the whole blob is wasteful) and is served from the block
-    /// cache instead. Parquet and FTS always come from the mmap.
+    /// Superfile mmapped from the local cache file. `vector_source` is `Some` when the vector blob
+    /// was left out of the file (vector search reads only a few clusters of it) and is served from
+    /// the block cache instead. Parquet and FTS always come from the mmap.
     Mapped {
         mmap: Arc<Mmap>,
         vector_source: Option<Arc<BlockCachedSource>>,
@@ -207,6 +255,15 @@ impl CachedEntry {
         matches!(self.residency, Residency::Mapped { .. })
     }
 
+    /// Whether the whole file is local, [`Residency::Mapped`] or [`Residency::Buffered`], so reads
+    /// need no GETs.
+    fn has_whole_file(&self) -> bool {
+        matches!(
+            self.residency,
+            Residency::Mapped { .. } | Residency::Buffered
+        )
+    }
+
     /// The live block source: a [`Residency::Paged`] entry's source, or the retained vector hole of
     /// a [`Residency::Mapped`] entry.
     fn block_source(&self) -> Option<&Arc<BlockCachedSource>> {
@@ -224,6 +281,22 @@ impl CachedEntry {
             _ => None,
         }
     }
+
+    /// Every byte this entry keeps charged: its own `size_bytes`, plus the blocks a retained vector
+    /// source charges for itself.
+    #[cfg(test)]
+    fn charged_bytes(&self) -> u64 {
+        let own = self.size_bytes.load(Ordering::Acquire);
+        match &self.residency {
+            Residency::Mapped {
+                vector_source: Some(source),
+                ..
+            } if source.owns_accounting() => {
+                own + source.filled_bytes_handle().load(Ordering::Acquire)
+            }
+            _ => own,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,17 +307,7 @@ enum EntryAccounting {
     SourceOwned,
 }
 
-/// How a promoted entry lands in `cached` (see [`DiskCacheStore::install_promoted_entry`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InstallMode {
-    /// Foreground cold-fetch: insert unconditionally, the slot is ours.
-    Fresh,
-    /// Background finalizer: replace only if still present, else drop the file (evicted mid-fill).
-    ReplaceIfPresent,
-}
-
-/// Coalescing cell — concurrent cold readers on the same URI
-/// share one `OnceCell` and observe the same fetch result.
+/// One in-flight walk for a URI: concurrent readers share the `OnceCell` and its result.
 type Coordinator = Arc<OnceCell<Result<Arc<CachedEntry>, DiskCacheError>>>;
 
 /// Snapshot of the disk cache's load. Surfaced via
@@ -278,25 +341,36 @@ struct UnindexedFile {
     mtime_us: u64,
 }
 
-/// Pulls superfile bytes through a [`StorageProvider`] and
-/// caches them locally as mmap-backed `SuperfileReader`s.
-///
-/// Construction is sync; `reader()` is async (cold fetches
-/// go through the storage provider's async interface).
+/// Pulls superfile bytes through a [`StorageProvider`] and caches them locally as mmap-backed
+/// `SuperfileReader`s. Construction is sync; the reads ([`Self::open_for_query`] and its siblings)
+/// are async, since a miss fetches through the provider's async interface.
 pub struct DiskCacheStore {
     storage: Arc<dyn StorageProvider>,
     config: DiskCacheConfig,
     started_at: Instant,
     cached: DashMap<SuperfileUri, Arc<CachedEntry>>,
-    /// Per-URI cold-fetch coalescing. Inserted by the first
-    /// caller to touch a cold URI; subsequent callers find
-    /// the same `OnceCell` and `await` it via
-    /// `get_or_try_init`.
+    /// One in-flight walk per URI (tiers 2 to 4). The first caller to miss creates the cell and
+    /// runs the walk; later callers await it. Removed once the walk settles.
     coordinators: DashMap<SuperfileUri, Coordinator>,
     /// Files on disk that no read has opened yet. Filled by `scan_cache_root`, drained by reuse or eviction.
     unindexed: DashMap<SuperfileUri, UnindexedFile>,
     block_files: DashMap<SuperfileUri, UnindexedFile>,
     current_bytes: AtomicU64,
+    /// Bytes of fetched runs handed to the block-file writers and not written yet. Past
+    /// [`WRITE_BEHIND_CAP_BYTES`] a read's run is not cached, so a slow disk limits memory, not
+    /// queries.
+    write_behind_bytes: AtomicU64,
+    /// Room reserved by downloads ahead of reads that are still downloading; see
+    /// [`Self::try_reserve_ahead`].
+    ahead_bytes: AtomicU64,
+    /// [`BLOCK_WRITERS`] slots; a fetched run waits for one before its write takes a thread.
+    block_writers: Arc<Semaphore>,
+    /// Queued block-file writes not finished yet (index write included), and a wake-up when it
+    /// reaches zero; see [`Self::block_writes_settled`].
+    #[cfg(test)]
+    block_writes: AtomicUsize,
+    #[cfg(test)]
+    block_writes_idle: Notify,
     /// Live disk budget in bytes, seeded from `config.disk_budget_bytes`.
     /// An engine-managed (auto-sized) budget is raised — never lowered —
     /// by [`Self::reconcile_budget_floor`] as the table's on-storage
@@ -335,6 +409,8 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
+    /// Numbers each download's tempfile, see [`Self::tmp_path`].
+    tmp_seq: AtomicU64,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -358,6 +434,9 @@ mod read;
 mod sources;
 mod store_files;
 
+#[cfg(test)]
+pub(crate) use budget::BlockWriteTicket;
+pub(crate) use budget::Reservation;
 pub(crate) use fetch::skip_background_fill;
 pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
 
@@ -393,6 +472,13 @@ impl DiskCacheStore {
             unindexed: DashMap::new(),
             block_files: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            write_behind_bytes: AtomicU64::new(0),
+            ahead_bytes: AtomicU64::new(0),
+            block_writers: Arc::new(Semaphore::new(BLOCK_WRITERS)),
+            #[cfg(test)]
+            block_writes: AtomicUsize::new(0),
+            #[cfg(test)]
+            block_writes_idle: Notify::new(),
             budget_bytes: AtomicU64::new(configured_budget),
             budget_auto_sized: AtomicBool::new(false),
             budget_warned: AtomicBool::new(false),
@@ -404,6 +490,7 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
+            tmp_seq: AtomicU64::new(0),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -462,21 +549,6 @@ impl DiskCacheStore {
         storage
             .map(Arc::clone)
             .unwrap_or_else(|| Arc::clone(&self.storage))
-    }
-
-    /// Whether `uri` has any cache entry — including a still-lazy
-    /// `LazyForegroundWithBackgroundFill` reader whose `mmap` is `None`.
-    /// Use [`Self::is_mmap_promoted`] to test for residency.
-    pub fn is_cached(&self, uri: &SuperfileUri) -> bool {
-        self.cached.contains_key(uri)
-    }
-
-    /// Whether `uri` is cached with a finished mmap promotion
-    /// (`CachedEntry::mmap == Some`). False while
-    /// `LazyForegroundWithBackgroundFill` still holds the lazy
-    /// in-memory reader or the background download is in flight.
-    pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
-        self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
     }
 
     /// Snapshot of the cache's load. Cheap; reads atomics +
@@ -568,26 +640,6 @@ impl DiskCacheStore {
         *g = pinned_fn;
     }
 
-    /// Observability accessor: invoke the currently-installed
-    /// `pinned_fn` and return its result. Useful for tests
-    /// that want to assert which URIs are protected from
-    /// eviction at the moment of the call; also for
-    /// debug-time inspection of long-running caches.
-    ///
-    /// Cheap: clones the `Arc<dyn Fn>` out of the mutex,
-    /// drops the lock, then invokes the closure. The closure
-    /// itself is whatever the caller installed — most
-    /// commonly the `Weak<SupertableInner>`-based snapshot
-    /// installed by [`crate::supertable::Supertable::create`]
-    /// / [`crate::supertable::Supertable::open`].
-    pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
-        let f = {
-            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
-            Arc::clone(&g)
-        };
-        f()
-    }
-
     pub(crate) fn now_us(&self) -> u64 {
         self.started_at.elapsed().as_micros() as u64
     }
@@ -595,6 +647,12 @@ impl DiskCacheStore {
     /// Build a per-URI cache file path under `cache_root`.
     pub(crate) fn cache_path(&self, uri: &SuperfileUri) -> PathBuf {
         self.config.cache_root.join(uri.cache_filename())
+    }
+
+    /// Where a promoted copy of `uri` lives when its vector blob was left out; see
+    /// [`SuperfileUri::cache_hole_filename`].
+    pub(crate) fn hole_path(&self, uri: &SuperfileUri) -> PathBuf {
+        self.config.cache_root.join(uri.cache_hole_filename())
     }
 
     /// Build a per-URI sparse block-cache path under `cache_root`.
@@ -612,25 +670,64 @@ impl DiskCacheStore {
         ))
     }
 
-    /// Build a per-URI tempfile path (sparse destination
-    /// during cold fetch; renamed to `cache_path` on success).
+    /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once complete. Every
+    /// call names a new file, since several downloads of one superfile can run at once.
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        self.config.cache_root.join(uri.cache_tmp_filename())
+        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
+        self.config.cache_root.join(uri.cache_tmp_filename(seq))
+    }
+
+    // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
+    // the shipped library.
+
+    /// Whether `uri` has any cache entry at all, including a lazy [`Residency::Paged`] one. Use
+    /// [`Self::is_mmap_promoted`] to test for a finished whole-file mmap.
+    #[cfg(test)]
+    pub(crate) fn is_cached(&self, uri: &SuperfileUri) -> bool {
+        self.cached.contains_key(uri)
+    }
+
+    /// Whether `uri` is cached as a [`Residency::Mapped`] entry. False while it is still lazy or
+    /// its background fill is in flight.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn is_mmap_promoted(&self, uri: &SuperfileUri) -> bool {
+        self.cached.get(uri).map(|e| e.is_mapped()).unwrap_or(false)
+    }
+
+    /// The URIs the installed `pinned_fn` protects from eviction right now. The closure is called
+    /// outside the mutex.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn current_pinned_uris(&self) -> HashSet<SuperfileUri> {
+        let f = {
+            let g = self.pinned_fn.lock().expect("pinned_fn mutex poisoned");
+            Arc::clone(&g)
+        };
+        f()
     }
 }
 
 #[cfg(test)]
-mod test_support {
-    use std::{sync::Arc, time::Duration};
+pub(crate) mod test_support {
+    use std::{
+        ops::Range,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use arrow_array::{LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use object_store::MultipartUpload;
     use roaring::RoaringBitmap;
     use tempfile::TempDir;
+    use tokio::{sync::Notify, time::sleep};
 
     use crate::{
-        storage::{LocalFsStorageProvider, StorageProvider},
+        storage::{LocalFsStorageProvider, ObjectMeta, StorageError, StorageProvider},
         superfile::{
             BytesLazyByteSource, LazyByteSource,
             builder::{BuilderOptions, SuperfileBuilder},
@@ -638,13 +735,102 @@ mod test_support {
         supertable::{
             manifest::SuperfileUri,
             reader_cache::{
-                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES, serialize_index},
+                block_source::{
+                    BlockCachedSource, CACHE_BLOCK_BYTES, SourceLayout, serialize_index,
+                },
                 config::DiskCacheConfig,
                 disk::*,
             },
         },
         test_helpers::{decimal128_id_field, decimal128_ids, default_vector_config},
     };
+
+    /// Storage that records every ranged GET, so a test can check which bytes left object storage.
+    /// [`Self::pause_next_read`] parks the next ranged GET until [`Self::resume`], so a test can act
+    /// in the middle of a download.
+    #[derive(Debug)]
+    pub(crate) struct RecordingStorage {
+        inner: Arc<dyn StorageProvider>,
+        ranges: Mutex<Vec<Range<u64>>>,
+        pause_next: AtomicBool,
+        paused: AtomicBool,
+        resume: Notify,
+    }
+
+    impl RecordingStorage {
+        pub(crate) fn over(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                ranges: Mutex::new(Vec::new()),
+                pause_next: AtomicBool::new(false),
+                paused: AtomicBool::new(false),
+                resume: Notify::new(),
+            })
+        }
+
+        pub(crate) fn n_ranges(&self) -> usize {
+            self.ranges.lock().expect("ranges").len()
+        }
+
+        pub(crate) fn ranges_since(&self, from: usize) -> Vec<Range<u64>> {
+            self.ranges.lock().expect("ranges")[from..].to_vec()
+        }
+
+        pub(crate) fn pause_next_read(&self) {
+            self.pause_next.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn is_paused(&self) -> bool {
+            self.paused.load(Ordering::SeqCst)
+        }
+
+        pub(crate) fn resume(&self) {
+            self.resume.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for RecordingStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.ranges.lock().expect("ranges").push(range.clone());
+            if self.pause_next.swap(false, Ordering::SeqCst) {
+                self.paused.store(true, Ordering::SeqCst);
+                self.resume.notified().await;
+            }
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
 
     /// A block source over empty storage, for tests that only need a [`Residency::Paged`] entry to
     /// exist. Does not own budget accounting, so dropping it never touches `current_bytes`.
@@ -658,7 +844,7 @@ mod test_support {
             Arc::downgrade(store),
             uri,
             store.blocks_path(&uri),
-            None,
+            SourceLayout::default(),
         )
     }
 
@@ -693,6 +879,34 @@ mod test_support {
     pub(crate) const PROMOTE_TIMEOUT: Duration = Duration::from_secs(10);
     /// Long enough to cover several background quiet-interval checks.
     pub(crate) const FOREGROUND_GUARD_HOLD: Duration = Duration::from_millis(50);
+    /// Long enough for a promotion to be observed if one were coming, short
+    /// enough to keep a "stays deferred" assertion quick.
+    pub(crate) const DEFER_OBSERVATION: Duration = Duration::from_millis(500);
+
+    /// Poll [`DiskCacheStore::is_mmap_promoted`] until it turns true or
+    /// `within` elapses.
+    ///
+    /// Deliberately not [`DiskCacheStore::wait_until_mmap_promoted`]: that
+    /// registers a promotion waiter, which is itself an override of the
+    /// fill's deferral, so a test using it cannot tell whether promotion
+    /// happened on its own.
+    pub(crate) async fn poll_until_mmap_promoted(
+        store: &Arc<DiskCacheStore>,
+        uri: &SuperfileUri,
+        within: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if store.is_mmap_promoted(uri) {
+                return true;
+            }
+            sleep(POLL_INTERVAL).await;
+        }
+        store.is_mmap_promoted(uri)
+    }
+
+    /// Gap between `is_mmap_promoted` polls.
+    const POLL_INTERVAL: Duration = Duration::from_millis(5);
     /// Large enough that one-byte sequential range reads cannot finish before
     /// the preemption test enters its foreground guard.
     pub(crate) const PREEMPT_TEST_BYTES: usize = 1 << 20;
@@ -721,6 +935,45 @@ mod test_support {
         let titles = LargeStringArray::from(vec!["alpha"]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)]).expect("batch");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Rows in [`multi_block_superfile_bytes`]: enough that the file spans several cache blocks.
+    const MULTI_BLOCK_ROWS: u64 = 40_000;
+    /// Characters per title in [`multi_block_superfile_bytes`].
+    const MULTI_BLOCK_TITLE_CHARS: usize = 64;
+
+    /// A scalar superfile several cache blocks long, with titles that barely compress, so a test
+    /// can read a block no open or query has touched.
+    pub(crate) fn multi_block_superfile_bytes() -> Bytes {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let schema = Arc::new(Schema::new(vec![
+            decimal128_id_field("doc_id"),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(schema.clone(), "doc_id", vec![], vec![]);
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let titles: Vec<String> = (0..MULTI_BLOCK_ROWS)
+            .map(|_| {
+                (0..MULTI_BLOCK_TITLE_CHARS)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        ALPHABET[(state % 64) as usize] as char
+                    })
+                    .collect()
+            })
+            .collect();
+        let ids = decimal128_ids((1..=MULTI_BLOCK_ROWS).collect::<Vec<u64>>());
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(LargeStringArray::from(titles))],
+        )
+        .expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }

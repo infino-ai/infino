@@ -25,6 +25,7 @@ use infino::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
+        id_space::RowId,
     },
     test_helpers::decimal128_ids,
 };
@@ -93,16 +94,16 @@ const PROBES: &[(&str, &str)] = &[
     ("body", "\"async runtime\""),
 ];
 
-async fn hits(r: &SuperfileReader, column: &str, query: &str) -> Vec<(u32, f32)> {
+async fn hits(r: &SuperfileReader, column: &str, query: &str) -> Vec<(RowId, f32)> {
     r.bm25_hits_async(column, query, K_ALL, BoolMode::Or)
         .await
         .expect("bm25 probe")
 }
 
 /// Assert `got` and `want` agree on both membership order and scores.
-fn assert_same_hits(got: &[(u32, f32)], want: &[(u32, f32)], label: &str) {
-    let g: Vec<u32> = got.iter().map(|(d, _)| *d).collect();
-    let w: Vec<u32> = want.iter().map(|(d, _)| *d).collect();
+fn assert_same_hits(got: &[(RowId, f32)], want: &[(RowId, f32)], label: &str) {
+    let g: Vec<u32> = got.iter().map(|(d, _)| d.get()).collect();
+    let w: Vec<u32> = want.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(g, w, "{label}: doc membership/order diverged");
     for ((d, gs), (_, ws)) in got.iter().zip(want.iter()) {
         assert!(
@@ -141,12 +142,12 @@ async fn index_only_column_is_searchable_but_not_stored() {
     // Ranked search and phrase both work over the index-only column.
     let got = hits(&r, "body", "fast").await;
     assert_eq!(
-        got.iter().map(|(d, _)| *d).collect::<Vec<_>>().len(),
+        got.iter().map(|(d, _)| d.get()).collect::<Vec<_>>().len(),
         3,
         "every doc mentions fast"
     );
     let got = hits(&r, "body", "\"fast async\"").await;
-    let ids: Vec<u32> = got.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = got.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(ids, vec![0, 2], "phrase matches contiguous docs only");
 }
 

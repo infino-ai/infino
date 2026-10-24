@@ -13,15 +13,18 @@
 use std::collections::{HashMap, HashSet};
 
 use infino::{
+    Stopwords,
     superfile::{
         SuperfileReader,
+        builder::FtsConfig,
         fts::{reader::BoolMode, tokenize::Phrase},
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 
 use crate::fts::brute_force_oracle::{
-    build_infino_superfile_positional, build_multi_block_corpus, corpus, oracle_top_k_atoms,
+    build_infino_superfile_positional, build_infino_superfile_with_fts, build_multi_block_corpus,
+    corpus, oracle_top_k_atoms,
 };
 
 /// k large enough to capture every match on the 60-doc corpus.
@@ -31,7 +34,7 @@ const K_ALL_MULTI_BLOCK: usize = 1024;
 /// Score-equality tolerance between the two BM25 implementations.
 const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 
-async fn search_hits(
+pub async fn search_hits(
     reader: &SuperfileReader,
     query: &str,
     k: usize,
@@ -42,13 +45,14 @@ async fn search_hits(
         .await
         .expect("phrase query")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect()
 }
 
 /// Compare reader results against the phrase oracle for `query`:
-/// identical match sets, per-doc scores within tolerance.
-async fn assert_matches_oracle(
+/// identical match sets, per-doc scores within tolerance. Shared with
+/// the boundary tests, which grade every shape the same way.
+pub async fn assert_matches_oracle(
     reader: &SuperfileReader,
     oracle: &BruteForceBm25,
     query: &str,
@@ -148,18 +152,23 @@ async fn three_token_phrase_and_absent_member() {
 
 #[tokio::test]
 async fn dropped_token_leaves_a_phrase_gap() {
-    // The default tokenizer drops runs containing non-ASCII bytes.
-    // A dropped run must still leave a position gap, or the tokens on
-    // either side of it would look adjacent and a phrase would match
-    // text that isn't contiguous.
+    // English stopwords drop `the` at index time. A dropped token must
+    // still leave a position gap, or the tokens on either side of it
+    // would look adjacent and a phrase would match text that isn't
+    // contiguous.
     let corp = vec![
-        (0u64, "new york"),          // genuinely adjacent → must match
-        (1, "new café york"),        // dropped word between → must NOT match
-        (2, "café new york"),        // dropped word before the phrase → matches
-        (3, "new york café"),        // dropped word after the phrase → matches
-        (4, "new naïve fresh york"), // dropped word + real word between → no match
+        (0u64, "new york"),        // genuinely adjacent → must match
+        (1, "new the york"),       // dropped word between → must NOT match
+        (2, "the new york"),       // dropped word before the phrase → matches
+        (3, "new york the"),       // dropped word after the phrase → matches
+        (4, "new the fresh york"), // dropped word + real word between → no match
     ];
-    let r = build_infino_superfile_positional(&corp);
+    let r = build_infino_superfile_with_fts(
+        &corp,
+        FtsConfig::new("title")
+            .positions(true)
+            .stopwords(Stopwords::English),
+    );
     let hits = search_hits(&r, r#""new york""#, K_ALL, BoolMode::Or).await;
     let mut ids: Vec<u64> = hits.iter().map(|(d, _)| *d).collect();
     ids.sort_unstable();

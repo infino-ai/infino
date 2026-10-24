@@ -15,21 +15,78 @@ export const BUILDER_ID: string = builderId();
 
 const STREAM = "stream";
 
+// Options the engine no longer takes, with what replaces each. The addon
+// drops unknown keys, so these throw rather than be silently ignored.
+const REMOVED_SEARCH_OPTIONS: Record<string, string> = {
+  stats: "term search scores with table-wide statistics; prefix search and lazily loaded tables score each segment with its own",
+};
+const REMOVED_REINDEX_OPTIONS: Record<string, string> = {
+  trustWriterAnalysis: "every superfile records its analysis revision",
+};
+
+/** Throws a `TypeError` naming the first removed option `opts` carries. */
+function rejectRemovedOptions(call: string, opts: object | null | undefined, removed: Record<string, string>): void {
+  if (opts == null) return;
+  for (const key of Object.keys(opts)) {
+    if (Object.hasOwn(removed, key)) {
+      throw new TypeError(`${call}: option \`${key}\` is not supported: ${removed[key]}`);
+    }
+  }
+}
+
 // --- public types ---
 
-/** Vector distance metric. */
-export type Metric = "cosine" | "l2sq" | "negdot";
+/** Vector distance metric. `l2` and `dot` are accepted spellings of `l2sq`
+ * and `negdot`, matching the Python binding and the hosted API. */
+export type Metric = "cosine" | "l2sq" | "l2" | "negdot" | "dot";
 /** Boolean mode for multi-term FTS queries. */
 export type BoolMode = "or" | "and";
-/** BM25 statistics scope: corpus-wide `"global"` IDF across superfiles
- * (the default) or `"per_superfile"` segment-local IDF. */
-export type Bm25Stats = "per_superfile" | "global";
 /** A row from a query/search when not materializing to Arrow. */
 export type RowRecord = Record<string, unknown>;
 /** A plain `{ column: type }` schema descriptor for `createTable`. */
 export type SchemaDescriptor = Record<string, string | { vector: number }>;
 /** Accepted shapes for `Table.append`. */
 export type AppendData = RowRecord[] | arrow.Table | arrow.RecordBatch | Buffer | Uint8Array;
+
+/** A column's index in the schema document: full-text or vector. */
+export type ColumnIndex =
+  | { kind: "fts"; analyzer: string; stopwords?: string; stemmer?: string; positions: boolean; stored: boolean; k1: number; b: number }
+  | { kind: "vector"; metric: Metric; rot_seed: string; rerank_codec: string };
+/** One field of the schema document. `type` is the document's type vocabulary (`"i64"`, `"large_utf8"`, …); a vector column carries `dim`. */
+export interface SchemaField {
+  id: number;
+  name: string;
+  type: string;
+  dim?: number;
+  nullable: boolean;
+  index?: ColumnIndex;
+  converting_from?: { type: string; dim?: number };
+}
+/** The schema document `Connection.schema` returns. */
+export interface TableSchema {
+  schema_id: number;
+  last_field_id: number;
+  max_fields: number;
+  max_depth: number;
+  fields: SchemaField[];
+  tombstoned: number[];
+}
+/** One field of a schema patch: a new column (`type` required), or a change to a live one addressed by `id` or `name`. */
+export interface SchemaFieldPatch {
+  id?: number;
+  name: string;
+  type?: string;
+  dim?: number;
+  nullable?: boolean;
+  index?: ColumnIndex;
+  dropped?: boolean;
+}
+/** What `Connection.schema(name, patch)` accepts: the document's own shape, every key optional. */
+export interface SchemaPatch {
+  fields?: SchemaFieldPatch[];
+  max_fields?: number;
+  max_depth?: number;
+}
 
 /**
  * Storage and cache config the `connect` URI can't carry. All optional.
@@ -110,14 +167,89 @@ export interface OptimizeOptions {
   /** How old a sealed tombstone sidecar has to be, in milliseconds,
    * before compaction treats its owner as dead and takes over. */
   staleSealTimeoutMs?: number;
+  /** When to recalibrate the vector probe laws (the O(N) query-serving
+   * calibration): `"auto"` (default — only when membership changed or the
+   * rerank pool lags), `"force"` (always), or `"skip"` (never; storage
+   * compaction still runs). Omit for `"auto"`. */
+  recalibrate?: "auto" | "force" | "skip";
+}
+
+/** How much a reindex repairs. `"auto"` gives each superfile the cheapest
+ * repair that makes it current; `"rewrite"` brings layouts current and leaves
+ * superfiles whose terms are stale (reported); `"reanalyze"` re-tokenizes every
+ * stale superfile from its stored text. */
+export type ReindexMode = "auto" | "rewrite" | "reanalyze";
+
+/** Options for `reindex`, `reindexPlan` and `indexStaleness`; all fields
+ * optional (omitted ⇒ engine default). Repairs the full-text index. */
+export interface ReindexOptions {
+  /** How much to repair; omit for `"auto"`. */
+  mode?: ReindexMode;
+  /** How old a sealed tombstone sidecar has to be, in milliseconds, before a
+   * rewrite takes it over. Omit to use the table's compaction setting. */
+  staleSealTimeoutMs?: number;
+}
+
+/** What a `reindex` did. */
+export interface ReindexReport {
+  /** Superfiles rewritten into the current format. */
+  rewritten: number;
+  /** Superfiles already current when the run planned. */
+  alreadyCurrent: number;
+  /** Superfiles holding terms from an older analysis that this run's mode
+   * cannot repair (non-zero only under `"rewrite"`). */
+  awaitingReanalysis: number;
+  /** Stale superfiles another run held; run again to finish them. */
+  heldByAnotherRun: number;
+  /** Columns whose text was never stored, so no repair can fix their terms;
+   * only re-ingesting them from source can. */
+  unrepairableColumns: string[];
+  /** Superfiles left untouched because their footer places a blob where
+   * the file or its manifest entry contradicts; they need inspection. */
+  inconsistentFooters: string[];
+}
+
+/** What a `reindex` would do, and what it would cost. */
+export interface StalenessReport {
+  /** Superfiles in the table, stale or not. */
+  superfiles: number;
+  /** Superfiles whose layout is behind — what `"rewrite"` would rewrite. */
+  needingRewrite: number;
+  /** Superfiles holding terms from an older analysis, which only
+   * re-analysis repairs. */
+  awaitingReanalysis: number;
+  /** Live bytes a `"rewrite"` would read and write again. */
+  bytesToRewrite: number;
+  /** Columns no repair can fix, because their text was never stored. */
+  unrepairableColumns: string[];
+  /** Superfiles whose footer places a blob where the file or its manifest
+   * entry contradicts. A reindex reports these and never rewrites them. */
+  inconsistentFooters: string[];
+  /** Whether a reindex would do nothing at all. */
+  isCurrent: boolean;
+}
+
+/** One superfile a `reindex` would repair, and how. */
+export interface PlannedRepair {
+  /** The superfile the run reads and replaces. */
+  superfileId: string;
+  /** The repair it gets — never `"auto"`, which the plan has resolved. */
+  mode: Exclude<ReindexMode, "auto">;
+  /** Live bytes in the superfile. */
+  liveBytes: number;
 }
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** BM25 statistics scope: `"global"` (default) or `"per_superfile"`. */
-  stats?: Bm25Stats;
   /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
   projection?: string[];
+  /** BM25 `k1` for this search only, overriding the column's declared value.
+   * Pass `k1` and `b` together or neither. Results stay exact; only pruning
+   * power is traded. A pair you mean to keep belongs on the column
+   * (`IndexSpec.fts`). */
+  k1?: number;
+  /** BM25 `b` for this search only; see {@link Bm25SearchOptions.k1}. */
+  b?: number;
   arrow?: boolean;
 }
 /** Text-predicate filter for `vectorSearch` (a pushdown pre-filter, not a
@@ -254,32 +386,74 @@ function buildColumn(field: arrow.Field, rows: RowRecord[]): arrow.Vector {
   return arrow.vectorFromArray(values, field.type);
 }
 
-// Normalize append input -> IPC bytes. An array of objects, or an
-// apache-arrow Table / RecordBatch (normalized to rows via its own
-// `toArray()`/`toJSON()`); either way the columns are rebuilt in our arrow
-// instance from the declared schema. (We can't feed the consumer's Table
-// straight into our `tableToIPC` — a different module instance isn't
-// recognized.)
-function dataToIpc(data: AppendData, getSchema: () => arrow.Schema): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (data instanceof Uint8Array) return Buffer.from(data);
+// Append / update input, sorted by how it reaches the engine: Arrow-typed
+// data (an apache-arrow Table / RecordBatch, or IPC bytes) as a batch, and
+// records as JSON text, which the engine maps to columns itself (nested
+// objects flatten to dot paths, arrays become list columns, a new key adds
+// a column typed from its values). `JSON.stringify` is what keeps a JS `5`
+// an integer literal and a `5.5` a float literal on the way in.
+//
+// A consumer's Table may come from another apache-arrow module instance,
+// which our `tableToIPC` does not recognize, so it is rebuilt here under
+// its own schema (types translated into our instance) from its rows.
+type WriteInput = { ipc: Buffer } | { rows: string };
 
-  let rows: RowRecord[];
-  const d = data as any;
-  if (Array.isArray(data)) {
-    rows = data as RowRecord[];
-  } else if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
-    rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
-  } else {
-    throw new TypeError(
-      "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
-    );
+// A `bigint` has no JSON form, so it travels as a one-key object the
+// replacer alone can produce and is then spliced back to the integer
+// literal it is — exact, and an integer rather than a float or a string.
+// A string in the data cannot be mistaken for one: `JSON.stringify`
+// escapes the quotes of a user's string, and the pattern below matches
+// only unescaped ones.
+const BIGINT_KEY = "$infino$bigint";
+function rowsToJson(rows: RowRecord[]): string {
+  const text = JSON.stringify(rows, (_key, value) =>
+    typeof value === "bigint" ? { [BIGINT_KEY]: value.toString() } : value,
+  );
+  return text.replace(/\{"\$infino\$bigint":"(-?\d+)"\}/g, "$1");
+}
+
+// Values JSON has no faithful spelling for. A `Buffer` stringifies to
+// `{"type":"Buffer","data":[...]}` and a `Date` to a string, so neither
+// throws on the document path and neither arrives as what it was. Rows
+// carrying them are refused with the route that does carry them, rather
+// than written as the object or the string JSON turned them into.
+function unspellableValue(rows: RowRecord[]): string | undefined {
+  for (const row of rows) {
+    for (const value of Object.values(row as Record<string, unknown>)) {
+      if (typeof Buffer !== "undefined" && Buffer.isBuffer(value)) return "a Buffer";
+      if (value instanceof Uint8Array) return "a Uint8Array";
+      if (value instanceof Date) return "a Date";
+    }
   }
+  return undefined;
+}
 
-  const schema = getSchema();
-  const cols: Record<string, arrow.Vector> = {};
-  for (const field of schema.fields) cols[field.name] = buildColumn(field, rows);
-  return Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM));
+function writeInput(data: AppendData): WriteInput {
+  if (Buffer.isBuffer(data)) return { ipc: data };
+  if (data instanceof Uint8Array) return { ipc: Buffer.from(data) };
+  if (Array.isArray(data)) {
+    const unspellable = unspellableValue(data);
+    if (unspellable) {
+      throw new TypeError(
+        `append: ${unspellable} has no document form and would be written as what JSON ` +
+          "turned it into; pass an apache-arrow Table or RecordBatch to keep its type",
+      );
+    }
+    return { rows: rowsToJson(data) };
+  }
+  const d = data as any;
+  if (d && (Array.isArray(d.batches) || (d.schema && typeof d.numRows === "number"))) {
+    const rows = Array.from(d).map((r: any) => r.toJSON() as RowRecord);
+    const fields: arrow.Field[] = d.schema.fields.map(
+      (f: any) => new arrow.Field(f.name, nativeTypeFromForeign(f.type), f.nullable),
+    );
+    const cols: Record<string, arrow.Vector> = {};
+    for (const field of fields) cols[field.name] = buildColumn(field, rows);
+    return { ipc: Buffer.from(arrow.tableToIPC(new arrow.Table(cols), STREAM)) };
+  }
+  throw new TypeError(
+    "append: expected an array of objects, an apache-arrow Table / RecordBatch, or an Arrow IPC Buffer",
+  );
 }
 
 // A Decimal128 value renders as a 4×u32 little-endian array in records.
@@ -368,8 +542,8 @@ export class Table {
    * append == one commit.
    */
   append(data: AppendData): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.append(ipc));
+    const input = writeInput(data);
+    guard(this.remote, () => ("rows" in input ? this.inner.appendRows(input.rows) : this.inner.append(input.ipc)));
   }
 
   /**
@@ -381,8 +555,10 @@ export class Table {
    * a hosted table.
    */
   appendNamed(data: AppendData, sourceName: string): void {
-    const ipc = dataToIpc(data, () => this.schema());
-    guard(this.remote, () => this.inner.appendNamed(ipc, sourceName));
+    const input = writeInput(data);
+    guard(this.remote, () =>
+      "rows" in input ? this.inner.appendRowsNamed(input.rows, sourceName) : this.inner.appendNamed(input.ipc, sourceName),
+    );
   }
 
   /** Ranked BM25 search; rows as records (or an Arrow `Table`). `score` is a
@@ -391,7 +567,10 @@ export class Table {
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions & { arrow: true }): arrow.Table;
   bm25Search(column: string, query: string, k: number, opts?: Bm25SearchOptions): RowRecord[];
   bm25Search(column: string, query: string, k: number, opts: Bm25SearchOptions = {}): RowRecord[] | arrow.Table {
-    const buf = guard(this.remote, () => this.inner.bm25Search(column, query, k, opts.mode, opts.stats, opts.projection));
+    rejectRemovedOptions("bm25Search", opts, REMOVED_SEARCH_OPTIONS);
+    const buf = guard(this.remote, () =>
+      this.inner.bm25Search(column, query, k, opts.mode, opts.projection, opts.k1, opts.b),
+    );
     return decode(buf, opts.arrow);
   }
 
@@ -443,8 +622,10 @@ export class Table {
    * `data` (same shapes as `append`), 1:1 — the matched count must equal the
    * replacement-row count. Requires durable storage (not `memory://`). */
   update(predicate: string, data: AppendData): MutationStats {
-    const ipc = dataToIpc(data, () => this.schema());
-    return guard(this.remote, () => this.inner.update(predicate, ipc));
+    const input = writeInput(data);
+    return guard(this.remote, () =>
+      "rows" in input ? this.inner.updateRows(predicate, input.rows) : this.inner.update(predicate, input.ipc),
+    );
   }
 
   /** Delete rows matching a SQL predicate (e.g. `"status = 'spam'"`).
@@ -474,6 +655,36 @@ export class Table {
    */
   gc(graceSecs: number): GcReport {
     return guard(this.remote, () => this.inner.gc(graceSecs));
+  }
+
+  /**
+   * Repair every superfile whose full-text index is behind what this engine
+   * writes. Rows, their order and their `_id`s are unchanged.
+   *
+   * Throws an Error whose message starts with `AlreadyRunningError:` while an
+   * `optimize` or another reindex holds the table — retry later.
+   *
+   * **Local durable connections only.** A `memory://` table has nothing to
+   * repair and a hosted table's storage is the service's, so on either this —
+   * and `reindexPlan` / `indexStaleness` — throws with `code` `"InvalidArg"`.
+   */
+  reindex(options?: ReindexOptions): ReindexReport {
+    rejectRemovedOptions("reindex", options, REMOVED_REINDEX_OPTIONS);
+    return guard(this.remote, () => this.inner.reindex(options));
+  }
+
+  /** The superfiles {@link Table.reindex} would repair under `options`, and
+   * the repair each gets — without repairing anything. Writes nothing. */
+  reindexPlan(options?: ReindexOptions): PlannedRepair[] {
+    rejectRemovedOptions("reindexPlan", options, REMOVED_REINDEX_OPTIONS);
+    return guard(this.remote, () => this.inner.reindexPlan(options));
+  }
+
+  /** What is behind and what repairing it would cost. Writes nothing, so it is
+   * safe against a live table. */
+  indexStaleness(options?: ReindexOptions): StalenessReport {
+    rejectRemovedOptions("indexStaleness", options, REMOVED_REINDEX_OPTIONS);
+    return guard(this.remote, () => this.inner.indexStaleness(options));
   }
 }
 
@@ -506,6 +717,24 @@ export class Connection {
     return new Table(guard(this.remote, () => this.inner.openTable(name)), this.remote);
   }
 
+  /**
+   * The schema document of `name`: its fields with ids, types, nullability
+   * and indexes, the field cap and the `schema_id`. With `patch` (the same
+   * shape), merge it into the schema — or create the table from it when
+   * there is none — and return the document afterwards. A field is matched
+   * by `id` when it carries one and by `name` otherwise; an unmatched field
+   * is added, a different type changes the column, `dropped: true` retires
+   * it, and a field not mentioned is untouched. `expectedSchemaId` is a
+   * compare-and-set against the current `schema_id`.
+   */
+  schema(name: string, patch?: SchemaPatch, expectedSchemaId?: number): TableSchema {
+    const text = guard(this.remote, () =>
+      this.inner.schema(name, patch === undefined ? undefined : JSON.stringify(patch), expectedSchemaId),
+    );
+    return JSON.parse(text) as TableSchema;
+  }
+
+  /** Drop a table. `purge` defaults to `true`, which also deletes the table's storage; pass `false` to only unregister it and keep the bytes. */
   dropTable(name: string, purge?: boolean): void {
     guard(this.remote, () => this.inner.dropTable(name, purge));
   }

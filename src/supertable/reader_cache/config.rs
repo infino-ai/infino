@@ -10,9 +10,10 @@ use std::{
     fmt::{self, Debug},
     path::PathBuf,
     sync::atomic::AtomicU64,
+    time::Duration,
 };
 
-use crate::supertable::manifest::SuperfileUri;
+use crate::{config::CrcVerification, supertable::manifest::SuperfileUri};
 
 /// How `DiskCacheStore` services a cache miss.
 ///
@@ -117,31 +118,57 @@ pub struct DiskCacheConfig {
     /// default threshold). Has no effect when
     /// `mmap_cold_threshold_secs == 0`.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background fill keeps yielding to foreground
+    /// queries that hold the same superfile's lazy reader before
+    /// it downloads anyway. Default 10 s.
+    ///
+    /// The fill yields so it does not compete for I/O with the
+    /// query that triggered it. Without a bound, a superfile under
+    /// continuous query load never goes idle, so the fill never
+    /// runs and the reader stays in its lazy state permanently —
+    /// holding the whole term dictionary and the doc-lengths tail
+    /// on the heap, per superfile, for the life of the process.
+    /// That state is also the slower one to query: reads are
+    /// per-block range fetches into fresh buffers rather than
+    /// slices of the mmap'd cache file.
+    ///
+    /// Promoting mid-query is safe — the fill writes a temp file
+    /// and swaps the cache entry, and an in-flight query keeps
+    /// reading through the `Arc` it already holds.
+    ///
+    /// [`Duration::MAX`] restores unbounded yielding.
+    pub promotion_defer_timeout: Duration,
     /// Pluggable eviction policy. Default: [`LruPolicy`].
     pub eviction: Box<dyn CacheEvictionPolicy>,
-    /// Whether the cache's `SuperfileReader::open` calls
-    /// verify CRC. Default `true`. Plumbed independently
-    /// from the supertable's own `verify_crc_on_open` so
-    /// callers constructing a `DiskCacheStore` directly can
-    /// set the right value for their storage backend; the
-    /// supertable typically sets both knobs from the same
-    /// `Config::supertable::verify_crc_on_open` source.
-    pub verify_crc_on_open: bool,
+    /// When the cache verifies a superfile's checksums. Under the
+    /// default [`CrcVerification::Auto`] that is once, as the bytes
+    /// land on the cache disk, and not again on each open of the
+    /// copy they wrote. Plumbed independently from the supertable's
+    /// own policy so callers constructing a `DiskCacheStore`
+    /// directly can set the right value for their storage backend;
+    /// the supertable sets both from one source.
+    pub crc_verification: CrcVerification,
 }
 
 /// Default Tier-1 disk-cache byte budget (10 GiB).
 const DEFAULT_DISK_BUDGET_BYTES: u64 = 10 * (1 << 30);
 /// Default number of parallel range-GET streams per cold miss.
-const DEFAULT_COLD_FETCH_STREAMS: usize = 16;
-/// Default range-GET chunk size (16 MiB); peak in-flight bytes is
-/// `streams × chunk`.
-const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 16 * (1 << 20);
+const DEFAULT_COLD_FETCH_STREAMS: usize = 8;
+/// Default range-GET chunk size (32 MiB); peak in-flight bytes is
+/// `streams × chunk` (256 MiB). Large chunks keep a whole-file download to
+/// few GETs: a 1 GB superfile is 32.
+const DEFAULT_COLD_FETCH_CHUNK_BYTES: u64 = 32 * (1 << 20);
 /// Default number of concurrent background full-superfile fills.
 const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 /// Default idle age (seconds) before an mmap is `MADV_DONTNEED`-swept.
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds, ≈ threshold / 4).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway. Long enough that a short burst of
+/// queries is served without a competing download; short enough that a
+/// sustained workload still reaches the mmap-backed state quickly.
+pub(crate) const DEFAULT_PROMOTION_DEFER_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Default for DiskCacheConfig {
     fn default() -> Self {
@@ -154,8 +181,9 @@ impl Default for DiskCacheConfig {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout: DEFAULT_PROMOTION_DEFER_TIMEOUT,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::default(),
         }
     }
 }
@@ -352,7 +380,7 @@ mod tests {
             config.mmap_sweep_interval_secs,
             DEFAULT_MMAP_SWEEP_INTERVAL_SECS
         );
-        assert!(config.verify_crc_on_open);
+        assert_eq!(config.crc_verification, CrcVerification::Auto);
 
         // The Debug impl elides the boxed policy but must keep the
         // tuning knobs readable for log lines.
@@ -379,6 +407,10 @@ mod tests {
         ] {
             assert!(debug.contains(field), "Debug must print {field}: {debug}");
         }
-        assert!(cfg.verify_crc_on_open, "CRC verification defaults on");
+        assert_eq!(
+            cfg.crc_verification,
+            CrcVerification::Auto,
+            "the cache mirrors the supertable's default policy"
+        );
     }
 }

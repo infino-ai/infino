@@ -28,7 +28,6 @@
 //! "ordered equality".
 
 use std::{
-    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -40,10 +39,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::{
-            reader::BoolMode,
-            tokenize::{Phrase, Tokenizer},
-        },
+        fts::{reader::BoolMode, tokenize::Tokenizer},
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -164,21 +160,7 @@ pub fn oracle_top_k_atoms(
     mode: BoolMode,
     k: usize,
 ) -> Vec<(u64, f32)> {
-    let clauses = tok.parse(query).into_clauses(mode);
-    let own =
-        |v: Vec<Cow<'_, str>>| -> Vec<String> { v.into_iter().map(Cow::into_owned).collect() };
-    let own_ph = |v: Vec<Phrase<Cow<'_, str>>>| -> Vec<Phrase<String>> {
-        v.iter().map(|p| p.map(|t| t.to_string())).collect()
-    };
-    oracle.top_k_atoms(
-        &own(clauses.musts),
-        &own_ph(clauses.must_phrases),
-        &own(clauses.shoulds),
-        &own_ph(clauses.should_phrases),
-        &own(clauses.negatives),
-        &own_ph(clauses.negative_phrases),
-        k,
-    )
+    oracle.top_k_query(query, mode, tok, k)
 }
 
 /// Run infino's BM25 search and return doc_ids in score-descending
@@ -189,7 +171,7 @@ async fn infino_top_k(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u6
         .bm25_hits_async("title", query, k, BoolMode::Or)
         .await
         .expect("BM25 search");
-    hits.into_iter().map(|(d, _)| d as u64).collect()
+    hits.into_iter().map(|(d, _)| u64::from(d.get())).collect()
 }
 
 /// Compare top-k *sets* between infino and brute-force for a query.
@@ -315,6 +297,72 @@ async fn oracle_three_term_query_top5_set_matches() {
 /// short high-tf anchor docs whose scores strictly decrease, giving a
 /// tie-free top-5 head. Large enough (`n`) that a k=1000 search exercises
 /// a genuinely deep top-k, not "return everything".
+/// Every third row is null for the column, on a corpus whose scores are
+/// otherwise exact (all lengths below the length quantizer's exact
+/// range). BM25 is defined over the documents that carry the field, so
+/// the empty rows must enter neither the average length nor the
+/// collection size — dividing by rows instead deflates the average and
+/// inflates idf for every term, and this asserts the engine's scores
+/// against the oracle's by value, not just by rank, so either mistake
+/// fails here rather than only shifting an order.
+#[tokio::test]
+async fn oracle_sparse_column_scores_match_by_value() {
+    let dense = [
+        "rust async runtime tokio",
+        "rust embedded systems",
+        "python data pipeline pandas numpy",
+        "python machine learning",
+        "javascript web frontend react vue svelte",
+        "rust python interop",
+        "go concurrency channels",
+        "rust rust rust systems",
+    ];
+    // Interleave a null row after every second document.
+    let corp: Vec<(u64, &str)> = dense
+        .iter()
+        .flat_map(|d| [*d, ""])
+        .chain(["", ""])
+        .enumerate()
+        .map(|(i, d)| (i as u64, d))
+        .collect();
+    let infino = build_infino_superfile(&corp);
+    let tok = default_tokenizer();
+    let oracle = BruteForceBm25::index(&corp, tok.as_ref());
+    for (query, mode) in [
+        ("rust", BoolMode::Or),
+        ("python data", BoolMode::Or),
+        ("rust systems", BoolMode::And),
+        ("javascript svelte", BoolMode::And),
+    ] {
+        let got: HashMap<u64, f32> = infino
+            .bm25_hits_async("title", query, corp.len(), mode)
+            .await
+            .expect("BM25 search")
+            .into_iter()
+            .map(|(d, s)| (u64::from(d.get()), s))
+            .collect();
+        let terms: Vec<String> = tok.tokenize(query).collect();
+        let want: HashMap<u64, f32> = match mode {
+            BoolMode::Or => oracle.top_k_terms(&terms, corp.len()),
+            BoolMode::And => oracle.top_k_terms_and(&terms, corp.len()),
+        }
+        .into_iter()
+        .collect();
+        assert_eq!(
+            got.keys().collect::<HashSet<_>>(),
+            want.keys().collect::<HashSet<_>>(),
+            "{query:?} {mode:?}: match sets"
+        );
+        for (doc, score) in &got {
+            let expected = want[doc];
+            assert!(
+                (score - expected).abs() < BM25_SCORE_ABS_TOLERANCE,
+                "{query:?} {mode:?} doc {doc}: engine {score} vs oracle {expected}"
+            );
+        }
+    }
+}
+
 fn common_heavy_corpus(n: u64) -> Vec<(u64, String)> {
     let terms = ["alpha", "beta", "gamma", "delta"];
     let mut docs = Vec::with_capacity(n as usize);
@@ -554,7 +602,7 @@ async fn infino_top_k_and(reader: &SuperfileReader, query: &str, k: usize) -> Ve
         .bm25_hits_async("title", query, k, BoolMode::And)
         .await
         .expect("AND BM25 search");
-    hits.into_iter().map(|(d, _)| d as u64).collect()
+    hits.into_iter().map(|(d, _)| u64::from(d.get())).collect()
 }
 
 async fn assert_top_k_and_set_matches(
@@ -664,7 +712,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let oracle_hits = oracle.top_k_terms_and(&terms, 10);
     assert_eq!(
@@ -675,7 +723,7 @@ async fn oracle_and_scores_match_brute_force_ordering() {
     for ((i_doc, i_score), (o_doc, o_score)) in infino_hits.iter().zip(oracle_hits.iter()) {
         assert_eq!(*i_doc, *o_doc, "doc-id mismatch");
         // f32 BM25 sums diverge by ~1e-4 between the two scorers due
-        // to operand ordering (infino precomputes idf_x_k1p1 and
+        // to operand ordering (infino precomputes idf_weight and
         // dl_norm_k1; the oracle multiplies term-by-term). 1e-3 is
         // tighter than any meaningful BM25 score gap on this corpus.
         let delta = (i_score - o_score).abs();
@@ -725,7 +773,7 @@ async fn oracle_and_membership_path_matches_brute_force() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 100 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -790,7 +838,7 @@ async fn oracle_and_membership_rejects_partial_matches() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 240 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -915,7 +963,7 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let want_set: HashSet<u64> = (0..N).filter(|i| i % 20 == 0).collect();
     let got_set: HashSet<u64> = got.iter().map(|&(d, _)| d).collect();
@@ -961,7 +1009,7 @@ async fn oracle_and_membership_middle_tier_multiblock_matches_brute_force() {
         .await
         .expect("truncated AND search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect();
     let want_topk: HashSet<u64> = oracle
         .top_k_terms_and(&terms, k)
@@ -1021,7 +1069,7 @@ async fn oracle_and_membership_reads_tf_above_one() {
         .await
         .expect("AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     // rare docs (i % 100 == 0) also carry common and mid (i % 100 == 0 ⇒ i % 4 ==
     // 0), so the intersection is exactly the 10 rare docs.
@@ -1061,14 +1109,14 @@ async fn dedup_repeated_query_term_scores_as_weighted() {
         .await
         .expect("single-term AND")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let dup: Vec<(u64, f32)> = infino
         .bm25_hits_async("title", "+common +common", 10, BoolMode::And)
         .await
         .expect("repeated-term AND")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     assert_eq!(single.len(), dup.len(), "dedup changed the result count");
     assert!(!single.is_empty(), "expected hits");
@@ -1098,14 +1146,14 @@ async fn dedup_repeated_should_term_scores_as_weighted() {
         .await
         .expect("single-term OR")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let dup: Vec<(u64, f32)> = infino
         .bm25_hits_async("title", "common common", 10, BoolMode::Or)
         .await
         .expect("repeated-term OR")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     assert_eq!(single.len(), dup.len(), "dedup changed the OR result count");
     assert!(!single.is_empty(), "expected hits");
@@ -1137,7 +1185,7 @@ async fn dedup_partial_repeat_preserves_matches_and_weights_one_term() {
             .await
             .expect("AND search")
             .into_iter()
-            .map(|(d, s)| (d as u64, s))
+            .map(|(d, s)| (u64::from(d.get()), s))
             .collect()
     }
 
@@ -1188,7 +1236,7 @@ async fn oracle_dedup_repeated_terms_match_brute_force() {
         .await
         .expect("repeated-AND search")
         .into_iter()
-        .map(|(d, s)| (d as u64, s))
+        .map(|(d, s)| (u64::from(d.get()), s))
         .collect();
     let oracle_and = oracle.top_k_terms_and(&and_terms, 10);
     assert_eq!(
@@ -1266,7 +1314,7 @@ async fn oracle_dedup_repeated_term_block_max_skip_matches_brute_force() {
         .await
         .expect("repeated-term OR search")
         .into_iter()
-        .map(|(d, _)| d as u64)
+        .map(|(d, _)| u64::from(d.get()))
         .collect();
     assert_eq!(
         infino_top1,
@@ -1438,7 +1486,11 @@ async fn oracle_or_multi_block_scores_match_brute_force() {
     for ((infino_doc, infino_score), (oracle_doc, oracle_score)) in
         infino_hits.iter().zip(&oracle_hits)
     {
-        assert_eq!(*infino_doc as u64, *oracle_doc, "OR doc-id mismatch");
+        assert_eq!(
+            u64::from(infino_doc.get()),
+            *oracle_doc,
+            "OR doc-id mismatch"
+        );
         let delta = (infino_score - oracle_score).abs();
         assert!(
             delta < BM25_SCORE_ABS_TOLERANCE,
@@ -1576,7 +1628,7 @@ async fn oracle_and_multi_block_score_matches_brute_force() {
     // may reorder within a single score class). Catches scoring
     // drift introduced by the block-crossing code paths in the
     // flat-merge (e.g. wrong `block_tfs[pos]` index after a block
-    // boundary, or a stale `idf_x_k1p1` if the cursor was
+    // boundary, or a stale `idf_weight` if the cursor was
     // reconstructed mid-walk).
     let corp_owned = build_multi_block_corpus();
     let corp_refs: Vec<(u64, &str)> = corp_owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
@@ -1643,7 +1695,7 @@ async fn oracle_and_multi_block_two_term_score_values_match_brute_force() {
     assert_eq!(infino_full.len(), 67, "full AND(alpha, gamma) count");
     for (doc, score) in &infino_full {
         let expected = oracle_by_doc
-            .get(&(*doc as u64))
+            .get(&(u64::from(doc.get())))
             .expect("returned doc not in oracle intersection");
         let delta = (score - expected).abs();
         assert!(

@@ -80,18 +80,13 @@ use std::{
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
+use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
-use super::{
-    SuperfileHit,
-    candidate::CandidatePlan,
-    dispatch,
-    exec::common::{SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source},
-    prune::{PruneLeaf, select_superfiles},
-};
 pub use crate::superfile::reader::VectorSearchOptions;
 #[cfg(feature = "test-helpers")]
 use crate::test_helpers::{admit_trace, served_shortlist_probe};
@@ -106,13 +101,19 @@ use crate::{
         SuperfileReader,
         error::ReadError,
         fts::reader::BoolMode,
+        id_space::RowId,
         vector::{
             cell_posting::EncodedCellRow,
-            distance::{Metric, distance, normalize, relative_score_window},
+            distance::{
+                Metric, dequantize_sq16_adaptive_into, distance, normalize, relative_score_window,
+            },
             flat::Sq4FlatIndex,
             hnsw::{self, HnswParams, Plane, Sq4Scorer, Sq16Scorer, encode_hnsw},
             layout::VectorLayout,
-            reader::{ProbeTally, ScanCandidate, ScanOutcome},
+            reader::{
+                EMPTY_FILTER_SELECTIVITY_MULT, ProbeTally, ScanCandidate, ScanOutcome,
+                selectivity_mult_from_counts,
+            },
         },
     },
     supertable::{
@@ -123,16 +124,31 @@ use crate::{
             ManifestSnapshot, RABITQ_ADMIT_CELL_SHORTLIST_FRACTION,
             RABITQ_ADMIT_CELL_SHORTLIST_MIN, RabitqAdmitQuery, SuperfileEntry, SuperfileUri,
             VectorSummary,
-            list::{CellRoutingParams, PartitionStrategy, WIDTH_LAW_KS},
+            list::{CellRoutingParams, PartitionStrategy},
         },
         opann::REPLICA_CLOSURE_DISTANCE_RATIO,
         options::{GappedPlacementCell, GappedPlacementIndex},
+        query::{
+            SuperfileHit,
+            candidate::{CandidatePlan, CandidateScope},
+            dispatch,
+            exec::common::{
+                SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
+            },
+            fts::{memo_from_locations, memos_from_plan_locations},
+            provider::prune_leaves_for_filters,
+            prune::{PruneLeaf, select_superfiles},
+            superfile_reader::OpenTierCounts,
+        },
+        reader_cache::ReadIntent,
+        schema::FieldId,
         slow_vector_state::{
             CentroidSection, ResidentIndexKind, ResidentVectorIndex, WalkPlaneRequest,
             fetch_centroid_section, fetch_resident_index_blob, hydrate_resident_index,
         },
         tombstones::SidecarCache,
     },
+    utils::trace::{self, detail_span, tiered_span},
 };
 
 /// A calibrated law width at or below this resolves to `None`: one cell
@@ -250,6 +266,13 @@ const FILTERED_HIDDEN_CELL_NPROBE: usize = 256;
 /// in deeper runs — the width sweep's 0.856 plateau across 6..16 cells
 /// is in-cell loss, recovered by probing deeper, not wider.
 const FILTERED_HIDDEN_FINE_NPROBE: usize = 16;
+
+/// Fraction of the pooled warm survivors kept for the global exact rerank,
+/// as a percent. The true top-10 sit within the top ~2-3% of the pool by
+/// the 1-bit estimate (dummy-assign probe + placement model); 3% is the
+/// recall-neutral cut versus a full rerank, and cutting below it drops true
+/// neighbours (the #821 warm-recall inversion).
+const GLOBAL_FINE_SHORTLIST_POOL_PCT: usize = 3;
 
 /// Fold one probe's work tallies into the op's collector.
 ///
@@ -473,7 +496,7 @@ fn cells_ranked_by_fine_score(
 /// before fine centroid scoring.
 fn postings_by_cell_from_summaries(
     superfiles: &[Arc<SuperfileEntry>],
-    column: &str,
+    column: FieldId,
     allow: Option<&HashMap<SuperfileUri, Arc<RoaringBitmap>>>,
     superseded: &BTreeMap<Uuid, BTreeSet<u32>>,
 ) -> (HashMap<u32, u64>, bool) {
@@ -483,7 +506,7 @@ fn postings_by_cell_from_summaries(
         if allow.is_some_and(|m| !m.contains_key(&entry.uri)) {
             continue;
         }
-        let Some(vs) = entry.vector_summary.get(column) else {
+        let Some(vs) = entry.vector_summary.get(&column) else {
             continue;
         };
         for cell in &vs.cells {
@@ -622,28 +645,35 @@ struct DeferredCellRescore {
 fn eligible_summary<'e>(
     entry: &'e SuperfileEntry,
     column: &str,
+    column_id: Option<FieldId>,
     query_dim: usize,
-) -> Result<&'e VectorSummary, QueryError> {
-    match entry.vector_summary.get(column) {
+) -> Result<Option<&'e VectorSummary>, QueryError> {
+    // A file written before the column existed holds no vectors for it
+    // and contributes nothing; a file that declares the column and has no
+    // summary is a malformed build.
+    if column_id.is_some_and(|id| !entry.holds_vector_column(id)) {
+        return Ok(None);
+    }
+    match column_id.and_then(|id| entry.vector_summary.get(&id)) {
         Some(vs) if !vs.cells.is_empty() => {
             for cell in &vs.cells {
                 if cell.clusters.dim as usize != query_dim {
-                    return Err(QueryError::Execute(format!(
+                    return Err(QueryError::Internal(format!(
                         "vector summary dimension {} for column `{column}` on superfile {} \
                          does not match query dimension {query_dim}",
                         cell.clusters.dim, entry.superfile_id,
                     )));
                 }
             }
-            Ok(vs)
+            Ok(Some(vs))
         }
-        Some(_) => Err(QueryError::Execute(format!(
+        Some(_) => Err(QueryError::Internal(format!(
             "superfile {} has no cluster centroids in its vector summary for \
              column `{column}` — malformed build; refusing to degrade to a \
              blind per-superfile probe",
             entry.superfile_id
         ))),
-        None => Err(QueryError::Execute(format!(
+        None => Err(QueryError::Internal(format!(
             "superfile {} has no vector summary for column `{column}` — \
              malformed build; refusing to degrade to a blind per-superfile \
              probe",
@@ -662,6 +692,7 @@ fn eligible_summary<'e>(
 fn estimate_admit_ranking(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
+    column_id: Option<FieldId>,
     query_len: usize,
     metric: Metric,
     admit_q: &RabitqAdmitQuery,
@@ -676,7 +707,9 @@ fn estimate_admit_ranking(
     };
     let mut cell_best: HashMap<u32, f32> = HashMap::new();
     for entry in superfiles.iter().filter(|e| eligible(e)) {
-        let vs = eligible_summary(entry, column, query_len)?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query_len)? else {
+            continue;
+        };
         for cell in &vs.cells {
             let Some(cell_id) = cell.cell_id else {
                 continue;
@@ -719,6 +752,7 @@ fn estimate_admit_ranking(
 fn score_fine_candidates(
     superfiles: &[Arc<SuperfileEntry>],
     column: &str,
+    column_id: Option<FieldId>,
     query: &[f32],
     metric: Metric,
     admit: Option<&HashSet<u32>>,
@@ -745,7 +779,9 @@ fn score_fine_candidates(
         if !eligible(entry) {
             continue;
         }
-        let vs = eligible_summary(entry, column, query.len())?;
+        let Some(vs) = eligible_summary(entry, column, column_id, query.len())? else {
+            continue;
+        };
         let mut flat_base = 0u32;
         for cell in &vs.cells {
             // Flat cluster ids must stay identical whether or not a cell is
@@ -808,7 +844,11 @@ fn union_cell_selection(grid: &[u32], fine: &[u32]) -> Vec<u32> {
 pub(crate) struct CentroidRouterGraph {
     scorer: crate::superfile::vector::hnsw::Fp32Scorer,
     graph: crate::superfile::vector::hnsw::Hnsw,
-    node_map: Vec<(usize, u32)>,
+    /// `node_map[i] = (superfile index, per-superfile flat cluster)` for graph
+    /// node `i`. Read by the recalibration to size the fanout ladder (node
+    /// count = total selectable fine clusters) and resolve each selected node
+    /// to its superfile + flat cluster.
+    pub(crate) node_map: Vec<(usize, u32)>,
     /// The column metric the scorer ranks by — set at build and reproduced on
     /// load. The query is transformed into the same space before the walk
     /// ([`gfc_prepare_for_metric`]), so build-time and query-time scoring agree.
@@ -832,6 +872,91 @@ pub(crate) struct StampedCentroidRouter {
     pub(crate) graph: CentroidRouterGraph,
 }
 
+/// Drain-side placement over the centroid-router HNSW: the graph plus a
+/// node -> global-cell map. Built by
+/// [`SupertableReader::build_global_fine_assign_router`] from the pre-commit
+/// manifest and shared read-only across the per-row assign. Placing a row in
+/// the cell of its nearest fine centroid (found by walking this graph) matches
+/// how queries route (they walk the same graph), so placement and routing agree
+/// at every scale.
+pub(crate) struct FineAssignRouter {
+    router: Arc<StampedCentroidRouter>,
+    /// `node_to_cell[node]` = global cell owning graph node `node`; `u32::MAX`
+    /// for a node whose cell could not be resolved (skipped at assign time).
+    node_to_cell: Vec<u32>,
+}
+
+impl FineAssignRouter {
+    /// Place one row: walk the centroid-router HNSW to the nearest fine
+    /// centroids, resolve each to its owning cell, dedup (several fine centroids
+    /// collapse into one cell), and BOUNDS-CHECK every resolved cell against the
+    /// live `clusters` grid — a cell id `>= clusters.n_cent` (a split landed on a
+    /// newer manifest than the one the router was built from) or a node with no
+    /// resolvable cell (`u32::MAX`) is dropped, so no out-of-range cell is ever
+    /// emitted. The PRIMARY is the cell of the nearest fine centroid (walk
+    /// order, so placement follows the router). The replica cells are then
+    /// re-scored EXACTLY against `clusters` and fed through the shared
+    /// [`boundary_from_ranked`] closure, so their margins are the coarse path's
+    /// Voronoi-boundary margins (comparable in the shared replica budget) and
+    /// the closure distance gate is applied — not raw HNSW score gaps.
+    ///
+    /// `None` when no walked node resolves to a valid cell, so the caller falls
+    /// back to the coarse cell grid. Thread-safe: the HNSW search and the
+    /// `clusters` reads are read-only per call, so this runs under the writer
+    /// pool.
+    pub(crate) fn assign_row_to_cells(
+        &self,
+        clusters: &crate::supertable::manifest::ClusterCentroids,
+        metric: Metric,
+        vector: &[f32],
+    ) -> Option<crate::supertable::opann::BoundaryAssignment> {
+        use crate::supertable::opann::{REPLICA_CLOSURE_MAX_REPLICAS, boundary_from_ranked};
+        let graph = &self.router.graph;
+        let mut q = vector.to_vec();
+        gfc_prepare_for_metric(graph.metric, &mut q);
+        // Over-fetch graph nodes so the primary + replica CELLS survive the
+        // dedup when several fine centroids share a cell.
+        let n_place = ((REPLICA_CLOSURE_MAX_REPLICAS + 1) * 8).min(graph.node_map.len().max(1));
+        let ef = n_place.saturating_mul(2).max(n_place);
+        let hits = graph.graph.search(&graph.scorer, &q, n_place, ef);
+        let n_cent = clusters.n_cent as usize;
+        // Distinct, bounds-checked cells in walk order. `[0]` is the primary
+        // (nearest fine centroid's cell); the rest are replica candidates.
+        // Capped at the closure width so the ranked list handed to
+        // `boundary_from_ranked` never overflows its fixed replica array.
+        let mut cells: Vec<u32> = Vec::with_capacity(REPLICA_CLOSURE_MAX_REPLICAS + 1);
+        for (node, _score) in hits {
+            let Some(&cell) = self.node_to_cell.get(node as usize) else {
+                continue;
+            };
+            if cell == u32::MAX || (cell as usize) >= n_cent || cells.contains(&cell) {
+                continue;
+            }
+            cells.push(cell);
+            if cells.len() == REPLICA_CLOSURE_MAX_REPLICAS + 1 {
+                break;
+            }
+        }
+        let (&primary, rest) = cells.split_first()?;
+        // Primary first (verbatim — placement follows the router), then the
+        // replica candidates ascending by exact cell score so the closure loop's
+        // early break is valid. Scores use the RAW vector via `score_one`, the
+        // same orientation the coarse assigner feeds `boundary_from_ranked`.
+        let mut ranked: Vec<(u32, f32)> = Vec::with_capacity(cells.len());
+        ranked.push((
+            primary,
+            clusters.score_one(metric, primary as usize, vector),
+        ));
+        let mut rest_scored: Vec<(u32, f32)> = rest
+            .iter()
+            .map(|&cell| (cell, clusters.score_one(metric, cell as usize, vector)))
+            .collect();
+        rest_scored.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.extend(rest_scored);
+        Some(boundary_from_ranked(clusters, metric, &ranked))
+    }
+}
+
 /// The column the eager centroid-router build should target, or `None` when
 /// the router is disabled or no column is eligible. The single-slot cache
 /// serves one column, so the eager path pre-warms the first vector column (any
@@ -849,14 +974,17 @@ pub(crate) struct StampedCentroidRouter {
 pub(crate) fn select_eager_router_column(
     search_mode: config::VectorSearchMode,
     ivf_router: config::IvfRouter,
-    global_fine_fanout: usize,
     vector_columns: &[crate::superfile::builder::VectorConfig],
 ) -> Option<String> {
     let router_engaged = matches!(
         ivf_router,
         config::IvfRouter::CentroidGraph | config::IvfRouter::Auto
     );
-    if search_mode != config::VectorSearchMode::Ivf || !router_engaged || global_fine_fanout == 0 {
+    // Whether the router engages is decided by `ivf_router` alone. The fanout
+    // value does not gate the eager build: `global_fine_fanout` (including a
+    // configured `0`) selects HOW WIDE the engaged graph reads, never WHETHER it
+    // engages.
+    if search_mode != config::VectorSearchMode::Ivf || !router_engaged {
         return None;
     }
     vector_columns.first().map(|vc| vc.column.clone())
@@ -871,6 +999,23 @@ pub(crate) fn select_eager_router_column(
 /// loosest at the smallest anchor), and skips the pin only for `auto` tables
 /// that route `stamped` at every `k` — the wasteful case this guards against.
 /// Resident inputs only (no I/O), matching the query-path gate.
+/// Whether this table's vector `column` is served by the centroid-graph
+/// router under the current config. Used by optimize to skip split /
+/// recalibration — the graph path walks fine centroids, not the coarse grid,
+/// so growing or recalibrating the grid is dead-weight (and the grid is frozen
+/// at its create-time size by design). Mirrors the query-time router choice.
+pub(crate) fn serves_via_graph(manifest: &ManifestSnapshot, column: &str) -> bool {
+    let vcfg = &config::global().vector;
+    if vcfg.search_mode != config::VectorSearchMode::Ivf {
+        return false;
+    }
+    match vcfg.ivf_router {
+        config::IvfRouter::CentroidGraph => true,
+        config::IvfRouter::Stamped => false,
+        config::IvfRouter::Auto => auto_prefers_centroid_graph(manifest, column, vcfg),
+    }
+}
+
 pub(crate) fn auto_prefers_centroid_graph(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -970,11 +1115,39 @@ fn resolve_ivf_router(
 /// selecting `centroid_graph` where the calibrated fanout is not actually a
 /// concentrated subset of the routable clusters. Counting only cells with at
 /// least one indexed doc realigns the denominator with the calibration input.
-fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
+/// Coefficient `c` in the deterministic coverage fanout `c·√n_fine` for the
+/// centroid-graph path — fit to deep1b's coverage knee (`c·√115000 ≈ 1024` at
+/// 1B, the validated point). PROVISIONAL: being finalized from the 1M/10M/1B
+/// coverage-knee sweep.
+const CENTROID_GRAPH_FANOUT_SQRT_COEFF: f64 = 3.0;
+/// Minimum deterministic graph fanout, so small tables still scan enough fine
+/// clusters for coverage (clamped to the cluster count for tiny tables).
+const CENTROID_GRAPH_FANOUT_FLOOR: usize = 32;
+
+/// Deterministic coverage fanout for the centroid-graph path: scan about
+/// `CENTROID_GRAPH_FANOUT_SQRT_COEFF · √n_fine` fine clusters, clamped to
+/// `[floor, n_fine]`. Replaces the calibrated `fanout_for_k` stamp — optimize
+/// no longer recalibrates under graph serving — so fanout needs no per-table
+/// measurement. The coverage knee scales ~√(fine clusters) (measured: ~56% of
+/// clusters at 1M, ~22% at 10M, ~1.8% at 1B); the coefficient is fit to the
+/// hard case (deep1b) so easier data is over-provisioned — recall met, a
+/// little more latency, the safe direction.
+fn graph_fanout_for_fine_clusters(n_fine: usize) -> usize {
+    if n_fine == 0 {
+        return CENTROID_GRAPH_FANOUT_FLOOR;
+    }
+    let f = (CENTROID_GRAPH_FANOUT_SQRT_COEFF * (n_fine as f64).sqrt()).round() as usize;
+    f.clamp(CENTROID_GRAPH_FANOUT_FLOOR.min(n_fine), n_fine)
+}
+
+pub(crate) fn total_fine_clusters(manifest: &ManifestSnapshot, column: &str) -> usize {
+    let Some(id) = manifest.field_id(column) else {
+        return 0;
+    };
     manifest
         .get_all_superfiles()
         .iter()
-        .filter_map(|e| e.vector_summary.get(column))
+        .filter_map(|e| e.vector_summary.get(&id))
         .flat_map(|s| s.cells.iter())
         .filter(|c| c.clusters.n_cent > 0 && c.clusters.counts.iter().any(|&n| n > 0))
         .map(|c| c.clusters.n_cent as usize)
@@ -1018,8 +1191,10 @@ fn centroid_router_walk(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     metric: Metric,
+    superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<(Vec<Vec<f32>>, Vec<(usize, u32)>), QueryError> {
     let mut vecs: Vec<Vec<f32>> = Vec::new();
     let mut node_map: Vec<(usize, u32)> = Vec::new();
@@ -1031,9 +1206,11 @@ fn centroid_router_walk(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr
-            .global_fine_cluster_vectors(column, section, sfid)
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+        // Exclude this superfile's split-superseded cells, matching the scan
+        // path — their fine centroids are dead and must not seed graph nodes.
+        let cell_superseded = superseded.and_then(|m| m.get(&sfid));
+        for (flat, mut vec) in
+            vr.global_fine_cluster_vectors(column, column_id, section, sfid, cell_superseded)?
         {
             gfc_prepare_for_metric(metric, &mut vec);
             vecs.push(vec);
@@ -1048,18 +1225,34 @@ fn centroid_router_walk(
 /// section (older tables, router-off-at-drain, or a build failure). `metric` is
 /// the column's configured metric: it selects the scorer's ranking and the
 /// centroid transform, so the graph is built in the metric's own space.
+///
+/// `serial` selects the HNSW build: the query path uses the parallel build (the
+/// router only SELECTS clusters, so its concurrent-insert reordering is
+/// harmless), while the drain-side PLACEMENT build passes `serial = true` so a
+/// retried or resumed commit that rebuilds the router scatters identical rows
+/// into identical cells (the same reason the coarse drain router uses
+/// `Hnsw::build_serial`).
 fn build_centroid_router(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
+    serial: bool,
+    superseded: Option<&BTreeMap<Uuid, BTreeSet<u32>>>,
 ) -> Result<CentroidRouterGraph, QueryError> {
     use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
-    let (vecs, node_map) = centroid_router_walk(superfiles, readers, column, section, metric)?;
+    let (vecs, node_map) = centroid_router_walk(
+        superfiles, readers, column, column_id, section, metric, superseded,
+    )?;
     let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
-    let graph = Hnsw::build(&scorer, HnswParams::default());
+    let graph = if serial {
+        Hnsw::build_serial(&scorer, HnswParams::default())
+    } else {
+        Hnsw::build(&scorer, HnswParams::default())
+    };
     Ok(CentroidRouterGraph {
         scorer,
         graph,
@@ -1121,6 +1314,7 @@ fn decode_centroid_router_section(
     superfiles: &[Arc<SuperfileEntry>],
     readers: &[Arc<SuperfileReader>],
     column: &str,
+    column_id: FieldId,
     section: &crate::supertable::slow_vector_state::CentroidSection,
     dim: usize,
     metric: Metric,
@@ -1171,7 +1365,15 @@ fn decode_centroid_router_section(
             continue;
         };
         let sfid = sf.superfile_id;
-        for (flat, mut vec) in vr.global_fine_cluster_vectors(column, section, sfid).ok()? {
+        // No superseded filter here: this fills a `(sfid, flat) -> vec` lookup
+        // and then assembles ONLY the persisted node-map entries, which the
+        // settle composed with superseded cells already excluded. Any extra
+        // superseded vec fetched into the map is simply never referenced; a
+        // split clears the section ref, so the persisted map is never stale.
+        for (flat, mut vec) in vr
+            .global_fine_cluster_vectors(column, column_id, section, sfid, None)
+            .ok()?
+        {
             gfc_prepare_for_metric(metric, &mut vec);
             cluster_vecs.insert((sfid, flat), vec);
         }
@@ -1198,281 +1400,119 @@ fn decode_centroid_router_section(
     })
 }
 
-/// Build the centroid-router section bytes AND measure the router's per-`k`
-/// fanout for the settled generation, opening readers and building the router
-/// graph exactly ONCE and sharing both across the two steps: open readers over
-/// `entries`, build the router for `column`/`dim` from the freshly published
-/// centroid `section`, serialize it, then calibrate the fanout by real recall
-/// against the same readers + graph. Returns `(section bytes, fanout law)` —
-/// either `None` when membership is empty or that step fails (the settle then
-/// stamps no ref / carries the prior fanout forward). The caller has already
-/// resolved `column`/`dim` via [`select_eager_router_column`], so this does not
-/// re-gate. Called from the drain/compaction settle so the graph is published
-/// once per generation, `mmap`-loaded identically on every node and after a
-/// restart, and the fanout is re-measured for the current membership.
-pub(crate) async fn compose_centroid_router_section_and_fanout(
-    options: &SupertableOptions,
+/// Build the centroid-router section bytes for the settled generation: open
+/// readers over `entries`, build the router for `column`/`dim` from the freshly
+/// published centroid `section`, and serialize it. `None` when membership is
+/// empty or a step fails (the settle then stamps no ref). The per-`k` fanout is
+/// derived and stamped by the compaction recalibration on its single
+/// ground-truth scan and carried forward by the settle, so it is not measured
+/// here. The caller has already resolved `column`/`dim` via
+/// [`select_eager_router_column`], so this does not re-gate. Called from the
+/// drain/compaction settle so the graph is published once per generation,
+/// `mmap`-loaded identically on every node and after a restart.
+pub(crate) async fn compose_centroid_router_section(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     section: &crate::supertable::slow_vector_state::CentroidSection,
     column: &str,
     dim: usize,
-) -> (Option<Vec<u8>>, Option<[u32; WIDTH_LAW_KS.len()]>) {
+) -> Option<Vec<u8>> {
     if entries.is_empty() {
-        return (None, None);
+        return None;
     }
-    let Some(metric) = column_metric(&options.vector_columns, column) else {
-        return (None, None);
-    };
+    let options = &manifest.options;
+    let metric = column_metric(&manifest.vector_configs(), column)?;
     let readers = match open_readers_from_options(options, entries).await {
         Ok(readers) => readers,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: reader open failed");
-            return (None, None);
+            return None;
         }
     };
-    let router = match build_centroid_router(entries, &readers, column, section, dim, metric) {
+    // Built once and persisted; every later load decodes the SAME topology, so
+    // the parallel build's non-determinism does not reach placement (which loads
+    // these fixed bytes). Parallel keeps the one-time publish cheap.
+    let column_id = manifest.field_id(column)?;
+    let router = match build_centroid_router(
+        entries,
+        &readers,
+        column,
+        column_id,
+        section,
+        dim,
+        metric,
+        false,
+        manifest.get_superseded_cells(),
+    ) {
         Ok(router) => router,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: build failed");
-            return (None, None);
+            return None;
         }
     };
-    let bytes = encode_centroid_router_section(&router, entries, dim);
-    // Reuse the same opened readers + built graph for the recall calibration.
-    let fanout =
-        calibrate_centroid_router_fanout(manifest, entries, &readers, &router, column, dim, metric)
-            .await;
-    (Some(bytes), fanout)
+    Some(encode_centroid_router_section(&router, entries, dim))
 }
 
-/// Held-out query sample size for the centroid-router fanout calibration.
-/// Fewer than the HNSW `ef` calibrator's 200: each router probe is a real
-/// per-cluster scan (reads + reranks), far heavier than the HNSW calibrator's
-/// in-memory graph walk, so the sample is smaller while staying large enough
-/// for a stable recall estimate at each ladder rung.
-const ROUTER_FANOUT_CALIB_QUERIES: usize = 64;
-/// Fixed seed for the fanout calibration's held-out query draw, so a
-/// re-settled identical membership measures the same recall ladder.
-const ROUTER_FANOUT_CALIB_SEED: u64 = 0x_FA_11_00_07_CA_11_B0_00;
-/// Deepest `k` the router fanout is calibrated at. Anchors above this (only
-/// `k = 1000` in [`WIDTH_LAW_KS`]) stay the sentinel `0`: the fanout to serve
-/// recall@1000 would be near the whole corpus, and computing a top-1000 ground
-/// truth over the full plane deepens the exact scan for a `k` the router does
-/// not usefully serve. So the fanout is measured at `k ∈ {1, 10, 100}` and the
-/// deepest anchor is left uncalibrated (the reader falls back to the constant
-/// there).
-const ROUTER_CALIB_MAX_ANCHOR: usize = 100;
-/// Headroom over the calibrated depth for the per-query PREFIX candidate pool:
-/// enough of each query's nearest SELECTED rows are kept (by exact distance,
-/// tagged with their cluster's selection rank) that the top-`k` distinct
-/// survivors of every fanout prefix — the nearest clusters dominate, so their
-/// rows sit at the front of this pool — are retained before the stable-id dedup.
-const PREFIX_POOL_HEADROOM: usize = 16;
-
-/// Ascending candidate fanouts to measure recall at, seeded around the grid's
-/// `width × fine` prior but NOT capped by it — a doubling ladder from 1 up to
-/// (and including) `max_fanout`, with the prior and its neighbours injected for
-/// resolution near the expected knee. `max_fanout` (the calibration ceiling,
-/// [`config::VectorSettings::centroid_graph_max_fanout`], NOT the total
-/// cluster count) is the last rung: if recall does not clear the target by it,
-/// the calibration stamps the sentinel. Reading more fine clusters than the
-/// grid's `W × F` is still cheaper than the grid's whole-cell reads, so the
-/// ladder deliberately climbs past the prior (the old proxy's cap under-stamped
-/// exactly here).
-fn router_fanout_ladder(prior_max: usize, max_fanout: usize) -> Vec<usize> {
-    let total = max_fanout.max(1);
-    let mut rungs: Vec<usize> = Vec::new();
-    let mut f = 1usize;
-    while f < total {
-        rungs.push(f);
-        f = f.saturating_mul(2);
-    }
-    rungs.push(total);
-    for extra in [prior_max / 2, prior_max, prior_max.saturating_mul(2)] {
-        if (1..=total).contains(&extra) {
-            rungs.push(extra);
-        }
-    }
-    rungs.sort_unstable();
-    rungs.dedup();
-    rungs.retain(|&r| (1..=total).contains(&r));
-    rungs
-}
-
-/// A PREFIX candidate: a selected row's exact distance, the SELECTION RANK of
-/// the fine cluster it came from (0 = the query's nearest selected centroid),
-/// and its stable id. Recall at fanout `F` uses only the rows whose cluster
-/// rank is `< F` — a prefix over the one ranked read. Ordered by distance so a
-/// bounded max-heap keeps the nearest and evicts the farthest.
-#[derive(Clone, Copy)]
-struct PrefixCand {
-    dist: f32,
-    rank: u32,
-    sid: i128,
-}
-impl PartialEq for PrefixCand {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl Eq for PrefixCand {}
-impl PartialOrd for PrefixCand {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for PrefixCand {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.dist
-            .total_cmp(&other.dist)
-            .then(self.rank.cmp(&other.rank))
-            .then(self.sid.cmp(&other.sid))
-    }
-}
-fn prefix_push(heap: &mut BinaryHeap<PrefixCand>, cand: PrefixCand, cap: usize) {
-    if heap.len() < cap {
-        heap.push(cand);
-    } else if let Some(top) = heap.peek()
-        && cand.dist < top.dist
-    {
-        heap.pop();
-        heap.push(cand);
-    }
-}
-
-/// Recall@`k` at each fanout for ONE query, evaluated as nested PREFIXES over a
-/// single ranked read — this is the crux of the scale-safe design. `pool` holds
-/// the query's nearest selected rows, each tagged with its fine cluster's
-/// selection rank; `gt[..k]` is the exact top-`k` truth. For fanout `F` the
-/// served path would read only the top-`F` clusters, so recall at `F` uses only
-/// pool rows with `rank < F` (a prefix), takes the `k` nearest DISTINCT of
-/// those (stable-id dedup, matching the served collapse), and intersects the
-/// truth. Reading once and cutting prefixes gives the SAME per-fanout recall as
-/// re-selecting + re-reading each fanout separately, without the per-rung cold
-/// re-read that made the sweep non-terminating at 100M. Anchors deeper than
-/// `measured_anchor_max` (or than the computed truth) return `None`
-/// (uncalibrated → sentinel).
-fn recall_by_fanout_for_query(
-    pool: &[PrefixCand],
-    gt: &[i128],
-    ladder: &[u32],
-    measured_anchor_max: usize,
-) -> Vec<[Option<f64>; WIDTH_LAW_KS.len()]> {
-    // One ascending-by-distance ordering of the pool, reused for every fanout.
-    let mut ordered: Vec<PrefixCand> = pool.to_vec();
-    ordered.sort_unstable();
-    ladder
-        .iter()
-        .map(|&fanout| {
-            // Prefix: distinct nearest stable ids whose cluster rank < fanout.
-            let mut seen: HashSet<i128> = HashSet::new();
-            let mut ranked_ids: Vec<i128> = Vec::new();
-            for c in &ordered {
-                if c.rank < fanout && seen.insert(c.sid) {
-                    ranked_ids.push(c.sid);
-                }
-            }
-            let mut out = [None; WIDTH_LAW_KS.len()];
-            for (ki, &k) in WIDTH_LAW_KS.iter().enumerate() {
-                if k > measured_anchor_max || k > gt.len() {
-                    continue;
-                }
-                let truth: HashSet<i128> = gt[..k].iter().copied().collect();
-                let got: HashSet<i128> = ranked_ids.iter().copied().take(k).collect();
-                let hit = truth.iter().filter(|t| got.contains(t)).count();
-                out[ki] = Some(hit as f64 / k as f64);
-            }
-            out
-        })
-        .collect()
-}
-
-/// Score one superfile's resident rows against every (metric-prepared) query,
-/// building BOTH the exact ground-truth heaps (over every row) AND the per-query
-/// prefix pools (only rows whose fine cluster the query selected, tagged with
-/// that cluster's rank). Pure + self-contained so it runs on the reader pool;
-/// the row plane is consumed and dropped here, so peak memory stays at ONE
-/// superfile's rows. `selected_for_si[qi]` maps this superfile's selected flat
-/// cluster → its selection rank for query `qi`.
-fn score_rows_unified(
-    rows: Vec<(u32, EncodedCellRow)>,
-    selected_for_si: Vec<HashMap<u32, u32>>,
-    queries_prepared: &[Vec<f32>],
-    metric: Metric,
+/// Build the in-memory centroid router from superfiles' OWN resident fine
+/// centroids — no [`CentroidSection`] fetch. This is the recalibration-side
+/// build (the settle path uses [`build_centroid_router`] from the published
+/// section). It mirrors [`centroid_router_walk`] node for node: superfiles in
+/// the given order, each superfile's fine clusters in `flat` order, the fp32
+/// centroids metric-prepared and indexed by [`HnswParams::default`] — so the
+/// router built here is byte-identical to the settle-published one for the same
+/// membership, the parity the carried-forward fanout stamp relies on.
+///
+/// Takes the centroids as already-extracted `(si, flat, centroid)` tuples in
+/// node order rather than opening readers itself, so the caller can stream the
+/// superfiles — extract each one's fine centroids, drop the (whole-superfile)
+/// reader, then build from the small centroid projection alone — instead of
+/// holding a resident reader per superfile (which would pin the entire hidden
+/// index in memory). Pass the tuples in superfile × `resident_fine_cluster_vectors`
+/// order.
+///
+/// [`CentroidSection`]: crate::supertable::slow_vector_state::CentroidSection
+pub(crate) fn build_centroid_router_from_cluster_vectors(
+    cluster_vectors: Vec<(usize, u32, Vec<f32>)>,
     dim: usize,
-    gt_cap: usize,
-    prefix_cap: usize,
-) -> Vec<(Vec<GtCand>, Vec<PrefixCand>)> {
-    let nq = queries_prepared.len();
-    let mut gt_heaps: Vec<BinaryHeap<GtCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
-    let mut px_heaps: Vec<BinaryHeap<PrefixCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
-    let mut scratch = vec![0f32; dim];
-    for (flat, enc) in &rows {
-        // Decode each row against ITS OWN codec + per-cluster ruler, so an
-        // adaptive-grid row (the L2Sq/NegDot default `Sq16Adaptive`) is measured
-        // in the same space the served path scores it in. A fixed `[-1, 1]` grid
-        // decode is correct only for the fixed-grid `Sq16` (cosine) codec; using
-        // it on adaptive codes distorts every row and craters the measured recall.
-        let Some(ops) = enc.rerank_codec.ops() else {
-            continue;
-        };
-        if enc.codes.len() != dim * 2 {
-            continue;
-        }
-        ops.dequantize_row_into(
-            &enc.codes,
-            &enc.residuals,
-            dim,
-            &enc.scale,
-            &enc.offset,
-            &mut scratch,
-        );
-        gfc_prepare_for_metric(metric, &mut scratch);
-        let sid = enc.stable_id;
-        for qi in 0..nq {
-            let dist = distance(metric, &queries_prepared[qi], &scratch);
-            gt_push(&mut gt_heaps[qi], GtCand { dist, sid }, gt_cap);
-            if let Some(&rank) = selected_for_si[qi].get(flat) {
-                prefix_push(
-                    &mut px_heaps[qi],
-                    PrefixCand { dist, rank, sid },
-                    prefix_cap,
-                );
-            }
-        }
+    metric: Metric,
+) -> Result<CentroidRouterGraph, QueryError> {
+    use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+    let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(cluster_vectors.len());
+    let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(cluster_vectors.len());
+    for (si, flat, mut vec) in cluster_vectors {
+        gfc_prepare_for_metric(metric, &mut vec);
+        vecs.push(vec);
+        node_map.push((si, flat));
     }
-    gt_heaps
-        .into_iter()
-        .zip(px_heaps)
-        .map(|(g, p)| (g.into_vec(), p.into_vec()))
-        .collect()
+    let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+    let graph = Hnsw::build(&scorer, HnswParams::default());
+    Ok(CentroidRouterGraph {
+        scorer,
+        graph,
+        node_map,
+        metric,
+    })
 }
 
-/// Per-component jitter applied to a sampled corpus row when it becomes a
-/// held-out calibration query, so measured recall reflects true off-node search
-/// rather than a row's trivial self-hit. Expressed as a fraction of the row's
-/// own L2 norm: the HNSW calibrator renormalizes its queries to the unit plane,
-/// so its fixed `0.05` is already norm-relative; this path keeps queries RAW
-/// (the reader prepares the metric space), so a fixed absolute step would be
-/// negligible against a raw-magnitude L2Sq/NegDot row (components ~100) — the
-/// jittered query would sit on top of its source, route into its own rank-0
-/// cluster, and stamp a too-small fanout. Scaling by the norm makes the
-/// perturbation meaningful at every metric while leaving the ~unit Cosine case
-/// (its later normalize divides the norm out) unchanged.
+/// Fixed seed for the fanout calibration's held-out query jitter, so a
+/// re-calibrated identical membership perturbs the same queries the same way
+/// and stamps the same fanout.
+const ROUTER_CALIB_JITTER_SEED: u64 = 0x_FA_11_00_07_CA_11_B0_00;
+
+/// Per-component jitter applied to a calibration query when the router selects
+/// its fine clusters, so measured recall reflects true off-node search rather
+/// than a corpus row's trivial self-route into its own home cluster. Expressed
+/// as a fraction of the query's own L2 norm: the query is kept RAW (the router
+/// prepares the metric space), so a fixed absolute step would be negligible
+/// against a raw-magnitude L2Sq/NegDot row (components ~100) — the query would
+/// route into its own rank-0 cluster and stamp a too-small fanout. Scaling by
+/// the norm makes the perturbation meaningful at every metric while leaving the
+/// ~unit Cosine case (its later normalize divides the norm out) unchanged.
 const ROUTER_CALIB_QUERY_JITTER: f32 = 0.05;
 
-/// Headroom over `k` for the per-query ground-truth candidate heap. Boundary
-/// replicas of one neighbour share a stable id AND a distance, so the heap can
-/// briefly hold several copies of one top-k id; keeping `k × this` nearest
-/// candidates by distance guarantees the k DISTINCT nearest survive the
-/// per-superfile merge before the final stable-id dedup (the drain replica
-/// factor is well under this multiple).
-const GT_CAND_HEADROOM: usize = 4;
-
-/// Small, fast splitmix64 step for the calibration's reservoir + jitter draws —
-/// deterministic across processes so a re-settled identical membership samples
-/// the same queries and stamps the same fanout.
+/// Small, fast splitmix64 step for the calibration's jitter draws —
+/// deterministic across processes so a re-calibrated identical membership
+/// perturbs the same queries and stamps the same fanout.
 fn router_calib_rand(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -1481,272 +1521,59 @@ fn router_calib_rand(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// A ground-truth candidate in the bounded per-query heap: ordered by distance
-/// (smaller is nearer for every metric), so a max-heap [`BinaryHeap`] keeps its
-/// FARTHEST candidate on top and evicts it first when the heap is full. The
-/// stable-id leg only breaks ties deterministically. `total_cmp` gives a total
-/// order over the f32 distance (NaN-safe).
-#[derive(Clone, Copy)]
-struct GtCand {
-    dist: f32,
-    sid: i128,
-}
-impl PartialEq for GtCand {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
-impl Eq for GtCand {}
-impl PartialOrd for GtCand {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for GtCand {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.dist
-            .total_cmp(&other.dist)
-            .then(self.sid.cmp(&other.sid))
-    }
-}
-
-/// Push `cand` into a bounded max-heap that keeps the `cap` NEAREST candidates:
-/// grow until full, then replace the current farthest only when `cand` is nearer.
-fn gt_push(heap: &mut BinaryHeap<GtCand>, cand: GtCand, cap: usize) {
-    if heap.len() < cap {
-        heap.push(cand);
-    } else if let Some(top) = heap.peek()
-        && cand.dist < top.dist
-    {
-        heap.pop();
-        heap.push(cand);
-    }
-}
-
-/// Collapse a per-query candidate heap to the top-`k` DISTINCT stable ids
-/// (best-scored copy per id), matching the served path's stable-id dedup
-/// ([`top_k_ascending`] collapses boundary replicas): a replicated neighbour
-/// must fill exactly ONE ground-truth slot, or it would evict a distinct
-/// neighbour and bias the measured recall (and the stamped fanout).
-fn gt_finalize(heap: BinaryHeap<GtCand>, k: usize) -> Vec<i128> {
-    let mut best: HashMap<i128, f32> = HashMap::new();
-    for c in heap.into_vec() {
-        best.entry(c.sid)
-            .and_modify(|d| {
-                if c.dist < *d {
-                    *d = c.dist;
-                }
-            })
-            .or_insert(c.dist);
-    }
-    let mut ranked: Vec<(f32, i128)> = best.into_iter().map(|(sid, d)| (d, sid)).collect();
-    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    ranked.into_iter().take(k).map(|(_, sid)| sid).collect()
-}
-
-/// Reservoir-sample `nq` corpus rows (spread uniformly across every superfile)
-/// as held-out calibration queries, returning the RAW (dequantized + jittered)
-/// query vectors plus the total row count. Streaming + memory-bounded: peak is
-/// one superfile's rows plus the `nq`-row reservoir, never the whole corpus.
-/// Queries are kept RAW (un-normalized) — the reader's scan prepares the metric
-/// space itself, exactly as the served query path passes a raw vector in.
-async fn sample_router_calibration_queries(
-    manifest: &ManifestSnapshot,
-    entries: &[Arc<SuperfileEntry>],
-    readers: &[Arc<SuperfileReader>],
-    column: &str,
-    dim: usize,
-    nq: usize,
-    seed: u64,
-) -> Result<(Vec<Vec<f32>>, usize), QueryError> {
-    let stride = dim * 2;
-    let empty_superseded = BTreeMap::new();
-    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-    let mut reservoir: Vec<EncodedCellRow> = Vec::with_capacity(nq);
-    let mut seen: usize = 0;
-    let mut rng = seed ^ 0x9E37_79B9_7F4A_7C15;
-    for (entry, reader) in entries.iter().zip(readers.iter()) {
-        let Some(vr) = reader.vec() else { continue };
-        // Draw queries from EXACTLY the superfile set the ground-truth scan
-        // covers. The GT scan ([`VectorReader::calibration_flat_cluster_rows`])
-        // and the router's node walk are both v2-only (a v1 single-cell pack has
-        // no global flat-cluster ids and contributes no router node), so a v1
-        // superfile's rows can enter neither the GT heaps nor the prefix pools.
-        // Were they still sampled as queries, GT would be computed over a corpus
-        // the queries don't match — a skewed stamp. The hidden index is written
-        // exclusively as MultiCellIvf packs, so a v1 reader here is not expected;
-        // skip it (keeping GT and queries on the same corpus) but say so.
-        if !vr.is_multi_cell() {
-            if vr.has_index_column(column) {
-                tracing::warn!(
-                    superfile = %entry.superfile_id,
-                    column,
-                    "router fanout calibrate: skipping an unexpected v1 (single-cell) superfile \
-                     in the hidden index; its rows are excluded from both queries and ground truth"
-                );
-            }
-            continue;
-        }
-        let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
-            .await
-        else {
-            continue;
-        };
-        for row in rows {
-            if row.encoded.codes.len() != stride {
-                continue;
-            }
-            if reservoir.len() < nq {
-                reservoir.push(row.encoded);
-            } else {
-                let j = (router_calib_rand(&mut rng) % (seen as u64 + 1)) as usize;
-                if j < nq {
-                    reservoir[j] = row.encoded;
-                }
-            }
-            seen += 1;
-        }
-    }
-    let mut jrng = seed ^ 0xD1B5_4A32_D192_ED03;
-    let queries = reservoir
-        .iter()
-        .map(|enc| {
-            // Reconstruct the sampled row against its own codec + per-cluster
-            // ruler. The adaptive-grid codec (L2Sq/NegDot) needs its fitted
-            // `scale`/`offset`; a fixed `[-1, 1]` grid decode would fabricate a
-            // distorted query that no longer sits near its own corpus row.
-            let mut v = vec![0f32; dim];
-            if let Some(ops) = enc.rerank_codec.ops() {
-                ops.dequantize_row_into(
-                    &enc.codes,
-                    &enc.residuals,
-                    dim,
-                    &enc.scale,
-                    &enc.offset,
-                    &mut v,
-                );
-            }
-            // Scale the jitter to THIS row's L2 norm so the perturbation is the
-            // same relative size at every metric (a fixed absolute step vanishes
-            // against raw-magnitude L2Sq/NegDot rows). A degenerate zero vector
-            // has no scale to perturb, so it is left as-is.
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let jitter_scale = norm * ROUTER_CALIB_QUERY_JITTER;
-            if jitter_scale > 0.0 {
-                for x in &mut v {
-                    // Uniform [0,1) → [-1,1) scaled by the norm-relative fraction.
-                    let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
-                    *x += (u * 2.0 - 1.0) * jitter_scale;
-                }
-            }
-            v
-        })
-        .collect();
-    Ok((queries, seen))
-}
-
-/// Measure the centroid-graph router's per-`k` fanout by REAL recall at the
-/// post-commit build stage, returning the knee to stamp into
-/// [`CellRoutingParams::fanout_for_k`] (or `None` when the router is off, no
-/// column is eligible, the corpus is empty, or any step fails — the settle then
-/// carries the prior fanout forward). This is the measured-recall replacement
-/// for the old centroid-coverage proxy, which upper-bounded recall (ignoring
-/// the within-cluster Sq16 + rerank loss) and so under-stamped the fanout, and
-/// whose `width × fine` cap wrongly treated "needs more clusters than the grid"
-/// as a loss.
-///
-/// **Scale-safe nested-prefix design.** The naive sweep re-ran the full reader
-/// query path (cold Blob reads) at EVERY fanout rung, up to the whole cluster
-/// count — quadratic, and non-terminating at 100M. Instead this does ONE
-/// corpus scan: every resident row is scored ONCE in the column metric (exact
-/// Sq16 rerank) AND attributed to the fine cluster it lives in (via
-/// [`VectorReader::calibration_flat_cluster_rows`]). Per query the router's
-/// graph selects the top-`max_fanout` clusters once, giving each a selection
-/// rank; recall at fanout `F` is then a PREFIX — the top-`k` distinct rows
-/// whose cluster rank is `< F` ([`recall_by_fanout_for_query`]). One read,
-/// every rung evaluated from it; no per-rung re-read. `max_fanout` is capped by
-/// [`config::VectorSettings::centroid_graph_max_fanout`] (default 4096), so the
-/// single scan and the selection stay bounded regardless of `N`.
-///
-/// The scan runs on the reader pool; ground truth and the prefix pools are
-/// built superfile-by-superfile, so peak memory stays at one superfile's rows
-/// (this router targets 10M–100M corpora). Fanout is calibrated at
-/// `k ∈ {1, 10, 100}` (see [`ROUTER_CALIB_MAX_ANCHOR`]); `k = 1000` stays the
-/// sentinel. The already-built `router` and opened `readers` are threaded in
-/// from the section-publish step (built once per settle), not rebuilt here.
-pub(crate) async fn calibrate_centroid_router_fanout(
-    manifest: &ManifestSnapshot,
-    entries: &[Arc<SuperfileEntry>],
-    readers: &[Arc<SuperfileReader>],
+/// Build the per-superfile fine-cluster selection the recalibration scan tags
+/// prefix rows with: for each RAW calibration query, jitter a norm-relative
+/// COPY (so a corpus row does not trivially self-route into its own home
+/// cluster), metric-prepare it, select the top-`max_fanout` fine clusters via
+/// the router graph, and record each selected cluster's ascending-distance
+/// rank. Returns `(selected_by_si, max_fanout, register_floor, parity_gap)`
+/// where `selected_by_si[si][qi]` maps superfile `si`'s selected flat clusters
+/// → rank for query `qi`, plus the ladder ceiling and the knee-policy floors —
+/// everything the scan and [`WidthLawCalibration::finish`] need for the fanout
+/// law. `queries_raw` is a flat `nq × dim` buffer of dequantized reservoir
+/// queries (the width-law sample), kept RAW exactly as the width walk holds
+/// them; only the jittered COPY here enters the router, so the width/fine/rerank
+/// derivations are untouched.
+#[allow(clippy::type_complexity)]
+pub(crate) fn build_router_fanout_selection(
     router: &CentroidRouterGraph,
-    column: &str,
+    queries_raw: &[f32],
     dim: usize,
+    n_superfiles: usize,
     metric: Metric,
-) -> Option<[u32; WIDTH_LAW_KS.len()]> {
+) -> (Vec<Vec<HashMap<u32, u32>>>, usize, f64, f64) {
     let vcfg = &config::global().vector;
     let total_fine = router.node_map.len();
-    if entries.is_empty() || total_fine == 0 {
-        return None;
-    }
-    let pool = Arc::clone(&manifest.options.reader_pool);
-    // Held-out queries reservoir-sampled across the corpus (raw vectors), plus
-    // the total row count — one memory-bounded streaming pass.
-    let (queries_raw, n) = sample_router_calibration_queries(
-        manifest,
-        entries,
-        readers,
-        column,
-        dim,
-        ROUTER_FANOUT_CALIB_QUERIES,
-        ROUTER_FANOUT_CALIB_SEED,
-    )
-    .await
-    .map_err(|error| tracing::warn!(%error, "router fanout calibrate: query sample failed"))
-    .ok()?;
-    if queries_raw.is_empty() || n == 0 {
-        return None;
-    }
-    // The deepest anchor to calibrate: the largest [`WIDTH_LAW_KS`] point that
-    // both the corpus supports and is within ROUTER_CALIB_MAX_ANCHOR. `k = 1000`
-    // is deliberately excluded (its fanout stays the sentinel `0`), which also
-    // keeps the exact ground-truth heap shallow.
-    let calib_k = WIDTH_LAW_KS
-        .iter()
-        .copied()
-        .filter(|&k| k <= n && k <= ROUTER_CALIB_MAX_ANCHOR)
-        .max()
-        .unwrap_or(0);
-    if calib_k == 0 {
-        return None;
-    }
-    let max_fanout = vcfg.centroid_graph_max_fanout.max(1).min(total_fine);
-
-    // Metric-prepared queries: the graph selection and the exact scoring both
-    // rank in the column metric's space (normalize only for Cosine).
-    let queries_prepared: Vec<Vec<f32>> = queries_raw
-        .iter()
-        .map(|q| {
-            let mut v = q.clone();
-            gfc_prepare_for_metric(metric, &mut v);
-            v
-        })
-        .collect();
-    let nq = queries_prepared.len();
-
-    // Per query, select the top-`max_fanout` fine clusters ONCE via the router
-    // graph and record each cluster's selection rank, grouped by superfile —
-    // `selected_by_si[si][qi]` maps that superfile's selected flat cluster → rank.
+    let max_fanout = vcfg.centroid_graph_max_fanout.max(1).min(total_fine.max(1));
+    let nq = queries_raw.len().checked_div(dim).unwrap_or(0);
+    // Search width: the configured graph ef, floored to cover the fanout, or
+    // twice the fanout when unset — the same rule the served path uses.
     let graph_ef = if vcfg.global_fine_graph_ef > 0 {
         vcfg.global_fine_graph_ef.max(max_fanout)
     } else {
         max_fanout.saturating_mul(2)
     };
-    let mut selected_by_si: Vec<Vec<HashMap<u32, u32>>> = (0..entries.len())
+    let mut selected_by_si: Vec<Vec<HashMap<u32, u32>>> = (0..n_superfiles)
         .map(|_| vec![HashMap::new(); nq])
         .collect();
-    for (qi, q) in queries_prepared.iter().enumerate() {
-        let mut hits = router.graph.search(&router.scorer, q, max_fanout, graph_ef);
+    let mut jrng = ROUTER_CALIB_JITTER_SEED ^ 0xD1B5_4A32_D192_ED03;
+    for qi in 0..nq {
+        let mut q = queries_raw[qi * dim..(qi + 1) * dim].to_vec();
+        // Norm-relative jitter on a COPY: a degenerate zero vector has no scale
+        // to perturb and is left as-is.
+        let norm = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let jitter_scale = norm * ROUTER_CALIB_QUERY_JITTER;
+        if jitter_scale > 0.0 {
+            for x in &mut q {
+                // Uniform [0,1) → [-1,1) scaled by the norm-relative fraction.
+                let u = (router_calib_rand(&mut jrng) >> 40) as f32 / (1u64 << 24) as f32;
+                *x += (u * 2.0 - 1.0) * jitter_scale;
+            }
+        }
+        gfc_prepare_for_metric(metric, &mut q);
+        let mut hits = router
+            .graph
+            .search(&router.scorer, &q, max_fanout, graph_ef);
         // Nearest first — assign the selection rank by ascending distance.
         hits.sort_by(|a, b| a.1.total_cmp(&b.1));
         for (rank, (node, _)) in hits.iter().enumerate() {
@@ -1757,127 +1584,12 @@ pub(crate) async fn calibrate_centroid_router_fanout(
             }
         }
     }
-
-    // ONE corpus scan: score every row exactly (ground truth) and pool the
-    // selected rows tagged with their cluster rank (fanout prefixes), superfile
-    // by superfile, on the reader pool. Peak memory = one superfile's rows.
-    let gt_cap = calib_k.saturating_mul(GT_CAND_HEADROOM).max(calib_k).max(1);
-    let prefix_cap = calib_k
-        .saturating_mul(PREFIX_POOL_HEADROOM)
-        .max(calib_k)
-        .max(1);
-    let queries_arc = Arc::new(queries_prepared);
-    let empty_superseded = BTreeMap::new();
-    let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
-    let mut gt_heaps: Vec<BinaryHeap<GtCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
-    let mut px_heaps: Vec<BinaryHeap<PrefixCand>> = (0..nq).map(|_| BinaryHeap::new()).collect();
-    for (si, (entry, reader)) in entries.iter().zip(readers.iter()).enumerate() {
-        let Some(vr) = reader.vec() else { continue };
-        let Some(rows) = vr
-            .calibration_flat_cluster_rows(column, superseded.get(&entry.superfile_id))
-            .await
-        else {
-            continue;
-        };
-        if rows.is_empty() {
-            continue;
-        }
-        let selected_for_si = std::mem::take(&mut selected_by_si[si]);
-        let qp = Arc::clone(&queries_arc);
-        let contrib = run_on_pool(
-            Some(&pool),
-            "router fanout calibrate: unified scan",
-            move || score_rows_unified(rows, selected_for_si, &qp, metric, dim, gt_cap, prefix_cap),
-        )
-        .await
-        .map_err(|error| tracing::warn!(%error, "router fanout calibrate: scan pool dropped"))
-        .ok()?;
-        for (qi, (gt_cands, px_cands)) in contrib.into_iter().enumerate() {
-            for c in gt_cands {
-                gt_push(&mut gt_heaps[qi], c, gt_cap);
-            }
-            for c in px_cands {
-                prefix_push(&mut px_heaps[qi], c, prefix_cap);
-            }
-        }
-    }
-    let gt: Vec<Vec<i128>> = gt_heaps
-        .into_iter()
-        .map(|h| gt_finalize(h, calib_k))
-        .collect();
-    let prefix_pools: Vec<Vec<PrefixCand>> =
-        px_heaps.into_iter().map(BinaryHeap::into_vec).collect();
-
-    // Seed the ladder around the grid's `width × fine` prior (a start, not a
-    // cap), capped at `max_fanout`.
-    let routing = match manifest.get_partition_strategy() {
-        PartitionStrategy::VectorCell { routing, .. } => routing,
-        _ => CellRoutingParams::default(),
-    };
-    let prior = crate::supertable::opann::fanout_prior_for_k(
-        &routing.width_for_k,
-        &routing.fine_for_k,
-        total_fine.min(u32::MAX as usize) as u32,
-    );
-    let prior_max = prior.iter().copied().max().unwrap_or(0) as usize;
-    let ladder: Vec<u32> = router_fanout_ladder(prior_max, max_fanout)
-        .into_iter()
-        .map(|f| f as u32)
-        .collect();
-    if ladder.is_empty() {
-        return None;
-    }
-
-    // Average the per-query prefix recalls into the ladder the knee policy reads.
-    let mut sum = vec![[0f64; WIDTH_LAW_KS.len()]; ladder.len()];
-    let mut cnt = vec![[0usize; WIDTH_LAW_KS.len()]; ladder.len()];
-    for qi in 0..nq {
-        let per_fanout = recall_by_fanout_for_query(&prefix_pools[qi], &gt[qi], &ladder, calib_k);
-        for (fi, arr) in per_fanout.iter().enumerate() {
-            for ki in 0..WIDTH_LAW_KS.len() {
-                if let Some(r) = arr[ki] {
-                    sum[fi][ki] += r;
-                    cnt[fi][ki] += 1;
-                }
-            }
-        }
-    }
-    let recall_ladder: Vec<(u32, [f64; WIDTH_LAW_KS.len()])> = ladder
-        .iter()
-        .enumerate()
-        .map(|(fi, &f)| {
-            let mut rk = [0f64; WIDTH_LAW_KS.len()];
-            for ki in 0..WIDTH_LAW_KS.len() {
-                if cnt[fi][ki] > 0 {
-                    rk[ki] = sum[fi][ki] / cnt[fi][ki] as f64;
-                }
-            }
-            (f, rk)
-        })
-        .collect();
-
-    // The acceptance bar for the knee is `hnsw_register_floor` (default 0.98),
-    // NOT `target_recall`: the global-fine path's recall ceiling sits ~0.99, so
-    // requiring the full `target_recall` would leave every rung short of the bar
-    // and stamp the sentinel — `auto` would then never engage. The
-    // recall-parity-vs-stamped question this bar implies is a tracked follow-up.
-    let knee = crate::supertable::opann::fanout_knee_from_recalls(
-        &recall_ladder,
-        vcfg.hnsw_register_floor,
-    );
-    tracing::info!(
-        column,
-        n,
-        total_fine,
+    (
+        selected_by_si,
         max_fanout,
-        calib_k,
-        acceptance_bar = vcfg.hnsw_register_floor,
-        prior = ?prior,
-        rungs = ?ladder,
-        knee = ?knee,
-        "router fanout calibrate: measured-recall knee stamped (nested-prefix)"
-    );
-    Some(knee)
+        vcfg.hnsw_register_floor,
+        vcfg.centroid_graph_parity_gap,
+    )
 }
 
 /// Open a [`SuperfileReader`] per entry through a table's store + caches,
@@ -1895,7 +1607,7 @@ async fn open_readers_from_options(
                 options.disk_cache.as_ref(),
                 options.storage.as_ref(),
                 entry,
-                false,
+                ReadIntent::Stream,
             )
             .await?,
         );
@@ -1983,16 +1695,6 @@ fn fine_first_cell_selection(fine_ranked: &[(u32, f32)], grid_top: Option<u32>) 
     cells
 }
 
-/// Map a per-superfile vector-search error to a query error. A budget refusal
-/// keeps its own variant (found via `ReadError::over_budget`) so it surfaces as
-/// the public `InfinoError::OverBudget`; anything else is a generic query error.
-fn vector_read_query_error(e: ReadError) -> QueryError {
-    if let Some(msg) = e.over_budget() {
-        return QueryError::OverBudget(msg.to_string());
-    }
-    QueryError::Parquet(e.to_string())
-}
-
 /// An optional text-predicate filter for vector kNN search. When
 /// supplied, kNN is ranked only among rows matching the predicate
 /// (pushdown, not post-filter). Built from an FTS-indexed column, a
@@ -2039,6 +1741,27 @@ async fn lookup_user_placements_by_id(
     user_row_ids: &[i128],
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Vec<(Arc<SuperfileEntry>, u32)>, QueryError> {
+    lookup_user_placements_by_id_opt(manifest, user_row_ids, op_stats)
+        .await?
+        .into_iter()
+        .enumerate()
+        .map(|(index, placement)| {
+            placement.ok_or_else(|| {
+                QueryError::Internal(format!("no user superfile owns id {}", user_row_ids[index]))
+            })
+        })
+        .collect()
+}
+
+/// [`lookup_user_placements_by_id`] for ids that may no longer be rows —
+/// `None` for one no live superfile owns. A graph walk reaches nodes by
+/// an edge table that can lag the rows it names; a row gone since the edge
+/// was written is skipped, not an error.
+pub(crate) async fn lookup_user_placements_by_id_opt(
+    manifest: &ManifestSnapshot,
+    user_row_ids: &[i128],
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Vec<Option<(Arc<SuperfileEntry>, u32)>>, QueryError> {
     if user_row_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2070,7 +1793,7 @@ async fn lookup_user_placements_by_id(
         if row_id_from_manifest_entry(&entry, 0).is_some() {
             for index in matching {
                 let local = u32::try_from(user_row_ids[index] - entry.id_min).map_err(|_| {
-                    QueryError::Execute(format!(
+                    QueryError::Internal(format!(
                         "local_doc_id out of range for id {}",
                         user_row_ids[index]
                     ))
@@ -2127,6 +1850,13 @@ async fn lookup_user_placements_by_id(
         // not a duplicate one); the CPU inversion runs on the reader pool, not
         // the tokio blocking pool. `try_join_all` preserves `cells` order, so
         // the probe below stays deterministic in manifest order.
+        // `unbuilt` is how many of those maps this call waits on: every gapped
+        // file on a freshly started process, none once the cache is warm.
+        let span = detail_span!(
+            "vector.resolve_placement",
+            gapped = cells.len(),
+            unbuilt = cells.iter().filter(|(_, cell)| !cell.initialized()).count(),
+        );
         let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> =
             try_join_all(cells.into_iter().map(|(entry, cell)| async move {
                 let index = cell
@@ -2136,6 +1866,7 @@ async fn lookup_user_placements_by_id(
                     .await?;
                 Ok::<_, QueryError>((entry, Arc::clone(index)))
             }))
+            .instrument(span)
             .await?;
         // Probe in manifest (gapped) order: if an id is resident in two live
         // superfiles — an updated row's tombstoned-old copy plus its live copy,
@@ -2154,15 +1885,7 @@ async fn lookup_user_placements_by_id(
         }
     }
 
-    placements
-        .into_iter()
-        .enumerate()
-        .map(|(index, placement)| {
-            placement.ok_or_else(|| {
-                QueryError::Execute(format!("no user superfile owns id {}", user_row_ids[index]))
-            })
-        })
-        .collect()
+    Ok(placements)
 }
 
 /// Extract the `_id` column (column 0, Decimal128) of `batch` as `Vec<i128>`.
@@ -2172,7 +1895,7 @@ fn id_values_from_batch(batch: &RecordBatch) -> Result<Vec<i128>, QueryError> {
         .as_any()
         .downcast_ref::<Decimal128Array>()
         .map(|a| a.values().to_vec())
-        .ok_or_else(|| QueryError::Execute("_id column missing".into()))
+        .ok_or_else(|| QueryError::Internal("_id column missing".into()))
 }
 
 /// Build one gapped superfile's sorted `stable_id -> local` index (#556): read
@@ -2199,7 +1922,11 @@ async fn build_gapped_placement_index(
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-    let ids = read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await?;
+    // Every row, so never the inline region: it is stored per cell, so
+    // reading all of it costs one small read per cell, each rounded up to a
+    // whole cache block. A cold file serves every row from its stable-id
+    // sidecar in one range; see `read_ids_for_locals`.
+    let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false, op_stats).await?;
     // Build scratch only, released the moment the sorted arrays are extracted.
     // The transient peak holds all three vectors at once — the decoded `ids`
     // and `locals` are still alive while the `(i128, u32)` pairs they zip into
@@ -2238,7 +1965,7 @@ async fn build_gapped_placement_index(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     Ok(Arc::new(index))
 }
 
@@ -2287,9 +2014,7 @@ pub(crate) async fn stable_ids_by_local_for_routing(
     }
     let id_column = reader.id_column();
     if reader.parquet_bytes().is_some() {
-        let batch = reader
-            .take_by_local_doc_ids(&locals, &[id_column])
-            .map_err(|e| QueryError::Execute(e.to_string()))?;
+        let batch = reader.take_by_local_doc_ids(&locals, &[id_column])?;
         return id_values_from_batch(&batch);
     }
     read_ids_for_locals(manifest, entry, &locals, id_column, true, op_stats).await
@@ -2299,11 +2024,20 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
 ///
-/// `allow_inline_region` selects the resolution source:
+/// Every source holds the same ids in the same row order; `allow_inline_region`
+/// picks the cheaper one for the rows asked for:
 ///
-///   - `true` — prefer the IVF blob's inline `_id` region (hidden cells).
-///   - `false` — never use the inline region; read the scalar `_id` column
-///     (user superfiles after compaction — inline region is cluster-ordered).
+///   - `true`: the vector blob's inline `_id` region, stored once per cell.
+///     Free when resident; cold, it costs one read per cell the rows touch,
+///     so it suits a few rows.
+///   - `false`: the scalar `_id` column, one chunk per row group, read
+///     through its page index, so it suits rows spread over a file.
+///
+/// Every row of a cold file comes from the packed stable-id sidecar instead,
+/// whichever is asked for: one contiguous range of a few bytes per row,
+/// where either source above costs a read per cell or per column chunk.
+/// A file whose vector blob carries rows the Parquet body does not (boundary
+/// stubs) never reads the inline region; its order would not match.
 async fn read_ids_for_locals(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
@@ -2318,15 +2052,17 @@ async fn read_ids_for_locals(
     let storage = manifest.options.storage.as_ref();
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.as_ref();
-    let reader = dispatch::open_reader(&store, disk_cache, storage, entry, false).await?;
+    let reader =
+        dispatch::open_reader(&store, disk_cache, storage, entry, ReadIntent::Stream).await?;
     // The inline IVF region is usable as an `_id` source only when its rows
     // map 1:1 to Parquet rows. Boundary-replicated user commits break that:
     // the IVF carries stub rows beyond the Parquet count, so inline order
     // diverges from Parquet row order and the shortcut would pair ids with
     // the wrong locals. Hidden cells keep the shortcut — their replicas are
     // real Parquet rows, so the counts (and orders) match.
-    let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
-    if allow_inline_region && inline_is_parquet_ordered {
+    let inline_usable =
+        allow_inline_region && reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
+    if inline_usable {
         // The inline-region read is one planned range per file — the plan
         // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
@@ -2354,7 +2090,7 @@ async fn read_ids_for_locals(
                 },
             )
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
         };
         if let Some(ids) = resident {
             if let Some(stats) = op_stats {
@@ -2362,12 +2098,20 @@ async fn read_ids_for_locals(
             }
             return Ok(ids);
         }
+    }
+    // Cold, and asked for every row: the sidecar holds them all in one
+    // range of a few bytes per row, where the inline region costs a read per
+    // cell and the column a read per row-group chunk (`id_sidecar_serves`
+    // says when it applies).
+    if reader.id_sidecar_serves(local_ids, id_column)
+        && let Some(ids) = ids_from_sidecar(manifest, entry, &reader, local_ids, op_stats).await?
+    {
+        return Ok(ids);
+    }
+    if inline_usable {
         // Cold path: fetch the inline region async when present but not resident.
         if let Some(v) = reader.vec()
-            && let Some(ids) = v
-                .inline_stable_ids_for_locals_async(local_ids)
-                .await
-                .map_err(|e| QueryError::Execute(e.to_string()))?
+            && let Some(ids) = v.inline_stable_ids_for_locals_async(local_ids).await?
         {
             if let Some(stats) = op_stats {
                 stats.add_planned_read_ranges(1);
@@ -2389,12 +2133,12 @@ async fn read_ids_for_locals(
                     op_stats::timed_section(|| {
                         reader
                             .take_by_local_doc_ids(&locals, &[id_column.as_str()])
-                            .map_err(|e| QueryError::Execute(e.to_string()))
+                            .map_err(QueryError::from)
                     })
                 },
             )
             .await
-            .map_err(|e| QueryError::Execute(e.to_string()))?
+            .map_err(|e| QueryError::Internal(e.to_string()))?
         };
         if let Some(stats) = op_stats {
             stats.add_kernel_cpu_ns(decode_ns);
@@ -2403,8 +2147,97 @@ async fn read_ids_for_locals(
     }
     let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
         .await
-        .map_err(|error| QueryError::Execute(error.to_string()))?;
+        .map_err(QueryError::DataFusion)?;
     id_values_from_batch(&batch)
+}
+
+/// The `_id`s of `local_ids` from `reader`'s stable-id sidecar: one ranged
+/// read for the whole sidecar, decoded and checked on the reader pool
+/// (`IdSidecar::verified_ids`). `None` sends the caller to another source,
+/// which holds the same ids in the same row order:
+///
+///   - no sidecar, or one this table already found damaged;
+///   - the read failed: nothing is known about the sidecar's bytes, so it is
+///     not marked and a later read tries it again;
+///   - it does not decode or fails its checks: recorded in the table, so no
+///     later read fetches or warns about it again, through this reader or
+///     any that replaces it once the cache evicts this one.
+///
+/// A doc past the file's end is the caller's error, returned as such, and
+/// leaves the sidecar unmarked.
+async fn ids_from_sidecar(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    reader: &SuperfileReader,
+    local_ids: &Arc<Vec<u32>>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Option<Vec<i128>>, QueryError> {
+    let damaged = &manifest.options.damaged_id_sidecars;
+    if damaged.lock().is_ok_and(|set| set.contains(&entry.uri)) {
+        return Ok(None);
+    }
+    let sidecar = match reader.fetch_id_sidecar().await {
+        Ok(Some(sidecar)) => sidecar,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            warn!(
+                uri = ?entry.uri,
+                %error,
+                "reading _id from the column this time, the id sidecar fetch failed"
+            );
+            return Ok(None);
+        }
+    };
+    let locals = Arc::clone(local_ids);
+    let metadata = Arc::clone(reader.parquet_metadata());
+    let id_column = reader.id_column().to_string();
+    let id_range = (entry.id_min, entry.id_max);
+    let (decoded, decode_ns) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "id sidecar decode: reader pool dropped result",
+        move || {
+            op_stats::timed_section(|| {
+                let every = sidecar.verified_ids(&metadata, &id_column, id_range)?;
+                locals
+                    .iter()
+                    .map(|&doc_id| {
+                        every
+                            .get(doc_id as usize)
+                            .copied()
+                            .ok_or(ReadError::DocIdOutOfRange {
+                                doc_id,
+                                n_docs: every.len() as u64,
+                            })
+                    })
+                    .collect::<Result<Vec<i128>, ReadError>>()
+            })
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
+    if let Some(stats) = op_stats {
+        stats.add_kernel_cpu_ns(decode_ns);
+    }
+    match decoded {
+        Ok(ids) => {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
+            Ok(Some(ids))
+        }
+        Err(error @ ReadError::DocIdOutOfRange { .. }) => Err(QueryError::from(error)),
+        Err(error) => {
+            if let Ok(mut set) = damaged.lock() {
+                set.insert(entry.uri);
+            }
+            warn!(
+                uri = ?entry.uri,
+                %error,
+                "reading _id from the column, the id sidecar is damaged"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
@@ -2443,7 +2276,7 @@ async fn hidden_hits_user_ids(
             .await
             .map_err(QueryError::ManifestLoad)?
             .ok_or_else(|| {
-                QueryError::Execute(format!("hidden superfile {uri:?} missing from manifest"))
+                QueryError::Internal(format!("hidden superfile {uri:?} missing from manifest"))
             })?;
         // Contiguous span → arithmetic, no read.
         if row_id_from_manifest_entry(&entry, 0).is_some() {
@@ -2565,7 +2398,7 @@ pub(crate) fn hits_id_score_batch(
     let mut scores = Vec::with_capacity(hits.len());
     for hit in hits {
         let id = hit.stable_id.ok_or_else(|| {
-            QueryError::Execute(format!(
+            QueryError::Internal(format!(
                 "hit {:?}/{} missing stable _id before output materialization",
                 hit.superfile, hit.local_doc_id
             ))
@@ -2573,7 +2406,20 @@ pub(crate) fn hits_id_score_batch(
         ids.push(id);
         scores.push(hit.score);
     }
-    id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Execute(e.to_string()))
+    id_score_batch(user_reader, &ids, &scores).map_err(|e| QueryError::Internal(e.to_string()))
+}
+
+/// What placement does with a hit whose `_id` no live superfile owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissingRow {
+    /// A search hit's id is always a row — identity resolution belongs
+    /// before this boundary — so a missing one is an upstream bug.
+    Error,
+    /// A graph walk reaches rows through an edge table that can lag the
+    /// rows it names; one gone since the edge was written is skipped, as a
+    /// deleted row is.
+    #[cfg(feature = "graph-index")]
+    Skip,
 }
 
 /// Locate each hit's user-table `(superfile, local_doc_id)` for scalar
@@ -2582,6 +2428,18 @@ pub(crate) fn hits_id_score_batch(
 pub(crate) async fn user_placement_for_scalar_resolve(
     user_reader: &SupertableReader,
     hits: &[SuperfileHit],
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    place_for_scalar_resolve(user_reader, hits, MissingRow::Error).await
+}
+
+/// [`user_placement_for_scalar_resolve`] with `missing` saying what a hit
+/// whose id is no row becomes. A hit of [`SuperfileUri::UNPLACED`] — one
+/// known by its `_id` alone (`SuperfileHit::by_id`) — is placed by the id
+/// without a manifest lookup, like a hidden-index hit.
+pub(crate) async fn place_for_scalar_resolve(
+    user_reader: &SupertableReader,
+    hits: &[SuperfileHit],
+    missing: MissingRow,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     if hits.is_empty() {
         return Ok(Vec::new());
@@ -2602,10 +2460,11 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     let mut out: Vec<Option<SuperfileHit>> = vec![None; hits.len()];
     let mut placement_requests: Vec<(usize, i128)> = Vec::new();
     for (i, hit) in hits.iter().enumerate() {
-        if let Some(user_entry) = user_manifest
-            .lookup_superfile_entry(hit.superfile)
-            .await
-            .map_err(QueryError::ManifestLoad)?
+        if hit.superfile != SuperfileUri::UNPLACED
+            && let Some(user_entry) = user_manifest
+                .lookup_superfile_entry(hit.superfile)
+                .await
+                .map_err(QueryError::ManifestLoad)?
             && !(user_entry.vector_layout == VectorLayout::MultiCellIvf && hit.stable_id.is_some())
         {
             out[i] = Some(*hit);
@@ -2622,7 +2481,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
             )
             .await?[0]
         } else {
-            return Err(QueryError::Execute(format!(
+            return Err(QueryError::Internal(format!(
                 "hit superfile {:?} missing from manifests",
                 hit.superfile
             )));
@@ -2636,11 +2495,24 @@ pub(crate) async fn user_placement_for_scalar_resolve(
         placement_requests.push((i, user_row_id));
     }
     let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
-    let placements =
-        lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats).await?;
-    for ((index, stable_id), (entry, local_doc_id)) in
-        placement_requests.into_iter().zip(placements)
-    {
+    let placements: Vec<Option<(Arc<SuperfileEntry>, u32)>> = match missing {
+        MissingRow::Error => {
+            lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats)
+                .await?
+                .into_iter()
+                .map(Some)
+                .collect()
+        }
+        #[cfg(feature = "graph-index")]
+        MissingRow::Skip => {
+            lookup_user_placements_by_id_opt(user_manifest, &requested_ids, &user_reader.op_stats)
+                .await?
+        }
+    };
+    for ((index, stable_id), placement) in placement_requests.into_iter().zip(placements) {
+        let Some((entry, local_doc_id)) = placement else {
+            continue;
+        };
         out[index] = Some(SuperfileHit {
             superfile: entry.uri,
             local_doc_id,
@@ -2658,7 +2530,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
 /// fallback wave).
 fn score_cell_fp32(
     superfiles: &[Arc<SuperfileEntry>],
-    column: &str,
+    column: FieldId,
     d: &DeferredCellRescore,
     fp32: &[f32],
     query: &[f32],
@@ -2668,7 +2540,7 @@ fn score_cell_fp32(
     let entry = &superfiles[d.si];
     let Some(cell) = entry
         .vector_summary
-        .get(column)
+        .get(&column)
         .and_then(|vs| vs.cells.iter().find(|cell| cell.cell_id == d.cell_id))
     else {
         return false;
@@ -2714,33 +2586,108 @@ const HNSW_CALIB_SEED: u64 = 0x_C0FF_EE00_CA11_B000;
 /// in the same order). `stride_step = Some(k)` keeps only every k-th row — a
 /// coarse, deterministic, evenly-spread sample that lets the probe bound its
 /// memory to ~`n/k` rows instead of the whole plane; `None` collects every row.
-async fn collect_hnsw_codes(
+/// The node-ordered rerank plane a resident-index build gathers, in the form the
+/// column's ruler needs. Cosine keeps the raw fixed-grid Sq16 codes (used
+/// verbatim); a fitted-ruler metric (`Sq16Adaptive`, whose codes are
+/// per-cluster) is decoded to fp32 so the caller can refit it onto ONE global
+/// ruler. Node ordering is identical either way — the gather iteration is what
+/// defines what node index N means, and the metric only changes the payload.
+enum GatheredPlane {
+    /// `rows × dim × 2` fixed-grid Sq16 code bytes (cosine).
+    Codes(Vec<u8>),
+    /// `rows × dim` decoded fp32, row-major (a fitted-ruler metric).
+    Fp32(Vec<f32>),
+}
+
+impl Default for GatheredPlane {
+    /// An empty cosine plane — the placeholder `std::mem::take` leaves behind
+    /// once the build has consumed the gathered plane.
+    fn default() -> Self {
+        GatheredPlane::Codes(Vec::new())
+    }
+}
+
+impl GatheredPlane {
+    /// Decoded/carried row count implied by the payload length and `dim`.
+    fn rows(&self, dim: usize) -> usize {
+        match self {
+            GatheredPlane::Codes(b) => b.len() / (dim * 2),
+            GatheredPlane::Fp32(f) => f.len() / dim,
+        }
+    }
+
+    /// Build the resident scorer this plane serves: the fixed cosine grid for
+    /// raw codes, or a freshly-fitted global ruler over the decoded fp32.
+    fn into_scorer(self, dim: usize, len: usize, metric: Metric) -> Sq16Scorer {
+        match self {
+            GatheredPlane::Codes(b) => Sq16Scorer::from_codes(b, dim, len),
+            GatheredPlane::Fp32(f) => Sq16Scorer::from_fp32_metric(&f, dim, len, metric),
+        }
+    }
+
+    /// The raw Sq16 code bytes; valid only for the cosine (`Codes`) plane the
+    /// flat arm gathers (it is metric-gated to cosine, so it never sees fp32).
+    fn expect_codes(self) -> Vec<u8> {
+        match self {
+            GatheredPlane::Codes(b) => b,
+            GatheredPlane::Fp32(_) => {
+                unreachable!("flat index build gathers a cosine (Codes) plane")
+            }
+        }
+    }
+}
+
+/// Decode one materialized single-`u16` rerank row (`Sq16Adaptive`) to fp32
+/// through its per-cluster ruler — the reconstruction the metric-aware graph
+/// refits onto one global ruler at drain, the same transient fp32 the IVF merge
+/// transcode already produces. `out.len() == dim`.
+fn decode_adaptive_row_into(enc: &EncodedCellRow, out: &mut [f32]) {
+    dequantize_sq16_adaptive_into(&enc.codes, &enc.scale, &enc.offset, out);
+}
+
+async fn collect_hnsw_plane(
     manifest: &ManifestSnapshot,
     column: &str,
-    stride: usize,
+    dim: usize,
     stride_step: Option<usize>,
-) -> Result<Vec<u8>, QueryError> {
+    metric: Metric,
+) -> Result<GatheredPlane, QueryError> {
+    let stride = dim * 2;
+    let metric_aware = metric != Metric::Cosine;
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
     let empty_superseded = BTreeMap::new();
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut codes: Vec<u8> = Vec::new();
+    let mut fp32: Vec<f32> = Vec::new();
+    let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
         };
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
@@ -2750,12 +2697,21 @@ async fn collect_hnsw_codes(
                 None => true,
             };
             if keep {
-                codes.extend_from_slice(&row.encoded.codes);
+                if metric_aware {
+                    decode_adaptive_row_into(&row.encoded, &mut scratch);
+                    fp32.extend_from_slice(&scratch);
+                } else {
+                    codes.extend_from_slice(&row.encoded.codes);
+                }
             }
             gi += 1;
         }
     }
-    Ok(codes)
+    Ok(if metric_aware {
+        GatheredPlane::Fp32(fp32)
+    } else {
+        GatheredPlane::Codes(codes)
+    })
 }
 
 /// Cheap metadata-only row count for `column` across all superfiles, excluding
@@ -2774,11 +2730,17 @@ async fn count_hnsw_rows(manifest: &ManifestSnapshot, column: &str) -> Result<us
     let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
     let mut n: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
-        if !vr.has_index_column(column) {
+        // The file's own label for the column; see the fan-out sites.
+        if !vr.has_index_column(reader.column_alias(manifest.field_id(column), column)) {
             continue;
         }
         let sup = superseded.get(&entry.superfile_id);
@@ -2821,6 +2783,18 @@ pub(crate) enum IndexUnavailable {
     CodecUnsupported { column: String, codec: &'static str },
     /// The column's metric is not the one these scorers rank under.
     MetricUnsupported { column: String, metric: Metric },
+    /// The resident graph was built for a different metric than the column now
+    /// declares (a metric change, or a pre-metric-aware cosine graph on a column
+    /// since re-declared) — serve ivf until the next drain rebuilds it.
+    MetricMismatch {
+        column: String,
+        built: Metric,
+        declared: Metric,
+    },
+    /// Incremental extend of a fitted-ruler (non-cosine) graph is not yet
+    /// supported — the caller does a full rebuild, which refits the global ruler
+    /// over the whole corpus. (Extend inheriting the prior ruler is a follow-up.)
+    IncrementalMetricUnsupported { column: String, metric: Metric },
     /// No rows materialized for the column.
     NoRows { column: String },
     /// The corpus is past the index's document ceiling.
@@ -2873,6 +2847,20 @@ impl std::fmt::Display for IndexUnavailable {
                 f,
                 "column `{column}` uses metric {metric:?}; the resident scorers rank \
                  by inner product, which orders neighbours correctly only under Cosine"
+            ),
+            IndexUnavailable::MetricMismatch {
+                column,
+                built,
+                declared,
+            } => write!(
+                f,
+                "the resident graph for `{column}` was built for metric {built:?}, but \
+                 the column now declares {declared:?}"
+            ),
+            IndexUnavailable::IncrementalMetricUnsupported { column, metric } => write!(
+                f,
+                "column `{column}` uses metric {metric:?}; incremental extend of a \
+                 fitted-ruler graph is not yet supported — rebuilding in full"
             ),
             IndexUnavailable::NoRows { column } => {
                 write!(f, "no rows materialized for column `{column}`")
@@ -3060,8 +3048,14 @@ async fn gather_sq16_rows(
     op_stats: &Option<Arc<OpStatsCollector>>,
     n: usize,
     probe_step: Option<usize>,
-) -> Result<Option<(Vec<i128>, Vec<u8>)>, QueryError> {
+    metric: Metric,
+) -> Result<Option<(Vec<i128>, GatheredPlane)>, QueryError> {
     let stride = dim * 2;
+    // A fitted-ruler metric (Sq16Adaptive) carries per-cluster codes, so the raw
+    // bytes are meaningless as one plane; decode each row to fp32 through its own
+    // ruler and refit onto a single global ruler in the caller. Cosine's fixed
+    // grid is one ruler already, so its codes ride verbatim.
+    let metric_aware = metric != Metric::Cosine;
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
     let storage = manifest.options.storage.clone();
@@ -3070,14 +3064,27 @@ async fn gather_sq16_rows(
 
     let mut doc_ids: Vec<i128> = Vec::with_capacity(n);
     let mut carried_codes: Vec<u8> = Vec::new();
+    let mut carried_fp32: Vec<f32> = Vec::new();
+    let mut scratch = vec![0.0f32; dim];
     let mut gi: usize = 0;
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -3086,25 +3093,30 @@ async fn gather_sq16_rows(
             stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "vector index: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
             }
             let local = row.local_doc_id as usize;
             let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
+                QueryError::Internal(format!(
                     "vector index: local_doc_id {local} out of range ({} ids) on `{column}`",
                     ids.len()
                 ))
             })?;
             doc_ids.push(stable_id);
-            match probe_step {
-                Some(step) if gi.is_multiple_of(step) => {
+            let keep = match probe_step {
+                Some(step) => gi.is_multiple_of(step),
+                None => true,
+            };
+            if keep {
+                if metric_aware {
+                    decode_adaptive_row_into(&row.encoded, &mut scratch);
+                    carried_fp32.extend_from_slice(&scratch);
+                } else {
                     carried_codes.extend_from_slice(&row.encoded.codes);
                 }
-                Some(_) => {}
-                None => carried_codes.extend_from_slice(&row.encoded.codes),
             }
             gi += 1;
         }
@@ -3120,7 +3132,12 @@ async fn gather_sq16_rows(
     if doc_ids.is_empty() {
         return Ok(None);
     }
-    Ok(Some((doc_ids, carried_codes)))
+    let plane = if metric_aware {
+        GatheredPlane::Fp32(carried_fp32)
+    } else {
+        GatheredPlane::Codes(carried_codes)
+    };
+    Ok(Some((doc_ids, plane)))
 }
 
 /// Build and encode the flat 4-bit index for `column` — the drain path for
@@ -3193,14 +3210,17 @@ pub(crate) async fn assemble_flat_sections(
     // of a graph build - the calibration sweep - does not exist here; the fit
     // is one pass, and the gate below runs against the real plane rather than
     // a subsample whose recall would be optimistic.
-    let Some((doc_ids, sq16_codes)) =
-        gather_sq16_rows(manifest, column, dim, op_stats, n, None).await?
+    // The flat arm is metric-gated to cosine above, so the gather always yields
+    // the raw fixed-grid Sq16 codes this build fits from.
+    let Some((doc_ids, plane)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, None, Metric::Cosine).await?
     else {
         return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
             column: column.to_string(),
             pre_count: n,
         }));
     };
+    let sq16_codes = plane.expect_codes();
     // The bare 4-bit plane, always. The 1.0 B/dim residual rung was carved out
     // pending a matched-bytes comparison against a single 8-bit plane — the
     // Sq16-vs-Sq8Residual theorem says a uniform plane beats coarse+residual
@@ -3239,7 +3259,7 @@ pub(crate) async fn assemble_flat_sections(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if recall < floor {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::BelowRegisterFloor { recall, floor },
@@ -3277,7 +3297,20 @@ pub(crate) async fn assemble_hnsw_sections(
                 .collect(),
         }));
     };
-    if !vc.rerank_codec.is_sq16() {
+    let metric = vc.metric;
+    // The graph serves the fixed cosine grid (`Sq16`) and, via one fitted global
+    // ruler, the per-cluster `Sq16Adaptive` plane that L2Sq/NegDot columns store.
+    // Cosine keeps the fixed grid; every other metric requires the fitted-ruler
+    // single-u16 codec (a fixed-grid `Sq16` carries no per-cluster ruler to
+    // decode its rows through, and its `[-1, 1]` grid is cosine-only anyway).
+    // (The flat arm and centroid router stay cosine-only via `metric_supported`
+    // — this arm's own scorer is metric-aware, so it does not gate on it.)
+    let codec_ok = if metric == Metric::Cosine {
+        vc.rerank_codec.is_sq16()
+    } else {
+        vc.rerank_codec.writes_single_u16_plane() && vc.rerank_codec.fits_per_cluster_ruler()
+    };
+    if !codec_ok {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::CodecUnsupported {
                 column: column.to_string(),
@@ -3285,11 +3318,7 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         ));
     }
-    if let Some(reason) = metric_supported(manifest, column) {
-        return Ok(IndexOutcome::Unavailable(reason));
-    }
     let dim = vc.dim;
-    let stride = dim * 2;
 
     // Gather the stable doc-ids (cheap: 16 B/row) and the row count first. The
     // Sq16 code plane itself (dim*2 B/row — GBs at scale) is gathered LATER: a
@@ -3335,8 +3364,8 @@ pub(crate) async fn assemble_hnsw_sections(
     // the sample is ~probe_cap rows. `None` = small corpus, no probe.
     let probe_step: Option<usize> = (n > probe_cap).then(|| (n / probe_cap).max(1));
 
-    let Some((doc_ids, mut carried_codes)) =
-        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step).await?
+    let Some((doc_ids, mut carried_plane)) =
+        gather_sq16_rows(manifest, column, dim, op_stats, n, probe_step, metric).await?
     else {
         return Ok(IndexOutcome::Unavailable(IndexUnavailable::GatherEmpty {
             column: column.to_string(),
@@ -3346,10 +3375,12 @@ pub(crate) async fn assemble_hnsw_sections(
 
     if probe_step.is_some() {
         // Reuse the strided sample gathered in the merged pass above — no second
-        // decode. (Byte-identical to the prior `collect_hnsw_codes(Some(step))`.)
-        let pcodes = std::mem::take(&mut carried_codes);
-        let pn = pcodes.len() / stride;
-        let pscorer = Sq16Scorer::from_codes(pcodes, dim, pn);
+        // decode. For a fitted-ruler metric the sample fits its OWN ruler (the
+        // probe only sizes `m0` against scale, so a sample ruler is fine here);
+        // the full-corpus pass below fits the authoritative one.
+        let psample = std::mem::take(&mut carried_plane);
+        let pn = psample.rows(dim);
+        let pscorer = psample.into_scorer(dim, pn, metric);
         // The calibrate build is pure CPU; run it on the reader pool (not the
         // global rayon pool, and not inline on the tokio worker) per the
         // concurrency contract. The candidate grids are tiny, so clone them
@@ -3383,7 +3414,7 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         if !pchoice.registered {
             tracing::info!(
                 column,
@@ -3422,10 +3453,10 @@ pub(crate) async fn assemble_hnsw_sections(
     // above (no probe was taken from `carried_codes`); the probe path re-reads
     // the plane here, having kept it out of RAM through the probe to bound peak
     // memory at scale.
-    let codes = if probe_step.is_none() {
-        std::mem::take(&mut carried_codes)
+    let full_plane = if probe_step.is_none() {
+        std::mem::take(&mut carried_plane)
     } else {
-        collect_hnsw_codes(manifest, column, stride, None).await?
+        collect_hnsw_plane(manifest, column, dim, None, metric).await?
     };
     // Size the scorer from the DECODED plane, not the metadata pre-count `n`
     // (which only sizes the probe step). The decode can skip a superfile the
@@ -3435,7 +3466,7 @@ pub(crate) async fn assemble_hnsw_sections(
     // plane and the doc-id pass disagree, a transient fault desynced the two
     // reads and a graph built now would mismap nodes to ids: skip it and serve
     // ivf; the next drain rebuilds.
-    let decoded_rows = codes.len() / stride;
+    let decoded_rows = full_plane.rows(dim);
     if decoded_rows != doc_ids.len() {
         tracing::warn!(
             column,
@@ -3450,7 +3481,10 @@ pub(crate) async fn assemble_hnsw_sections(
             },
         ));
     }
-    let scorer = Sq16Scorer::from_codes(codes, dim, decoded_rows);
+    // For a fitted-ruler metric this fits the authoritative global ruler over
+    // the full corpus and re-encodes the single-u16 plane; cosine adopts the raw
+    // codes verbatim.
+    let scorer = full_plane.into_scorer(dim, decoded_rows, metric);
     // Calibrate (m0, ef) to the table's recall bar on the FULL corpus (build
     // once at m0_max, prune down, sweep ef by re-search — free). The m0
     // requirement is scale-dependent, so this full-corpus pass is authoritative
@@ -3474,7 +3508,21 @@ pub(crate) async fn assemble_hnsw_sections(
         vcfg.hnsw_register_floor,
         vcfg.hnsw_ef_construction,
     );
-    let walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    let mut walk = hnsw::WalkCodec::from_config(vcfg.hnsw_plane);
+    // The SQ8 / 4-bit walk planes are code-space proxies fitted to the uniform
+    // fixed cosine grid; they do not carry the per-dim fitted ruler, so on a
+    // metric-aware plane their navigation is wrong. Walk the metric-aware Sq16
+    // plane directly for non-cosine columns (the refine is Sq16 regardless, so
+    // only per-candidate walk cost changes, never the order returned). A
+    // ruler-aware coarse walk is a follow-up.
+    if metric != Metric::Cosine && walk != hnsw::WalkCodec::Sq16 {
+        tracing::debug!(
+            column,
+            ?walk,
+            "hnsw: non-cosine column walks the ruler-aware Sq16 plane (coarse walk planes are not ruler-aware yet)"
+        );
+        walk = hnsw::WalkCodec::Sq16;
+    }
     let n_rows = doc_ids.len();
     let (scorer, sq4, choice, ef_curve, graph) = run_on_pool(
         Some(&manifest.options.reader_pool),
@@ -3533,7 +3581,7 @@ pub(crate) async fn assemble_hnsw_sections(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if !choice.registered {
         tracing::info!(
             column,
@@ -3573,15 +3621,17 @@ pub(crate) async fn assemble_hnsw_sections(
         column,
         walk,
         sq4.as_ref(),
+        scorer.metric(),
+        scorer.ruler(),
+        scorer.node_norms(),
     )))
 }
 
 /// Incrementally extend a prior persisted `hnsw` graph with a
 /// freshly-drained append delta — no full rebuild. Reads only rows whose
-/// `stable_id > prior_high_water` (the append boundary from the prior
-/// bundle header; ids are assigned monotonically at drain), concatenates
-/// their code plane + stable ids onto the prior graph's, and inserts only
-/// the new nodes via [`Hnsw::extend`]. Returns
+/// `stable_id > prior_high_water` (the largest id in the prior graph),
+/// concatenates their code plane + stable ids onto the prior graph's, and
+/// inserts only the new nodes via [`Hnsw::extend`]. Returns
 /// `(data_bundle_bytes, new_high_water, inserted_node_count)`.
 ///
 /// `Ok(None)` means "cannot incrementally extend — do a full rebuild
@@ -3589,6 +3639,13 @@ pub(crate) async fn assemble_hnsw_sections(
 /// (the prior count plus the delta does not equal the current row count,
 /// so rows were removed or ids are not a clean monotonic extension). This
 /// guard keeps the incremental path strictly for pure appends.
+///
+/// Ids are minted at append, and concurrent appends (in one process or
+/// across processes) can publish out of id order. A batch that lands after
+/// the graph was built over a later-minted one sits below the high water,
+/// so this returns `NoNewRows` or `NotPureAppend` and the caller rebuilds:
+/// out-of-order publishing costs a full rebuild, never a row missing from
+/// the graph.
 pub(crate) async fn assemble_hnsw_incremental(
     manifest: &ManifestSnapshot,
     column: &str,
@@ -3613,7 +3670,13 @@ pub(crate) async fn assemble_hnsw_incremental(
         }));
     };
     let dim = prior.dim;
-    if !vc.rerank_codec.is_sq16() {
+    let metric = vc.metric;
+    let codec_ok = if metric == Metric::Cosine {
+        vc.rerank_codec.is_sq16()
+    } else {
+        vc.rerank_codec.writes_single_u16_plane() && vc.rerank_codec.fits_per_cluster_ruler()
+    };
+    if !codec_ok {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::CodecUnsupported {
                 column: column.to_string(),
@@ -3627,6 +3690,18 @@ pub(crate) async fn assemble_hnsw_incremental(
             index: dim,
         }));
     }
+    // A fitted-ruler (non-cosine) delta must re-encode onto the prior global
+    // ruler, and the recall re-check below grades on the fixed grid — neither is
+    // wired yet. Decline to a full rebuild, which refits the ruler over the whole
+    // corpus and is correct; the cosine incremental path is unchanged.
+    if metric != Metric::Cosine {
+        return Ok(IndexOutcome::Unavailable(
+            IndexUnavailable::IncrementalMetricUnsupported {
+                column: column.to_string(),
+                metric,
+            },
+        ));
+    }
     let stride = dim * 2;
     let store = Arc::clone(&manifest.options.store);
     let disk_cache = manifest.options.disk_cache.clone();
@@ -3638,12 +3713,23 @@ pub(crate) async fn assemble_hnsw_incremental(
     let mut new_codes: Vec<u8> = Vec::new();
     let mut new_doc_ids: Vec<i128> = Vec::new();
     for entry in manifest.get_all_superfiles() {
-        let reader =
-            dispatch::open_reader(&store, disk_cache.as_ref(), storage.as_ref(), entry, false)
-                .await?;
+        let reader = dispatch::open_reader(
+            &store,
+            disk_cache.as_ref(),
+            storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        )
+        .await?;
         let Some(vr) = reader.vec() else { continue };
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let file_column = reader.column_alias(manifest.field_id(column), column);
         let Some(rows) = vr
-            .materialized_index_rows_excluding_async(column, superseded.get(&entry.superfile_id))
+            .materialized_index_rows_excluding_async(
+                file_column,
+                superseded.get(&entry.superfile_id),
+            )
             .await
         else {
             continue;
@@ -3652,14 +3738,14 @@ pub(crate) async fn assemble_hnsw_incremental(
             stable_ids_by_local_for_routing(manifest, entry, reader.as_ref(), op_stats).await?;
         for row in rows {
             if row.encoded.codes.len() != stride {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hnsw: Sq16 row length {} != dim*2 ({stride}) on column `{column}`",
                     row.encoded.codes.len()
                 )));
             }
             let local = row.local_doc_id as usize;
             let stable_id = *ids.get(local).ok_or_else(|| {
-                QueryError::Execute(format!(
+                QueryError::Internal(format!(
                     "hnsw: local_doc_id {local} out of range ({} ids) on `{column}`",
                     ids.len()
                 ))
@@ -3894,7 +3980,7 @@ pub(crate) async fn assemble_hnsw_incremental(
         },
     )
     .await
-    .map_err(|e| QueryError::Execute(e.to_string()))?;
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
     if recall < floor {
         return Ok(IndexOutcome::Unavailable(
             IndexUnavailable::BelowRegisterFloor { recall, floor },
@@ -3912,6 +3998,9 @@ pub(crate) async fn assemble_hnsw_incremental(
             column,
             inherited_walk,
             sq4.as_ref(),
+            scorer.metric(),
+            scorer.ruler(),
+            scorer.node_norms(),
         ),
         new_high_water,
         inserted,
@@ -4037,7 +4126,7 @@ impl SupertableReader {
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
@@ -4089,11 +4178,21 @@ impl SupertableReader {
         if data.doc_ids.is_empty() {
             return Ok(IndexOutcome::Unavailable(IndexUnavailable::IndexEmpty));
         }
-        // A graph published before the build-side metric gate existed can still
-        // be resident, and it ranks by inner product regardless of what the
-        // column's metric says.
-        if let Some(reason) = metric_supported(self.manifest(), column) {
-            return Ok(IndexOutcome::Unavailable(reason));
+        // Reject a graph built for a different metric than the column now
+        // declares — a metric change, or a pre-metric-aware cosine graph on a
+        // column since re-declared — rather than serve the wrong geometry at the
+        // right latency. The resident scorer knows which metric it serves (the
+        // fixed grid serves Cosine; a fitted ruler serves its own metric).
+        let served = data.scorer.served_metric();
+        let declared = column_metric(&self.manifest().vector_configs(), column);
+        if declared != Some(served) {
+            return Ok(IndexOutcome::Unavailable(
+                IndexUnavailable::MetricMismatch {
+                    column: column.to_string(),
+                    built: served,
+                    declared: declared.unwrap_or(served),
+                },
+            ));
         }
         let k_fetch = replica_fetch_width(k);
         // The calibrated per-`k` beam from the stamped k→ef curve drives the
@@ -4142,7 +4241,18 @@ impl SupertableReader {
                 // monomorphized walk. A coarse plane re-ranks its beam on Sq16
                 // (`refine_k`), so the plane changes which candidates are
                 // considered, never the order returned.
-                let walked = if let Some(sq4) = &data.sq4 {
+                //
+                // A fitted-ruler (non-cosine) graph MUST walk the metric-aware
+                // Sq16 plane directly: the SQ8 / 4-bit walk planes are code-space
+                // `−dot` proxies that assume the UNIFORM fixed cosine grid (one
+                // scale/offset for every dim), so on a per-dim ruler their
+                // navigation is meaningless and the beam that reaches the refine
+                // is wrong. (`decode_hnsw` may still have derived an SQ8 plane
+                // because the running `hnsw_plane` config asked for it; ignore it
+                // here rather than mis-navigate.)
+                let walked = if served != Metric::Cosine {
+                    data.graph.search(&data.scorer, &query_owned, k_fetch, ef)
+                } else if let Some(sq4) = &data.sq4 {
                     data.search_walk_refine(sq4, &query_owned, k_fetch, ef, refine_k)
                 } else if !data.sq8_plane.is_empty() {
                     data.search_sq8_refine(&query_owned, k_fetch, ef, refine_k)
@@ -4152,15 +4262,21 @@ impl SupertableReader {
                 walked
                     .into_iter()
                     .filter_map(|(node, dist)| {
-                        // Shift the graph's `−dot` onto the ivf/scan arm's
-                        // `1 − dot` cosine scale so the cross-arm merge
-                        // (top_k_ascending) compares like with like. Monotonic
-                        // in `dist`, so intra-arm order is unchanged; the public
-                        // `score` column stays non-negative.
+                        // Publish the metric's own distance so the cross-arm
+                        // merge (top_k_ascending) compares like with like: the
+                        // cosine grid walks `−dot` and shifts onto the scan arm's
+                        // `1 − dot` scale (monotonic, non-negative), while L2Sq /
+                        // NegDot already score the exact distance the scan emits
+                        // (squared distance, `−dot`) and pass it straight through.
+                        let score = if served == Metric::Cosine {
+                            1.0 + dist
+                        } else {
+                            dist
+                        };
                         Some(SuperfileHit {
                             superfile: SuperfileUri(Uuid::nil()),
                             local_doc_id: 0,
-                            score: 1.0 + dist,
+                            score,
                             stable_id: Some(*data.doc_ids.get(node as usize)?),
                         })
                     })
@@ -4168,7 +4284,7 @@ impl SupertableReader {
             },
         )
         .await
-        .map_err(|e| QueryError::Execute(e.to_string()))?;
+        .map_err(|e| QueryError::Internal(e.to_string()))?;
         Ok(IndexOutcome::Ready(top_k_ascending(vec![hits], k)))
     }
 
@@ -4179,7 +4295,7 @@ impl SupertableReader {
     /// ref (older generation / above the scale ceiling) or the fetch failed
     /// — `hnsw_search` then returns `None` and the caller falls through to
     /// the ivf scan.
-    async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
+    pub(crate) async fn resident_vector_index(&self) -> Option<Arc<ResidentVectorIndex>> {
         let manifest = self.manifest();
         let slot = Arc::clone(&manifest.options.resident_index_cache);
         let Some(reference) = manifest.resident_vector_index_blob().cloned() else {
@@ -4304,6 +4420,10 @@ impl SupertableReader {
         candidates: &mut Vec<FineCandidate>,
         deferred: Vec<DeferredCellRescore>,
     ) -> Result<(), QueryError> {
+        // A column the table does not have has no cells to rescore.
+        let Some(column_id) = self.manifest().field_id(column) else {
+            return Ok(());
+        };
         let deferred = if deferred.is_empty() {
             deferred
         } else if let Some(section) = self.centroid_section().await {
@@ -4318,16 +4438,17 @@ impl SupertableReader {
                 for d in deferred {
                     let entry = &superfiles[d.si];
                     let read = section
-                        .read_cell(entry.superfile_id, column, d.cell_id)
+                        .read_cell(entry.superfile_id, column_id, d.cell_id)
                         .map_err(|e| {
-                            QueryError::Execute(format!("centroid section spill read: {e}"))
+                            QueryError::Internal(format!("centroid section spill read: {e}"))
                         })?;
                     let Some(fp32) = read else {
                         leftovers.push(d);
                         continue;
                     };
                     cells_read += 1;
-                    if !score_cell_fp32(superfiles, column, &d, &fp32, query, metric, candidates) {
+                    if !score_cell_fp32(superfiles, column_id, &d, &fp32, query, metric, candidates)
+                    {
                         leftovers.push(d);
                     }
                 }
@@ -4353,13 +4474,13 @@ impl SupertableReader {
                 let mut leftovers = Vec::new();
                 for d in deferred {
                     let entry = &superfiles[d.si];
-                    let Some(fp32) = cache.cell(entry.superfile_id, column, d.cell_id) else {
+                    let Some(fp32) = cache.cell(entry.superfile_id, column_id, d.cell_id) else {
                         leftovers.push(d);
                         continue;
                     };
                     if !score_cell_fp32(
                         superfiles,
-                        column,
+                        column_id,
                         &d,
                         fp32.as_slice(),
                         query,
@@ -4380,7 +4501,7 @@ impl SupertableReader {
         };
         if let Some(d) = deferred.first() {
             let entry = &superfiles[d.si];
-            return Err(QueryError::Execute(format!(
+            return Err(QueryError::Internal(format!(
                 "deferred admit rescore: no manifest-published fp32 covers superfile {} column \
                  {column} cell {:?} ({} cell(s) uncovered) — the centroid section / full parts \
                  must cover every stripped summary cell",
@@ -4419,21 +4540,23 @@ impl SupertableReader {
     /// cells, take one global shortlist cut, and exact-rerank where the winners
     /// live. The router overrides only cluster SELECTION; the byte fetch, 1-bit
     /// shortlist, rerank, and id remap are the stamped path's own code.
+    /// `metric` is `column`'s, already resolved by the caller's up-front check.
     async fn global_fine_fanout(
         &self,
         superfiles: &[Arc<SuperfileEntry>],
         column: &str,
+        metric: Metric,
         query: &[f32],
         k: usize,
         options: &VectorSearchOptions,
         fanout: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
         let manifest = self.manifest();
-        let metric = column_metric(&manifest.options.vector_columns, column).ok_or_else(|| {
-            QueryError::Execute(format!("global-fine: unknown vector column `{column}`"))
-        })?;
+        // A file written before a rename labels its vector blob with the name
+        // the column had then; the id is what finds the column in either file.
+        let column_field_id = manifest.field_id(column);
         let section = self.centroid_section().await.ok_or_else(|| {
-            QueryError::Execute("global-fine: centroid section unavailable".into())
+            QueryError::Internal("global-fine: centroid section unavailable".into())
         })?;
         // Path-scoped rerank: a caller-set `rerank_mult` wins, else this
         // path's own configured default — never the shared 256 that serves
@@ -4441,6 +4564,24 @@ impl SupertableReader {
         let rerank_mult = options
             .rerank_mult()
             .unwrap_or(config::global().vector.global_fine_rerank_mult);
+        // Grid-independent per-cluster rerank budget + rerank-all: each
+        // scanned fine cluster keeps `k·rerank_mult` candidates (pool =
+        // `fanout·k·rerank_mult`, independent of the coarse grid) and the
+        // whole pool is exact-reranked, instead of a per-cell budget cut by
+        // a global 1-bit shortlist. `false` restores the legacy per-cell
+        // budget + global 1-bit cut.
+        let per_cluster = config::global().vector.global_fine_per_cluster_budget;
+        // Pool floor: at small N, `fanout` (≈√fine-clusters) is tiny, so
+        // `fanout·k·rerank_mult` under-reranks and recall turns depth-limited.
+        // Boost the per-cluster budget so the pooled — and fully reranked —
+        // count stays ≥ the configured floor. The floor binds only at small N;
+        // large tables already pool above it, so it's a no-op there.
+        let pool_floor = config::global().vector.global_fine_rerank_pool_floor;
+        let effective_rerank_mult = if per_cluster {
+            rerank_mult.max(pool_floor.div_ceil(k.max(1).saturating_mul(fanout.max(1))))
+        } else {
+            rerank_mult
+        };
 
         // Phase 1: build the global candidate pool. Scores are comparable
         // across cells/superfiles (one metric + one query), so a single
@@ -4470,6 +4611,9 @@ impl SupertableReader {
                     superfiles,
                     &readers,
                     section.as_ref(),
+                    // Query-side selection: the parallel build is fine (the
+                    // router only ranks clusters, never places rows).
+                    false,
                 )
                 .await?;
             let router = &stamped.graph;
@@ -4486,9 +4630,29 @@ impl SupertableReader {
             }
             .max(fc);
             let hits = router.graph.search(&router.scorer, &q, fc, ef);
+            // A selected fine cluster whose owning cell has been SUPERSEDED by an
+            // in-place split points at dead on-disk blocks the whole-cell scan
+            // paths filter out (see `postings_by_cell_from_summaries`); the graph
+            // walk has no such filter, so apply it here — otherwise the scan
+            // fetches and scores a superseded parent's clusters. The split's
+            // successor cells (live) are selected on their own nodes.
+            let empty_superseded = BTreeMap::new();
+            let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
             let mut m: HashMap<usize, Vec<u32>> = HashMap::new();
             for (node, _) in hits {
                 if let Some(&(si, flat)) = router.node_map.get(node as usize) {
+                    let dead = readers
+                        .get(si)
+                        .and_then(|r| r.vec())
+                        .and_then(|vr| vr.global_cell_of_flat(flat))
+                        .is_some_and(|cell| {
+                            superseded
+                                .get(&superfiles[si].superfile_id)
+                                .is_some_and(|s| s.contains(&cell))
+                        });
+                    if dead {
+                        continue;
+                    }
                     m.entry(si).or_default().push(flat);
                 }
             }
@@ -4530,29 +4694,39 @@ impl SupertableReader {
             let Some(vr) = readers[si].as_ref().vec() else {
                 continue;
             };
+            let file_column = readers[si]
+                .as_ref()
+                .column_alias(column_field_id, column)
+                .to_owned();
             let pool = Arc::clone(&scan_pool);
             let budget = Arc::clone(&scan_budget);
             scan_futs.push(async move {
-                let flats = if coalesce {
-                    vr.coalesce_flats_to_cell_spans(&flats)
+                // Coalesce widens each cell's selected clusters to their
+                // contiguous `[min..max]` id span so the gap clusters between
+                // them ride one larger read. That span is an I/O plan only:
+                // the fetch covers it, but scoring and rerank stay on the
+                // originally selected clusters, passed through as `score_only`.
+                let (fetch, score_only) = if coalesce {
+                    (vr.coalesce_flats_to_cell_spans(&flats), Some(flats))
                 } else {
-                    flats
+                    (flats, None)
                 };
                 let scan = vr
                     .search_clusters_scan_async(
-                        column,
+                        &file_column,
                         query,
                         k,
-                        &flats,
-                        rerank_mult,
-                        rerank_mult,
+                        &fetch,
+                        score_only.as_deref(),
+                        effective_rerank_mult,
+                        effective_rerank_mult,
+                        per_cluster,
                         None,
                         None,
                         Some(pool),
                         Some(budget),
                     )
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .await?;
                 Ok::<_, QueryError>((si, scan))
             });
         }
@@ -4586,7 +4760,25 @@ impl SupertableReader {
         // Phase C: single global exact rerank of the pooled warm survivors —
         // one cross-cell shortlist cut, reranked where the winners live.
         if !pooled.is_empty() {
-            let shortlist_limit = k.saturating_mul(rerank_mult);
+            // Size the exact-rerank shortlist to the pool: true neighbours sit within the
+            // top ~2-3% of the pool by the 1-bit estimate at billion scale, so a global cut
+            // proportional to the pool captures them, while a fixed k*rerank_mult (top
+            // ~0.05%) dropped them (the #821 warm-recall inversion). No per-cell floor:
+            // pooling everything and cutting once globally on the estimate is sufficient
+            // once the cut is wide enough, and far cheaper than a per-cell floor that
+            // exact-reranks ~the whole pool.
+            //
+            // Deliberately NOT capped by an absolute bound: recall needs the full ~3%, so
+            // capping the shortlist would re-open the inversion this fixes. The proportional
+            // term is self-limiting in practice because the pool itself is bounded by the
+            // fanout law (routed fanout x cluster size) — recall is the side we protect
+            // here, and latency is bounded by the fanout knob upstream, not by capping this
+            // shortlist.
+            let shortlist_limit = if per_cluster {
+                pooled.len()
+            } else {
+                global_fine_shortlist_limit(k, rerank_mult, pooled.len())
+            };
             let winners = select_global_shortlist(pooled, shortlist_limit, 0);
             let mut by_seg: HashMap<usize, Vec<ScanCandidate>> = HashMap::new();
             for (si, c) in winners {
@@ -4604,10 +4796,10 @@ impl SupertableReader {
             for (si, selected) in by_seg {
                 let entry = &superfiles[si];
                 let reader = readers[si].as_ref();
+                let file_column = reader.column_alias(column_field_id, column);
                 let (hits, rerank_ns) = reader
-                    .vector_rerank_selected(column, query, k, selected, None)
-                    .await
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .vector_rerank_selected(file_column, query, k, selected, None)
+                    .await?;
                 if let Some(stats) = &self.op_stats {
                     stats.add_kernel_cpu_ns(rerank_ns);
                 }
@@ -4652,8 +4844,10 @@ impl SupertableReader {
         superfiles: &[Arc<SuperfileEntry>],
         readers: &[Arc<SuperfileReader>],
         section: &CentroidSection,
+        serial_build: bool,
     ) -> Result<Arc<StampedCentroidRouter>, QueryError> {
-        let options = &self.manifest().options;
+        let manifest = self.manifest();
+        let options = &manifest.options;
         let is_fresh = |entry: &StampedCentroidRouter| {
             entry.generation == generation && entry.column == column
         };
@@ -4673,7 +4867,22 @@ impl SupertableReader {
             .await
         {
             Some(graph) => graph,
-            None => build_centroid_router(superfiles, readers, column, section, dim, metric)?,
+            None => {
+                let column_id = manifest.field_id(column).ok_or_else(|| {
+                    QueryError::Internal(format!("unknown vector column `{column}`"))
+                })?;
+                build_centroid_router(
+                    superfiles,
+                    readers,
+                    column,
+                    column_id,
+                    section,
+                    dim,
+                    metric,
+                    serial_build,
+                    manifest.get_superseded_cells(),
+                )?
+            }
         };
         let entry = Arc::new(StampedCentroidRouter {
             generation,
@@ -4716,6 +4925,7 @@ impl SupertableReader {
             superfiles,
             readers,
             column,
+            manifest.field_id(column)?,
             section,
             dim,
             metric,
@@ -4743,12 +4953,12 @@ impl SupertableReader {
             .iter()
             .find(|vc| vc.column == column)
             .ok_or_else(|| {
-                QueryError::Execute(format!("eager centroid-router: unknown column `{column}`"))
+                QueryError::Internal(format!("eager centroid-router: unknown column `{column}`"))
             })?;
         let dim = vector_config.dim;
         let metric = vector_config.metric;
         let section = self.centroid_section().await.ok_or_else(|| {
-            QueryError::Execute("eager centroid-router: centroid section unavailable".into())
+            QueryError::Internal("eager centroid-router: centroid section unavailable".into())
         })?;
         let entries = manifest
             .get_all_superfiles_loaded()
@@ -4766,12 +4976,109 @@ impl SupertableReader {
             &entries,
             &readers,
             section.as_ref(),
+            // Eager serving-side warm: parallel build (selection only).
+            false,
         )
         .await?;
         Ok(())
     }
 
-    async fn vector_fanout_over_superfiles(
+    /// Build the drain-side fine-centroid placement router: the centroid-router
+    /// HNSW (the SAME graph queries walk) plus a node -> global-cell map. A
+    /// drain assigns each new row to the cell of its nearest fine centroid by
+    /// walking this graph, so placement matches routing — instead of placing by
+    /// the coarse cell grid, which lands rows in cells the fine router ranks deep
+    /// and forces a wide (slow) probe to reach them. Using the graph (not a
+    /// linear scan of the fine centroids) keeps placement log-N, so the same
+    /// path is exercised at 10M, 100M and 1B, and an approximate pick is
+    /// self-consistent (a nearby query walks the same graph to the same node).
+    ///
+    /// Returns `None` — so the caller keeps coarse cell-grid placement — when
+    /// there is nothing to place against yet (first drain, no centroid section,
+    /// no superfiles) or on any load failure; placement degrades to the cell
+    /// grid rather than failing the commit.
+    pub(crate) async fn build_global_fine_assign_router(
+        &self,
+        column: &str,
+    ) -> Option<FineAssignRouter> {
+        let manifest = self.manifest();
+        let vc = manifest
+            .options
+            .vector_columns
+            .iter()
+            .find(|vc| vc.column == column)?;
+        let dim = vc.dim;
+        let metric = vc.metric;
+        // Build the router from the STANDALONE slow-state centroid section only.
+        // The section (its own blob, spilled to a temp file — never a superfile)
+        // holds every fine centroid tagged with its owning `(superfile, cell)`,
+        // so this opens NO superfile and drain-time memory stays at the (small)
+        // centroid set rather than the whole resident hidden index.
+        let section = self.centroid_section().await?;
+        let column_id = manifest.field_id(column)?;
+        let centroids = section.fine_centroids_for_column(column_id);
+        if centroids.is_empty() {
+            return None;
+        }
+        // `node_to_cell[node]` is the owning cell straight from the section. A
+        // node whose cell has been SUPERSEDED by an in-place split is left as the
+        // `u32::MAX` sentinel and skipped at assign time, so a row is never
+        // placed into a superseded parent (which every query path filters out);
+        // it falls back to a live cell instead.
+        let empty_superseded = BTreeMap::new();
+        let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
+        let mut vecs: Vec<Vec<f32>> = Vec::with_capacity(centroids.len());
+        let mut node_map: Vec<(usize, u32)> = Vec::with_capacity(centroids.len());
+        let mut node_to_cell: Vec<u32> = Vec::with_capacity(centroids.len());
+        let mut any = false;
+        for (node, (superfile_id, cell_id, mut v)) in centroids.into_iter().enumerate() {
+            let cell = match cell_id {
+                Some(c)
+                    if !superseded
+                        .get(&superfile_id)
+                        .is_some_and(|s| s.contains(&c)) =>
+                {
+                    any = true;
+                    c
+                }
+                _ => u32::MAX,
+            };
+            gfc_prepare_for_metric(metric, &mut v);
+            vecs.push(v);
+            node_map.push((node, node as u32));
+            node_to_cell.push(cell);
+        }
+        if !any {
+            return None;
+        }
+        // Serial build so a retried/resumed drain that rebuilds the router from
+        // the same section scatters identical rows into identical cells.
+        use crate::superfile::vector::hnsw::{Fp32Scorer, Hnsw, HnswParams};
+        let scorer = Fp32Scorer::from_vectors(&vecs, dim, metric);
+        let graph = Hnsw::build_serial(&scorer, HnswParams::default());
+        let stamped = Arc::new(StampedCentroidRouter {
+            generation: manifest.manifest_id,
+            column: column.to_string(),
+            graph: CentroidRouterGraph {
+                scorer,
+                graph,
+                node_map,
+                metric,
+            },
+        });
+        Some(FineAssignRouter {
+            router: stamped,
+            node_to_cell,
+        })
+    }
+
+    /// kNN fan-out over exactly `superfiles`, optionally admitting only the
+    /// rows in `allow` (per superfile; a superfile absent from the map has
+    /// no admitted row). The user-table kernel behind both the plain
+    /// search and the filtered one; `hybrid_search`'s vector leg calls it
+    /// directly so a pushed-down `WHERE` scopes both of its retrievers to
+    /// the same superfiles and rows.
+    pub(crate) async fn vector_fanout_over_superfiles(
         &self,
         superfiles: Vec<Arc<SuperfileEntry>>,
         column: &str,
@@ -4791,19 +5098,24 @@ impl SupertableReader {
         // Unfiltered hidden path only; `stamped` (or a filtered/user-table
         // query) leaves the stamped-law path below untouched.
         let vcfg = &config::global().vector;
-        // Validate the queried column exists BEFORE any serving branch. An
-        // undeclared column is a caller error and must be rejected uniformly —
-        // otherwise a drained table would answer an unknown-column query from
-        // the graph (which carries its own column check but is reached first),
-        // while an undrained table rejects it later at the grid lookup.
-        if !manifest
-            .options
-            .vector_columns
-            .iter()
-            .any(|vc| vc.column == column)
-        {
-            return Err(QueryError::Execute(format!(
+        // Validate the query BEFORE any serving branch. An undeclared column or
+        // a query vector of the wrong length is a caller error and must be
+        // rejected uniformly, as `InvalidQuery`: otherwise a drained table would
+        // answer an unknown-column query from the graph (which carries its own
+        // column check but is reached first), while an undrained table rejects
+        // it later at the grid lookup, and a wrong length would surface deep in
+        // the probe as if the stored index were at fault.
+        let vector_configs = manifest.vector_configs();
+        let Some(vector_config) = vector_configs.iter().find(|vc| vc.column == column) else {
+            return Err(QueryError::InvalidQuery(format!(
                 "unknown vector column `{column}`"
+            )));
+        };
+        if query.len() != vector_config.dim {
+            return Err(QueryError::InvalidQuery(format!(
+                "query vector has {} dimensions; column `{column}` has {}",
+                query.len(),
+                vector_config.dim
             )));
         }
         // HNSW search mode (`vector.search_mode = hnsw_ivf`): walk the
@@ -4845,17 +5157,25 @@ impl SupertableReader {
         // The centroid router scores per the column's configured metric
         // (Cosine unit-normalizes and ranks by −dot; NegDot ranks by raw −dot;
         // L2Sq by squared distance), so it engages for any metric.
-        // Per-table calibrated fanout wins over the scale-blind
-        // `vector.global_fine_fanout` constant: a drain stamps `width × fine`
-        // (clamped to the table's cluster count) per k, so a ~1M table no
-        // longer over-reads to a full scan. A table stamped before this feature
-        // (or with the router off at drain) has no stamp and falls back to the
-        // constant. There is no caller-set fanout knob, so precedence is
-        // stamp-then-constant.
+        // Fanout precedence. The default config value
+        // ([`config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT`]) and an explicit `0`
+        // both resolve to a DETERMINISTIC coverage fanout from the table's
+        // fine-cluster count (`graph_fanout_for_fine_clusters` ≈ c·√n_fine) —
+        // no per-table calibration, which optimize no longer runs under graph
+        // serving. Any OTHER explicit value overrides it (manual tuning /
+        // fanout sweeps), capped at `centroid_graph_max_fanout` so one config
+        // line cannot drive `fanout × rerank_mult` into a runaway exact rerank.
         let stamped_fanout = manifest
             .vector_cell_routing()
             .and_then(|routing| routing.fanout_for_k_at(k));
-        let resolved_fanout = stamped_fanout.unwrap_or(vcfg.global_fine_fanout);
+        let default_fanout = config::DEFAULT_VECTOR_GLOBAL_FINE_FANOUT;
+        let resolved_fanout =
+            if vcfg.global_fine_fanout == 0 || vcfg.global_fine_fanout == default_fanout {
+                graph_fanout_for_fine_clusters(total_fine_clusters(manifest, column))
+                    .min(vcfg.centroid_graph_max_fanout)
+            } else {
+                vcfg.global_fine_fanout.min(vcfg.centroid_graph_max_fanout)
+            };
         // `auto` picks the router per hidden-vector table by scale +
         // concentration; explicit `stamped` / `centroid_graph` are honored
         // verbatim (no gating). The per-table inputs are resident (no I/O) and
@@ -4879,8 +5199,24 @@ impl SupertableReader {
             && effective_router == config::IvfRouter::CentroidGraph
             && resolved_fanout > 0
         {
+            tracing::debug!(
+                target: "infino::gfc",
+                stamped_fanout = ?stamped_fanout,
+                config_fanout = vcfg.global_fine_fanout,
+                resolved_fanout,
+                k,
+                "gfc fanout resolved (centroid_graph)"
+            );
             return self
-                .global_fine_fanout(&superfiles, column, query, k, &options, resolved_fanout)
+                .global_fine_fanout(
+                    &superfiles,
+                    column,
+                    vector_config.metric,
+                    query,
+                    k,
+                    &options,
+                    resolved_fanout,
+                )
                 .await;
         }
         // Borrow routing — do not clone the VectorCell centroid grid just to
@@ -4933,17 +5269,10 @@ impl SupertableReader {
         // fp32 centroids. Rank every (superfile, cluster) with [`distance`]
         // on the resident centroid slices (zero-copy, no dequant), then
         // probe only the globally-closest clusters.
-        // Undeclared column = caller error, rejected here — not a silent
-        // L2Sq default that fails later with a per-superfile decode error.
-        // `rot_seed` feeds the 1-bit admit prefilter (same rotation as the
-        // column's row codes).
-        let (metric, rot_seed) = manifest
-            .options
-            .vector_columns
-            .iter()
-            .find(|vc| vc.column == column)
-            .map(|vc| (vc.metric, vc.rot_seed))
-            .ok_or_else(|| QueryError::Execute(format!("unknown vector column `{column}`")))?;
+        // The column's own metric, never a default: the up-front check above
+        // resolved it. `rot_seed` feeds the 1-bit admit prefilter (same
+        // rotation as the column's row codes).
+        let (metric, rot_seed) = (vector_config.metric, vector_config.rot_seed);
 
         let grid = manifest
             .global_vector_index()
@@ -4964,6 +5293,19 @@ impl SupertableReader {
         // gate. Phase timers (INFINO_TRACE_VECTOR_WARM_PHASES): admit covers
         // that work; fanout_wall is probe+rerank+remap wall.
         let admit_t0 = io_counters::phase_start();
+        // The admit stage: which cells and superfiles the query will probe.
+        // Made here and ended once `units` is known, so it times the whole
+        // stage. The stage awaits in between, and a guard held across an
+        // await would mis-parent other tasks' spans, so rather than being
+        // entered it instruments those awaits; their spans nest under it.
+        let phases = self.phase_spans();
+        let route_span = trace::phase(phases, || {
+            detail_span!(
+                "vector.route",
+                superfiles = superfiles.len(),
+                units = tracing::field::Empty,
+            )
+        });
         // The grid/centroid ranking is the admit stage's kernel section —
         // pure CPU over manifest summaries on this thread.
         let ranked_cells_scored: Option<Vec<(u32, f32)>> =
@@ -5004,8 +5346,11 @@ impl SupertableReader {
         let superseded = manifest.get_superseded_cells().unwrap_or(&empty_superseded);
         // A pass over every superfile's per-cell summaries — the routing
         // input, and pure CPU this query asked for.
+        let Some(column_id) = manifest.field_id(column) else {
+            return Ok(Vec::new());
+        };
         let (postings_by_cell, any_tagged) = op_stats::timed_kernel(&self.op_stats, || {
-            postings_by_cell_from_summaries(&superfiles, column, allow_ref, superseded)
+            postings_by_cell_from_summaries(&superfiles, column_id, allow_ref, superseded)
         });
 
         let mut gated = Vec::new();
@@ -5027,7 +5372,7 @@ impl SupertableReader {
             // override on top.
             let mut cell_routing = if hidden_vector_index {
                 let base = hidden_routing.ok_or_else(|| {
-                    QueryError::Execute("hidden manifest missing cell routing".into())
+                    QueryError::Internal("hidden manifest missing cell routing".into())
                 })?;
                 if filtered {
                     // Allow-set queries widen to the filtered floor and
@@ -5044,13 +5389,34 @@ impl SupertableReader {
                     base
                 }
             } else if filtered {
-                // Filtered UNDRAINED-tail fan: the default user-table
-                // search with a small fixed floor
-                // ([`FILTERED_USER_CELL_NPROBE`]) — the nearest MATCHING
-                // rows sit deeper than the fine-first single cell reaches.
+                // Filtered UNDRAINED-tail fan: cell routing follows the QUERY,
+                // but a sparse predicate's matches sit wherever they sit — so
+                // widen the [`FILTERED_USER_CELL_NPROBE`] floor by the filter's
+                // inverse selectivity (same capped math as the superfile tier's
+                // `selectivity_mult_from_counts`). Dense filters keep the floor.
+                // Count over THIS fan's superfiles only: the allow map still
+                // carries drained superfiles' entries, and mixing their
+                // matches into `allowed` overstates selectivity for the tail.
+                let allowed: u64 = allow
+                    .as_ref()
+                    .map(|m| {
+                        superfiles
+                            .iter()
+                            .filter_map(|e| m.get(&e.uri))
+                            .map(|bm| bm.len())
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let population: u64 = superfiles.iter().map(|e| e.n_docs).sum();
+                let mult = selectivity_mult_from_counts(allowed, population);
+                if mult == EMPTY_FILTER_SELECTIVITY_MULT {
+                    // No tail row matches the filter: nothing to probe.
+                    return Ok(Vec::new());
+                }
+                let width = FILTERED_USER_CELL_NPROBE.saturating_mul(mult);
                 CellRoutingParams {
-                    nprobe_min: FILTERED_USER_CELL_NPROBE,
-                    nprobe_max: FILTERED_USER_CELL_NPROBE,
+                    nprobe_min: width,
+                    nprobe_max: width,
                     ..CellRoutingParams::default()
                 }
             } else {
@@ -5176,7 +5542,7 @@ impl SupertableReader {
                 .copied()
                 .collect();
             if ranked_for_beam.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "vector candidates name no cell present in the grid — \
                      malformed cell tags"
                         .into(),
@@ -5213,6 +5579,7 @@ impl SupertableReader {
                 estimate_admit_ranking(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query.len(),
                     metric,
                     &admit_q,
@@ -5220,9 +5587,14 @@ impl SupertableReader {
                     superseded,
                 )
             })?;
+            // Round-0 exact-score shortlist: anchor to the stamped
+            // (target-aware) width when the law is serving; the fixed
+            // fraction/floor is the legacy fallback for unstamped tables.
+            let round0_window =
+                law_width.unwrap_or_else(|| admit_shortlist_window(admit_ranking.len()));
             let mut admitted: HashSet<u32> = admit_ranking
                 .iter()
-                .take(admit_shortlist_window(admit_ranking.len()))
+                .take(round0_window)
                 .map(|(cell, _)| *cell)
                 .collect();
             admitted.extend(must_include.iter().copied());
@@ -5230,6 +5602,7 @@ impl SupertableReader {
                 score_fine_candidates(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query,
                     metric,
                     Some(&admitted),
@@ -5248,6 +5621,7 @@ impl SupertableReader {
                     &mut candidates,
                     deferred,
                 )
+                .instrument(route_span.clone())
                 .await?;
             }
             // #515 self-measured admit loop, law-served default path only
@@ -5259,8 +5633,24 @@ impl SupertableReader {
             // estimates could plausibly land inside the serve window;
             // admission is evidence-bounded, no query-side fraction.
             let law_default = !filtered && options.nprobe.is_none() && law_width.is_some();
+            // Cap the #515 extension at a target-aware multiple of the stamped
+            // width, so a loose near-tie window cannot balloon the served cell
+            // count far past what the width targets (`mult=1` => width-only).
+            // Floor the cap at the grid cover-k picks so a large `must_include`
+            // (a coarse blended query) never counts against — and starve — the
+            // near-tie extension budget.
+            let admit_cap = law_width
+                .map(|w| {
+                    w.saturating_mul(config::global().vector.admit_extension_mult)
+                        .max(w)
+                        .max(must_include.len())
+                })
+                .unwrap_or(usize::MAX);
             if law_default {
                 loop {
+                    if admitted.len() >= admit_cap {
+                        break;
+                    }
                     let fine_ranked_now = op_stats::timed_kernel(&self.op_stats, || {
                         cells_ranked_by_fine_score(&candidates)
                     });
@@ -5270,12 +5660,19 @@ impl SupertableReader {
                     let serve_threshold = relative_score_window(best_exact, serve_near_tie_slack);
                     let exact_best_by_cell: HashMap<u32, f32> =
                         fine_ranked_now.into_iter().collect();
-                    let round = admit_extension_round(
+                    let mut round = admit_extension_round(
                         &admit_ranking,
                         &admitted,
                         &exact_best_by_cell,
                         serve_threshold,
                     );
+                    if round.is_empty() {
+                        break;
+                    }
+                    // Bound this round to the target-aware cap: a single round
+                    // can qualify many cells at once, so keep only the best
+                    // (admit_ranking is best-first) up to the cap.
+                    round.truncate(admit_cap.saturating_sub(admitted.len()));
                     if round.is_empty() {
                         break;
                     }
@@ -5286,6 +5683,7 @@ impl SupertableReader {
                             score_fine_candidates(
                                 &superfiles,
                                 column,
+                                manifest.field_id(column),
                                 query,
                                 metric,
                                 Some(&delta),
@@ -5304,6 +5702,7 @@ impl SupertableReader {
                             &mut delta_candidates,
                             delta_deferred,
                         )
+                        .instrument(route_span.clone())
                         .await?;
                     }
                     candidates.extend(delta_candidates);
@@ -5469,6 +5868,7 @@ impl SupertableReader {
                 score_fine_candidates(
                     &superfiles,
                     column,
+                    manifest.field_id(column),
                     query,
                     metric,
                     None,
@@ -5487,6 +5887,7 @@ impl SupertableReader {
                     &mut candidates,
                     deferred,
                 )
+                .instrument(route_span.clone())
                 .await?;
             }
             candidate_counts = candidates
@@ -5608,6 +6009,8 @@ impl SupertableReader {
         if let Some(t0) = admit_t0 {
             io_counters::phase_record("vec.admit", t0.elapsed().as_micros() as u64);
         }
+        route_span.record("units", units.len());
+        trace::end(route_span);
 
         // Fan out through the shared [`query::dispatch::fanout`] (also
         // used by FTS), but in waves capped by the configured reader
@@ -5682,6 +6085,7 @@ impl SupertableReader {
             }
             _ => options,
         };
+        let column_field_id = manifest.field_id(column);
         let column_arc = Arc::new(column.to_owned());
         let query_arc = Arc::new(query.to_vec());
         let column_arc2 = Arc::clone(&column_arc);
@@ -5725,6 +6129,10 @@ impl SupertableReader {
                 let max_replica_overhead = Arc::clone(&max_replica_overhead_body);
                 let op_stats = op_stats_scan.clone();
                 async move {
+                    // A file written before a rename labels its vector
+                    // blob with the name the column had then; the id is what
+                    // finds the column in either file.
+                    let column = reader.column_alias(column_field_id, &column).to_owned();
                     // Unfiltered user path on row-addressable locals: resolve the
                     // bitmap once (warm after the orchestrator's prefetch) and
                     // push it down. Filtered search leaves it `None` — its
@@ -5765,8 +6173,7 @@ impl SupertableReader {
                                 pool,
                                 budget,
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         fold_probe_work(&op_stats, &scan.work());
                         max_replica_overhead
                             .fetch_max(replica_overhead as u64, atomic::Ordering::Relaxed);
@@ -5782,8 +6189,7 @@ impl SupertableReader {
                             .vector_search_clusters_filtered(
                                 &column, &query, k_fetch, &ids, options, bitmap, deny, pool, budget,
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         fold_probe_work(&op_stats, &tally);
                         hits
                     };
@@ -5824,20 +6230,37 @@ impl SupertableReader {
         // carries no bitmaps and fans out all units at once (matching
         // main's concurrency — every superfile GET overlaps on tokio).
         let fanout_t0 = io_counters::phase_start();
+        let scan_span = trace::phase(phases, || tiered_span!("vector.scan", units = units.len()));
         let mut per_superfile = if allow.is_some() {
             let fanout_width = manifest.options.reader_pool.current_num_threads().max(1);
+            // One tally across the waves, recorded once on the phase.
+            let tiers = OpenTierCounts::for_span(&scan_span);
             let mut collected = Vec::new();
             while !units.is_empty() {
                 let n = fanout_width.min(units.len());
                 let wave: Vec<_> = units.drain(..n).collect();
                 collected.extend(
-                    dispatch::fanout_with(self, wave, !hidden_vector_index, false, body.clone())
-                        .await?,
+                    dispatch::fanout_with_counted(
+                        self,
+                        wave,
+                        !hidden_vector_index,
+                        ReadIntent::Stream,
+                        body.clone(),
+                        tiers.clone(),
+                    )
+                    .instrument(scan_span.clone())
+                    .await?,
                 );
             }
+            if let Some(tiers) = &tiers {
+                tiers.record_on(&scan_span);
+            }
+            trace::end(scan_span);
             collected
         } else {
-            dispatch::fanout_with(self, units, !hidden_vector_index, false, body).await?
+            dispatch::fanout_with(self, units, !hidden_vector_index, ReadIntent::Stream, body)
+                .instrument(scan_span)
+                .await?
         };
 
         // Phase C of the deferred-rerank width sweep: select the best
@@ -5867,7 +6290,7 @@ impl SupertableReader {
                 // differently-seeded unit, fail the query loudly instead of
                 // silently ranking incomparable estimates.
                 if pooled.windows(2).any(|w| w[0].1 != w[1].1) {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "pooled 1-bit estimates require one rotation seed per column".into(),
                     ));
                 }
@@ -5991,6 +6414,10 @@ impl SupertableReader {
                     let reader_pool = Arc::clone(&reader_pool);
                     let op_stats = op_stats_c.clone();
                     async move {
+                        // A file written before a rename labels its vector
+                        // blob with the name the column had then; the id is what
+                        // finds the column in either file.
+                        let column = reader.column_alias(column_field_id, &column).to_owned();
                         // Hidden-path invariants: no tombstone sidecars (the
                         // manifest's deletes apply after the stable-id
                         // remap upstream), replica slack mirrors phase A.
@@ -6008,8 +6435,7 @@ impl SupertableReader {
                                 selected,
                                 Some(reader_pool),
                             )
-                            .await
-                            .map_err(vector_read_query_error)?;
+                            .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_kernel_cpu_ns(rerank_kernel_ns);
                         }
@@ -6028,8 +6454,14 @@ impl SupertableReader {
                         Ok::<Vec<SuperfileHit>, QueryError>(tagged)
                     }
                 };
-                per_superfile
-                    .extend(dispatch::fanout_with(self, rerank_units, false, false, body_c).await?);
+                let rerank_span = trace::phase(phases, || {
+                    tiered_span!("vector.rerank", units = rerank_units.len())
+                });
+                per_superfile.extend(
+                    dispatch::fanout_with(self, rerank_units, false, ReadIntent::Stream, body_c)
+                        .instrument(rerank_span)
+                        .await?,
+                );
             }
         }
         if let Some(t0) = fanout_t0 {
@@ -6074,7 +6506,7 @@ impl SupertableReader {
         // postings AND the manifest term blooms). A non-FTS filter column
         // matches nothing; no tokens (empty / punctuation-only) ⇒
         // nothing matches.
-        let Some(tokenizer) = manifest.options.try_fts_tokenizer_for(filter.column) else {
+        let Some(tokenizer) = manifest.try_fts_tokenizer_for(filter.column) else {
             return Ok(Vec::new());
         };
         let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
@@ -6091,17 +6523,30 @@ impl SupertableReader {
             terms: tokens.clone(),
             mode: filter.mode,
         }];
+        let select_span = trace::phase(self.phase_spans(), || {
+            detail_span!(
+                "vector.select_superfiles",
+                manifest_superfiles = manifest.superfiles.len(),
+                survivors = tracing::field::Empty,
+            )
+        });
         let surviving: HashSet<u128> = select_superfiles(manifest, &prune_leaves)
+            .instrument(select_span.clone())
             .await?
             .iter()
             .map(|e| e.superfile_id.as_u128())
             .collect();
         if surviving.is_empty() {
+            select_span.record("survivors", 0);
+            trace::end(select_span);
             return Ok(Vec::new());
         }
         let superfiles = self
             .vector_pruned_superfiles_intersect(manifest, &surviving)
+            .instrument(select_span.clone())
             .await?;
+        select_span.record("survivors", superfiles.len());
+        trace::end(select_span);
         if superfiles.is_empty() {
             return Ok(Vec::new());
         }
@@ -6154,17 +6599,25 @@ impl SupertableReader {
     ) -> Result<HashMap<SuperfileUri, Arc<RoaringBitmap>>, QueryError> {
         let filter_col_arc = Arc::new(filter_col.to_owned());
         let tokens_arc: Arc<Vec<String>> = Arc::new(tokens.to_vec());
+        // The term index's locations let each superfile resolve the filter
+        // from its postings alone, without opening its dictionary.
+        let token_refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let locations = self
+            .index_locations(filter_col, &token_refs, superfiles)
+            .await?;
         let op_stats = self.op_stats.clone();
-        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+        self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let filter_col_arc = Arc::clone(&filter_col_arc);
             let tokens_arc = Arc::clone(&tokens_arc);
+            let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             async move {
+                let memo = memo_from_locations(&r, &locations, entry.superfile_id).await;
                 let refs: Vec<&str> = tokens_arc.iter().map(String::as_str).collect();
                 let (docs, work) = r
-                    .token_match(&filter_col_arc, &refs, mode)
+                    .token_match_prefetched(&filter_col_arc, &refs, mode, memo.as_deref())
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    .map_err(QueryError::from)?;
                 // The predicate-resolution leg of filtered vector search
                 // is FTS work like any other; flush it per superfile.
                 if let Some(stats) = &op_stats {
@@ -6172,7 +6625,7 @@ impl SupertableReader {
                     stats.add_planned_read_ranges(work.planned_ranges);
                     stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
                 }
-                Ok(docs.into_iter().collect::<RoaringBitmap>())
+                Ok(docs.into_iter().map(RowId::get).collect::<RoaringBitmap>())
             }
         })
         .await
@@ -6232,6 +6685,43 @@ impl SupertableReader {
             .await
     }
 
+    /// Resolve what a SQL `WHERE` pushed into a search table function
+    /// admits — the superfiles that may hold a match and, under a bounded
+    /// `plan`, the candidate rows in each. See [`CandidateScope`].
+    ///
+    /// Superfile survival is the intersection of two gates on the pinned
+    /// manifest, both pure statistics reads: the prune leaves the SQL scan
+    /// itself lowers `filters` to (scalar min/max, value sets, `LIKE`
+    /// blooms and ranges, null counts — so a `path = 'x'` on a column with
+    /// no full-text index still skips every superfile whose `path` range
+    /// excludes `x`), and the plan's term-bloom survival. The candidate
+    /// rows are the plan's per-superfile evaluation, tombstones removed;
+    /// an [`Unbounded`](CandidatePlan::Unbounded) plan bounds no row and
+    /// leaves `allow` as `None`.
+    pub(crate) async fn candidate_scope(
+        &self,
+        filters: &[Expr],
+        plan: &CandidatePlan,
+    ) -> Result<CandidateScope, QueryError> {
+        let manifest = self.manifest();
+        let leaves = prune_leaves_for_filters(manifest, &self.manifest().scalar_schema(), filters);
+        let mut superfiles = select_superfiles(manifest, &leaves).await?;
+        if let Some(surviving) = plan.surviving_superfile_ids(manifest).await? {
+            superfiles.retain(|e| surviving.contains(&e.superfile_id.as_u128()));
+        }
+        if superfiles.is_empty() {
+            return Ok(CandidateScope::empty());
+        }
+        let allow = match plan {
+            CandidatePlan::Unbounded => None,
+            bounded => Some(
+                self.candidate_bitmaps_from_plan(&superfiles, bounded)
+                    .await?,
+            ),
+        };
+        Ok(CandidateScope { superfiles, allow })
+    }
+
     /// Convert user-table allow bitmaps (local doc ids) to stable `_id`s.
     async fn stable_ids_from_user_allow_async(
         &self,
@@ -6246,7 +6736,7 @@ impl SupertableReader {
                 .await
                 .map_err(QueryError::ManifestLoad)?
                 .ok_or_else(|| {
-                    QueryError::Execute(format!("user superfile {uri:?} missing from manifest"))
+                    QueryError::Internal(format!("user superfile {uri:?} missing from manifest"))
                 })?;
             if row_id_from_manifest_entry(&entry, 0).is_some() {
                 for local in bm.iter() {
@@ -6321,7 +6811,7 @@ impl SupertableReader {
                 .prepare_vector_stable_allow_async(Arc::new(stable_ids))
                 .await?;
             if !prepared.use_hidden_index {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "drained filtered-vector ids resolved to a user allow-set instead of the \
                      hidden index"
                         .into(),
@@ -6406,7 +6896,7 @@ impl SupertableReader {
                     })
                     .await?;
                 if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "global allow ids for drained filtered-vector rows did not map to any \
                          hidden superfile"
                             .into(),
@@ -6418,7 +6908,7 @@ impl SupertableReader {
                 });
             }
             if !drained.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "hidden vector manifest has drained ranges but no hidden superfiles".into(),
                 ));
             }
@@ -6523,7 +7013,10 @@ impl SupertableReader {
                         &routing_stats,
                     )
                     .await?;
-                    if let Some(vs) = entry.vector_summary.get(&column) {
+                    if let Some(vs) = manifest_for_ids
+                        .field_id(&column)
+                        .and_then(|id| entry.vector_summary.get(&id))
+                    {
                         let mut idx = 0usize;
                         let mut guard = map.lock().expect("diag cell-map lock");
                         for cell in &vs.cells {
@@ -6619,7 +7112,7 @@ impl SupertableReader {
                     })
                     .await?;
                 if allow_by_uri.is_empty() {
-                    return Err(QueryError::Execute(
+                    return Err(QueryError::Internal(
                         "stable ids for drained filtered-vector rows did not map to any hidden \
                          superfile"
                             .into(),
@@ -6631,7 +7124,7 @@ impl SupertableReader {
                 });
             }
             if !drained.is_empty() {
-                return Err(QueryError::Execute(
+                return Err(QueryError::Internal(
                     "hidden vector manifest has drained ranges but no hidden superfiles".into(),
                 ));
             }
@@ -6725,7 +7218,7 @@ impl SupertableReader {
         }
         if prepared.use_hidden_index {
             let vit = self.vector_index_table().ok_or_else(|| {
-                QueryError::Execute("prepared hidden allow-set but no hidden index table".into())
+                QueryError::Internal("prepared hidden allow-set but no hidden index table".into())
             })?;
             let hidden_reader = vit.pinned_reader_with(self.op_stats.clone());
             let superfiles = hidden_reader
@@ -6794,15 +7287,20 @@ impl SupertableReader {
         // A `LIKE` leaf's dictionary walk is CPU work: it runs on the reader
         // pool, not on the tokio worker driving this fan-out.
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
-        self.fanout_candidate_bitmaps(superfiles, move |r, _entry| {
+        // The index's locations for the plan's terms let each superfile
+        // resolve them from its postings alone.
+        let locations = Arc::new(self.plan_locations(plan, superfiles).await?);
+        self.fanout_candidate_bitmaps(superfiles, move |r, entry| {
             let plan = Arc::clone(&plan_arc);
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
+            let locations = Arc::clone(&locations);
             async move {
+                let memos = memos_from_plan_locations(&r, &locations, entry.superfile_id).await;
                 let (bitmap, work) = plan
-                    .evaluate(r.as_ref(), Some(&reader_pool))
+                    .evaluate(r.as_ref(), Some(&reader_pool), &memos)
                     .await
-                    .map_err(|e| QueryError::Parquet(e.to_string()))?;
+                    .map_err(QueryError::from)?;
                 // The SQL predicate's posting walks, summed across the
                 // plan tree — the pushdown leg of the vector TVF.
                 if let Some(stats) = &op_stats {
@@ -6817,7 +7315,7 @@ impl SupertableReader {
                         all.insert_range(0..r.n_docs() as u32);
                         Ok(all)
                     }
-                    None => Err(QueryError::Execute(
+                    None => Err(QueryError::Internal(
                         "bounded CandidatePlan evaluated to Unbounded — planner bug".into(),
                     )),
                 }
@@ -6852,7 +7350,7 @@ impl SupertableReader {
             }
         };
         let pairs: Vec<(SuperfileUri, RoaringBitmap)> =
-            dispatch::fanout_with(self, units, true, false, body).await?;
+            dispatch::fanout_with(self, units, true, ReadIntent::Stream, body).await?;
         Ok(pairs
             .into_iter()
             .filter(|(_, bm)| !bm.is_empty())
@@ -6900,7 +7398,7 @@ impl SupertableReader {
             // were ever reclaimed, return incomplete results). A genuinely absent
             // index (never configured, or pre-first-drain) falls back.
             if let Some(reason) = self.hidden_index_open_error() {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hidden vector index present but failed to open: {reason}"
                 )));
             }
@@ -6932,9 +7430,19 @@ impl SupertableReader {
             vit.ensure_fresh_async().await;
             vit.pinned_reader_with(self.op_stats.clone())
                 .hidden_deleted_ids()
-                .map_err(|error| QueryError::Execute(error.to_string()))
+                .map_err(|error| QueryError::Internal(error.to_string()))
         };
         let user_parts = self.manifest().get_undrained_superfiles_loaded(&drained);
+        // Three concurrent legs, one span each: which one the query waited on
+        // is the question a slow vector search asks first.
+        let phases = self.phase_spans();
+        let hidden_search = hidden_search.instrument(trace::phase(phases, || {
+            detail_span!("vector.hidden", superfiles = hidden_entries.len())
+        }));
+        let fast_state =
+            fast_state.instrument(trace::phase(phases, || detail_span!("vector.delete_state")));
+        let user_parts =
+            user_parts.instrument(trace::phase(phases, || detail_span!("vector.user_parts")));
         let (hidden_hits, deleted, user_entries) = join!(hidden_search, fast_state, user_parts);
         let mut hidden_hits = hidden_hits?;
         let deleted = deleted?;
@@ -6946,6 +7454,9 @@ impl SupertableReader {
             Vec::new()
         } else {
             self.fanout_vector_clusters(&user_entries, column, query, k, options)
+                .instrument(trace::phase(phases, || {
+                    detail_span!("vector.user_delta", superfiles = user_entries.len())
+                }))
                 .await?
         };
         let refill_cap = k.saturating_add(deleted.len()).max(k);
@@ -6953,7 +7464,7 @@ impl SupertableReader {
         loop {
             let mut combined = top_k_ascending(vec![hidden_hits, user_hits], requested);
             if let Some(hit) = combined.iter().find(|hit| hit.stable_id.is_none()) {
-                return Err(QueryError::Execute(format!(
+                return Err(QueryError::Internal(format!(
                     "hit {:?}/{} missing stable _id before combined delete filtering",
                     hit.superfile, hit.local_doc_id
                 )));
@@ -7012,7 +7523,11 @@ impl SupertableReader {
                         .await
                 }
             };
-            let (next_hidden, next_user) = join!(hidden_retry, user_retry);
+            let (next_hidden, next_user) = async { join!(hidden_retry, user_retry) }
+                .instrument(trace::phase(phases, || {
+                    detail_span!("vector.refill", requested = requested)
+                }))
+                .await;
             hidden_hits = next_hidden?;
             user_hits = next_user?;
         }
@@ -7081,6 +7596,8 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.check_projection(projection)?;
+
         let query = calibrated_query(self, column, query);
         let query: &[f32] = &query;
         // Mark a foreground query in flight so background cache-fills yield
@@ -7110,11 +7627,16 @@ impl SupertableReader {
             {
                 let batch = hits_id_score_batch(self, &hits)?
                     .project(&indices)
-                    .map_err(|e| QueryError::Execute(e.to_string()))?;
+                    .map_err(|e| QueryError::Internal(e.to_string()))?;
                 return Ok(vec![batch]);
             }
-            let hits = user_placement_for_scalar_resolve(self, &hits).await?;
-            let batch = resolve_hits_named(self, &hits, projection).await?;
+            let resolve = async {
+                let hits = user_placement_for_scalar_resolve(self, &hits).await?;
+                resolve_hits_named(self, &hits, projection).await
+            };
+            let batch = resolve
+                .instrument(detail_span!("search.resolve", hits = hits.len()))
+                .await?;
             Ok(vec![batch])
         })
     }
@@ -7148,7 +7670,7 @@ fn subtract_tombstones(
     if let Some(cache) = tombstone_cache {
         let deleted = cache
             .bitmap_for(entry.superfile_id, now)
-            .map_err(|e| QueryError::build(format!("tombstone cache: {e}"), &e))?;
+            .map_err(QueryError::tombstone_cache)?;
         if !deleted.is_empty() {
             *bm -= &*deleted;
         }
@@ -7283,6 +7805,15 @@ fn deferred_shortlist_limit(
     } else {
         base
     }
+}
+
+/// Global-fine exact-rerank shortlist size: at least `k * rerank_mult`, at
+/// least [`GLOBAL_FINE_SHORTLIST_POOL_PCT`] of the pool. One helper so the
+/// warm rerank path and its test size the cut the same way. Call site has the
+/// why-uncapped reasoning (#821).
+fn global_fine_shortlist_limit(k: usize, rerank_mult: usize, pool_len: usize) -> usize {
+    k.saturating_mul(rerank_mult)
+        .max(pool_len.saturating_mul(GLOBAL_FINE_SHORTLIST_POOL_PCT) / 100)
 }
 
 /// Deterministic global shortlist selection for deferred-rerank width
@@ -7507,7 +8038,27 @@ impl Supertable {
     /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
-        tracing::instrument(skip_all, fields(column = column, k = k, dim = query.len(), role = self.role().as_str(), origin = OpOrigin::Query.as_str()))
+        // The empty fields are the read's outcome, filled once it has run;
+        // see `CloseOut`.
+        tracing::instrument(skip_all, fields(
+            column = column,
+            k = k,
+            dim = query.len(),
+            role = self.role().as_str(),
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            vector_cells_scanned = tracing::field::Empty,
+            vector_candidates_scanned = tracing::field::Empty,
+            vector_rows_reranked = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn vector_search(
         &self,
@@ -7518,10 +8069,14 @@ impl Supertable {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, crate::InfinoError> {
-        self.reader()?
+        let close_out = self.close_out();
+        let batches = self
+            .reader()?
             .vector_search(column, query, k, options, filter, projection)
             .map_err(crate::InfinoError::from)
-            .map_err(|e| e.with_context("vector_search", None))
+            .map_err(|e| e.with_context("vector_search", None))?;
+        close_out.finish_batches(&batches);
+        Ok(batches)
     }
 }
 
@@ -7530,14 +8085,24 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        sync::Arc,
+        fs,
+        path::Path,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use arrow::array::Array;
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::IndexOutcome;
-    use crate::superfile::fts::reader::Bm25SearchOptions;
+    use crate::{
+        superfile::fts::reader::Bm25SearchOptions, supertable::manifest::ScalarStats,
+        test_helpers::fid,
+    };
 
     /// Cosine columns normalize the query; every other metric passes the
     /// caller's slice through untouched, by reference (no copy, no scale).
@@ -7557,28 +8122,32 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
-        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
+        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, ReadIntent,
+        SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
         admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
         build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
+        decode_centroid_router_section, dispatch, encode_centroid_router_section, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, postings_by_cell_from_summaries,
-        rerank_mult_from_law, score_fine_candidates, select_global_shortlist, union_cell_selection,
-        vector_read_query_error,
+        id_values_from_batch, is_hidden_vector_manifest, law_floor_serve_selection,
+        lookup_user_placements_by_id, postings_by_cell_from_summaries, read_ids_for_locals,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist,
+        take_rows_byte_source, union_cell_selection,
     };
     use crate::{
         BoolMode, InfinoError,
+        config::{CompactionSettings, OptimizeOptions},
         superfile::{
-            SuperfileReader,
+            BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
-            fts::reader::Bm25Stats,
+            format::{footer::read_kv_metadata, kv},
+            ids::{with_damaged_id_block, with_shifted_id_block},
             vector::{
                 distance::Metric,
                 flat::Sq4FlatIndex,
                 hnsw::{PayloadKind, encode_resident_envelope},
+                layout::VectorLayout,
                 rerank_codec::RerankCodec,
             },
         },
@@ -7589,10 +8158,14 @@ mod tests {
                 ClusterCentroids, ManifestSnapshot,
                 list::{CellRoutingParams, PartitionStrategy},
             },
+            query::vector::global_fine_shortlist_limit,
+            reader_cache::{ReaderCacheError, SuperfileReaderCache},
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::distinct_unit_vectors,
+        test_helpers::{
+            distinct_unit_vectors, lazy_disk_cache_without_promotion, lazy_foreground_disk_cache,
+        },
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -7646,7 +8219,7 @@ mod tests {
 
         // Fully enabled: the first column, whatever its metric.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &cols)
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, &cols)
                 .as_deref(),
             Some("nd"),
         );
@@ -7655,7 +8228,6 @@ mod tests {
             select_eager_router_column(
                 VectorSearchMode::Ivf,
                 IvfRouter::CentroidGraph,
-                32,
                 &[vc("only", Metric::L2Sq)],
             )
             .as_deref(),
@@ -7665,233 +8237,23 @@ mod tests {
         // what stamps the fanout `auto_router_choice` reads. Gate it off and an
         // `auto`-only table never calibrates → never routes centroid_graph.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, 32, &cols)
-                .as_deref(),
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, &cols).as_deref(),
             Some("nd"),
         );
         // Gated off: default `stamped` router.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, 32, &cols),
-            None,
-        );
-        // Gated off: fanout of zero.
-        assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 0, &cols),
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Stamped, &cols),
             None,
         );
         // Gated off: the HNSW search mode serves via its own graph.
         assert_eq!(
-            select_eager_router_column(
-                VectorSearchMode::HnswIvf,
-                IvfRouter::CentroidGraph,
-                32,
-                &cols,
-            ),
+            select_eager_router_column(VectorSearchMode::HnswIvf, IvfRouter::CentroidGraph, &cols,),
             None,
         );
         // No vector columns: nothing to pre-warm.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, 32, &[]),
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::CentroidGraph, &[]),
             None,
-        );
-    }
-
-    /// The nested-prefix evaluation ([`recall_by_fanout_for_query`]) gives the
-    /// SAME per-fanout recall as re-selecting + reading each fanout separately:
-    /// recall at fanout `F` uses exactly the pool rows whose cluster rank `< F`
-    /// (a prefix of one ranked read), takes the `k` nearest DISTINCT, and
-    /// intersects the truth. This is the crux of the scale-safe redesign — one
-    /// read, all rungs — so it is checked against a hand-computed reference AND
-    /// an independent "separate reads" reference on the same fixture.
-    #[test]
-    fn nested_prefix_recall_matches_separate_per_fanout() {
-        use super::{PrefixCand, recall_by_fanout_for_query};
-        use crate::supertable::manifest::list::WIDTH_LAW_KS;
-
-        let pc = |dist: f32, rank: u32, sid: i128| PrefixCand { dist, rank, sid };
-        // Rows tagged (dist, cluster rank, stable id). Ranks: cluster 0 nearest.
-        // sid 11 is a false positive (not in the truth); sid 1 also appears as a
-        // boundary REPLICA at rank 2 (must collapse to one truth slot).
-        let pool = vec![
-            pc(0.10, 0, 1),
-            pc(0.20, 0, 2),
-            pc(0.30, 1, 3),
-            pc(0.35, 1, 11),
-            pc(0.40, 2, 4),
-            pc(0.15, 2, 1), // replica of sid 1, farther-ranked cluster
-        ];
-        // Exact top-10 truth (nearest first); sids 1..=10 are the true neighbours.
-        let gt: Vec<i128> = (1..=10).collect();
-        let ladder = [1u32, 2, 3];
-
-        // Reference: "run each fanout separately" — for fanout F, take only rows
-        // from clusters with rank < F, dedup by stable id keeping the nearest,
-        // sort by distance, take k, intersect the truth.
-        let separate = |fanout: u32, k: usize| -> f64 {
-            let mut rows: Vec<PrefixCand> =
-                pool.iter().copied().filter(|c| c.rank < fanout).collect();
-            rows.sort_by(|a, b| a.dist.total_cmp(&b.dist));
-            let mut seen = std::collections::HashSet::new();
-            let got: std::collections::HashSet<i128> = rows
-                .iter()
-                .filter(|c| seen.insert(c.sid))
-                .take(k)
-                .map(|c| c.sid)
-                .collect();
-            let truth: std::collections::HashSet<i128> = gt[..k].iter().copied().collect();
-            truth.iter().filter(|t| got.contains(t)).count() as f64 / k as f64
-        };
-
-        let got = recall_by_fanout_for_query(&pool, &gt, &ladder, 100);
-        let k1 = WIDTH_LAW_KS
-            .iter()
-            .position(|&k| k == 1)
-            .expect("k=1 anchor");
-        let k10 = WIDTH_LAW_KS
-            .iter()
-            .position(|&k| k == 10)
-            .expect("k=10 anchor");
-        // Hand-computed expectations.
-        //   F=1 (rank<1 → {1,2}):        recall@1 = 1.0,  recall@10 = 2/10
-        //   F=2 (rank<2 → {1,2,3,11}):   recall@1 = 1.0,  recall@10 = 3/10 (11 excluded)
-        //   F=3 (rank<3 → {1,2,3,11,4}): recall@1 = 1.0,  recall@10 = 4/10 (replica of 1 collapses)
-        let expect = [(1.0, 0.2), (1.0, 0.3), (1.0, 0.4)];
-        for (fi, &fanout) in ladder.iter().enumerate() {
-            let r1 = got[fi][k1].expect("recall@1 measured");
-            let r10 = got[fi][k10].expect("recall@10 measured");
-            assert!((r1 - expect[fi].0).abs() < 1e-9, "F={fanout} recall@1");
-            assert!((r10 - expect[fi].1).abs() < 1e-9, "F={fanout} recall@10");
-            // Prefix evaluation == independent per-fanout evaluation.
-            assert!(
-                (r1 - separate(fanout, 1)).abs() < 1e-9,
-                "F={fanout} k=1 vs separate"
-            );
-            assert!(
-                (r10 - separate(fanout, 10)).abs() < 1e-9,
-                "F={fanout} k=10 vs separate"
-            );
-        }
-        // Anchors deeper than the measured max stay unmeasured (→ sentinel).
-        let k1000 = WIDTH_LAW_KS
-            .iter()
-            .position(|&k| k == 1000)
-            .expect("k=1000 anchor");
-        assert!(
-            got.iter().all(|arr| arr[k1000].is_none()),
-            "k=1000 is never measured (> ROUTER_CALIB_MAX_ANCHOR)"
-        );
-    }
-
-    /// The measured-recall calibrator must decode each corpus row against ITS
-    /// OWN codec + per-cluster ruler. The L2Sq/NegDot default codec
-    /// (`Sq16Adaptive`) stores a per-cluster fitted grid; decoding those codes
-    /// off the fixed `[-1, 1]` cosine grid distorts every row and mismeasures
-    /// recall. This fixture pins that: the router selects the true-nearest's
-    /// cluster (by fp32 centroid geometry, modelled here as the rank-0
-    /// selection), so a CORRECT decode measures recall@1 = 1.0, while the
-    /// fixed-grid mis-decode reorders the ground truth onto an UNSELECTED
-    /// cluster and measures 0.0. The cosine (fixed `Sq16`) leg guards the
-    /// already-correct path against regression.
-    #[test]
-    fn calibrator_measures_adaptive_recall_in_codec_space() {
-        use std::{collections::HashMap, sync::Arc};
-
-        use super::{gt_finalize, recall_by_fanout_for_query, score_rows_unified};
-        use crate::{
-            superfile::vector::{
-                cell_posting::EncodedCellRow,
-                distance::{encode_sq16_adaptive_row, encode_sq16_row},
-                rerank_codec::RerankCodec,
-            },
-            supertable::manifest::list::WIDTH_LAW_KS,
-        };
-
-        let dim = 2;
-        let k1 = WIDTH_LAW_KS
-            .iter()
-            .position(|&k| k == 1)
-            .expect("k=1 anchor");
-
-        // Run one fixture through the calibrator's own scan + finalize +
-        // nested-prefix recall, returning measured recall@1. `rows` are
-        // (flat cluster, encoded row); `selected` maps the query's selected flat
-        // clusters → rank; only the rank-0 (fanout 1) cluster's rows enter the
-        // pool, so a ground truth that lands in an unselected cluster is missed.
-        let measure = |rows: Vec<(u32, EncodedCellRow)>,
-                       selected: HashMap<u32, u32>,
-                       query: Vec<f32>,
-                       metric: Metric|
-         -> f64 {
-            let queries = vec![query];
-            let mut contrib = score_rows_unified(rows, vec![selected], &queries, metric, dim, 8, 8);
-            let (gt_cands, px_cands) = contrib.remove(0);
-            let gt = gt_finalize(gt_cands.into_iter().collect(), 1);
-            let per_fanout = recall_by_fanout_for_query(&px_cands, &gt, &[1u32], 1);
-            per_fanout[0][k1].expect("recall@1 measured")
-        };
-
-        // --- L2Sq, adaptive per-cluster ruler -----------------------------
-        // One ruler fit to the corpus range [1, 100] per dim. sid 1 lives in the
-        // near cluster (flat 0); sids 2/3 in the far cluster (flat 1). Decoded
-        // off the fixed [-1, 1] grid, sid 3's high codes collapse toward the
-        // origin and it spuriously outranks the true nearest sid 1 — the exact
-        // reorder this fix removes.
-        let scale = vec![(100.0f32 - 1.0) / 65535.0; dim];
-        let offset = vec![1.0f32; dim];
-        let adaptive = |v: &[f32], flat: u32, sid: i128| -> (u32, EncodedCellRow) {
-            let mut codes = vec![0u8; dim * 2];
-            encode_sq16_adaptive_row(v, &scale, &offset, &mut codes);
-            (
-                flat,
-                EncodedCellRow {
-                    stable_id: sid,
-                    rerank_codec: RerankCodec::Sq16Adaptive,
-                    scale: Arc::from(scale.clone()),
-                    offset: Arc::from(offset.clone()),
-                    codes,
-                    residuals: Vec::new(),
-                    norm_sq: None,
-                },
-            )
-        };
-        let l2_rows = vec![
-            adaptive(&[1.0, 1.0], 0, 1),
-            adaptive(&[100.0, 100.0], 1, 2),
-            adaptive(&[90.0, 90.0], 1, 3),
-        ];
-        let sel_l2 = HashMap::from([(0u32, 0u32)]);
-        let recall_l2 = measure(l2_rows, sel_l2, vec![0.0, 0.0], Metric::L2Sq);
-        assert!(
-            (recall_l2 - 1.0).abs() < 1e-9,
-            "L2Sq adaptive recall@1 must be 1.0 (fixed-grid mis-decode measures 0.0), got \
-             {recall_l2}"
-        );
-
-        // --- Cosine, fixed [-1, 1] grid (regression guard) ----------------
-        // sid 1 points along the query; sid 2 opposite. The fixed-grid decode is
-        // the correct codec here, so recall@1 stays 1.0 both before and after.
-        let cos_row = |v: &[f32], flat: u32, sid: i128| -> (u32, EncodedCellRow) {
-            let mut codes = vec![0u8; dim * 2];
-            encode_sq16_row(v, &mut codes);
-            (
-                flat,
-                EncodedCellRow {
-                    stable_id: sid,
-                    rerank_codec: RerankCodec::Sq16,
-                    scale: Arc::from(Vec::<f32>::new()),
-                    offset: Arc::from(Vec::<f32>::new()),
-                    codes,
-                    residuals: Vec::new(),
-                    norm_sq: None,
-                },
-            )
-        };
-        let cos_rows = vec![cos_row(&[0.9, 0.1], 0, 1), cos_row(&[-0.9, 0.1], 1, 2)];
-        let sel_cos = HashMap::from([(0u32, 0u32)]);
-        let recall_cos = measure(cos_rows, sel_cos, vec![1.0, 0.0], Metric::Cosine);
-        assert!(
-            (recall_cos - 1.0).abs() < 1e-9,
-            "cosine fixed-grid recall@1 must stay 1.0, got {recall_cos}"
         );
     }
 
@@ -8007,8 +8369,7 @@ mod tests {
         // fanout is never measured. This is the crux of the fix: pre-fix it
         // returned `None` here and the rest of the chain never ran.
         assert_eq!(
-            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, 1024, &cols)
-                .as_deref(),
+            select_eager_router_column(VectorSearchMode::Ivf, IvfRouter::Auto, &cols).as_deref(),
             Some("emb"),
             "auto must engage the settle-side calibration that stamps the fanout",
         );
@@ -8613,9 +8974,15 @@ mod tests {
         // routes all the way to the public `InfinoError::OverBudget` and isn't
         // flattened to a generic query error.
         let read_err = ReadError::Vector(Box::new(VectorError::OverBudget("gate".into())));
-        let q = vector_read_query_error(read_err);
+        let q = QueryError::from(read_err);
 
         assert!(matches!(q, QueryError::OverBudget(_)), "got {q:?}");
+        // The scan returns the vector reader's own error, unwrapped: the same
+        // refusal must survive that path too, not read as an engine fault.
+        assert!(matches!(
+            QueryError::from(VectorError::OverBudget("gate".into())),
+            QueryError::OverBudget(_)
+        ));
         assert!(matches!(
             InfinoError::from(QueryError::OverBudget("x".into())),
             InfinoError::OverBudget(_)
@@ -8623,7 +8990,7 @@ mod tests {
 
         // A non-budget read error stays a generic query error.
         assert!(matches!(
-            vector_read_query_error(ReadError::MissingKv("k")),
+            QueryError::from(ReadError::MissingKv("k")),
             QueryError::Parquet(_)
         ));
     }
@@ -8707,8 +9074,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8731,8 +9098,8 @@ mod tests {
 
         let ids = arrow_array::Decimal128Array::from((0..n_total as i128).collect::<Vec<_>>())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles =
@@ -8783,8 +9150,8 @@ mod tests {
             Field::new(
                 "_id",
                 DataType::Decimal128(
-                    crate::supertable::options::DECIMAL128_PRECISION,
-                    crate::supertable::options::DECIMAL128_SCALE,
+                    crate::supertable::schema::DECIMAL128_PRECISION,
+                    crate::supertable::schema::DECIMAL128_SCALE,
                 ),
                 false,
             ),
@@ -8806,8 +9173,8 @@ mod tests {
         let mut b = SuperfileBuilder::new(opts).expect("builder");
         let id_arr = Decimal128Array::from(ids.to_vec())
             .with_precision_and_scale(
-                crate::supertable::options::DECIMAL128_PRECISION,
-                crate::supertable::options::DECIMAL128_SCALE,
+                crate::supertable::schema::DECIMAL128_PRECISION,
+                crate::supertable::schema::DECIMAL128_SCALE,
             )
             .expect("decimal128");
         let titles = LargeStringArray::from(
@@ -8844,6 +9211,7 @@ mod tests {
             .insert(uri, superfile_bytes_with_ids(ids, dim))
             .expect("insert superfile bytes");
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -8851,7 +9219,7 @@ mod tests {
             n_docs: ids.len() as u64,
             id_min: *ids.iter().min().expect("nonempty ids"),
             id_max: *ids.iter().max().expect("nonempty ids"),
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -8867,6 +9235,7 @@ mod tests {
     fn contiguous_entry(id_min: i128, n_docs: u64, seed: u128) -> Arc<SuperfileEntry> {
         let id = Uuid::from_u128(seed);
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -8874,7 +9243,7 @@ mod tests {
             n_docs,
             id_min,
             id_max: id_min + n_docs as i128 - 1,
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -8882,6 +9251,650 @@ mod tests {
             vector_layout: crate::superfile::vector::layout::VectorLayout::Ivf,
             subsection_offsets: None,
         })
+    }
+
+    /// Rows in the cold placement-build test's one user superfile: enough
+    /// that its cells' inline `_id` regions sit more than a cache block apart.
+    const COLD_PLACEMENT_ROWS: usize = 16_384;
+    /// Vector width in the cold placement-build test; wide vectors spread the
+    /// cells' inline `_id` regions across the blob.
+    const COLD_PLACEMENT_DIM: usize = 128;
+    /// GETs the cold placement build may take: the id sidecar's one range.
+    const COLD_PLACEMENT_MAX_GETS: u64 = 1;
+
+    #[test]
+    fn a_cold_placement_build_reads_ids_in_one_range_not_every_cell() {
+        let dim = COLD_PLACEMENT_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        // A meter of its own: `LocalFsStorageProvider::new` records into the
+        // process-wide default meter, so with the lib tests in one process
+        // the window below also counted other tests' GETs and the bound
+        // failed on reads this lookup never made.
+        let local = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), UsageMeter::new()).expect("storage"),
+        );
+        let storage: Arc<dyn StorageProvider> = local.clone();
+        {
+            let st = Supertable::create(
+                options_one_superfile_per_commit(dim).with_storage(Arc::clone(&storage)),
+            )
+            .expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&build_vector_batch(0, COLD_PLACEMENT_ROWS, dim, schema))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let st = Supertable::open(
+            options_one_superfile_per_commit(dim)
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        let before = local.usage_meter().snapshot();
+        block_on(lookup_user_placements_by_id(
+            manifest,
+            &[entry.id_min, entry.id_max],
+            &None,
+        ))
+        .expect("placements");
+        let io = local.usage_meter().snapshot().since(&before);
+        // One range for every id. Reading the cells' inline regions instead
+        // took 109 GETs and 56 MB here.
+        assert!(
+            io.get_count <= COLD_PLACEMENT_MAX_GETS,
+            "a cold placement build must read ids in one range, not every cell: {io:?}"
+        );
+
+        assert_places_every_row(manifest);
+    }
+
+    /// Row groups in the cold sidecar tests' file, so the `_id` column is
+    /// that many chunks with the other columns' between them.
+    const SIDECAR_PLACEMENT_ROW_GROUPS: usize = 4;
+    /// Rows per row group in the cold sidecar tests: few, so the file builds
+    /// in well under a second.
+    const SIDECAR_PLACEMENT_ROW_GROUP_ROWS: usize = 2048;
+    /// Rows in the cold sidecar tests' file.
+    const SIDECAR_PLACEMENT_ROWS: usize =
+        SIDECAR_PLACEMENT_ROW_GROUPS * SIDECAR_PLACEMENT_ROW_GROUP_ROWS;
+    /// Seed for the cold sidecar tests' random titles, so a run is
+    /// repeatable.
+    const SIDECAR_PLACEMENT_SEED: u64 = 7;
+    /// Vector width in the cold sidecar tests; the smallest the options
+    /// accept, since only the id read is measured.
+    const SIDECAR_PLACEMENT_DIM: usize = 16;
+    /// Random 64-bit words per title in the cold sidecar tests: enough
+    /// incompressible text that each row group's title chunk outgrows the
+    /// smallest GET, so the `_id` chunks are fetched apart, as they are on any
+    /// table that stores text.
+    const SIDECAR_PLACEMENT_TITLE_WORDS: usize = 20;
+    /// GETs a cold every-row id read may take once the file carries an id
+    /// sidecar: the one contiguous sidecar range.
+    const SIDECAR_PLACEMENT_MAX_GETS: u64 = 1;
+
+    /// `n` rows whose titles are random hex, `SIDECAR_PLACEMENT_TITLE_WORDS`
+    /// words each, deterministic per row; vectors as `build_vector_batch`.
+    fn wide_title_batch(n: usize, dim: usize, schema: Arc<Schema>) -> RecordBatch {
+        // Seeded random words: they neither compress nor change between runs.
+        let mut rng = StdRng::seed_from_u64(SIDECAR_PLACEMENT_SEED);
+        let titles: Vec<String> = (0..n)
+            .map(|_| {
+                (0..SIDECAR_PLACEMENT_TITLE_WORDS)
+                    .map(|_| format!("{:016x}", rng.random::<u64>()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let vectors = build_vector_batch(0, n, dim, Arc::clone(&schema));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::clone(vectors.column(1)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Options for the cold sidecar tests: one superfile per commit, with
+    /// row groups of `SIDECAR_PLACEMENT_ROW_GROUP_ROWS` rows.
+    fn sidecar_test_options() -> SupertableOptions {
+        let mut opts = options_one_superfile_per_commit(SIDECAR_PLACEMENT_DIM);
+        opts.row_group_size = Some(SIDECAR_PLACEMENT_ROW_GROUP_ROWS);
+        opts
+    }
+
+    /// Commit the cold sidecar tests' one file to `storage`.
+    fn write_sidecar_test_file(storage: &Arc<dyn StorageProvider>) {
+        let st = Supertable::create(sidecar_test_options().with_storage(Arc::clone(storage)))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&wide_title_batch(
+            SIDECAR_PLACEMENT_ROWS,
+            SIDECAR_PLACEMENT_DIM,
+            schema_with_vector(SIDECAR_PLACEMENT_DIM),
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// The table in `storage` over a fresh disk cache that never promotes a
+    /// held reader, so every read starts cold and stays lazy. The directory
+    /// guard keeps the cache alive.
+    fn open_cold(storage: &Arc<dyn StorageProvider>) -> (Supertable, TempDir) {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = lazy_disk_cache_without_promotion(Arc::clone(storage), cache_dir.path());
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(Arc::clone(storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold");
+        (st, cache_dir)
+    }
+
+    /// Open `entry`'s reader the way the id read does, so a test can count
+    /// only the GETs of the read itself.
+    fn open_entry(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Arc<SuperfileReader> {
+        block_on(dispatch::open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        ))
+        .expect("open the superfile")
+    }
+
+    /// Every row's `_id` of the superfile at `path`, read from its Parquet
+    /// `_id` column straight from the file's bytes: an oracle that shares no
+    /// reader or cache with the read it checks.
+    fn column_ids_of(path: &Path) -> Vec<i128> {
+        let bytes = Bytes::from(fs::read(path).expect("read the superfile"));
+        let reader = SuperfileReader::open(bytes).expect("open the superfile");
+        let every: Vec<u32> = (0..reader.n_docs() as u32).collect();
+        let id_column = reader.id_column().to_string();
+        let batch = reader
+            .take_by_local_doc_ids_from_parquet(&every, &[id_column.as_str()])
+            .expect("read the `_id` column");
+        id_values_from_batch(&batch).expect("decimal `_id`")
+    }
+
+    /// Every row's `_id` of `entry`, read the way a placement build reads it.
+    fn every_row_id(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Vec<i128> {
+        let every = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+        block_on(read_ids_for_locals(
+            manifest,
+            entry,
+            &every,
+            &manifest.options.id_column,
+            false,
+            &None,
+        ))
+        .expect("every row's id")
+    }
+
+    /// The one superfile under `root`'s data directory, found without opening
+    /// the table, so nothing reads it before a test edits it.
+    fn only_data_file(root: &Path) -> std::path::PathBuf {
+        let mut files: Vec<_> = fs::read_dir(root.join("data"))
+            .expect("data directory")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(files.len(), 1, "one superfile");
+        files.remove(0)
+    }
+
+    /// Where the superfile at `path` keeps its id sidecar, from its footer.
+    fn sidecar_range_of(path: &Path) -> (u64, u64) {
+        let bytes = fs::read(path).expect("read the superfile");
+        let kvs = read_kv_metadata(&bytes).expect("superfile footer");
+        let at = |key: &str| -> u64 { kvs[key].parse().expect("a byte offset") };
+        let offset = at(kv::IDS_OFFSET);
+        (offset, offset + at(kv::IDS_LENGTH))
+    }
+
+    /// A cold placement build over a file with several row groups reads the
+    /// stable-id sidecar, one range of a few bytes per row, rather than the
+    /// `_id` column's chunk in every row group.
+    #[test]
+    fn a_cold_placement_build_reads_the_id_sidecar_in_one_range() {
+        let dir = TempDir::new().expect("tempdir");
+        let local = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), UsageMeter::new()).expect("storage"),
+        );
+        let storage: Arc<dyn StorageProvider> = local.clone();
+        write_sidecar_test_file(&storage);
+
+        let (st, _cache_dir) = open_cold(&storage);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        open_entry(manifest, &entry);
+        let before = local.usage_meter().snapshot();
+        block_on(lookup_user_placements_by_id(
+            manifest,
+            &[entry.id_min, entry.id_max],
+            &None,
+        ))
+        .expect("placements");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The `_id` column instead costs a GET per row-group chunk, and more
+        // where its pages are fetched apart.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "a cold placement build must read the id sidecar in one range: {io:?}"
+        );
+        assert_places_every_row(manifest);
+
+        // Routing asks for every row with the inline region allowed; cold, the
+        // sidecar still serves it in one range rather than a read per cell.
+        let (st, _cache_dir) = open_cold(&storage);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        open_entry(manifest, &entry);
+        let every_row = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+        let before = local.usage_meter().snapshot();
+        let ids = block_on(read_ids_for_locals(
+            manifest,
+            &entry,
+            &every_row,
+            &manifest.options.id_column,
+            true,
+            &None,
+        ))
+        .expect("every row's id");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The inline region instead costs a GET per cell.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "an every-row read must take the sidecar before the inline region: {io:?}"
+        );
+        assert_eq!(
+            ids,
+            parquet_column_ids(manifest, &entry),
+            "the sidecar's ids, row for row, are the `_id` column's"
+        );
+    }
+
+    /// A source over a superfile's bytes that counts the reads of exactly its
+    /// id sidecar (the open's own footer read may overlap the sidecar and is
+    /// not one) and can fail them, standing in for object storage so a test
+    /// decides what the sidecar read returns.
+    struct SidecarSource {
+        inner: BytesLazyByteSource,
+        sidecar: (u64, u64),
+        fail: bool,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for SidecarSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            if (start, start + len) == self.sidecar {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.fail {
+                    return Err(LazyByteSourceError::OutOfBounds {
+                        start,
+                        len,
+                        size: 0,
+                    });
+                }
+            }
+            self.inner.range(start, len).await
+        }
+    }
+
+    /// A reader cache that holds one prebuilt reader, so a table's own id
+    /// read goes through a reader whose byte source the test controls.
+    struct OneReader {
+        uri: SuperfileUri,
+        reader: StdMutex<Arc<SuperfileReader>>,
+    }
+
+    impl OneReader {
+        fn new(uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Self {
+            Self {
+                uri,
+                reader: StdMutex::new(reader),
+            }
+        }
+
+        /// Swap in `reader`, as the cache does when it evicts a file and
+        /// opens it again.
+        fn replace(&self, reader: Arc<SuperfileReader>) {
+            *self.reader.lock().expect("lock") = reader;
+        }
+    }
+
+    impl SuperfileReaderCache for OneReader {
+        fn reader(&self, uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+            match *uri == self.uri {
+                true => Ok(Arc::clone(&self.reader.lock().expect("lock"))),
+                false => Err(ReaderCacheError::NotFound { uri: *uri }),
+            }
+        }
+
+        fn insert(&self, _uri: SuperfileUri, _bytes: Bytes) -> Result<(), ReaderCacheError> {
+            Ok(())
+        }
+
+        fn resident_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    /// A lazy reader over `source`.
+    fn lazy_reader_over(source: &Arc<SidecarSource>) -> Arc<SuperfileReader> {
+        let source: Arc<dyn LazyByteSource> = source.clone();
+        Arc::new(block_on(SuperfileReader::open_lazy(source)).expect("open lazy"))
+    }
+
+    /// What the cold sidecar tests read through: the table, its one-reader
+    /// cache, the source behind that reader, the `_id` column of the file as
+    /// written (read straight from its bytes), and the table's directory.
+    struct SidecarTable {
+        st: Supertable,
+        cache: Arc<OneReader>,
+        source: Arc<SidecarSource>,
+        want: Vec<i128>,
+        _dir: TempDir,
+    }
+
+    /// The cold sidecar tests' file read through a lazy reader over its bytes
+    /// (as written, or damaged by `damage`), whose sidecar reads fail when
+    /// `fail` is set.
+    fn table_over_sidecar_source(
+        damage: Option<fn(&[u8], usize) -> Vec<u8>>,
+        fail: bool,
+    ) -> SidecarTable {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        write_sidecar_test_file(&storage);
+        let path = only_data_file(dir.path());
+        let want = column_ids_of(&path);
+        let written = fs::read(&path).expect("read the superfile");
+        let bytes = match damage {
+            Some(damage) => damage(&written, 0),
+            None => written,
+        };
+        let source = Arc::new(SidecarSource {
+            inner: BytesLazyByteSource::new(Bytes::from(bytes)),
+            sidecar: sidecar_range_of(&path),
+            fail,
+            reads: AtomicUsize::new(0),
+        });
+        let probe = Supertable::open(sidecar_test_options().with_storage(Arc::clone(&storage)))
+            .expect("open");
+        let uri = probe.reader().expect("reader").manifest().superfiles[0].uri;
+        let cache = Arc::new(OneReader::new(uri, lazy_reader_over(&source)));
+        let store: Arc<dyn SuperfileReaderCache> = cache.clone();
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(storage)
+                .with_store(store),
+        )
+        .expect("open over the test's reader");
+        SidecarTable {
+            st,
+            cache,
+            source,
+            want,
+            _dir: dir,
+        }
+    }
+
+    /// A sidecar read that fails falls back to the `_id` column for that read
+    /// only: the answer is the column's, the sidecar is not taken for
+    /// damaged, and the next read tries the sidecar again.
+    #[test]
+    fn a_failed_sidecar_fetch_reads_the_column_and_keeps_the_sidecar() {
+        let SidecarTable {
+            st,
+            source,
+            want,
+            _dir: _keep_dir,
+            ..
+        } = table_over_sidecar_source(None, true);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(every_row_id(manifest, &entry), want, "the column answers");
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "the sidecar was tried"
+        );
+        assert!(
+            !manifest
+                .options
+                .damaged_id_sidecars
+                .lock()
+                .expect("lock")
+                .contains(&entry.uri),
+            "a failed read says nothing about the sidecar's bytes"
+        );
+        assert_eq!(every_row_id(manifest, &entry), want);
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            2,
+            "the next read tries the sidecar again"
+        );
+    }
+
+    /// A sidecar that does not decode, or decodes to ids the footer disagrees
+    /// with, is read once: the answer is the column's, the table remembers
+    /// the file, and a later read does not fetch the sidecar again, even
+    /// through a new reader after the cache evicted the first.
+    #[test]
+    fn a_damaged_sidecar_is_read_once_then_the_column_answers() {
+        type Damage = fn(&[u8], usize) -> Vec<u8>;
+        let damages: [(&str, Damage); 2] = [
+            ("a block that does not decode", with_damaged_id_block),
+            ("a block of wrong ids", with_shifted_id_block),
+        ];
+        for (what, damage) in damages {
+            let SidecarTable {
+                st,
+                cache,
+                source,
+                want,
+                _dir: _keep_dir,
+            } = table_over_sidecar_source(Some(damage), false);
+            let reader = st.reader().expect("reader");
+            let manifest = reader.manifest();
+            let entry = Arc::clone(&manifest.superfiles[0]);
+            assert_eq!(
+                every_row_id(manifest, &entry),
+                want,
+                "{what}: the column answers"
+            );
+            assert_eq!(source.reads.load(Ordering::Relaxed), 1, "{what}");
+            assert!(
+                manifest
+                    .options
+                    .damaged_id_sidecars
+                    .lock()
+                    .expect("lock")
+                    .contains(&entry.uri),
+                "{what}: the table remembers the damaged sidecar"
+            );
+            cache.replace(lazy_reader_over(&source));
+            assert_eq!(every_row_id(manifest, &entry), want, "{what}");
+            assert_eq!(
+                source.reads.load(Ordering::Relaxed),
+                1,
+                "{what}: a damaged sidecar is not fetched again"
+            );
+        }
+    }
+
+    /// Rows per commit in the merged-file placement test.
+    const MERGED_PLACEMENT_ROWS: usize = 500;
+    /// Commits the merged-file placement test compacts into one file.
+    const MERGED_PLACEMENT_COMMITS: u64 = 4;
+    /// Fragment count that triggers a merge: as soon as there are two.
+    const MERGE_AT_FRAGMENTS: u64 = 2;
+
+    #[test]
+    fn a_merged_cell_packed_file_places_every_row() {
+        // Compaction rewrites the commits into one cell-packed file, the shape
+        // a long-lived table's files have.
+        let dim = 16;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(options_one_superfile_per_commit(dim).with_storage(storage))
+            .expect("create");
+        for c in 0..MERGED_PLACEMENT_COMMITS {
+            let mut w = st.writer().expect("writer");
+            let start = c * MERGED_PLACEMENT_ROWS as u64;
+            w.append(&build_vector_batch(
+                start,
+                MERGED_PLACEMENT_ROWS,
+                dim,
+                schema.clone(),
+            ))
+            .expect("append");
+            w.commit().expect("commit");
+        }
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+            min_superfiles_for_merge: MERGE_AT_FRAGMENTS,
+            ..CompactionSettings::default()
+        }))
+        .expect("optimize");
+
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        assert_eq!(
+            manifest.superfiles.len(),
+            1,
+            "the commits merged into one file"
+        );
+        let entry = &manifest.superfiles[0];
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        assert_eq!(
+            entry.n_docs,
+            MERGED_PLACEMENT_COMMITS * MERGED_PLACEMENT_ROWS as u64
+        );
+        assert_places_every_row(manifest);
+    }
+
+    /// A sidecar written by compaction is read cold like a commit's: from the
+    /// sidecar, once, with the same ids, row for row, as the merged file's
+    /// `_id` column.
+    #[test]
+    fn a_merged_files_sidecar_is_read_cold() {
+        let dim = SIDECAR_PLACEMENT_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let uri = {
+            let st = Supertable::create(sidecar_test_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+            for _ in 0..MERGED_PLACEMENT_COMMITS {
+                let mut w = st.writer().expect("writer");
+                w.append(&wide_title_batch(
+                    SIDECAR_PLACEMENT_ROW_GROUP_ROWS,
+                    dim,
+                    schema.clone(),
+                ))
+                .expect("append");
+                w.commit().expect("commit");
+            }
+            st.optimize(&OptimizeOptions::compact(CompactionSettings {
+                min_superfiles_for_merge: MERGE_AT_FRAGMENTS,
+                ..CompactionSettings::default()
+            }))
+            .expect("optimize");
+            let reader = st.reader().expect("reader");
+            assert_eq!(reader.manifest().superfiles.len(), 1, "the commits merged");
+            reader.manifest().superfiles[0].uri
+        };
+        let path = dir.path().join(uri.storage_path());
+        let source = Arc::new(SidecarSource {
+            inner: BytesLazyByteSource::new(Bytes::from(fs::read(&path).expect("read"))),
+            sidecar: sidecar_range_of(&path),
+            fail: false,
+            reads: AtomicUsize::new(0),
+        });
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(storage)
+                .with_store(Arc::new(OneReader::new(uri, lazy_reader_over(&source)))),
+        )
+        .expect("open over the test's reader");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(every_row_id(manifest, &entry), column_ids_of(&path));
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "the cold read took the merged file's sidecar"
+        );
+    }
+
+    /// Every row's `_id` of `entry`, read from the Parquet `_id` column
+    /// itself: the oracle the placement map is checked against, independent
+    /// of the stable-id sidecar the map is built from.
+    fn parquet_column_ids(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Vec<i128> {
+        let reader = block_on(dispatch::open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        ))
+        .expect("open the superfile");
+        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+        let batch = block_on(take_rows_byte_source(
+            &reader,
+            &locals,
+            &[manifest.options.id_column.as_str()],
+        ))
+        .expect("read the `_id` column");
+        id_values_from_batch(&batch).expect("decimal `_id`")
+    }
+
+    /// Place every id in the table and check each lands on its own row. The
+    /// rows' ids come from the Parquet `_id` column, not the sidecar the map
+    /// is built from, so the two must agree on row order.
+    fn assert_places_every_row(manifest: &ManifestSnapshot) {
+        for entry in manifest.superfiles.iter() {
+            let ids = parquet_column_ids(manifest, entry);
+            let placed =
+                block_on(lookup_user_placements_by_id(manifest, &ids, &None)).expect("placements");
+            for (local, (owner, placed_local)) in placed.iter().enumerate() {
+                assert_eq!(
+                    owner.uri, entry.uri,
+                    "id {} placed in the wrong file",
+                    ids[local]
+                );
+                assert_eq!(
+                    *placed_local as usize, local,
+                    "id {} placed on the wrong row",
+                    ids[local]
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -9202,9 +10215,32 @@ mod tests {
         // not the old shape (silent metric default + blind per-superfile
         // probe, surfacing later as a kernel decode error).
         assert!(
-            matches!(&err, QueryError::Execute(m) if m.contains("unknown vector column")),
+            matches!(&err, QueryError::InvalidQuery(m) if m.contains("unknown vector column")),
             "got {err:?}"
         );
+    }
+
+    /// A query vector of the wrong length is the caller's mistake, named as
+    /// such before any probe runs, not a mismatch found deep in the index.
+    #[test]
+    fn vector_search_wrong_dimension_errors() {
+        let dim = 16;
+        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let mut w = st.writer().expect("writer");
+        let schema = st.options().schema.clone();
+        w.append(&build_vector_batch(0, 8, dim, schema)).expect("a");
+        w.commit().expect("c");
+        let r = st.reader().expect("reader");
+        for len in [dim - 1, dim + 1] {
+            let q = vec![0.1f32; len];
+            let err = r
+                .vector_hits("emb", &q, 5, VectorSearchOptions::new(), None)
+                .expect_err("expected error");
+            assert!(
+                matches!(&err, QueryError::InvalidQuery(m) if m.contains("dimensions")),
+                "len {len}: got {err:?}"
+            );
+        }
     }
 
     // ---- Tombstone filter helper: direct-call coverage --------------
@@ -9220,6 +10256,7 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
+        runtime_metrics::UsageMeter,
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
@@ -9231,6 +10268,7 @@ mod tests {
 
     fn synthetic_entry(superfile_id: Uuid) -> SuperfileEntry {
         SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id,
@@ -9238,7 +10276,7 @@ mod tests {
             n_docs: 100,
             id_min: 0,
             id_max: 99,
-            scalar_stats: std::collections::HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: std::collections::HashMap::new(),
             vector_summary: std::collections::HashMap::new(),
             partition_key: Vec::new(),
@@ -9383,7 +10421,7 @@ mod tests {
         let sf_id = Uuid::from_u128(0xC0FFEE);
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            fid(column),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
@@ -9394,7 +10432,7 @@ mod tests {
         // No supersessions: every tagged cell is routable.
         let empty = BTreeMap::new();
         let (postings, any_tagged) =
-            postings_by_cell_from_summaries(&entries, column, None, &empty);
+            postings_by_cell_from_summaries(&entries, fid(column), None, &empty);
         assert!(any_tagged);
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
@@ -9404,7 +10442,7 @@ mod tests {
         let mut superseded = BTreeMap::new();
         superseded.insert(sf_id, BTreeSet::from([2u32]));
         let (postings, any_tagged) =
-            postings_by_cell_from_summaries(&entries, column, None, &superseded);
+            postings_by_cell_from_summaries(&entries, fid(column), None, &superseded);
         assert!(any_tagged, "surviving cells still tag");
         assert!(!postings.contains_key(&2), "superseded cell is skipped");
         assert_eq!(postings.get(&1), Some(&10));
@@ -9414,7 +10452,7 @@ mod tests {
         // this one.
         let mut other = BTreeMap::new();
         other.insert(Uuid::from_u128(0xDEAD), BTreeSet::from([1u32]));
-        let (postings, _) = postings_by_cell_from_summaries(&entries, column, None, &other);
+        let (postings, _) = postings_by_cell_from_summaries(&entries, fid(column), None, &other);
         assert_eq!(postings.get(&1), Some(&10));
         assert_eq!(postings.get(&2), Some(&20));
         assert_eq!(postings.get(&3), Some(&30));
@@ -9445,9 +10483,12 @@ mod tests {
         };
 
         let sf_id = Uuid::from_u128(0xB0BA);
+        let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            ManifestSnapshot::empty(Arc::clone(&opts))
+                .field_id(column)
+                .expect("the table declares the column"),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![
@@ -9460,7 +10501,6 @@ mod tests {
             },
         );
 
-        let opts = Arc::new(options_one_superfile_per_commit(DIM as usize));
         let manifest = ManifestSnapshot::new(1, opts, vec![Arc::new(entry)], None, None);
 
         assert_eq!(
@@ -9495,7 +10535,7 @@ mod tests {
         let sf_id = Uuid::from_u128(0xC0FFEE);
         let mut entry = synthetic_entry(sf_id);
         entry.vector_summary.insert(
-            column.into(),
+            fid(column),
             VectorSummary {
                 centroid: vec![0.0; DIM as usize],
                 cells: vec![cell(1, 10), cell(2, 20), cell(3, 30)],
@@ -9510,6 +10550,7 @@ mod tests {
             let (cands, deferred) = score_fine_candidates(
                 &entries,
                 column,
+                Some(fid(column)),
                 &query,
                 Metric::L2Sq,
                 None,
@@ -9537,6 +10578,199 @@ mod tests {
             touched(&superseded),
             HashSet::from([1, 3]),
             "superseded cell is not fine-scored or fetched"
+        );
+    }
+
+    /// Drain-side fine placement: a row lands in the cell of its NEAREST FINE
+    /// centroid (found by walking the centroid-router HNSW), which can differ
+    /// from its nearest COARSE cell — the whole point of the placement fix. Two
+    /// fine centroids: node 0 at 0.9 owned by cell 0, node 1 at 0.45 owned by
+    /// cell 1. A row at 0.45 is nearest fine centroid node 1 (exact) so fine
+    /// placement -> cell 1, whereas the coarse cell grid (cell 0 at 0.4, cell 1
+    /// at 0.6) would place it in cell 0. That divergence is the bite.
+    #[test]
+    fn fine_assign_router_places_row_in_nearest_fine_centroids_cell() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+
+        // The cell grid: cell 0 at 0.4, cell 1 at 0.6.
+        let mut cell_centroids = vec![0.4f32; dim * 2];
+        for v in cell_centroids[dim..].iter_mut() {
+            *v = 0.6;
+        }
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+
+        // Fine placement via the centroid-router HNSW.
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.9f32; dim]), (0, 1, vec![0.45f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            node_to_cell: vec![0, 1],
+        };
+        let placed = fine
+            .assign_row_to_cells(&grid, Metric::L2Sq, &row)
+            .expect("row places against a non-empty router");
+        assert_eq!(
+            placed.primary, 1,
+            "fine placement follows the nearest fine centroid (node 1) into cell 1"
+        );
+
+        // The coarse cell grid would have placed the same row in cell 0.
+        let admit = crate::supertable::manifest::RabitqAdmitContext::new(dim, 7);
+        let coarse = crate::supertable::opann::boundary_assignment_fp32(
+            &grid,
+            Metric::L2Sq,
+            &row,
+            &admit,
+            crate::supertable::opann::assignment_shortlist_window(2),
+        );
+        assert_eq!(
+            coarse.primary, 0,
+            "coarse cell grid places the same row in cell 0 — the divergence fine placement fixes"
+        );
+    }
+
+    /// Bounds check: a node resolving to a cell id past the live grid's
+    /// `n_cent` (a split landed on a manifest newer than the router's) is
+    /// dropped, never emitted as a primary or replica. Here node 0 (the row's
+    /// nearest fine centroid) maps to out-of-range cell 9 on a 2-cell grid, so
+    /// placement must skip it and fall to node 1's in-range cell 1.
+    #[test]
+    fn fine_assign_router_drops_out_of_range_cells() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+        let mut cell_centroids = vec![0.4f32; dim * 2];
+        for v in cell_centroids[dim..].iter_mut() {
+            *v = 0.6;
+        }
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.45f32; dim]), (0, 1, vec![0.6f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        // node 0 (nearest to the row) resolves to cell 9 — out of range for the
+        // 2-cell grid; node 1 resolves to the in-range cell 1.
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            node_to_cell: vec![9, 1],
+        };
+        let placed = fine
+            .assign_row_to_cells(&grid, Metric::L2Sq, &row)
+            .expect("row still places against the in-range node");
+        assert_eq!(
+            placed.primary, 1,
+            "the out-of-range cell 9 is dropped; placement falls to the in-range cell 1"
+        );
+        assert!(
+            placed
+                .replicas
+                .iter()
+                .flatten()
+                .all(|&(cell, _)| (cell as usize) < grid.n_cent as usize),
+            "no replica may reference an out-of-range cell"
+        );
+    }
+
+    /// All walked nodes resolve out of range → no valid cell → `None`, so the
+    /// caller falls back to coarse placement rather than emitting a bad cell.
+    #[test]
+    fn fine_assign_router_none_when_all_cells_out_of_range() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+        let cell_centroids = vec![0.4f32; dim * 2];
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.45f32; dim]), (0, 1, vec![0.6f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            // Both nodes map past the grid, and one is the unresolved sentinel.
+            node_to_cell: vec![9, u32::MAX],
+        };
+        assert!(
+            fine.assign_row_to_cells(&grid, Metric::L2Sq, &row)
+                .is_none(),
+            "no in-range cell means no placement; caller falls back to coarse"
+        );
+    }
+
+    /// Superseded-aware placement: `build_global_fine_assign_router` marks a node
+    /// whose owning cell is superseded with the `u32::MAX` sentinel. A row whose
+    /// NEAREST fine centroid sits on such a node must skip it and fall to the
+    /// next node's LIVE cell — never placed into the superseded parent. Here node
+    /// 0 (nearest to the row) is the superseded sentinel; node 1 is live cell 1.
+    #[test]
+    fn fine_assign_router_skips_superseded_sentinel_to_live_cell() {
+        let dim = 8usize;
+        let row = vec![0.45f32; dim];
+        let mut cell_centroids = vec![0.4f32; dim * 2];
+        for v in cell_centroids[dim..].iter_mut() {
+            *v = 0.6;
+        }
+        let grid = crate::supertable::manifest::ClusterCentroids::from_fp32(
+            2,
+            dim as u32,
+            &cell_centroids,
+            vec![1, 1],
+        );
+        let graph = super::build_centroid_router_from_cluster_vectors(
+            vec![(0, 0, vec![0.45f32; dim]), (0, 1, vec![0.6f32; dim])],
+            dim,
+            Metric::L2Sq,
+        )
+        .expect("router builds");
+        // node 0 is nearest to the row but its cell was superseded (sentinel);
+        // node 1 owns the live cell 1.
+        let fine = super::FineAssignRouter {
+            router: Arc::new(super::StampedCentroidRouter {
+                generation: 0,
+                column: "emb".into(),
+                graph,
+            }),
+            node_to_cell: vec![u32::MAX, 1],
+        };
+        let placed = fine
+            .assign_row_to_cells(&grid, Metric::L2Sq, &row)
+            .expect("row places against the live node");
+        assert_eq!(
+            placed.primary, 1,
+            "the superseded parent (sentinel node 0) is skipped; the row lands in the live cell 1"
         );
     }
 
@@ -9662,9 +10896,19 @@ mod tests {
             // NegDot/L2Sq section must route identically to its freshly-built
             // graph, not just a Cosine one.
             for metric in [Metric::Cosine, Metric::NegDot, Metric::L2Sq] {
-                let built =
-                    build_centroid_router(&entries, &readers, "emb", section.as_ref(), dim, metric)
-                        .expect("build_centroid_router");
+                let emb = hr.manifest().field_id("emb").expect("emb id");
+                let built = build_centroid_router(
+                    &entries,
+                    &readers,
+                    "emb",
+                    emb,
+                    section.as_ref(),
+                    dim,
+                    metric,
+                    false,
+                    None,
+                )
+                .expect("build_centroid_router");
                 assert!(!built.node_map.is_empty(), "fixture must produce a router");
 
                 // Real storage round trip: serialize -> PUT -> fetch+mmap -> decode.
@@ -9687,6 +10931,7 @@ mod tests {
                     &entries,
                     &readers,
                     "emb",
+                    emb,
                     section.as_ref(),
                     dim,
                     metric,
@@ -9708,6 +10953,86 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    /// A split supersedes the coarse parent cell but leaves its superfile in
+    /// place until a later merge. The centroid-router graph is built over fine
+    /// centroids, so it MUST exclude a superseded cell's fine centroids — the
+    /// scan path already skips those cells, so a graph node pointing at one is a
+    /// dead pick that spends fanout and returns nothing. Regression: phase-1 (the
+    /// router build) once lacked the superseded filter phase-2 (scan) has, so a
+    /// freshly-split, un-merged table carried its dead parent centroids in the
+    /// graph (on a 1B index the resident centroid set measured ~2x the live
+    /// fine-cluster count until a merge reclaimed the parents).
+    #[test]
+    fn centroid_router_skips_superseded_cells() {
+        use crate::supertable::manifest::list::PartitionStrategy;
+
+        let (_dir, st, _q, _k) = drained_three_direction_fixture();
+        block_on_mt(async {
+            let outer = st.reader().expect("reader");
+            let hidden = outer.vector_index_table().expect("hidden index").clone();
+            let hr = hidden.reader().expect("hidden reader");
+            let section = hr.centroid_section().await.expect("centroid section");
+            let manifest = hr.manifest();
+            let entries = manifest.get_all_superfiles_loaded().await.expect("entries");
+            let readers = hr.open_superfile_readers(&entries).await.expect("readers");
+            let column_id = manifest.field_id("emb").expect("emb id");
+            let dim = FIXTURE_DIM;
+
+            let n_cent = match manifest.get_partition_strategy() {
+                PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+                other => panic!("hidden index must be VectorCell, got {other:?}"),
+            };
+            let per_sf = |cells: BTreeSet<u32>| -> BTreeMap<Uuid, BTreeSet<u32>> {
+                entries
+                    .iter()
+                    .map(|e| (e.superfile_id, cells.clone()))
+                    .collect()
+            };
+            let node_count = |ss: Option<&BTreeMap<Uuid, BTreeSet<u32>>>| {
+                build_centroid_router(
+                    &entries,
+                    &readers,
+                    "emb",
+                    column_id,
+                    section.as_ref(),
+                    dim,
+                    Metric::Cosine,
+                    false,
+                    ss,
+                )
+                .expect("router build")
+                .node_map
+                .len()
+            };
+
+            let full = node_count(None);
+            assert!(
+                full >= 2,
+                "fixture must carry multiple fine centroids, got {full}"
+            );
+            // A populated cell is one whose supersession drops router nodes.
+            let cell_a = (0..n_cent)
+                .find(|&c| node_count(Some(&per_sf(BTreeSet::from([c])))) < full)
+                .expect("at least one populated cell");
+            let without_a = node_count(Some(&per_sf(BTreeSet::from([cell_a]))));
+            let mut others: BTreeSet<u32> = (0..n_cent).collect();
+            others.remove(&cell_a);
+            let only_a = node_count(Some(&per_sf(others)));
+
+            assert!(
+                without_a < full,
+                "superseding a populated cell must drop its fine centroids from the \
+                 router graph"
+            );
+            assert_eq!(
+                without_a + only_a,
+                full,
+                "the superseded filter partitions the fine centroids exactly — a \
+                 split's dead parent cells must not leak into the router graph"
+            );
         });
     }
 
@@ -9749,13 +11074,17 @@ mod tests {
                 .expect("entries");
             let readers = hr.open_superfile_readers(&entries).await.expect("readers");
 
+            let emb = hr.manifest().field_id("emb").expect("emb id");
             let built = build_centroid_router(
                 &entries,
                 &readers,
                 "emb",
+                emb,
                 section.as_ref(),
                 dim,
                 Metric::Cosine,
+                false,
+                None,
             )
             .expect("build_centroid_router");
             let bytes = encode_centroid_router_section(&built, &entries, dim);
@@ -9771,6 +11100,7 @@ mod tests {
                 &entries_rev,
                 &readers_rev,
                 "emb",
+                emb,
                 section.as_ref(),
                 dim,
                 Metric::Cosine,
@@ -9876,6 +11206,7 @@ mod tests {
                     &entries,
                     &readers,
                     section.as_ref(),
+                    false,
                 )
                 .await
                 .expect("resident router");
@@ -10504,6 +11835,86 @@ mod tests {
         );
     }
 
+    /// The pool-proportional shortlist rescues a true neighbour whose 1-bit
+    /// estimate lands mid-pool: past the fixed `k*rerank_mult` cut (top
+    /// ~0.5% here) but inside the proportional top-`GLOBAL_FINE_SHORTLIST_POOL_PCT`
+    /// (3%) cut. The neighbour IS kept under the proportional limit and is
+    /// DROPPED under the old fixed limit — the #821 warm-recall inversion —
+    /// so this asserts both that the fix recalls it and that the fix matters.
+    ///
+    /// Asserted on a synthetic pool with explicit estimate values (the cut
+    /// is on the estimate, so placement is controlled directly); the
+    /// end-to-end proof is the N=50 az1 recall aggregate on the PR.
+    #[test]
+    fn global_fine_shortlist_limit_takes_larger_of_fixed_and_proportional() {
+        // Small pool: the fixed k*rerank_mult floor dominates (3% of 100 = 3 < 10).
+        assert_eq!(
+            global_fine_shortlist_limit(10, 1, 100),
+            10,
+            "small pool keeps the k*rerank_mult floor"
+        );
+        // Large pool: the proportional 3%-of-pool cut dominates (3% of 2000 = 60 > 10).
+        assert_eq!(
+            global_fine_shortlist_limit(10, 1, 2000),
+            60,
+            "large pool takes 3% of the pool"
+        );
+        // The rerank_mult knob lifts the fixed floor.
+        assert_eq!(
+            global_fine_shortlist_limit(10, 8, 2000),
+            80,
+            "k*rerank_mult (80) beats 3% of 2000 (60)"
+        );
+    }
+
+    #[test]
+    fn select_global_shortlist_proportional_cut_rescues_mid_pool_neighbour() {
+        let cand = |est: f32, cell: usize, pos: u32, did: u32| ScanCandidate {
+            did,
+            estimate: est,
+            pos,
+            cluster_id: 0,
+            cell_idx: cell,
+        };
+        const POOL: usize = 2_000;
+        const K: usize = 10;
+        const RERANK_MULT: usize = 1;
+        // The planted true neighbour ranks 41st by 1-bit estimate: well past
+        // the fixed top-10 (k*rerank_mult) cut, comfortably inside the
+        // proportional top-60 (3% of 2000) cut.
+        const PLANTED_DID: u32 = 40;
+
+        // Strictly decreasing estimates: did=i is the (i+1)-th best in the
+        // pool, so a candidate's did IS its rank. cell_floor is 0 here, so
+        // cell_idx is irrelevant to the cut.
+        let pooled: Vec<(usize, ScanCandidate)> = (0..POOL)
+            .map(|i| (0usize, cand((POOL - i) as f32, 0, i as u32, i as u32)))
+            .collect();
+
+        let fixed_limit = K.saturating_mul(RERANK_MULT);
+        // Use the production helper, not a recomputed copy, so a regression
+        // in the phase-C cut fails here.
+        let proportional_limit = global_fine_shortlist_limit(K, RERANK_MULT, POOL);
+        assert_eq!(fixed_limit, 10, "old fixed cut is the top k*rerank_mult");
+        assert_eq!(proportional_limit, 60, "proportional cut is 3% of the pool");
+
+        let has_planted =
+            |winners: &[(usize, ScanCandidate)]| winners.iter().any(|(_, c)| c.did == PLANTED_DID);
+
+        let kept_proportional = select_global_shortlist(pooled.clone(), proportional_limit, 0);
+        assert!(
+            has_planted(&kept_proportional),
+            "the proportional cut must keep the mid-pool true neighbour"
+        );
+
+        let kept_fixed = select_global_shortlist(pooled, fixed_limit, 0);
+        assert!(
+            !has_planted(&kept_fixed),
+            "the old fixed cut drops the mid-pool true neighbour — the bite \
+             that proves the proportional cut matters"
+        );
+    }
+
     /// Monotonicity by construction: widening the sweep (adding a new
     /// cell's candidates to the pool) never evicts another cell's floored
     /// survivors — the exact property whose absence inverts recall as
@@ -10693,9 +12104,7 @@ mod tests {
                 "title",
                 "5",
                 8,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::And)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::And),
                 None,
             )
             .expect("global-stats bm25");
@@ -11341,10 +12750,84 @@ mod tests {
         );
     }
 
+    /// A row-returning vector search whose projection names a column the table
+    /// does not have is a caller error, and it must surface *before* the search
+    /// runs. `vector_search` validates the projection against the resident
+    /// output schema at its top (fail fast), so the query rejects the unknown
+    /// column immediately instead of running the full search and id/placement
+    /// resolution — at billion scale, gigabytes of I/O — only to reject the
+    /// name at output materialization. The message matches the late
+    /// `resolve_hits_named` check exactly (one shared validator).
+    #[test]
+    fn vector_search_unknown_projection_column_errors() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let err = st
+            .reader()
+            .expect("reader")
+            .vector_search(
+                "emb",
+                &q,
+                5,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id", "does_not_exist", "score"]),
+            )
+            .expect_err("a projection naming a nonexistent column must error");
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "an unknown projected column is a bad request, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown column") && msg.contains("in projection"),
+            "message must name the unknown column and the projection, got {msg:?}"
+        );
+    }
+
     /// Single vector column (`emb`), Sq16 rerank codec — so the drain builds
     /// and persists the resident per-row graph the hnsw serving path walks.
     fn options_one_col_sq16(dim: usize) -> SupertableOptions {
         options_one_col_sq16_metric(dim, Metric::Cosine)
+    }
+
+    /// A one-column table under a non-cosine metric, whose rerank codec is the
+    /// per-cluster-fitted `Sq16Adaptive` the engine picks for L2Sq/NegDot (the
+    /// fixed-grid `Sq16` is cosine-only and config validation rejects it here).
+    fn options_one_col_adaptive_metric(dim: usize, metric: Metric) -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(
+            schema_with_vector(dim),
+            vec![FtsConfig::new("title")],
+            vec![VectorConfig {
+                column: "emb".into(),
+                dim,
+                rot_seed: 7,
+                metric,
+                rerank_codec: RerankCodec::Sq16Adaptive,
+                provided_centroids: None,
+            }],
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
     }
 
     fn options_one_col_sq16_metric(dim: usize, metric: Metric) -> SupertableOptions {
@@ -11415,6 +12898,129 @@ mod tests {
             hits[0].score < 0.05,
             "an exact match is distance ~0 on the cosine scale, got {}",
             hits[0].score
+        );
+    }
+
+    /// A drained L2Sq table (rerank codec `Sq16Adaptive`) with a GRAPH published
+    /// and stamped — the l2sq peer of [`drained_graph_fixture`], used to pin that
+    /// `hnsw_ivf` now serves the resident graph for non-cosine metrics instead of
+    /// declining every one to the ivf scan.
+    fn drained_l2sq_graph_fixture() -> (Supertable, TempDir, Arc<Supertable>) {
+        let schema = schema_with_vector(GRAPH_FIXTURE_DIM);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let opts =
+            options_one_col_adaptive_metric(GRAPH_FIXTURE_DIM, Metric::L2Sq).with_storage(storage);
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(
+            0,
+            GRAPH_FIXTURE_ROWS,
+            GRAPH_FIXTURE_DIM,
+            schema,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.drain_vectors_to_cells_sync().expect("drain");
+
+        let hidden = hidden_index_of(&st);
+        let reader = hidden.reader().expect("hidden reader");
+        let manifest = reader.manifest();
+        // The build fix: an L2Sq column no longer declines the graph at the codec
+        // gate (`Sq16Adaptive` is not `is_sq16`) or the cosine-only metric gate —
+        // before it, this `expect_ready` panicked with `CodecUnsupported`.
+        let graph = expect_ready(
+            block_on(assemble_hnsw_sections(manifest, "emb", &None)).expect("assemble ok"),
+            "a drained L2Sq corpus",
+        );
+        // The metric-aware plane is stamped in the v06 bundle.
+        use crate::superfile::vector::hnsw::{HNSW_DATA_MAGIC_LEN, HNSW_DATA_MAGIC_V6};
+        assert_eq!(
+            &graph[..HNSW_DATA_MAGIC_LEN],
+            HNSW_DATA_MAGIC_V6,
+            "a fitted-ruler (non-cosine) graph stamps the v06 metric-aware magic"
+        );
+        let storage = manifest.options.storage.clone().expect("storage");
+        let blob = encode_resident_envelope(0, 0, &[], Some((PayloadKind::Graph, &graph)));
+        let reference =
+            block_on(write_resident_index_blob(storage.as_ref(), blob)).expect("publish");
+        let stamped = manifest.with_slow_vector_state_graphs(Some(reference));
+        drop(reader);
+        hidden.inner().manifest.store(Arc::new(stamped));
+        (st, dir, hidden)
+    }
+
+    /// The metric-aware graph fix (infino-ai/infino#757): under `hnsw_ivf` an
+    /// L2Sq column now BUILDS and SERVES the resident graph, where before the
+    /// build declined it (the `Sq16Adaptive` codec fails `is_sq16`, and the
+    /// serve/build metric gate was cosine-only) and every query fell back to the
+    /// ivf scan. The regression is twofold: the graph must answer, and it must
+    /// answer on the L2Sq distance scale (squared distance, ~0 for an exact
+    /// match) rather than the cosine `1 − dot` the old publish shifted onto.
+    #[test]
+    fn hnsw_ivf_serves_the_graph_for_l2sq() {
+        let (_st, _dir, hidden) = drained_l2sq_graph_fixture();
+        let served = hidden.reader().expect("hidden reader after publish");
+
+        // The resident graph is metric-aware: it serves the column's own L2Sq,
+        // not the fixed-grid cosine every pre-fix graph carried.
+        let resident = block_on(served.resident_vector_index()).expect("the ref must hydrate");
+        let data = resident
+            .data
+            .as_ref()
+            .and_then(ResidentIndexKind::graph)
+            .expect("the fixture publishes a decodable graph");
+        assert_eq!(
+            data.scorer.served_metric(),
+            Metric::L2Sq,
+            "the resident graph must serve the column's L2Sq metric"
+        );
+        // A fitted-ruler graph must carry NO coarse walk plane: the SQ8 / 4-bit
+        // walks are code-space `−dot` proxies for the uniform cosine grid and
+        // mis-navigate a per-dim ruler, so decode derives none and the serve
+        // path walks the metric-aware Sq16 plane directly. Before this, decode
+        // derived an SQ8 plane (config default `hnsw_plane = sq8`) and the walk
+        // returned near-random neighbours (recall collapsed to ~0 at scale).
+        assert!(
+            data.sq8_plane.is_empty() && data.sq4.is_none(),
+            "a metric-aware graph must serve the Sq16 walk, not a coarse proxy plane"
+        );
+
+        // An exact one-hot match (direction 5) is L2Sq distance ~0. Before the
+        // fix, hnsw_search declined L2Sq outright and this was `Unavailable`.
+        let mut q = vec![0.0f32; GRAPH_FIXTURE_DIM];
+        q[5] = 1.0;
+        let hits = expect_ready(
+            block_on(served.hnsw_search("emb", &q, 5, None)).expect("hnsw search"),
+            "the published L2Sq graph",
+        );
+        assert!(!hits.is_empty(), "the graph must answer its own generation");
+        assert!(
+            hits.windows(2).all(|w| w[0].score <= w[1].score),
+            "hits must be ascending by distance"
+        );
+        assert!(
+            hits[0].score < 0.05,
+            "an exact match is L2Sq distance ~0, got {}",
+            hits[0].score
+        );
+
+        // L2Sq scale, not the cosine `1 − dot`: scaling the query to magnitude 2
+        // leaves the nearest one-hot row PARALLEL (cosine distance 0) but at L2Sq
+        // distance ‖2·e5 − e5‖² = 1. A score near 1 proves the graph publishes the
+        // metric's own distance; the pre-fix cosine shift would report ~0.
+        let q2: Vec<f32> = q.iter().map(|x| x * 2.0).collect();
+        let hits2 = expect_ready(
+            block_on(served.hnsw_search("emb", &q2, 5, None)).expect("hnsw search x2"),
+            "the published L2Sq graph",
+        );
+        assert!(
+            (hits2[0].score - 1.0).abs() < 0.1,
+            "a magnitude-2 query is L2Sq distance ~1 from a parallel unit row \
+             (cosine would report ~0), got {}",
+            hits2[0].score
         );
     }
 
@@ -11679,11 +13285,15 @@ mod tests {
             other => panic!("expected CodecUnsupported, got {}", describe(other)),
         }
 
-        // A non-cosine column. Both resident index types rank by `-dot`, which
-        // is the column's own ordering only under Cosine — and the register
-        // gate cannot catch it, because `probe_recall` grades a `-dot` scan
-        // against a `-dot` exhaustive scan and so measures a mis-metriced
-        // index as perfect. Declined at build, for BOTH arms.
+        // A non-cosine column stored under the fixed-grid `Sq16` codec. The
+        // FLAT arm is cosine-only: it ranks by `-dot` mapped onto `1 - dot`,
+        // which is the column's own ordering only under Cosine, so it declines
+        // as MetricUnsupported. The HNSW arm is metric-aware, but a fitted-ruler
+        // graph needs the fitted-ruler codec — the fixed `[-1, 1]` grid carries
+        // no per-cluster ruler to decode these rows through — so it declines the
+        // fixed-grid codec as CodecUnsupported (a real L2Sq table stores the
+        // `Sq16Adaptive` codec and builds the graph; see
+        // `hnsw_ivf_serves_the_graph_for_l2sq`).
         for metric in [Metric::L2Sq, Metric::NegDot] {
             let metric_dir = TempDir::new().expect("tempdir");
             let metric_storage: Arc<dyn StorageProvider> =
@@ -11693,29 +13303,29 @@ mod tests {
             )
             .expect("create non-cosine table");
             let reader = table.reader().expect("reader");
-            for (arm, outcome) in [
-                (
-                    "flat",
-                    block_on(assemble_flat_sections(reader.manifest(), "emb", &None)),
-                ),
-                (
-                    "hnsw",
-                    block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)),
-                ),
-            ] {
-                match outcome.expect("ok") {
-                    IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
-                        column,
-                        metric: named,
-                    }) => {
-                        assert_eq!(column, "emb");
-                        assert_eq!(named, metric);
-                    }
-                    other => panic!(
-                        "the {arm} arm must decline {metric:?} as MetricUnsupported, got {}",
-                        describe(other)
-                    ),
+            match block_on(assemble_flat_sections(reader.manifest(), "emb", &None)).expect("ok") {
+                IndexOutcome::Unavailable(IndexUnavailable::MetricUnsupported {
+                    column,
+                    metric: named,
+                }) => {
+                    assert_eq!(column, "emb");
+                    assert_eq!(named, metric);
                 }
+                other => panic!(
+                    "the flat arm must decline {metric:?} as MetricUnsupported, got {}",
+                    describe(other)
+                ),
+            }
+            match block_on(assemble_hnsw_sections(reader.manifest(), "emb", &None)).expect("ok") {
+                IndexOutcome::Unavailable(IndexUnavailable::CodecUnsupported { column, codec }) => {
+                    assert_eq!(column, "emb");
+                    assert_eq!(codec, RerankCodec::Sq16.name());
+                }
+                other => panic!(
+                    "the hnsw arm must decline the fixed-grid codec under {metric:?} as \
+                     CodecUnsupported, got {}",
+                    describe(other)
+                ),
             }
         }
 
@@ -12245,7 +13855,7 @@ mod tests {
         let fts_cols: HashSet<&str> = HashSet::from(["title"]);
         let filters = [col("title").eq(lit("doc"))];
         let plan = CandidatePlan::from_filters(&filters, &fts_cols, &|col| {
-            manifest.options.try_fts_tokenizer_for(col)
+            manifest.try_fts_tokenizer_for(col)
         });
 
         let mut q = vec![0.0f32; dim];

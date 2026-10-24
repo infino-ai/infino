@@ -22,8 +22,14 @@ mod search_tvf;
 mod table;
 mod uri;
 
+#[cfg(feature = "graph-index")]
+use std::sync::Weak;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    io::{Error as IoError, ErrorKind},
+    ops::ControlFlow,
+    path::Path,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -32,22 +38,29 @@ use std::{
 };
 
 use arrow::record_batch::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dashmap::DashMap;
 use datafusion::{
     common::tree_node::{TreeNode, TreeNodeRecursion},
-    config::Dialect,
-    error::DataFusionError,
-    execution::context::SQLOptions,
+    execution::{context::SQLOptions, session_state::SessionState},
     logical_expr::{BinaryExpr, Operator},
     prelude::Expr,
-    sql::sqlparser::{
-        dialect::GenericDialect,
-        keywords::Keyword,
-        tokenizer::{Token, Tokenizer as SqlTokenizer},
+    sql::{
+        parser::{DFParserBuilder, Statement as DFStatement},
+        sqlparser::{
+            ast::{
+                CastKind, DataType as SqlDataType, ExactNumberInfo, Expr as SqlExpr,
+                Statement as SqlStatement, Value as SqlValue, visit_expressions_mut,
+                visit_statements,
+            },
+            dialect::GenericDialect,
+            keywords::Keyword,
+            tokenizer::{Token, Tokenizer as SqlTokenizer},
+        },
     },
 };
 use futures::future::try_join_all;
+pub(crate) use index_spec::DEFAULT_ROT_SEED;
 pub use index_spec::{FtsField, IndexSpec};
 use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
@@ -55,7 +68,7 @@ use manifest::{
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
 use tokio::runtime::{Handle, Runtime};
-use tracing::{debug, info};
+use tracing::{Instrument, debug, info, warn};
 use uri::{Backend, parse_uri};
 
 /// Most `AND` / `OR` connectives allowed in one SQL statement or mutation predicate: past a few
@@ -67,12 +80,29 @@ pub(crate) const MAX_PREDICATE_CONNECTIVES: usize = 1024;
 /// `MIN_BYTES_PER_CONNECTIVE * MAX_PREDICATE_CONNECTIVES` cannot reach the cap and skips the scan.
 const MIN_BYTES_PER_CONNECTIVE: usize = 3;
 
+/// Most digits a whole-number literal can carry and still be read exactly: `Decimal128`'s
+/// precision, which is also the `_id` column's (`DECIMAL(38, 0)`).
+const MAX_EXACT_INTEGER_DIGITS: usize = 38;
+
+/// The file in a table's disk-cache directory naming the storage location of
+/// the table generation its cached bytes belong to. The directory is keyed on
+/// the stable table name, which a drop and re-create reuses; superfile keys
+/// carry the location, so a later generation never reads an earlier one's
+/// bytes, but nothing else would ever reclaim them. Not a superfile name, so
+/// the cache's own scan leaves it alone.
+const TABLE_CACHE_LOCATION_FILE: &str = ".table-location";
+
+/// What `query_sql` answers a write with, from either read-only check.
+const READ_ONLY_REFUSAL: &str =
+    "query_sql is read-only; writes go through the table's append / update / delete API";
+
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
-    memory::{ConnectionMemoryBudget, budgeted_session_context},
+    error::{datafusion_error, datafusion_planning_error},
+    memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
@@ -86,8 +116,9 @@ use crate::{
     superfile::{
         builder::FtsConfig,
         fts::{
-            analysis::{Stemmer, Stopwords},
+            analysis::{Stemmer, Stopwords, check_recorded_tokenizer},
             bm25,
+            tokenize::STANDARD_TOKENIZER,
         },
         vector::{builder::VectorConfig, distance::Metric},
     },
@@ -95,9 +126,11 @@ use crate::{
         Supertable as SupertableHandle,
         manifest::disk_cache::ManifestDiskCache,
         options::SupertableOptions,
-        query::exec::common::collect_plan_metered,
+        query::{exec::common::collect_plan_metered, sql::sql_session_context},
         reader_cache::{DiskCacheConfig, DiskCacheError, DiskCacheStore},
+        schema::{ColumnIndex, TableSchema, change::SchemaPatch, error::SchemaError},
     },
+    utils::trace::{self, CloseOut, detail_span},
 };
 
 /// Subdirectory under a tables cache root holding the manifest-part cache.
@@ -193,6 +226,8 @@ pub fn connect_with(
             connection_memory_budget,
             usage_meter,
             gcs_credential,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -225,6 +260,8 @@ fn connect_remote(backend: Backend, options: ConnectOptions) -> Result<Connectio
             connection_memory_budget,
             usage_meter: UsageMeter::new(),
             gcs_credential: None,
+            #[cfg(feature = "graph-index")]
+            graph: Mutex::new(None),
         }),
     })
 }
@@ -258,6 +295,14 @@ struct ConnectionInner {
     usage_meter: Arc<UsageMeter>,
     /// Swappable GCS credential shared by every provider on this connection.
     gcs_credential: Option<Arc<SwappableGcpCredential>>,
+    /// A graph attached from another catalog (see [`Connection::attach_graph`]):
+    /// the connection it lives in and its edge table, served to this
+    /// connection's SQL as `graph_walk` / `graph_rank` with no table argument.
+    /// Held weakly: the caller keeps the graph's connection open, and a
+    /// strong handle here would let a connection attached to itself, or two
+    /// attached to each other, keep both alive for good.
+    #[cfg(feature = "graph-index")]
+    graph: Mutex<Option<(Weak<ConnectionInner>, String)>>,
 }
 
 /// Where the `name → table` map lives. Durable backends persist it on the
@@ -304,6 +349,31 @@ enum CatalogStore {
 }
 
 impl Connection {
+    /// Serve `table` of `graph` — an edge table over this connection's
+    /// rows that `graph` has indexed with `OptimizeOptions::with_adjacency`
+    /// — to this connection's [`query_sql`](Self::query_sql) as
+    /// `graph_walk(table, seed_table, seed_ids, hops, k)` and
+    /// `graph_rank(...)`, with no edge-table argument. The edge table
+    /// stays `graph`'s: it is not listed, opened or scanned here, and a
+    /// statement reaches it only through the two functions, which return
+    /// rows of this connection's tables. So a graph can live in a catalog
+    /// of its own and be walked from another. Attaching again replaces the
+    /// earlier graph.
+    ///
+    /// The graph's connection is held weakly: keep `graph` (or a clone)
+    /// open while it is attached. Once every handle to it is dropped, a
+    /// statement that calls the functions fails and says so. Behind the
+    /// `graph-index` feature, off the curated public surface.
+    #[cfg(feature = "graph-index")]
+    pub fn attach_graph(&self, graph: &Connection, table: &str) {
+        *self
+            .inner
+            .graph
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((Arc::downgrade(&graph.inner), table.to_string()));
+    }
+
     /// Cumulative object-store usage for this connection (read-only snapshot).
     /// Shared by every table provider created through this connection; take
     /// two snapshots and call [`UsageSnapshot::since`] for a window delta.
@@ -376,7 +446,22 @@ impl Connection {
     ) -> Result<Supertable, InfinoError> {
         validate_name(name).map_err(|e| e.with_context("create_table", Some(name)))?;
         validate_schema(&schema).map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_analyzers()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_companions()
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
+        // A companion is a table on storage beside this one; a catalog with
+        // no storage, or one forwarding to a hosted service, has nowhere to
+        // put it.
+        if indexes.has_companions() && !matches!(self.inner.store, CatalogStore::Storage { .. }) {
+            return Err(InfinoError::Unsupported(
+                "companion tables need a storage-backed connection".to_string(),
+            )
+            .with_context("create_table", Some(name)));
+        }
 
         match &self.inner.store {
             CatalogStore::Memory(map) => {
@@ -437,7 +522,10 @@ impl Connection {
                     schema_ipc: schema_to_ipc(&schema)
                         .map_err(|e| e.with_context("create_table", Some(name)))?,
                     fts: indexes.fts_columns(),
-                    fts_analyzers: indexes.fts_analyzers(),
+                    fts_analyzers: vec![
+                        STANDARD_TOKENIZER.to_string();
+                        indexes.fts_columns().len()
+                    ],
                     fts_stopwords: indexes
                         .fts_stopwords()
                         .iter()
@@ -467,9 +555,12 @@ impl Connection {
                 // Disk cache is keyed on the stable name (not the unique
                 // location) so the producer and a later reopener share one
                 // cache directory; superfile keys carry the location, so a
-                // re-created table never reads a dropped generation's bytes.
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("create_table", Some(name)))?;
+                // re-created table never reads a dropped generation's bytes,
+                // and the directory is claimed for this location, so a
+                // dropped generation's bytes do not stay on disk either.
+                let disk_cache =
+                    build_disk_cache(&self.inner.options, &table_storage, name, &location)
+                        .map_err(|e| e.with_context("create_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -486,7 +577,9 @@ impl Connection {
 
                 // Honor the connection's read-consistency policy (default
                 // BoundedStaleness); `open_table` applies the same.
-                opts = opts.with_read_consistency(self.inner.options.read_consistency);
+                opts = opts
+                    .with_read_consistency(self.inner.options.read_consistency)
+                    .with_companions(indexes.companion_specs());
 
                 // Create the physical table at its unique location, then
                 // register the name. A losing racer that also created a
@@ -578,33 +671,18 @@ impl Connection {
                 // the defaults it applies (rotation seed, rerank codec) are
                 // identical and the table's options-hash check passes.
                 let mut spec = IndexSpec::new();
-                // The analyzer decides how query text is tokenized, so it
-                // cannot be inferred: a record that does not name one per
-                // full-text column is unusable, and guessing would return
-                // wrong results rather than an error.
-                if entry.fts_analyzers.len() != entry.fts.len() {
-                    return Err(InfinoError::Backend(format!(
-                        "table '{name}' has {} full-text columns but {} analyzer names recorded; \
-                         the table record is incomplete",
-                        entry.fts.len(),
-                        entry.fts_analyzers.len()
-                    ))
-                    .with_context("open_table", Some(name)));
-                }
                 for (i, column) in entry.fts.iter().enumerate() {
-                    let analyzer = entry.fts_analyzers[i].as_str();
-                    // `fts_stored` keeps its back-compat rule: a catalog
-                    // written before index-only columns existed can only
-                    // mean the text is stored.
+                    check_recorded_tokenizer(
+                        column,
+                        entry.fts_analyzers.get(i).map(String::as_str),
+                    )
+                    .map_err(|e| {
+                        InfinoError::Config(e.to_string()).with_context("open_table", Some(name))
+                    })?;
+                    // A missing or short list reads as the default.
                     let stored = entry.fts_stored.get(i).copied().unwrap_or(true);
-                    // Same rule for positions: a catalog written before
-                    // they were declarable describes a table built
-                    // without them, because nothing could have asked
-                    // for them.
                     let positions = entry.fts_positions.get(i).copied().unwrap_or(false);
-                    // Same rule for the analysis filters: a catalog
-                    // written before they existed, or one whose entry
-                    // is empty, describes a column with no filter. A
+                    // A missing or empty filter name means no filter; a
                     // name that does not resolve is different — the
                     // recorded analysis cannot be reproduced, so the
                     // table is unusable rather than usable-with-a-guess.
@@ -628,15 +706,12 @@ impl Connection {
                             .with_context("open_table", Some(name))
                         })?,
                     };
-                    // And again for the BM25 pair: a catalog written before
-                    // it was declarable can only describe a table built with
-                    // the standard values, so the fallback is frozen there
-                    // rather than tracking the crate default.
+                    // The BM25 fallback is the frozen standard pair, not
+                    // the crate default.
                     let k1 = entry.fts_k1.get(i).copied().unwrap_or(bm25::K1);
                     let b = entry.fts_b.get(i).copied().unwrap_or(bm25::B);
                     spec = spec.fts(
                         FtsField::new(column.clone())
-                            .analyzer(analyzer)
                             .stopwords(stopwords)
                             .stemmer(stemmer)
                             .positions(positions)
@@ -665,8 +740,9 @@ impl Connection {
 
                 // Cache directory is keyed on the stable name, matching
                 // `create_table` (the on-storage subtree is `entry.location`).
-                let disk_cache = build_disk_cache(&self.inner.options, &table_storage, name)
-                    .map_err(|e| e.with_context("open_table", Some(name)))?;
+                let disk_cache =
+                    build_disk_cache(&self.inner.options, &table_storage, name, &entry.location)
+                        .map_err(|e| e.with_context("open_table", Some(name)))?;
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -723,6 +799,93 @@ impl Connection {
         Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
+    /// The schema document of table `name`: its live columns with their
+    /// ids, types, nullability and indexes, the field cap, and the
+    /// `schema_id` a write can compare against. What this returns is also
+    /// what [`Connection::apply_schema`] accepts, so a document read back
+    /// applies as a no-op.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// let doc = db.schema("posts")?;
+    /// assert_eq!(doc.fields()[0].name, "body");
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(_) = &self.inner.store {
+            return Err(remote_schema_unsupported("schema", name));
+        }
+        let handle = self.open_table_handle(name)?;
+        Ok((*handle.table_schema()).clone())
+    }
+
+    /// Change the schema of table `name` by merging `patch` into it, or
+    /// create the table from `patch` when there is none. The result is the
+    /// document the table holds afterwards.
+    ///
+    /// Each field in the patch is matched to a live column by `id` when it
+    /// carries one and by `name` otherwise. An unmatched field adds a
+    /// column; a matched field with another name (possible only by id)
+    /// renames it; another type changes it; `dropped` retires it; a field
+    /// not mentioned is untouched. Nothing is dropped by omission, and a
+    /// patch that changes nothing commits nothing. `expected` is an
+    /// optional compare-and-set against the current `schema_id`; it fails
+    /// with [`InfinoError::Conflict`] when the schema has moved.
+    ///
+    /// ```
+    /// # use infino::arrow_schema::DataType;
+    /// # use infino::{connect, FieldPatch, SchemaPatch};
+    /// # let db = connect("memory://")?;
+    /// let patch = SchemaPatch::new(vec![
+    ///     FieldPatch::named("body")
+    ///         .with_type(DataType::LargeUtf8)
+    ///         .with_nullable(false),
+    /// ]);
+    /// let doc = db.apply_schema("posts", &patch, None)?;
+    /// assert_eq!(doc.schema_id(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply_schema(
+        &self,
+        name: &str,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(_) = &self.inner.store {
+            return Err(remote_schema_unsupported("apply_schema", name));
+        }
+        let handle = match self.open_table_handle(name) {
+            Ok(handle) => handle,
+            Err(InfinoError::NotFound(_)) => {
+                if let Some(expected) = expected {
+                    return Err(InfinoError::Conflict(
+                        SchemaError::SchemaConflict {
+                            expected,
+                            current: 0,
+                        }
+                        .to_string(),
+                    )
+                    .with_context("apply_schema", Some(name)));
+                }
+                let (schema, indexes) = seed_from_patch(patch)
+                    .map_err(|e| e.with_context("apply_schema", Some(name)))?;
+                self.create_table(name, schema, indexes)?;
+                // The seed carries the columns; the cap and anything else the
+                // patch sets lands by the same merge an existing table takes.
+                self.open_table_handle(name)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok((*handle.apply_schema(patch, expected)?).clone())
+    }
+
     /// Rotate the GCS bearer token in place, returning `true` when it was
     /// swapped. Only the bearer (`google_bearer_token`) is honored; any other
     /// key in `storage_options` is ignored on this path. Returns `false` when
@@ -760,6 +923,11 @@ impl Connection {
     /// table. When the table was already absent there is nothing to purge.
     /// For `memory://`, tables live in-process and free with the
     /// last handle, so `purge` has nothing extra to do.
+    ///
+    /// The hidden tables kept under the table's location — its vector
+    /// index, and any companions declared with [`IndexSpec::companion`] —
+    /// are part of those bytes: a drop without `purge` leaves them there,
+    /// orphaned with the rest of the table, and `purge` removes them.
     ///
     /// ```
     /// # use std::sync::Arc;
@@ -830,6 +998,15 @@ impl Connection {
                     )
                     .map_err(|e| InfinoError::from(e).with_context("drop_table", Some(name)))?;
                 }
+                // The table's local disk cache goes with it: its bytes belong
+                // to a generation nothing will read again. Under the gate, so
+                // no open of the same name is building a cache over it. The
+                // catalog commit above is the drop; a cache that cannot be
+                // removed here is cleared by the next open of the name
+                // (`claim_table_cache`), so it does not fail the drop.
+                if let Some(cache_root) = self.inner.options.cache_dir.as_ref() {
+                    remove_table_cache(&cache_root.join(name));
+                }
                 Ok(())
             }
             #[cfg(feature = "remote")]
@@ -896,6 +1073,10 @@ impl Connection {
     /// DataFusion session, so cross-table joins and aggregations work.
     /// Returns the collected result batches.
     ///
+    /// Read-only, and one statement per call: a query, `EXPLAIN` or
+    /// `DESCRIBE`. A write of any kind is refused with [`InfinoError::Query`];
+    /// writes go through a table's `append`, `update` and `delete`.
+    ///
     /// ```
     /// # use std::sync::Arc;
     /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
@@ -912,8 +1093,25 @@ impl Connection {
     #[cfg_attr(
         feature = "detailed-tracing",
         // Connection-level entry: no table handle yet, so no `role` — the
-        // per-table spans beneath this one carry it.
-        tracing::instrument(skip_all, fields(sql = sql, origin = OpOrigin::Query.as_str()))
+        // per-table spans beneath this one carry it. The empty fields are
+        // filled in once the query has run: what it returned, the per-op
+        // counters the meter collected for it, and the object-store
+        // requests and bytes the connection issued meanwhile, so the span,
+        // the billed read work and the GETs can be read against each other.
+        tracing::instrument(skip_all, fields(
+            sql = sql,
+            origin = OpOrigin::Query.as_str(),
+            rows_out = tracing::field::Empty,
+            sql_page_bytes = tracing::field::Empty,
+            planned_read_ranges = tracing::field::Empty,
+            rows_materialized = tracing::field::Empty,
+            kernel_cpu_ns = tracing::field::Empty,
+            store_heads = tracing::field::Empty,
+            store_gets = tracing::field::Empty,
+            store_get_bytes = tracing::field::Empty,
+            store_bg_gets = tracing::field::Empty,
+            store_bg_get_bytes = tracing::field::Empty,
+        ))
     )]
     pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
@@ -929,21 +1127,25 @@ impl Connection {
         ensure_sql_within_connective_cap(sql)?;
 
         // Gate SQL heap on the connection budget: DataFusion allocates the
-        // working set (sort / aggregate / join), so its pool is the gate.
-        let ctx = budgeted_session_context(&self.inner.connection_memory_budget)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+        // working set (sort / aggregate / join), so its pool is the gate. The
+        // same constructor as a table reader's, so covered aggregates are
+        // answered from manifest statistics here too. A session built from
+        // our own budget config failing is ours, not the query's.
+        let ctx = sql_session_context(&self.inner.connection_memory_budget)
+            .map_err(|e| InfinoError::Backend(e.to_string()).with_context("query_sql", None))?;
+
+        // One snapshot of the session for parsing and table lookup; planning
+        // takes a fresh one later, after the tables are registered.
+        let state = ctx.state();
+        let statement =
+            read_only_statement(&state, sql).map_err(|e| e.with_context("query_sql", None))?;
 
         // Resolve the relations the query names and register each that is a
         // catalog table. Unknown names (CTEs, search TVFs, aliases) are
         // skipped — the planner resolves those by other means or errors.
-        let statement = ctx
-            .state()
-            .sql_to_statement(sql, &Dialect::Generic)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
-        let refs = ctx
-            .state()
+        let refs = state
             .resolve_table_references(&statement)
-            .map_err(|e| InfinoError::Query(e.to_string()).with_context("query_sql", None))?;
+            .map_err(|e| datafusion_planning_error(&e).with_context("query_sql", None))?;
 
         let mut seen = HashSet::new();
         let mut handles: Vec<SupertableHandle> = Vec::new();
@@ -953,12 +1155,16 @@ impl Connection {
                 continue;
             }
             match self.open_table_handle(&name) {
-                Ok(table) => {
-                    table.register_into(&ctx, &name).map_err(|e| {
-                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                    })?;
-                    handles.push(table);
-                }
+                // Minting its reader can fail like any manifest load (a
+                // storage fault, refused credentials), and keeps that cause. A
+                // table purged since it was opened is skipped like a name that
+                // was never a table, so the planner reports it, as the search
+                // table functions do.
+                Ok(table) => match table.register_into(&ctx, &name).map_err(InfinoError::from) {
+                    Ok(_) => handles.push(table),
+                    Err(InfinoError::NotFound(_)) => {}
+                    Err(e) => return Err(e.with_context("query_sql", None)),
+                },
                 Err(InfinoError::NotFound(_)) => {}
                 Err(e) => return Err(e.with_context("query_sql", None)),
             }
@@ -968,59 +1174,90 @@ impl Connection {
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
         search_tvf::register_search_tvfs(&ctx, self.clone());
+        // The graph functions walk an edge table of this catalog by name, or
+        // the one attached from another catalog with no name.
+        #[cfg(feature = "graph-index")]
+        {
+            let attached = self
+                .inner
+                .graph
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            match attached {
+                Some((graph, table)) => {
+                    let graph = graph
+                        .upgrade()
+                        .map(|inner| Connection { inner })
+                        .ok_or_else(|| {
+                            InfinoError::Query(
+                                "the attached graph's connection was dropped; keep it open while \
+                                 it is attached, or attach it again"
+                                    .to_string(),
+                            )
+                        })?;
+                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                }
+                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+            }
+        }
+        trace::follow_spans_into_datafusion_tasks();
 
-        let sql = sql.to_owned();
         // Caller-thread pickup, same as reader mint: the drive future may
         // poll on runtime threads where the scope's slot is invisible.
         let op_stats = op_stats::current();
+        // What the span records when the query is done; see `CloseOut`.
+        let close_out = CloseOut::begin(
+            || op_stats.clone(),
+            || Some(Arc::clone(&self.inner.usage_meter)),
+        );
         let drive = async move {
             // Plan on this runtime's 16 MiB workers, not the calling thread `block_on` polls on:
             // planner recursion depth must not hang on a stack the engine does not own. A panic
             // surfaces through the join as a query error.
             let planner_ctx = ctx.clone();
-            let (task_ctx, plan) = Handle::current()
-                .spawn(async move {
-                    // Plan, check, execute. `SessionContext::sql` would run a DDL or session
-                    // statement while producing the DataFrame, so the read-only check sits between
-                    // planning and execution. It runs on the planned tree, so spelling is
-                    // irrelevant: `SELECT ... INTO` is a CREATE TABLE, and an INSERT behind a
-                    // comment or an EXPLAIN is the same DML node. Planning has no side effects; a
-                    // refused statement has touched nothing.
-                    let plan = planner_ctx
-                        .state()
-                        .create_logical_plan(&sql)
-                        .await
-                        .map_err(|e| {
-                            InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                        })?;
+            // The planning task runs on another thread, which inherits no
+            // span on its own: instrument it, or the spans it creates start
+            // a trace of their own and the plan phase vanishes from this one.
+            let planning = async move {
+                // Plan the statement already parsed and checked, check the plan, execute.
+                // `SessionContext::sql` would run a DDL or session statement while producing
+                // the DataFrame, so the second read-only check sits between planning and
+                // execution. It runs on the planned tree and catches what the statement does
+                // not show: `SELECT ... INTO` reads like a query and plans to a CREATE TABLE.
+                // Planning has no side effects; a refused statement has touched nothing.
+                let plan = planner_ctx
+                    .state()
+                    .statement_to_plan(statement)
+                    .await
+                    .map_err(|e| datafusion_planning_error(&e))?;
 
-                    read_only_sql_options().verify_plan(&plan).map_err(|e| {
-                        InfinoError::Query(format!(
-                            "query_sql is read-only; writes go through the table's append / update / delete API ({e})"
-                        ))
-                        .with_context("query_sql", None)
-                    })?;
+                read_only_sql_options()
+                    .verify_plan(&plan)
+                    .map_err(|e| InfinoError::Query(format!("{READ_ONLY_REFUSAL} ({e})")))?;
 
-                    let df = planner_ctx.execute_logical_plan(plan).await.map_err(|e| {
-                        InfinoError::Query(e.to_string()).with_context("query_sql", None)
-                    })?;
+                let df = planner_ctx
+                    .execute_logical_plan(plan)
+                    .await
+                    .map_err(|e| datafusion_error(&e))?;
 
-                    // Execute through the physical plan (what `DataFrame::collect`
-                    // does internally) so the plan handle survives execution and
-                    // DataFusion's own operator metrics — elapsed compute, scan
-                    // output rows — can be folded into the per-query stats.
-                    let task_ctx = planner_ctx.task_ctx();
-                    let plan = df
-                        .create_physical_plan()
-                        .await
-                        .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-                    Ok::<_, InfinoError>((task_ctx, plan))
-                })
-                .await
-                .map_err(|join| {
-                    InfinoError::Query(format!("planning task failed: {join}"))
-                        .with_context("query_sql", None)
-                })??;
+                // Execute through the physical plan (what `DataFrame::collect`
+                // does internally) so the plan handle survives execution and
+                // DataFusion's own operator metrics — elapsed compute, scan
+                // output rows — can be folded into the per-query stats.
+                let task_ctx = planner_ctx.task_ctx();
+                let plan = df
+                    .create_physical_plan()
+                    .await
+                    .map_err(|e| datafusion_error(&e))?;
+                Ok::<_, InfinoError>((task_ctx, plan))
+            }
+            .instrument(detail_span!("sql.plan"))
+            .in_current_span();
+            let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
+                // A panic while planning is the engine's fault, never the query's.
+                InfinoError::Backend(format!("planning task failed: {join}"))
+            })??;
             // The shared meter-collect-harvest step: the root wrapper
             // meters the whole plan (aggregation, sort and join work sits
             // above the scan and is this query's CPU too), the scan
@@ -1028,31 +1265,44 @@ impl Connection {
             // thread never runs, and the shared bracket depth keeps a
             // single-partition plan from counting both.
             let batches = collect_plan_metered(&plan, task_ctx, &op_stats)
+                .instrument(detail_span!("sql.execute"))
                 .await
-                .map_err(|e| sql_exec_error(e).with_context("query_sql", None))?;
-            if batches.is_empty() {
-                // An empty Vec carries no schema, so hand back one empty batch
-                // instead. Its schema comes from the physical plan, not the
-                // DataFrame: the scan types scalar strings as `Utf8View`, and
-                // `expand_views_at_output` undoes that during optimization,
-                // which the DataFrame's logical plan predates.
-                let output_schema: SchemaRef = plan.schema();
-                Ok(vec![RecordBatch::new_empty(output_schema)])
+                .map_err(|e| datafusion_error(&e))?;
+            // An empty Vec carries no schema, so hand back one empty batch
+            // instead. Its schema comes from the physical plan, not the
+            // DataFrame: the scan types scalar strings as `Utf8View`, and
+            // `expand_views_at_output` undoes that during optimization,
+            // which the DataFrame's logical plan predates.
+            let batches = if batches.is_empty() {
+                vec![RecordBatch::new_empty(plan.schema())]
             } else {
-                Ok(batches)
-            }
+                batches
+            };
+            // Field ids are the engine's bookkeeping; a result carries the
+            // caller's columns.
+            Ok(batches
+                .into_iter()
+                .map(crate::supertable::schema::strip_field_ids)
+                .collect::<Vec<_>>())
         };
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
         // be multi-thread: a table-free query can be a search TVF, which
-        // fans out object-store reads under the hood.
-        match handles.first() {
+        // fans out object-store reads under the hood. Every error out of
+        // `drive` gets its `query_sql` context here, once.
+        let result = match handles.first() {
             Some(table) => table
                 .block_on_query(drive)
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
             None => bridge_on_runtime(drive, &self.query_runtime())
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
+        };
+
+        if let Ok(batches) = &result {
+            close_out.finish_batches(batches);
         }
+
+        result
     }
 
     /// Runtime for the table-free `query_sql` fallback.
@@ -1061,9 +1311,142 @@ impl Connection {
     }
 }
 
-/// `query_sql`'s read-only policy: refuse every plan node that acts on data, schema, or session
-/// state (DDL, DML and `COPY`, session statements such as `SET`). **The check is on the planned
-/// tree, so whatever the planner turns into a write is refused, however it was spelled.**
+/// Parse `sql` into the one statement `query_sql` runs, refusing a write before it is planned.
+///
+/// ```text
+///  sql ──► parse ──► one statement? ──no──► Query: "runs exactly one SQL statement"
+///                          │
+///                      reads only? ──no──► Query: read-only refusal
+///                          │
+///                   planned once from this statement, then the plan is checked again
+/// ```
+///
+/// Checking the statement, not only the plan, is what refuses a write DataFusion cannot plan
+/// (`ALTER TABLE`, an `INSERT` inside a CTE): planning fails on those before the plan check
+/// runs, and they would otherwise read as SQL a later version might support.
+fn read_only_statement(state: &SessionState, sql: &str) -> Result<DFStatement, InfinoError> {
+    let recursion_limit = state.config().options().sql_parser.recursion_limit;
+
+    let mut statements = DFParserBuilder::new(sql)
+        .with_dialect(&GenericDialect {})
+        .with_recursion_limit(recursion_limit)
+        .build()
+        .and_then(|mut parser| parser.parse_statements())
+        .map_err(|e| datafusion_planning_error(&e))?;
+
+    let (Some(mut statement), true) = (statements.pop_front(), statements.is_empty()) else {
+        return Err(InfinoError::Query(
+            "query_sql runs exactly one SQL statement".to_string(),
+        ));
+    };
+
+    if !reads_only(&statement) {
+        return Err(InfinoError::Query(READ_ONLY_REFUSAL.to_string()));
+    }
+
+    exact_wide_integers(&mut statement);
+    Ok(statement)
+}
+
+/// Read every whole-number literal too wide for 64 bits as the exact decimal it spells.
+///
+/// DataFusion reads a number literal as an `i64`, else a `u64`, else a `Float64`. A row's `_id`
+/// is a 32-digit `DECIMAL(38, 0)`, so `WHERE _id = 3304...` compared the column with a float:
+/// the comparison is coerced to `Decimal128(38, 15)`, which overflows and fails the query, and a
+/// float would not hold the 32 digits anyway. Each such literal becomes
+/// `CAST('<digits>' AS DECIMAL(38, 0))`, which compares with the column exactly. A literal that
+/// fits 64 bits, has a fraction or an exponent, or is past `MAX_EXACT_INTEGER_DIGITS` is left as
+/// DataFusion reads it.
+fn exact_wide_integers(statement: &mut DFStatement) {
+    match statement {
+        DFStatement::Statement(statement) => {
+            let _ = visit_expressions_mut(statement.as_mut(), |expr| {
+                if let Some(digits) = wide_integer_digits(expr) {
+                    *expr = SqlExpr::Cast {
+                        kind: CastKind::Cast,
+                        expr: Box::new(SqlExpr::Value(SqlValue::SingleQuotedString(digits).into())),
+                        data_type: SqlDataType::Decimal(ExactNumberInfo::PrecisionAndScale(
+                            MAX_EXACT_INTEGER_DIGITS as u64,
+                            0,
+                        )),
+                        array: false,
+                        format: None,
+                    };
+                }
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        DFStatement::Explain(explain) => exact_wide_integers(&mut explain.statement),
+        _ => {}
+    }
+}
+
+/// The digits of `expr` when it is a whole-number literal DataFusion would read as a float: past
+/// `u64` and within `MAX_EXACT_INTEGER_DIGITS`. A sign is a separate unary operator in the AST, so
+/// the literal itself is digits alone.
+fn wide_integer_digits(expr: &SqlExpr) -> Option<String> {
+    let SqlExpr::Value(value) = expr else {
+        return None;
+    };
+    let SqlValue::Number(text, _) = &value.value else {
+        return None;
+    };
+    let whole = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (whole && text.len() <= MAX_EXACT_INTEGER_DIGITS && text.parse::<u64>().is_err())
+        .then(|| text.clone())
+}
+
+/// Whether `statement`, and every statement nested in it, only reads: an `INSERT` can hide in a
+/// CTE, in parentheses or under an `EXPLAIN`. An allowlist, so a statement kind nobody listed is
+/// refused rather than run.
+fn reads_only(statement: &DFStatement) -> bool {
+    match statement {
+        DFStatement::Statement(statement) => visit_statements(statement.as_ref(), |nested| {
+            if is_read(nested) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        })
+        .is_continue(),
+
+        DFStatement::Explain(explain) => reads_only(&explain.statement),
+
+        _ => false,
+    }
+}
+
+/// The statements that change nothing: a query, and the ones that describe (`EXPLAIN`,
+/// `DESCRIBE`, every `SHOW` form). Listing a read DataFusion cannot plan is deliberate: the
+/// planner then reports it as unsupported, not as a write. A statement nested in one of these is
+/// checked on its own.
+fn is_read(statement: &SqlStatement) -> bool {
+    matches!(
+        statement,
+        SqlStatement::Query(_)
+            | SqlStatement::Explain { .. }
+            | SqlStatement::ExplainTable { .. }
+            | SqlStatement::ShowCatalogs { .. }
+            | SqlStatement::ShowCharset(_)
+            | SqlStatement::ShowCollation { .. }
+            | SqlStatement::ShowColumns { .. }
+            | SqlStatement::ShowCreate { .. }
+            | SqlStatement::ShowDatabases { .. }
+            | SqlStatement::ShowFunctions { .. }
+            | SqlStatement::ShowObjects(_)
+            | SqlStatement::ShowProcessList { .. }
+            | SqlStatement::ShowSchemas { .. }
+            | SqlStatement::ShowStatus { .. }
+            | SqlStatement::ShowTables { .. }
+            | SqlStatement::ShowVariable { .. }
+            | SqlStatement::ShowVariables { .. }
+            | SqlStatement::ShowViews { .. }
+    )
+}
+
+/// `query_sql`'s second read-only check: refuse every plan node that acts on data, schema, or
+/// session state (DDL, DML and `COPY`, session statements such as `SET`). **The check is on the
+/// planned tree, so whatever the planner turns into a write is refused, however it was spelled.**
 fn read_only_sql_options() -> SQLOptions {
     SQLOptions::new()
         .with_allow_ddl(false)
@@ -1187,15 +1570,6 @@ fn build_options(
     Ok(opts)
 }
 
-/// Map a SQL execution error to the public error: a budget exhaustion becomes
-/// [`InfinoError::OverBudget`], anything else a generic query error.
-fn sql_exec_error(e: DataFusionError) -> InfinoError {
-    match e {
-        DataFusionError::ResourcesExhausted(msg) => InfinoError::OverBudget(msg),
-        other => InfinoError::Query(other.to_string()),
-    }
-}
-
 /// Construct the storage provider for `backend` (None for `memory://`).
 /// Every durable provider records into the connection's `usage_meter`.
 fn backend_to_provider(
@@ -1254,11 +1628,13 @@ fn build_disk_cache(
     options: &ConnectOptions,
     storage: &Arc<dyn StorageProvider>,
     name: &str,
+    location: &str,
 ) -> Result<Option<(Arc<DiskCacheStore>, Arc<ManifestDiskCache>)>, InfinoError> {
     let Some(cache_root) = options.cache_dir.as_ref() else {
         return Ok(None);
     };
     let table_root = cache_root.join(name);
+    claim_table_cache(&table_root, location)?;
     let mut cfg = DiskCacheConfig {
         cache_root: table_root.clone(),
         cold_fetch_mode: options.cold_fetch_mode.to_internal(),
@@ -1283,6 +1659,46 @@ fn build_disk_cache(
     )
     .map_err(|e| InfinoError::Io(e.to_string()))?;
     Ok(Some((cache, manifest_cache)))
+}
+
+/// Make `table_root` the disk cache of the table generation stored at
+/// `location`. A directory holding another generation's bytes - the table was
+/// dropped and re-created under the same name, by this process or another -
+/// or bytes of no recorded generation (a cache written before the record
+/// existed) is emptied first: those bytes are keyed by locations nothing will
+/// read again, and the cache would otherwise count them against its budget
+/// and keep them on disk until eviction. Then `location` is recorded.
+fn claim_table_cache(table_root: &Path, location: &str) -> Result<(), InfinoError> {
+    let record = table_root.join(TABLE_CACHE_LOCATION_FILE);
+    let io = |e: IoError| InfinoError::Io(format!("disk cache {}: {e}", table_root.display()));
+    match fs::read_to_string(&record) {
+        Ok(held) if held == location => return Ok(()),
+        Ok(_) => remove_table_cache(table_root),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            let holds_files = fs::read_dir(table_root)
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(false);
+            if holds_files {
+                remove_table_cache(table_root);
+            }
+        }
+        Err(e) => return Err(io(e)),
+    }
+    fs::create_dir_all(table_root).map_err(io)?;
+    fs::write(&record, location).map_err(io)
+}
+
+/// Remove a table's disk-cache directory, if there is one. A failure is
+/// logged, not returned: the bytes are a cache, and the next claim of the
+/// directory ([`claim_table_cache`]) clears what this left.
+fn remove_table_cache(table_root: &Path) {
+    match fs::remove_dir_all(table_root) {
+        Ok(()) => info!(dir = %table_root.display(), "removed a table's disk cache"),
+        Err(e) if e.kind() == ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(dir = %table_root.display(), error = %e, "could not remove a table's disk cache")
+        }
+    }
 }
 
 /// The cached handle for `name`, or `None` (after evicting it) if its table was
@@ -1354,14 +1770,86 @@ fn validate_name(name: &str) -> Result<(), InfinoError> {
 /// table built from one fails on the ambiguous column. Catching it here turns
 /// a table that would otherwise error on every read into a create-time
 /// rejection.
+/// The seed `create_table` takes for `patch`: every listed column with its
+/// type (a new table's columns all need one), and the indexes they declare.
+/// Fields marked `dropped` are left out.
+fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), InfinoError> {
+    let mut fields = Vec::with_capacity(patch.fields.len());
+    let mut indexes = IndexSpec::new();
+    for field in patch.fields.iter().filter(|f| !f.dropped) {
+        let data_type = field.data_type.clone().ok_or_else(|| {
+            InfinoError::Schema(SchemaError::TypeRequired {
+                column: field.name.clone(),
+            })
+        })?;
+        match &field.index {
+            Some(ColumnIndex::Fts {
+                stopwords,
+                stemmer,
+                positions,
+                stored,
+                bm25,
+            }) => {
+                indexes = indexes.fts(
+                    FtsField::new(field.name.clone())
+                        .stopwords(*stopwords)
+                        .stemmer(*stemmer)
+                        .positions(*positions)
+                        .stored(*stored)
+                        .bm25(bm25.k1, bm25.b),
+                );
+            }
+            Some(ColumnIndex::Vector {
+                metric,
+                rot_seed,
+                rerank_codec,
+            }) => {
+                let DataType::FixedSizeList(_, dim) = &data_type else {
+                    return Err(InfinoError::Schema(SchemaError::InvalidIndex {
+                        column: field.name.clone(),
+                        reason: "a vector index needs a vector column".to_owned(),
+                    }));
+                };
+                // Carry what the document recorded. Taking the defaults
+                // instead would accept a patch naming a seed or a codec and
+                // silently build the table with different ones, so cloning a
+                // table's schema onto a new one would not reproduce it.
+                indexes = indexes.vector_as_recorded(
+                    field.name.clone(),
+                    *dim as usize,
+                    *metric,
+                    *rot_seed,
+                    *rerank_codec,
+                );
+            }
+            None => {}
+        }
+        fields.push(Field::new(
+            &field.name,
+            data_type,
+            field.nullable.unwrap_or(true),
+        ));
+    }
+    Ok((Arc::new(Schema::new(fields)), indexes))
+}
+
+/// The schema document is served by the engine; a hosted connection does
+/// not carry it over the wire yet.
+#[cfg(feature = "remote")]
+fn remote_schema_unsupported(operation: &'static str, name: &str) -> InfinoError {
+    InfinoError::Backend(
+        "the schema document is not available over a hosted connection yet".to_string(),
+    )
+    .with_context(operation, Some(name))
+}
+
 fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {
     let mut seen = HashSet::new();
     for field in schema.fields() {
         if !seen.insert(field.name().as_str()) {
-            return Err(InfinoError::Schema(format!(
-                "duplicate column name: {}",
-                field.name()
-            )));
+            return Err(InfinoError::Schema(SchemaError::DuplicateColumn {
+                name: field.name().clone(),
+            }));
         }
     }
     Ok(())
@@ -1428,19 +1916,25 @@ mod tests {
         time::Duration,
     };
 
-    use arrow_array::{Array, Int64Array, LargeStringArray, StringViewArray};
+    use arrow::util::pretty::pretty_format_batches;
+    use arrow_array::{
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
+        StringViewArray,
+    };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
+        error::DataFusionError,
         logical_expr::LogicalPlan,
         prelude::{SessionContext, col, lit},
     };
     use proptest::prelude::*;
+    use serde_json::{Map, Value, json};
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency, Stemmer, Stopwords,
+        Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        supertable::manifest::commit::POINTER_PATH,
+        supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
         test_helpers::{build_title_batch, schema_id_title},
     };
 
@@ -1632,6 +2126,40 @@ mod tests {
             conn.open_table("docs"),
             Err(InfinoError::NotFound(_))
         ));
+    }
+
+    /// `standard` may be named explicitly; any other analyzer is refused
+    /// at create, naming the column.
+    #[test]
+    fn create_table_accepts_only_the_standard_analyzer() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "pinned",
+            schema_id_title(),
+            IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
+        )
+        .expect("an explicit standard is accepted");
+
+        let err = conn
+            .create_table(
+                "other",
+                schema_id_title(),
+                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
+            )
+            .expect_err("a non-standard analyzer is refused");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("title") && msg.contains("ascii_lower"),
+            "names the column and analyzer: {msg}"
+        );
+        assert!(
+            !conn
+                .list_tables()
+                .expect("list")
+                .contains(&"other".to_string()),
+            "a refused create registers nothing"
+        );
     }
 
     /// Stemming, end to end: one inflection finds the others because
@@ -1963,105 +2491,28 @@ mod tests {
         }
     }
 
-    /// An unknown tokenizer is refused at create time, naming what the
-    /// caller wrote. The filters are separate options, so a
-    /// chain-shaped string is simply a tokenizer name that does not
-    /// resolve — it must not be quietly interpreted as a chain.
-    #[test]
-    fn an_unknown_analyzer_is_refused_and_a_chain_shaped_name_is_not_interpreted() {
-        let conn = connect("memory://").expect("connect");
-        for name in ["nonesuch", "standard+stop=english"] {
-            let err = conn
-                .create_table(
-                    "bad",
-                    schema_id_title(),
-                    IndexSpec::new().fts(FtsField::new("title").analyzer(name)),
-                )
-                .expect_err("an unresolvable analyzer must be rejected");
-            let msg = err.to_string();
-            assert!(
-                msg.contains(name),
-                "the error must name the analyzer as written, got: {msg}"
-            );
-        }
-    }
-
     #[test]
     fn standard_analyzer_keeps_non_ascii_end_to_end() {
+        // A bare declaration is analyzed by `standard`, which keeps
+        // non-ASCII, so "café" matches through the full create → append →
+        // search path.
         let conn = connect("memory://").expect("connect");
-
-        // Explicit ascii_lower drops non-ASCII, so "café" is unsearchable.
-        let ascii = conn
-            .create_table(
-                "ascii",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("ascii_lower")),
-            )
-            .expect("create ascii table");
-        ascii
+        let table = conn
+            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create default table");
+        table
             .append(&build_title_batch(&["café latte"]))
             .expect("append");
-        let ascii_hits = ascii
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(ascii_hits, 0, "ascii_lower drops the non-ASCII term");
-
-        // The standard analyzer keeps non-ASCII, so "café" matches — the
-        // full create → append → search path honors the chosen analyzer
-        // at both index and query time.
-        let std_tbl = conn
-            .create_table(
-                "std",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("standard")),
-            )
-            .expect("create standard table");
-        std_tbl
-            .append(&build_title_batch(&["café latte"]))
-            .expect("append");
-        let hits = std_tbl
+        let hits = table
             .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
             .expect("bm25_search");
         assert_eq!(
             n_rows(&hits),
             1,
-            "standard analyzer matches the non-ASCII term"
-        );
-
-        // A column declared without an analyzer gets `standard`, so it
-        // behaves like the explicit table above rather than the ascii one.
-        let default_tbl = conn
-            .create_table("dflt", schema_id_title(), IndexSpec::new().fts("title"))
-            .expect("create default table");
-        default_tbl
-            .append(&build_title_batch(&["café latte"]))
-            .expect("append");
-        let default_hits = default_tbl
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("bm25_search");
-        assert_eq!(
-            n_rows(&default_hits),
-            1,
             "a bare declaration keeps the non-ASCII term"
         );
-
-        // An unknown analyzer is a configuration error at create time.
-        let err = conn
-            .create_table(
-                "bad",
-                schema_id_title(),
-                IndexSpec::new().fts(FtsField::new("title").analyzer("nonesuch")),
-            )
-            .expect_err("unknown analyzer must be rejected");
-        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
     }
 
-    /// Two text columns, different analyzers: `title` = standard,
-    /// `body` = ascii_lower. A non-ASCII term in BOTH columns is
-    /// searchable via `title` but not `body`, and an ASCII term is
-    /// searchable via `body` — proving each column is indexed AND
-    /// queried with its own tokenizer (not column 0's for all).
     fn schema_title_body() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
             Field::new("title", DataType::LargeUtf8, false),
@@ -2080,8 +2531,12 @@ mod tests {
         .expect("batch shape matches schema")
     }
 
+    /// Two text columns, different analysis: `title` plain, `body`
+    /// stemmed. The same text holds `running` in both, so `run` reaches
+    /// it through `body` but not `title` — each column is indexed AND
+    /// queried with its own chain, not column 0's for all.
     #[test]
-    fn mixed_per_column_analyzers_index_and_query_independently() {
+    fn mixed_per_column_analysis_indexes_and_queries_independently() {
         let conn = connect("memory://").expect("connect");
         let schema = schema_title_body();
         let table = conn
@@ -2089,133 +2544,111 @@ mod tests {
                 "docs",
                 schema.clone(),
                 IndexSpec::new()
-                    .fts(FtsField::new("title").analyzer("standard"))
-                    .fts(FtsField::new("body").analyzer("ascii_lower")),
+                    .fts("title")
+                    .fts(FtsField::new("body").stemmer(Stemmer::English)),
             )
             .expect("create_table");
         table
-            .append(&title_body_batch(schema, "café latte", "café latte"))
+            .append(&title_body_batch(schema, "running late", "running late"))
             .expect("append");
 
-        let title_cafe = table
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("title search");
-        assert_eq!(
-            n_rows(&title_cafe),
-            1,
-            "standard column matches the non-ASCII term"
-        );
-
-        let body_cafe = table
-            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(body_cafe, 0, "ascii_lower column drops the non-ASCII term");
-
-        // The ascii_lower column is genuinely indexed (not empty): an
-        // ASCII term still matches there.
-        let body_latte = table
-            .bm25_search("body", "latte", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("body search");
-        assert_eq!(n_rows(&body_latte), 1, "ascii_lower column indexes ASCII");
-    }
-
-    #[test]
-    fn mixed_analyzers_survive_reopen_on_storage() {
-        // Storage-backed: a fresh connection reopens the table by
-        // reconstructing the per-column analyzers from the catalog
-        // (TableEntry.fts_analyzers), so query tokenization still honors
-        // each column's tokenizer after reopen.
-        let dir = std::env::temp_dir().join(format!("infino-mixed-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let uri = format!("file://{}", dir.display());
-        let schema = schema_title_body();
-        {
-            let conn = connect(&uri).expect("connect");
-            let table = conn
-                .create_table(
-                    "docs",
-                    schema.clone(),
-                    IndexSpec::new()
-                        .fts(FtsField::new("title").analyzer("standard"))
-                        .fts(FtsField::new("body").analyzer("ascii_lower")),
-                )
-                .expect("create_table");
+        let search = |column: &str, query: &str| {
             table
-                .append(&title_body_batch(
-                    schema.clone(),
-                    "café latte",
-                    "café latte",
-                ))
-                .expect("append");
-        }
-        // Fresh connection → open_table rebuilds the spec from the catalog.
-        let conn2 = connect(&uri).expect("reconnect");
-        let table = conn2.open_table("docs").expect("open_table");
-        let title_cafe = table
-            .bm25_search("title", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .expect("title search");
+                .bm25_search(column, query, TOP_K, Bm25SearchOptions::new(), None)
+                .map(|h| n_rows(&h))
+                .unwrap_or(0)
+        };
         assert_eq!(
-            n_rows(&title_cafe),
+            search("body", "run"),
             1,
-            "standard column still matches non-ASCII after reopen"
+            "the stemmed column folds the inflection"
         );
-        let body_cafe = table
-            .bm25_search("body", "café", TOP_K, Bm25SearchOptions::new(), None)
-            .map(|h| n_rows(&h))
-            .unwrap_or(0);
-        assert_eq!(
-            body_cafe, 0,
-            "ascii_lower column still drops non-ASCII after reopen"
-        );
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(search("title", "run"), 0, "the plain column does not");
+        assert_eq!(search("title", "running"), 1, "the plain column is indexed");
     }
 
-    #[test]
-    fn open_table_rejects_a_record_missing_its_analyzer_names() {
-        // The analyzer names are what let a reopened table tokenize query
-        // text the way its postings were built. A record that has full-text
-        // columns but no name for one of them cannot be reopened
-        // correctly, so `open_table` says so and names the table instead
-        // of picking an analyzer and returning wrong results.
-        let dir = std::env::temp_dir().join(format!("infino-noanalyzer-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).expect("mkdir");
-        let uri = format!("file://{}", dir.display());
-        let schema = schema_title_body();
-        {
-            let conn = connect(&uri).expect("connect");
-            conn.create_table(
-                "docs",
-                schema.clone(),
-                IndexSpec::new().fts("title").fts("body"),
-            )
-            .expect("create_table");
-        }
-        // Strip the analyzer list from the stored record, the shape a
-        // record written before analyzers were recorded per column has.
+    /// Rewrite table `docs`'s catalog record through `edit`.
+    fn edit_catalog_entry(dir: &Path, edit: impl FnOnce(&mut Map<String, Value>)) {
         let catalog_file = dir.join(CATALOG_PATH);
-        let mut body: serde_json::Value =
+        let mut body: Value =
             serde_json::from_slice(&fs::read(&catalog_file).expect("read catalog"))
                 .expect("catalog json");
-        body["tables"]["docs"]
-            .as_object_mut()
-            .expect("table entry")
-            .remove("fts_analyzers");
+        edit(body["tables"]["docs"].as_object_mut().expect("table entry"));
         fs::write(
             &catalog_file,
             serde_json::to_vec(&body).expect("encode catalog"),
         )
         .expect("write catalog");
+    }
 
-        let conn = connect(&uri).expect("reconnect");
-        let err = conn.open_table("docs").expect_err("incomplete record");
-        let rendered = err.to_string();
-        assert!(rendered.contains("docs"), "must name the table: {rendered}");
-        assert!(
-            rendered.contains("analyzer"),
-            "must say what is missing: {rendered}"
+    /// A new record names `standard` per column, and a recorded name is
+    /// checked on open: absent or `standard` opens, any other name refuses
+    /// the table with the re-create instruction rather than querying it
+    /// with `standard`.
+    #[test]
+    fn open_table_checks_a_recorded_analyzer_name() {
+        let (conn, dir) = storage_conn();
+        conn.create_table(
+            "docs",
+            schema_title_body(),
+            IndexSpec::new().fts("title").fts("body"),
+        )
+        .expect("create_table");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+
+        let mut written = None;
+        edit_catalog_entry(dir.path(), |entry| {
+            written = entry.get("fts_analyzers").cloned();
+        });
+        assert_eq!(
+            written,
+            Some(json!(["standard", "standard"])),
+            "a new record names `standard` per column"
         );
-        let _ = fs::remove_dir_all(&dir);
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.remove("fts_analyzers");
+        });
+        connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect("an absent analyzer list opens");
+
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.insert("fts_analyzers".into(), json!(["standard", "standard"]));
+        });
+        connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect("a recorded standard opens");
+
+        edit_catalog_entry(dir.path(), |entry| {
+            entry.insert("fts_analyzers".into(), json!(["standard", "ascii_lower"]));
+        });
+        let err = connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect_err("a removed analyzer must be refused");
+        assert!(matches!(err, InfinoError::Config(_)), "got: {err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("docs")
+                && msg.contains("body")
+                && msg.contains("ascii_lower")
+                && msg.contains("re-create"),
+            "must name the table, column, analyzer and fix: {msg}"
+        );
+
+        // An unrelated catalog commit rewrites every record; the removed
+        // analyzer must survive it, or the refusal silently disappears.
+        connect(&uri)
+            .expect("reconnect")
+            .create_table("other", schema_title_body(), IndexSpec::new().fts("title"))
+            .expect("an unrelated create_table");
+        let err = connect(&uri)
+            .expect("reconnect")
+            .open_table("docs")
+            .expect_err("the refusal survives an unrelated catalog commit");
+        assert!(err.to_string().contains("ascii_lower"), "got: {err}");
     }
 
     /// An index-only column (`FtsField::stored(false)`) survives a
@@ -2439,6 +2872,142 @@ mod tests {
         assert_eq!(
             cold_after_q2, cold_after_q1,
             "second query must reuse the warm disk cache, not cold-fetch again"
+        );
+    }
+
+    /// The files under a table's disk-cache directory, its location record
+    /// aside, by path relative to the directory.
+    fn table_cache_files(table_root: &Path) -> HashSet<PathBuf> {
+        let mut found = HashSet::new();
+        let mut pending = vec![table_root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if !path.ends_with(TABLE_CACHE_LOCATION_FILE) {
+                    found.insert(
+                        path.strip_prefix(table_root)
+                            .expect("under root")
+                            .to_path_buf(),
+                    );
+                }
+            }
+        }
+        found
+    }
+
+    /// A cached reader over `uri`, with strong reads so it sees a peer's drop.
+    fn cached_reader(uri: &str, cache: &Path) -> Connection {
+        connect_with(
+            uri,
+            ConnectOptions::new()
+                .with_cache_dir(cache.to_path_buf())
+                .with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect cached reader")
+    }
+
+    /// Dropping a table removes its local disk cache: the bytes belong to a
+    /// generation nothing will read again, and kept, they count against the
+    /// disk the cache shares with every other table.
+    #[test]
+    fn dropping_a_table_removes_its_disk_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        connect(&uri)
+            .expect("connect writer")
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let reader = cached_reader(&uri, cache.path());
+        reader.query_sql("SELECT title FROM docs").expect("scan");
+        let table_root = cache.path().join("docs");
+        assert!(
+            !table_cache_files(&table_root).is_empty(),
+            "the scan cached the superfile"
+        );
+
+        reader.drop_table("docs", true).expect("drop");
+        assert!(!table_root.exists(), "the dropped table's cache is gone");
+    }
+
+    /// A table dropped and re-created by another process keeps its name, and
+    /// so its cache directory here; opening the new generation clears the old
+    /// one's bytes rather than keep them beside its own until eviction.
+    #[test]
+    fn a_re_created_table_clears_the_dropped_generations_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        let writer = connect_with(
+            &uri,
+            ConnectOptions::new().with_read_consistency(Consistency::Strong),
+        )
+        .expect("connect writer");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let reader = cached_reader(&uri, cache.path());
+        reader.query_sql("SELECT title FROM docs").expect("scan");
+        let table_root = cache.path().join("docs");
+        let first = table_cache_files(&table_root);
+        assert!(!first.is_empty(), "the first generation is cached");
+
+        writer.drop_table("docs", true).expect("drop elsewhere");
+        writer
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("re-create")
+            .append(&build_title_batch(&["a slow green turtle"]))
+            .expect("append");
+        // Trip the reader's freshness probe, as a peer's drop is first seen
+        // (`storage_recreated_table_after_a_peer_drop_reads_the_new_generation`).
+        let _ = reader.query_sql("SELECT COUNT(*) FROM docs");
+        reader
+            .query_sql("SELECT title FROM docs")
+            .expect("scan again");
+
+        let second = table_cache_files(&table_root);
+        assert!(!second.is_empty(), "the new generation is cached");
+        assert!(
+            first.is_disjoint(&second),
+            "no file of the dropped generation is left: {first:?} {second:?}"
+        );
+    }
+
+    /// A cache directory with no location record - written before the record
+    /// existed - holds bytes of no known generation, and is emptied when the
+    /// table is opened.
+    #[test]
+    fn a_table_cache_of_no_recorded_generation_is_emptied_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = tempfile::tempdir().expect("cache dir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        connect(&uri)
+            .expect("connect writer")
+            .create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create_table")
+            .append(&build_title_batch(&["the quick brown fox"]))
+            .expect("append");
+        let table_root = cache.path().join("docs");
+        fs::create_dir_all(&table_root).expect("mkdir");
+        let leftover = table_root.join("seg-leftover.sf.parquet");
+        fs::write(&leftover, b"bytes of an unknown generation").expect("seed");
+
+        cached_reader(&uri, cache.path())
+            .open_table_handle("docs")
+            .expect("open");
+        assert!(!leftover.exists(), "the unrecorded bytes are gone");
+        assert!(
+            table_root.join(TABLE_CACHE_LOCATION_FILE).exists(),
+            "the directory now records its generation"
         );
     }
 
@@ -3482,6 +4051,201 @@ mod tests {
         assert_eq!(rows, 3, "2 from docs + 1 from more");
     }
 
+    /// A three-value `title` over two superfiles, so a grouped count merges two superfiles'
+    /// value counts.
+    fn create_cab_types(conn: &Connection, name: &str) {
+        let table = conn
+            .create_table(name, schema_id_title(), IndexSpec::new())
+            .expect("create");
+        table
+            .append(&build_title_batch(&["yellow", "green", "yellow"]))
+            .expect("append 1");
+        table
+            .append(&build_title_batch(&["fhv", "yellow"]))
+            .expect("append 2");
+    }
+
+    /// `(group, count)` rows of a grouped count, sorted by group.
+    fn grouped_counts(batches: &[RecordBatch]) -> Vec<(String, i64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 group");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count");
+            for i in 0..batch.num_rows() {
+                rows.push((groups.value(i).to_string(), counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Whether `EXPLAIN` output plans a scan of any table.
+    fn scans(explained: &[RecordBatch]) -> bool {
+        pretty_format_batches(explained)
+            .expect("format plan")
+            .to_string()
+            .contains("TableScan")
+    }
+
+    /// `GROUP BY col, COUNT(*)` and a single-column filtered `COUNT(*)` are answered from the
+    /// manifest's value counts through the public API, with no scan.
+    #[test]
+    fn query_sql_answers_covered_aggregates_from_manifest_stats() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(grouped).expect("grouped")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 3)
+            ]
+        );
+        let filtered = "SELECT count(*) FROM cabs WHERE title = 'yellow'";
+        let n = conn.query_sql(filtered).expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 3);
+
+        for sql in [grouped, filtered] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(
+                !scans(&plan),
+                "answered from manifest stats, no scan: {sql}"
+            );
+        }
+    }
+
+    /// The catalog and a table's reader plan the same aggregate the same way: same rows, and
+    /// neither scans. The two build their SQL context separately, and once drifted apart.
+    #[test]
+    fn query_sql_plans_aggregates_like_the_table_reader() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        let reader = conn
+            .open_table_handle("cabs")
+            .expect("handle")
+            .reader()
+            .expect("reader");
+
+        let sql = "SELECT title, count(*) FROM {} GROUP BY title";
+        let through_catalog = conn.query_sql(&sql.replace("{}", "cabs")).expect("catalog");
+        let through_reader = reader
+            .query_sql(&sql.replace("{}", TABLE_NAME))
+            .expect("reader");
+        assert_eq!(
+            grouped_counts(&through_catalog),
+            grouped_counts(&through_reader)
+        );
+
+        let catalog_plan = conn
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", "cabs")))
+            .expect("catalog explain");
+        let reader_plan = reader
+            .query_sql(&format!("EXPLAIN {}", sql.replace("{}", TABLE_NAME)))
+            .expect("reader explain");
+        assert!(!scans(&catalog_plan), "catalog plan scans");
+        assert!(!scans(&reader_plan), "reader plan scans");
+    }
+
+    /// Deleted rows never reach a covered aggregate: a superfile with tombstones is not clean, so
+    /// the rewrite scans it and the scan drops the deleted rows.
+    #[test]
+    fn query_sql_covered_aggregates_see_deletes() {
+        // Deletes need durable storage; `memory://` refuses them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = connect(dir.path().to_str().expect("utf8 path")).expect("connect");
+        create_cab_types(&conn, "cabs");
+        conn.open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+
+        assert_eq!(
+            grouped_counts(
+                &conn
+                    .query_sql("SELECT title, count(*) FROM cabs GROUP BY title")
+                    .expect("grouped")
+            ),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)],
+            "the deleted group is gone"
+        );
+        let n = conn
+            .query_sql("SELECT count(*) FROM cabs WHERE title = 'green'")
+            .expect("filtered")[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64 count")
+            .value(0);
+        assert_eq!(n, 0, "deleted rows are not counted");
+    }
+
+    /// A fresh connection to a durable table, as a cold worker opens it: a clean table is
+    /// answered from stats, and once rows are deleted the counts still leave them out.
+    #[test]
+    fn query_sql_covered_aggregates_after_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let uri = dir.path().to_str().expect("utf8 path").to_string();
+        create_cab_types(&connect(&uri).expect("connect"), "cabs");
+        let grouped = "SELECT title, count(*) FROM cabs GROUP BY title";
+
+        let reopened = connect(&uri).expect("reopen");
+        let plan = reopened
+            .query_sql(&format!("EXPLAIN {grouped}"))
+            .expect("explain");
+        assert!(
+            !scans(&plan),
+            "a clean reopened table is answered from stats"
+        );
+
+        reopened
+            .open_table("cabs")
+            .expect("open")
+            .delete(col("title").eq(lit("green")))
+            .expect("delete");
+        let after_delete = connect(&uri).expect("reopen after delete");
+        assert_eq!(
+            grouped_counts(&after_delete.query_sql(grouped).expect("grouped")),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)]
+        );
+    }
+
+    /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
+    /// two tables still scans both and counts the joined rows.
+    #[test]
+    fn query_sql_does_not_rewrite_an_aggregate_over_a_join() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        create_cab_types(&conn, "fares");
+
+        let sql = "SELECT a.title, count(*) FROM cabs a JOIN fares b ON a.title = b.title \
+                   GROUP BY a.title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(sql).expect("join")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 9)
+            ]
+        );
+        let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        assert!(scans(&plan), "a join is planned as scans");
+    }
+
     // Many distinct group keys force DataFusion's aggregate to build a real
     // hash table, so its memory pool (the connection budget) is exercised.
     fn many_distinct_titles() -> Vec<String> {
@@ -3558,6 +4322,21 @@ mod tests {
     }
 
     #[test]
+    fn query_sql_exact_ilike_over_a_tiny_budget_is_refused_as_over_budget() {
+        // `title` is `standard`-analyzed, so `%filler%` is answered from the
+        // dictionary, which charges what it holds to the connection budget
+        // while the plan is built. A 0-byte gate refuses it as OverBudget.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs WHERE title ILIKE '%filler%'")
+            .expect_err("a 0-byte gate refuses the exact path");
+        assert!(
+            matches!(&err, InfinoError::OverBudget(msg) if msg.contains("exact ILIKE")),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
     fn query_sql_streaming_scan_is_not_refused_under_a_tiny_budget() {
         // A projection streams (no buffering), so it reserves nothing and runs
         // even at a 0-byte gate: the budget bounds sort/aggregate/join, not scans.
@@ -3566,6 +4345,36 @@ mod tests {
             .query_sql("SELECT title FROM docs")
             .expect("a streaming scan is not gated");
         assert_eq!(n_rows(&out), n);
+    }
+
+    #[test]
+    fn query_sql_sort_over_a_tiny_budget_is_refused_as_over_budget() {
+        // The sort wraps the pool's refusal in context of its own ("Not enough
+        // memory to continue external sort"); the wrapped refusal is still a
+        // budget refusal, not a generic query error.
+        let (_dir, conn, _n) = tiny_budget_conn_after_ingest();
+        let err = conn
+            .query_sql("SELECT title FROM docs ORDER BY title")
+            .expect_err("a 0-byte gate refuses the sort");
+        assert!(
+            matches!(err, InfinoError::OverBudget(_)),
+            "expected OverBudget, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_refusal_is_classified_by_its_root() {
+        let wrapped = DataFusionError::ResourcesExhausted("over".into()).context("sorting");
+        assert!(matches!(
+            datafusion_error(&wrapped),
+            InfinoError::OverBudget(msg) if msg == "over"
+        ));
+        // DataFusion's own `Execution` counts as ours until shown otherwise:
+        // see `datafusion_error`.
+        assert!(matches!(
+            datafusion_error(&DataFusionError::Execution("boom".into())),
+            InfinoError::Backend(_)
+        ));
     }
 
     #[test]
@@ -3921,6 +4730,166 @@ mod tests {
         assert_eq!(rows, 1, "one doc equals the raw string exactly");
     }
 
+    /// Embedding dimension of the [`conn_with_vector_table`] fixture.
+    const VEC_DIM: usize = 16;
+    /// Titles of the [`conn_with_vector_table`] fixture, one row each.
+    const VEC_TITLES: [&str; 4] = ["rust async", "python data", "rust systems", "go rust"];
+
+    /// A `memory://` connection holding table `vecs`: one row per
+    /// [`VEC_TITLES`] entry, row `i` one-hot at dim `i` (so a one-hot query
+    /// at dim 0 is the exact nearest neighbour of row 0), with a full-text
+    /// index on `title` and an L2 vector index on `emb`.
+    fn conn_with_vector_table() -> Connection {
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(Arc::clone(&item), VEC_DIM as i32),
+                false,
+            ),
+        ]));
+        let mut flat = Vec::<f32>::with_capacity(VEC_TITLES.len() * VEC_DIM);
+        for i in 0..VEC_TITLES.len() {
+            for d in 0..VEC_DIM {
+                flat.push(if d == i { 1.0 } else { 0.0 });
+            }
+        }
+        let list = FixedSizeListArray::new(
+            item,
+            VEC_DIM as i32,
+            Arc::new(Float32Array::from(flat)),
+            None,
+        );
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(VEC_TITLES.to_vec())),
+                Arc::new(list),
+            ],
+        )
+        .expect("vector batch");
+
+        let conn = connect("memory://").expect("connect");
+        conn.create_table(
+            "vecs",
+            schema,
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", VEC_DIM, Metric::L2Sq),
+        )
+        .expect("create table")
+        .append(&batch)
+        .expect("append");
+        conn
+    }
+
+    /// The [`VEC_DIM`]-wide one-hot vector at `dim`, as the comma-separated
+    /// literal the vector TVFs take.
+    fn one_hot_csv(dim: usize) -> String {
+        (0..VEC_DIM)
+            .map(|d| if d == dim { "1" } else { "0" })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Two calls of one search table function in a statement are two
+    /// searches. DataFusion names every table-function scan after the
+    /// function alone and compares scans without their provider, where
+    /// the arguments live, so the optimizer used to merge calls that
+    /// differed only in arguments: each pair below answered the first
+    /// call's count in both columns — across tables as well as terms,
+    /// and for every search function.
+    #[test]
+    fn search_tvf_calls_differing_in_arguments_stay_distinct() {
+        let conn = conn_with_vector_table();
+        conn.create_table("docs", schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create docs")
+            .append(&build_title_batch(&["rust", "zig"]))
+            .expect("append");
+        let v = one_hot_csv(0);
+        // (what, first call, second call, first count, second count)
+        let cases: Vec<(&str, String, String, i64, i64)> = vec![
+            (
+                "token_match, different terms",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('vecs', 'title', 'python')".into(),
+                3,
+                1,
+            ),
+            (
+                "token_match, different tables",
+                "token_match('vecs', 'title', 'rust')".into(),
+                "token_match('docs', 'title', 'rust')".into(),
+                3,
+                1,
+            ),
+            (
+                "exact_match",
+                "exact_match('vecs', 'title', 'rust async')".into(),
+                "exact_match('vecs', 'title', 'no such title')".into(),
+                1,
+                0,
+            ),
+            (
+                "bm25_search, different terms",
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                "bm25_search('vecs', 'title', 'python', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "bm25_search, different k",
+                "bm25_search('vecs', 'title', 'rust', 1)".into(),
+                "bm25_search('vecs', 'title', 'rust', 10)".into(),
+                1,
+                3,
+            ),
+            (
+                "bm25_search_prefix",
+                "bm25_search_prefix('vecs', 'title', 'rus', 10)".into(),
+                "bm25_search_prefix('vecs', 'title', 'pyt', 10)".into(),
+                3,
+                1,
+            ),
+            (
+                "vector_search, different k",
+                format!("vector_search('vecs', 'emb', '{v}', 1)"),
+                format!("vector_search('vecs', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+            (
+                "hybrid_search, different k",
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 1)"),
+                format!("hybrid_search('vecs', 'title', 'rust', 'emb', '{v}', 3)"),
+                1,
+                3,
+            ),
+        ];
+        for (what, first, second, want_first, want_second) in cases {
+            let batches = conn
+                .query_sql(&format!(
+                    "SELECT (SELECT count(*) FROM {first}) AS a, \
+                            (SELECT count(*) FROM {second}) AS b"
+                ))
+                .unwrap_or_else(|e| panic!("{what}: {e}"));
+            let count = |i: usize| {
+                batches[0]
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count(*) is Int64")
+                    .value(0)
+            };
+            assert_eq!(
+                (count(0), count(1)),
+                (want_first, want_second),
+                "{what}: each call answers its own count"
+            );
+        }
+    }
+
     /// The remaining catalog-level search TVFs — `bm25_search_prefix`,
     /// `vector_search`, and `hybrid_search` — resolve their leading
     /// table-name argument and forward the rest to the table's search
@@ -3928,71 +4897,11 @@ mod tests {
     /// carries both an FTS index and a vector index.
     #[test]
     fn query_sql_prefix_vector_and_hybrid_tvfs_resolve_table() {
-        use crate::Metric;
-
-        /// Embedding dimension for the fixture's vector column.
-        const DIM: usize = 16;
-        /// Rows in the fixture (one-hot vectors at dims 0..ROWS).
-        const ROWS: usize = 4;
         /// Top-k requested by the vector / hybrid queries.
         const TOP_K: usize = 4;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("title", DataType::LargeUtf8, false),
-            Field::new(
-                "emb",
-                DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::Float32, true)),
-                    DIM as i32,
-                ),
-                false,
-            ),
-        ]));
-
-        // Four docs; doc `i` is one-hot at dim `i`, so a one-hot query
-        // at dim 0 is the exact nearest neighbour of doc 0.
-        let batch = {
-            use arrow_array::{FixedSizeListArray, Float32Array, LargeStringArray};
-            let titles = ["rust async", "python data", "rust systems", "go rust"];
-            let mut flat = Vec::<f32>::with_capacity(ROWS * DIM);
-            for i in 0..ROWS {
-                for d in 0..DIM {
-                    flat.push(if d == i { 1.0 } else { 0.0 });
-                }
-            }
-            let field = Arc::new(Field::new("item", DataType::Float32, true));
-            let list = FixedSizeListArray::new(
-                field,
-                DIM as i32,
-                Arc::new(Float32Array::from(flat)),
-                None,
-            );
-            RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(LargeStringArray::from(titles.to_vec())),
-                    Arc::new(list),
-                ],
-            )
-            .expect("vector batch")
-        };
-
-        let conn = connect("memory://").expect("connect");
-        let table = conn
-            .create_table(
-                "vecs",
-                schema,
-                IndexSpec::new()
-                    .fts("title")
-                    .vector("emb", DIM, Metric::L2Sq),
-            )
-            .expect("create table");
-        table.append(&batch).expect("append");
-
-        let one_hot_0 = (0..DIM)
-            .map(|d| if d == 0 { "1" } else { "0" })
-            .collect::<Vec<_>>()
-            .join(",");
+        let conn = conn_with_vector_table();
+        let one_hot_0 = one_hot_csv(0);
 
         // bm25_search_prefix: 'rus' expands to 'rust'.
         let prefix_rows: usize = conn
@@ -4246,7 +5155,8 @@ mod tests {
         //  - DDL, DML, COPY and session statements each plan to a side-effecting node.
         //  - `SELECT INTO` plans to CREATE TABLE; a comment or an EXPLAIN in front of an INSERT
         //    leaves the same DML node underneath.
-        //  - all are refused between planning and execution.
+        //  - all are refused before they run: by the statement check, or for `SELECT INTO`,
+        //    which reads like a query, by the plan check after planning.
         // Afterwards the catalog and the table are exactly as created.
         let conn = conn_with_docs();
         for sql in [
@@ -4281,26 +5191,89 @@ mod tests {
         );
     }
 
+    /// A filter that fails on the table's own values is the caller's mistake.
+    /// The filter runs in the `FilterExec` above the scan, so the failure is
+    /// Arrow's cast error itself; the message check pins that, so a DataFusion
+    /// upgrade that rewords it fails here instead of the error silently turning
+    /// into an engine fault.
     #[test]
-    fn query_sql_refuses_writes_the_planner_cannot_plan() {
-        // Writes the planner cannot plan today.
-        //  - they fail at planning, so they never execute either;
-        //  - the error is the planner's, not the read-only message.
-        // If a DataFusion upgrade learns to plan one, it becomes a DML or DDL node and the gate refuses it.
+    fn query_sql_reports_a_filter_that_fails_on_the_data_as_the_callers() {
+        let conn = conn_with_docs();
+        let err = conn.query_sql("SELECT title FROM docs WHERE CAST(title AS BIGINT) = 1");
+        assert!(
+            matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("Cannot cast string")),
+            "got {err:?}"
+        );
+        // A regex the caller wrote that does not parse: DataFusion returns the
+        // regex crate's error, and it is still the caller's.
+        let err = conn.query_sql("SELECT title FROM docs WHERE title ~ '('");
+        assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    /// A valid read the engine does not implement is neither the caller's
+    /// mistake nor an engine fault: `Unsupported`, so a client can tell "rewrite
+    /// this" from "this query is wrong". A write is never this: it is refused as
+    /// one before planning, whether or not DataFusion could plan it.
+    #[test]
+    fn query_sql_reports_an_unimplemented_read_as_unsupported() {
+        let conn = conn_with_docs();
+        for sql in [
+            "SELECT title FROM docs ORDER BY title FETCH FIRST 1 ROWS WITH TIES",
+            // `SHOW` forms DataFusion does not plan: reads, so unsupported, not refused.
+            "SHOW SCHEMAS",
+            "SHOW DATABASES",
+            "SHOW VIEWS",
+        ] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(&err, Err(InfinoError::Unsupported(msg)) if msg.contains("not implemented")),
+                "{sql:?}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_sql_reports_a_function_argument_rejected_at_planning_as_the_callers() {
+        // DataFusion rejects a bad function argument with an `Execution` error
+        // while it plans, before anything is read: the caller's mistake.
+        let conn = conn_with_docs();
+        let err = conn.query_sql("SELECT arrow_cast(title, 'NotAType') FROM docs");
+        assert!(matches!(err, Err(InfinoError::Query(_))), "got {err:?}");
+    }
+
+    #[test]
+    fn query_sql_refuses_a_write_from_its_statement_before_planning() {
+        // Writes DataFusion cannot plan, or plans only to refuse: the statement
+        // check refuses each before planning, with the same answer as a
+        // plannable write, so none reads as SQL a later version might run.
         let conn = conn_with_docs();
         for sql in [
             "ALTER TABLE docs ADD COLUMN y int",
             "TRUNCATE TABLE docs",
             "WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
             "(INSERT INTO docs VALUES (1, 'x'))",
-            "SELECT 1; DROP TABLE docs",
+            "WITH t AS (INSERT INTO docs VALUES (1, 'x') RETURNING title) SELECT * FROM t",
+            "EXPLAIN WITH t AS (SELECT 'x' AS title) INSERT INTO docs (title) SELECT title FROM t",
         ] {
+            assert_refused_as_write(&conn, sql);
+        }
+        assert_docs_intact(&conn);
+    }
+
+    #[test]
+    fn query_sql_runs_exactly_one_statement() {
+        // A second statement, or none, is the caller's mistake, however
+        // harmless each one is; a trailing semicolon is still one statement.
+        let conn = conn_with_docs();
+        for sql in ["SELECT 1; DROP TABLE docs", "SELECT 1; SELECT 2", ""] {
             let err = conn.query_sql(sql);
             assert!(
-                matches!(err, Err(InfinoError::Query(_))),
+                matches!(&err, Err(InfinoError::Query(msg)) if msg.contains("exactly one SQL statement")),
                 "{sql:?}: got {err:?}"
             );
         }
+        conn.query_sql("SELECT 1;")
+            .expect("one statement with a trailing semicolon");
         assert_docs_intact(&conn);
     }
 
@@ -4324,9 +5297,102 @@ mod tests {
             "EXPLAIN SELECT title FROM docs",
             "WITH ranked AS (SELECT title, ROW_NUMBER() OVER (ORDER BY title) AS rn, COUNT(*) OVER () AS total FROM docs), top AS (SELECT title, rn FROM ranked WHERE rn <= 10 OR total < 100) SELECT title FROM top WHERE rn > 0 AND title <> '' ORDER BY rn",
             "SELECT title, SUM(CHAR_LENGTH(title)) OVER (ORDER BY title ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS w FROM docs ORDER BY title LIMIT 5",
+            "DESCRIBE docs",
+            // Parsed as sqlparser's own `EXPLAIN`, not DataFusion's.
+            "DESCRIBE SELECT title FROM docs",
+            "EXPLAIN ANALYZE SELECT title FROM docs",
         ] {
             conn.query_sql(sql)
                 .unwrap_or_else(|e| panic!("{sql:?} should be allowed: {e}"));
+        }
+        // `SHOW` reads too. `query_sql` does not enable `information_schema`,
+        // so these fail, but as reads: never refused as a write.
+        for sql in [
+            "SHOW TABLES",
+            "SHOW COLUMNS FROM docs",
+            "SHOW CREATE TABLE docs",
+            "SHOW FUNCTIONS",
+            "SHOW datafusion.execution.batch_size",
+        ] {
+            let err = conn.query_sql(sql);
+            assert!(
+                matches!(&err, Err(InfinoError::Query(msg)) if !msg.contains("read-only")),
+                "{sql:?}: got {err:?}"
+            );
+        }
+    }
+
+    /// Rows in the first append of the ordering test: under one default
+    /// DataFusion batch (8192), so the superfile is smaller than the next.
+    const ORDER_FIRST_APPEND_ROWS: usize = 3_000;
+    /// Rows in the second append: past one batch, so the two superfiles
+    /// together carry enough rows that the planner repartitions above the sort.
+    const ORDER_SECOND_APPEND_ROWS: usize = 9_000;
+    /// Times the ordered query runs: the bad order depends on which output
+    /// partition finishes first, so one run can come back sorted by chance.
+    const ORDER_QUERY_RUNS: usize = 8;
+
+    /// Every `_id` in `batches`' single string column, parsed back to its number.
+    fn ids_from_strings(batches: &[RecordBatch]) -> Vec<u128> {
+        let mut ids = Vec::new();
+        for batch in batches {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("SQL strings come back as LargeUtf8");
+            for i in 0..col.len() {
+                ids.push(col.value(i).parse().expect("_id renders as an integer"));
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn query_sql_order_by_holds_across_superfiles() {
+        // Two appends, two superfiles; the second holds the larger ids. The final
+        // cast to `LargeUtf8` makes the planner split the sorted stream across
+        // partitions above the sort, and collecting those partitions must not
+        // undo the order. Every run must return all ids ascending.
+        let conn = connect("memory://").expect("connect");
+        let t = conn
+            .create_table("t", schema_id_title(), IndexSpec::new())
+            .expect("create t");
+        for rows in [ORDER_FIRST_APPEND_ROWS, ORDER_SECOND_APPEND_ROWS] {
+            let titles: Vec<String> = (0..rows).map(|i| format!("row {i}")).collect();
+            let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+            t.append(&build_title_batch(&refs)).expect("append");
+        }
+        let sql = "SELECT CAST(_id AS VARCHAR) AS v FROM t ORDER BY _id";
+
+        // The plan shape, which does not depend on timing: no repartition may
+        // sit between the root and the merge that produces the sorted stream.
+        let explain = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+        let text = pretty_format_batches(&explain)
+            .expect("format explain")
+            .to_string();
+        let physical = &text[text.find("physical_plan").expect("physical plan row")..];
+        let merge_at = physical
+            .find("SortPreservingMergeExec")
+            .expect("the sorted result comes from a merge");
+        assert!(
+            !physical[..merge_at].contains("RepartitionExec"),
+            "a repartition splits the sorted result:\n{text}"
+        );
+
+        let total = ORDER_FIRST_APPEND_ROWS + ORDER_SECOND_APPEND_ROWS;
+        for run in 0..ORDER_QUERY_RUNS {
+            let batches = conn.query_sql(sql).expect("ordered select");
+            let ids = ids_from_strings(&batches);
+            assert_eq!(ids.len(), total, "run {run}: row count");
+            if let Some(at) = ids.windows(2).position(|w| w[0] >= w[1]) {
+                panic!(
+                    "run {run}: ids not ascending at row {}: {} then {}",
+                    at + 1,
+                    ids[at],
+                    ids[at + 1]
+                );
+            }
         }
     }
 
@@ -4437,6 +5503,34 @@ mod tests {
         let sql = format!("SELECT title FROM docs WHERE title = '{literal}'");
         conn.query_sql(&sql)
             .expect("literal ORs are not connectives");
+    }
+
+    #[test]
+    fn query_sql_compares_a_full_width_id_literal_exactly() {
+        // A row's `_id` is wider than 64 bits, so DataFusion would read it unquoted as a float and
+        // fail the comparison on a Decimal128 overflow. Equality and IN both find the row.
+        let conn = conn_with_docs();
+        let ids = conn.query_sql("SELECT _id FROM docs").expect("read _id");
+        let id = ids[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128")
+            .value(0)
+            .to_string();
+        assert!(
+            id.parse::<u64>().is_err(),
+            "_id {id} must be past u64 to exercise the fix"
+        );
+        for sql in [
+            format!("SELECT title FROM docs WHERE _id = {id}"),
+            format!("SELECT title FROM docs WHERE _id IN ({id}, 1)"),
+        ] {
+            let rows = conn
+                .query_sql(&sql)
+                .unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert_eq!(n_rows(&rows), 1, "{sql}");
+        }
     }
 
     #[test]

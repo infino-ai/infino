@@ -168,9 +168,6 @@ pub enum MutationError {
 
     /// `update()` only: `new_rows`'s schema doesn't match the
     /// supertable's user-facing schema.
-    #[error("new_rows schema does not match the supertable's user schema: {0}")]
-    SchemaMismatch(String),
-
     /// `update()` only: `new_rows` carries a vector column the index can't
     /// take — a null vector, or a width disagreeing with the declared dim.
     /// The same check `append` runs, applied before anything is buffered.

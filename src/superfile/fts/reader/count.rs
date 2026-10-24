@@ -6,22 +6,54 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
+use std::str::from_utf8;
+
+#[cfg(any(test, feature = "test-helpers"))]
+use super::cursor::{TermCursor, TermMeta};
 use super::{
     core::*,
+    cursor::CursorUse,
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
+    search::FetchedTermMemo,
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
+#[cfg(any(test, feature = "test-helpers"))]
+use crate::superfile::fts::posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED};
 use crate::{
     runtime_metrics::op_stats::timed_section,
     superfile::{
         ReadError,
         error::FtsError,
         format::fts::U32_BYTES,
-        fts::{builder::TERM_META_SIZE, dict::make_key, fst_value::FstValue, tokenize::Phrase},
+        fts::{bm25, builder::TERM_META_SIZE, short::short_df, tokenize::Phrase},
+        id_space::{FtsDocId, RowId},
     },
+    utils::terms::{DictEntry, make_key},
 };
+
+/// Planned dictionary reads for a cursor build over `tokens`: none when a
+/// memo already resolves every token, one otherwise.
+fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> u64 {
+    match prefetched.is_some_and(|m| m.covers(tokens)) {
+        true => 0,
+        false => 1,
+    }
+}
+
+/// One term's entry in a table-level term index, as read from one
+/// superfile: see [`FtsReader::term_index_facts_with`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TermIndexFact {
+    /// Documents in this superfile containing the term.
+    pub(crate) df: u64,
+    /// Upper bound on the term's BM25 score here, at this superfile's own
+    /// statistics.
+    pub(crate) bound: f32,
+    /// The term's dictionary entry: where its postings sit.
+    pub(crate) entry: DictEntry,
+}
 
 impl FtsReader {
     /// Unranked doc-at-a-time walk over heterogeneous atoms, calling
@@ -127,11 +159,19 @@ impl FtsReader {
         terms: &[&str],
         phrases: &[Phrase<String>],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(
+                column_id,
+                terms,
+                phrases,
+                QueryIdf::ThisFile,
+                None,
+                CursorUse::Match,
+            )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -144,11 +184,11 @@ impl FtsReader {
         }
         let (walk, walk_ns) = timed_section(|| {
             let mut out = Vec::new();
-            self.walk_atoms_match(atoms, mode, None, |d| out.push(d))
+            self.walk_atoms_match(atoms, mode, None, |d| out.push(FtsDocId::new(d)))
                 .map(|()| out)
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((walk?, work))
+        Ok((self.ids_to_rows(walk?), work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -163,9 +203,17 @@ impl FtsReader {
         neg_phrases: &[Phrase<String>],
     ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        // Unranked: idf is irrelevant to the match set, so build local.
+        // Unranked: built to match, so no global idf and no norms; the
+        // column's length array is never read.
         let (built, dict_ranges) = self
-            .build_atom_cursors(column_id, terms, phrases, None, None)
+            .build_atom_cursors(
+                column_id,
+                terms,
+                phrases,
+                QueryIdf::ThisFile,
+                None,
+                CursorUse::Match,
+            )
             .await?;
         let missing_and_atom = mode == BoolMode::And && built.iter().any(Option::is_none);
         let atoms: Vec<AnyCursor> = built.into_iter().flatten().collect();
@@ -182,7 +230,14 @@ impl FtsReader {
         let mut filter = None;
         if !neg_terms.is_empty() || !neg_phrases.is_empty() {
             let (neg_built, neg_dict_ranges) = self
-                .build_atom_cursors(column_id, neg_terms, neg_phrases, None, None)
+                .build_atom_cursors(
+                    column_id,
+                    neg_terms,
+                    neg_phrases,
+                    QueryIdf::ThisFile,
+                    None,
+                    CursorUse::Match,
+                )
                 .await?;
             let neg_atoms: Vec<AnyCursor> = neg_built.into_iter().flatten().collect();
             // Count the negated clause's posting work the same way the
@@ -233,19 +288,42 @@ impl FtsReader {
         column: &str,
         tokens: &[&str],
         mode: BoolMode,
-    ) -> Result<(Vec<u32>, MatchWork), FtsError> {
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        self.token_match_prefetched(column, tokens, mode, None)
+            .await
+    }
+
+    /// [`Self::token_match`] with the terms a caller has already resolved
+    /// — from a table-level term index that knows where each term's
+    /// postings sit — served from `prefetched`. When the memo covers every
+    /// token the dictionary is never opened; a token it lacks resolves
+    /// through the dictionary as usual.
+    pub(crate) async fn token_match_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, None)
+            .build_term_cursors(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                prefetched,
+            )
             .await?;
         // Tallied before the mode branch: the cursors that DID build cost
         // their bytes even when a missing AND token empties the result.
-        // +1: the build's dictionary fetch.
+        // +1 for the dictionary fetch, when the build had to make one.
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += 1;
+        work.planned_ranges += dictionary_fetches(tokens, prefetched);
         let (docs, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 // AND needs every token present; a missing token ⇒ empty
@@ -254,18 +332,21 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return Vec::new();
                 }
-                self.collect_and_intersect(column_id, cursors)
+                self.collect_and_intersect(cursors)
             }
-            BoolMode::Or => or_merge_unranked(cursors),
+            BoolMode::Or => or_merge_unranked(cursors)
+                .into_iter()
+                .map(FtsDocId::new)
+                .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((docs, work))
+        Ok((self.ids_to_rows(docs), work))
     }
 
     /// Unranked token-match **count** — the cardinality
     /// [`token_match`](Self::token_match) would return, without
-    /// materializing the doc-id `Vec`. The AND path tallies through a
-    /// [`CountSink`], the OR path counts the union walk; both skip the
+    /// materializing the doc-id `Vec`. The AND path counts its
+    /// intersection, the OR path its union walk; both skip the
     /// `Vec<u32>` so a high-cardinality count doesn't allocate one id
     /// per match.
     pub async fn token_match_count(
@@ -274,21 +355,41 @@ impl FtsReader {
         tokens: &[&str],
         mode: BoolMode,
     ) -> Result<(u64, MatchWork), FtsError> {
+        self.token_match_count_prefetched(column, tokens, mode, None)
+            .await
+    }
+
+    /// [`Self::token_match_count`] served from `prefetched`, as
+    /// [`Self::token_match_prefetched`] is.
+    pub(crate) async fn token_match_count_prefetched(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        mode: BoolMode,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(u64, MatchWork), FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((0, MatchWork::default()));
         }
         let cursors = self
-            .build_term_cursors(column_id, tokens, None, true, None, None)
+            .build_term_cursors(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                prefetched,
+            )
             .await?;
         let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += 1;
+        work.planned_ranges += dictionary_fetches(tokens, prefetched);
         let (n, walk_ns) = timed_section(|| match mode {
             BoolMode::And => {
                 if cursors.len() != tokens.len() {
                     return 0;
                 }
-                self.count_and_intersect(column_id, cursors)
+                self.count_and_intersect(cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
         });
@@ -296,51 +397,223 @@ impl FtsReader {
         Ok((n, work))
     }
 
+    /// What a table-level term index records about each of `tokens` in
+    /// `column`, in input order — `None` for an absent token: its `df`, the
+    /// upper bound on the BM25 score it can reach in this superfile, and
+    /// its dictionary entry. One dictionary resolution and one cursor build
+    /// serve all three: a built cursor already carries the term's `df` and
+    /// its maximum block score, so nothing is read twice.
+    ///
+    /// The bound is scored at this superfile's own idf and declared
+    /// parameters, exactly as its stored block maxima are: for a long term
+    /// the maximum over its skip entries, for a short or inline term the
+    /// maximum over its postings. A query rescales it for a global idf the
+    /// same way the in-superfile bounds are.
+    #[cfg(test)]
+    pub(crate) async fn term_index_facts(
+        &self,
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
+        self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dict_bytes = self.dict_bytes_async().await?;
+        self.term_index_facts_with(&dict_bytes, column, tokens)
+            .await
+    }
+
+    /// [`Self::term_index_facts`] over `dict_bytes`, this reader's dictionary
+    /// already fetched by the caller.
+    pub(crate) async fn term_index_facts_with(
+        &self,
+        dict_bytes: &[u8],
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
+        self.debug_assert_own_dict(dict_bytes);
+        let column_id = self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dict = Self::open_dict(dict_bytes)?;
+        let col_meta = &self.columns[column_id as usize];
+        let entries: Vec<Option<DictEntry>> = tokens
+            .iter()
+            .map(|token| dict.lookup(&make_key(&col_meta.name, token)))
+            .collect();
+        let cursors = self
+            .build_term_cursors_opt(
+                column_id,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Score,
+                None,
+                None,
+                Some(dict_bytes),
+            )
+            .await?;
+        Ok(entries
+            .into_iter()
+            .zip(cursors)
+            .map(|(entry, cursor)| {
+                let cursor = cursor?;
+                Some(TermIndexFact {
+                    df: cursor.df,
+                    bound: cursor.term_max_bm25,
+                    entry: entry?,
+                })
+            })
+            .collect())
+    }
+
+    /// Up to `limit` of `column`'s terms after `after` (from the first when
+    /// `None`), in term order, each with what [`Self::term_index_facts_with`]
+    /// records for it. Walks the dictionary with its values, avoiding a
+    /// separate term lookup for each entry.A df=1 inline term gets its fact
+    /// straight from its entry: its one posting's score is its bound, so no
+    /// cursor is built. `dict_bytes` is this reader's dictionary, fetched
+    /// once by the caller.
+    pub(crate) async fn term_index_facts_after(
+        &self,
+        dict_bytes: &[u8],
+        column: &str,
+        after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, Option<TermIndexFact>)>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        // The walk starts at `after` itself, which the caller already has.
+        let mut entries =
+            self.column_terms_from(dict_bytes, column_id, after.unwrap_or(b""), limit + 1)?;
+        if let Some(after) = after
+            && entries
+                .first()
+                .is_some_and(|(term, _)| term.as_slice() == after)
+        {
+            entries.remove(0);
+        }
+        entries.truncate(limit);
+        self.ensure_norms(column_id).await?;
+        let col_meta = &self.columns[column_id as usize];
+        // What a cursor built for an inline term would score it at: this
+        // superfile's own idf for df = 1, unweighted.
+        //
+        // A column no row in this superfile filled has no scored documents
+        // and so no inline term to score — `df = 1` against `n_docs = 0` is
+        // not a ratio, so it is not computed. Reachable on a table where one
+        // indexed column is sparse enough to miss a whole superfile.
+        let inline_idf = match col_meta.scored_doc_count() {
+            0 => 0.0,
+            scored => bm25::idf(scored, 1),
+        };
+
+        let mut out = Vec::with_capacity(entries.len());
+        let mut with_postings: Vec<usize> = Vec::new();
+        for (term, entry) in entries {
+            let fact = match entry {
+                DictEntry::Inline { doc_id, tf } => Some(TermIndexFact {
+                    df: 1,
+                    bound: bm25::score_with_dl_norm_k1(
+                        inline_idf,
+                        col_meta.inline_tf(tf),
+                        col_meta.dl_norm_k1().get(doc_id),
+                    ),
+                    entry,
+                }),
+                DictEntry::Pfor { .. } => {
+                    with_postings.push(out.len());
+                    None
+                }
+            };
+            out.push((term, fact));
+        }
+        // The rest need their postings read: the lookup path serves them.
+        let facts = {
+            let terms = with_postings
+                .iter()
+                .map(|&i| from_utf8(&out[i].0))
+                .collect::<Result<Vec<&str>, _>>()
+                .map_err(|_| FtsError::Read(ReadError::Malformed("non-utf8 term".into())))?;
+            self.term_index_facts_with(dict_bytes, column, &terms)
+                .await?
+        };
+        for (i, fact) in with_postings.into_iter().zip(facts) {
+            out[i].1 = fact;
+        }
+        Ok(out)
+    }
+
     /// Document frequency for each of `tokens` in `column` — the number
     /// of docs containing each — in input order, read cheaply from the
     /// index **without** decoding posting lists.
     ///
-    /// The whole set resolves against **one** FST parse and **one**
-    /// coalesced header fetch, rather than one parse + one fetch per
-    /// token: the dictionary is opened once, every token is classified
-    /// by an in-memory FST lookup (absent → `0`; inline df=1 term → `1`;
-    /// PFOR term → its `df`, the first 4 bytes of its 20-byte metadata
-    /// header), and all the PFOR headers are pulled in a single batched
-    /// [`Self::fetch_term_postings`] call (which coalesces adjacent
-    /// ranges into a minimal set of parallel GETs). This matters on the
-    /// global-statistics path, where a superfile is probed for every
-    /// scored term of a query at once.
+    /// The whole set resolves against **one** dictionary parse and **one**
+    /// coalesced header fetch, rather than one parse + one fetch per token: the
+    /// dictionary is opened once, every token is classified by an in-memory
+    /// dictionary lookup (absent → `0`; inline df=1 term → `1`; PFOR term → its
+    /// `df`, the first 4 bytes of its 20-byte metadata header), and all the
+    /// PFOR headers are pulled in a single batched
+    /// [`Self::fetch_term_postings`] call (which coalesces adjacent ranges into
+    /// a minimal set of parallel GETs). This matters on the global-statistics
+    /// path, where a superfile is probed for every scored term of a query at
+    /// once.
     pub async fn term_dfs(
         &self,
         column: &str,
         tokens: &[&str],
     ) -> Result<(Vec<u64>, MatchWork), FtsError> {
+        self.resolve_column_id(column)?;
+        if tokens.is_empty() {
+            return Ok((Vec::new(), MatchWork::default()));
+        }
+        let dict_bytes = self.dict_bytes_async().await?;
+        self.term_dfs_with(&dict_bytes, column, tokens).await
+    }
+
+    /// [`Self::term_dfs`] over `dict_bytes`, this reader's dictionary already
+    /// fetched by the caller.
+    pub(crate) async fn term_dfs_with(
+        &self,
+        dict_bytes: &[u8],
+        column: &str,
+        tokens: &[&str],
+    ) -> Result<(Vec<u64>, MatchWork), FtsError> {
+        self.debug_assert_own_dict(dict_bytes);
         let column_id = self.resolve_column_id(column)?;
         if tokens.is_empty() {
             return Ok((Vec::new(), MatchWork::default()));
         }
-        let fst_bytes = self.dict_bytes_async().await?;
-        let dict = Self::open_dict(&fst_bytes)?;
+        let dict = Self::open_dict(dict_bytes)?;
         let col_meta = &self.columns[column_id as usize];
 
-        // First pass — pure in-memory FST lookups. Absent and inline
+        // First pass — pure in-memory dictionary lookups. Absent and inline
         // tokens get their df here; each PFOR token's header range is
         // collected for the single batched fetch below, remembering
         // which token slot it fills so results scatter back in order.
         let mut dfs = vec![0u64; tokens.len()];
-        let mut header_ranges: Vec<(usize, Option<usize>)> = Vec::new();
-        let mut pfor_slots: Vec<usize> = Vec::new();
+        let mut header_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut pfor_slots: Vec<(usize, bool)> = Vec::new();
         for (i, token) in tokens.iter().enumerate() {
             let key = make_key(&col_meta.name, token);
             match dict.lookup(&key) {
                 None => {}
-                Some(packed) => match FstValue::unpack(packed) {
-                    FstValue::Inline { .. } => dfs[i] = 1,
-                    FstValue::Pfor {
-                        metadata_offset, ..
+                Some(packed) => match packed {
+                    DictEntry::Inline { .. } => dfs[i] = 1,
+                    DictEntry::Pfor {
+                        metadata_offset,
+                        postings_length,
+                        short,
                     } => {
-                        header_ranges.push((metadata_offset as usize, Some(TERM_META_SIZE)));
-                        pfor_slots.push(i);
+                        // A long term's df heads its 20-byte header; a
+                        // short body is at most a few hundred bytes and
+                        // leads with its df, so fetch it whole.
+                        let len = match short {
+                            true => postings_length as usize,
+                            false => TERM_META_SIZE,
+                        };
+                        header_ranges.push((metadata_offset as usize, len));
+                        pfor_slots.push((i, short));
                     }
                 },
             }
@@ -359,16 +632,24 @@ impl FtsReader {
             let fetched = self.fetch_term_postings(&header_ranges).await?;
             work.planned_ranges += header_ranges.len() as u64;
             let (decoded, decode_ns) = timed_section(|| {
-                for (fetched_idx, &slot) in pfor_slots.iter().enumerate() {
+                for (fetched_idx, &(slot, short)) in pfor_slots.iter().enumerate() {
                     let header = fetched.get(fetched_idx).ok_or_else(|| {
-                        FtsError::Read(ReadError::MalformedVersion(
+                        FtsError::Read(ReadError::Malformed(
                             "term_dfs: fetched fewer headers than requested".into(),
                         ))
                     })?;
                     work.postings_bytes += header.len() as u64;
                     let header_bytes = header.as_ref();
+                    if short {
+                        dfs[slot] = u64::from(short_df(header_bytes).ok_or_else(|| {
+                            FtsError::Read(ReadError::Malformed(
+                                "term_dfs: short-form term body does not decode".into(),
+                            ))
+                        })?);
+                        continue;
+                    }
                     if header_bytes.len() < U32_BYTES {
-                        return Err(FtsError::Read(ReadError::MalformedVersion(
+                        return Err(FtsError::Read(ReadError::Malformed(
                             "term_dfs: short postings header".into(),
                         )));
                     }
@@ -393,19 +674,112 @@ impl FtsReader {
         let (mut dfs, work) = self.term_dfs(column, &[token]).await?;
         Ok((dfs.pop().unwrap_or(0), work))
     }
+
+    /// How `term`'s postings are laid out in `column` of this file, or
+    /// `None` if the term is absent. Benchmarks report this for every term
+    /// their quality battery names, so the battery is known to reach every
+    /// posting form (inline, short, packed, patched, bitset) rather than
+    /// assumed to from the term's rank. Reads the term's postings once, the
+    /// way a search would, and parses only the block headers.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub async fn term_layout(
+        &self,
+        column: &str,
+        term: &str,
+    ) -> Result<Option<TermLayout>, FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let col_meta = &self.columns[column_id as usize];
+        let dict_bytes = self.dict_bytes_async().await?;
+        let dict = Self::open_dict(&dict_bytes)?;
+        let key = make_key(&col_meta.name, term);
+        let Some(packed) = dict.lookup(&key) else {
+            return Ok(None);
+        };
+        let (metadata_offset, postings_length, short) = match packed {
+            DictEntry::Inline { .. } => {
+                return Ok(Some(TermLayout {
+                    df: 1,
+                    inline: true,
+                    ..TermLayout::default()
+                }));
+            }
+            DictEntry::Pfor {
+                metadata_offset,
+                postings_length,
+                short,
+            } => (metadata_offset, postings_length, short),
+        };
+        let mut fetched = self
+            .fetch_term_postings(&[(metadata_offset as usize, postings_length as usize)])
+            .await?;
+        let bytes = fetched.pop().expect("one fetched range for one PFOR term");
+        if short {
+            let df = short_df(bytes.as_ref()).ok_or_else(|| {
+                FtsError::Read(ReadError::Malformed(
+                    "term_layout: short-form term body does not decode".into(),
+                ))
+            })?;
+            return Ok(Some(TermLayout {
+                df: u64::from(df),
+                short: true,
+                num_blocks: 1,
+                ..TermLayout::default()
+            }));
+        }
+        let meta = TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?;
+        let cursor = TermCursor::new(bytes, col_meta, TermIdf::Absent, 1, CursorUse::Count)?;
+        let mut layout = TermLayout {
+            df: meta.df,
+            num_blocks: meta.num_blocks,
+            has_coarse: meta.has_coarse,
+            ..TermLayout::default()
+        };
+        for b in 0..cursor.block_count() {
+            match cursor.block_header(b).encoding {
+                ENCODING_PACKED => layout.packed_blocks += 1,
+                ENCODING_PATCHED => layout.patched_blocks += 1,
+                ENCODING_BITSET => layout.bitset_blocks += 1,
+                other => {
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
+                        "term_layout: block {b} carries unknown encoding {other}"
+                    ))));
+                }
+            }
+        }
+        Ok(Some(layout))
+    }
+}
+
+/// The posting form one term takes in one file — see
+/// [`FtsReader::term_layout`].
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TermLayout {
+    /// Documents carrying the term in this file.
+    pub df: u64,
+    /// A df=1 term stored inline in the dictionary: no posting bytes.
+    pub inline: bool,
+    /// A short-form term (`df <= BLOCK_LEN`): one bodiless block.
+    pub short: bool,
+    /// Posting blocks (one for a short term, zero for an inline one).
+    pub num_blocks: usize,
+    /// Whether the term carries a coarse block-max table.
+    pub has_coarse: bool,
+    /// Long-form blocks by encoding.
+    pub packed_blocks: usize,
+    pub patched_blocks: usize,
+    pub bitset_blocks: usize,
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use bytes::Bytes;
 
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{self, ENCODING_BITSET, ENCODING_PACKED},
-        tokenize::AsciiLowerTokenizer,
+        posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
     };
 
     #[tokio::test]
@@ -467,7 +841,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_match_count_matches_token_match_len() {
-        // The counting path (CountSink for AND, or_count_unranked for OR)
+        // The counting path (count_and_intersect for AND, or_count_unranked for OR)
         // must agree with token_match's materialized length on every
         // shape — single token, OR union, AND intersection, absent
         // tokens, and the empty list.
@@ -507,8 +881,7 @@ mod tests {
         // length) is the reference. Tied to OR_WINDOW so it keeps crossing
         // the boundary if the window size changes.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc
@@ -524,7 +897,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let shapes: &[&[&str]] = &[
@@ -564,9 +937,9 @@ mod tests {
 
     #[tokio::test]
     async fn and_count_matches_merge_on_dense_bitset_corpus() {
-        // A dense corpus stores common terms as bitset blocks (v4). The
+        // A dense corpus stores common terms as bitset blocks. The
         // intersection count must agree with `token_match`'s flat-merge AND
-        // length across both v4 intersection kernels: the bitset-AND
+        // length across both count intersection kernels: the bitset-AND
         // (word-parallel presence AND, when every term is dense enough to
         // trip the density gate) and the rarest-driven membership walk (when
         // a sparse term keeps the intersection below the gate). `token_match`
@@ -574,8 +947,7 @@ mod tests {
         // reference from either count kernel.
         const N_DOCS: u32 = OR_WINDOW * 2 + 500;
         const RARE_STRIDE: u32 = 371; // sparse ⇒ below the density gate
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("alpha "); // every doc → dense
@@ -594,7 +966,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         let shapes: &[&[&str]] = &[
@@ -643,8 +1015,7 @@ mod tests {
         const DENSE_END: u32 = 256; // docs 0..256 hold `mix` every doc → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common "); // every doc → dense partner
@@ -662,21 +1033,30 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Prove `mix` really has both encodings — else the test silently checks
         // nothing about the transition.
         let cursors = r
-            .build_term_cursors(0, &["mix"], None, true, None, None)
+            .build_term_cursors(
+                0,
+                &["mix"],
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                None,
+                None,
+            )
             .await
             .expect("build cursors");
         let mix = &cursors[0];
         let (mut saw_bitset, mut saw_packed) = (false, false);
         for blk in mix.blocks.iter() {
-            match mix.bytes.as_ref()[blk.block_byte_offset + posting::ENCODING_OFF] {
+            match posting::block_encoding(
+                &mix.bytes.as_ref()[blk.block_byte_offset..blk.block_byte_end],
+            ) {
                 ENCODING_BITSET => saw_bitset = true,
-                ENCODING_PACKED => saw_packed = true,
+                ENCODING_PACKED | ENCODING_PATCHED => saw_packed = true,
                 other => panic!("unexpected encoding byte {other}"),
             }
         }
@@ -728,8 +1108,7 @@ mod tests {
         // union (`or_cursor_into_bitset` inline branch). All cross-checked
         // against `token_match`'s independent flat-merge length.
         const N_DOCS: u32 = 4096; // max doc id 4095
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::from("common"); // every doc
@@ -751,7 +1130,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // Pin the gate arithmetic: `gatehi` lands on/above the switch, `gatelo`
@@ -845,8 +1224,7 @@ mod tests {
         const RARE_STRIDE: u32 = 250; // rare term hits ~1/250 docs
         const RAREB_STRIDE: u32 = 400;
         const HOLE_STRIDE: u32 = 300; // docs missing the dominant term
-        let tok = Arc::new(AsciiLowerTokenizer);
-        let mut b = FtsBuilder::new(tok);
+        let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
         for i in 0..N_DOCS {
             let mut text = String::new();
@@ -869,7 +1247,7 @@ mod tests {
             b.add_doc(0, i, text.trim()).expect("add doc");
         }
         let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let r = FtsReader::open(blob, json).expect("open");
 
         // `common` alone is far more than 4× `rare` + `rareb` combined, so
@@ -904,7 +1282,7 @@ mod tests {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open");
         // common → df 3 (PFOR header read), rust → df 2 (PFOR),
-        // uniqzero → df 1 (inline FST value), absent → 0.
+        // uniqzero → df 1 (inline dictionary entry), absent → 0.
         assert_eq!(r.term_df("body", "common").await.expect("df").0, 3);
         assert_eq!(r.term_df("body", "rust").await.expect("df").0, 2);
         assert_eq!(r.term_df("body", "uniqzero").await.expect("df").0, 1);
@@ -923,7 +1301,7 @@ mod tests {
     async fn term_dfs_matches_per_term_term_df() {
         let (blob, json) = build_mixed_df_blob();
         let r = FtsReader::open(blob, &json).expect("open");
-        // Interleave the FST value kinds — PFOR (df>1), absent, inline
+        // Interleave the dictionary entry kinds — PFOR (df>1), absent, inline
         // (df=1), PFOR, absent — so a slot-mapping bug in the batched
         // path (which fetches only the PFOR headers, then scatters the
         // results back) would surface as a mismatch here.
@@ -943,5 +1321,111 @@ mod tests {
         assert_eq!(batched, vec![2, 0, 1, 3, 0], "planted document frequencies");
         // Empty input short-circuits to empty output (no dict open, no fetch).
         assert!(r.term_dfs("body", &[]).await.expect("empty").0.is_empty());
+    }
+
+    /// A column no row in this superfile filled is walked without
+    /// computing an idf for it.
+    ///
+    /// Sparse columns miss whole superfiles — a compaction or a repair
+    /// that lands such a shard would otherwise ask for `df = 1` against
+    /// `n_docs = 0`, which is not a ratio and trips the scorer's
+    /// precondition.
+    #[tokio::test]
+    async fn a_column_with_no_scored_documents_walks_without_scoring() {
+        const N_DOCS: u32 = 8;
+        let mut b = FtsBuilder::new();
+        b.register_column("filled".into(), false).expect("register");
+        b.register_column("empty".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            b.add_doc(0, i, &format!("common u{i}"))
+                .expect("add filled");
+            // Indexed for row alignment, but every cell is empty.
+            b.add_doc(1, i, "").expect("add empty");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"filled","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"empty","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let dict_bytes = r.dict_bytes_async().await.expect("dict");
+
+        let walked = r
+            .term_index_facts_after(&dict_bytes, "empty", None, 16)
+            .await
+            .expect("walking an empty column must not panic");
+        assert!(
+            walked.is_empty(),
+            "an empty column has no terms: {walked:?}"
+        );
+
+        // The filled column beside it still reports its terms.
+        let filled = r
+            .term_index_facts_after(&dict_bytes, "filled", None, 16)
+            .await
+            .expect("walk");
+        assert!(!filled.is_empty(), "the filled column still has terms");
+    }
+
+    /// The walk with values gives every term exactly the fact the lookup
+    /// path gives it: inline (tf 1 and more), short and long terms, on a
+    /// positional and a plain column, across chunk edges.
+    #[tokio::test]
+    async fn facts_from_the_walk_match_facts_from_lookups() {
+        const N_DOCS: u32 = 600;
+        const CHUNK: usize = 5;
+        let mut b = FtsBuilder::new();
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // `common` is long, `mid` short, `u{i}` inline with tf 1 and
+            // `twice{i}` a df=1 term with tf 2. `u{i}` sits past position
+            // 1, so its positional slot differs from its tf.
+            let mut text = format!("common twice{i} twice{i} u{i}");
+            if i.is_multiple_of(7) {
+                text.push_str(" mid");
+            }
+            b.add_doc(0, i, &text).expect("add pos");
+            b.add_doc(1, i, &text).expect("add flat");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"pos","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true},{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let dict_bytes = r.dict_bytes_async().await.expect("dict");
+        for column in ["pos", "flat"] {
+            let mut walked = Vec::new();
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let chunk = r
+                    .term_index_facts_after(&dict_bytes, column, after.as_deref(), CHUNK)
+                    .await
+                    .expect("walk");
+                let done = chunk.len() < CHUNK;
+                after = chunk.last().map(|(t, _)| t.clone());
+                walked.extend(chunk);
+                if done {
+                    break;
+                }
+            }
+            let all = r.iter_column_terms(column).expect("terms");
+            let names: Vec<&str> = all
+                .iter()
+                .map(|t| std::str::from_utf8(t).expect("utf8"))
+                .collect();
+            assert_eq!(
+                walked.iter().map(|(t, _)| t.clone()).collect::<Vec<_>>(),
+                all,
+                "{column}: the walk visits every term once, in order"
+            );
+            let looked_up = r.term_index_facts(column, &names).await.expect("lookups");
+            for ((term, walk), lookup) in walked.iter().zip(looked_up) {
+                let (walk, lookup) = (walk.clone().expect("walk fact"), lookup.expect("fact"));
+                let name = String::from_utf8_lossy(term);
+                assert_eq!(walk.df, lookup.df, "{column}/{name}: df");
+                assert_eq!(
+                    walk.bound.to_bits(),
+                    lookup.bound.to_bits(),
+                    "{column}/{name}: bound"
+                );
+                assert_eq!(walk.entry, lookup.entry, "{column}/{name}: entry");
+            }
+        }
     }
 }

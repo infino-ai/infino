@@ -29,13 +29,25 @@
 //!    committed corpus. Tests the full path through the
 //!    auto-injection in `append()` + the OCC retry on the
 //!    manifest pointer.
+//!
+//! 3. **One handle, concurrent appends.** Threads append through
+//!    one shared handle, so they share its generator: each append
+//!    reserves its batch's ids under the generator's lock and
+//!    expands them after releasing it. Reading `_id` back checks
+//!    that every id is distinct, that no row is lost, and that
+//!    each batch got one contiguous, increasing run.
 
 #![deny(clippy::unwrap_used)]
 
-use std::{collections::HashSet, sync::Arc, thread};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Barrier},
+    thread,
+};
 
-use arrow_array::{LargeStringArray, RecordBatch};
+use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
 use infino::{
+    config::CrcVerification,
     supertable::{
         Supertable,
         reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore, LruPolicy},
@@ -191,7 +203,7 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned_fn: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
@@ -240,4 +252,106 @@ async fn four_handles_to_shared_storage_produce_globally_unique_ids() {
     // ids actually persisted, so we know we read them all.
     let total_rows: u64 = segs.iter().map(|s| s.n_docs).sum();
     assert_eq!(total_rows, N_HANDLES as u64 * ROWS_PER_HANDLE);
+}
+
+// ---------------------------------------------------------
+// One handle, concurrent appends.
+// ---------------------------------------------------------
+
+#[test]
+fn concurrent_appends_on_one_handle_give_each_batch_a_contiguous_run_of_distinct_ids() {
+    const THREADS: usize = 8;
+    const APPENDS_PER_THREAD: usize = 4;
+    const ROWS_PER_APPEND: usize = 1_000;
+
+    let st = Supertable::create(default_supertable_options()).expect("create");
+
+    // Row `r` of append `a` on thread `t` is titled `t{t}-a{a}-r{r}`, so
+    // every id read back can be traced to its batch and its row in it.
+    let start = Barrier::new(THREADS);
+    thread::scope(|scope| {
+        for t in 0..THREADS {
+            let (st, start) = (&st, &start);
+            scope.spawn(move || {
+                start.wait();
+                for a in 0..APPENDS_PER_THREAD {
+                    let titles: Vec<String> = (0..ROWS_PER_APPEND)
+                        .map(|r| format!("t{t}-a{a}-r{r}"))
+                        .collect();
+                    let batch = RecordBatch::try_new(
+                        schema_id_title(),
+                        vec![Arc::new(LargeStringArray::from(titles))],
+                    )
+                    .expect("batch");
+                    st.append(&batch).expect("append");
+                }
+            });
+        }
+    });
+
+    let batches = st
+        .reader()
+        .expect("reader")
+        .query_sql("SELECT _id, title FROM supertable")
+        .expect("query _id, title");
+
+    let total = THREADS * APPENDS_PER_THREAD * ROWS_PER_APPEND;
+    let mut seen: HashSet<i128> = HashSet::with_capacity(total);
+    // (thread, append) -> the ids of that batch, indexed by row.
+    let mut per_batch: HashMap<(usize, usize), Vec<Option<i128>>> = HashMap::new();
+    for b in &batches {
+        let ids = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("_id is Decimal128");
+        let titles = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title is LargeUtf8");
+        for i in 0..b.num_rows() {
+            let id = ids.value(i);
+            assert!(seen.insert(id), "duplicate _id {id}");
+            let parts: Vec<usize> = titles
+                .value(i)
+                .split('-')
+                .map(|p| p[1..].parse().expect("title part"))
+                .collect();
+            let [t, a, r] = parts[..] else {
+                panic!("unexpected title {}", titles.value(i));
+            };
+            let rows = per_batch
+                .entry((t, a))
+                .or_insert_with(|| vec![None; ROWS_PER_APPEND]);
+            assert!(
+                rows[r].replace(id).is_none(),
+                "row t{t}-a{a}-r{r} read twice"
+            );
+        }
+    }
+
+    assert_eq!(
+        seen.len(),
+        total,
+        "every appended row comes back with its own id"
+    );
+    assert_eq!(per_batch.len(), THREADS * APPENDS_PER_THREAD);
+    for ((t, a), rows) in &per_batch {
+        let ids: Vec<i128> = rows
+            .iter()
+            .enumerate()
+            .map(|(r, id)| id.unwrap_or_else(|| panic!("row t{t}-a{a}-r{r} is missing")))
+            .collect();
+        // 32,000 ids in all is far below one millisecond's 2^24, so each
+        // batch's reservation is a single span: consecutive, in row order.
+        for (r, pair) in ids.windows(2).enumerate() {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "batch t{t}-a{a}: row {} does not follow row {r}",
+                r + 1
+            );
+        }
+    }
 }

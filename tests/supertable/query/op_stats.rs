@@ -18,16 +18,12 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    Bm25SearchOptions, ConnectOptions, Connection, FtsField, IndexSpec, Metric, connect,
-    connect_with,
+    Bm25SearchOptions, ConnectOptions, Connection, IndexSpec, Metric, connect, connect_with,
     runtime_metrics::op_stats::{OpStats, with_op_stats},
     storage::{LocalFsStorageProvider, StorageProvider},
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::{
-            reader::{Bm25Stats, BoolMode},
-            tokenize::STANDARD_TOKENIZER,
-        },
+        fts::{reader::BoolMode, tokenize::MAX_TOKEN_CHARS},
         vector::rerank_codec::RerankCodec,
     },
     supertable::{
@@ -40,13 +36,18 @@ use tempfile::TempDir;
 
 /// Docs per committed segment. Commits row-shard across the writer
 /// pool, so this must keep every term's per-superfile df ≥ 2 —
-/// df=1 terms store inline in the FST with genuinely zero
+/// df=1 terms store inline in the term dictionary with genuinely zero
 /// postings-region bytes, which would make the assertions vacuous.
 const DOCS_PER_SEGMENT: usize = 40;
 /// Rayon pool size for deterministic builds (two shards per commit).
 const RAYON_POOL_THREADS: usize = 2;
 /// Top-k ≥ the corpus size so no assertion depends on ranking cutoffs.
 const TOP_K: usize = 128;
+/// Ranges a query plans per superfile for its term dictionary: one fetch.
+const DICT_RANGES_PER_SUPERFILE: u64 = 1;
+/// Ranges a one-term query plans per superfile: the dictionary fetch
+/// plus the term's posting range.
+const ONE_TERM_RANGES_PER_SUPERFILE: u64 = DICT_RANGES_PER_SUPERFILE + 1;
 
 /// Schema `[title (FTS, no positions)]` — the smallest corpus that
 /// exercises the full multi-superfile BM25 fan-out.
@@ -132,9 +133,7 @@ fn scoped_fts_stats(st: &Supertable, query: &str) -> OpStats {
                 "title",
                 query,
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -167,9 +166,7 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -180,9 +177,7 @@ fn a_scoped_bm25_query_reports_its_planned_ranges() {
                 "title",
                 "rust async web",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -217,16 +212,14 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
     // Per superfile: one dictionary fetch + one PFOR posting range.
     assert_eq!(
         one_term.planned_read_ranges,
-        2 * n_superfiles,
+        ONE_TERM_RANGES_PER_SUPERFILE * n_superfiles,
         "single term = dict + posting range per superfile"
     );
     let (_, three_terms) = with_op_stats(|| {
@@ -236,96 +229,75 @@ fn fts_planned_ranges_pin_one_range_per_term_per_superfile() {
                 "title",
                 "rust async web",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
     // Per superfile: one dictionary fetch + three PFOR posting ranges.
     assert_eq!(
         three_terms.planned_read_ranges,
-        4 * n_superfiles,
+        (DICT_RANGES_PER_SUPERFILE + 3) * n_superfiles,
         "three PFOR terms = dict + three posting ranges per superfile"
     );
 }
 
 #[test]
 fn fts_work_stats_repeat_identically_on_the_same_table_state() {
-    // Named for what it guards. It used to claim the first run decodes
-    // from a cold state and the repeat hits warm structures, but this
-    // fixture has no cache-temperature axis at all: `demo_two_superfiles`
-    // attaches no storage, so every published superfile's bytes sit in
-    // the table's in-memory reader cache for its lifetime and both runs
-    // are served from the same resident reader. What it really pins is
-    // run-to-run repeatability across the full masked snapshot, which is
-    // worth having — the genuine cold-open axis is covered by
+    // Pins run-to-run repeatability across the full masked snapshot. The
+    // fixture has no cache-temperature axis: `demo_two_superfiles`
+    // attaches no storage, so every run is served from the same resident
+    // reader. The genuine cold-open axis is covered by
     // `sql_work_stats_do_not_depend_on_reader_open_shape` for SQL and by
-    // the reader-lifetime transposition in the vector sibling.
+    // the reader-lifetime transposition in the vector sibling. The first
+    // query of a manifest generation also gathers document frequencies,
+    // so it is compared with the first query on an identical table, and
+    // the idf-cache-served repeats with each other.
     let st = demo_two_superfiles();
+    let twin = demo_two_superfiles();
     let first = deterministic(scoped_fts_stats(&st, "rust"));
-    let second = deterministic(scoped_fts_stats(&st, "rust"));
-    assert_eq!(first, second, "same plan, same table state, same work");
-}
-
-/// One scoped global-stats BM25 query's planned ranges.
-fn global_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
-    let (hits, stats) = with_op_stats(|| {
-        st.reader()
-            .expect("reader")
-            .bm25_hits(
-                "title",
-                q,
-                TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(mode)
-                    .with_stats(Bm25Stats::Global),
-            )
-            .expect("bm25")
-    });
-    assert!(!hits.is_empty(), "fixture query {q:?} must match");
-    stats.planned_read_ranges
-}
-
-/// One scoped per-superfile BM25 query's planned ranges.
-fn per_superfile_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
-    let (hits, stats) = with_op_stats(|| {
-        st.reader()
-            .expect("reader")
-            .bm25_hits(
-                "title",
-                q,
-                TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(mode)
-                    .with_stats(Bm25Stats::PerSuperfile),
-            )
-            .expect("bm25")
-    });
-    assert!(!hits.is_empty(), "fixture query {q:?} must match");
-    stats.planned_read_ranges
-}
-
-/// Under `Bm25Stats::Global`, an OR query's df gather is FUSED with the
-/// query's own reads: the scoring prune set IS the presence set, so the
-/// open wave fetches exactly the dictionary + postings ranges the walk
-/// needs and df rides along for free. The pinned contract: a global OR
-/// query — first for its terms or cache-served — plans EXACTLY the
-/// per-superfile work, on every manifest generation.
-#[test]
-fn global_stats_or_query_plans_exactly_the_per_superfile_work() {
-    let st = demo_two_superfiles();
-    let per_superfile = per_superfile_ranges(&st, "rust", BoolMode::Or);
-
-    let first = global_ranges(&st, "rust", BoolMode::Or);
-    let repeat = global_ranges(&st, "rust", BoolMode::Or);
+    let twin_first = deterministic(scoped_fts_stats(&twin, "rust"));
+    assert_eq!(first, twin_first, "same plan, same table state, same work");
+    let repeat = deterministic(scoped_fts_stats(&st, "rust"));
+    let second_repeat = deterministic(scoped_fts_stats(&st, "rust"));
     assert_eq!(
-        first, per_superfile,
-        "fused open wave: the first global OR query plans no extra ranges"
+        repeat, second_repeat,
+        "same plan, same table state, same work"
+    );
+}
+
+/// One scoped BM25 query's planned ranges.
+fn planned_ranges(st: &Supertable, q: &str, mode: BoolMode) -> u64 {
+    let (hits, stats) = with_op_stats(|| {
+        st.reader()
+            .expect("reader")
+            .bm25_hits("title", q, TOP_K, Bm25SearchOptions::new().with_mode(mode))
+            .expect("bm25")
+    });
+    assert!(!hits.is_empty(), "fixture query {q:?} must match");
+    stats.planned_read_ranges
+}
+
+/// An OR query's df gather is FUSED with the query's own reads: the
+/// scoring prune set IS the presence set, so the open wave fetches
+/// exactly the dictionary + postings ranges the walk needs and df rides
+/// along for free. The pinned contract: an OR query — first for its
+/// terms or cache-served — plans exactly one dictionary fetch plus one
+/// posting range per superfile, on every manifest generation.
+#[test]
+fn or_query_df_gather_plans_no_extra_ranges() {
+    let st = demo_two_superfiles();
+    let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
+    let own_work = ONE_TERM_RANGES_PER_SUPERFILE * n_superfiles;
+
+    assert_eq!(
+        planned_ranges(&st, "rust", BoolMode::Or),
+        own_work,
+        "fused open wave: the first OR query plans no extra ranges"
     );
     assert_eq!(
-        repeat, per_superfile,
-        "cache-served repeat plans the per-superfile work too"
+        planned_ranges(&st, "rust", BoolMode::Or),
+        own_work,
+        "cache-served repeat plans the same work"
     );
 
     // A new manifest generation re-runs the (still fused) wave once and
@@ -337,15 +309,16 @@ fn global_stats_or_query_plans_exactly_the_per_superfile_work() {
     w.commit().expect("commit seg3");
     drop(w);
 
-    let per_superfile_after = per_superfile_ranges(&st, "rust", BoolMode::Or);
+    let own_work_after =
+        ONE_TERM_RANGES_PER_SUPERFILE * st.reader().expect("reader").n_superfiles() as u64;
     assert_eq!(
-        global_ranges(&st, "rust", BoolMode::Or),
-        per_superfile_after,
+        planned_ranges(&st, "rust", BoolMode::Or),
+        own_work_after,
         "new generation: fused wave still plans no extra ranges"
     );
     assert_eq!(
-        global_ranges(&st, "rust", BoolMode::Or),
-        per_superfile_after,
+        planned_ranges(&st, "rust", BoolMode::Or),
+        own_work_after,
         "cache re-serves under the new generation"
     );
 }
@@ -355,36 +328,30 @@ fn global_stats_or_query_plans_exactly_the_per_superfile_work() {
 /// though scoring skips it. That residual is dict-only — bounded, and
 /// gone on the cache-served repeat.
 #[test]
-fn global_stats_and_residual_is_dict_only_and_cached() {
+fn and_query_df_residual_is_dict_only_and_cached() {
     let st = demo_two_superfiles();
     // `filler0x0` lives only in segment 0's superfiles, `rust` in every
     // superfile — so the AND prune keeps segment 0 only, while segment
     // 1's superfiles owe `rust`'s df through the residual probe.
     let q = "rust filler0x0";
-    let per_superfile = per_superfile_ranges(&st, q, BoolMode::And);
-
-    let first = global_ranges(&st, q, BoolMode::And);
-    let repeat = global_ranges(&st, q, BoolMode::And);
+    let first = planned_ranges(&st, q, BoolMode::And);
+    let own_work = planned_ranges(&st, q, BoolMode::And);
     assert!(
-        first > per_superfile,
+        first > own_work,
         "the residual superfiles' df probes plan real ranges \
-         ({first} vs {per_superfile})"
+         ({first} vs {own_work})"
     );
     // Residual cost: per residual superfile a dictionary fetch plus one
     // coalesced header fetch — never a postings-body plan. Bounding by
     // 2 ranges × residual superfiles pins the dict-only shape.
     let n_superfiles = st.reader().expect("reader").n_superfiles() as u64;
-    let kept_upper_bound = per_superfile / 2; // ≥ dict + 1 range per kept superfile
+    let kept_upper_bound = own_work / 2; // ≥ dict + 1 range per kept superfile
     let residual_superfiles = n_superfiles - kept_upper_bound.max(1);
     assert!(
-        first - per_superfile <= 2 * residual_superfiles,
+        first - own_work <= 2 * residual_superfiles,
         "residual is dict-only, not a postings re-fetch \
          (extra {} over {residual_superfiles} residual superfiles)",
-        first - per_superfile
-    );
-    assert_eq!(
-        repeat, per_superfile,
-        "cache-served repeat plans the per-superfile work only"
+        first - own_work
     );
 }
 
@@ -413,9 +380,7 @@ fn a_scoped_bm25_query_reports_kernel_cpu() {
                     "title",
                     query,
                     TOP_K,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::Or)
-                        .with_stats(Bm25Stats::PerSuperfile),
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 )
                 .expect("bm25");
         }
@@ -450,9 +415,7 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -465,10 +428,10 @@ fn a_reader_minted_outside_the_scope_records_nothing() {
 
 #[test]
 fn an_inline_df1_term_plans_no_posting_range() {
-    // "filler0x0" is unique to one doc: inline in the FST of its home
-    // superfile (zero fetches planned), absent everywhere else. Adding
-    // it to a query must not change the planned range count — a phantom
-    // range per inline term was the old behavior.
+    // "filler0x0" is unique to one doc: inline in the term dictionary of its
+    // home superfile (zero fetches planned), absent everywhere else. Adding it
+    // to a query must not change the planned range count — a phantom range per
+    // inline term was the old behavior.
     let st = demo_two_superfiles();
     let (_, base) = with_op_stats(|| {
         st.reader()
@@ -477,9 +440,7 @@ fn an_inline_df1_term_plans_no_posting_range() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -490,9 +451,7 @@ fn an_inline_df1_term_plans_no_posting_range() {
                 "title",
                 "rust filler0x0",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::PerSuperfile),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
             )
             .expect("bm25")
     });
@@ -576,8 +535,8 @@ fn a_scoped_exact_match_reports_posting_work() {
 
 #[test]
 fn a_scoped_prefix_search_reports_posting_work() {
-    // Prefix expansion used to flush nothing at all — a prefix widening
-    // to many terms billed as zero FTS work.
+    // Prefix expansion bills its posting work: a prefix widening to many
+    // terms must not report zero FTS work.
     let st = demo_two_superfiles();
     let (hits, stats) = with_op_stats(|| {
         st.reader()
@@ -608,9 +567,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 Some(&["title"]),
             )
             .expect("projected search")
@@ -628,9 +585,7 @@ fn a_scalar_projection_reports_materialized_rows() {
                 "title",
                 "rust",
                 TOP_K,
-                Bm25SearchOptions::new()
-                    .with_mode(BoolMode::Or)
-                    .with_stats(Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(BoolMode::Or),
                 None,
             )
             .expect("bare search")
@@ -885,8 +840,7 @@ fn a_full_width_probe_scans_every_row_exactly_once() {
 fn a_filtered_vector_query_meters_its_predicate_leg() {
     // Filtered kNN first resolves the text predicate on the user table
     // (posting walks), then ranks among matching rows. Both legs are
-    // real work and both must land in the counters — the predicate leg
-    // used to be invisible.
+    // real work and both must land in the counters.
     let dir = TempDir::new().expect("tempdir");
     let st = drained_vector_table(&dir);
     let query = row_vec(3);
@@ -1040,19 +994,15 @@ const LIKE_PADDING: &str = " the quick brown fox jumps over the lazy dog again a
 /// A `standard`-analyzer table for the `LIKE` pushdown: the substring
 /// `nimble` occurs only inside the term `nimblefox`, planted in every
 /// [`LIKE_NEEDLE_STRIDE`]-th row. `padded` appends [`LIKE_PADDING`] to
-/// every row.
-fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
+/// every row; `extra` rows follow the [`LIKE_ROWS`] fixture rows.
+fn sql_like_fixture(dir: &TempDir, padded: bool, extra: &[String]) -> Connection {
     let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
     let schema = Arc::new(Schema::new(vec![
         Field::new("title", DataType::LargeUtf8, false),
         Field::new("rating", DataType::Int64, false),
     ]));
     let docs = db
-        .create_table(
-            "docs",
-            schema.clone(),
-            IndexSpec::new().fts(FtsField::new("title").analyzer(STANDARD_TOKENIZER)),
-        )
+        .create_table("docs", schema.clone(), IndexSpec::new().fts("title"))
         .expect("create_table");
     let padding = if padded { LIKE_PADDING } else { "" };
     let titles: Vec<String> = (0..LIKE_ROWS)
@@ -1063,11 +1013,14 @@ fn sql_like_fixture(dir: &TempDir, padded: bool) -> Connection {
                 format!("filler{i} rust{padding}")
             }
         })
+        .chain(extra.iter().cloned())
         .collect();
     let title_arr: ArrayRef = Arc::new(LargeStringArray::from(
         titles.iter().map(String::as_str).collect::<Vec<_>>(),
     ));
-    let ratings: ArrayRef = Arc::new(Int64Array::from((0..LIKE_ROWS as i64).collect::<Vec<_>>()));
+    let ratings: ArrayRef = Arc::new(Int64Array::from(
+        (0..titles.len() as i64).collect::<Vec<_>>(),
+    ));
     let batch = RecordBatch::try_new(schema, vec![title_arr, ratings]).expect("batch");
     docs.append(&batch).expect("append");
     db
@@ -1080,7 +1033,7 @@ fn a_like_predicate_is_answered_from_the_index() {
     // FTS work the counters must show. The same query used to decode
     // every row of `title` to test the substring.
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, true);
+    let db = sql_like_fixture(&dir, true, &[]);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
     assert!(
         stats.fts_postings_bytes > 0,
@@ -1110,7 +1063,7 @@ fn a_like_predicate_is_answered_from_the_index() {
     // empty — but the index still hands the scan the rows holding a term
     // that starts with it, and only the FilterExec rejects them. Decoding
     // exactly those candidates is the signature of the index path: a plain
-    // scan with the row filter inside it would decode none.
+    // scan would decode every row.
     let (batches, prefix) = with_op_stats(|| {
         db.query_sql("SELECT title FROM docs WHERE title LIKE 'nimble%'")
             .expect("query_sql")
@@ -1143,6 +1096,74 @@ fn a_like_predicate_is_answered_from_the_index() {
     );
 }
 
+/// Characters ahead of the needle in a cut row: one short of the
+/// tokenizer's cut, so `nimble` starts in the first piece of the word and
+/// ends in the second, and only the row's text can say it matches.
+const CUT_HEAD: usize = MAX_TOKEN_CHARS - 1;
+
+#[test]
+fn an_exact_ilike_counts_each_row_it_checks_once() {
+    // A match across a tokenizer cut, and a near miss beside one: the
+    // dictionary leaves both doubtful, and their text decides. The count is
+    // rows decoded, so the checked row the scan then emits counts once, and
+    // the one the check rejects counts once too.
+    let across = format!("{}nimble", "x".repeat(CUT_HEAD));
+    let beside = format!("{}ni mble", "x".repeat(CUT_HEAD - 1));
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true, &[across, beside]);
+    let (batches, stats) = with_op_stats(|| {
+        db.query_sql("SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'")
+            .expect("query_sql")
+    });
+    let returned = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
+    assert_eq!(
+        returned,
+        (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64 + 1,
+        "the needle rows and the match across the cut"
+    );
+    assert_eq!(
+        stats.rows_materialized,
+        returned + 1,
+        "every returned row once, plus the near miss the check rejected"
+    );
+}
+
+#[test]
+fn an_exact_ilike_inside_a_small_bound_reads_no_postings_of_its_own() {
+    // `filler3%` bounds a few rows (3, 30..39, 300..399). Inside so small a
+    // bound the exact conjunct's rows are checked against their text, not
+    // its needle's postings unioned over the whole superfile, so the
+    // statement reads exactly the postings the bound reads alone. (Those
+    // are none: each `filler…` term holds one row, stored inline in the
+    // dictionary. The needle's term holds many, so alone it reads some.)
+    let dir = TempDir::new().expect("tempdir");
+    let db = sql_like_fixture(&dir, true, &[]);
+    let needle = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title ILIKE '%NIMBLE%'");
+    assert!(
+        needle.fts_postings_bytes > 0,
+        "the needle alone reads its term's postings"
+    );
+    let bound = "title LIKE 'filler3%'";
+    let alone = scoped_sql_stats(&db, &format!("SELECT title FROM docs WHERE {bound}"));
+    let (batches, both) = with_op_stats(|| {
+        db.query_sql(&format!(
+            "SELECT title FROM docs WHERE {bound} AND title ILIKE '%NIMBLE%'"
+        ))
+        .expect("query_sql")
+    });
+    let expected = (0..LIKE_ROWS)
+        .filter(|i| i.to_string().starts_with('3') && i % LIKE_NEEDLE_STRIDE == 0)
+        .count();
+    assert_eq!(
+        batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+        expected
+    );
+    assert_eq!(
+        both.fts_postings_bytes, alone.fts_postings_bytes,
+        "the exact conjunct read postings of its own inside a small bound"
+    );
+}
+
 #[test]
 fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
     // One unique word per row makes the vocabulary as large as the column
@@ -1152,7 +1173,7 @@ fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
     // exactly. The prefix `nimble%` walks only its own subtree, which the
     // gate does not touch, so it stays index-bounded.
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, false);
+    let db = sql_like_fixture(&dir, false, &[]);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%nimble%'");
     assert_eq!(
         stats.fts_postings_bytes, 0,
@@ -1182,7 +1203,7 @@ fn a_whole_dictionary_walk_is_skipped_when_the_scan_is_cheaper() {
 #[test]
 fn a_like_inside_a_boolean_tree_keeps_its_bound() {
     let dir = TempDir::new().expect("tempdir");
-    let db = sql_like_fixture(&dir, true);
+    let db = sql_like_fixture(&dir, true, &[]);
     let needle_rows = (LIKE_ROWS / LIKE_NEEDLE_STRIDE) as u64;
 
     // Two fragments: `filler1` names the rows whose filler term starts
@@ -1237,18 +1258,16 @@ fn a_like_inside_a_boolean_tree_keeps_its_bound() {
 
 #[test]
 fn an_open_edged_like_under_the_default_analyzer_still_scans() {
-    // Under `ascii_lower` an open-edged token is never required, whatever
-    // the data: the analyzer drops any run holding a non-ASCII byte whole,
-    // so in general a term merely containing `rust` may not exist for a
-    // row that matches. `%rust%` therefore scans here even though this
-    // corpus is pure ASCII. Control for the tests above: no posting work,
-    // same answer.
+    // `%rust%` needs a whole-dictionary walk, and this fixture's vocabulary
+    // (one `fillerN` term per short row) is nearly as large as the column,
+    // so the walk does not pay: the token stays unbounded and the query
+    // scans. Control for the tests above: no posting work, same answer.
     let dir = TempDir::new().expect("tempdir");
     let db = sql_fixture(&dir);
     let stats = scoped_sql_stats(&db, "SELECT title FROM docs WHERE title LIKE '%rust%'");
     assert_eq!(
         stats.fts_postings_bytes, 0,
-        "no index bound under ascii_lower; got {}",
+        "no index bound when the walk does not pay; got {}",
         stats.fts_postings_bytes
     );
     assert!(
@@ -1566,6 +1585,143 @@ fn id_only_projection_costs_no_more_than_the_native_result() {
             "projection [{label}] must plan the same reads as the native result"
         );
     }
+}
+
+/// A projection naming a column the table does not carry is a caller
+/// error, and every row-returning search entry point rejects it BEFORE
+/// running any search — not after a full search whose result is then
+/// discarded.
+///
+/// The `*_unknown_projection_column_errors` coverage pins the error and
+/// its message; a late-only check inside the row materializer produces
+/// that identical error, so it cannot tell the fail-fast path from a
+/// full search that is thrown away at materialization. This pins the
+/// property that motivates validating up front: with the projection
+/// rejected at the entry point, the op-stats collector sees zero cells
+/// scanned, zero candidates, zero postings walked, and zero rows
+/// materialized. Remove the early guard and each leg reports a full
+/// search's tallies here, so this test bites.
+#[test]
+fn a_rejected_projection_does_no_search_work() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = drained_vector_table(&dir);
+    let query = row_vec(3);
+    // `does_not_exist` is carried by none of `_id`, `title`, or `score`.
+    let bad = ["_id", "does_not_exist", "score"];
+
+    // Vector search: the motivating case — a full search plus id/placement
+    // resolution is gigabytes of object-store I/O at billion scale.
+    let (vec_err, vec_stats) = with_op_stats(|| {
+        st.vector_search(
+            "emb",
+            &query,
+            VECTOR_K,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            None,
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        vec_err.to_string().contains("unknown column"),
+        "vector_search must name the unknown column, got {vec_err}"
+    );
+    assert_eq!(
+        (
+            vec_stats.vector_cells_scanned,
+            vec_stats.vector_candidates_scanned,
+            vec_stats.vector_rows_reranked,
+            vec_stats.rows_materialized,
+        ),
+        (0, 0, 0, 0),
+        "a rejected vector projection must scan no cells, generate no \
+         candidates, rerank nothing, and materialize no rows"
+    );
+
+    // BM25 search: the same early guard over the FTS entry point.
+    let (bm25_err, bm25_stats) = with_op_stats(|| {
+        st.bm25_search(
+            "title",
+            "vec",
+            VECTOR_K,
+            Bm25SearchOptions::new(),
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        bm25_err.to_string().contains("unknown column"),
+        "bm25_search must name the unknown column, got {bm25_err}"
+    );
+    assert_eq!(
+        (bm25_stats.fts_postings_bytes, bm25_stats.rows_materialized),
+        (0, 0),
+        "a rejected BM25 projection must walk no postings and materialize no rows"
+    );
+
+    // Hybrid search: fuses a full vector wave with an FTS walk, so failing
+    // late is nearly as costly as the vector path — both legs must stay idle.
+    let (hyb_err, hyb_stats) = with_op_stats(|| {
+        st.hybrid_search(
+            "title",
+            "vec",
+            BoolMode::Or,
+            "emb",
+            &query,
+            VectorSearchOptions::new().with_nprobe(VECTOR_NPROBE),
+            VECTOR_K,
+            Some(&bad),
+        )
+        .expect_err("unknown projection column must error")
+    });
+    assert!(
+        hyb_err.to_string().contains("unknown column"),
+        "hybrid_search must name the unknown column, got {hyb_err}"
+    );
+    assert_eq!(
+        (
+            hyb_stats.vector_cells_scanned,
+            hyb_stats.vector_candidates_scanned,
+            hyb_stats.fts_postings_bytes,
+            hyb_stats.rows_materialized,
+        ),
+        (0, 0, 0, 0),
+        "a rejected hybrid projection must run neither the vector nor the FTS leg"
+    );
+
+    // Unranked token match: the same early guard over the FTS entry point,
+    // so no postings are walked and no rows materialized.
+    let (tok_err, tok_stats) = with_op_stats(|| {
+        st.token_match("title", "vec", BoolMode::Or, Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        tok_err.to_string().contains("unknown column"),
+        "token_match must name the unknown column, got {tok_err}"
+    );
+    assert_eq!(
+        (tok_stats.fts_postings_bytes, tok_stats.rows_materialized),
+        (0, 0),
+        "a rejected token_match projection must walk no postings and materialize no rows"
+    );
+
+    // Unranked exact match: the same early guard, likewise idle on rejection.
+    let (exact_err, exact_stats) = with_op_stats(|| {
+        st.exact_match("title", "vec", Some(&bad))
+            .expect_err("unknown projection column must error")
+    });
+    assert!(
+        exact_err.to_string().contains("unknown column"),
+        "exact_match must name the unknown column, got {exact_err}"
+    );
+    assert_eq!(
+        (
+            exact_stats.fts_postings_bytes,
+            exact_stats.rows_materialized
+        ),
+        (0, 0),
+        "a rejected exact_match projection must walk no postings and materialize no rows"
+    );
 }
 
 /// The gapped-placement memo must not pin connection-budget bytes. The

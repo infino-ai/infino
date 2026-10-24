@@ -98,19 +98,20 @@ use bytes::Bytes;
 use infino::{
     Bm25SearchOptions,
     config::{
-        CompactionSettings, Config, StorageBackend, StorageColdFetchMode, StorageSettings,
-        SupertableSettings,
+        CompactionSettings, Config, CrcVerification, StorageBackend, StorageColdFetchMode,
+        StorageSettings, SupertableSettings,
     },
     runtime_metrics::UsageMeter,
     superfile::{
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
+        format::fts::{HEADER_SIZE as FTS_HEADER_SIZE, U64_BYTES, hdr},
         fts::reader::BoolMode,
         vector::distance::Metric,
     },
     supertable::{
         SuperfileUri, Supertable, SupertableOptions,
         query::VectorSearchOptions,
-        reader_cache::DiskCacheStore,
+        reader_cache::{DiskCacheStore, ReadIntent},
         storage::{S3StorageProvider, StorageProvider},
     },
 };
@@ -875,6 +876,10 @@ pub(crate) mod diag {
             self.inner.put_atomic(uri, bytes).await
         }
 
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
         async fn put_if_match(
             &self,
             uri: &str,
@@ -1302,21 +1307,19 @@ pub(crate) mod diag {
         }
 
         // ── Phase 2b: cold-open HINTED (1 RTT parallel) ─────────────
-        eprintln!(
-            "[diag] === cold-open HINTED via cache.reader_with_hints (3 fresh-cache iters) ==="
-        );
+        eprintln!("[diag] === cold-open HINTED via cache.open_for_query (3 fresh-cache iters) ===");
         for i in 0..3 {
             let before = storage.snapshot();
             let (cache_dir, cache) = fresh_cache(Arc::clone(&storage_dyn));
             let off_ref = offsets.clone();
             let t0 = Instant::now();
             let _reader = rt
-                .block_on(cache.reader_with_hints(
+                .block_on(cache.open_for_query(
                     &uri,
                     &uri.storage_path(),
                     Some(&off_ref),
                     None,
-                    true,
+                    ReadIntent::Warm,
                 ))
                 .expect("cold reader");
             let wall = t0.elapsed();
@@ -1364,7 +1367,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 let vec = reader.vec().expect("vector reader present");
@@ -1420,7 +1429,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 reader
@@ -1447,7 +1462,13 @@ pub(crate) mod diag {
             let t0 = Instant::now();
             let _hits = rt.block_on(async {
                 let reader = cache
-                    .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                    .open_for_query(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&off_ref),
+                        None,
+                        ReadIntent::Warm,
+                    )
                     .await
                     .expect("cold reader");
                 reader
@@ -1567,12 +1588,12 @@ pub(crate) mod diag {
                 let off_ref = offsets.clone();
                 let t0 = Instant::now();
                 let _reader = rt
-                    .block_on(cache.reader_with_hints(
+                    .block_on(cache.open_for_query(
                         &uri,
                         &uri.storage_path(),
                         Some(&off_ref),
                         None,
-                        true,
+                        ReadIntent::Warm,
                     ))
                     .expect("real S3 cold reader");
                 let wall = t0.elapsed();
@@ -1594,7 +1615,13 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                        .open_for_query(
+                            &uri,
+                            &uri.storage_path(),
+                            Some(&off_ref),
+                            None,
+                            ReadIntent::Warm,
+                        )
                         .await
                         .expect("real S3 cold reader");
                     let vec = reader.vec().expect("vector reader present");
@@ -1625,7 +1652,13 @@ pub(crate) mod diag {
                 let t0 = Instant::now();
                 let _hits = rt.block_on(async {
                     let reader = cache
-                        .reader_with_hints(&uri, &uri.storage_path(), Some(&off_ref), None, true)
+                        .open_for_query(
+                            &uri,
+                            &uri.storage_path(),
+                            Some(&off_ref),
+                            None,
+                            ReadIntent::Warm,
+                        )
                         .await
                         .expect("real S3 cold reader");
                     reader
@@ -2055,15 +2088,18 @@ pub(crate) mod diag {
     }
 
     fn fts_open_ranges(bytes: &[u8], off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
-        const FTS_HEADER_SIZE: usize = 48;
         let start = off as usize;
         let end = start.checked_add(len as usize)?;
         let blob = bytes.get(start..end)?;
         if blob.len() < FTS_HEADER_SIZE {
             return None;
         }
-        let postings_offset = read_u64_le(blob.get(32..40)?) as usize;
-        let doc_lengths_offset = read_u64_le(blob.get(40..48)?) as usize;
+        let postings_offset =
+            read_u64_le(blob.get(hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES)?)
+                as usize;
+        let doc_lengths_offset =
+            read_u64_le(blob.get(hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES)?)
+                as usize;
         if postings_offset > blob.len()
             || doc_lengths_offset > blob.len()
             || postings_offset > doc_lengths_offset
@@ -2156,7 +2192,7 @@ pub(crate) mod diag {
             mmap_cold_threshold_secs: 0,
             mmap_sweep_interval_secs: 0,
             eviction: Box::new(LruPolicy::new()),
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::Always,
             ..Default::default()
         };
         let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);

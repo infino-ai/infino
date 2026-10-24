@@ -22,8 +22,8 @@ use object_store::{
 };
 
 use super::{
-    ObjectMeta, StorageError, StorageOptions, StorageProvider, counting, io_counters,
-    logical_list_key, options::apply, retry,
+    ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
+    io_counters, logical_list_key, options::apply, retry,
 };
 use crate::runtime_metrics::io::UsageMeter;
 
@@ -357,6 +357,31 @@ impl StorageProvider for AzureStorageProvider {
         out
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        let path = self.path(uri)?;
+        let n = bytes.len() as u64;
+        // Overwrite is idempotent, so a transient failure re-issues like the
+        // create-only path; there is no precondition to lose.
+        let out = retry::with_reissue(|| {
+            let bytes = bytes.clone();
+            async {
+                let opts = PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                };
+                self.store
+                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| translate(uri, e))
+            }
+        })
+        .await;
+        if out.is_ok() {
+            self.meter.record_put(n);
+        }
+        out
+    }
     async fn put_if_match(
         &self,
         uri: &str,
@@ -444,6 +469,14 @@ impl StorageProvider for AzureStorageProvider {
             ));
         }
         Ok(out)
+    }
+
+    async fn list_child_prefixes(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let path = self.path(prefix)?;
+        self.meter.record_list();
+        child_prefix_names(self.store.as_ref(), &path)
+            .await
+            .map_err(|e| translate(prefix, e))
     }
 
     fn object_store_handle(&self, uri: &str) -> Option<(Arc<dyn ObjectStore>, ObjPath)> {

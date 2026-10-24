@@ -233,16 +233,16 @@ fn strong_consistency_query_on_uncommitted_table_stays_at_zero() {
 }
 
 #[test]
-fn open_rejects_mismatched_options_via_options_hash() {
-    // A producer commits with one schema; opening with
-    // a structurally-different schema (different column
-    // name) must surface a typed `OptionsHashMismatch`
+fn open_rejects_mismatched_identity_via_options_hash_but_not_a_different_seed_schema() {
+    // The manifest list is the authority for the table's schema, so a
+    // handle that opens with a different seed schema reads the list's
+    // and succeeds. The id column is the caller's to get wrong: opening
+    // with another one must surface a typed `OptionsHashMismatch`
     // before any decode work happens.
     let dir = TempDir::new().expect("tempdir");
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
 
-    // Producer: standard schema.
     {
         let producer =
             Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
@@ -252,10 +252,6 @@ fn open_rejects_mismatched_options_via_options_hash() {
         w.commit().expect("commit");
     }
 
-    // Consumer: same id_column, same fts column name, but
-    // schema lists fields in REVERSE order — that changes
-    // the per-field iteration the options_hash digest
-    // covers.
     let other_schema = Arc::new(arrow_schema::Schema::new(vec![
         arrow_schema::Field::new("title", arrow_schema::DataType::LargeUtf8, false),
         arrow_schema::Field::new("doc_id", arrow_schema::DataType::UInt64, false),
@@ -267,14 +263,30 @@ fn open_rejects_mismatched_options_via_options_hash() {
             .build()
             .expect("pool"),
     );
-    let mismatched_opts =
-        SupertableOptions::new(other_schema, vec![FtsConfig::new("title")], vec![])
-            .expect("opts")
-            .with_writer_pool(pool)
-            .with_storage(Arc::clone(&storage));
+    let other_seed = SupertableOptions::new(other_schema, vec![FtsConfig::new("title")], vec![])
+        .expect("opts")
+        .with_writer_pool(Arc::clone(&pool))
+        .with_storage(Arc::clone(&storage));
+    let opened = Supertable::open(other_seed).expect("a different seed schema opens");
+    let columns: Vec<String> = opened
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(
+        columns,
+        vec!["title"],
+        "the list's schema wins over the seed"
+    );
 
-    let err = Supertable::open(mismatched_opts)
-        .expect_err("open must surface OptionsHashMismatch for a reordered schema");
+    let other_id_column = default_supertable_options()
+        .with_id_column("row")
+        .expect("id column")
+        .with_writer_pool(pool)
+        .with_storage(Arc::clone(&storage));
+    let err = Supertable::open(other_id_column)
+        .expect_err("open must surface OptionsHashMismatch for another id column");
     assert!(
         matches!(
             err,

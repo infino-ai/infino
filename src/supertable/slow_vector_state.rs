@@ -31,8 +31,10 @@ use tempfile::NamedTempFile;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
+#[cfg(feature = "graph-index")]
+use crate::superfile::vector::adjacency;
 use crate::{
-    config,
+    config::{self, scratch_root},
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::vector::{flat, hnsw},
@@ -44,6 +46,7 @@ use crate::{
             part::{self, ContentHash, ManifestPart, PartId},
         },
         reader_cache::disk,
+        schema::{FieldId, LegacyNames},
     },
 };
 
@@ -134,11 +137,18 @@ fn encode_entries_with_mode(entries: &[Arc<SuperfileEntry>], mode: SummaryWireMo
     part::encode_with_mode(&synthetic, mode)
 }
 
-/// Decode a blob written by [`encode_entries`].
+/// Decode a blob written by [`encode_entries`]. `legacy` resolves the column
+/// names a blob written before field ids keyed its vector summaries by: this
+/// blob IS the serving membership until the next drain republishes it, so
+/// dropping a name-keyed summary here would leave every vector query on an
+/// upgraded table failing on an entry with no summary, not merely rebuild
+/// something later.
 pub(crate) fn decode_entries(
     bytes: &[u8],
+    legacy: &LegacyNames,
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    let decoded = part::decode(bytes).map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
+    let decoded =
+        part::decode(bytes, legacy).map_err(|e| SlowVectorStateError::Parse(e.to_string()))?;
     Ok(decoded.superfiles)
 }
 
@@ -164,10 +174,13 @@ fn encode_checkpoint_state(
     bytes
 }
 
-pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowVectorState, SlowVectorStateError> {
+pub(crate) fn decode_state(
+    bytes: &[u8],
+    legacy: &LegacyNames,
+) -> Result<SlowVectorState, SlowVectorStateError> {
     if !bytes.starts_with(CHECKPOINT_MAGIC) {
         return Ok(SlowVectorState {
-            entries: decode_entries(bytes)?,
+            entries: decode_entries(bytes, legacy)?,
             pending_drain: None,
         });
     }
@@ -206,38 +219,22 @@ pub(crate) fn decode_state(bytes: &[u8]) -> Result<SlowVectorState, SlowVectorSt
         ));
     }
     Ok(SlowVectorState {
-        entries: decode_entries(&bytes[CHECKPOINT_HEADER_BYTES..visible_end])?,
+        entries: decode_entries(&bytes[CHECKPOINT_HEADER_BYTES..visible_end], legacy)?,
         pending_drain: Some(PendingDrainState {
             metadata: bytes[visible_end..metadata_end].to_vec(),
-            entries: decode_entries(&bytes[metadata_end..pending_end])?,
+            entries: decode_entries(&bytes[metadata_end..pending_end], legacy)?,
         }),
     })
 }
-
-/// Above this size the slow-state blob is written via multipart (staged blocks)
-/// instead of a single PUT. Azure/S3 cap a single `Put Blob`/`PutObject` at
-/// ~5 GiB; the fp32-centroid slow state exceeds that at ~100M+ docs. 100 MiB
-/// matches the superfile multipart cutoff.
-const SLOW_STATE_MULTIPART_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
 async fn write_bytes(
     storage: &dyn StorageProvider,
     bytes: Vec<u8>,
 ) -> Result<(String, ContentHash), SlowVectorStateError> {
-    let content_hash = ContentHash::of(&bytes);
-    let uri = storage_path(&content_hash);
-    match crate::supertable::writer::put_bytes_multipart_or_atomic(
-        storage,
-        &uri,
-        Bytes::from(bytes),
-        SLOW_STATE_MULTIPART_THRESHOLD_BYTES,
-    )
-    .await
-    {
-        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {}
-        Err(error) => return Err(SlowVectorStateError::Storage(error.to_string())),
-    }
-    Ok((uri, content_hash))
+    let reference = crate::supertable::writer::put_content_addressed(storage, storage_path, bytes)
+        .await
+        .map_err(|error| SlowVectorStateError::Storage(error.to_string()))?;
+    Ok((reference.uri, reference.content_hash))
 }
 
 /// References to one published slow-state generation — exactly TWO
@@ -292,7 +289,7 @@ pub(crate) fn compose_centroid_section(
                     continue;
                 }
                 let carried = previous
-                    .map(|section| section.read_cell(entry.superfile_id, column, cell.cell_id))
+                    .map(|section| section.read_cell(entry.superfile_id, *column, cell.cell_id))
                     .transpose()
                     .map_err(|e| {
                         SlowVectorStateError::Storage(format!("previous section read: {e}"))
@@ -339,7 +336,7 @@ pub(crate) fn section_len(entries: &[Arc<SuperfileEntry>]) -> usize {
 /// iteration both the section encoder and the consumer offset walk share.
 pub(crate) fn sorted_summaries(
     entry: &SuperfileEntry,
-) -> impl Iterator<Item = (&String, &VectorSummary)> {
+) -> impl Iterator<Item = (&FieldId, &VectorSummary)> {
     let mut summaries: Vec<_> = entry.vector_summary.iter().collect();
     summaries.sort_by(|a, b| a.0.cmp(b.0));
     summaries.into_iter()
@@ -361,7 +358,7 @@ struct SectionCell {
 pub(crate) struct CentroidSection {
     uri: String,
     spill: NamedTempFile,
-    cells: HashMap<(Uuid, String), Vec<SectionCell>>,
+    cells: HashMap<(Uuid, FieldId), Vec<SectionCell>>,
 }
 
 impl CentroidSection {
@@ -379,10 +376,10 @@ impl CentroidSection {
     pub(crate) fn read_cell_bytes(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<u8>>> {
-        let Some(cells) = self.cells.get(&(superfile_id, column.to_owned())) else {
+        let Some(cells) = self.cells.get(&(superfile_id, column)) else {
             return Ok(None);
         };
         let Some(cell) = cells.iter().find(|c| c.cell_id == cell_id) else {
@@ -394,6 +391,42 @@ impl CentroidSection {
         Ok(Some(buf))
     }
 
+    /// Every fine centroid the section holds for `column`, each tagged with
+    /// its owning `(superfile_id, cell_id)`. Reads the spilled section blob
+    /// ONLY — no superfile is opened — so a router built from this touches no
+    /// hidden-index data, keeping drain-time memory to the centroid set (small)
+    /// rather than the whole resident index. Centroids are cluster-major within
+    /// each cell (`n_cent × dim` fp32); an empty or unreadable cell is skipped.
+    pub(crate) fn fine_centroids_for_column(
+        &self,
+        column: FieldId,
+    ) -> Vec<(Uuid, Option<u32>, Vec<f32>)> {
+        let mut out = Vec::new();
+        for ((superfile_id, col), cells) in &self.cells {
+            if *col != column {
+                continue;
+            }
+            for cell in cells {
+                let dim = cell.dim as usize;
+                if dim == 0 || cell.n_cent == 0 {
+                    continue;
+                }
+                let Ok(Some(bytes)) = self.read_cell_bytes(*superfile_id, column, cell.cell_id)
+                else {
+                    continue;
+                };
+                for chunk in bytes.chunks_exact(dim * 4) {
+                    let v: Vec<f32> = chunk
+                        .chunks_exact(4)
+                        .map(|b| f32::from_le_bytes(b.try_into().expect("chunks_exact(4)")))
+                        .collect();
+                    out.push((*superfile_id, cell.cell_id, v));
+                }
+            }
+        }
+        out
+    }
+
     /// Read one cell's fp32 fine centroids (cluster-major, `n_cent × dim`).
     /// `Ok(None)` when the `(superfile, column, cell)` triple is not in the
     /// section; a spill-read fault is an error, never "absent" — mapping it
@@ -401,7 +434,7 @@ impl CentroidSection {
     pub(crate) fn read_cell(
         &self,
         superfile_id: Uuid,
-        column: &str,
+        column: FieldId,
         cell_id: Option<u32>,
     ) -> io::Result<Option<Vec<f32>>> {
         Ok(self
@@ -434,7 +467,9 @@ pub(crate) async fn fetch_centroid_section(
             meta.size
         )));
     }
-    let spill = NamedTempFile::new().map_err(io_err)?;
+
+    let scratch_root = scratch_root();
+    let spill = NamedTempFile::new_in(&scratch_root).map_err(io_err)?;
     let mut hasher = blake3::Hasher::new();
     // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,
     // bounded in flight. `buffered` yields chunks in range order, so each
@@ -461,7 +496,7 @@ pub(crate) async fn fetch_centroid_section(
         return Err(SlowVectorStateError::HashMismatch);
     }
 
-    let mut cells: HashMap<(Uuid, String), Vec<SectionCell>> = HashMap::new();
+    let mut cells: HashMap<(Uuid, FieldId), Vec<SectionCell>> = HashMap::new();
     let mut cursor = 0u64;
     for entry in entries {
         for (column, summary) in sorted_summaries(entry) {
@@ -475,7 +510,7 @@ pub(crate) async fn fetch_centroid_section(
                 });
                 cursor += cell.clusters.n_cent as u64 * cell.clusters.dim as u64 * 4;
             }
-            cells.insert((entry.superfile_id, column.clone()), list);
+            cells.insert((entry.superfile_id, *column), list);
         }
     }
     Ok(CentroidSection {
@@ -660,6 +695,10 @@ pub(crate) enum ResidentIndexKind {
     /// The flat 4-bit index: a nibble plane + ruler + node→doc-id map, and
     /// deliberately no Sq16 plane.
     Flat(flat::Sq4FlatIndex),
+    /// A knowledge graph's adjacency over an edge table: each node's table
+    /// and `_id`, plus the single-level graph the walks read.
+    #[cfg(feature = "graph-index")]
+    Adjacency(adjacency::AdjacencyIndex),
 }
 
 impl ResidentIndexKind {
@@ -672,6 +711,8 @@ impl ResidentIndexKind {
         match self {
             ResidentIndexKind::Graph(g) => Some(g),
             ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            ResidentIndexKind::Adjacency(_) => None,
         }
     }
 
@@ -680,6 +721,18 @@ impl ResidentIndexKind {
         match self {
             ResidentIndexKind::Flat(f) => Some(f),
             ResidentIndexKind::Graph(_) => None,
+            #[cfg(feature = "graph-index")]
+            ResidentIndexKind::Adjacency(_) => None,
+        }
+    }
+
+    /// The adjacency, or `None` when this generation published a vector
+    /// index.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn adjacency(&self) -> Option<&adjacency::AdjacencyIndex> {
+        match self {
+            ResidentIndexKind::Adjacency(a) => Some(a),
+            ResidentIndexKind::Graph(_) | ResidentIndexKind::Flat(_) => None,
         }
     }
 }
@@ -760,6 +813,14 @@ pub(crate) async fn hydrate_resident_index(
             Some((hnsw::PayloadKind::Flat, b)) => {
                 flat::Sq4FlatIndex::decode(b).map(ResidentIndexKind::Flat)
             }
+            // A build without the `graph-index` feature has no `Adjacency`
+            // kind: an edge table's envelope reads as an unknown payload
+            // there, and the generation serves no resident index, as a
+            // payload that failed to decode would.
+            #[cfg(feature = "graph-index")]
+            Some((hnsw::PayloadKind::Adjacency, b)) => {
+                adjacency::AdjacencyIndex::decode(b).map(ResidentIndexKind::Adjacency)
+            }
         };
         Ok::<_, SlowVectorStateError>((bundle.high_water_id, data))
     })
@@ -783,6 +844,12 @@ pub(crate) async fn hydrate_resident_index(
             resident_mib = idx.resident_bytes() / (1024 * 1024),
             "flat: resident index hydrated"
         ),
+        #[cfg(feature = "graph-index")]
+        Some(ResidentIndexKind::Adjacency(idx)) => tracing::debug!(
+            nodes = idx.len(),
+            resident_graph_mib = idx.resident_graph_bytes() / (1024 * 1024),
+            "adjacency: resident index hydrated"
+        ),
         None => {}
     }
     Ok(ResidentVectorIndex {
@@ -799,17 +866,22 @@ pub(crate) async fn load_state(
     storage: &dyn StorageProvider,
     uri: &str,
     expected: &ContentHash,
+    legacy: &LegacyNames,
 ) -> Result<Vec<Arc<SuperfileEntry>>, SlowVectorStateError> {
-    Ok(load_full_state(storage, uri, expected).await?.entries)
+    Ok(load_full_state(storage, uri, expected, legacy)
+        .await?
+        .entries)
 }
 
 pub(crate) async fn load_full_state(
     storage: &dyn StorageProvider,
     uri: &str,
     expected: &ContentHash,
+    legacy: &LegacyNames,
 ) -> Result<SlowVectorState, SlowVectorStateError> {
     let bytes = fetch_blob_striped(storage, uri, STRIPED_FETCH_CHUNK_BYTES).await?;
     let expected = *expected;
+    let legacy = legacy.clone();
     // blake3 over the whole blob plus the Avro parse is a CPU wave
     // (multi-GiB at 100M docs); run it on the blocking pool so the
     // runtime keeps driving I/O instead of stalling behind the decode.
@@ -817,7 +889,7 @@ pub(crate) async fn load_full_state(
         if ContentHash::of(bytes.as_ref()) != expected {
             return Err(SlowVectorStateError::HashMismatch);
         }
-        decode_state(bytes.as_ref())
+        decode_state(bytes.as_ref(), &legacy)
     }))
     .await
     {
@@ -882,7 +954,10 @@ mod tests {
     use crate::{
         storage::LocalFsStorageProvider,
         superfile::vector::{layout::VectorLayout, quant::BitQuantizer, rotation::RandomRotation},
-        supertable::manifest::{CellVectorSummary, ClusterCentroids, SuperfileUri, VectorSummary},
+        supertable::manifest::{
+            CellVectorSummary, ClusterCentroids, ScalarStats, SuperfileUri, VectorSummary,
+        },
+        test_helpers::fid,
     };
 
     /// Doc count for the first fixture entry; arbitrary but distinct from
@@ -894,6 +969,7 @@ mod tests {
     fn entry(n_docs: u64, cell: u32) -> Arc<SuperfileEntry> {
         let id = Uuid::new_v4();
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 3,
             superfile_id: id,
@@ -901,7 +977,7 @@ mod tests {
             n_docs,
             id_min: 10,
             id_max: 10 + n_docs.saturating_sub(1) as i128,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: cell.to_le_bytes().to_vec(),
@@ -949,7 +1025,7 @@ mod tests {
             ROUTING_FIXTURE_ROT_SEED,
         );
         e.vector_summary.insert(
-            "emb".into(),
+            fid("emb"),
             VectorSummary {
                 centroid: vec![0.5; ROUTING_FIXTURE_DIM],
                 cells: vec![CellVectorSummary {
@@ -976,7 +1052,7 @@ mod tests {
     fn entries_roundtrip_and_deterministic() {
         let entries = vec![entry(FIRST_N_DOCS, 0), entry(SECOND_N_DOCS, 5)];
         let bytes = encode_entries(&entries);
-        let decoded = decode_entries(&bytes).expect("decode");
+        let decoded = decode_entries(&bytes, &LegacyNames::none()).expect("decode");
         assert_eq!(decoded.len(), entries.len());
         for (d, e) in decoded.iter().zip(entries.iter()) {
             assert_entries_match(d, e);
@@ -993,7 +1069,7 @@ mod tests {
 
     #[test]
     fn decode_garbage_is_parse_error() {
-        let err = decode_entries(&[0u8; 16]).expect_err("garbage");
+        let err = decode_entries(&[0u8; 16], &LegacyNames::none()).expect_err("garbage");
         assert!(matches!(err, SlowVectorStateError::Parse(_)), "{err:?}");
     }
 
@@ -1022,9 +1098,9 @@ mod tests {
             .await
             .expect("fetch section");
         for entry in &entries {
-            let cell = &entry.vector_summary["emb"].cells[0];
+            let cell = &entry.vector_summary[&fid("emb")].cells[0];
             let got = fetched
-                .read_cell(entry.superfile_id, "emb", cell.cell_id)
+                .read_cell(entry.superfile_id, fid("emb"), cell.cell_id)
                 .expect("spill read")
                 .expect("cell served");
             assert_eq!(got, cell.clusters.centroids, "fp32 must round-trip");
@@ -1032,7 +1108,7 @@ mod tests {
         // Unknown cells miss cleanly (caller falls back).
         assert!(
             fetched
-                .read_cell(entries[0].superfile_id, "emb", Some(999))
+                .read_cell(entries[0].superfile_id, fid("emb"), Some(999))
                 .expect("spill read")
                 .is_none()
         );
@@ -1047,7 +1123,8 @@ mod tests {
             entries: pending_entries.clone(),
         };
         let bytes = encode_checkpoint_state(&visible, &pending);
-        let decoded = decode_state(&bytes).expect("decode checkpoint envelope");
+        let decoded =
+            decode_state(&bytes, &LegacyNames::none()).expect("decode checkpoint envelope");
         assert_eq!(decoded.entries.len(), 1);
         assert_entries_match(&decoded.entries[0], &visible[0]);
         let decoded_pending = decoded.pending_drain.expect("pending drain");
@@ -1141,19 +1218,26 @@ mod tests {
         assert_eq!(hash, republished.content_hash);
         assert_eq!(published.centroids, republished.centroids);
 
-        let loaded = load_state(&storage, &uri, &hash).await.expect("load");
+        let loaded = load_state(&storage, &uri, &hash, &LegacyNames::none())
+            .await
+            .expect("load");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
 
         let wrong = ContentHash::of(b"wrong");
-        let err = load_state(&storage, &uri, &wrong)
+        let err = load_state(&storage, &uri, &wrong, &LegacyNames::none())
             .await
             .expect_err("hash mismatch");
         assert!(matches!(err, SlowVectorStateError::HashMismatch), "{err:?}");
 
-        let missing = load_state(&storage, "slow-vector-state/absent.bin", &hash)
-            .await
-            .expect_err("missing object");
+        let missing = load_state(
+            &storage,
+            "slow-vector-state/absent.bin",
+            &hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect_err("missing object");
         assert!(
             matches!(missing, SlowVectorStateError::Storage(_)),
             "{missing:?}"
@@ -1168,7 +1252,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
         let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
-        let expected_slab = entries[0].vector_summary["emb"].cells[0]
+        let expected_slab = entries[0].vector_summary[&fid("emb")].cells[0]
             .clusters
             .admit_codes_built()
             .expect("write-time slab")
@@ -1193,12 +1277,17 @@ mod tests {
         );
         assert!(blob_len > 0, "state blob must be non-empty");
 
-        let loaded = load_state(&storage, &published.uri, &published.content_hash)
-            .await
-            .expect("load blob");
+        let loaded = load_state(
+            &storage,
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load blob");
         assert_eq!(loaded.len(), 1);
         assert_entries_match(&loaded[0], &entries[0]);
-        let clusters = &loaded[0].vector_summary["emb"].cells[0].clusters;
+        let clusters = &loaded[0].vector_summary[&fid("emb")].cells[0].clusters;
         assert!(
             !clusters.vectors_resident(),
             "state-blob entries land in the stripped shape"
@@ -1219,23 +1308,28 @@ mod tests {
         let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
             .await
             .expect("checkpoint write");
-        let state = load_full_state(&storage, &checkpoint.uri, &checkpoint.content_hash)
-            .await
-            .expect("load checkpoint");
+        let state = load_full_state(
+            &storage,
+            &checkpoint.uri,
+            &checkpoint.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("load checkpoint");
         assert_eq!(
             state.entries.len(),
             entries.len(),
             "checkpoint blob carries the visible entries"
         );
         assert!(
-            !state.entries[0].vector_summary["emb"].cells[0]
+            !state.entries[0].vector_summary[&fid("emb")].cells[0]
                 .clusters
                 .vectors_resident(),
             "visible checkpoint entries are stripped"
         );
         let pending_loaded = state.pending_drain.expect("pending state rides the blob");
         assert!(
-            pending_loaded.entries[0].vector_summary["emb"].cells[0]
+            pending_loaded.entries[0].vector_summary[&fid("emb")].cells[0]
                 .clusters
                 .vectors_resident(),
             "pending entries keep fp32 inline for drain resume"
@@ -1261,13 +1355,20 @@ mod tests {
 
         // Round-trip the entries through the routing wire — the stripped
         // shape a writer's hydrated manifest carries at republish time.
-        let stripped = load_state(&storage, &published.uri, &published.content_hash)
-            .await
-            .expect("hydrate stripped");
+        let stripped = load_state(
+            &storage,
+            &published.uri,
+            &published.content_hash,
+            &LegacyNames::none(),
+        )
+        .await
+        .expect("hydrate stripped");
         assert!(
             stripped
                 .iter()
-                .all(|e| !e.vector_summary["emb"].cells[0].clusters.vectors_resident()),
+                .all(|e| !e.vector_summary[&fid("emb")].cells[0]
+                    .clusters
+                    .vectors_resident()),
             "fixture must exercise the stripped path"
         );
         assert!(

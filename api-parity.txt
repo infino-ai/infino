@@ -12,6 +12,7 @@ Connection::drop_table	covered	(&self, &str, bool) -> Result<(), InfinoError>
 Connection::list_tables	covered	(&self) -> Result<Vec<String>, InfinoError>
 Connection::open_table	covered	(&self, &str) -> Result<Supertable, InfinoError>
 Connection::query_sql	covered	(&self, &str) -> Result<Vec<RecordBatch>, InfinoError>
+Connection::schema	covered	(&self, &str) -> Result<TableSchema, InfinoError>
 Supertable::append	covered	(&self, &RecordBatch) -> Result<(), InfinoError>
 Supertable::append_named	covered	(&self, &RecordBatch, &str) -> Result<(), InfinoError>
 Supertable::bm25_search	covered	(&self, &str, &str, usize, Bm25SearchOptions, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
@@ -20,7 +21,10 @@ Supertable::delete	covered	(&self, Expr) -> Result<MutationStats, InfinoError>
 Supertable::exact_match	covered	(&self, &str, &str, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::gc	covered	(&self, Duration) -> Result<GcReport, GcError>
 Supertable::hybrid_search	covered	(&self, &str, &str, BoolMode, &str, &[f32], usize, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
+Supertable::index_staleness	covered	(&self, &ReindexOptions) -> Result<StalenessReport, ReindexError>
 Supertable::optimize	covered	(&self, &OptimizeOptions) -> Result<(), OptimizeError>
+Supertable::reindex	covered	(&self, &ReindexOptions) -> Result<ReindexReport, ReindexError>
+Supertable::reindex_plan	covered	(&self, &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>
 Supertable::schema	covered	(&self) -> SchemaRef
 Supertable::token_match	covered	(&self, &str, &str, BoolMode, Option<&[&str]>) -> Result<Vec<RecordBatch>, InfinoError>
 Supertable::update	covered	(&self, Expr, &RecordBatch) -> Result<MutationStats, InfinoError>
@@ -28,4 +32,12 @@ Supertable::vector_search	covered	(&self, &str, &[f32], usize, Option<VectorFilt
 connect	covered	(impl AsRef<str>) -> Result<Connection, InfinoError>
 connect_with	covered	(impl AsRef<str>, ConnectOptions) -> Result<Connection, InfinoError>
 
-Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface.
+Connection::apply_schema	exempt	the bindings fold the write into the `schema(name, patch, expected_schema_id)` overload; a second method would be a parallel API
+Connection::update_storage_credentials	exempt	Rotates an object-store credential in place; Rust-embedder API, not part of the language-binding operation surface
+Supertable::append_rows	exempt	the bindings' append(rows) routes record input through it; their public shape is the one append
+Supertable::append_rows_named	exempt	the bindings' append_named(rows, source) routes record input through it; one public method per binding
+Supertable::apply_schema	exempt	the bindings change a named table's schema through the connection's `schema(name, patch, expected_schema_id)` overload; this handle form exists for companion tables, which have no catalog name, and the bindings create no companions
+Supertable::companion	exempt	companion tables are declared through the Rust IndexSpec for embedders that keep their own state beside a table; the bindings create no companions, so there is none to reach
+Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
+Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
+Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update

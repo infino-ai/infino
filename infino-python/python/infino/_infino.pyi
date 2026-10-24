@@ -5,7 +5,11 @@ from pyarrow import RecordBatch, Schema, Table as ArrowTable
 
 Metric: TypeAlias = Literal["cosine", "l2sq", "l2", "negdot", "dot"]
 BoolMode: TypeAlias = Literal["or", "and"]
-Bm25Stats: TypeAlias = Literal["per_superfile", "global"]
+# How much a reindex repairs: "auto" gives each superfile the cheapest repair
+# that makes it current; "rewrite" brings layouts current and leaves superfiles
+# whose terms are stale (reported); "reanalyze" re-tokenizes every stale
+# superfile from its stored text.
+ReindexMode: TypeAlias = Literal["auto", "rewrite", "reanalyze"]
 ColdFetchMode: TypeAlias = Literal[
     "hybrid_with_prefetch",
     "range_only",
@@ -73,10 +77,38 @@ class ConflictError(InfinoError):
     retries were exhausted. Recoverable: nothing partial is visible, so catch it,
     back off, and reissue the append / update / delete."""
 
+class SchemaError(ValueError):
+    """Raised when the schema refuses a write: a batch whose types disagree with
+    the table, a row document the mapper cannot map, or a schema change the table
+    will not take. ``kind`` names the cause (``TypeMismatch``,
+    ``FieldCapExceeded``, ``SchemaConflict``, …) for code that has to tell one
+    from another; ``str(e)`` is the message, which names the column, cap or
+    version at fault and is written to be read rather than matched on.
+
+    Based on ``ValueError``, which is what every schema refusal raised before it
+    had a class of its own, so existing ``except ValueError`` keeps working."""
+
+    kind: str
+
+class AlreadyRunningError(InfinoError):
+    """Raised by ``reindex`` when an ``optimize`` or another reindex already holds
+    the table. Recoverable: nothing was changed, so catch it and try again once
+    the other run has finished."""
+
 class Connection:
     def create_database(self) -> None: ...
     def create_table(self, name: str, schema: Schema, indexes: IndexSpec) -> Table: ...
     def open_table(self, name: str) -> Table: ...
+    # The schema document (fields with ids, types, nullability, indexes; the
+    # field cap; `schema_id`). With `patch`, a dict in the same shape, merge it
+    # into the schema — creating the table when there is none — and return
+    # the document afterwards; `expected_schema_id` is a compare-and-set.
+    def schema(
+        self,
+        name: str,
+        patch: dict[str, Any] | None = None,
+        expected_schema_id: int | None = None,
+    ) -> dict[str, Any]: ...
     def drop_table(self, name: str, purge: bool = True) -> None: ...
     def list_tables(self) -> list[str]: ...
     def query_sql(self, sql: str) -> ArrowTable: ...
@@ -97,8 +129,9 @@ class IndexSpec:
     # text is never kept, so it cannot be selected, projected, or filtered on.
     # `k1` / `b` are the column's BM25 similarity parameters (defaults 1.2 and
     # 0.75); pass both or neither. The stored score bounds are built with them.
-    # The three analysis options are keyword-only and come after `b`, so
-    # existing positional calls keep their meaning.
+    # `analyzer` names the base tokenizer; `"standard"`, the default, is the
+    # only one. The three analysis options are keyword-only and come after
+    # `b`, so existing positional calls keep their meaning.
     def fts(
         self,
         column: str,
@@ -116,6 +149,9 @@ class IndexSpec:
 
 class Table:
     def append(self, data: RowData) -> None: ...
+    # `append`, naming the source the rows came from; the name becomes part of
+    # the superfile's object key. Not available on a hosted table.
+    def append_named(self, data: RowData, source_name: str) -> None: ...
     # `k1` / `b` override the columns' declared parameters for this search
     # only; pass both or neither. Results stay exact — only pruning power is
     # traded — and nothing is rebuilt.
@@ -126,7 +162,7 @@ class Table:
         k: int,
         mode: BoolMode | None = ...,
         projection: Sequence[str] | None = ...,
-        stats: Bm25Stats | None = ...,
+        *,
         k1: float | None = ...,
         b: float | None = ...,
     ) -> ArrowTable: ...
@@ -183,6 +219,14 @@ class Table:
     def update(self, predicate: str, new_rows: RowData) -> MutationStats: ...
     def optimize(self, settings: OptimizeOptions | None = ...) -> None: ...
     def gc(self, grace_secs: float) -> GcReport: ...
+    # Repairs every superfile whose full-text index is behind what this engine
+    # writes; rows, their order and their `_id`s are unchanged. All three
+    # reindex calls raise `ValueError` on a `memory://` or hosted table, which
+    # has no storage of its own to repair; `reindex` raises `AlreadyRunningError`
+    # while an `optimize` or another reindex holds the table.
+    def reindex(self, options: ReindexOptions | None = ...) -> ReindexReport: ...
+    def reindex_plan(self, options: ReindexOptions | None = ...) -> list[PlannedRepair]: ...
+    def index_staleness(self, options: ReindexOptions | None = ...) -> StalenessReport: ...
     def schema(self) -> Schema: ...
 
 class MutationStats:
@@ -215,4 +259,55 @@ class OptimizeOptions:
         min_fill_percent: int | None = ...,
         target_superfile_size_mb: int | None = ...,
         stale_seal_timeout_ms: int | None = ...,
+        recalibrate: Literal["auto", "force", "skip"] | None = ...,
     ) -> None: ...
+
+class ReindexOptions:
+    def __init__(
+        self,
+        *,
+        mode: ReindexMode | None = ...,
+        stale_seal_timeout_ms: int | None = ...,
+    ) -> None: ...
+
+class ReindexReport:
+    @property
+    def rewritten(self) -> int: ...
+    @property
+    def already_current(self) -> int: ...
+    @property
+    def awaiting_reanalysis(self) -> int: ...
+    @property
+    def held_by_another_run(self) -> int: ...
+    @property
+    def unrepairable_columns(self) -> list[str]: ...
+    @property
+    def inconsistent_footers(self) -> list[str]: ...
+    def __repr__(self) -> str: ...
+
+class StalenessReport:
+    @property
+    def superfiles(self) -> int: ...
+    @property
+    def needing_rewrite(self) -> int: ...
+    @property
+    def awaiting_reanalysis(self) -> int: ...
+    @property
+    def bytes_to_rewrite(self) -> int: ...
+    @property
+    def unrepairable_columns(self) -> list[str]: ...
+    @property
+    def inconsistent_footers(self) -> list[str]: ...
+    @property
+    def is_current(self) -> bool: ...
+    def __repr__(self) -> str: ...
+
+class PlannedRepair:
+    @property
+    def superfile_id(self) -> str: ...
+    # Never "auto": the plan has already resolved it per superfile.
+    @property
+    def mode(self) -> Literal["rewrite", "reanalyze"]: ...
+    @property
+    def live_bytes(self) -> int: ...
+    def __repr__(self) -> str: ...

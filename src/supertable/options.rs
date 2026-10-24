@@ -1,7 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! `SupertableOptions` — the immutable per-supertable configuration.
+//! `SupertableOptions` — the immutable per-handle configuration.
+//!
+//! ## What the options are, and are not
+//!
+//! The options carry what a caller must supply to open a table (its id
+//! column and partition strategy — the identity the manifest list's hash
+//! verifies), the runtime knobs (pools, caches, consistency, thresholds),
+//! and the *creation seed*: the schema and index configs the table is
+//! created with. Once a table exists, the manifest list is the authority
+//! for its schema and index config: `ManifestSnapshot::table_schema` and
+//! the accessors beside it are what every read and write path consults.
+//! The seed is read to create the table, and to open a list written before
+//! the list carried a schema.
 //!
 //! ## Shape
 //!
@@ -41,11 +53,11 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Schema};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
@@ -57,7 +69,10 @@ use super::{
     },
 };
 use crate::{
-    config::{Config, DrainConsolidate, StorageBackend, StorageColdFetchMode, ThreadCount},
+    config::{
+        Config, CrcVerification, DrainConsolidate, StorageBackend, StorageColdFetchMode,
+        ThreadCount,
+    },
     memory::ConnectionMemoryBudget,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
@@ -66,17 +81,16 @@ use crate::{
     superfile::{
         OpenOptions,
         builder::{BuilderOptions, FtsConfig, VectorConfig},
-        fts::{
-            analysis::{Base, chain_tokenizer},
-            tokenize::{Tokenizer, tokenizer_for_name},
-        },
         vector::layout::VectorLayout,
     },
     supertable::{
+        companion::CompanionSpec,
         manifest::{
             SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
         },
+        schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
+        wal::pipeline::DEFAULT_MAX_SEALED_RETRIES,
     },
 };
 
@@ -126,7 +140,7 @@ pub(crate) struct GappedIdPlacementCache {
 const VECTOR_DIM_MIN: usize = 16;
 const VECTOR_DIM_MAX: usize = 4096;
 
-/// Reserved separator inside FTS FST keys (`<col>\x1F<term>`); user
+/// Reserved separator inside FTS dictionary keys (`<col>\x1F<term>`); user
 /// column names must not contain it. Mirrors superfile's
 /// `check_user_column_name`.
 const RESERVED_SEPARATOR: char = '\x1F';
@@ -190,20 +204,6 @@ fn default_id_column() -> String {
     "_id".to_string()
 }
 
-/// Arrow / Parquet decimal precision for the id column. 38 is
-/// the maximum precision a `Decimal128` can carry — covers
-/// every possible 128-bit value without truncation, lets
-/// Parquet annotate the column as `DECIMAL(38, 0)`, and
-/// preserves byte-comparable / numerically-comparable sort
-/// order against the underlying `i128`.
-pub(crate) const DECIMAL128_PRECISION: u8 = 38;
-
-/// Scale of zero — the id column carries integers, not
-/// fractions. With precision 38 and scale 0, the column
-/// behaves as a signed 128-bit integer for both Arrow's
-/// comparison kernels and Parquet's stats encoding.
-pub(crate) const DECIMAL128_SCALE: i8 = 0;
-
 /// Default bounded-staleness window for read consistency — how long
 /// a hot query may reuse a manifest pointer before re-checking.
 const DEFAULT_READ_STALENESS_SECS: u64 = 1;
@@ -219,6 +219,11 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// triggered them. Lazy load stays available as an explicit opt-in
 /// (`with_eager_load_threshold(0)`).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
+/// Default for [`SupertableOptions::bound_ordered_open_window`]. Sixty-four
+/// covers any compacted table up to a few hundred million rows outright, so
+/// the ceiling order changes nothing there; pruning begins where tables have
+/// more superfiles than that, which is where it pays.
+const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -302,6 +307,10 @@ pub struct SupertableOptions {
     /// Must NOT contain a field named [`Self::id_column`] — the
     /// supertable injects that column at append time.
     pub schema: Arc<Schema>,
+    /// Stable identity of every user column (see [`crate::supertable::schema`]).
+    /// Derived from `schema` at construction; the ids ride on the stored
+    /// Parquet schema, never on `schema` itself.
+    pub(crate) table_schema: Arc<TableSchema>,
     /// Name of the system-managed primary-key column the
     /// supertable injects on every `append()`. Defaults to
     /// `"_id"`; override via [`Self::with_id_column`] or by
@@ -363,6 +372,14 @@ pub struct SupertableOptions {
     /// restarts. Independent of `disk_cache` (which caches superfile
     /// content) and uses its own byte budget. `None` disables it.
     pub manifest_disk_cache: Option<Arc<ManifestDiskCache>>,
+    /// Superfiles a ranked query opens concurrently when it orders them by
+    /// score ceiling. Below this many candidates every superfile opens at
+    /// once, exactly as the unordered fan-out does, so ordering costs no
+    /// parallelism; above it, the first results raise the shared floor and
+    /// a later superfile whose ceiling is below it is never opened. This is
+    /// I/O concurrency, deliberately independent of the reader pool's CPU
+    /// width: a one-thread pool must not serialize fifteen superfile opens.
+    pub bound_ordered_open_window: usize,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -440,6 +457,16 @@ pub struct SupertableOptions {
     /// scan. Contiguous entries resolve by arithmetic and are never cached (no
     /// RAM). The interim of a write-time on-disk index (#556).
     pub(crate) gapped_id_placement_cache: Arc<TokioMutex<GappedIdPlacementCache>>,
+    /// User superfiles whose stable-id sidecar failed its checks, so cold
+    /// `_id` reads go straight to the column without fetching or warning
+    /// again. Superfiles are immutable, so a damaged sidecar stays damaged;
+    /// this outlives any one reader, which the cache can evict or stream.
+    pub(crate) damaged_id_sidecars: Arc<Mutex<HashSet<SuperfileUri>>>,
+    /// Rows per Parquet row group in the superfiles this table writes, in
+    /// place of the builder's default, so a test reaches several row groups
+    /// with a few thousand rows.
+    #[cfg(test)]
+    pub(crate) row_group_size: Option<usize>,
     /// Single-slot cache for the user table's fp32 fine centroids, hydrated
     /// once per manifest generation from the FULL manifest parts on the
     /// first stripped-summary rescore (consumers open with routing parts,
@@ -540,6 +567,12 @@ pub struct SupertableOptions {
     /// concurrent-writer contention; writer-heavy workloads can
     /// raise via [`Self::with_max_commit_retries`].
     pub max_commit_retries: u32,
+    /// How many sealed-sidecar retries a mutation may spend without forward
+    /// progress before it gives up with `SealedSidecarRetryExhausted`.
+    /// Progress refunds the budget, so a healthy table never reaches this;
+    /// tests lower it to reach the exhausted path in bounded time. Raise via
+    /// [`Self::with_max_sealed_retries`].
+    pub max_sealed_retries: u32,
     /// Auto-flush threshold for the writer's in-memory buffer,
     /// in MiB of accumulated raw payload (Arrow scalar columns +
     /// f32 vector slices). When the buffer crosses this
@@ -577,18 +610,14 @@ pub struct SupertableOptions {
     /// set to a tiny value (e.g. `1`) to force every
     /// superfile through the multipart path (useful for tests).
     pub put_multipart_threshold_bytes: u64,
-    /// Whether the supertable's read-side opens of
-    /// `SuperfileReader` should verify the trailing whole-
-    /// blob CRC and per-subsection CRCs. Default `true`. The
-    /// supertable threads this through
-    /// `SuperfileReader::open_with`'s
-    /// `OpenOptions { verify_crc }` on every open it
-    /// performs (writer post-commit summary extraction, disk
-    /// cache cold-fetch finalize). Set `false` when the
-    /// underlying storage already validates checksums —
-    /// content-addressed object stores, ZFS, etc. — to skip
-    /// the scan.
-    pub verify_crc_on_open: bool,
+    /// When this table verifies a superfile's stored checksums: the
+    /// trailing whole-blob CRC and the per-subsection ones. Under the
+    /// default [`CrcVerification::Auto`] that is once, as bytes land in
+    /// the disk cache, and not on the opens that read them back. The
+    /// supertable threads the answer through `SuperfileReader::open_with`'s
+    /// `OpenOptions { verify_crc }` on every open it performs, so one
+    /// setting covers them all.
+    pub crc_verification: CrcVerification,
     /// Read-path freshness policy. The query path checks the manifest
     /// pointer for the caller per this setting (see [`Consistency`]);
     /// the application never refreshes by hand. Default:
@@ -616,6 +645,11 @@ pub struct SupertableOptions {
     /// Per-table override for the **hidden** vector-index grid's cell
     /// count. `None` → `vector.hidden_cell_count` from the YAML config.
     pub hidden_cell_count: Option<usize>,
+    /// Hidden companion tables to create beside the table, each under this
+    /// one's storage at its own prefix, recorded on its manifest and
+    /// reopened from there. Read at create only; on open the manifest says
+    /// which companions exist. Requires storage. Default empty.
+    pub(crate) companions: Vec<CompanionSpec>,
 }
 
 impl SupertableOptions {
@@ -733,29 +767,19 @@ impl SupertableOptions {
             }
         }
 
-        // 5. Each FTS column's base tokenizer name must resolve.
-        //    Validating here surfaces a typo at construction with a
-        //    typed error, instead of at the first commit's builder
-        //    construction. The stopword set and stemmer need no check:
-        //    they arrive as enums, so an unrepresentable one cannot be
-        //    constructed. (A *persisted* filter name is different and is
-        //    validated where it is read.)
-        for fc in &fts_columns {
-            if tokenizer_for_name(&fc.analyzer).is_none() {
-                return Err(BuildError::UnknownAnalyzer {
-                    column: fc.column.clone(),
-                    analyzer: fc.analyzer.clone(),
-                });
-            }
-        }
-
-        // 6. Shared thread pools + a fresh store.
+        // 5. Shared thread pools + a fresh store.
         let reader_pool = shared_reader_pool();
         let writer_pool = shared_writer_pool();
         let store: Arc<dyn SuperfileReaderCache> = Arc::new(InMemoryReaderCache::new());
 
+        let table_schema = Arc::new(TableSchema::from_options(
+            &schema,
+            &fts_columns,
+            &vector_columns,
+        ));
         Ok(Self {
             schema,
+            table_schema,
             id_column,
             fts_columns,
             vector_columns,
@@ -765,6 +789,7 @@ impl SupertableOptions {
             storage: None,
             disk_cache: None,
             manifest_disk_cache: None,
+            bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -776,6 +801,9 @@ impl SupertableOptions {
             centroid_router_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             centroid_router_build_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
+            damaged_id_sidecars: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            row_group_size: None,
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
@@ -787,37 +815,17 @@ impl SupertableOptions {
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,
             max_commit_retries: DEFAULT_MAX_COMMIT_RETRIES,
+            max_sealed_retries: DEFAULT_MAX_SEALED_RETRIES,
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
             put_multipart_threshold_bytes: DEFAULT_PUT_MULTIPART_THRESHOLD_BYTES,
-            verify_crc_on_open: true,
+            crc_verification: CrcVerification::default(),
             read_consistency: Consistency::default(),
             summary_centroids_from_superfiles: false,
             user_cell_count: None,
             hidden_cell_count: None,
+            companions: Vec::new(),
         })
-    }
-
-    /// Schema as the user supplied it — the shape that
-    /// `Supertable::append`'s callers build their batches
-    /// against. By contract the user schema never contains
-    /// the id column; the supertable injects it at append
-    /// time.
-    pub fn user_schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.schema)
-    }
-
-    /// Schema with the id column prepended — what the writer's
-    /// commit path hands to `SuperfileBuilder` and what Parquet
-    /// stores.
-    pub fn effective_schema(&self) -> Arc<Schema> {
-        let mut fields = vec![Arc::new(Field::new(
-            &self.id_column,
-            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            false,
-        ))];
-        fields.extend(self.schema.fields().iter().cloned());
-        Arc::new(Schema::new(fields))
     }
 
     /// Resolve the effective partition strategy for this
@@ -867,6 +875,13 @@ impl SupertableOptions {
         self
     }
 
+    /// Create the table with `companions` beside it. See
+    /// [`Self::companions`].
+    pub(crate) fn with_companions(mut self, companions: Vec<CompanionSpec>) -> Self {
+        self.companions = companions;
+        self
+    }
+
     /// Set the read-path freshness policy. See [`Consistency`].
     /// Default: [`Consistency::BoundedStaleness`] with a 1s window.
     pub fn with_read_consistency(mut self, consistency: Consistency) -> Self {
@@ -899,23 +914,6 @@ impl SupertableOptions {
         self
     }
 
-    /// Tokenizer configured for `column`, or `None` when `column` carries
-    /// no full-text index — a `None` return is exactly the "column is not
-    /// full-text-indexed" signal, which lets a search path reject up front
-    /// instead of failing deep in the scan. Resolves the column's analyzer
-    /// name from its `FtsConfig` (validated at construction, so the
-    /// resolution cannot fail for a registered column). The lookup is a
-    /// single pass over `fts_columns`.
-    pub fn try_fts_tokenizer_for(&self, column: &str) -> Option<Arc<dyn Tokenizer>> {
-        let cfg = self.fts_columns.iter().find(|c| c.column == column)?;
-        // The whole chain, not the base: every caller here tokenizes
-        // query-side text — search terms, an equality literal, a `LIKE`
-        // fragment — and must produce the forms the column was indexed
-        // under.
-        let base = Base::from_name(&cfg.analyzer)?;
-        Some(chain_tokenizer(base, cfg.stopwords, cfg.stemmer))
-    }
-
     /// Attach a disk cache for storage-backed reads.
     /// Must be paired with [`Self::with_storage`]; attaching a
     /// cache without storage is caught at create / open time.
@@ -939,6 +937,13 @@ impl SupertableOptions {
     /// resulting `Arc<DiskCacheStore>` here.
     pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
         self.disk_cache = Some(cache);
+        self
+    }
+
+    /// Set how many superfiles a ceiling-ordered ranked query opens at once
+    /// (see [`Self::bound_ordered_open_window`]).
+    pub fn with_bound_ordered_open_window(mut self, window: usize) -> Self {
+        self.bound_ordered_open_window = window.max(1);
         self
     }
 
@@ -1039,6 +1044,14 @@ impl SupertableOptions {
         self
     }
 
+    /// Override the sealed-sidecar retry budget. See
+    /// [`Self::max_sealed_retries`] for semantics. Clamped to at least 1 where
+    /// it is read, so a zero cannot disable the retry entirely.
+    pub fn with_max_sealed_retries(mut self, n: u32) -> Self {
+        self.max_sealed_retries = n;
+        self
+    }
+
     /// Override the auto-flush threshold (MiB).
     pub fn with_commit_threshold_size_mb(mut self, mb: u64) -> Self {
         self.commit_threshold_size_mb = mb;
@@ -1061,11 +1074,25 @@ impl SupertableOptions {
         self
     }
 
-    /// Override whether the supertable's `SuperfileReader::open`
-    /// calls verify CRC on the embedded vector blob. Default
-    /// `true`. See [`Self::verify_crc_on_open`].
+    /// Override whether this table's `SuperfileReader::open` calls
+    /// verify checksums. See [`Self::with_crc_verification`] for the
+    /// three-valued setting this is a shim over.
+    ///
+    /// Kept for callers written against the boolean. `true` maps to
+    /// [`CrcVerification::Always`] rather than to the default, because a
+    /// caller passing `true` asked for verification at open and must keep
+    /// it now that the default verifies at a different boundary.
     pub fn with_verify_crc_on_open(mut self, v: bool) -> Self {
-        self.verify_crc_on_open = v;
+        self.crc_verification = match v {
+            true => CrcVerification::Always,
+            false => CrcVerification::Never,
+        };
+        self
+    }
+
+    /// When this table verifies a superfile's stored checksums.
+    pub fn with_crc_verification(mut self, policy: CrcVerification) -> Self {
+        self.crc_verification = policy;
         self
     }
 
@@ -1089,13 +1116,17 @@ impl SupertableOptions {
         self
     }
 
-    /// Build the `SuperfileReader::open_with` options that
-    /// match the current `verify_crc_on_open` setting. Used
-    /// by every supertable-internal callsite that opens a
-    /// superfile so the global config knob applies uniformly.
+    /// Build the `SuperfileReader::open_with` options this table's
+    /// checksum policy calls for at an open. Used by every
+    /// supertable-internal callsite that opens a superfile so the
+    /// policy applies uniformly.
+    ///
+    /// An open is one of the two boundaries the policy distinguishes;
+    /// the disk cache asks about the other one, where bytes land,
+    /// through `CrcVerification::verifies_on_landing`.
     pub(crate) fn superfile_open_options(&self) -> OpenOptions {
         OpenOptions {
-            verify_crc: self.verify_crc_on_open,
+            verify_crc: self.crc_verification.verifies_on_open(),
         }
     }
 
@@ -1152,7 +1183,7 @@ impl SupertableOptions {
         };
         self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
         self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
-        self.verify_crc_on_open = cfg.supertable.verify_crc_on_open;
+        self.crc_verification = cfg.supertable.crc_policy();
         self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
         self.target_recall = cfg.vector.target_recall;
         self.drain_consolidate = cfg.vector.drain_consolidate;
@@ -1242,8 +1273,11 @@ impl SupertableOptions {
                 prefetch_concurrency: cfg.storage.prefetch_concurrency.max(1),
                 mmap_cold_threshold_secs: cfg.storage.mmap_cold_threshold_secs,
                 mmap_sweep_interval_secs: cfg.storage.mmap_sweep_interval_secs,
+                promotion_defer_timeout: Duration::from_secs(
+                    cfg.storage.promotion_defer_timeout_secs,
+                ),
                 eviction: Box::new(LruPolicy::new()),
-                verify_crc_on_open: cfg.supertable.verify_crc_on_open,
+                crc_verification: cfg.supertable.crc_policy(),
             };
             let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), disk_cfg)
                 .map_err(|e| BuildError::Store(format!("disk cache construction: {e}")))?;
@@ -1269,90 +1303,55 @@ impl SupertableOptions {
         self.vector_layout = layout;
         self
     }
+}
 
-    /// Construct a `superfile::BuilderOptions` for one rayon
-    /// shard worker at commit time. The shard worker constructs
-    /// its own `SuperfileBuilder` from this and feeds its slice
-    /// of buffered batches into it.
-    ///
-    /// Differences from a "natural" superfile config:
-    /// - Schema is the **scalar-only** schema
-    ///   ([`SupertableOptions::scalar_schema`]) — vector columns
-    ///   live in the embedded vector blob, never in Parquet.
-    ///   The id column is prepended (Decimal128(38, 0)).
-    pub fn builder_options(&self) -> BuilderOptions {
-        BuilderOptions::new(
-            self.scalar_schema(),
-            self.id_column.clone(),
-            self.fts_columns.clone(),
-            self.vector_columns.clone(),
-        )
-        .with_vector_layout(self.vector_layout)
-    }
-
-    /// Effective scalar-only schema — the user's columns with
-    /// vector columns projected out *and* the supertable-
-    /// injected id column prepended. This is what the
-    /// underlying `SuperfileBuilder` sees at ingest.
-    ///
-    /// Vectors live in the embedded vector blob, never in
-    /// Parquet, so they don't appear here. The id column is
-    /// always first. Index-only FTS columns DO appear here —
-    /// their text must reach the builder to be tokenized —
-    /// but the builder drops them from the Parquet body, so
-    /// the readable shape is [`Self::stored_schema`].
-    ///
-    /// Cost is one schema-walk + one `Vec::clone` of the
-    /// surviving fields per call. Caching on first call is a
-    /// future optimization if benches show this on the hot
-    /// path.
-    pub fn scalar_schema(&self) -> Arc<Schema> {
-        let vector_names: HashSet<&str> = self
-            .vector_columns
-            .iter()
-            .map(|vc| vc.column.as_str())
-            .collect();
-        let mut kept: Vec<Arc<Field>> = Vec::with_capacity(self.schema.fields().len() + 1);
-        kept.push(Arc::new(Field::new(
-            &self.id_column,
-            DataType::Decimal128(DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            false,
-        )));
-        kept.extend(
-            self.schema
-                .fields()
+/// Builder options for a superfile of a table whose schema is `schema`
+/// and whose identity and layout knobs are `options`': the Parquet body
+/// holds the scalar schema, the indexes are the schema's, and the file
+/// records the schema generation it was written under.
+pub(crate) fn builder_options_for(
+    schema: &TableSchema,
+    options: &SupertableOptions,
+) -> BuilderOptions {
+    let vector_configs = schema.vector_configs();
+    let fts_configs = schema.fts_configs();
+    // Vector columns live in the vector blob and index-only FTS columns in
+    // no body at all, so the builder's schema does not carry their ids.
+    let outside_schema: Vec<(String, FieldId)> = vector_configs
+        .iter()
+        .map(|vc| vc.column.as_str())
+        .chain(
+            fts_configs
                 .iter()
-                .filter(|f| !vector_names.contains(f.name().as_str()))
-                .cloned(),
-        );
-        Arc::new(Schema::new(kept))
-    }
+                .filter(|fc| !fc.stored)
+                .map(|fc| fc.column.as_str()),
+        )
+        .filter_map(|column| Some((column.to_owned(), schema.id_of(column)?)))
+        .collect();
+    let builder = BuilderOptions::new(
+        schema.scalar_schema(&options.id_column),
+        options.id_column.clone(),
+        fts_configs,
+        vector_configs,
+    )
+    .with_vector_layout(options.vector_layout)
+    .with_schema_id(schema.schema_id())
+    .with_field_ids_outside_schema(outside_schema);
+    #[cfg(test)]
+    let builder = BuilderOptions {
+        row_group_size: options.row_group_size.unwrap_or(builder.row_group_size),
+        ..builder
+    };
+    builder
+}
 
-    /// The readable (stored) schema — [`Self::scalar_schema`] minus
-    /// index-only FTS columns (`stored: false`). Index-only text feeds
-    /// the FTS blob at ingest but never lands in Parquet, so it cannot
-    /// be scanned, projected, or filtered on; the SQL scan view and the
-    /// search-result projection surface resolve names against this
-    /// shape so such a column is rejected up front like any unknown
-    /// column, instead of failing mid-decode.
-    pub fn stored_schema(&self) -> Arc<Schema> {
-        let unstored: HashSet<&str> = self
-            .fts_columns
-            .iter()
-            .filter(|fc| !fc.stored)
-            .map(|fc| fc.column.as_str())
-            .collect();
-        let scalar = self.scalar_schema();
-        if unstored.is_empty() {
-            return scalar;
-        }
-        let kept: Vec<Arc<Field>> = scalar
-            .fields()
-            .iter()
-            .filter(|f| !unstored.contains(f.name().as_str()))
-            .cloned()
-            .collect();
-        Arc::new(Schema::new(kept))
+impl SupertableOptions {
+    /// The name resolver for parts and lists written before field ids.
+    pub(crate) fn legacy_names(&self) -> crate::supertable::schema::LegacyNames {
+        crate::supertable::schema::LegacyNames::new(
+            Arc::clone(&self.table_schema),
+            self.id_column.clone(),
+        )
     }
 }
 
@@ -1391,7 +1390,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::superfile::vector::{distance::Metric, rerank_codec::RerankCodec};
+    use crate::{
+        superfile::vector::{distance::Metric, rerank_codec::RerankCodec},
+        supertable::schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
+    };
 
     fn fixed_list_f32(dim: usize) -> DataType {
         DataType::FixedSizeList(
@@ -1649,18 +1651,6 @@ mod tests {
     }
 
     #[test]
-    fn fts_column_with_unknown_analyzer_rejected() {
-        let s = Arc::new(Schema::new(vec![Field::new(
-            "title",
-            DataType::LargeUtf8,
-            false,
-        )]));
-        let err = SupertableOptions::new(s, vec![fc("title").analyzer("nonesuch")], vec![])
-            .expect_err("expected error");
-        assert!(matches!(err, BuildError::UnknownAnalyzer { .. }));
-    }
-
-    #[test]
     fn empty_fts_and_vector_succeeds_without_tokenizer() {
         let s = Arc::new(Schema::new(vec![Field::new(
             "category",
@@ -1677,7 +1667,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let scalar = opts.scalar_schema();
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
         // _id field is `Decimal128(38, 0)`.
@@ -1696,7 +1686,7 @@ mod tests {
             false,
         )]));
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![]).expect("valid options");
-        let scalar = opts.scalar_schema();
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
         let names: Vec<_> = scalar.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title"]);
     }
@@ -1706,7 +1696,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let eff = opts.effective_schema();
+        let eff = opts.table_schema.effective_schema(&opts.id_column);
         let names: Vec<_> = eff.fields().iter().map(|f| f.name().as_str()).collect();
         assert_eq!(names, vec!["_id", "title", "emb"]);
     }
@@ -1716,7 +1706,7 @@ mod tests {
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(Arc::clone(&s), vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let us = opts.user_schema();
+        let us = opts.table_schema.user_schema();
         assert_eq!(us.fields().len(), s.fields().len());
         for (a, b) in us.fields().iter().zip(s.fields().iter()) {
             assert_eq!(a.name(), b.name());
@@ -1732,7 +1722,7 @@ mod tests {
             .expect("override accepted");
         assert_eq!(opts.id_column, "row_id");
         // effective_schema now uses the new name.
-        let eff = opts.effective_schema();
+        let eff = opts.table_schema.effective_schema(&opts.id_column);
         assert_eq!(eff.field(0).name(), "row_id");
     }
 
@@ -1827,6 +1817,38 @@ supertable:
 
     /// Helper: a minimal valid options instance (no FTS / vector) for
     /// exercising the builder methods that don't touch the schema.
+    /// Field ids are a property of what the table stores, not of what the
+    /// caller declared: the stored schemas carry them in field metadata, in
+    /// declared order from 1, and the user-facing schema is returned exactly
+    /// as it was given.
+    #[test]
+    fn stored_schemas_carry_field_ids_and_the_user_schema_does_not() {
+        use crate::supertable::schema::{FieldId, field_id_of};
+        let opts = plain_opts();
+        for f in opts.table_schema.user_schema().fields() {
+            assert_eq!(
+                field_id_of(f),
+                None,
+                "user schema is unstamped: {}",
+                f.name()
+            );
+        }
+        let scalar = opts.table_schema.scalar_schema(&opts.id_column);
+        assert_eq!(field_id_of(scalar.field(0)), Some(FieldId::ID_COLUMN));
+        for (i, f) in scalar.fields().iter().skip(1).enumerate() {
+            assert_eq!(
+                field_id_of(f),
+                Some(FieldId(i as u32 + 1)),
+                "column {}",
+                f.name()
+            );
+        }
+        let effective = opts.table_schema.effective_schema(&opts.id_column);
+        assert_eq!(field_id_of(effective.field(0)), Some(FieldId::ID_COLUMN));
+        assert_eq!(field_id_of(effective.field(1)), Some(FieldId(1)));
+        assert_eq!(builder_options_for(&opts.table_schema, &opts).schema_id, 1);
+    }
+
     fn plain_opts() -> SupertableOptions {
         let s = Arc::new(Schema::new(vec![Field::new(
             "category",
@@ -1848,7 +1870,7 @@ supertable:
     fn new_sets_documented_defaults() {
         let opts = plain_opts();
         assert!(opts.prepopulate_cache_on_commit);
-        assert!(opts.verify_crc_on_open);
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(opts.storage.is_none());
         assert!(opts.disk_cache.is_none());
         assert!(opts.memory_budget_bytes.is_none());
@@ -1918,7 +1940,7 @@ supertable:
         assert_eq!(opts.put_multipart_threshold_bytes, 1);
         assert_eq!(opts.memory_budget_bytes, Some(1 << 30));
         assert!(!opts.prepopulate_cache_on_commit);
-        assert!(!opts.verify_crc_on_open);
+        assert_eq!(opts.crc_verification, CrcVerification::Never);
     }
 
     #[test]
@@ -1973,11 +1995,22 @@ supertable:
     }
 
     #[test]
-    fn superfile_open_options_track_verify_crc_flag() {
+    fn superfile_open_options_track_the_crc_policy() {
+        // The default is `Auto`, which verifies where bytes arrive rather
+        // than at an open, so the open options it produces verify nothing.
         let opts = plain_opts();
-        assert!(opts.superfile_open_options().verify_crc);
-        let opts = opts.with_verify_crc_on_open(false);
+        assert_eq!(opts.crc_verification, CrcVerification::Auto);
         assert!(!opts.superfile_open_options().verify_crc);
+
+        // The boolean builder still means what it meant: `true` asks for
+        // verification and gets the strict policy, not the default.
+        let strict = plain_opts().with_verify_crc_on_open(true);
+        assert_eq!(strict.crc_verification, CrcVerification::Always);
+        assert!(strict.superfile_open_options().verify_crc);
+
+        let off = plain_opts().with_verify_crc_on_open(false);
+        assert_eq!(off.crc_verification, CrcVerification::Never);
+        assert!(!off.superfile_open_options().verify_crc);
     }
 
     #[test]
@@ -1985,7 +2018,7 @@ supertable:
         let s = schema_with_vector(16);
         let opts = SupertableOptions::new(s, vec![fc("title")], vec![vc("emb", 16)])
             .expect("valid options");
-        let bo = opts.builder_options();
+        let bo = builder_options_for(&opts.table_schema, &opts);
         // builder_options carries the scalar-only schema (vectors
         // dropped, id prepended) and the same id column + role configs.
         let names: Vec<_> = bo

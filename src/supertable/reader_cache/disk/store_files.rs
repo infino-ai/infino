@@ -15,10 +15,37 @@ use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
 use tokio::io::AsyncWriteExt;
 
-use crate::supertable::{
-    manifest::SuperfileUri,
-    reader_cache::{block_source::indexed_filled_bytes, disk::*},
+use crate::{
+    storage::StorageProvider,
+    supertable::{
+        manifest::SuperfileUri,
+        reader_cache::{block_source::indexed_filled_bytes, disk::*},
+    },
 };
+
+/// Whether adopting an on-disk cache file verifies its checksums.
+///
+/// A query does not: the file was verified by whichever fill wrote it, nothing
+/// is being written now, and checking it would mean reading every byte of
+/// every cached superfile at process start — the scan this policy exists to
+/// remove, and one the engines this matches default to off.
+///
+/// A [`ReadIntent::Load`] does, because a Load is a compaction or reindex
+/// input. Those read every byte of the file anyway, so the checksum is
+/// marginal, and what they do with it is the reason: the merge writes a *new*
+/// superfile with fresh, valid checksums over whatever it read, and once the
+/// inputs are reclaimed that output is the only copy left. A bad input
+/// adopted here is therefore not a wrong answer that a refetch repairs, it is
+/// the good copy being replaced by a bad one — which is the one failure the
+/// "recovery is a refetch" argument cannot survive.
+///
+/// `never` still means never, at every boundary.
+fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
+    match intent {
+        ReadIntent::Load => config.crc_verification.verifies_on_landing(),
+        ReadIntent::Warm | ReadIntent::Stream => config.crc_verification.verifies_on_open(),
+    }
+}
 
 impl DiskCacheStore {
     /// Insert already-in-hand bytes into the cache without
@@ -75,26 +102,27 @@ impl DiskCacheStore {
             let tmp = self.tmp_path(uri);
             let final_path = self.cache_path(uri);
 
-            // Write the bytes to a tmp file, then atomically rename into place.
-            // No fsync: the disk cache is a reconstructible mirror of bytes that
-            // are already durable in object storage, so a crash losing an
-            // unflushed cache file just cold-fetches on the next open — and
-            // `restore_from_cache_root` CRC-verifies on-disk files at open,
-            // dropping any torn one. Skipping the fsync keeps the committer's
-            // warm-fill off the synchronous disk-flush path.
+            // Write the bytes to a tmp file, fsync, then atomically rename into
+            // place. The fsync is what makes the file on disk match the bytes
+            // written: nothing reads it back to check. An earlier version
+            // skipped it and leaned on a later run re-verifying every cache
+            // file at open to drop a torn one, but the default policy no
+            // longer does that scan, so a crash between the write and the
+            // flush would leave a torn file that the next run adopts. The
+            // other two fill paths already `sync_all` for the same reason.
             {
                 let mut file = tokio::fs::File::create(&tmp).await?;
                 file.write_all(&bytes).await?;
                 file.flush().await?;
+                file.sync_all().await?;
             }
             tokio::fs::rename(&tmp, &final_path).await?;
 
             // mmap the freshly-written file + open it as a superfile reader.
             // Skip CRC: the committer just built these bytes in memory and they
             // are known-valid (CRC'd at build, already opened as a reader for
-            // summary extraction) — re-scanning here is redundant. Files read
-            // back from a PRIOR run take the verifying path via
-            // `restore_from_cache_root`.
+            // summary extraction) — re-scanning here is redundant, and the
+            // fsync above is what carries that validity to disk.
             self.open_cached_entry(&final_path, size, false)
         }
         .await;
@@ -135,11 +163,12 @@ impl DiskCacheStore {
 
     /// List `cache_root` and record each superfile's size and mtime in `unindexed`, adding the total
     /// to `current_bytes`. Only a stat per file: files are opened later, by the reads that need them
-    /// ([`Self::try_reuse_cached_file`]).
+    /// ([`Self::fetch_from_disk_cache`]).
     ///
     /// Deletes leftovers that can never be used: orphaned `.blocks` sidecars, zero-length files,
-    /// and `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
-    /// in-flight fetch). On a scan error the map stays empty and reads just cold-fetch.
+    /// `.tmp` files older than [`TMP_RECLAIM_AGE`] (a fresh one belongs to a sibling process's
+    /// in-flight fetch), and a holed copy ([`Self::hole_path`]) that a complete copy of the same
+    /// superfile makes redundant. On a scan error the map stays empty and reads just cold-fetch.
     pub(crate) fn scan_cache_root(&self) {
         let dir = match fs::read_dir(&self.config.cache_root) {
             Ok(d) => d,
@@ -194,9 +223,18 @@ impl DiskCacheStore {
                 continue;
             }
 
-            let Some(uri) = SuperfileUri::from_cache_filename(name) else {
+            let Some((uri, holed)) = SuperfileUri::from_cache_filename(name)
+                .map(|uri| (uri, false))
+                .or_else(|| SuperfileUri::from_cache_hole_filename(name).map(|uri| (uri, true)))
+            else {
                 continue; // Foreign file: leave it alone.
             };
+
+            // A complete copy wins over one missing its vector blob.
+            if holed && self.cache_path(&uri).exists() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
 
             let Ok(meta) = entry.metadata() else { continue };
             let size = meta.len();
@@ -239,12 +277,16 @@ impl DiskCacheStore {
                 mtime_us: file_mtime_us(&meta),
             },
         );
+        tracing::info!(target: "infino::cache", uri = %uri.0, filled, "cache build: adopted .blocks on scan");
         Some(filled)
     }
 
     /// Serve `uri` from an existing cache file instead of fetching from storage. Runs before every
     /// cold fetch and checks the filesystem directly, so it also finds files written after this
     /// store opened.
+    ///
+    /// A copy under [`Self::hole_path`] is reused too: it is opened the way its fill left it, with
+    /// the vector blob read through the block cache, and charged for what it holds.
     ///
     /// Returns `Ok(None)` when there is no usable file: missing, wrong size, or it fails to open.
     /// Unusable files are deleted so the cold fetch writes a fresh one. A file can also vanish
@@ -253,13 +295,19 @@ impl DiskCacheStore {
     /// `expected_size` is optional: pass it when the caller already has the size (the lazy path gets
     /// it from the manifest), never fetch one. A truncated file fails to open anyway, since the
     /// footer sits at the end.
-    pub(crate) async fn try_reuse_cached_file(
-        &self,
+    pub(crate) async fn fetch_from_disk_cache(
+        self: &Arc<Self>,
         uri: &SuperfileUri,
+        storage_key: &str,
         expected_size: Option<u64>,
+        intent: ReadIntent,
+        storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<Option<Arc<CachedEntry>>, DiskCacheError> {
-        let path = self.cache_path(uri);
-        let Ok(meta) = fs::metadata(&path) else {
+        let found = [(self.cache_path(uri), false), (self.hole_path(uri), true)]
+            .into_iter()
+            .find_map(|(path, holed)| fs::metadata(&path).ok().map(|meta| (path, meta, holed)));
+
+        let Some((path, meta, holed)) = found else {
             // No whole-file copy; decrement a vanished counted one but leave any block cache intact.
             if let Some((_, file)) = self.unindexed.remove(uri) {
                 self.current_bytes
@@ -270,6 +318,13 @@ impl DiskCacheStore {
 
         let size = meta.len();
         if size == 0 || expected_size.is_some_and(|want| want != size) {
+            tracing::warn!(
+                target: "infino::cache",
+                uri = %uri.0,
+                on_disk_bytes = size,
+                manifest_bytes = expected_size,
+                "cache file size zero or does not match manifest offsets; discarding + re-fetching"
+            );
             self.discard_cache_file(uri);
             return Ok(None);
         }
@@ -283,29 +338,44 @@ impl DiskCacheStore {
             Some(self.reserve(size).await?)
         };
 
-        match self.open_cached_entry(&path, size, self.config.verify_crc_on_open) {
+        let opened = if holed {
+            self.open_holed_entry(uri, size, storage_key, self.resolve_storage(storage))
+                .await
+        } else {
+            self.open_cached_entry(&path, size, adoption_verifies(&self.config, intent))
+        };
+
+        match opened {
             Ok(entry) => {
-                // Two racing reuses of one URI can both insert; the second insert must free the
-                // first one's bytes.
-                if let Some(replaced) = self.cached.insert(*uri, Arc::clone(&entry)) {
-                    self.release_entry_accounting(&replaced);
-                }
+                // Counted or reserved at the file's length; a holed copy is charged less, since
+                // its hole is not on disk.
+                let uncharged = size - entry.size_bytes.load(Ordering::Acquire);
+
+                // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
+                let entry = self.admit_entry(*uri, entry);
 
                 if let Some(r) = reservation {
                     r.commit();
                 }
 
+                self.current_bytes.fetch_sub(uncharged, Ordering::Release);
+
                 self.n_disk_reuses.fetch_add(1, Ordering::AcqRel);
 
                 Ok(Some(entry))
             }
-            Err(_) => {
+            Err(e) => {
                 // A dropped reservation frees itself; scan-counted bytes are given back by hand.
                 if counted {
                     self.current_bytes.fetch_sub(size, Ordering::Release);
                 }
+
+                tracing::warn!(target: "infino::cache", uri = %uri.0, err = ?e, "evict: cache file failed to open, discarding + re-fetching");
+
                 let _ = fs::remove_file(&path);
+
                 self.drop_block_file(uri);
+
                 Ok(None)
             }
         }
@@ -320,8 +390,15 @@ impl DiskCacheStore {
                 .fetch_sub(file.size_bytes, Ordering::Release);
         }
 
-        let _ = fs::remove_file(self.cache_path(uri));
+        tracing::info!(target: "infino::cache", uri = %uri.0, "evict: discard whole .sf.parquet (unusable/size-mismatch)");
+        self.remove_local_copy(uri);
         self.drop_block_file(uri);
+    }
+
+    /// Delete the local copy of `uri`, under whichever name it has.
+    pub(crate) fn remove_local_copy(&self, uri: &SuperfileUri) {
+        let _ = fs::remove_file(self.cache_path(uri));
+        let _ = fs::remove_file(self.hole_path(uri));
     }
 
     pub(crate) fn drop_block_file(&self, uri: &SuperfileUri) {
@@ -329,8 +406,31 @@ impl DiskCacheStore {
             self.current_bytes
                 .fetch_sub(file.size_bytes, Ordering::Release);
         }
+        tracing::info!(target: "infino::cache", uri = %uri.0, "evict: dropped .blocks + .blocks.idx (unusable/scan)");
         let _ = fs::remove_file(self.blocks_path(uri));
         let _ = fs::remove_file(self.blocks_idx_path(uri));
+    }
+
+    /// Keep charging a dropped lazy entry's `.blocks` file. Its source releases its own bytes on
+    /// drop but leaves the file for a later open to adopt; untracked, the file would sit on disk
+    /// outside the budget, where eviction cannot reach it.
+    pub(crate) fn retain_block_file(&self, uri: &SuperfileUri, entry: &CachedEntry, now_us: u64) {
+        let Some(source) = entry.block_source() else {
+            return;
+        };
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        if filled == 0 {
+            return;
+        }
+        self.current_bytes.fetch_add(filled, Ordering::Release);
+        let file = UnindexedFile {
+            size_bytes: filled,
+            mtime_us: now_us,
+        };
+        if let Some(prior) = self.block_files.insert(*uri, file) {
+            self.current_bytes
+                .fetch_sub(prior.size_bytes, Ordering::Release);
+        }
     }
 
     pub(crate) fn release_scanned_block_file(&self, uri: &SuperfileUri) {
@@ -372,7 +472,8 @@ impl DiskCacheStore {
         }
 
         self.coordinators.remove(uri);
-        let _ = fs::remove_file(self.cache_path(uri));
+        tracing::info!(target: "infino::cache", uri = %uri.0, present, "evict: erased local copy (object-store GC drop)");
+        self.remove_local_copy(uri);
         self.drop_block_file(uri);
         if present {
             self.n_gc_drops.fetch_add(1, Ordering::AcqRel);
@@ -383,10 +484,351 @@ impl DiskCacheStore {
 }
 
 #[cfg(test)]
+mod landing_tests {
+    use std::{
+        fs::{read, write},
+        path::Path,
+    };
+
+    use bytes::Bytes;
+
+    use super::super::test_support::{
+        put_superfile, reopen_store, test_store_with, tiny_vector_superfile_bytes,
+    };
+    use crate::{
+        config::CrcVerification, superfile::format::footer::read_kv_metadata,
+        supertable::manifest::SuperfileUri,
+    };
+
+    /// Bytes back from the vector blob's end to flip. Near the end rather
+    /// than near the start so the flip lands in data covered by a checksum
+    /// rather than in a header or an offset table, which a structural check
+    /// would reject whatever the policy said.
+    const CORRUPT_INTO_VEC: usize = 16;
+
+    /// `bytes` with one byte of its vector blob flipped, which is a region
+    /// the superfile's own checksums cover.
+    ///
+    /// The region matters. Most of the file is Parquet, which these checksums
+    /// do not cover, so a flip at an arbitrary offset would go unnoticed and
+    /// prove nothing about the policy. The fixture is chosen for the same
+    /// reason: a superfile built with no FTS and no vector config carries no
+    /// embedded blob, and therefore nothing for verification to check.
+    fn corrupt_the_vector_blob(bytes: impl AsRef<[u8]>) -> Bytes {
+        let mut bytes = bytes.as_ref().to_vec();
+        let kv = read_kv_metadata(&bytes).expect("the fixture carries its footer");
+        let vec_off: usize = kv["inf.vec.offset"].parse().expect("vector blob offset");
+        let vec_len: usize = kv["inf.vec.length"].parse().expect("vector blob length");
+        bytes[vec_off + vec_len - CORRUPT_INTO_VEC] ^= 0xFF;
+        Bytes::from(bytes)
+    }
+
+    /// Flip the same byte in a copy already on the cache disk.
+    fn corrupt_the_cached_copy(path: &Path) {
+        let bytes = read(path).expect("the landed copy is on disk");
+        write(path, corrupt_the_vector_blob(bytes)).expect("write the corrupted copy back");
+    }
+
+    /// Bytes that arrive corrupted are caught as they land, and the entry is
+    /// not admitted.
+    ///
+    /// This is the true-positive half of the landing check. The cache file is
+    /// written from these bytes and opened, so a flip anywhere the superfile's
+    /// checksums cover has to surface here or nowhere: nothing downstream
+    /// re-reads the file to check it.
+    #[tokio::test]
+    async fn a_corrupt_download_is_refused_as_it_lands() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(
+            &store,
+            &uri,
+            corrupt_the_vector_blob(tiny_vector_superfile_bytes()),
+        )
+        .await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect_err("corrupt bytes must not be admitted to the cache");
+
+        // And nothing is left behind under the name a later read, or a later
+        // process scanning this directory, would adopt. Adoption does not
+        // re-check the file, so a rejected download promoted anyway would be
+        // laundered into the cache by the very next attempt.
+        assert!(
+            !store.cache_path(&uri).is_file(),
+            "a download that failed verification must not keep the cache name"
+        );
+    }
+
+    /// With verification off the same bytes are admitted, which is what makes
+    /// the test above a statement about the policy rather than about some
+    /// other check happening to fire.
+    #[tokio::test]
+    async fn never_admits_the_corrupt_download_it_does_not_check() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(
+            &store,
+            &uri,
+            corrupt_the_vector_blob(tiny_vector_superfile_bytes()),
+        )
+        .await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("never checks, so the corruption goes unnoticed");
+    }
+
+    /// Healthy bytes land and serve.
+    ///
+    /// The half that matters more. Verification that rejected good data would
+    /// turn a readable table into an unreadable one, which is a worse failure
+    /// than the gap it closes, and it would show up as exactly this test
+    /// failing.
+    #[tokio::test]
+    async fn a_healthy_download_lands_and_serves() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("healthy bytes must land and serve");
+    }
+
+    /// A copy a previous run left on disk is adopted without being read back,
+    /// even when it is corrupt.
+    ///
+    /// Deliberate, and the exposure this policy accepts by name. Adoption
+    /// writes nothing, so there is no landing to check at; verifying here
+    /// would mean reading every byte of every cached superfile at process
+    /// start, which is the scan the policy removes. The engines this matches
+    /// default that scan to off and carry the same exposure.
+    #[tokio::test]
+    async fn a_query_adopts_a_copy_left_by_a_previous_run_unread() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        // A query's intent, not a compaction's: this is the read whose cost
+        // the policy is protecting.
+        let _ = restarted.reader(&uri).await;
+        let after = restarted.stats();
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            0,
+            "auto does not look on the query path, and so must not refetch"
+        );
+    }
+
+    /// A compaction input is verified even where a query would not be, and a
+    /// corrupt copy is refetched instead of merged.
+    ///
+    /// This is the one failure the rest of the design cannot absorb.
+    /// Compaction reads its inputs from this cache and writes a new superfile
+    /// with fresh, valid checksums over whatever it read; once the inputs are
+    /// reclaimed, that output is the only copy. A bad input adopted here is
+    /// therefore not a wrong answer a refetch repairs, it is the good copy in
+    /// the object store being replaced by a bad one.
+    #[tokio::test]
+    async fn a_compaction_input_is_verified_where_a_query_would_not_be() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Auto;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let reader = restarted
+            .reader_synchronous(&uri)
+            .await
+            .expect("a corrupt input must not fail the compaction, it must be refetched");
+        let after = restarted.stats();
+
+        assert_eq!(
+            after.n_disk_reuses - before.n_disk_reuses,
+            0,
+            "the corrupt copy must not be handed to a merge"
+        );
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            1,
+            "it must come from the authoritative copy instead"
+        );
+        drop(reader);
+    }
+
+    /// `never` still means never, including for a compaction input. An
+    /// operator who turned verification off must not have it reappear on a
+    /// path this change touched.
+    #[tokio::test]
+    async fn never_does_not_verify_a_compaction_input_either() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Never;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let _ = restarted.reader_synchronous(&uri).await;
+        let after = restarted.stats();
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            0,
+            "never must not look, on any path"
+        );
+    }
+
+    /// `always` does look, and a corrupt copy left by a previous run is
+    /// discarded and refetched, so the read still returns.
+    ///
+    /// Two things asserted together on purpose. Detecting the corruption is
+    /// useless if the query then fails, and recovering is useless if the
+    /// corruption went unnoticed; what a caller needs is the right answer
+    /// without knowing anything happened.
+    #[tokio::test]
+    async fn always_rescans_a_copy_left_by_a_previous_run() {
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.crc_verification = CrcVerification::Always;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        store
+            .reader_synchronous(&uri)
+            .await
+            .expect("a Load read lands the whole file on disk");
+
+        corrupt_the_cached_copy(&store.cache_path(&uri));
+
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.crc_verification = CrcVerification::Always;
+        });
+        drop(store);
+        restarted.scan_cache_root();
+
+        let before = restarted.stats();
+        let reader = restarted
+            .reader_synchronous(&uri)
+            .await
+            .expect("a corrupt cached copy must not fail the read");
+        let after = restarted.stats();
+
+        assert_eq!(
+            after.n_disk_reuses - before.n_disk_reuses,
+            0,
+            "the corrupt copy must not be adopted"
+        );
+        assert_eq!(
+            after.n_cold_fetches - before.n_cold_fetches,
+            1,
+            "it must be refetched from the authoritative copy instead"
+        );
+        drop(reader);
+    }
+
+    /// A healthy copy from a previous run is adopted under every policy, and
+    /// adopting it costs no fetch. The `always` arm is the one that could
+    /// regress: it reads the file back, and a false positive there would turn
+    /// a restart into a full refetch of the cache.
+    #[tokio::test]
+    async fn a_healthy_copy_is_reused_after_a_restart_under_every_policy() {
+        for policy in [
+            CrcVerification::Auto,
+            CrcVerification::Always,
+            CrcVerification::Never,
+        ] {
+            let (_dir, store) = test_store_with(|cfg| {
+                cfg.crc_verification = policy;
+            });
+            let uri = SuperfileUri::new_v4();
+            put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+            store
+                .reader_synchronous(&uri)
+                .await
+                .expect("a Load read lands the whole file on disk");
+
+            let restarted = reopen_store(&store, |cfg| {
+                cfg.crc_verification = policy;
+            });
+            drop(store);
+            restarted.scan_cache_root();
+
+            let before = restarted.stats();
+            restarted
+                .reader_synchronous(&uri)
+                .await
+                .expect("restart reuses the copy");
+            let after = restarted.stats();
+
+            assert_eq!(
+                after.n_disk_reuses - before.n_disk_reuses,
+                1,
+                "{policy:?}: the healthy copy must be adopted, not refetched"
+            );
+            assert_eq!(
+                after.n_cold_fetches - before.n_cold_fetches,
+                0,
+                "{policy:?}: and adopting it must cost no fetch"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
+    use roaring::RoaringBitmap;
     use tempfile::TempDir;
 
     use crate::{
@@ -606,17 +1048,48 @@ mod tests {
     async fn erase_superfile_local_copy_unlinks_file_left_without_an_entry() {
         // A cache file can exist with no map entry (crash between rename and
         // insert); erase_superfile_local_copy still unlinks it so the orphan cannot outlive its
-        // storage object.
+        // storage object. Under either name: a complete copy or a holed one.
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         fs::write(store.cache_path(&uri), b"stale bytes").expect("write orphan");
+        fs::write(store.hole_path(&uri), b"stale bytes").expect("write holed orphan");
 
         assert!(!store.erase_superfile_local_copy(&uri), "no entry to drop");
         assert!(
-            !store.cache_path(&uri).exists(),
-            "orphan file still unlinked"
+            !store.cache_path(&uri).exists() && !store.hole_path(&uri).exists(),
+            "orphan files still unlinked"
         );
         assert_eq!(store.stats().n_gc_drops, 0);
+    }
+
+    /// The open-time scan counts a holed copy like any cache file, and drops it when a complete
+    /// copy of the same superfile is there too.
+    #[tokio::test]
+    async fn restart_scan_keeps_one_local_copy_per_superfile() {
+        let (_dir, store) = test_store();
+        let bytes = tiny_superfile_bytes();
+        let (both, holed) = (SuperfileUri::new_v4(), SuperfileUri::new_v4());
+        let complete = seed_cache_file(&store, &both, &bytes);
+        fs::write(store.hole_path(&both), &bytes).expect("stale holed copy");
+        fs::write(store.hole_path(&holed), &bytes).expect("holed copy");
+
+        let opened = reopen_store(&store, |_| {});
+
+        assert!(opened.cache_path(&both).exists(), "the complete copy stays");
+        assert!(
+            !opened.hole_path(&both).exists(),
+            "and wins over the holed one"
+        );
+        assert!(
+            opened.hole_path(&holed).exists(),
+            "a lone holed copy is kept"
+        );
+        assert_eq!(
+            opened.stats().current_bytes,
+            complete + bytes.len() as u64,
+            "both kept copies are counted"
+        );
+        opened.assert_budget_consistent();
     }
 
     #[tokio::test]
@@ -701,6 +1174,39 @@ mod tests {
             reopened.stats().current_bytes,
             filled,
             "scan counts the retained block bytes against the budget"
+        );
+    }
+
+    /// The block size older builds indexed block files with.
+    const OLDER_BLOCK_BYTES: u64 = 512 * 1024;
+
+    /// A block file an older build indexed with larger blocks is kept by the
+    /// restart scan and counted at the bytes it holds, its last block clipped to
+    /// the file.
+    #[tokio::test]
+    async fn restart_scan_counts_a_block_file_indexed_with_larger_blocks() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        let size = OLDER_BLOCK_BYTES + 1000;
+        let f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(store.blocks_path(&uri))
+            .expect("blocks");
+        f.set_len(size).expect("set_len");
+        let mut idx = OLDER_BLOCK_BYTES.to_le_bytes().to_vec();
+        RoaringBitmap::from_iter([0u32, 1])
+            .serialize_into(&mut idx)
+            .expect("serialize");
+        fs::write(store.blocks_idx_path(&uri), idx).expect("idx");
+
+        let reopened = reopen_store(&store, |_| {});
+        assert!(reopened.blocks_path(&uri).exists(), "kept for adoption");
+        assert_eq!(
+            reopened.stats().current_bytes,
+            size,
+            "both older blocks, the second clipped to the file"
         );
     }
 
@@ -864,24 +1370,40 @@ mod tests {
     #[tokio::test]
     async fn unusable_cache_files_fall_through_to_source() {
         // Every rejection path lands in the same place: unlink the bad file and let the read
-        // cold-fetch a clean copy. Nothing is ever served from a file that failed to open.
+        // cold-fetch a clean copy. Nothing is ever served from a file that failed to open, under
+        // either name.
         let bytes = tiny_superfile_bytes();
-        for (label, seeded) in [
-            ("zero length", Bytes::new()),
-            ("not a superfile", Bytes::from_static(b"garbage bytes")),
-        ] {
-            let (_dir, store) = test_store();
-            let uri = SuperfileUri::new_v4();
-            put_superfile(&store, &uri, bytes.clone()).await;
-            seed_cache_file(&store, &uri, &seeded);
+        for holed in [false, true] {
+            for (label, seeded) in [
+                ("zero length", Bytes::new()),
+                ("not a superfile", Bytes::from_static(b"garbage bytes")),
+            ] {
+                let (_dir, store) = test_store();
+                let uri = SuperfileUri::new_v4();
+                put_superfile(&store, &uri, bytes.clone()).await;
+                let bad = if holed {
+                    store.hole_path(&uri)
+                } else {
+                    store.cache_path(&uri)
+                };
+                fs::create_dir_all(&store.config.cache_root).expect("cache root");
+                fs::write(&bad, &seeded).expect("seed bad copy");
 
-            let reader = store.reader(&uri).await;
-            assert!(reader.is_ok(), "{label}: falls through and serves");
-            assert_eq!(
-                store.stats().n_cold_fetches,
-                1,
-                "{label}: came from storage, not the bad local file"
-            );
+                let reader = store.reader(&uri).await;
+                assert!(
+                    reader.is_ok(),
+                    "{label}, holed {holed}: falls through and serves"
+                );
+                assert_eq!(
+                    store.stats().n_cold_fetches,
+                    1,
+                    "{label}, holed {holed}: came from storage, not the bad local file"
+                );
+                assert!(
+                    !bad.exists(),
+                    "{label}, holed {holed}: the bad copy is deleted"
+                );
+            }
         }
     }
 
@@ -891,21 +1413,26 @@ mod tests {
         // sibling process's in-flight fetch: deleting it would fail that fetch's rename.
         let (_dir, store) = test_store();
         let bytes = tiny_superfile_bytes();
-        let stale = SuperfileUri::new_v4();
-        let fresh = SuperfileUri::new_v4();
-        let skewed = SuperfileUri::new_v4();
         let now = SystemTime::now();
-        for (uri, mtime) in [
-            (stale, now - TMP_RECLAIM_AGE * 2),
-            (fresh, now),
+        let stale = store.tmp_path(&SuperfileUri::new_v4());
+        let fresh = store.tmp_path(&SuperfileUri::new_v4());
+        let skewed = store.tmp_path(&SuperfileUri::new_v4());
+        // The unnumbered name older builds wrote is reclaimed by the same rule.
+        let legacy = store
+            .config
+            .cache_root
+            .join(format!("{}.tmp", SuperfileUri::new_v4().cache_filename()));
+        for (path, mtime) in [
+            (&stale, now - TMP_RECLAIM_AGE * 2),
+            (&fresh, now),
             // A future mtime (clock skew) must read as not-stale, never as reclaimable.
-            (skewed, now + TMP_RECLAIM_AGE),
+            (&skewed, now + TMP_RECLAIM_AGE),
+            (&legacy, now - TMP_RECLAIM_AGE * 2),
         ] {
-            let path = store.tmp_path(&uri);
-            fs::write(&path, bytes.as_ref()).expect("seed tmp");
+            fs::write(path, bytes.as_ref()).expect("seed tmp");
             fs::File::options()
                 .write(true)
-                .open(&path)
+                .open(path)
                 .expect("open tmp")
                 .set_modified(mtime)
                 .expect("set mtime");
@@ -913,14 +1440,12 @@ mod tests {
 
         let opened = reopen_store(&store, |_| {});
 
-        assert!(!opened.tmp_path(&stale).exists(), "stale tmp reclaimed");
+        assert!(!stale.exists(), "stale tmp reclaimed");
+        assert!(fresh.exists(), "fresh tmp left for its owner");
+        assert!(skewed.exists(), "future mtime spared under clock skew");
         assert!(
-            opened.tmp_path(&fresh).exists(),
-            "fresh tmp left for its owner"
-        );
-        assert!(
-            opened.tmp_path(&skewed).exists(),
-            "future mtime spared under clock skew"
+            !legacy.exists(),
+            "a stale unnumbered tmp from an older build is reclaimed"
         );
         assert_eq!(
             opened.stats().current_bytes,
@@ -936,16 +1461,14 @@ mod tests {
         let (_dir, store) = test_store();
         let uri = SuperfileUri::new_v4();
         let bytes = tiny_superfile_bytes();
-        fs::write(store.tmp_path(&uri), bytes.as_ref()).expect("sibling's in-flight tmp");
+        let sibling_tmp = store.tmp_path(&uri);
+        fs::write(&sibling_tmp, bytes.as_ref()).expect("sibling's in-flight tmp");
 
         let opened = reopen_store(&store, |_| {});
-        assert!(
-            opened.tmp_path(&uri).exists(),
-            "scan spared the in-flight tmp"
-        );
+        assert!(sibling_tmp.exists(), "scan spared the in-flight tmp");
 
         // The sibling finishes: fsync'd bytes, atomic rename to the final name.
-        fs::rename(opened.tmp_path(&uri), opened.cache_path(&uri)).expect("sibling renames");
+        fs::rename(&sibling_tmp, opened.cache_path(&uri)).expect("sibling renames");
 
         let _r = opened
             .reader(&uri)
@@ -1006,7 +1529,13 @@ mod tests {
 
         let wrong = bytes.len() as u64 + 1;
         let reused = store
-            .try_reuse_cached_file(&uri, Some(wrong))
+            .fetch_from_disk_cache(
+                &uri,
+                &uri.storage_path(),
+                Some(wrong),
+                ReadIntent::Warm,
+                None,
+            )
             .await
             .expect("reuse probe");
         assert!(reused.is_none(), "size mismatch is a miss, not a serve");

@@ -28,6 +28,7 @@
 use std::sync::Arc;
 
 use infino::{
+    config::CrcVerification,
     supertable::{
         Supertable,
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -248,7 +249,7 @@ fn stats_with_disk_cache_attached_surface_zero_counters_on_fresh_cache() {
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let pinned: Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync> = Arc::new(HashSet::new);

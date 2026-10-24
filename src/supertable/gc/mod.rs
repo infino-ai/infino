@@ -2,12 +2,17 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    future, iter,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use tracing::{debug, warn};
+use futures::{StreamExt, stream};
+use tokio::task::spawn_blocking;
+use tracing::{debug, error, info, warn};
+
+pub(in crate::supertable) mod superseded;
 
 use crate::{
     runtime_bridge::bridge_on_runtime,
@@ -17,9 +22,11 @@ use crate::{
         error::GcError,
         handle::SupertableInner,
         manifest::{
-            SUPERFILE_DATA_DIR, SuperfileUri,
+            SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
-            term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
+            list::RoutingRef,
+            summaries::MANIFEST_SUMMARIES_DIR,
+            term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
@@ -31,6 +38,23 @@ use crate::{
 /// superseded superfiles after a manifest swap.
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) const DEFAULT_SUPERFILE_RECLAIM_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// DELETEs one sweep keeps in flight. A compaction can drop thousands of superfiles in one commit;
+/// issued one at a time that is minutes of wall clock, and unbounded it would crowd the
+/// object-store client the table's queries share.
+const RECLAIM_CONCURRENCY: usize = 32;
+
+/// Most referenced-but-unlisted superfiles one sweep confirms with a HEAD. A table that has lost
+/// more than this is already reported loudly, and a HEAD each for thousands would stall the sweep.
+const MAX_MISSING_SUPERFILE_PROBES: usize = 64;
+
+/// A superfile deleted younger than this gets its own `info` line. Routine reclaim removes
+/// superseded files long after they were written, so a young one is the rare, risky case: a file
+/// whose commit was still in flight, or never landed. Three of the deferred sweep's grace windows
+/// keeps the line for a file taken the moment it cleared the grace, without logging every routine
+/// delete.
+const YOUNG_SUPERFILE_DELETE_AGE: Duration =
+    Duration::from_secs(3 * DEFAULT_SUPERFILE_RECLAIM_GRACE.as_secs());
 
 /// Outcome of a [`crate::Supertable::gc`] sweep: what was reclaimed and what was
 /// intentionally kept.
@@ -59,13 +83,8 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     live.insert(POINTER_PATH.to_string());
     live.insert(manifest_uri(manifest.manifest_id));
 
-    // The part fan this list is built from, plus each part's routing sibling where it has one.
-    for entry in manifest.get_all_list_entries() {
-        live.insert(entry.uri.clone());
-        if let Some(routing) = &entry.routing {
-            live.insert(routing.uri.clone());
-        }
-    }
+    // The parts, their routing siblings and the list-level blobs, all read off the list.
+    live.extend(list_refs(manifest).map(str::to_owned));
 
     // Every superfile, but only when the parts are all loaded. A partial view names some of the
     // superfiles and no more, so the caller must skip `data/` entirely rather than treat the ones
@@ -79,26 +98,6 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
         false
     };
 
-    // The slow-CAS state blob and its centroid section, read straight off the list refs with no
-    // fetch. Older drains are absent from the current list and age out past the safety gap.
-    if let Some((uri, _)) = manifest.slow_vector_state_blob() {
-        live.insert(uri.to_owned());
-    }
-    if let Some(centroids) = manifest.slow_vector_state_centroids_blob() {
-        live.insert(centroids.uri.clone());
-    }
-    if let Some(graphs) = manifest.resident_vector_index_blob() {
-        live.insert(graphs.uri.clone());
-    }
-    if let Some(centroid_graph) = manifest.slow_vector_state_centroid_graph_blob() {
-        live.insert(centroid_graph.uri.clone());
-    }
-    // The global term-stats sidecar, same list-ref discipline: the current
-    // artifact is live; superseded generations age out past the safety gap.
-    if let Some(stats) = manifest.term_stats_blob() {
-        live.insert(stats.uri.clone());
-    }
-
     // Each resident superfile's tombstone sidecar. `superfiles/` is swept whatever the flag says,
     // so these have to be named here or a sidecar past the gap is deleted and its deleted rows
     // come back. The superfile paths repeat what the complete view above already inserted.
@@ -110,10 +109,122 @@ fn build_live_set(manifest: &ManifestSnapshot) -> (HashSet<String>, bool) {
     (live, superfiles_complete)
 }
 
+/// Every object a manifest's list references besides the list itself: the parts and their routing
+/// siblings, and the list-level blobs (vector state and its sections, graph and router blobs, term
+/// stats, the term-index root). Read off the list with no I/O. The listing sweep keeps these and
+/// the deferred sweep diffs them, so a new kind of list reference is added here, once, for both.
+fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
+    let parts = manifest.get_all_list_entries().iter().flat_map(|entry| {
+        iter::once(entry.uri.as_str())
+            .chain(entry.routing.as_ref().map(|routing| routing.uri.as_str()))
+            .chain(entry.summaries.as_ref().map(|section| section.uri.as_str()))
+    });
+
+    let blobs = [
+        manifest.slow_vector_state_blob().map(|(uri, _)| uri),
+        manifest
+            .slow_vector_state_centroids_blob()
+            .map(|r| r.uri.as_str()),
+        manifest
+            .resident_vector_index_blob()
+            .map(|r| r.uri.as_str()),
+        manifest
+            .slow_vector_state_centroid_graph_blob()
+            .map(|r| r.uri.as_str()),
+        manifest.term_index_ref().map(|r| r.uri.as_str()),
+    ]
+    .into_iter()
+    .flatten();
+
+    parts.chain(blobs)
+}
+
+/// The slices a term-index root names, which takes reading the root, one small object. A root
+/// that cannot be read is a permanent failure on that URI: slices a sweep could not enumerate are
+/// slices it must not decide about.
+async fn term_index_slices(
+    storage: &dyn StorageProvider,
+    root: &RoutingRef,
+) -> Result<Vec<String>, GcError> {
+    let loaded = term_index::load_root(storage, root)
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: root.uri.clone(),
+                source: Box::new(error),
+            })
+        })?;
+
+    Ok(loaded
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.slices)
+        .map(|slice| term_index::slice_uri(&slice.content_hash))
+        .collect())
+}
+
+/// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in
+/// flight. `on_result` sees every key's outcome as it arrives. Both sweeps delete through here.
+async fn delete_objects(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    keys: Vec<String>,
+    mut on_result: impl FnMut(String, Result<(), StorageError>),
+) {
+    erase_cached_copies(inner, &keys).await;
+    stream::iter(keys)
+        .map(|key| {
+            let storage = Arc::clone(storage);
+            async move {
+                let result = storage.delete(&key).await;
+                (key, result)
+            }
+        })
+        .buffer_unordered(RECLAIM_CONCURRENCY)
+        .for_each(|(key, result)| {
+            on_result(key, result);
+            future::ready(())
+        })
+        .await;
+}
+
+/// Drop the disk-cache copy of each superfile about to be deleted. Unlinking thousands of files is
+/// blocking filesystem work, so it runs on the blocking pool, off the runtime queries share.
+async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
+    let Some(cache) = inner.options.disk_cache.clone() else {
+        return;
+    };
+
+    let uris: Vec<SuperfileUri> = keys
+        .iter()
+        .filter_map(|key| SuperfileUri::from_storage_path(key))
+        .collect();
+
+    if uris.is_empty() {
+        return;
+    }
+
+    if let Err(error) = spawn_blocking(move || {
+        for uri in &uris {
+            cache.erase_superfile_local_copy(uri);
+        }
+    })
+    .await
+    {
+        warn!(%error, "gc: disk-cache erase for deleted superfiles did not finish");
+    }
+}
+
 impl Supertable {
     /// Delete orphaned storage objects left by compaction or interrupted
-    /// writes. Only objects older than `safety_gap` are removed, so a
-    /// concurrent reader or writer is never raced. Requires durable storage.
+    /// writes. Only objects older than `safety_gap` are removed. Requires
+    /// durable storage.
+    ///
+    /// A commit uploads its files before it publishes them, so until it lands
+    /// they look exactly like orphans. `safety_gap` must be longer than any
+    /// commit can take, or a slow commit loses its own files; `optimize` uses
+    /// a day. What commits replace is reclaimed separately, minutes after each
+    /// commit, without this sweep.
     #[doc(alias = "vacuum")]
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         bridge_on_runtime(self.gc_async(safety_gap), &self.inner().query_runtime())
@@ -174,19 +285,28 @@ async fn live_set(
         // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
         // it through the existing `Storage` variant rather than a dedicated
         // public error variant.
-        let state = slow_vector_state::load_full_state(storage.as_ref(), uri, &hash)
-            .await
-            .map_err(|error| {
-                GcError::Storage(StorageError::Permanent {
-                    uri: uri.to_string(),
-                    source: Box::new(error),
-                })
-            })?;
+        let state = slow_vector_state::load_full_state(
+            storage.as_ref(),
+            uri,
+            &hash,
+            &manifest.options.legacy_names(),
+        )
+        .await
+        .map_err(|error| {
+            GcError::Storage(StorageError::Permanent {
+                uri: uri.to_string(),
+                source: Box::new(error),
+            })
+        })?;
         if let Some(pending) = state.pending_drain {
             uris.extend(pending.entries.iter().map(|entry| entry.storage_path()));
         }
     }
 
+    // Every slice the term-index root names (the root itself is a list ref, already in).
+    if let Some(reference) = manifest.term_index_ref() {
+        uris.extend(term_index_slices(storage.as_ref(), reference).await?);
+    }
     Ok(LiveSet {
         uris,
         superfiles_complete,
@@ -202,6 +322,31 @@ async fn live_set(
 /// before listing and once more before deleting — and an object referenced by either version is
 /// kept. Unioning the two keep-sets rather than replacing the first is the point: a commit that
 /// lands mid-sweep would otherwise fall between them.
+///
+/// The same listing doubles as an integrity check: a superfile the committed manifest references
+/// but storage does not hold is data already lost, and every read or compaction touching it fails
+/// from then on. It runs only over a fully resident membership, the one case `data/` is listed.
+/// This sweep serves [`Supertable::gc`], which `optimize` calls once per table per maintenance
+/// pass; the deferred sweep a commit schedules never lists (see [`superseded`]), so ingest never
+/// pays for the check. On a healthy table it costs one pass over the keep-set and a counter:
+///
+/// ```text
+///   list every prefix ── count the referenced superfiles `data/` returned
+///        │                 (a counter, no allocation; equal to the referenced total when healthy)
+///        ▼ came up short
+///   re-list `data/`, HEAD each referenced key it lacks          (rare path, probes capped)
+///        │
+///        ▼
+///   re-read the pointer ── manifest moved? keep only keys the newer one still references
+///        │
+///        ▼
+///   log the survivors at `error`
+/// ```
+///
+/// The HEAD runs before that pointer re-read on purpose. A key the HEAD found absent, and that a
+/// manifest read afterwards still references, was missing while committed: that is loss. Probing
+/// after the re-read would open a window in which a compaction drops the key, a concurrent sweep
+/// reclaims it, and this sweep reports the legitimate reclaim as loss.
 pub(super) async fn gc_storage_sweep_for_inner(
     inner: &SupertableInner,
     safety_gap: Duration,
@@ -225,8 +370,9 @@ pub(super) async fn gc_storage_sweep_for_inner(
     let mut prefixes = vec![
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
+        MANIFEST_SUMMARIES_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-        TERM_STATS_STORAGE_PREFIX,
+        TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
         SUPERFILES_DIR,
@@ -235,11 +381,23 @@ pub(super) async fn gc_storage_sweep_for_inner(
         prefixes.push(SUPERFILE_DATA_DIR);
     }
 
-    let mut candidates: Vec<(String, u64)> = Vec::new();
+    // `data/` is only listed when membership is complete, so the check needs that too.
+    let check_integrity = superfiles_complete;
+
+    let mut candidates: Vec<(String, u64, SystemTime)> = Vec::new();
+    // Referenced superfiles the `data/` listing returned. Only a shortfall against the referenced
+    // total sends the sweep down the integrity path below.
+    let mut listed_referenced_superfiles = 0usize;
     for prefix in prefixes {
+        // Decided once per prefix. Every referenced key `data/` returns is a superfile.
+        let count_referenced = check_integrity && prefix == SUPERFILE_DATA_DIR;
         let entries = storage.list_with_prefix_metadata(prefix).await?;
         for (key, meta) in entries {
             if live_uris.contains(&key) {
+                if count_referenced {
+                    listed_referenced_superfiles += 1;
+                }
+
                 report.objects_skipped_live += 1;
                 continue;
             }
@@ -247,9 +405,27 @@ pub(super) async fn gc_storage_sweep_for_inner(
                 report.objects_skipped_too_new += 1;
                 continue;
             }
-            candidates.push((key, meta.size));
+            candidates.push((key, meta.size, meta.last_modified));
         }
     }
+
+    // Only superfile keys end in the suffix: the pointer, manifest lists and parts, sidecars and
+    // index blobs never do. Were one to, the check would only re-list and HEAD it (finding it
+    // present), never report it.
+    let referenced_superfiles = if check_integrity {
+        live_uris
+            .iter()
+            .filter(|key| key.ends_with(SUPERFILE_KEY_SUFFIX))
+            .count()
+    } else {
+        0
+    };
+
+    let mut absent = if listed_referenced_superfiles < referenced_superfiles {
+        absent_superfiles(&storage, &live_uris).await?
+    } else {
+        AbsentSuperfiles::default()
+    };
 
     // Nothing is deleted until the listing is complete and the pointer has been re-read once more,
     // so candidates accumulate across every prefix first. That also keeps the re-read below at one
@@ -264,12 +440,18 @@ pub(super) async fn gc_storage_sweep_for_inner(
     // costs a slow-state fetch on a vector table, so it happens solely when the manifest actually
     // moved. Candidates can only be removed here, never added, so a re-check that comes back with a
     // partial view keeps more than it should rather than deleting something it cannot see.
-    if !candidates.is_empty() {
+    //
+    // The same re-read vets the absent superfiles, which is why they alone can trigger it: the HEADs
+    // above already ran, so only a key the newer manifest still references is loss.
+    let mut checked_manifest_id = live_manifest_id;
+    if !candidates.is_empty() || !absent.is_empty() {
         refresh_to_committed(inner).await?;
         if inner.manifest.load().manifest_id != live_manifest_id {
             let recheck = live_set(inner, &storage).await?;
+            checked_manifest_id = recheck.manifest_id;
+            absent.retain_referenced(&recheck.uris);
             let before = candidates.len();
-            candidates.retain(|(key, _)| !recheck.uris.contains(key));
+            candidates.retain(|(key, _, _)| !recheck.uris.contains(key));
 
             let rescued = before - candidates.len();
             report.objects_skipped_live += rescued as u64;
@@ -284,35 +466,151 @@ pub(super) async fn gc_storage_sweep_for_inner(
         }
     }
 
-    for (key, size) in candidates {
-        // Drop the cache copy first.
-        if let (Some(cache), Some(uri)) = (
-            inner.options.disk_cache.as_ref(),
-            SuperfileUri::from_storage_path(&key),
-        ) {
-            cache.erase_superfile_local_copy(&uri);
+    absent.report(checked_manifest_id);
+
+    let now = SystemTime::now();
+    let mut young_superfiles_deleted = 0u64;
+    let mut listed: HashMap<String, (u64, SystemTime)> = HashMap::with_capacity(candidates.len());
+    let keys: Vec<String> = candidates
+        .into_iter()
+        .map(|(key, size, last_modified)| {
+            listed.insert(key.clone(), (size, last_modified));
+            key
+        })
+        .collect();
+    delete_objects(inner, &storage, keys, |key, result| match result {
+        Ok(()) => {
+            let (size, last_modified) = listed[&key];
+            report.objects_deleted += 1;
+            report.bytes_freed += size;
+            let age = now.duration_since(last_modified).unwrap_or_default();
+            if age < YOUNG_SUPERFILE_DELETE_AGE && key.ends_with(SUPERFILE_KEY_SUFFIX) {
+                young_superfiles_deleted += 1;
+                info!(
+                    object = %key,
+                    bytes = size,
+                    age_secs = age.as_secs(),
+                    manifest_id = checked_manifest_id,
+                    "gc: deleted a young superfile unreferenced by the committed manifest"
+                );
+            }
+        }
+        Err(e) => {
+            warn!(object = %key, error = %e, "gc: failed to delete orphan object");
+            report.delete_errors += 1;
+        }
+    })
+    .await;
+
+    // A routine sweep stays at `debug`. One that deleted a young superfile (only possible with a
+    // gap shorter than a commit can take) or failed a delete is the one worth reading.
+    if young_superfiles_deleted > 0 || report.delete_errors > 0 {
+        info!(
+            deleted = report.objects_deleted,
+            young_superfiles_deleted,
+            bytes_freed = report.bytes_freed,
+            delete_errors = report.delete_errors,
+            manifest_id = checked_manifest_id,
+            "gc sweep complete"
+        );
+    } else {
+        debug!(
+            deleted = report.objects_deleted,
+            bytes_freed = report.bytes_freed,
+            manifest_id = checked_manifest_id,
+            superfiles_complete,
+            "gc sweep complete"
+        );
+    }
+    Ok(report)
+}
+
+/// Referenced superfiles the sweep's listing did not return, split by whether a HEAD confirmed
+/// them absent. Every key is still subject to the caller's manifest re-check before it is reported.
+#[derive(Debug, Default)]
+struct AbsentSuperfiles {
+    /// A HEAD answered `NotFound`.
+    confirmed: Vec<String>,
+    /// Past [`MAX_MISSING_SUPERFILE_PROBES`], never probed. Reported as a count, not by name.
+    unprobed: Vec<String>,
+}
+
+impl AbsentSuperfiles {
+    fn is_empty(&self) -> bool {
+        self.confirmed.is_empty() && self.unprobed.is_empty()
+    }
+
+    /// Keep only keys the newer manifest still references. One it dropped was reclaimed by a
+    /// concurrent sweep after a compaction removed it: a legitimate delete, not loss. A newer
+    /// manifest seen only in part drops keys it cannot see, which under-reports rather than
+    /// reports loss on a guess.
+    fn retain_referenced(&mut self, referenced: &HashSet<String>) {
+        self.confirmed.retain(|key| referenced.contains(key));
+        self.unprobed.retain(|key| referenced.contains(key));
+    }
+
+    /// One `error` per confirmed key, plus one for the unprobed remainder. Keep the message text
+    /// stable: operators alert on it.
+    fn report(&self, manifest_id: u64) {
+        for key in &self.confirmed {
+            error!(
+                object = %key,
+                manifest_id,
+                "manifest references a superfile missing from storage"
+            );
+        }
+        if !self.unprobed.is_empty() {
+            error!(
+                unprobed = self.unprobed.len(),
+                manifest_id,
+                "manifest references a superfile missing from storage: more than the sweep probes"
+            );
+        }
+    }
+}
+
+/// Re-list `data/` and HEAD each referenced superfile it lacks, at most
+/// [`MAX_MISSING_SUPERFILE_PROBES`] of them; the rest are kept as unprobed. Only called when the
+/// sweep's own listing came up short, so the key set built here costs nothing on a healthy table.
+///
+/// A HEAD that finds the object means the listing raced a write and nothing is lost. One that fails
+/// for another reason is no evidence either way; the next explicit sweep probes the key again.
+async fn absent_superfiles(
+    storage: &Arc<dyn StorageProvider>,
+    referenced: &HashSet<String>,
+) -> Result<AbsentSuperfiles, GcError> {
+    let listed: HashSet<String> = storage
+        .list_with_prefix(SUPERFILE_DATA_DIR)
+        .await?
+        .into_iter()
+        .collect();
+
+    let mut absent = AbsentSuperfiles::default();
+    let mut probes = 0usize;
+
+    for key in referenced
+        .iter()
+        .filter(|key| key.ends_with(SUPERFILE_KEY_SUFFIX) && !listed.contains(*key))
+    {
+        if probes == MAX_MISSING_SUPERFILE_PROBES {
+            absent.unprobed.push(key.clone());
+            continue;
         }
 
-        match storage.delete(&key).await {
-            Ok(()) => {
-                report.objects_deleted += 1;
-                report.bytes_freed += size;
-            }
-            Err(e) => {
-                warn!(object = %key, error = %e, "gc: failed to delete orphan object");
-                report.delete_errors += 1;
-            }
+        probes += 1;
+
+        match storage.head(key).await {
+            Err(StorageError::NotFound { .. }) => absent.confirmed.push(key.clone()),
+            Ok(_) => {}
+            Err(e) => warn!(
+                object = %key,
+                error = %e,
+                "gc: could not confirm a superfile the listing did not return"
+            ),
         }
     }
 
-    debug!(
-        deleted = report.objects_deleted,
-        bytes_freed = report.bytes_freed,
-        delete_errors = report.delete_errors,
-        superfiles_complete,
-        "gc sweep complete"
-    );
-    Ok(report)
+    Ok(absent)
 }
 
 #[cfg(test)]
@@ -320,6 +618,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use tempfile::tempdir;
+    use tracing::Level;
     use uuid::Uuid;
 
     use super::*;
@@ -328,15 +627,16 @@ mod tests {
         supertable::{
             SupertableOptions,
             manifest::{
-                ManifestSnapshot, SuperfileEntry, SuperfileUri,
+                ManifestSnapshot, ScalarStats, SuperfileEntry, SuperfileUri,
                 list::{
                     FORMAT_VERSION, Manifest, ManifestPartEntry, PartitionStrategy, RoutingRef,
                 },
                 part::{ContentHash, PartId},
+                summaries::{SummariesRef, summaries_uri},
             },
             slow_vector_state,
         },
-        test_helpers::default_supertable_options,
+        test_helpers::{capture_logs, default_supertable_options},
     };
 
     /// The hidden vector index sweeps through a `PrefixedStorageProvider`, which
@@ -382,6 +682,7 @@ mod tests {
 
     fn sf_entry(uri: SuperfileUri) -> Arc<SuperfileEntry> {
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: Uuid::new_v4(),
@@ -389,7 +690,7 @@ mod tests {
             n_docs: 1,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: HashMap::new(),
             vector_summary: HashMap::new(),
             partition_key: vec![],
@@ -445,13 +746,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn build_live_set_marks_lazy_part_membership_incomplete() {
-        let dir = tempdir().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    /// A manifest whose one part is listed but not loaded, naming
+    /// `summaries` as the part's section.
+    fn lazy_part_manifest(
+        storage: Arc<dyn StorageProvider>,
+        summaries: Option<SummariesRef>,
+    ) -> ManifestSnapshot {
         let part_id = PartId::new_v4();
-        let manifest = ManifestSnapshot::new(
+        ManifestSnapshot::new(
             TEST_MANIFEST_ID,
             opts(),
             Vec::new(),
@@ -459,18 +761,19 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
                 },
                 vector_index_storage_prefix: None,
+                companions: Default::default(),
                 global_vector_index: None,
                 drained_ranges: Default::default(),
                 deleted_user_ids_inline: None,
@@ -479,7 +782,8 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: vec![ManifestPartEntry {
                     part_id,
                     uri: format!("manifest-parts/part-{part_id}.avro.zst"),
@@ -491,12 +795,66 @@ mod tests {
                     id_range: (0, 0),
                     scalar_stats_agg: HashMap::new(),
                     fts_summary_agg: Default::default(),
+                    fts_length_totals: None,
+                    summaries,
                 }],
             }),
-        );
+        )
+    }
+
+    #[test]
+    fn build_live_set_marks_lazy_part_membership_incomplete() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let manifest = lazy_part_manifest(storage, None);
 
         let (_, superfiles_complete) = build_live_set(&manifest);
         assert!(!superfiles_complete);
+    }
+
+    /// A part's summaries section is live while the list names it: the
+    /// sweep lists its prefix, so a section not in the keep-set is deleted.
+    #[test]
+    fn build_live_set_contains_a_part_s_summaries_section() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let section = SummariesRef {
+            uri: "manifest-summaries/summ-abc.bin".into(),
+            content_hash: ContentHash::of(b"section"),
+            size_bytes: 7,
+        };
+        let manifest = lazy_part_manifest(storage, Some(section.clone()));
+
+        let (live, _) = build_live_set(&manifest);
+        assert!(live.contains(&section.uri));
+    }
+
+    /// A section no list names is swept, and the one the list names stays.
+    #[test]
+    fn a_sweep_deletes_an_orphaned_summaries_section_and_keeps_the_live_one() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = table_with_superfiles(&storage, &["alphatoken marker"]);
+        let live = st
+            .inner()
+            .manifest
+            .load()
+            .get_all_list_entries()
+            .iter()
+            .filter_map(|entry| entry.summaries.as_ref().map(|section| section.uri.clone()))
+            .next()
+            .expect("a user part names its section");
+        let orphan = summaries_uri(&ContentHash::of(b"an orphaned section"));
+        std::fs::write(dir.path().join(&orphan), b"an orphaned section").expect("write orphan");
+        assert!(dir.path().join(&live).exists());
+
+        let (report, _) = sweep_logging(&st);
+
+        assert!(!dir.path().join(&orphan).exists(), "{report:?}");
+        assert!(dir.path().join(&live).exists(), "{report:?}");
     }
 
     #[test]
@@ -532,18 +890,19 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
                 },
                 vector_index_storage_prefix: None,
+                companions: Default::default(),
                 global_vector_index: None,
                 drained_ranges: Default::default(),
                 deleted_user_ids_inline: None,
@@ -555,7 +914,8 @@ mod tests {
                 }),
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: Vec::new(),
             }),
         );
@@ -600,18 +960,19 @@ mod tests {
             Some(Manifest {
                 tombstone_seqs: Default::default(),
                 superseded_cells: Default::default(),
+                split_checks: Default::default(),
                 format_version: FORMAT_VERSION.into(),
                 manifest_id: TEST_MANIFEST_ID,
                 options_hash: ContentHash::of(b"options"),
-                schema: Vec::new(),
+                schema: None,
                 id_column: "_id".into(),
-                fts_columns: Vec::new(),
-                vector_columns: Vec::new(),
+                commit_token: Uuid::nil(),
                 partition_strategy: PartitionStrategy::Hash {
                     column: "_id".into(),
                     n_buckets: TEST_HASH_BUCKETS,
                 },
                 vector_index_storage_prefix: None,
+                companions: Default::default(),
                 global_vector_index: None,
                 drained_ranges: Default::default(),
                 deleted_user_ids_inline: None,
@@ -623,7 +984,8 @@ mod tests {
                     uri: centroid_graph_uri.clone(),
                     content_hash: centroid_graph_hash,
                 }),
-                term_stats: None,
+                term_index: None,
+                term_index_complete: false,
                 parts: Vec::new(),
             }),
         );
@@ -636,5 +998,424 @@ mod tests {
             !live.contains(&orphan),
             "unreferenced blob must still be sweepable"
         );
+    }
+
+    /// Runs `hook` on a plain thread the first time the sweep lists `data/` after [`Self::arm`],
+    /// before the listing reads anything, and hides `hidden` from every `data/` listing. That puts a
+    /// concurrent commit, or a listing that missed an object, exactly where the sweep is most exposed
+    /// without any timing assumption. The plain thread matters: a sync commit builds its own runtime.
+    struct DataListHook {
+        inner: Arc<dyn StorageProvider>,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        hidden: Option<String>,
+        armed: std::sync::atomic::AtomicBool,
+        /// Requests the sweep issued while armed, so a test can pin its shape.
+        heads: std::sync::atomic::AtomicUsize,
+        data_lists: std::sync::atomic::AtomicUsize,
+    }
+
+    // `StorageProvider: Debug`, and a boxed closure is not; the wrapper is its inner provider.
+    impl std::fmt::Debug for DataListHook {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.inner.fmt(f)
+        }
+    }
+
+    impl DataListHook {
+        /// A table handle over `inner` wrapped in the hook, armed once the open's own listings are
+        /// done so only the sweep under test sees the hook.
+        fn sweeper(
+            inner: Arc<dyn StorageProvider>,
+            hook: Option<Box<dyn FnOnce() + Send>>,
+            hidden: Option<String>,
+        ) -> (Arc<Self>, Supertable) {
+            let hooked = Arc::new(Self {
+                inner,
+                hook: std::sync::Mutex::new(hook),
+                hidden,
+                armed: Default::default(),
+                heads: Default::default(),
+                data_lists: Default::default(),
+            });
+            let storage: Arc<dyn StorageProvider> = Arc::clone(&hooked) as _;
+            let sweeper =
+                Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+            hooked
+                .armed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            (hooked, sweeper)
+        }
+
+        fn heads(&self) -> usize {
+            self.heads.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn data_lists(&self) -> usize {
+            self.data_lists.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for DataListHook {
+        async fn head(&self, uri: &str) -> Result<crate::storage::ObjectMeta, StorageError> {
+            if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+                self.heads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.inner.head(uri).await
+        }
+
+        async fn get(
+            &self,
+            uri: &str,
+        ) -> Result<(bytes::Bytes, crate::storage::ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+
+        async fn get_if_none_match(
+            &self,
+            uri: &str,
+            etag: &str,
+        ) -> Result<Option<(bytes::Bytes, crate::storage::ObjectMeta)>, StorageError> {
+            self.inner.get_if_none_match(uri, etag).await
+        }
+
+        async fn get_range(
+            &self,
+            uri: &str,
+            range: std::ops::Range<u64>,
+        ) -> Result<bytes::Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: bytes::Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+
+        async fn put_multipart(
+            &self,
+            uri: &str,
+        ) -> Result<Box<dyn object_store::MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, crate::storage::ObjectMeta)>, StorageError> {
+            let armed = self.armed.load(std::sync::atomic::Ordering::Relaxed);
+            if armed && prefix == SUPERFILE_DATA_DIR {
+                self.data_lists
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let hook = self.hook.lock().expect("hook slot").take();
+                if let Some(hook) = hook {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    std::thread::spawn(move || {
+                        hook();
+                        let _ = tx.send(());
+                    });
+                    rx.await.expect("hook thread");
+                }
+            }
+            let mut entries = self.inner.list_with_prefix_metadata(prefix).await?;
+            if armed && let Some(hidden) = &self.hidden {
+                entries.retain(|(key, _)| key != hidden);
+            }
+            Ok(entries)
+        }
+    }
+
+    /// A table over `storage`, committed one title at a time so each title is its own superfile.
+    fn table_with_superfiles(storage: &Arc<dyn StorageProvider>, titles: &[&str]) -> Supertable {
+        let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(storage)))
+            .expect("create");
+        for title in titles {
+            let mut writer = st.writer().expect("writer");
+            writer
+                .append(&crate::test_helpers::build_title_batch(&[title]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        st
+    }
+
+    fn superfile_keys(st: &Supertable) -> Vec<String> {
+        st.inner()
+            .manifest
+            .load_full()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| entry.storage_path())
+            .collect()
+    }
+
+    /// Sweep `st` with no grace, capturing every line it logs at `info` and above.
+    ///
+    /// A multi-thread runtime, so `block_on` drives the sweep on this thread and the thread-local
+    /// subscriber sees its events.
+    fn sweep_logging(st: &Supertable) -> (GcReport, String) {
+        capture_logs(Level::INFO, || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(gc_storage_sweep_for_inner(st.inner(), Duration::ZERO))
+                .expect("sweep")
+        })
+    }
+
+    /// Lines reporting loss, under the stable message operators alert on.
+    fn loss_lines(logs: &str) -> Vec<&str> {
+        logs.lines()
+            .filter(|line| line.contains("manifest references a superfile missing from storage"))
+            .collect()
+    }
+
+    /// A referenced superfile deleted behind the table's back is named at `error`, and the one still
+    /// there is neither named nor touched.
+    #[test]
+    fn a_sweep_reports_a_referenced_superfile_missing_from_storage() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = table_with_superfiles(&storage, &["alphatoken marker", "betatoken marker"]);
+        let [lost, kept] = <[String; 2]>::try_from(superfile_keys(&st)).expect("two superfiles");
+        std::fs::remove_file(dir.path().join(&lost)).expect("delete behind the table");
+
+        let (report, logs) = sweep_logging(&st);
+
+        let lines = loss_lines(&logs);
+        assert_eq!(lines.len(), 1, "exactly the lost superfile: {logs}");
+        assert!(
+            lines[0].contains("ERROR") && lines[0].contains(&lost),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains(&kept),
+            "the present superfile is not named: {logs}"
+        );
+        assert!(dir.path().join(&kept).exists(), "{report:?}");
+    }
+
+    /// The race the ordering exists for: between the sweep's keep-set and its listing, a compaction
+    /// drops two superfiles and a concurrent sweep reclaims them. They are absent and were
+    /// referenced, but the committed manifest no longer names them, so nothing is lost and nothing
+    /// may be reported. The merged output is new to the sweep and must survive too.
+    #[test]
+    fn a_superfile_a_concurrent_compaction_dropped_is_not_reported() {
+        let dir = tempdir().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // Enough small superfiles for the planner to merge them.
+        let titles: Vec<String> = (0..10).map(|i| format!("token{i} marker")).collect();
+        let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let writer = Arc::new(table_with_superfiles(&local, &titles));
+        let inputs = superfile_keys(&writer);
+
+        let compactor = Arc::clone(&writer);
+        let root = dir.path().to_path_buf();
+        let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+            compactor
+                .optimize(&crate::OptimizeOptions::compact(
+                    crate::CompactionSettings {
+                        target_superfile_size_mb: 1,
+                        min_fill_percent: 1,
+                        ..crate::CompactionSettings::default()
+                    },
+                ))
+                .expect("optimize");
+            let live = superfile_keys(&compactor);
+            let dropped: Vec<&String> = inputs.iter().filter(|key| !live.contains(key)).collect();
+            assert!(!dropped.is_empty(), "the compaction merged something");
+            for key in dropped {
+                std::fs::remove_file(root.join(key)).expect("concurrent reclaim");
+            }
+        });
+        let (_, sweeper) = DataListHook::sweeper(Arc::clone(&local), Some(hook), None);
+
+        let (report, logs) = sweep_logging(&sweeper);
+
+        assert!(
+            loss_lines(&logs).is_empty(),
+            "a legitimate reclaim was reported as loss: {logs}"
+        );
+        for key in superfile_keys(&writer) {
+            assert!(
+                dir.path().join(&key).exists(),
+                "merged output kept: {report:?}"
+            );
+        }
+    }
+
+    /// A listing that missed an object storage does hold is a race, not loss: the HEAD finds it.
+    #[test]
+    fn a_superfile_the_listing_missed_but_storage_holds_is_not_reported() {
+        let dir = tempdir().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let writer = table_with_superfiles(&local, &["alphatoken marker"]);
+        let [key] = <[String; 1]>::try_from(superfile_keys(&writer)).expect("one superfile");
+
+        let (_, sweeper) = DataListHook::sweeper(local, None, Some(key.clone()));
+
+        let (_, logs) = sweep_logging(&sweeper);
+
+        assert!(loss_lines(&logs).is_empty(), "{logs}");
+        assert!(
+            dir.path().join(&key).exists(),
+            "the hidden superfile was kept"
+        );
+    }
+
+    /// A table missing more superfiles than one sweep probes: the first batch is confirmed by name,
+    /// the rest carried as unprobed so the report can still count them.
+    #[tokio::test]
+    async fn probing_stops_at_the_cap_and_keeps_the_rest_unprobed() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let referenced: HashSet<String> = (0..=MAX_MISSING_SUPERFILE_PROBES)
+            .map(|_| SuperfileUri::new_v4().storage_path())
+            .chain([POINTER_PATH.to_string()])
+            .collect();
+
+        let absent = absent_superfiles(&storage, &referenced)
+            .await
+            .expect("probe");
+
+        assert_eq!(absent.confirmed.len(), MAX_MISSING_SUPERFILE_PROBES);
+        assert_eq!(
+            absent.unprobed.len(),
+            1,
+            "only superfile keys, past the cap"
+        );
+    }
+
+    /// Routine reclaim stays at `debug`; a superfile deleted soon after it was written, the case an
+    /// in-flight commit loses, gets its own `info` line and lifts the summary to `info`.
+    #[test]
+    fn a_sweep_logs_only_young_superfile_deletes_at_info() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = table_with_superfiles(&storage, &[]);
+
+        let young = SuperfileUri::new_v4().storage_path();
+        let old = SuperfileUri::new_v4().storage_path();
+        std::fs::create_dir_all(dir.path().join(SUPERFILE_DATA_DIR)).expect("data dir");
+        for key in [&young, &old] {
+            std::fs::write(dir.path().join(key), b"orphan").expect("plant orphan");
+        }
+        let stamp = SystemTime::now() - 2 * YOUNG_SUPERFILE_DELETE_AGE;
+        std::fs::File::options()
+            .write(true)
+            .open(dir.path().join(&old))
+            .expect("open old orphan")
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_accessed(stamp)
+                    .set_modified(stamp),
+            )
+            .expect("backdate old orphan");
+
+        let (report, logs) = sweep_logging(&st);
+
+        assert!(
+            !dir.path().join(&young).exists() && !dir.path().join(&old).exists(),
+            "both orphans reclaimed: {report:?}"
+        );
+        assert!(logs.contains(&young), "the young delete is logged: {logs}");
+        assert!(
+            !logs.contains(&old),
+            "the old delete stays at debug: {logs}"
+        );
+        assert!(
+            logs.contains("young_superfiles_deleted=1"),
+            "summary at info: {logs}"
+        );
+    }
+
+    /// A sweep that only reclaimed routine leftovers logs nothing at `info`.
+    #[test]
+    fn a_routine_sweep_stays_below_info() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        // Each commit supersedes the manifest list before it, which the sweep then reclaims.
+        let st = table_with_superfiles(&storage, &["alphatoken marker", "betatoken marker"]);
+
+        let (report, logs) = sweep_logging(&st);
+
+        assert!(
+            report.objects_deleted > 0,
+            "something routine was reclaimed"
+        );
+        assert!(logs.is_empty(), "nothing at info or above: {logs}");
+    }
+
+    /// The check must add no request to a healthy sweep: no HEAD, and `data/` listed once, as before.
+    #[test]
+    fn a_healthy_sweep_issues_no_extra_requests() {
+        let dir = tempdir().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        table_with_superfiles(&local, &["alphatoken marker", "betatoken marker"]);
+        let (hooked, sweeper) = DataListHook::sweeper(local, None, None);
+
+        let (_, logs) = sweep_logging(&sweeper);
+
+        assert!(loss_lines(&logs).is_empty(), "{logs}");
+        assert_eq!(hooked.heads(), 0, "no HEAD on a healthy table");
+        assert_eq!(hooked.data_lists(), 1, "data/ listed once");
+    }
+
+    /// A HEAD that fails for another reason proves nothing either way: it is logged at `warn`,
+    /// never reported as loss, and the next explicit sweep probes the key again.
+    #[test]
+    fn a_superfile_whose_head_fails_is_not_reported() {
+        use crate::test_helpers::fault_storage::{FaultOp, FaultStorage};
+
+        let dir = tempdir().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faulty = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&faulty) as _;
+        let st = table_with_superfiles(&storage, &["alphatoken marker"]);
+        let [lost] = <[String; 1]>::try_from(superfile_keys(&st)).expect("one superfile");
+        std::fs::remove_file(dir.path().join(&lost)).expect("delete behind the table");
+        faulty.fail(FaultOp::Head, &lost, usize::MAX);
+
+        let (_, logs) = sweep_logging(&st);
+
+        assert!(
+            loss_lines(&logs).is_empty(),
+            "an unanswered HEAD was reported as loss: {logs}"
+        );
+        assert!(
+            logs.contains("could not confirm"),
+            "the failed probe is visible: {logs}"
+        );
+        assert!(faulty.fired() > 0, "the probe ran and failed");
     }
 }

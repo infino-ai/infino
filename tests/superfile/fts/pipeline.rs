@@ -8,12 +8,9 @@
 //! correctness pattern used across the integration tests.
 
 use bytes::Bytes;
-use infino::{
-    superfile::fts::{
-        builder::FtsBuilder,
-        reader::{BoolMode, FtsReader},
-    },
-    test_helpers::default_tokenizer,
+use infino::superfile::fts::{
+    builder::FtsBuilder,
+    reader::{BoolMode, FtsReader},
 };
 
 /// Document count for the two-column FTS pipeline fixture.
@@ -46,8 +43,7 @@ const BMW_MULTISPAN_HIGH_TF_DOCS: u32 = 32;
 const BMW_MULTISPAN_HIGH_TF: usize = 40;
 
 fn build_with_two_columns() -> (Bytes, String) {
-    let tok = default_tokenizer();
-    let mut b = FtsBuilder::new(tok);
+    let mut b = FtsBuilder::new();
     let _ = b
         .register_column("title".into(), false)
         .expect("register column");
@@ -69,8 +65,7 @@ fn build_with_two_columns() -> (Bytes, String) {
     b.add_doc(1, 3, "filler only here").expect("add doc");
 
     let bytes = b.finish().expect("finish fts");
-    let json =
-        r#"[{"name":"title","tokenizer":"ascii_lower"},{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     (Bytes::from(bytes), json.to_string())
 }
 
@@ -86,14 +81,14 @@ async fn end_to_end_routing_per_column() {
         .search("title", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
-    let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| *d).collect();
+    let title_ids: Vec<u32> = title_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(title_ids, vec![0]);
 
     let body_hits = r
         .search("body", &["rust"], FTS_PIPELINE_SEARCH_K, BoolMode::Or)
         .await
         .expect("FTS search");
-    let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| *d).collect();
+    let body_ids: Vec<u32> = body_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(body_ids, vec![1]);
 }
 
@@ -111,7 +106,7 @@ async fn end_to_end_and_intersection() {
         )
         .await
         .expect("search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(ids, vec![0]);
 }
 
@@ -129,7 +124,7 @@ async fn end_to_end_or_union() {
         )
         .await
         .expect("search");
-    let mut ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let mut ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     ids.sort();
     assert_eq!(ids, vec![0, 1]);
 }
@@ -148,7 +143,7 @@ async fn end_to_end_missing_term_or_drops() {
         )
         .await
         .expect("search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(ids, vec![0]);
 }
 
@@ -223,7 +218,7 @@ async fn end_to_end_search_multi_weighted_combine() {
         )
         .await
         .expect("FTS multi-column search");
-    let ids: Vec<u32> = hits.iter().map(|(d, _)| *d).collect();
+    let ids: Vec<u32> = hits.iter().map(|(d, _)| d.get()).collect();
     // doc 0 (title: "rust runtime") and doc 1 (body: "rust ecosystem mature") should both rank.
     assert!(ids.contains(&0));
     assert!(ids.contains(&1));
@@ -246,7 +241,7 @@ fn end_to_end_n_terms_and_columns_reported_correctly() {
 async fn bmw_single_term_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
 
@@ -266,7 +261,7 @@ async fn bmw_single_term_matches_brute_force() {
         b.add_doc(0, i, &text).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → BMW path.
@@ -289,8 +284,8 @@ async fn bmw_single_term_matches_brute_force() {
         .await
         .expect("search");
 
-    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();
-    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| *d).collect();
+    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| d.get()).collect();
+    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(bmw_ids, mt_ids, "BMW and multi-term paths must agree");
 
     // Scores should match within FP noise.
@@ -313,7 +308,7 @@ async fn bmw_single_term_matches_brute_force() {
 async fn bmw_single_term_multispan_matches_brute_force() {
     use infino::superfile::fts::reader::BoolMode;
 
-    let mut b = FtsBuilder::new(default_tokenizer());
+    let mut b = FtsBuilder::new();
     b.register_column("body".into(), false)
         .expect("register column");
 
@@ -350,7 +345,7 @@ async fn bmw_single_term_multispan_matches_brute_force() {
         b.add_doc(0, i, &toks.join(" ")).expect("add doc");
     }
     let bytes = b.finish().expect("finish fts");
-    let json = r#"[{"name":"body","tokenizer":"ascii_lower"}]"#;
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
 
     // Single term → coarse-skip BMW path.
@@ -370,8 +365,8 @@ async fn bmw_single_term_multispan_matches_brute_force() {
         .expect("search");
 
     assert_eq!(bmw_hits.len(), FTS_PIPELINE_SEARCH_K);
-    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| *d).collect();
-    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| *d).collect();
+    let bmw_ids: Vec<u32> = bmw_hits.iter().map(|(d, _)| d.get()).collect();
+    let mt_ids: Vec<u32> = mt_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(
         bmw_ids, mt_ids,
         "coarse-skip BMW and full-decode paths must agree across many spans"

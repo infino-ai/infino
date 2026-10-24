@@ -53,6 +53,7 @@ use infino::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
         fts::reader::BoolMode,
+        id_space::RowId,
     },
     supertable::{
         StorageRangeSource,
@@ -156,7 +157,7 @@ fn build_positional_test_bytes() -> Bytes {
 
 #[tokio::test]
 async fn open_lazy_reads_positional_v2_blob_like_eager() {
-    // The v2 header extension and the shifted FST prefetch range are
+    // The v2 header extension and the shifted dictionary prefetch range are
     // lazy-open-specific code paths; this pins them against the eager
     // open on the same bytes, including a term resolution (postings
     // fetch through the lazy source with the positional term-meta
@@ -194,7 +195,7 @@ async fn open_lazy_reads_positional_v2_blob_like_eager() {
         .expect("eager match")
         .0;
     assert_eq!(lazy_hits, eager_hits);
-    assert_eq!(lazy_hits, vec![0, 2]);
+    assert_eq!(lazy_hits, vec![RowId::new(0), RowId::new(2)]);
 }
 
 // ============================================================
@@ -233,6 +234,10 @@ impl StorageProvider for CountingProxy {
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
+    }
+
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
     }
     async fn put_if_match(
         &self,
@@ -329,8 +334,8 @@ async fn open_lazy_via_storage_matches_open_via_bytes() {
         .search("title", &["alpha"], LAZY_TEST_BM25_K, BoolMode::Or)
         .await
         .expect("lazy bm25");
-    let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| *d).collect();
-    let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| *d).collect();
+    let eager_ids: Vec<_> = eager_hits.iter().map(|(d, _)| d.get()).collect();
+    let lazy_ids: Vec<_> = lazy_hits.iter().map(|(d, _)| d.get()).collect();
     assert_eq!(lazy_ids, eager_ids);
 }
 
@@ -449,7 +454,7 @@ async fn cold_open_lazy_within_documented_range_budget_for_vec_plus_fts() {
     //   1 footer tail
     //   3 vector metadata ranges (outer header, directory+crc, subheader;
     //     +1 more for Sq8 codec_meta on Sq8 superfiles)
-    //   3 FTS metadata ranges (header, FST directory, doc-length tail)
+    //   3 FTS metadata ranges (header, dictionary directory, doc-length tail)
     //
     // This tiny fixture uses a non-Sq8 vector superfile, so the expected
     // combined budget is 7. The production latency target is governed by

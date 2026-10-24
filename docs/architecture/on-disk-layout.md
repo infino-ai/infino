@@ -28,23 +28,47 @@ mydb/                                     database root (the connect() path)
 │   │
 │   ├── manifest/
 │   │   └── manifest-000004.json          JSON · immutable manifest version
-│   │       ├ stores : parts[] (each: uri + content_hash), schema, fts/vector
-│   │       │          column specs, partition strategy
-│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts
+│   │       ├ stores : parts[] (each: uri + content_hash, and the summaries
+│   │       │          section's uri + hash + size), schema, fts/vector
+│   │       │          column specs, partition strategy; format 3.0 since the
+│   │       │          summaries section (majors 1 and 2 still read)
+│   │       └ used   : one written per commit (NNNNNN bumps); names the live parts.
+│   │                  The first commit by an engine that writes sections, a
+│   │                  no-data maintenance publish or the hidden index's sibling
+│   │                  included, writes 3.0, which an engine from before refuses:
+│   │                  a deployment that has committed cannot roll back past it
 │   │
 │   ├── manifest-parts/
 │   │   └── part-<blake3>.avro.zst        Avro+zstd · immutable, content-addressed
 │   │       ├ stores : superfiles[] entries, each with uri, n_docs, id_min/max,
-│   │       │          bloom + min/max summaries
-│   │       └ used   : skip-pruning; reject superfiles before reading their bytes
+│   │       │          term range + BM25 length statistics (a term bloom only
+│   │       │          on a table with no storage attached); per-column
+│   │       │          statistics inline only in parts written before the
+│   │       │          summaries section, and in the hidden vector index's
+│   │       └ used   : the superfiles a version holds; what a handle keeps resident
 │   │
-│   ├── term-stats/                       present only after a maintenance pass
-│   │   └── stats-<blake3>.bin            binary · magic "INFTSTA1", immutable,
-│   │                                     content-addressed
-│   │       ├ stores : document frequency per (column, term), summed over the
-│   │       │          superfile ids the file records as covered
-│   │       └ used   : corpus-wide BM25 statistics; one lookup replaces probing
-│   │                  every superfile's own term dictionary
+│   ├── manifest-summaries/
+│   │   └── summ-<blake3>.bin             binary · magic "ISUM", immutable, content-addressed;
+│   │                                     one per part, named by the part's list entry
+│   │       ├ stores : every superfile's per-column scalar statistics (min/max,
+│   │       │          null count, sum, sketch, value table) as Arrow IPC batches,
+│   │       │          one per column type, with a directory from column to its rows
+│   │       └ used   : skip-pruning and planner statistics; a column is decoded
+│   │                  on request, so a handle's cost does not grow with the column count
+│   │
+│   ├── term-index/                       written by every commit that adds a superfile
+│   │   ├── root-<blake3>.bin             binary · magic "INFTIDX1", immutable,
+│   │   │                                 content-addressed; the manifest names one
+│   │   │       ├ stores : the covered superfiles (uuid + smallest doc id) and,
+│   │   │       │          per segment, every slice's key range, hash and length
+│   │   │       └ used   : resident; binary-searched to find the slice for a term
+│   │   └── slice-<blake3>.bin            binary · magic "INFTSLC1", immutable,
+│   │                                     content-addressed, a few MB each
+│   │           ├ stores : one contiguous range of (column, term) keys: a front-coded
+│   │           │          block dictionary over postings of (superfile ordinal,
+│   │           │          df, score ceiling, postings location)
+│   │           └ used   : exact term routing, part selection, ceiling-ordered
+│   │                      opening, and cursor build without the superfile dictionary
 │   │
 │   ├── data/
 │   │   └── <superfile>.sf.parquet        the superfiles: seg-<uuid>, or <stem>-<uuid> when appended with a source name
@@ -100,22 +124,16 @@ Who points to whom, and how many. The catalog lists many tables; each table pins
                │    │  (avro.zst)      │─ entry ━━━━━▶ seg-B.sf.parquet ╌╌╌╌╌▶ B.tombstones
                │    └──────────────────┘
                │
-               ├──▶ ┌──────────────────┐
-               │    │ manifest part 2  │─ entry ━━━━━▶ seg-C.sf.parquet ╌╌╌╌╌▶ C.tombstones
-               │    │  (avro.zst)      │─ entry ━━━━━▶ seg-D.sf.parquet ╌╌╌╌╌▶ (none yet, as nothing deleted/updated)
-               │    └──────────────────┘
-               │
-               │    term_stats.uri
-               └──▶ ┌──────────────────────┐
-                    │ stats-<blake3>.bin   │  absent on a table no maintenance
-                    └──────────────────────┘  pass has run yet
+               └──▶ ┌──────────────────┐
+                    │ manifest part 2  │─ entry ━━━━━▶ seg-C.sf.parquet ╌╌╌╌╌▶ C.tombstones
+                    │  (avro.zst)      │─ entry ━━━━━▶ seg-D.sf.parquet ╌╌╌╌╌▶ (none yet, as nothing deleted/updated)
+                    └──────────────────┘
 
    Legend
      seg-X            = data/seg-<id>.sf.parquet   (the superfile: Parquet + BM25 + vector;
                         data/<stem>-<id>.sf.parquet when the rows were appended with a
                         source name — the stem is a label, the id keeps the key unique)
      X.tombstones     = superfiles/<id>.tombstones (shares the superfile's id)
-     stats-<blake3>   = term-stats/stats-<blake3>.bin
 
      ━━━━━▶   stored pointer: the labelled field names the next file
      ╌╌╌╌╌▶   NOT a stored pointer: derived from the superfile id; the
@@ -129,7 +147,7 @@ Every hop below the two pointer files is content-addressed with a blake3 hash, s
 - `data/` holds the superfiles; `superfiles/` holds only their tombstones. The directory name is misleading.
 - The live set is whatever the current manifest names. An update writes a new superfile and tombstones the old one, so `data/` accumulates more `.sf.parquet` files than the table's live row count until GC removes the dead ones.
 - `wal/mutations/` is normally empty. A `<walid>.json` (and, for UPDATE, its `.arrow` sidecar) exists only while a mutation is in flight or was interrupted; the next recovery sweep drains it.
-- `term-stats/` is derived, not source data: every figure in it can be recomputed by reading the covered superfiles' own dictionaries, and a reader that cannot load the file falls back to doing exactly that. A maintenance pass (`optimize`) writes it; a commit that only appends keeps the reference, since the new superfiles are simply uncovered and a query tops their df up from their own dictionaries; a commit that removes superfiles drops the reference, because a departed superfile's contribution is baked into sums that cannot be attributed back out. So a table can legitimately have no `term-stats/` file, one file, or one live file alongside superseded ones GC has not yet swept.
+- `term-index/` is derived, not source data: every posting can be recomputed from its superfile's own dictionary, and a reader that cannot load the root or a slice routes by the manifest summaries instead. Every commit that adds a superfile appends a delta segment and a new root; a maintenance pass (`optimize`) folds the deltas into one base, keeping any deltas committed while it ran after that base (or re-indexing their superfiles on top of it), for the next pass to fold. A removal never invalidates it: a posting is followed only if its superfile is still listed by the reader's manifest, so a stale index is incomplete, never wrong. Superseded roots and slices age out through GC like every other derived artifact.
 
 ## Source references
 
@@ -143,7 +161,9 @@ Anchored by symbol so they survive line moves:
 | `data/seg-<uuid>.sf.parquet` name | `SuperfileUri::storage_path` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | `data/<stem>-<uuid>.sf.parquet` name (source-named) | `SuperfileEntry::storage_path`, `superfile_stem` | [src/supertable/manifest/mod.rs](../../src/supertable/manifest/mod.rs) |
 | manifest-part Avro schema (`superfiles[].uri`, summaries) | `SuperfileEntry` schema | [src/supertable/manifest/part.rs](../../src/supertable/manifest/part.rs) |
+| `manifest-summaries/summ-<hash>.bin` name and layout: header with the part's id, superfile ids, directory, one IPC batch per column type | `MANIFEST_SUMMARIES_DIR`, `summaries_uri`, `SummariesSection` | [src/supertable/manifest/summaries.rs](../../src/supertable/manifest/summaries.rs) |
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |
-| `term-stats/stats-<hash>.bin` name, binary layout (`INFTSTA1` + covered ids + FST), and the carry/drop rule | `STORAGE_PREFIX`, `MAGIC`, `TermStatsSidecar` | [src/supertable/manifest/term_stats.rs](../../src/supertable/manifest/term_stats.rs) |
+| `term-index/root-<hash>.bin` and `slice-<hash>.bin` names, root and slice binary layouts, posting encoding | `STORAGE_PREFIX`, `ROOT_MAGIC`, `SLICE_MAGIC`, `Root`, `Slice`, `Posting` | [src/supertable/manifest/term_index/format.rs](../../src/supertable/manifest/term_index/format.rs) |
+| term-index build: per-superfile contributions, k-way merge into slices, delta segments | `ContributionWriter`, `build_segment`, `append_delta` | [src/supertable/manifest/term_index/build.rs](../../src/supertable/manifest/term_index/build.rs), [mod.rs](../../src/supertable/manifest/term_index/mod.rs) |

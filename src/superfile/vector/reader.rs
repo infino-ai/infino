@@ -12,7 +12,7 @@
 //! eagerly at `open()`; per-query work happens on demand.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fmt,
     ops::Range,
     sync::{
@@ -29,7 +29,6 @@ use roaring::RoaringBitmap;
 use serde::Deserialize;
 use tokio::sync::oneshot;
 
-pub(crate) use crate::superfile::lazy_source::Source;
 use crate::{
     memory::{ConnectionMemoryBudget, Reservation},
     runtime_bridge::{run_on_pool, spawn_on},
@@ -49,7 +48,9 @@ use crate::{
             },
             {self},
         },
-        lazy_source::{LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan},
+        lazy_source::{
+            LazyByteSource, LazyByteSourceError, PrefetchedSource, RangeCoalescePlan, Source,
+        },
         vector::{
             cell_posting::{EncodedCellRow, MaterializedIvfRow},
             distance::{
@@ -65,6 +66,7 @@ use crate::{
             rotation::RandomRotation,
         },
     },
+    supertable::schema::FieldId,
 };
 
 /// Bytes per fp32 lane in the on-disk centroid region.
@@ -80,6 +82,9 @@ const SUB_HEADER_SIZE: usize = format::vec::SUB_HEADER_SIZE;
 #[derive(Debug, Clone, Deserialize)]
 pub struct VectorColumnConfig {
     pub column: String,
+    /// The column's stable id, when the writer stamped one.
+    #[serde(default)]
+    pub field_id: Option<u32>,
     pub dim: usize,
     pub rot_seed: u64,
     /// `"l2sq"`, `"cosine"`, or `"negdot"`.
@@ -115,6 +120,8 @@ pub struct ColumnReader {
     /// borrow). See [`TransposedCodeCache`].
     transposed_codes: Arc<TransposedCodeCache>,
     pub name: String,
+    /// The column's stable id, when the writer stamped one.
+    pub field_id: Option<FieldId>,
     pub dim: usize,
     pub n_cent: u32,
     pub n_docs: u32,
@@ -122,7 +129,7 @@ pub struct ColumnReader {
     pub rot_seed: u64,
     /// — on-disk rerank codec for this column. Today
     /// admits Fp32, Sq8, and RabitqOnly; the parser rejects
-    /// every other codec at open time with a `MalformedVersion`
+    /// every other codec at open time with a `Malformed`
     /// until support for it is added (the `None` codec is not yet
     /// implemented).
     pub rerank_codec: RerankCodec,
@@ -358,6 +365,16 @@ pub struct VectorReader {
 }
 
 impl VectorReader {
+    /// Base flat-cluster id for `cell_id` on a multi-cell (v2) blob: the global
+    /// flat cluster the centroid-graph router indexes is
+    /// `flat_cluster_base_for_cell(cell) + local_fine_ordinal`. `None` on the v1
+    /// single-cell layout or an unknown cell. Lets the recalibration scan map a
+    /// per-cell row to its router node without re-deriving the prefix sums.
+    pub(crate) fn flat_cluster_base_for_cell(&self, cell_id: u32) -> Option<u32> {
+        let idx = self.cell_ids.iter().position(|&c| c == cell_id)?;
+        self.flat_cluster_base.get(idx).copied()
+    }
+
     /// The column at `idx`, or a typed error. Cell maps resolve to column
     /// indices by construction, so a miss is inconsistent index state
     /// rather than bad input — surfaced as an error, on the same
@@ -452,10 +469,9 @@ impl VectorReader {
         let header_bytes = source
             .range(0, OUTER_HEADER_SIZE as u64)
             .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy open: outer header fetch: {e}"
-                )))
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy open: outer header fetch".to_string(),
+                source: e,
             })?;
         if &header_bytes[0..MAGIC_BYTES] != format::vec::OUTER_MAGIC {
             return Err(VectorError::Read(ReadError::BadMagic {
@@ -483,7 +499,7 @@ impl VectorReader {
         ) as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "lazy open: directory end {dir_end} exceeds blob size {blob_size}",
             ))));
         }
@@ -491,10 +507,9 @@ impl VectorReader {
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
             .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy open: directory fetch: {e}"
-                )))
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy open: directory fetch".to_string(),
+                source: e,
             })?;
 
         // Validate directory CRC against the prefetched bytes
@@ -538,20 +553,20 @@ impl VectorReader {
                     ..entry_off + dir_entry::CODEC_META_SIZE_OFF + U32_BYTES],
             ) as usize;
             if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
             let sub_end = subsection_off + subsection_len;
             if sub_end > blob_size {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} runs past blob",
                 ))));
             }
             if dir_codec_meta_size > 0 {
                 let meta_end = dir_codec_meta_off + dir_codec_meta_size;
                 if dir_codec_meta_off < SUB_HEADER_SIZE || meta_end > subsection_len - 4 {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} directory codec_meta range [{dir_codec_meta_off}..\
                          {meta_end}) outside subsection body length {}",
                         subsection_len - 4
@@ -577,10 +592,9 @@ impl VectorReader {
                     let bytes = source
                         .range(subsection_off as u64, SUB_HEADER_SIZE as u64)
                         .await
-                        .map_err(|e| {
-                            VectorError::Read(ReadError::MalformedVersion(format!(
-                                "lazy open: subsection {i} sub-header fetch: {e}"
-                            )))
+                        .map_err(|e| VectorError::RangeFetch {
+                            what: format!("lazy open: subsection {i} sub-header fetch"),
+                            source: e,
                         })?;
                     Ok::<_, VectorError>((i, subsection_off, bytes))
                 }
@@ -604,7 +618,7 @@ impl VectorReader {
             ) as usize;
             let open_time_abs_end = subsection_off + per_cluster_blocks_off;
             if open_time_abs_end > sub_end {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} per_cluster_blocks_off {per_cluster_blocks_off} \
                      exceeds subsection length {subsection_len}",
                 ))));
@@ -640,14 +654,14 @@ impl VectorReader {
                 if !stable_ids_gap
                     .is_some_and(|gap| gap.is_multiple_of(format::vec::STABLE_ID_BYTES))
                 {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} codec_meta_size {codec_meta_size} does not end at or a \
                          whole number of stable-`_id`s before per_cluster_blocks_off \
                          {per_cluster_blocks_off}"
                     ))));
                 }
                 if dir_codec_meta_off != codec_meta_off || dir_codec_meta_size != codec_meta_size {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} directory codec_meta range \
                          off={dir_codec_meta_off} len={dir_codec_meta_size} does not match \
                          subheader-derived off={codec_meta_off} len={codec_meta_size}"
@@ -655,7 +669,7 @@ impl VectorReader {
                 }
                 let _ = subsection_len;
             } else if dir_codec_meta_size != 0 || dir_codec_meta_off != 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} has zero codec_meta_size but directory declares \
                      off={dir_codec_meta_off} len={dir_codec_meta_size}"
                 ))));
@@ -729,7 +743,7 @@ impl VectorReader {
         // subsection CRCs since we walk dir entries to find them).
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_columns, DIR_ENTRY_SIZE)?;
         if dir_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "vector directory runs past blob".into(),
             )));
         }
@@ -798,13 +812,13 @@ impl VectorReader {
                 ) as usize;
                 let sub_end = subsection_off + subsection_len;
                 if sub_end > source.len() {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} runs past blob"
                     ))));
                 }
                 let sub = fetch_sync(&source, subsection_off..sub_end, "subsection")?;
                 if sub.len() < SUB_HEADER_SIZE + format::CRC_BYTES {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "subsection {i} too short"
                     ))));
                 }
@@ -849,12 +863,10 @@ impl VectorReader {
         // Parse JSON.
         let cols_json: Vec<VectorColumnConfig> =
             serde_json::from_str(columns_json).map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "inf.vec.columns JSON: {e}"
-                )))
+                VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
             })?;
         if cols_json.len() != n_columns {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "inf.vec.columns has {} entries, header says {n_columns}",
                 cols_json.len()
             ))));
@@ -867,7 +879,7 @@ impl VectorReader {
             let entry_off = i * DIR_ENTRY_SIZE;
             let column_id = read_u32_le(&dir_bytes[entry_off..entry_off + U32_BYTES]);
             if column_id != i as u32 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "vector dir entry {i} has column_id {column_id}"
                 ))));
             }
@@ -903,7 +915,7 @@ impl VectorReader {
             );
             let codec_id = dir_bytes[entry_off + dir_entry::CODEC_ID_OFF];
             let rerank_codec = RerankCodec::from_codec_id(codec_id).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
+                VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' has unknown rerank-codec id {codec_id} \
                      (known ids: 0=fp32, 1=sq8_residual, 2=rabitq_only, \
                       3=sq8_fixed_residual, 4=sq16, 5=sq16_adaptive)",
@@ -911,24 +923,22 @@ impl VectorReader {
                 )))
             })?;
             if !rerank_codec.is_implemented() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses rerank codec {} which is not implemented yet \
-                     (`fp32`, `sq8_residual`, `sq8_fixed_residual`, `sq16`, \
-                      `sq16_adaptive`, `rabitq_only` are the supported codecs)",
-                    cfg.column,
-                    rerank_codec.name()
+                return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                    "rerank codec {} in column '{}'",
+                    rerank_codec.name(),
+                    cfg.column
                 ))));
             }
 
             // Validate against JSON.
             if dim != cfg.dim {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' dim mismatch: dir={dim} json={}",
                     cfg.column, cfg.dim
                 ))));
             }
             if rot_seed != cfg.rot_seed {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' rot_seed mismatch",
                     cfg.column
                 ))));
@@ -938,14 +948,14 @@ impl VectorReader {
                 format::vec::METRIC_ID_COSINE => Metric::Cosine,
                 format::vec::METRIC_ID_NEGDOT => Metric::NegDot,
                 _ => {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "unknown metric_id {metric_id} for column '{}'",
                         cfg.column
                     ))));
                 }
             };
             if !rerank_codec.supports_metric(metric) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' codec {} supports cosine metric only",
                     cfg.column,
                     rerank_codec.name()
@@ -980,12 +990,12 @@ impl VectorReader {
             // underlying async `range` and round-trip per fetch.
             let sub_end = subsection_off + subsection_len;
             if sub_end > source.len() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} runs past blob"
                 ))));
             }
             if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "subsection {i} too short"
                 ))));
             }
@@ -1022,9 +1032,8 @@ impl VectorReader {
             let subsection_version =
                 read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
             if subsection_version != format::vec::SUBSECTION_VERSION {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' has unsupported subsection layout version \
-                     {subsection_version}; this build supports only {}",
+                return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                    "subsection layout {subsection_version} in column '{}'; this build reads {}",
                     cfg.column,
                     format::vec::SUBSECTION_VERSION
                 ))));
@@ -1033,7 +1042,7 @@ impl VectorReader {
             let quant = BitQuantizer::new(dim);
             let code_bytes = quant.code_bytes();
             if code_bytes == 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' dim={dim} yields code_bytes=0",
                     cfg.column
                 ))));
@@ -1063,7 +1072,7 @@ impl VectorReader {
             ) as usize;
 
             if codec_meta_required_zero && codec_meta_size != 0 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' has codec_meta_size={codec_meta_size} for codec {}; \
                      fp32/rabitq_only must write codec_meta_size=0",
                     cfg.column,
@@ -1093,7 +1102,7 @@ impl VectorReader {
             // from the offsets — no header flag.
             let stable_ids_region_bytes =
                 per_cluster_blocks_off.checked_sub(preceding_end).ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
+                    VectorError::Read(ReadError::Malformed(format!(
                         "column '{}' regions before per_cluster_blocks_off={per_cluster_blocks_off} \
                          overrun it (preceding_end={preceding_end})",
                         cfg.column
@@ -1109,7 +1118,7 @@ impl VectorReader {
             let blocks_region_size = sub_crc_pos - per_cluster_blocks_off;
             let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
             if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' per_cluster_blocks region {blocks_region_size} bytes \
                      not divisible by per-doc stride {per_doc_stride}",
                     cfg.column
@@ -1120,7 +1129,7 @@ impl VectorReader {
             let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
             if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' gap before per_cluster_blocks_off is {stable_ids_region_bytes} \
                      bytes; expected 0 or n_docs×16 = {expected_stable_ids_bytes}",
                     cfg.column
@@ -1137,7 +1146,7 @@ impl VectorReader {
             let expected_codec_meta_size =
                 rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent as usize, metric);
             if actual_codec_meta_size != expected_codec_meta_size {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' codec_meta_size={actual_codec_meta_size} on disk but \
                      codec {} / metric {metric:?} expects {expected_codec_meta_size} bytes",
                     cfg.column,
@@ -1212,23 +1221,17 @@ impl VectorReader {
             // guards an off-by-one in the cluster_idx slot.
             let cluster_idx_end = cluster_idx_off + cluster_idx_size;
             if cluster_idx_end > sub_crc_pos {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' cluster index runs past subsection",
                     cfg.column
                 ))));
             }
 
             // Soft cross-check: cfg.metric matches blob's metric.
-            let cfg_metric = match cfg.metric.as_str() {
-                "l2sq" => Some(Metric::L2Sq),
-                "cosine" => Some(Metric::Cosine),
-                "negdot" => Some(Metric::NegDot),
-                _ => None,
-            };
-            if let Some(m) = cfg_metric
+            if let Some(m) = Metric::from_name(&cfg.metric)
                 && m != metric
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "column '{}' metric mismatch: dir={metric:?} json={}",
                     cfg.column, cfg.metric
                 ))));
@@ -1237,6 +1240,7 @@ impl VectorReader {
             columns.push(ColumnReader {
                 transposed_codes: Arc::new(TransposedCodeCache::default()),
                 name: cfg.column.clone(),
+                field_id: cfg.field_id.map(FieldId),
                 dim,
                 n_cent,
                 n_docs: col_n_docs,
@@ -1285,7 +1289,7 @@ impl VectorReader {
                 as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
         if dir_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "multi-cell directory runs past blob".into(),
             )));
         }
@@ -1305,27 +1309,21 @@ impl VectorReader {
 
         let cols_json: Vec<VectorColumnConfig> =
             serde_json::from_str(columns_json).map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "inf.vec.columns JSON: {e}"
-                )))
+                VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
             })?;
         if cols_json.len() != 1 {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "multi-cell blob requires exactly one logical column in inf.vec.columns, got {}",
                 cols_json.len()
             ))));
         }
         let cfg = &cols_json[0];
-        let metric = match cfg.metric.as_str() {
-            "l2sq" => Metric::L2Sq,
-            "cosine" => Metric::Cosine,
-            "negdot" => Metric::NegDot,
-            other => {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "unknown metric {other}"
-                ))));
-            }
-        };
+        let metric = Metric::from_name(&cfg.metric).ok_or_else(|| {
+            VectorError::Read(ReadError::Malformed(format!(
+                "unknown metric {}",
+                cfg.metric
+            )))
+        })?;
         let mut columns = Vec::with_capacity(n_cells);
         let mut cell_ids = Vec::with_capacity(n_cells);
         let mut flat_cluster_base = Vec::with_capacity(n_cells + 1);
@@ -1363,7 +1361,7 @@ impl VectorReader {
                     RerankCodec::Sq16Adaptive
                 }
                 _ => {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "multi-cell directory has unknown rerank codec id {raw_codec}"
                     ))));
                 }
@@ -1371,19 +1369,19 @@ impl VectorReader {
             if let Some(expected) = packed_codec
                 && expected != rerank_codec
             {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell directory mixes rerank codecs".into(),
                 )));
             }
             packed_codec = Some(rerank_codec);
             if !rerank_codec.supports_metric(metric) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell codec {} supports cosine metric only",
                     rerank_codec.name()
                 ))));
             }
             if i > 0 && cell_id <= cell_ids[i - 1] {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell directory cell_ids must be strictly ascending".into(),
                 )));
             }
@@ -1401,7 +1399,7 @@ impl VectorReader {
             // every later cell onto the same flat base in
             // `resolve_flat_cluster`.
             flat_total = flat_total.checked_add(col.n_cent).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(
+                VectorError::Read(ReadError::Malformed(
                     "multi-cell directory total cluster count exceeds u32".into(),
                 ))
             })?;
@@ -1420,12 +1418,12 @@ impl VectorReader {
         // summed cell docs exceed that space would silently wrap routing
         // and bitmap remaps.
         if summed_docs > u64::from(u32::MAX) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "multi-cell blob doc count exceeds u32 local-doc-id space".into(),
             )));
         }
         if n_docs != summed_docs {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "multi-cell outer header n_docs={n_docs} != summed cell docs {summed_docs}"
             ))));
         }
@@ -1436,7 +1434,7 @@ impl VectorReader {
         if opts.verify_crc {
             let blob_len = source.len();
             if blob_len < format::CRC_BYTES {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell blob shorter than its trailing CRC".into(),
                 )));
             }
@@ -1490,7 +1488,7 @@ impl VectorReader {
         ) as usize;
         let (dir_size, dir_end) = checked_dir_bounds(dir_offset, n_cells, CELL_DIR_ENTRY_SIZE)?;
         if dir_end > blob_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "lazy multi-cell: directory end {dir_end} exceeds blob size {blob_size}",
             ))));
         }
@@ -1498,11 +1496,14 @@ impl VectorReader {
         // CRC-on: one full-blob GET so sync CRC verification can
         // `fetch_sync` contiguous ranges (PrefetchedSource does not stitch).
         if opts.verify_crc {
-            let full = source.range(0, blob_size as u64).await.map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy multi-cell: full-blob CRC fetch: {e}"
-                )))
-            })?;
+            let full =
+                source
+                    .range(0, blob_size as u64)
+                    .await
+                    .map_err(|e| VectorError::RangeFetch {
+                        what: "lazy multi-cell: full-blob CRC fetch".to_string(),
+                        source: e,
+                    })?;
             let mut overlay = PrefetchedSource::new(Arc::clone(&source));
             overlay.install(0, full);
             return Self::open_multi_cell_with_source(
@@ -1516,10 +1517,9 @@ impl VectorReader {
         let dir_prefetch = source
             .range(dir_offset as u64, (dir_end - dir_offset) as u64)
             .await
-            .map_err(|e| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
-                    "lazy multi-cell: directory fetch: {e}"
-                )))
+            .map_err(|e| VectorError::RangeFetch {
+                what: "lazy multi-cell: directory fetch".to_string(),
+                source: e,
             })?;
         let dir_bytes_slice = &dir_prefetch[0..dir_size];
         let dir_crc_expected = read_u32_le(&dir_prefetch[dir_size..dir_size + format::CRC_BYTES]);
@@ -1543,14 +1543,12 @@ impl VectorReader {
         // resident). The multi-cell contract is one logical column, whose
         // dim bounds the cluster index.
         let cols: Vec<VectorColumnConfig> = serde_json::from_str(columns_json).map_err(|e| {
-            VectorError::Read(ReadError::MalformedVersion(format!(
-                "inf.vec.columns JSON: {e}"
-            )))
+            VectorError::Read(ReadError::Malformed(format!("inf.vec.columns JSON: {e}")))
         })?;
         let dim = match cols.as_slice() {
             [only] if only.dim > 0 => only.dim,
             _ => {
-                return Err(VectorError::Read(ReadError::MalformedVersion(
+                return Err(VectorError::Read(ReadError::Malformed(
                     "multi-cell blob requires exactly one logical column".into(),
                 )));
             }
@@ -1566,17 +1564,16 @@ impl VectorReader {
                     ..entry_off + cell_dir_entry::SUBSECTION_LEN_OFF + U64_BYTES],
             );
             if subsection_len < SUB_HEADER_SIZE as u64 + format::CRC_BYTES as u64 {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i} too short ({subsection_len} bytes)"
                 ))));
             }
             let sub_hdr_bytes = source
                 .range(subsection_off, SUB_HEADER_SIZE as u64)
                 .await
-                .map_err(|e| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
-                        "lazy multi-cell: sub-header {i}: {e}"
-                    )))
+                .map_err(|e| VectorError::RangeFetch {
+                    what: format!("lazy multi-cell: sub-header {i}"),
+                    source: e,
                 })?;
             overlay.install(subsection_off, sub_hdr_bytes.clone());
             let centroids_off = read_u64_le(
@@ -1587,12 +1584,12 @@ impl VectorReader {
                     [sub_hdr::CLUSTER_IDX_OFF_OFF..sub_hdr::CLUSTER_IDX_OFF_OFF + U64_BYTES],
             );
             let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(format!(
+                VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i}: cluster_idx_off precedes centroids_off"
                 )))
             })?;
             if !centroids_span.is_multiple_of(dim as u64 * 4) {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "multi-cell subsection {i}: centroids region not divisible by dim*4"
                 ))));
             }
@@ -1602,10 +1599,9 @@ impl VectorReader {
                 let idx_bytes = source
                     .range(subsection_off + cluster_idx_off, idx_len)
                     .await
-                    .map_err(|e| {
-                        VectorError::Read(ReadError::MalformedVersion(format!(
-                            "lazy multi-cell: cluster index {i}: {e}"
-                        )))
+                    .map_err(|e| VectorError::RangeFetch {
+                        what: format!("lazy multi-cell: cluster index {i}"),
+                        source: e,
                     })?;
                 overlay.install(subsection_off + cluster_idx_off, idx_bytes);
             }
@@ -1632,7 +1628,7 @@ impl VectorReader {
         let dim = cfg.dim;
         let rot_seed = cfg.rot_seed;
         if !rerank_codec.supports_metric(metric) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell codec {} supports cosine metric only",
                 rerank_codec.name()
             ))));
@@ -1640,17 +1636,17 @@ impl VectorReader {
         // Checked: both values come from on-disk metadata, so the sum can
         // overflow before the bounds check and wrap to a bogus in-range end.
         let sub_end = subsection_off.checked_add(subsection_len).ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(
+            VectorError::Read(ReadError::Malformed(
                 "cell subsection offset + length overflows".into(),
             ))
         })?;
         if sub_end > source.len() {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection runs past blob".into(),
             )));
         }
         if subsection_len < SUB_HEADER_SIZE + format::CRC_BYTES {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection too short".into(),
             )));
         }
@@ -1669,8 +1665,9 @@ impl VectorReader {
         let subsection_version =
             read_u32_le(&sub_header[sub_hdr::VERSION_OFF..sub_hdr::VERSION_OFF + U32_BYTES]);
         if subsection_version != format::vec::SUBSECTION_VERSION {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "cell subsection unsupported layout version {subsection_version}"
+            return Err(VectorError::Read(ReadError::UnsupportedVersion(format!(
+                "cell subsection layout {subsection_version}; this build reads {}",
+                format::vec::SUBSECTION_VERSION
             ))));
         }
         if verify_crc {
@@ -1706,17 +1703,17 @@ impl VectorReader {
         ) as usize;
 
         // Untrusted sub-header offsets: validate ordering with checked
-        // arithmetic — inverted offsets must surface as MalformedVersion,
+        // arithmetic: inverted offsets must surface as Malformed,
         // not an integer underflow, because the CRC-off lazy open path
         // (object-store reads) skips the checksum that would otherwise
         // catch the corruption.
         let centroids_span = cluster_idx_off.checked_sub(centroids_off).ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(
+            VectorError::Read(ReadError::Malformed(
                 "cell subsection offsets inverted: cluster_idx_off precedes centroids_off".into(),
             ))
         })?;
         if dim == 0 || !centroids_span.is_multiple_of(dim * 4) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(
+            return Err(VectorError::Read(ReadError::Malformed(
                 "cell subsection centroids region not divisible by dim*4".into(),
             )));
         }
@@ -1737,7 +1734,7 @@ impl VectorReader {
         let stable_ids_region_bytes = per_cluster_blocks_off
             .checked_sub(preceding_end)
             .ok_or_else(|| {
-                VectorError::Read(ReadError::MalformedVersion(
+                VectorError::Read(ReadError::Malformed(
                     "cell subsection regions overrun per_cluster_blocks_off".into(),
                 ))
             })?;
@@ -1745,7 +1742,7 @@ impl VectorReader {
             sub_crc_pos
                 .checked_sub(per_cluster_blocks_off)
                 .ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(
+                    VectorError::Read(ReadError::Malformed(
                         "cell subsection offsets inverted: per_cluster_blocks_off past the \
                      subsection CRC"
                             .into(),
@@ -1753,14 +1750,14 @@ impl VectorReader {
                 })?;
         let per_doc_stride = code_bytes + format::vec::DOC_ID_BYTES + per_vec_bytes;
         if per_doc_stride == 0 || !blocks_region_size.is_multiple_of(per_doc_stride) {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection blocks region {blocks_region_size} not divisible by stride {per_doc_stride}"
             ))));
         }
         let col_n_docs = (blocks_region_size / per_doc_stride) as u32;
         let expected_stable_ids_bytes = (col_n_docs as usize) * format::vec::STABLE_ID_BYTES;
         if stable_ids_region_bytes != 0 && stable_ids_region_bytes != expected_stable_ids_bytes {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection stable-id gap {stable_ids_region_bytes}, expected 0 or {expected_stable_ids_bytes}"
             ))));
         }
@@ -1768,7 +1765,7 @@ impl VectorReader {
         let expected_codec_meta_size =
             rerank_codec.codec_meta_bytes(dim, col_n_docs as usize, n_cent, metric);
         if codec_meta_size != expected_codec_meta_size {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+            return Err(VectorError::Read(ReadError::Malformed(format!(
                 "cell subsection codec_meta_size={codec_meta_size}, expected {expected_codec_meta_size}"
             ))));
         }
@@ -1831,6 +1828,7 @@ impl VectorReader {
         Ok(ColumnReader {
             transposed_codes: Arc::new(TransposedCodeCache::default()),
             name: cfg.column.clone(),
+            field_id: cfg.field_id.map(FieldId),
             dim,
             n_cent: n_cent_u32,
             n_docs: col_n_docs,
@@ -1899,6 +1897,18 @@ impl VectorReader {
         Some((lo, flat - bases[lo]))
     }
 
+    /// Global cell id owning a per-superfile `flat` fine-cluster id. Composes
+    /// [`Self::resolve_flat_cluster`] (flat -> cell ordinal) with this reader's
+    /// `cell_ids` (ordinal -> global cell id). The drain-side fine-centroid
+    /// placement and the query-side fine->cell resolution share this mapping,
+    /// so a row placed against a fine centroid lands in the same cell the
+    /// router will rank shallow for a nearby query. `None` on a v1 single-IVF
+    /// reader (no cell ids) or an out-of-range flat.
+    pub(crate) fn global_cell_of_flat(&self, flat: u32) -> Option<u32> {
+        let (cell_ord, _local) = self.resolve_flat_cluster(flat)?;
+        self.cell_ids.get(cell_ord).copied()
+    }
+
     /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
     /// tagged with their per-superfile `flat` cluster ids, from the resident
     /// centroid `section` (zero superfile opens). Feeds the in-memory centroid
@@ -1909,8 +1919,10 @@ impl VectorReader {
     pub(crate) fn global_fine_cluster_vectors(
         &self,
         column: &str,
+        column_id: FieldId,
         section: &crate::supertable::slow_vector_state::CentroidSection,
         superfile_id: uuid::Uuid,
+        superseded: Option<&BTreeSet<u32>>,
     ) -> Result<Vec<(u32, Vec<f32>)>, VectorError> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return Ok(Vec::new());
@@ -1921,9 +1933,18 @@ impl VectorReader {
                 continue;
             }
             let cell_id = self.cell_ids.get(ci).copied();
+            // A cell superseded by an in-place split carries dead on-disk blocks
+            // whose live rows now sit in the split's child cells. Its fine
+            // centroids must not seed centroid-router graph nodes: the scan path
+            // already skips these cells, so a node pointing at one is a dead pick
+            // that spends fanout and returns nothing.
+            if superseded.is_some_and(|ss| cell_id.is_some_and(|c| ss.contains(&c))) {
+                continue;
+            }
+            // A read of the local spill file, not of the superfile's source.
             let Some(bytes) = section
-                .read_cell_bytes(superfile_id, column, cell_id)
-                .map_err(|e| VectorError::LazySource(e.to_string()))?
+                .read_cell_bytes(superfile_id, column_id, cell_id)
+                .map_err(ReadError::Io)?
             else {
                 continue;
             };
@@ -1945,39 +1966,51 @@ impl VectorReader {
         Ok(out)
     }
 
-    /// Every resident row of `column` tagged with its GLOBAL flat fine-cluster
-    /// id — the id the centroid router's node map uses — plus its stable id and
-    /// Sq16 rerank codes. The fanout calibrator needs each row's fine cluster to
-    /// attribute it to the cluster the router selects (by rank), so it can score
-    /// recall at each candidate fanout as a PREFIX of one corpus scan rather
-    /// than re-reading per fanout. `flat = flat_cluster_base[cell] + row.cluster`
-    /// matches [`Self::global_fine_cluster_vectors`]'s node numbering exactly.
-    /// Superseded cells are dropped (their rows survive under the split
-    /// successors). Multi-cell (v2) readers only — the router requires them;
-    /// `None` for v1 or an absent column. Reads one superfile's plane, so peak
-    /// memory is bounded to a single superfile.
-    pub(crate) async fn calibration_flat_cluster_rows(
+    /// Emit the fp32 centroid VECTORS of every fine cluster in this superfile,
+    /// tagged with their per-superfile `flat` cluster ids, from the superfile's
+    /// OWN resident centroid region (no [`CentroidSection`] fetch) — the
+    /// recalibration-side source for the centroid router. Iterates cells and
+    /// per-cell fine clusters in the exact same order as
+    /// [`Self::global_fine_cluster_vectors`] (the section-backed walk), so a
+    /// router built from these nodes matches the settle-published one node for
+    /// node (byte-identical fp32 fine centroids in identical `flat` order).
+    /// Resident-only (`try_get_range_sync`); `None` on any non-resident or
+    /// malformed range, or a non-multi-cell / absent-column reader.
+    ///
+    /// [`CentroidSection`]: crate::supertable::slow_vector_state::CentroidSection
+    pub(crate) fn resident_fine_cluster_vectors(
         &self,
         column: &str,
-        superseded: Option<&BTreeSet<u32>>,
-    ) -> Option<Vec<(u32, EncodedCellRow)>> {
+    ) -> Option<Vec<(u32, Vec<f32>)>> {
         if !self.is_multi_cell() || !self.column_id_by_name.contains_key(column) {
             return None;
         }
-        let cells = self.materialized_cells_rows_async(None).await?;
         let mut out = Vec::new();
-        for (ci, (cell_id, rows)) in cells.into_iter().enumerate() {
-            if superseded.is_some_and(|s| s.contains(&cell_id)) {
+        for (ci, col) in self.columns.iter().enumerate() {
+            if col.n_docs == 0 || col.n_cent == 0 {
                 continue;
             }
+            let sub = self
+                .source
+                .try_get_range_sync(col.subsection_range.clone())?;
+            let n_fine = col.n_cent as usize;
+            let dim = col.dim;
+            let centroids_len = n_fine.checked_mul(dim)?.checked_mul(F32_BYTES)?;
+            let centroids_end = col.centroids_off.checked_add(centroids_len)?;
+            if centroids_end > sub.len() {
+                return None;
+            }
+            let region = sub.get(col.centroids_off..centroids_end)?;
             let base = self.flat_cluster_base.get(ci).copied().unwrap_or(0);
-            for row in rows {
-                // Carry the row's full encoded body (codec + per-cluster ruler),
-                // not just the raw codes: the calibrator decodes each row against
-                // its own quantizer, so an adaptive-grid (L2Sq/NegDot) row is
-                // measured in the space the served path scores it in. The stable
-                // id rides along inside `EncodedCellRow`.
-                out.push((base + row.cluster, row.encoded));
+            let stride = dim * F32_BYTES;
+            for local in 0..n_fine {
+                let off = local * stride;
+                let slab = region.get(off..off + stride)?;
+                let vec: Vec<f32> = slab
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                out.push((base + local as u32, vec));
             }
         }
         Some(out)
@@ -2440,7 +2473,7 @@ impl VectorReader {
             bases.push(0);
             for col in &self.columns {
                 running = running.checked_add(col.n_docs).ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(
+                    VectorError::Read(ReadError::Malformed(
                         "inline stable_id region: cell doc counts overflow".into(),
                     ))
                 })?;
@@ -2450,7 +2483,7 @@ impl VectorReader {
             let mut cell_idx = 0usize;
             for (output_idx, &file_local) in locals.iter().enumerate() {
                 if file_local >= running {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "inline stable_id region: file-local {file_local} out of range \
                          (n_docs={})",
                         self.n_docs
@@ -2474,11 +2507,7 @@ impl VectorReader {
             }
             let fetched = try_join_all(requests.into_iter().map(
                 |(cell_idx, range, positions)| async move {
-                    let region = self
-                        .source
-                        .range_async(range)
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let region = self.source.range_async(range).await?;
                     Ok::<_, VectorError>((cell_idx, positions, region))
                 },
             ))
@@ -2489,7 +2518,7 @@ impl VectorReader {
                     let p = (cell_local as usize) * format::vec::STABLE_ID_BYTES;
                     let end = p + format::vec::STABLE_ID_BYTES;
                     if end > region.len() {
-                        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                        return Err(VectorError::Read(ReadError::Malformed(format!(
                             "inline stable_id region: cell-local {cell_local} out of range \
                              ({} bytes, cell_idx={cell_idx})",
                             region.len()
@@ -2497,7 +2526,7 @@ impl VectorReader {
                     }
                     let arr: [u8; format::vec::STABLE_ID_BYTES] =
                         region[p..end].try_into().map_err(|_| {
-                            VectorError::Read(ReadError::MalformedVersion(
+                            VectorError::Read(ReadError::Malformed(
                                 "inline stable_id region slice".into(),
                             ))
                         })?;
@@ -2512,26 +2541,20 @@ impl VectorReader {
         let Some(range) = col.stable_ids_region_range() else {
             return Ok(None);
         };
-        let region = self
-            .source
-            .range_async(range)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let region = self.source.range_async(range).await?;
         let mut out = Vec::with_capacity(locals.len());
         for &local in locals {
             let p = (local as usize) * format::vec::STABLE_ID_BYTES;
             let end = p + format::vec::STABLE_ID_BYTES;
             if end > region.len() {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "inline stable_id region: local {local} out of range ({} bytes)",
                     region.len()
                 ))));
             }
             let arr: [u8; format::vec::STABLE_ID_BYTES] =
                 region[p..end].try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
+                    VectorError::Read(ReadError::Malformed("inline stable_id region slice".into()))
                 })?;
             out.push(i128::from_le_bytes(arr));
         }
@@ -2640,6 +2663,7 @@ impl VectorReader {
             scale,
             offset,
             stable_ids,
+            survivors: None,
         })
     }
 
@@ -2788,17 +2812,13 @@ impl VectorReader {
             let Some(range) = col.stable_ids_region_range() else {
                 return Ok(None);
             };
-            let region = self
-                .source
-                .range_async(range)
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            let region = self.source.range_async(range).await?;
             // Exact-size check: a truncated region would silently yield fewer
             // ids than rows (partial mapping); trailing bytes mean the offsets
             // are wrong. Both are corruption — fail fast.
             let expected_len = (col.n_docs as usize) * format::vec::STABLE_ID_BYTES;
             if region.len() != expected_len {
-                return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                return Err(VectorError::Read(ReadError::Malformed(format!(
                     "inline stable_id region for cell {cell_id}: {} bytes, expected {expected_len}",
                     region.len()
                 ))));
@@ -2806,9 +2826,7 @@ impl VectorReader {
             let mut ids = Vec::with_capacity(col.n_docs as usize);
             for chunk in region.as_ref().chunks_exact(format::vec::STABLE_ID_BYTES) {
                 let arr: [u8; format::vec::STABLE_ID_BYTES] = chunk.try_into().map_err(|_| {
-                    VectorError::Read(ReadError::MalformedVersion(
-                        "inline stable_id region slice".into(),
-                    ))
+                    VectorError::Read(ReadError::Malformed("inline stable_id region slice".into()))
                 })?;
                 ids.push(i128::from_le_bytes(arr));
             }
@@ -3092,10 +3110,7 @@ impl VectorReader {
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let centroid_idx_region = self
-            .source
-            .get_range(centroids_start..idx_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroid_idx_region = self.source.get_range(centroids_start..idx_end)?;
         let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
@@ -3167,10 +3182,7 @@ impl VectorReader {
         let (cluster_blocks, lazy_sq8_meta_bytes) = if let Some(prefix_blocks) = prefix_blocks_sync
         {
             let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                let mut fetched = self
-                    .source
-                    .get_ranges_parallel(&[range])
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let mut fetched = self.source.get_ranges_parallel(&[range])?;
                 fetched.pop()
             } else {
                 None
@@ -3185,8 +3197,7 @@ impl VectorReader {
                 &self.source,
                 &cluster_prefix_ranges,
                 &extras,
-            )
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+            )?;
             (blocks, extra_bytes.pop())
         };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
@@ -3230,10 +3241,7 @@ impl VectorReader {
         // wave; warm ranges resolve sync/zero-copy, so this is a cheap
         // sort.
         let survivor_full_rows = match survivor_full_ranges {
-            Some(ranges) => Some(
-                get_survivor_ranges_coalesced(&self.source, &ranges)
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?,
-            ),
+            Some(ranges) => Some(get_survivor_ranges_coalesced(&self.source, &ranges)?),
             None => None,
         };
 
@@ -3300,11 +3308,7 @@ impl VectorReader {
         let centroids_end = centroids_start + (col.n_cent as usize) * centroid_stride;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let centroid_idx_region = self
-            .source
-            .range_async(centroids_start..idx_end)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let centroid_idx_region = self.source.range_async(centroids_start..idx_end).await?;
         let centroids = centroid_idx_region.slice(0..centroids_end - centroids_start);
         let cluster_idx =
             centroid_idx_region.slice(idx_start - centroids_start..idx_end - centroids_start);
@@ -3344,7 +3348,7 @@ impl VectorReader {
             budget,
         };
         let (hits, mut tally) = self
-            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
             .await?;
         tally.kernel_cpu_ns += rot_ns;
         // The centroid + cluster-index span above was one planned range.
@@ -3398,11 +3402,7 @@ impl VectorReader {
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-        let cluster_idx = self
-            .source
-            .range_async(idx_start..idx_end)
-            .await
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
         let (q_rot, rot_ns) = timed_section(|| {
             let mut q_rot = vec![0f32; col.dim];
             col.rot.apply(query, &mut q_rot);
@@ -3430,7 +3430,7 @@ impl VectorReader {
             budget,
         };
         let (hits, mut tally) = self
-            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen)
+            .probe_clusters_async(col, query, &ctx, &cluster_idx, &chosen, None)
             .await?;
         tally.kernel_cpu_ns += rot_ns;
         // The cluster-index fetch above was one planned range.
@@ -3578,11 +3578,7 @@ impl VectorReader {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 let ctx = ProbeCtx {
                     q_rot: q_rot_shared,
                     k,
@@ -3593,7 +3589,7 @@ impl VectorReader {
                     budget,
                 };
                 let (hits, mut tally) = self
-                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals, None)
                     .await?;
                 // Each probed cell fetched its own cluster index above.
                 tally.ranges_requested += 1;
@@ -3651,6 +3647,14 @@ impl VectorReader {
     ///   as [`Self::search_clusters_async`] does, under the width-divided
     ///   `cold_rerank_mult` — deferring a cold cell would hold its fetched
     ///   blocks and budget reservation across the whole fan-out.
+    ///
+    /// `clusters` names the flat clusters to FETCH; `score_only`, when set,
+    /// names the subset to SCORE. They differ only under
+    /// `vector.global_fine_coalesce`, which widens each cell's selection to a
+    /// contiguous `[min..max]` span in `clusters` so the gap clusters ride one
+    /// larger read, while `score_only` carries the originally selected clusters
+    /// so the gap clusters are fetched but never admitted or reranked. Pass
+    /// `score_only = None` to score every fetched cluster.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn search_clusters_scan_async(
         &self,
@@ -3658,8 +3662,16 @@ impl VectorReader {
         query: &[f32],
         k: usize,
         clusters: &[u32],
+        score_only: Option<&[u32]>,
         rerank_mult: usize,
         cold_rerank_mult: usize,
+        // When set, the per-cell shortlist budget is scaled by the number
+        // of scanned fine clusters in each cell
+        // (`k·rerank_mult·clusters_in_cell`), so the pooled candidate count
+        // is `fanout·k·rerank_mult` regardless of how clusters group into
+        // coarse cells — the grid-independent per-cluster budget the
+        // global-fine path uses. `false` keeps the legacy per-cell budget.
+        budget_per_cluster: bool,
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
@@ -3722,6 +3734,41 @@ impl VectorReader {
         if per_cell.is_empty() {
             return Ok(outcome);
         }
+        // Resolve the coalesce score set to per-cell local cluster ids, mirroring
+        // how `per_cell` was keyed above: a fetched span is scored down to only
+        // these clusters. `None` scores every fetched cluster.
+        let score_by_cell: Option<HashMap<usize, Arc<HashSet<usize>>>> = score_only.map(|sel| {
+            let mut m: HashMap<usize, HashSet<usize>> = HashMap::new();
+            if self.is_multi_cell() {
+                for &flat in sel {
+                    if let Some((cell_idx, local)) = self.resolve_flat_cluster(flat) {
+                        m.entry(cell_idx).or_default().insert(local as usize);
+                    }
+                }
+            } else if let Some(&cid) = self.column_id_by_name.get(column) {
+                m.entry(cid as usize)
+                    .or_default()
+                    .extend(sel.iter().map(|&f| f as usize));
+            }
+            // Drift guards for the two keyings (`per_cell` groups the FETCH by
+            // the same resolution). A selected flat that fails to resolve would
+            // silently never score — lost recall; a score key outside the
+            // fetched cells would mean the two resolutions disagree. A fetched
+            // cell with NO entry is neither: a span's gap-only cell scores
+            // nothing, which is the span doing its job.
+            debug_assert_eq!(
+                m.values().map(|set| set.len()).sum::<usize>(),
+                sel.iter().collect::<HashSet<_>>().len(),
+                "a selected flat cluster failed to resolve into the score set"
+            );
+            debug_assert!(
+                m.keys()
+                    .all(|cell| per_cell.iter().any(|(c, _, _)| c == cell)),
+                "score set keyed to a cell the fetch does not cover"
+            );
+            // `Arc` so each probed cell clones a pointer, not the set.
+            m.into_iter().map(|(k, v)| (k, Arc::new(v))).collect()
+        });
         // Estimates pool cross-superfile keyed by this seed; report the
         // REQUESTED column's seed (every cell of one column shares it),
         // not `columns[0]`'s — a multi-column file's first column can be
@@ -3764,22 +3811,25 @@ impl VectorReader {
             if cell_allow.as_ref().is_some_and(|bm| bm.is_empty()) {
                 return None;
             }
+            // Clusters to SCORE in this cell (coalesce fetches a wider span);
+            // `None` scores every fetched cluster. A cell absent from the map
+            // holds only gap clusters — it was fetched for read contiguity and
+            // scores nothing. The drift cases are asserted at the map build.
+            let cell_score: Option<Arc<HashSet<usize>>> = score_by_cell
+                .as_ref()
+                .map(|m| m.get(&cell_idx).map(Arc::clone).unwrap_or_default());
             let pool = pool.clone();
             let budget = budget.clone();
             Some(async move {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 let cb = col.quant.code_bytes();
                 // Per-cell metadata assembly: a pass over this cell's chosen
                 // clusters, on the worker that probes it. Scales with probe
                 // width, so at a wide sweep it is paid once per cell.
-                let ((cluster_meta, prefix_ranges), meta_ns) =
+                let ((mut cluster_meta, prefix_ranges), meta_ns) =
                     timed_section(|| chosen_cluster_meta(col, &cluster_idx, &locals));
                 if cluster_meta.is_empty() {
                     // The cluster-index read itself was one planned range,
@@ -3792,14 +3842,18 @@ impl VectorReader {
                     return Ok((Vec::new(), Vec::new(), tally));
                 }
                 // Work-stats tallies, taken before the warm/cold branch so
-                // both arms count the codes their clusters hold. Ranges:
-                // the cluster index plus one per prefix span (the warm
-                // arm's fetches; the cold arm's whole-cluster blocks are
-                // one range per chosen cluster, the same count).
+                // both arms count the codes their clusters hold. Candidates:
+                // only the SCORED clusters — coalesce fetches the gap clusters
+                // but never scans them. Ranges: the cluster index plus one per
+                // prefix span (the warm arm's fetches; the cold arm's
+                // whole-cluster blocks are one range per fetched cluster, the
+                // same count), so they follow the fetched span, not the scored
+                // subset.
                 let mut tally = ProbeTally {
                     cells_scanned: 1,
                     candidates_scanned: cluster_meta
                         .iter()
+                        .filter(|&&(c, _, _)| cell_score.as_deref().is_none_or(|s| s.contains(&c)))
                         .map(|(_, _, cnt)| u64::from(*cnt))
                         .sum(),
                     ranges_requested: 1 + prefix_ranges.len() as u64,
@@ -3819,7 +3873,12 @@ impl VectorReader {
                 });
                 tally.kernel_cpu_ns += fetch_ns;
                 let rabitq_only = matches!(col.rerank_codec, RerankCodec::RabitqOnly);
-                if let (Some(blocks), false) = (prefix_blocks, rabitq_only) {
+                if let (Some(mut blocks), false) = (prefix_blocks, rabitq_only) {
+                    // Fetched the coalesced span; scan only the selected
+                    // clusters. Dropping the gap clusters here keeps
+                    // `scan_shortlist` unchanged and its survivor heap free of
+                    // rows that carry no recall benefit.
+                    retain_scored_clusters(&mut cluster_meta, &mut blocks, cell_score.as_deref());
                     let ctx = ProbeCtx {
                         q_rot: q_rot_shared,
                         k,
@@ -3829,7 +3888,13 @@ impl VectorReader {
                         pool,
                         budget,
                     };
-                    let coarse_limit = k.saturating_mul(rerank_mult);
+                    let coarse_limit = if budget_per_cluster {
+                        k.saturating_mul(rerank_mult)
+                            .saturating_mul(cluster_meta.len())
+                            .max(1)
+                    } else {
+                        k.saturating_mul(rerank_mult)
+                    };
                     // Timed like the immediate path's shortlist below: this
                     // warm deferred scan is the read the width pin certifies
                     // (whole-cell depth), which made it the dominant span of
@@ -3872,7 +3937,14 @@ impl VectorReader {
                     budget,
                 };
                 let (hits, probe_tally) = self
-                    .probe_clusters_async(col, query, &ctx, &cluster_idx, &locals)
+                    .probe_clusters_async(
+                        col,
+                        query,
+                        &ctx,
+                        &cluster_idx,
+                        &locals,
+                        cell_score.as_deref(),
+                    )
                     .await?;
                 // Only the rerank rows come from the probe: this scan
                 // already counted the cell, its candidates, and its
@@ -3946,11 +4018,7 @@ impl VectorReader {
                 let sub_start = col.subsection_range.start;
                 let idx_start = sub_start + col.cluster_idx_off;
                 let idx_end = idx_start + (col.n_cent as usize) * CLUSTER_IDX_ENTRY_BYTES;
-                let cluster_idx = self
-                    .source
-                    .range_async(idx_start..idx_end)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let cluster_idx = self.source.range_async(idx_start..idx_end).await?;
                 // Distinct probed clusters -> (off, cnt), for survivor
                 // row addressing.
                 let mut extent_by_cid: HashMap<u32, (u32, u32)> = HashMap::new();
@@ -3987,11 +4055,7 @@ impl VectorReader {
                     });
                 }
                 let meta_bytes = if let Some(range) = lazy_sq8_meta_range(col) {
-                    let mut fetched = self
-                        .source
-                        .get_ranges_parallel_async(&[range])
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
                     fetched.pop()
                 } else {
                     None
@@ -4063,9 +4127,7 @@ impl VectorReader {
                         });
                         (rows?, ns)
                     }
-                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges)
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?,
+                    None => get_survivor_ranges_coalesced_async(&self.source, &ranges).await?,
                 };
 
                 if let Some(t0) = survivor_t0 {
@@ -4120,6 +4182,13 @@ impl VectorReader {
     /// Returns the hits plus the number of rows the probe reranked at
     /// full precision (0 on the `RabitqOnly` and empty-shortlist paths),
     /// for the per-query work stats.
+    ///
+    /// `chosen` names the clusters to FETCH; `score_only`, when set, restricts
+    /// scoring/rerank to that subset of the fetched clusters. They differ only
+    /// on the coalesced global-fine path, where `chosen` is a contiguous span
+    /// and `score_only` is the originally selected clusters — the gap clusters
+    /// are fetched (one larger read) but never admitted. `None` scores every
+    /// fetched cluster.
     async fn probe_clusters_async(
         &self,
         col: &ColumnReader,
@@ -4127,9 +4196,10 @@ impl VectorReader {
         ctx: &ProbeCtx<'_>,
         cluster_idx: &[u8],
         chosen: &[usize],
+        score_only: Option<&HashSet<usize>>,
     ) -> Result<(Vec<(u32, f32)>, ProbeTally), VectorError> {
         let cb = col.quant.code_bytes();
-        let ((cluster_meta, cluster_prefix_ranges), meta_ns) =
+        let ((mut cluster_meta, cluster_prefix_ranges), meta_ns) =
             timed_section(|| chosen_cluster_meta(col, cluster_idx, chosen));
         if cluster_meta.is_empty() {
             // The metadata walk was real work; keep its CPU on the tally.
@@ -4168,18 +4238,14 @@ impl VectorReader {
         // reserve nothing.
         let mut _cold_guard: Option<Reservation> = None;
 
-        let (cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
+        let (mut cluster_blocks, lazy_sq8_meta_bytes, survivor_only_rerank_fetch) =
             if let Some(prefix_blocks) = prefix_blocks_sync {
                 // Warm: prefixes resident. Keep the survivor-only rerank
                 // split — the survivor `full[]` rows resolve sync/zero-copy
                 // below (no round-trip), so there is nothing to coalesce and
                 // we avoid touching the unneeded rerank bytes.
                 let meta_bytes = if let Some(range) = lazy_sq8_meta_range {
-                    let mut fetched = self
-                        .source
-                        .get_ranges_parallel_async(&[range])
-                        .await
-                        .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                    let mut fetched = self.source.get_ranges_parallel_async(&[range]).await?;
                     fetched.pop()
                 } else {
                     None
@@ -4231,8 +4297,7 @@ impl VectorReader {
                     &cluster_full_ranges,
                     &extras,
                 )
-                .await
-                .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                .await?;
                 let meta = meta_slot.map(|i| extra_bytes[i].clone());
                 if let Some(bytes) = region_slot.map(|i| extra_bytes[i].clone())
                     && let Ok(mut slot) = self.cold_stable_id_region.lock()
@@ -4242,6 +4307,17 @@ impl VectorReader {
                 (blocks, meta, false)
             };
         debug_assert_eq!(cluster_blocks.len(), cluster_meta.len());
+
+        // Fetched the (possibly coalesced) cluster span; scan only the selected
+        // clusters. Dropping the gap clusters keeps `build_shortlist` and the
+        // survivor rerank free of rows that carry no recall benefit.
+        retain_scored_clusters(&mut cluster_meta, &mut cluster_blocks, score_only);
+        if score_only.is_some() {
+            tally.candidates_scanned = cluster_meta.iter().map(|&(_, _, cnt)| u64::from(cnt)).sum();
+        }
+        if cluster_meta.is_empty() {
+            return Ok((Vec::new(), tally));
+        }
 
         // Shared pure-CPU shortlist + candidate-build stage (see
         // [`build_shortlist`]); only the survivor-row fetch below
@@ -4280,9 +4356,8 @@ impl VectorReader {
         let survivor_t0 = io_counters::phase_start();
         let survivor_full_rows = match survivor_full_ranges {
             Some(ranges) => {
-                let (rows, gather_ns) = get_survivor_ranges_coalesced_async(&self.source, &ranges)
-                    .await
-                    .map_err(|e| VectorError::LazySource(e.to_string()))?;
+                let (rows, gather_ns) =
+                    get_survivor_ranges_coalesced_async(&self.source, &ranges).await?;
                 tally.kernel_cpu_ns += gather_ns;
                 Some(rows)
             }
@@ -4327,8 +4402,8 @@ impl VectorReader {
         let col = &self.columns[cid as usize];
 
         if col.rerank_codec != RerankCodec::Fp32 {
-            return Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "column '{}' uses rerank codec {} instead of Fp32",
+            return Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                "column '{}' uses rerank codec {}; this read needs fp32",
                 col.name,
                 col.rerank_codec.name()
             ))));
@@ -4341,10 +4416,7 @@ impl VectorReader {
         let sub_start = col.subsection_range.start;
         let idx_start = sub_start + col.cluster_idx_off;
         let idx_end = idx_start + (col.n_cent as usize) * 8;
-        let cluster_idx = self
-            .source
-            .get_range(idx_start..idx_end)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_idx = self.source.get_range(idx_start..idx_end)?;
 
         let cb = col.quant.code_bytes();
         let per_vec_bytes = col.rerank_codec.per_vector_bytes(col.dim);
@@ -4367,10 +4439,7 @@ impl VectorReader {
         }
 
         // Fetch all cluster blocks
-        let cluster_blocks = self
-            .source
-            .get_ranges_parallel(&cluster_ranges)
-            .map_err(|e| VectorError::LazySource(e.to_string()))?;
+        let cluster_blocks = self.source.get_ranges_parallel(&cluster_ranges)?;
 
         // Allocate output vector with doc_id -> vector mapping
         let mut result: Vec<Option<Vec<f32>>> = vec![None; col.n_docs as usize];
@@ -4410,7 +4479,7 @@ impl VectorReader {
                     .collect();
 
                 if vec_f32.len() != col.dim {
-                    return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+                    return Err(VectorError::Read(ReadError::Malformed(format!(
                         "vector size mismatch: got {}, expected {}",
                         vec_f32.len(),
                         col.dim
@@ -4429,7 +4498,7 @@ impl VectorReader {
             .enumerate()
             .map(|(idx, vec_opt)| {
                 vec_opt.ok_or_else(|| {
-                    VectorError::Read(ReadError::MalformedVersion(format!(
+                    VectorError::Read(ReadError::Malformed(format!(
                         "missing vector for doc_id {}",
                         idx
                     )))
@@ -4452,14 +4521,14 @@ impl VectorReader {
         match col.rerank_codec {
             RerankCodec::Fp32 => self.get_vectors_fp32(column),
             RerankCodec::Sq8Residual | RerankCodec::Sq8FixedResidual => {
-                Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                    "column '{}' uses {} — merge via build_from_sq8_ivf_readers",
+                Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                    "column '{}' uses {}; merge it with build_from_sq8_ivf_readers",
                     col.name,
                     col.rerank_codec.name()
                 ))))
             }
-            other => Err(VectorError::Read(ReadError::MalformedVersion(format!(
-                "column '{}' uses rerank codec {} which cannot be merged",
+            other => Err(VectorError::Read(ReadError::WrongCodecPath(format!(
+                "column '{}' uses rerank codec {}, which cannot be merged",
                 col.name,
                 other.name()
             )))),
@@ -4539,6 +4608,38 @@ fn chosen_cluster_meta(
         cluster_meta.push((c, off, cnt));
     }
     (cluster_meta, prefix_ranges)
+}
+
+/// Drop the gap clusters a coalesced read pulled in, keeping metadata and
+/// fetched blocks in lockstep.
+///
+/// Under `vector.global_fine_coalesce` a cell's selected clusters are widened
+/// to their contiguous `[min..max]` id span so the unselected clusters between
+/// them ride one larger read instead of scattered per-cluster GETs. That span
+/// is an I/O plan only: the bytes are fetched, but only the originally selected
+/// clusters are scored and reranked. Given the fetched span in cluster order,
+/// this keeps every cluster whose local id is in `score_only` and discards the
+/// rest — from both `cluster_meta` and `cluster_blocks` — before the scan.
+/// `score_only == None` keeps the whole fetched set (the non-coalesced path).
+fn retain_scored_clusters(
+    cluster_meta: &mut Vec<(usize, u32, u32)>,
+    cluster_blocks: &mut Vec<Bytes>,
+    score_only: Option<&HashSet<usize>>,
+) {
+    let Some(selected) = score_only else {
+        return;
+    };
+    debug_assert_eq!(cluster_meta.len(), cluster_blocks.len());
+    let mut meta_out = Vec::with_capacity(cluster_meta.len());
+    let mut blocks_out = Vec::with_capacity(cluster_blocks.len());
+    for (meta, block) in cluster_meta.drain(..).zip(cluster_blocks.drain(..)) {
+        if selected.contains(&meta.0) {
+            meta_out.push(meta);
+            blocks_out.push(block);
+        }
+    }
+    *cluster_meta = meta_out;
+    *cluster_blocks = blocks_out;
 }
 
 /// Wave cap for concurrent per-cell probes: the pool's width — the same
@@ -5150,7 +5251,7 @@ const MAX_EFFECTIVE_FILTERED_RERANK_MULT: usize = 16_384;
 const UNFILTERED_SELECTIVITY_MULT: usize = 1;
 /// Multiplier for a present-but-empty allow-set: no row can match, so
 /// callers should return an empty result without probing.
-const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
+pub(crate) const EMPTY_FILTER_SELECTIVITY_MULT: usize = 0;
 /// Population count for an empty allow-set or empty column.
 const EMPTY_FILTER_POPULATION: u64 = 0;
 /// Numerator for the inverse-selectivity multiplier (`1 / selectivity`).
@@ -5165,11 +5266,17 @@ fn filter_selectivity_mult(allow: &Option<Arc<RoaringBitmap>>, n_docs: u32) -> u
     let Some(bm) = allow.as_ref() else {
         return UNFILTERED_SELECTIVITY_MULT;
     };
-    let allowed = bm.len();
+    selectivity_mult_from_counts(bm.len(), n_docs as u64)
+}
+
+/// Count-based core of [`filter_selectivity_mult`]: inverse-selectivity
+/// multiplier for `allowed` rows out of `n`, capped at
+/// [`MAX_FILTER_SELECTIVITY_MULT`]. Shared by superfile and supertable
+/// routing — the two must not drift.
+pub(crate) fn selectivity_mult_from_counts(allowed: u64, n: u64) -> usize {
     if allowed == EMPTY_FILTER_POPULATION {
         return EMPTY_FILTER_SELECTIVITY_MULT;
     }
-    let n = n_docs as u64;
     if n == EMPTY_FILTER_POPULATION {
         return UNFILTERED_SELECTIVITY_MULT;
     }
@@ -5511,7 +5618,6 @@ fn fetch_lazy_cluster_meta(
     ),
     VectorError,
 > {
-    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
     let mut clusters: Vec<u32> = candidates.iter().map(|c| c.cluster_id).collect();
     clusters.sort_unstable();
     clusters.dedup();
@@ -5525,7 +5631,7 @@ fn fetch_lazy_cluster_meta(
         ranges.push(scale_start..scale_start + cluster_meta_len);
         ranges.push(offset_start..offset_start + cluster_meta_len);
     }
-    let bytes = source.get_ranges_parallel(&ranges).map_err(map_lazy)?;
+    let bytes = source.get_ranges_parallel(&ranges)?;
     let mut scale_offset_by_cluster: HashMap<u32, (Vec<f32>, Vec<f32>)> =
         HashMap::with_capacity(clusters.len());
     for (idx, &cluster_id) in clusters.iter().enumerate() {
@@ -5558,7 +5664,7 @@ fn fetch_lazy_cluster_meta(
                 start..start + (hi - lo + 1) as usize * 4
             })
             .collect();
-        let norm_bytes = source.get_ranges_parallel(&norm_ranges).map_err(map_lazy)?;
+        let norm_bytes = source.get_ranges_parallel(&norm_ranges)?;
         let mut out = HashMap::new();
         for ((_, lo, hi), bytes) in span_items.into_iter().zip(norm_bytes) {
             let vals = parse_f32_le_vec(&bytes);
@@ -5585,7 +5691,6 @@ async fn rerank_candidates_from_blocks(
     k: usize,
 ) -> Result<(Vec<(u32, f32)>, u64), VectorError> {
     let stride = col.rerank_codec.per_vector_bytes(col.dim);
-    let map_lazy = |e: LazyByteSourceError| VectorError::LazySource(e.to_string());
     // Bracketed on-CPU ns of the scoring sections below (fetches excluded).
     let mut kernel_ns = 0u64;
     let reranked: Vec<(u32, f32)> = match col.rerank_codec {
@@ -5665,9 +5770,8 @@ async fn rerank_candidates_from_blocks(
                         NormLookup::Raw(meta_bytes.clone())
                     } else if let Some(norms_abs_off) = norms_abs_off {
                         let range = *norms_abs_off..*norms_abs_off + col.n_docs as usize * 4;
-                        let mut fetched = source
-                            .get_ranges_parallel(std::slice::from_ref(&range))
-                            .map_err(map_lazy)?;
+                        let mut fetched =
+                            source.get_ranges_parallel(std::slice::from_ref(&range))?;
                         NormLookup::Raw(fetched.swap_remove(0))
                     } else {
                         NormLookup::Absent
@@ -6175,7 +6279,7 @@ fn validate_quantizer_meta(
         .chain(offset.iter())
         .any(|value| !value.is_finite())
     {
-        return Err(VectorError::Read(ReadError::MalformedVersion(format!(
+        return Err(VectorError::Read(ReadError::Malformed(format!(
             "column {column:?} has non-finite quantizer metadata"
         ))));
     }
@@ -6196,7 +6300,7 @@ fn validate_quantizer_meta(
     if valid {
         Ok(())
     } else {
-        Err(VectorError::Read(ReadError::MalformedVersion(format!(
+        Err(VectorError::Read(ReadError::Malformed(format!(
             "column {column:?} has non-fixed quantizer metadata for codec {}",
             rerank_codec.name()
         ))))
@@ -6246,7 +6350,7 @@ fn checked_dir_bounds(
     entry_size: usize,
 ) -> Result<(usize, usize), VectorError> {
     let dir_size = entry_count.checked_mul(entry_size).ok_or_else(|| {
-        VectorError::Read(ReadError::MalformedVersion(format!(
+        VectorError::Read(ReadError::Malformed(format!(
             "vector directory size overflow (entries={entry_count})",
         )))
     })?;
@@ -6254,7 +6358,7 @@ fn checked_dir_bounds(
         .checked_add(dir_size)
         .and_then(|x| x.checked_add(format::CRC_BYTES))
         .ok_or_else(|| {
-            VectorError::Read(ReadError::MalformedVersion(format!(
+            VectorError::Read(ReadError::Malformed(format!(
                 "vector directory offset+size overflow (dir_offset={dir_offset})",
             )))
         })?;
@@ -6272,17 +6376,25 @@ fn checked_dir_bounds(
 const SURVIVOR_RANGE_COALESCE_MAX_GAP: usize = 2 * 1024 * 1024;
 const SURVIVOR_RANGE_COALESCE_MAX_OVERFETCH: usize = 2 * 1024 * 1024;
 
+/// The column's whole `codec_meta` region when its quantizer metadata was
+/// left on disk at open: per-cluster scale and offset arrays ahead of the
+/// per-doc norm table for the fitted and residual codecs, the norm table
+/// alone for the fixed-grid single-plane codec. Sized by the codec, never
+/// by the residual layout: a range that assumes the arrays reaches past a
+/// single-plane cell's table into bytes the rerank never reads, and past
+/// the blob when that cell is a small last cell of a packed multi-cell
+/// blob, where the source refuses it and the query fails.
 fn lazy_sq8_meta_range(col: &ColumnReader) -> Option<Range<usize>> {
     let Sq8ColumnMeta::Lazy { scale_abs_off, .. } = col.sq8_meta.as_ref()? else {
         return None;
     };
-    let scale_offset_bytes = 2 * (col.n_cent as usize) * col.dim * 4;
-    let norm_bytes = if matches!(col.metric, Metric::L2Sq | Metric::Cosine) {
-        (col.n_docs as usize) * 4
-    } else {
-        0
-    };
-    Some(*scale_abs_off..*scale_abs_off + scale_offset_bytes + norm_bytes)
+    let meta_bytes = col.rerank_codec.codec_meta_bytes(
+        col.dim,
+        col.n_docs as usize,
+        col.n_cent as usize,
+        col.metric,
+    );
+    Some(*scale_abs_off..*scale_abs_off + meta_bytes)
 }
 
 // Reserve from the budget, the bytes a cold fetch is about to allocate, and if
@@ -6450,7 +6562,7 @@ fn fetch_sync(source: &Source, range: Range<usize>, what: &str) -> Result<Bytes,
     let start = range.start;
     let end = range.end;
     source.try_get_range_sync(range).ok_or_else(|| {
-        VectorError::Read(ReadError::MalformedVersion(format!(
+        VectorError::Read(ReadError::Malformed(format!(
             "vector {what} range {start}..{end} past blob"
         )))
     })
@@ -6498,6 +6610,7 @@ mod tests {
             finish_multi_cell_blob,
         },
         cell_posting::{EncodedCellRow, MaterializedIvfRow},
+        distance::{encode_sq16_row, sq16_decoded_norm_sq},
     };
 
     fn build_blob(n_docs: u32, dim: usize, n_cent: usize, metric: Metric) -> (Bytes, String) {
@@ -6688,7 +6801,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("summed cell docs")
             ),
             "unexpected error: {error}"
@@ -6733,7 +6846,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("cluster_idx_off precedes centroids_off")
             ),
             "unexpected error: {error}"
@@ -6754,7 +6867,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("per_cluster_blocks_off past the subsection CRC")
             ),
             "unexpected error: {error}"
@@ -6785,7 +6898,7 @@ mod tests {
         assert!(
             matches!(
                 &error,
-                VectorError::Read(ReadError::MalformedVersion(message))
+                VectorError::Read(ReadError::Malformed(message))
                     if message.contains("non-finite quantizer metadata")
             ),
             "unexpected error: {error}"
@@ -7089,10 +7202,7 @@ mod tests {
         // header says 1 column; pass 2-column JSON.
         let bad_json = r#"[{"column":"a","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"},{"column":"b","dim":16,"n_cent":4,"rot_seed":7,"metric":"l2sq"}]"#;
         let err = VectorReader::open(blob, bad_json).expect_err("expected error");
-        assert!(matches!(
-            err,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(err, VectorError::Read(ReadError::Malformed(_))));
     }
 
     // -----------------------------------------------------------------
@@ -7103,7 +7213,7 @@ mod tests {
     // directory entry; the codec_meta region offset rides as bytes
     // 12..16 of the sub-header. Both are zero on older fp32
     // superfiles. `Fp32` / `Sq8` / `RabitqOnly` are wired end-to-end;
-    // must still round-trip as a typed `MalformedVersion` at open
+    // must still round-trip as a typed `Malformed` at open
     // time so a future superfile built by a newer binary fails loud
     // against an older binary rather than mis-decoding.
 
@@ -7506,6 +7616,96 @@ mod tests {
         );
     }
 
+    /// A packed multi-cell blob whose last cell holds one row of the
+    /// fixed-grid single-plane codec, whose `codec_meta` is the per-doc norm
+    /// table alone. The lazy reader fetches that table when a query probes
+    /// the cell. Sized as the residual layout, with per-cluster scale and
+    /// offset arrays ahead of the table, the fetch would reach past the cell
+    /// and past the blob, and the source would refuse it. The lazy search must
+    /// answer and match the eager reader.
+    #[tokio::test]
+    async fn multi_cell_lazy_search_probes_a_one_row_single_plane_last_cell() {
+        let dim = 16usize;
+        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
+            (0..n)
+                .map(|i| {
+                    let local = i as u32;
+                    let stable_id = (cell as i128) * 1_000 + local as i128;
+                    // Distinct in-grid vectors, not normalized, so every row
+                    // carries its own norm and a misread table changes the order.
+                    let v: Vec<f32> = (0..dim)
+                        .map(|j| {
+                            (((cell as f32 + 1.0) * 0.31 + (i as f32) * 0.17 + (j as f32) * 0.11)
+                                .sin())
+                                * 0.6
+                        })
+                        .collect();
+                    let mut codes = vec![0u8; dim * 2];
+                    encode_sq16_row(&v, &mut codes);
+                    let norm_sq = sq16_decoded_norm_sq(&codes, dim);
+                    MaterializedIvfRow {
+                        local_doc_id: local,
+                        stable_id,
+                        cluster: 0,
+                        rabitq_code: vec![0u8; dim.div_ceil(8)],
+                        encoded: EncodedCellRow {
+                            stable_id,
+                            rerank_codec: RerankCodec::Sq16,
+                            scale: StdArc::from(Vec::<f32>::new()),
+                            offset: StdArc::from(Vec::<f32>::new()),
+                            codes,
+                            residuals: Vec::new(),
+                            norm_sq: Some(norm_sq),
+                        },
+                    }
+                })
+                .collect()
+        };
+        let cfg = || VectorConfig {
+            column: "emb".into(),
+            dim,
+            rot_seed: 1,
+            metric: Metric::Cosine,
+            rerank_codec: RerankCodec::Sq16,
+            provided_centroids: None,
+        };
+        let sub0 =
+            build_merged_subsection_from_materialized(cfg(), 1, make_rows(0, 4)).expect("cell 0");
+        let sub1 =
+            build_merged_subsection_from_materialized(cfg(), 1, make_rows(1, 1)).expect("cell 1");
+        let blob = Bytes::from(finish_multi_cell_blob(&[(0, sub0), (1, sub1)]).expect("pack"));
+        let json = format!(
+            r#"[{{"column":"emb","dim":{dim},"n_cent":1,"rot_seed":1,"metric":"cosine"}}]"#
+        );
+
+        let eager = VectorReader::open(blob.clone(), &json).expect("eager open");
+        let source = StdArc::new(CountingLazyByteSource::new(blob));
+        // No sync reads: the norm table is left on disk at open and fetched
+        // through the lazy range when the cell is probed.
+        source.disable_sync();
+        let lazy = VectorReader::open_lazy(
+            StdArc::clone(&source) as StdArc<dyn LazyByteSource>,
+            &json,
+            OpenOptions::for_object_store(),
+        )
+        .await
+        .expect("lazy multi-cell open");
+
+        let q = vec![0.1f32; dim];
+        let (eager_hits, _) = eager
+            .search_clusters_async("emb", &q, 3, &[0, 1], 8, None, None, None, None)
+            .await
+            .expect("eager multi-cell search");
+        let (lazy_hits, _) = lazy
+            .search_clusters_async("emb", &q, 3, &[0, 1], 8, None, None, None, None)
+            .await
+            .expect("lazy multi-cell search must read the one-row last cell's norm table");
+        assert_eq!(
+            eager_hits, lazy_hits,
+            "lazy multi-cell search must match the eager reader"
+        );
+    }
+
     /// `packed_cell_stable_ids_async` reads each packed cell's inline
     /// stable-`_id` region and returns the ids per cell, in cell order.
     #[tokio::test]
@@ -7659,10 +7859,7 @@ mod tests {
             OpenOptions { verify_crc: false },
         )
         .expect_err("fixed codec must reject local quantizer metadata");
-        assert!(matches!(
-            error,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(error, VectorError::Read(ReadError::Malformed(_))));
     }
 
     #[test]
@@ -8284,7 +8481,7 @@ mod tests {
 
     /// a directory entry carrying an unknown codec id
     /// (anything outside `0..=3` — e.g. `255` from a corrupted /
-    /// future-format superfile) errors as `MalformedVersion`. The
+    /// future-format superfile) errors as `Malformed`. The
     /// safety net catches both forward-compat reads (future codec
     /// ids land in the gap) and on-disk corruption.
     #[test]
@@ -8307,8 +8504,8 @@ mod tests {
             VectorReader::open_with(Bytes::from(bytes), &json, OpenOptions { verify_crc: false })
                 .expect_err("unknown codec id must error at open");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion for unknown codec id, got {err:?}"
+            matches!(err, VectorError::Read(ReadError::Malformed(_))),
+            "expected Malformed for unknown codec id, got {err:?}"
         );
         let msg = err.to_string();
         assert!(
@@ -10035,10 +10232,10 @@ mod tests {
         // Should error because codec is Sq8Residual, not Fp32
         let result = reader.get_vectors_fp32("embedding");
         assert!(result.is_err());
-        if let Err(VectorError::Read(ReadError::MalformedVersion(msg))) = result {
-            assert!(msg.contains("Fp32"));
+        if let Err(VectorError::Read(ReadError::WrongCodecPath(msg))) = result {
+            assert!(msg.contains("fp32"));
         } else {
-            panic!("expected MalformedVersion error, got {:?}", result);
+            panic!("expected WrongCodecPath error, got {:?}", result);
         }
     }
 
@@ -10262,8 +10459,10 @@ mod tests {
                 &all[7],
                 k,
                 &clusters,
+                None,
                 rerank_mult,
                 rerank_mult,
+                false,
                 None,
                 None,
                 None,
@@ -10285,6 +10484,203 @@ mod tests {
             immediate.0, deferred,
             "deferred scan+select+rerank must equal the immediate probe's top-k"
         );
+    }
+
+    /// Coalesce (`vector.global_fine_coalesce`) is an I/O plan only: it fetches
+    /// each cell's selected clusters as one contiguous `[min..max]` span so the
+    /// unselected gap clusters ride a single larger read, but scoring and rerank
+    /// stay on the originally selected clusters. This asserts the gap clusters
+    /// are NOT admitted — `search_clusters_scan_async` fetches the whole span
+    /// yet only the selected clusters reach the candidate pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_span_fetches_gap_but_scores_only_selected() {
+        let n_cent = 8usize;
+        let (blob, json, all) =
+            build_large_corpus(16, n_cent, 2600, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let r = VectorReader::open(blob, &json).expect("open");
+        let q = &all[7];
+        let k = 25usize;
+        // Undivided budget (k * rerank_mult >= corpus): the warm deferred scan
+        // truncates nothing, so every scored cluster contributes candidates.
+        let rerank_mult = 128usize;
+        let full_span: Vec<u32> = (0..n_cent as u32).collect();
+
+        // Baseline: score the whole fetched span. Each candidate is tagged with
+        // the cluster it was scored from, so this reveals the non-empty probed
+        // clusters.
+        let baseline = r
+            .search_clusters_scan_async(
+                "v",
+                q,
+                k,
+                &full_span,
+                None,
+                rerank_mult,
+                rerank_mult,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("baseline scan");
+        assert!(
+            baseline.hits.is_empty(),
+            "a fully-resident reader defers every cell (no cold hits)"
+        );
+        let present: BTreeSet<u32> = baseline.candidates.iter().map(|c| c.cluster_id).collect();
+        assert!(
+            present.len() >= 3,
+            "need >=3 non-empty clusters so the span has a gap, got {present:?}"
+        );
+
+        // Select the lowest and highest non-empty clusters; every non-empty
+        // cluster between them is a gap the coalesced span fetches but must not
+        // score.
+        let selected: Vec<u32> = vec![
+            *present.iter().next().expect("min present"),
+            *present.iter().next_back().expect("max present"),
+        ];
+        let gap: Vec<u32> = present
+            .iter()
+            .copied()
+            .filter(|c| !selected.contains(c))
+            .collect();
+        assert!(
+            !gap.is_empty(),
+            "the span between the selected clusters must contain a gap"
+        );
+
+        // Fetch the same span, but score only the selected clusters.
+        let scoped = r
+            .search_clusters_scan_async(
+                "v",
+                q,
+                k,
+                &full_span,
+                Some(&selected),
+                rerank_mult,
+                rerank_mult,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("scoped scan");
+        let scored: BTreeSet<u32> = scoped.candidates.iter().map(|c| c.cluster_id).collect();
+
+        // Only the selected clusters are admitted.
+        for c in &scored {
+            assert!(
+                selected.contains(c),
+                "cluster {c} leaked into scoring; selected={selected:?}"
+            );
+        }
+        // The gap clusters were fetched but never scored.
+        for g in &gap {
+            assert!(
+                !scored.contains(g),
+                "gap cluster {g} was scored under coalesce; it must be fetch-only"
+            );
+        }
+        // The selected clusters still produce candidates (fetch + score intact).
+        for s in &selected {
+            assert!(
+                scored.contains(s),
+                "selected cluster {s} produced no candidates"
+            );
+        }
+        // Scoping to the selected clusters cuts the scanned work: fewer
+        // candidates in the pool, and the work-stat counts only what was scored,
+        // not the fetched span.
+        assert!(
+            scoped.candidates.len() < baseline.candidates.len(),
+            "scoping must scan fewer candidates ({} vs {})",
+            scoped.candidates.len(),
+            baseline.candidates.len()
+        );
+        assert!(
+            scoped.candidates_scanned < baseline.candidates_scanned,
+            "candidates_scanned must count only the selected clusters ({} vs {})",
+            scoped.candidates_scanned,
+            baseline.candidates_scanned
+        );
+    }
+
+    /// The multi-cell arm of the coalesce score set: `score_only` carries FLAT
+    /// cluster ids, and the scan must resolve them to `(cell, local)` the same
+    /// way the fetch keying does. The fixture packs two cells (tags 7 and 15,
+    /// two clusters each, rows in each cell's local cluster 0), so flats 0 and
+    /// 2 hold rows. Scoping to one cell's flat must surface that cell's rows
+    /// only — a keying slip would score the wrong cell or nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_score_only_resolves_flat_ids_per_cell_on_packed_files() {
+        let (blob, json) = build_multi_cell_blob();
+        let r = VectorReader::open(blob.into(), &json).expect("open");
+        assert!(r.is_multi_cell(), "fixture must be a v2 packed file");
+        let q = vec![0.0f32; 16];
+        let fetch: Vec<u32> = (0..4).collect();
+
+        // Baseline over the whole span: both cells contribute.
+        let baseline = r
+            .search_clusters_scan_async(
+                "embedding",
+                &q,
+                5,
+                &fetch,
+                None,
+                8,
+                8,
+                false,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("baseline scan");
+        let cells: BTreeSet<usize> = baseline.candidates.iter().map(|c| c.cell_idx).collect();
+        assert_eq!(
+            cells.len(),
+            2,
+            "fixture sanity: candidates from both packed cells, got {cells:?}"
+        );
+
+        // Scope to one cell's flat at a time; only that cell may score.
+        for (flat, cell_idx) in [(0u32, 0usize), (2u32, 1usize)] {
+            let scoped = r
+                .search_clusters_scan_async(
+                    "embedding",
+                    &q,
+                    5,
+                    &fetch,
+                    Some(&[flat]),
+                    8,
+                    8,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("scoped scan");
+            assert!(
+                !scoped.candidates.is_empty(),
+                "flat {flat} resolves to a non-empty cluster; scoping it must score rows"
+            );
+            for c in &scoped.candidates {
+                assert_eq!(
+                    c.cell_idx, cell_idx,
+                    "flat {flat} belongs to cell {cell_idx}; a candidate scored from cell {} \
+                     means the flat-to-cell mapping drifted from the fetch keying",
+                    c.cell_idx
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11113,7 +11509,7 @@ mod tests {
     // fetch_sync error arm
     // -----------------------------------------------------------------
 
-    /// `fetch_sync` surfaces a `MalformedVersion` whose message names
+    /// `fetch_sync` surfaces a `Malformed` whose message names
     /// the out-of-bounds range when the requested span runs past the
     /// blob.
     #[test]
@@ -11123,10 +11519,7 @@ mod tests {
         assert_eq!(ok.len(), 4);
         let err = fetch_sync(&src, 4..100, "directory").expect_err("oob fails");
         let msg = err.to_string();
-        assert!(matches!(
-            err,
-            VectorError::Read(ReadError::MalformedVersion(_))
-        ));
+        assert!(matches!(err, VectorError::Read(ReadError::Malformed(_))));
         assert!(
             msg.contains("directory") && msg.contains("4..100"),
             "message names the region and range, got: {msg}"
@@ -11343,12 +11736,21 @@ mod tests {
     /// those lets open succeed before the failing mode trips.
     const FAIL_NEVER: u64 = u64::MAX;
 
+    /// The label an open-time fetch failure carries, if `err` is one.
+    fn open_fetch_label(err: &VectorError) -> Option<&str> {
+        match err {
+            VectorError::RangeFetch { what, .. } => Some(what),
+            _ => None,
+        }
+    }
+
     /// Test-only [`LazyByteSource`] over a real blob that serves bytes
     /// until the test flips it into a failing mode. `try_get_range_sync`
     /// always returns `None`, so every reader fetch routes through the
     /// async `range()` (or its sync bridge) and observes the flag. Used
-    /// to pin that a backing-store failure surfaces as
-    /// `VectorError::LazySource` instead of a panic or silent miss.
+    /// to pin that a backing-store failure surfaces as a typed fetch error
+    /// (`VectorError::RangeFetch` while opening, `LazySource` after) instead
+    /// of a panic or silent miss.
     #[derive(Debug)]
     struct FlakyLazyByteSource {
         bytes: Bytes,
@@ -11518,9 +11920,9 @@ mod tests {
         );
     }
 
-    /// A failure on the outer-header fetch during `open_lazy` maps to a
-    /// `MalformedVersion` read error (the open path stringifies the
-    /// lazy error into its own structural-decode error).
+    /// A failure on the outer-header fetch during `open_lazy` aborts open
+    /// with the fetch's own error, kept typed and labelled with the part it
+    /// was fetching: a failed read, not a malformed file.
     #[tokio::test]
     async fn open_lazy_header_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11533,15 +11935,16 @@ mod tests {
         )
         .await
         .expect_err("header fetch failure must abort open_lazy");
-        assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+        assert_eq!(
+            open_fetch_label(&err),
+            Some("lazy open: outer header fetch"),
+            "got {err:?}"
         );
     }
 
     /// A failure on the directory fetch (the second `range()` wave)
-    /// during `open_lazy` also aborts open with a `MalformedVersion`
-    /// read error, exercising the directory-fetch error arm.
+    /// during `open_lazy` also aborts open with the fetch's own error,
+    /// exercising the directory-fetch error arm.
     #[tokio::test]
     async fn open_lazy_directory_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11554,15 +11957,16 @@ mod tests {
         )
         .await
         .expect_err("directory fetch failure must abort open_lazy");
-        assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+        assert_eq!(
+            open_fetch_label(&err),
+            Some("lazy open: directory fetch"),
+            "got {err:?}"
         );
     }
 
     /// A failure on the subsection-header fetch wave (third `range()`
-    /// onward) during `open_lazy` aborts open with a `MalformedVersion`
-    /// read error, exercising the subheader-fetch error arm.
+    /// onward) during `open_lazy` aborts open with the fetch's own error,
+    /// exercising the subheader-fetch error arm.
     #[tokio::test]
     async fn open_lazy_subheader_fetch_failure_errors() {
         let (blob, json, _) = build_search_corpus();
@@ -11575,14 +11979,16 @@ mod tests {
         )
         .await
         .expect_err("subheader fetch failure must abort open_lazy");
+        // Which subsection fails first depends on the fetch wave's order.
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            open_fetch_label(&err).is_some_and(|what| what.starts_with("lazy open: subsection")
+                && what.ends_with(" sub-header fetch")),
+            "got {err:?}"
         );
     }
 
     /// Malformed `inf.vec.columns` JSON is rejected at open with a
-    /// `MalformedVersion` read error — exercises the JSON-parse error
+    /// `Malformed` read error: exercises the JSON-parse error
     /// arm in `open_with_source`.
     #[test]
     fn open_rejects_malformed_columns_json() {
@@ -11590,8 +11996,8 @@ mod tests {
         let err = VectorReader::open(blob, "{ this is not valid json")
             .expect_err("malformed JSON must be rejected");
         assert!(
-            matches!(err, VectorError::Read(ReadError::MalformedVersion(_))),
-            "expected MalformedVersion, got {err:?}"
+            matches!(err, VectorError::Read(ReadError::Malformed(_))),
+            "expected Malformed, got {err:?}"
         );
     }
 

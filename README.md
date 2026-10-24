@@ -1,6 +1,6 @@
 # Infino
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/infino-ai/infino)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-blue)](https://deepwiki.com/infino-ai/infino)
 [![Crates.io](https://img.shields.io/crates/v/infino.svg)](https://crates.io/crates/infino)
 [![docs.rs](https://img.shields.io/docsrs/infino)](https://docs.rs/infino)
 [![CI](https://github.com/infino-ai/infino/actions/workflows/ci.yml/badge.svg)](https://github.com/infino-ai/infino/actions/workflows/ci.yml)
@@ -17,13 +17,13 @@ cargo add infino                # Rust
 or in Cargo.toml:
 
 [dependencies]
-infino = "0.5"
+infino = "0.11"
 ```
 
 Note: infino installs the [mimalloc](https://github.com/microsoft/mimalloc)
 global allocator by default. If you embed infino in a process that already
 sets a global allocator, turn it off to avoid a second one:
-`infino = { version = "0.5", default-features = false }`.
+`infino = { version = "0.11", default-features = false }`.
 
 ## Quickstart
 
@@ -446,10 +446,40 @@ keyword, or SQL — in memory or over object storage, with no service to run:
 
 ## Documentation
 
+Full documentation is at [infino.ai/docs](https://infino.ai/docs). Start here:
+
+- [Quickstart](https://infino.ai/docs/quickstart) — connect, create a table, run your first search
+- [Core concepts](https://infino.ai/docs/core-concepts) — one table, four ways to query it
+- [Search guide](https://infino.ai/docs/guides/search) — full-text, vector, and hybrid retrieval
+- [Hybrid search on Parquet](https://infino.ai/docs/guides/hybrid-search-on-parquet) — BM25 and vector in one ranked pass over a Parquet file
+- [SQL reference](https://infino.ai/docs/sql-reference) — the search table-valued functions and how to combine them
+- [Agent memory](https://infino.ai/docs/use-cases/agent-memory) — retrieval as an agent's long-term memory over object storage
+- [MCP integration](https://infino.ai/docs/integrations/mcp) — hybrid and SQL retrieval for Claude, Cursor, and VS Code
+- [Parquet interop](https://infino.ai/docs/guides/parquet-interop) — read the same file with DuckDB, pyarrow, and DataFusion
+- [Embeddings](https://infino.ai/docs/guides/embeddings) and [storage](https://infino.ai/docs/guides/storage) — bring your own vectors; run on local disk, S3, GCS, or Azure
+
+The same pages are available as Markdown source on GitHub:
+[quickstart](https://github.com/infino-ai/docs/blob/main/quickstart.mdx),
+[core concepts](https://github.com/infino-ai/docs/blob/main/core-concepts.mdx),
+[search](https://github.com/infino-ai/docs/blob/main/guides/search.mdx),
+[hybrid search on Parquet](https://github.com/infino-ai/docs/blob/main/guides/hybrid-search-on-parquet.mdx),
+[SQL reference](https://github.com/infino-ai/docs/blob/main/sql-reference.mdx),
+[agent memory](https://github.com/infino-ai/docs/blob/main/use-cases/agent-memory.mdx),
+[MCP](https://github.com/infino-ai/docs/blob/main/integrations/mcp.mdx),
+[Parquet interop](https://github.com/infino-ai/docs/blob/main/guides/parquet-interop.mdx),
+[embeddings](https://github.com/infino-ai/docs/blob/main/guides/embeddings.mdx),
+[storage](https://github.com/infino-ai/docs/blob/main/guides/storage.mdx).
+
+In this repo:
+
+- [FAQ](docs/faq.md) — short answers to common questions
+- [How Infino compares](docs/comparisons.md) — how it relates to vector databases, search engines, and query engines
+
+Design references (in this repo):
+
 - [Overview](docs/architecture/overview.md) — the mental model, and how this compares
 - [Superfile format](docs/architecture/superfile.md) — how indexes fit inside Parquet
 - [Supertable layer](docs/architecture/supertable.md) — manifest, commit, query fan-out
-- [infino.ai/docs](https://infino.ai/docs) — concepts and guides
 
 | Language | Package | Examples |
 |----------|---------|----------|

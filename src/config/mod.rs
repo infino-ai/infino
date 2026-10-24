@@ -35,9 +35,11 @@
 
 use std::{
     collections::HashMap,
-    env, fmt,
+    env, fmt, fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
+    thread::available_parallelism,
     time::Duration,
 };
 
@@ -49,6 +51,11 @@ use serde::{
     Deserialize, Serialize,
     de::{self, Deserializer, Visitor},
     ser::Serializer,
+};
+
+use crate::{
+    runtime_metrics::rss::available_memory_bytes,
+    supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT,
 };
 
 /// Embedded baseline. Compiled in via `include_str!`.
@@ -138,7 +145,10 @@ pub struct Config {
 pub struct MemorySettings {
     /// Per-connection memory (heap) budget in bytes. `0` (the default) is
     /// measure-only: usage is tracked but never refused. A positive value
-    /// enforces a ceiling so one connection can't exhaust process memory.
+    /// enforces a ceiling on what this connection's search and ingest work may
+    /// hold. Compaction is not charged to it — see
+    /// [`ConnectOptions::with_connection_memory_budget_bytes`] — so this is not
+    /// a ceiling on the process.
     ///
     /// Applies to connections built from a config file (`apply_config`). Code
     /// that opens a connection programmatically sets the budget on
@@ -146,12 +156,20 @@ pub struct MemorySettings {
     ///
     /// [`ConnectOptions::with_connection_memory_budget_bytes`]: crate::ConnectOptions::with_connection_memory_budget_bytes
     pub connection_budget_bytes: u64,
+    /// Process-wide limit for SQL, in bytes of anonymous resident memory: a
+    /// running statement is refused once the process passes it. Unset (the
+    /// default) takes 90% of the process's cgroup memory limit, the lower of
+    /// `memory.high` and `memory.max` up its cgroup v2 hierarchy, and sets no
+    /// limit where there is none; `0` sets no limit; a positive value is the
+    /// limit. Read once per process.
+    pub process_limit_bytes: Option<u64>,
 }
 
 impl Default for MemorySettings {
     fn default() -> Self {
         Self {
             connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
+            process_limit_bytes: None,
         }
     }
 }
@@ -188,6 +206,15 @@ pub fn global() -> &'static Config {
     })
 }
 
+/// Resolve the root used for temporary scratch space.
+pub(crate) fn scratch_root() -> PathBuf {
+    global()
+        .storage
+        .scratch_root
+        .clone()
+        .unwrap_or_else(env::temp_dir)
+}
+
 /// Supertable subsection of [`Config`]. Keeps supertable-
 /// specific knobs grouped so they don't crowd the top-level
 /// namespace as the layer grows.
@@ -218,14 +245,95 @@ pub struct SupertableSettings {
     /// every this many bytes and builds one superfile per piece, so the file count follows the
     /// data volume rather than the core count. `0` falls back to one piece per pool thread.
     pub superfile_buffer_split_mb: u64,
-    /// Verify the trailing whole-blob CRC and per-subsection
-    /// CRCs on every `SuperfileReader::open`. Defaults to
-    /// `true`. Set to `false` only when the underlying
-    /// storage already validates checksums (content-
-    /// addressed object store, ZFS, etc.) — skipping the
-    /// scan trades that storage-layer guarantee for faster
-    /// cold opens.
-    pub verify_crc_on_open: bool,
+    /// Deprecated in favour of [`Self::crc_verification`], and still read so
+    /// that a configuration naming it keeps the behaviour it asked for.
+    /// `Some(true)` means [`CrcVerification::Always`], `Some(false)` means
+    /// [`CrcVerification::Never`]. Unknown fields are dropped silently by
+    /// this loader, so removing it outright would turn an operator's explicit
+    /// choice into a default without saying so.
+    pub verify_crc_on_open: Option<bool>,
+
+    /// When the engine verifies a superfile's checksums. See
+    /// [`CrcVerification`]. Takes precedence over
+    /// [`Self::verify_crc_on_open`] when both are set.
+    pub crc_verification: Option<CrcVerification>,
+}
+
+/// When the engine verifies a superfile's stored checksums.
+///
+/// Checksums are always written. This decides when they are read back, which
+/// is a cost question rather than a correctness one: the bytes are the same
+/// either way, and verification only decides whether a corrupt copy is
+/// noticed before it is used.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CrcVerification {
+    /// Verify where bytes arrive and not where they are read, which is what
+    /// Lucene, Elasticsearch and OpenSearch do. The default.
+    #[default]
+    Auto,
+    /// Verify the whole blob and every subsection on each open. The
+    /// strictest setting, and the most expensive by a wide margin: it reads
+    /// every byte of every superfile it opens, including the bytes no query
+    /// touches, so what it costs grows with the data rather than with the
+    /// work being done.
+    Always,
+    /// Never verify. Appropriate only where the storage beneath already
+    /// guarantees integrity end to end.
+    Never,
+}
+
+impl CrcVerification {
+    /// Whether an open verifies the blob's stored checksums.
+    ///
+    /// The single place the policy becomes a yes or no for an open, so what
+    /// `Auto` does on that path is decided here and nowhere else.
+    pub fn verifies_on_open(self) -> bool {
+        match self {
+            Self::Always => true,
+            // `Auto` verifies where bytes arrive, not where they are read, so
+            // an open verifies nothing. Lucene, Elasticsearch and OpenSearch
+            // all read without recomputing a checksum, and this is the line
+            // that makes us match them.
+            Self::Auto | Self::Never => false,
+        }
+    }
+
+    /// Whether bytes are verified as they land in the local disk cache.
+    ///
+    /// This is where `Auto` does its checking. A cached superfile is the one
+    /// copy of the data nothing else guards: in flight it is covered by TLS,
+    /// and at rest in the object store by the provider, but the local file is
+    /// written by this process and validated by nobody. Checking it once as
+    /// it lands costs a single pass over bytes already in hand, where
+    /// checking at open costs that pass again on every process start.
+    ///
+    /// This is the same boundary Elasticsearch verifies at, where a segment
+    /// received from another node is checksummed as it is written rather than
+    /// when it is later read.
+    pub fn verifies_on_landing(self) -> bool {
+        match self {
+            Self::Auto | Self::Always => true,
+            Self::Never => false,
+        }
+    }
+}
+
+impl SupertableSettings {
+    /// The checksum policy in force, reconciling the current field with the
+    /// deprecated one.
+    ///
+    /// Explicit beats default in both directions, which is the point: an
+    /// operator who asked for verification keeps it when the default moves,
+    /// and one who turned it off does not have it turned back on.
+    pub fn crc_policy(&self) -> CrcVerification {
+        match (self.crc_verification, self.verify_crc_on_open) {
+            (Some(policy), _) => policy,
+            (None, Some(true)) => CrcVerification::Always,
+            (None, Some(false)) => CrcVerification::Never,
+            (None, None) => DEFAULT_CRC_VERIFICATION,
+        }
+    }
 }
 
 impl Default for SupertableSettings {
@@ -236,14 +344,16 @@ impl Default for SupertableSettings {
             id_column: default_id_column(),
             commit_threshold_size_mb: DEFAULT_COMMIT_THRESHOLD_SIZE_MB,
             superfile_buffer_split_mb: DEFAULT_SUPERFILE_BUFFER_SPLIT_MB,
-            verify_crc_on_open: DEFAULT_VERIFY_CRC_ON_OPEN,
+            verify_crc_on_open: None,
+            crc_verification: None,
         }
     }
 }
 
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 const DEFAULT_SUPERFILE_BUFFER_SPLIT_MB: u64 = 64;
-const DEFAULT_VERIFY_CRC_ON_OPEN: bool = true;
+/// The policy when a configuration names neither field.
+const DEFAULT_CRC_VERIFICATION: CrcVerification = CrcVerification::Auto;
 
 // Compaction defaults
 const DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB: u64 = 1024;
@@ -276,8 +386,29 @@ pub struct CompactionSettings {
     /// tables. Values below 2 are raised to 2 — merging fewer than two inputs
     /// is a no-op rewrite.
     pub min_superfiles_for_merge: u64,
-    /// Maximum memory budget for materializing inputs during a single merge, in MiB.
+    /// Ceiling on the raw input bytes one merge may accumulate, in MiB. The
+    /// packer stops adding superfiles to a job once it would cross this.
+    ///
+    /// Independent of `target_superfile_size_mb`: raising the target does not
+    /// raise this. Most jobs never approach it, because the output target
+    /// closes them out first — it is the backstop for a partition of unusually
+    /// large superfiles, not a typical job's size.
+    ///
+    /// It is also NOT a bound on the merge's resident set, which runs several
+    /// times higher once rows are decoded and the output encoded, and it does
+    /// not govern how many merges run at once: the runner admits them against
+    /// the host's free memory.
     pub max_memory_mb: u64,
+    /// How many of a pass's merge jobs may be in flight at once.
+    ///
+    /// `None` (the default) derives the ceiling from the maintenance pool and
+    /// lets the runner admit another merge only while the host reports free
+    /// memory; `Some(n)` forces exactly `n`, and `Some(1)` is strictly serial.
+    ///
+    /// Not a thread count: a job is an async task whose CPU work runs on the
+    /// shared maintenance pool, so this is how many merges may overlap, not
+    /// how many threads they get.
+    pub max_concurrent_jobs: Option<usize>,
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
@@ -290,6 +421,7 @@ impl Default for CompactionSettings {
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
         }
     }
@@ -306,14 +438,39 @@ const DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP: u64 = 500_000;
 /// Default modality-split threshold; `0.0` = off. Must equal config.yaml
 /// `cell_split_modality_d` (see there for the working value and why it ships on).
 const DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D: f64 = 8.0;
+/// Default [`VectorSettings::recal_growth_fraction`]: recalibrate after the
+/// corpus grows 50% since the last one, so a long build recalibrates a few
+/// times instead of on every drain.
+const DEFAULT_VECTOR_RECAL_GROWTH_FRACTION: f64 = 0.5;
 /// Default k-means training points per centroid for per-cell sub-builds.
 const DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID: usize = 64;
-/// Default fine-cluster fanout for `ivf_router = centroid_graph`.
-const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
-/// Default exact-rerank over-fetch for `ivf_router = centroid_graph` —
-/// the measured knee; scoped to this path so it never shifts the stamped,
-/// filtered, or user-table defaults.
-const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 128;
+/// Default fine-cluster fanout for `ivf_router = centroid_graph`. The default
+/// leaves the per-table stamped `fanout_for_k` (auto-calibrated at drain) in
+/// charge; an explicit non-default value overrides that stamp for the whole
+/// table, and an explicit `0` also defers to the stamp (falling back to this
+/// default when the table is unstamped) so it never disables an engaged graph.
+pub(crate) const DEFAULT_VECTOR_GLOBAL_FINE_FANOUT: usize = 1024;
+/// Default per-cluster exact-rerank over-fetch for `ivf_router =
+/// centroid_graph` (with `global_fine_per_cluster_budget` on): each scanned
+/// fine cluster keeps `k·rerank_mult` candidates, so the pooled — and fully
+/// reranked — count is `fanout·k·rerank_mult`. The measured 1B knee is
+/// `k·12 ≈ 120` per cluster (recall@10 ≈ 0.98); far below the old per-cell
+/// default because a coarse cell holds many clusters. Scoped to this path so
+/// it never shifts the stamped / filtered / user-table defaults.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT: usize = 12;
+/// Default for `global_fine_per_cluster_budget`: the grid-independent
+/// per-cluster rerank budget + rerank-all is the centroid-graph serving
+/// default. `false` restores the legacy per-cell budget + global 1-bit
+/// shortlist cut (then raise `global_fine_rerank_mult` back toward ~128).
+const DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET: bool = true;
+/// Default rerank-pool floor for `ivf_router = centroid_graph` with
+/// `global_fine_per_cluster_budget` on: the per-cluster budget is boosted so
+/// the pooled — and fully reranked — candidate count never drops below this.
+/// It binds only at small N (where `fanout ≈ √fine-clusters` is tiny); large
+/// tables already pool above it, so it is a no-op there. A candidate count,
+/// so the bytes reranked scale with it times the vector width — on high-dim
+/// data a given floor costs proportionally more latency than on low-dim.
+const DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR: usize = 30_000;
 /// Default `ivf_router = auto` concentration threshold: `centroid_graph` only
 /// when the calibrated fanout selects under half the fine clusters (a real
 /// subset to concentrate on). A documented starting point, tuned per corpus.
@@ -323,6 +480,16 @@ const DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO: f64 = 0.5;
 /// graph measured a win at 10M+, a loss at 1M). A documented starting point.
 const DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS: u64 = 10_000_000;
 const DEFAULT_CENTROID_GRAPH_MAX_FANOUT: usize = 4096;
+/// Default `ivf_router = auto` parity gap: how far below `hnsw_register_floor`
+/// the router-fanout acceptance bar may relax toward the router's OWN measured
+/// recall ceiling. The router reads the same Sq16 codes as the stamped grid, so
+/// it shares the grid's within-cell ceiling — on hard/high-dim data that ceiling
+/// is below 0.98 (laion-100M: router ~0.973, grid ~0.975), and an absolute bar
+/// would reject the router at parity with the grid it replaces. 0.03 accepts a
+/// router up to 3pt under the floor when that is its ceiling (the ~0.7pt codec
+/// gap clears) while still rejecting a collapsed graph. `0` restores the strict
+/// absolute floor.
+const DEFAULT_CENTROID_GRAPH_PARITY_GAP: f64 = 0.03;
 /// Default upper bound on the `hnsw` calibration ef grid. High-dimensional
 /// cosine tables need a wide beam to reach the recall bar (e.g. glove-100
 /// clears ~0.99 only at ef=1024), so the ceiling allows that; the stamped
@@ -414,8 +581,21 @@ const DEFAULT_VECTOR_FINE_NPROBE_PCT: f64 = 0.0;
 /// (0.287–0.294 across the BioASQ diag configs; decisive-geometry
 /// controls cliff shut below it, so they are unaffected by the value).
 const DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
+/// Cap on the #515 admit extension as a multiple of the stamped
+/// `width_for_k`: served cells are bounded to `mult * width` so the serve
+/// stays anchored to the target-aware width instead of the unbounded
+/// near-tie window. `1` = width-only (no extension). Default 3.
+const DEFAULT_VECTOR_ADMIT_EXTENSION_MULT: usize = 3;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
+/// Default drain-side cell assignment path: route through a centroid HNSW
+/// built once per drain (`true`) rather than the 1-bit shortlist + exact
+/// rescore. The graph reaches the same placement much faster as the grid
+/// grows; `false` is the kill-switch back to the shortlist path.
+const DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN: bool = true;
+/// Fine-centroid drain placement is on by default; `false` forces coarse
+/// cell-centroid placement (the isolation switch for a placement A/B).
+const DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT: bool = true;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
 /// replication, which is the default: at 10M it was a measured net loss —
 /// the extra boundary copies inflated cell size (159K → 232K rows), crowding
@@ -556,20 +736,22 @@ pub enum VectorSearchMode {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum IvfRouter {
-    /// DEFAULT. Grid routing to cells, then the manifest's stamped per-cell
-    /// width. The established path.
-    #[default]
+    /// Grid routing to cells, then the manifest's stamped per-cell width — the
+    /// established path. An explicit opt-out from `auto`: forced verbatim, no
+    /// per-table gating.
     Stamped,
-    /// EXPERIMENTAL (opt-in): score fine centroids via an HNSW over the
-    /// resident fp32 fine centroids and read the top `global_fine_fanout`
-    /// clusters, bypassing the grid. A cold-read win at scale. Forced verbatim
-    /// (no per-table gating).
+    /// Opt-in: score fine centroids via an HNSW over the resident fp32 fine
+    /// centroids and read the top `global_fine_fanout` clusters, bypassing the
+    /// grid. A cold-read win at scale. Forced verbatim (no per-table gating).
     CentroidGraph,
-    /// EXPERIMENTAL (opt-in): pick the router per hidden-vector table at query
-    /// time — `centroid_graph` only where it wins (a concentrated calibrated
-    /// fanout at large scale), else `stamped`. See
+    /// DEFAULT. Pick the router per hidden-vector table at query time —
+    /// `centroid_graph` only where it wins (a concentrated calibrated fanout at
+    /// large scale, at or above the scale floor), else `stamped`. The floor is
+    /// kept equal to `hnsw_max_docs` so the graph takes over exactly where the
+    /// resident HNSW drops out. See
     /// [`VectorSettings::centroid_graph_concentration_ratio`] and
     /// [`VectorSettings::centroid_graph_scale_floor_docs`].
+    #[default]
     Auto,
 }
 
@@ -622,6 +804,10 @@ pub struct VectorSettings {
     /// measure real-query slack, the same distribution mismatch that
     /// under-stamped the width law on such corpora.
     pub serve_near_tie_slack: f32,
+    /// Cap on the #515 admit extension as a multiple of the stamped
+    /// `width_for_k` (see [`DEFAULT_VECTOR_ADMIT_EXTENSION_MULT`]). Anchors
+    /// admission to the target-aware width; `1` disables the extension.
+    pub admit_extension_mult: usize,
     /// K-means training points per centroid for the drain's per-cell
     /// sub-builds. Higher trains on more points (slower, tighter
     /// clusters).
@@ -642,14 +828,35 @@ pub struct VectorSettings {
     /// Ignored under `search_mode = hnsw_ivf`.
     pub ivf_router: IvfRouter,
     /// For `ivf_router = centroid_graph`: number of fine clusters the query
-    /// reads (globally scored, clamped to the table's total). See `config.yaml`
-    /// for sizing guidance. Ignored otherwise.
+    /// reads (globally scored, clamped to the table's total). The default
+    /// (1024) defers to the per-table stamped `fanout_for_k` (auto-calibrated at
+    /// drain), falling back to 1024 only when the table carries no stamp; an
+    /// explicit non-default value overrides the stamp for the whole table
+    /// (manual tuning / fanout sweeps), capped at `centroid_graph_max_fanout`;
+    /// an explicit `0` also defers to the stamp (never disabling an engaged
+    /// graph). See `config.yaml` for sizing guidance. Ignored otherwise.
     pub global_fine_fanout: usize,
     /// For `ivf_router = centroid_graph`: the exact-rerank over-fetch
-    /// multiplier for this path specifically (a caller-set `rerank_mult`
-    /// still wins). Scoped here rather than the shared default so tuning
-    /// it never touches the stamped / filtered / user-table paths.
+    /// multiplier (a caller-set `rerank_mult` still wins). With
+    /// `global_fine_per_cluster_budget` on (default) it is applied PER
+    /// SCANNED FINE CLUSTER — each keeps `k·rerank_mult` candidates, so the
+    /// pool is `fanout·k·rerank_mult`, independent of the coarse grid.
+    /// Scoped here so tuning it never touches the stamped / filtered /
+    /// user-table paths.
     pub global_fine_rerank_mult: usize,
+    /// For `ivf_router = centroid_graph`: apply the rerank budget PER FINE
+    /// CLUSTER (pool `fanout·k·rerank_mult`, independent of how clusters
+    /// group into coarse cells) and exact-rerank the whole pool, instead of
+    /// a per-cell budget cut down by a global 1-bit shortlist. On by
+    /// default; `false` restores the legacy per-cell + global-cut path.
+    pub global_fine_per_cluster_budget: bool,
+    /// For `ivf_router = centroid_graph` with `global_fine_per_cluster_budget`
+    /// on: the minimum pooled (and fully reranked) candidate count. Boosts the
+    /// per-cluster budget at small N so recall does not turn depth-limited;
+    /// a no-op at large N, where the pool already exceeds it. Higher trades
+    /// latency for recall, and the cost scales with the vector width (it is a
+    /// candidate count, not a byte budget). Ignored otherwise.
+    pub global_fine_rerank_pool_floor: usize,
     /// For `ivf_router = centroid_graph`: coalesce the selected clusters
     /// within each cell into contiguous reads. Ignored otherwise.
     pub global_fine_coalesce: bool,
@@ -667,8 +874,10 @@ pub struct VectorSettings {
     /// which `auto` picks `stamped`. The selected clusters coalesce into a
     /// cold-read win only at large N — the centroid graph measured a win at 10M+
     /// and a loss at 1M, where the selection is spread too thin across cells to
-    /// coalesce. Documented starting point, tunable; final value from a
-    /// real-corpus sweep.
+    /// coalesce. Documented starting point (10M), tunable; final value from a
+    /// real-corpus sweep. A `0` value is rejected at load and reverts to the
+    /// default (a 0 floor would route below-scale tables to a graph that loses
+    /// there).
     pub centroid_graph_scale_floor_docs: u64,
     /// Ceiling on the fanout the router's recall calibration considers — the
     /// widest number of global fine clusters the calibration sweep selects and
@@ -680,6 +889,16 @@ pub struct VectorSettings {
     /// query time are still governed by the stamped per-`k` fanout, which this
     /// only caps. Default 4096 (≈ `512 · √(N/1e6)` at 100M).
     pub centroid_graph_max_fanout: usize,
+    /// For `ivf_router = auto`: how far below `hnsw_register_floor` the router's
+    /// fanout-calibration acceptance bar may relax toward the router's OWN
+    /// measured recall ceiling. The router scores the same Sq16 codes as the
+    /// stamped grid and so shares its within-cell recall ceiling; on hard/high-
+    /// dim data that ceiling sits under the absolute floor, and grading the
+    /// router against a bar its shared codec can't reach would reject it at
+    /// parity with the grid it replaces. This bounds the relaxation so a
+    /// genuinely collapsed router (ceiling far under the floor) is still
+    /// rejected. `0` keeps the strict absolute floor. Documented starting point.
+    pub centroid_graph_parity_gap: f64,
     /// For `search_mode = hnsw_ivf`: the upper bound on the calibration ef grid —
     /// the drain sweeps [`HNSW_EF_CANDIDATES`] up to this ceiling and stamps
     /// the winning `ef` per table into the persisted bundle. Must be at least
@@ -772,6 +991,11 @@ pub struct VectorSettings {
     /// tentative two-means partition is bimodal by at least this D (with
     /// `cell_split_doc_cap` demoted to a hard ceiling).
     pub cell_split_modality_d: f64,
+    /// How much the corpus must grow since the last full recalibration before
+    /// `optimize` runs another one. A split or a lagging rerank law also
+    /// trigger it; a drain that only appended rows does not. `0.0`
+    /// recalibrates on any growth.
+    pub recal_growth_fraction: f64,
     /// How user-superfile clusters align to the global cell grid.
     pub user_centroids: CentroidAlignment,
     /// User superfiles the hidden-index drain materializes per batch
@@ -786,6 +1010,20 @@ pub struct VectorSettings {
     pub drain_replica_target_factor: f32,
     /// Per-cell consolidation op the drain applies.
     pub drain_consolidate: DrainConsolidate,
+    /// Route drain-side cell assignment through a centroid HNSW built once
+    /// per drain (default `true`), instead of the 1-bit shortlist + exact
+    /// rescore. The graph reaches the same placement far faster as the grid
+    /// grows; `false` is the kill-switch back to the shortlist path. Small
+    /// grids always take the exact path regardless of this flag.
+    pub drain_graph_assign: bool,
+    /// Place each drained row in the cell of its nearest FINE centroid (found by
+    /// walking the centroid-router graph, read from the hidden table's slow-state
+    /// section) instead of the nearest coarse cell centroid, so drain placement
+    /// matches how the `centroid_graph` router routes queries (default `true`).
+    /// Only takes effect when the table's router resolves to `centroid_graph` and
+    /// the drain graph-assign path is active; `false` forces coarse cell-centroid
+    /// placement even then (the isolation switch for a placement A/B).
+    pub global_fine_drain_placement: bool,
     /// Read fan-out for the drain's superfile opens. `auto` resolves
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
@@ -831,17 +1069,21 @@ impl Default for VectorSettings {
             target_recall: DEFAULT_VECTOR_TARGET_RECALL,
             fine_nprobe_pct: DEFAULT_VECTOR_FINE_NPROBE_PCT,
             serve_near_tie_slack: DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK,
+            admit_extension_mult: DEFAULT_VECTOR_ADMIT_EXTENSION_MULT,
             kmeans_pts_per_centroid: DEFAULT_VECTOR_KMEANS_PTS_PER_CENTROID,
             search_mode: VectorSearchMode::Ivf,
             hnsw_plane: VectorHnswPlane::default(),
-            ivf_router: IvfRouter::Stamped,
+            ivf_router: IvfRouter::Auto,
             global_fine_fanout: DEFAULT_VECTOR_GLOBAL_FINE_FANOUT,
             global_fine_rerank_mult: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_MULT,
+            global_fine_per_cluster_budget: DEFAULT_VECTOR_GLOBAL_FINE_PER_CLUSTER_BUDGET,
+            global_fine_rerank_pool_floor: DEFAULT_VECTOR_GLOBAL_FINE_RERANK_POOL_FLOOR,
             global_fine_coalesce: false,
             global_fine_graph_ef: 0,
             centroid_graph_concentration_ratio: DEFAULT_CENTROID_GRAPH_CONCENTRATION_RATIO,
             centroid_graph_scale_floor_docs: DEFAULT_CENTROID_GRAPH_SCALE_FLOOR_DOCS,
             centroid_graph_max_fanout: DEFAULT_CENTROID_GRAPH_MAX_FANOUT,
+            centroid_graph_parity_gap: DEFAULT_CENTROID_GRAPH_PARITY_GAP,
             hnsw_ef_ceil: DEFAULT_VECTOR_HNSW_EF_CEIL,
             hnsw_ef_construction: DEFAULT_VECTOR_HNSW_EF_CONSTRUCTION,
             hnsw_ef_search: DEFAULT_VECTOR_HNSW_EF_SEARCH,
@@ -854,10 +1096,13 @@ impl Default for VectorSettings {
             hnsw_probe_max_docs: DEFAULT_VECTOR_HNSW_PROBE_MAX_DOCS,
             cell_split_doc_cap: DEFAULT_VECTOR_CELL_SPLIT_DOC_CAP,
             cell_split_modality_d: DEFAULT_VECTOR_CELL_SPLIT_MODALITY_D,
+            recal_growth_fraction: DEFAULT_VECTOR_RECAL_GROWTH_FRACTION,
             user_centroids: CentroidAlignment::Local,
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
+            drain_graph_assign: DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN,
+            global_fine_drain_placement: DEFAULT_VECTOR_GLOBAL_FINE_DRAIN_PLACEMENT,
             drain_read_concurrency: ThreadCount::Auto,
             maintenance_threads: ThreadCount::Auto,
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
@@ -877,6 +1122,11 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
+    /// / recalibrate / settle / compact_total / router_cache) plus the merge
+    /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick
+    /// for compaction scaling work.
+    pub optimize_phase_timers: bool,
     /// Emit the FTS builder's finish-phase profile.
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.
@@ -915,6 +1165,20 @@ impl GcSettings {
     }
 }
 
+/// Which columns of an edge table carry the graph `optimize()` builds a
+/// resident adjacency index over. A node is a row of some table — its
+/// table's name and its stable `_id` — so an edge is four columns: the
+/// source row's table (a string) and `_id` (the engine's `Decimal128` id
+/// type), and the destination row's.
+#[cfg(feature = "graph-index")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdjacencySpec {
+    pub(crate) src_table: String,
+    pub(crate) src_id: String,
+    pub(crate) dst_table: String,
+    pub(crate) dst_id: String,
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -923,6 +1187,13 @@ impl GcSettings {
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
+    pub(crate) recalibrate: RecalibratePolicy,
+    pub(crate) skip_router_cache_warmup: bool,
+    /// The edge columns of a table whose rows are a graph; set, `optimize()`
+    /// builds and publishes the resident adjacency index the graph walks
+    /// read, as it builds the `hnsw` graph over a vector column.
+    #[cfg(feature = "graph-index")]
+    pub(crate) adjacency: Option<AdjacencySpec>,
 }
 
 impl OptimizeOptions {
@@ -930,13 +1201,219 @@ impl OptimizeOptions {
     pub fn compact(settings: CompactionSettings) -> Self {
         Self {
             compaction: settings,
-            gc: GcSettings::default(),
+            ..Self::default()
         }
+    }
+
+    /// Treat the table's rows as a graph's edges between rows — the source
+    /// row's table name and `_id` in `src_table` / `src_id`, the
+    /// destination's in `dst_table` / `dst_id` — and have `optimize()` build
+    /// and publish the resident adjacency index over them, in the lifecycle
+    /// of the `hnsw` graph: one content-addressed blob referenced from the
+    /// manifest, fetched once per generation and decoded into memory, kept
+    /// by GC while referenced, and rebuilt when the rows, the table's
+    /// deletes or these columns change. Edges are directed: a walk follows
+    /// an edge from its source row to its destination row only, so an
+    /// undirected graph is written as two rows per edge. Behind the
+    /// `graph-index` feature, off the curated public surface. The columns
+    /// are checked against the table's schema before `optimize()` changes
+    /// anything; a column that is missing or of the wrong type fails it
+    /// there.
+    #[cfg(feature = "graph-index")]
+    pub fn with_adjacency(
+        mut self,
+        src_table: &str,
+        src_id: &str,
+        dst_table: &str,
+        dst_id: &str,
+    ) -> Self {
+        self.adjacency = Some(AdjacencySpec {
+            src_table: src_table.to_string(),
+            src_id: src_id.to_string(),
+            dst_table: dst_table.to_string(),
+            dst_id: dst_id.to_string(),
+        });
+        self
     }
 
     /// Override the gc settings `optimize()`'s bundled sweep uses.
     pub fn with_gc(mut self, gc: GcSettings) -> Self {
         self.gc = gc;
+        self
+    }
+
+    /// Override how `optimize()` handles probe-law recalibration (default
+    /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
+    pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
+        self.recalibrate = recalibrate;
+        self
+    }
+
+    /// Skip pre-building the in-process centroid-router cache after
+    /// compaction. For a process that optimizes but serves no queries;
+    /// queries still load or build the router lazily.
+    pub fn with_skip_router_cache_warmup(mut self, skip: bool) -> Self {
+        self.skip_router_cache_warmup = skip;
+        self
+    }
+}
+
+/// How `optimize()` treats the probe-law recalibration — the O(N) query-serving
+/// calibration, separable from the storage-necessary drain/split/merge which
+/// always run. Storage work is unaffected by this; only recalibration is gated.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecalibratePolicy {
+    /// Engine decides: recalibrate when the live superfile set changed since the
+    /// pre-pass snapshot, or the rerank law lags its pool.
+    #[default]
+    Auto,
+    /// Always recalibrate this optimize, regardless of the Auto condition — for a
+    /// final optimize before serving, when the laws must reflect the full corpus.
+    Force,
+    /// Skip recalibration this optimize; the storage-necessary drain/split/merge
+    /// still run. For a repeated-optimize ingest loop where no query is served
+    /// until a later, deliberately recalibrated optimize.
+    Skip,
+}
+
+/// What a reindex repairs, per superfile.
+///
+/// Two things go out of date independently — the on-disk layout and the
+/// terms — and repairing the terms costs far more. The mode chooses how
+/// much to repair; [`ReindexMode::Auto`] decides per superfile, so a file
+/// that is only behind on layout never pays for a re-analysis it does not
+/// need.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ReindexMode {
+    /// Give each superfile the cheapest repair that makes it current:
+    /// [`ReindexMode::Rewrite`] where only its layout is behind,
+    /// [`ReindexMode::Reanalyze`] where its terms are.
+    ///
+    /// The default, because it is the only mode that leaves no stale
+    /// superfile behind and charges the expensive repair only where it is
+    /// the one that works.
+    #[default]
+    Auto,
+    /// Bring each superfile's index into the current on-disk layout,
+    /// keeping its terms.
+    ///
+    /// Cheap: postings are copied, not rebuilt. Recovers the pruning the
+    /// newer layout allows. Does not fix terms produced by an older
+    /// analyzer — nothing that copies postings can — so superfiles whose
+    /// terms are stale are left alone and reported.
+    Rewrite,
+    /// Rebuild terms by re-analyzing the text each superfile stored, and
+    /// bring the layout current as a side effect.
+    ///
+    /// Expensive: every document is tokenized again and every index
+    /// rebuilt. This is what repairs a table whose terms predate a change
+    /// in how text is analyzed — a query analyzed one way cannot find
+    /// terms written another. Columns whose text was never stored cannot
+    /// be repaired and are reported.
+    ///
+    /// Applies to every stale superfile, including ones whose recorded
+    /// revision says their terms are already current — which is the only
+    /// thing this offers over [`ReindexMode::Auto`], and the reason to
+    /// reach for it is not trusting that record.
+    Reanalyze,
+}
+
+/// What a reindex repairs.
+///
+/// Tiered by where the thing lives, so the two ways this grows are two
+/// different edits: a new *kind* of target — the manifest, the tombstone
+/// sidecars — is a variant here, while a new index inside a superfile is
+/// a variant of [`SuperfileIndex`]. Only superfile indexes have a repair
+/// today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReindexTarget {
+    /// An index held inside each superfile.
+    Superfile(SuperfileIndex),
+}
+
+impl Default for ReindexTarget {
+    fn default() -> Self {
+        Self::Superfile(SuperfileIndex::default())
+    }
+}
+
+/// Which of a superfile's indexes a reindex repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SuperfileIndex {
+    /// The full-text index. Vectors, the Parquet body and the hidden
+    /// vector index are copied or left untouched.
+    #[default]
+    Fts,
+}
+
+/// Knobs for [`crate::Supertable::reindex`].
+///
+/// No sizing knobs, because a reindex has nothing to decide there: it
+/// rewrites every stale superfile, one in and one out, so there is no
+/// target size to pack toward and no fill threshold to clear. Taking
+/// [`CompactionSettings`] instead would hand a caller three knobs the
+/// operation ignores.
+// Every field's default is its type's, so the derive cannot drift from
+// the enums it defers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ReindexOptions {
+    /// What to repair. Defaults to the superfile full-text index, the
+    /// only one with a repair today; a default naming one index can never
+    /// silently widen to cover another.
+    pub target: ReindexTarget,
+    /// How much to repair. Defaults to [`ReindexMode::Auto`], which gives
+    /// each superfile the cheapest repair that makes it current.
+    pub mode: ReindexMode,
+    /// How old a sealed tombstone sidecar has to be, in milliseconds,
+    /// before a rewrite treats it as abandoned and takes it over.
+    ///
+    /// `None`, the default, uses the table's
+    /// [`CompactionSettings::stale_seal_timeout_ms`]: the seal is the same
+    /// guard and a reindex job takes it the same way, so a table that
+    /// tuned it for compaction meant it for this too. A value here
+    /// overrides that for one run.
+    pub stale_seal_timeout_ms: Option<u64>,
+}
+
+impl ReindexOptions {
+    /// Repair layouts only, leaving superfiles whose terms are stale
+    /// untouched and reported.
+    pub fn rewriting() -> Self {
+        Self {
+            mode: ReindexMode::Rewrite,
+            ..Self::default()
+        }
+    }
+
+    /// Re-analyze every stale superfile, including ones whose recorded
+    /// revision says their terms are current.
+    pub fn reanalyzing() -> Self {
+        Self {
+            mode: ReindexMode::Reanalyze,
+            ..Self::default()
+        }
+    }
+
+    /// Repair `target` instead of the default.
+    pub fn with_target(mut self, target: ReindexTarget) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Repair to `mode` instead of the default.
+    pub fn with_mode(mut self, mode: ReindexMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Override the table's seal-takeover age for this run.
+    pub fn with_stale_seal_timeout_ms(mut self, ms: u64) -> Self {
+        self.stale_seal_timeout_ms = Some(ms);
         self
     }
 }
@@ -996,6 +1473,8 @@ pub struct StorageSettings {
     pub backend: StorageBackend,
     /// Local filesystem root when `backend: local_fs`.
     pub local_root: Option<PathBuf>,
+    /// Configurable root directory for temporary scratch files.
+    pub scratch_root: Option<PathBuf>,
     /// Object-store bucket name (used by the `s3` backend).
     pub bucket: Option<String>,
     /// Credentials/tuning for the backend, keyed by `object_store`
@@ -1034,6 +1513,15 @@ pub struct StorageSettings {
     /// `mmap_cold_threshold_secs` and not accessed since the
     /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background superfile fill yields to foreground
+    /// queries holding the same superfile's lazy reader before it
+    /// downloads anyway. Default: 10 s. `0` promotes immediately;
+    /// a superfile under continuous query load would otherwise never
+    /// go idle, so the fill would never run and the reader would stay
+    /// in its heap-resident lazy state for the life of the process.
+    /// See
+    /// [`crate::supertable::reader_cache::DiskCacheConfig::promotion_defer_timeout`].
+    pub promotion_defer_timeout_secs: u64,
 }
 
 impl Default for StorageSettings {
@@ -1041,6 +1529,7 @@ impl Default for StorageSettings {
         Self {
             backend: StorageBackend::None,
             local_root: None,
+            scratch_root: None,
             bucket: None,
             storage_options: HashMap::new(),
             prefix: String::new(),
@@ -1053,6 +1542,7 @@ impl Default for StorageSettings {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout_secs: DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS,
         }
     }
 }
@@ -1072,6 +1562,14 @@ pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway (seconds).
+///
+/// Derived from the runtime-side default rather than restated, so the YAML
+/// default and [`DiskCacheConfig`]'s can never drift apart.
+///
+/// [`DiskCacheConfig`]: crate::supertable::reader_cache::DiskCacheConfig
+const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = DEFAULT_PROMOTION_DEFER_TIMEOUT.as_secs();
 
 fn default_id_column() -> String {
     "_id".to_string()
@@ -1154,6 +1652,47 @@ impl Serialize for ThreadCount {
 }
 
 impl Config {
+    /// How many compaction merge jobs a pass may run at once.
+    ///
+    /// An explicit setting is honored as written. Unset, the width derives
+    /// from the maintenance pool, because merges run on that pool and more
+    /// concurrent jobs than it has threads is width without throughput.
+    ///
+    /// This is a CPU ceiling only. The memory bound lives in the compaction
+    /// runner, which admits another merge only while the host reports free memory
+    /// — an observation, where this layer could only guess from the
+    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// nothing downstream can bound the merges there, so the derived width is 1.
+    /// `compaction` is the settings the pass actually runs with, not
+    /// necessarily `self.compaction`: the hidden vector index compacts under
+    /// its own derived settings and resolves its own width from them.
+    pub(crate) fn compaction_concurrency(&self, compaction: &CompactionSettings) -> usize {
+        let maintenance = self
+            .vector
+            .maintenance_threads
+            .resolve_or_default(available_parallelism().map(NonZeroUsize::get).unwrap_or(1));
+        let resolved = match available_memory_bytes() {
+            // Memory is observable, so the runner reads what this process may
+            // actually spend — its cgroup ceiling where it has one, the host's
+            // `MemAvailable` otherwise — between admissions, and stops
+            // widening once less than its reserve share is free. That measures
+            // what merges cost on this corpus, where this layer could only
+            // guess from the `max_memory_mb` CAP, which real jobs are
+            // routinely a fraction of. The derived value is then just the CPU
+            // ceiling.
+            Some(_) => maintenance,
+            // No procfs: nothing downstream can bound the merges, so stay serial
+            // rather than invent a width.
+            None => 1,
+        };
+        // No upper clamp. An explicit setting is honored as written, and the
+        // real bounds are structural: the merges in flight never exceed the jobs
+        // the pass actually planned, memory narrows it further wherever the
+        // host reports any, and compaction's input opens ride a process-wide
+        // semaphore that bounds object-store fan-out on its own.
+        compaction.max_concurrent_jobs.unwrap_or(resolved).max(1)
+    }
+
     /// Load from the standard hierarchy. See module docs for the
     /// precedence order.
     pub fn load() -> Result<Self, ConfigError> {
@@ -1235,6 +1774,17 @@ impl Config {
             );
             v.centroid_graph_max_fanout = DEFAULT_CENTROID_GRAPH_MAX_FANOUT;
         }
+        // Parity gap: a fraction in [0, 1). A negative gap is meaningless and a
+        // gap at/above the floor would drive the acceptance bar to ~0 and engage
+        // the router on any nonzero recall — reset either to the default.
+        if !(0.0..1.0).contains(&v.centroid_graph_parity_gap) {
+            tracing::warn!(
+                default = DEFAULT_CENTROID_GRAPH_PARITY_GAP,
+                got = v.centroid_graph_parity_gap,
+                "vector.centroid_graph_parity_gap must be in [0, 1); falling back to the default"
+            );
+            v.centroid_graph_parity_gap = DEFAULT_CENTROID_GRAPH_PARITY_GAP;
+        }
     }
 
     /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
@@ -1256,6 +1806,13 @@ impl Config {
     /// load time so a bad config fails fast with a clear message instead of
     /// panicking or misbehaving at query time.
     fn validate(&self) -> Result<(), ConfigError> {
+        // Create scratch root directory if it doesn't exist
+        if let Some(path) = self.storage.scratch_root.as_deref() {
+            fs::create_dir_all(path).map_err(|e| {
+                ConfigError::Invalid(format!("storage.scratch_root {}: {e}", path.display()))
+            })?;
+        }
+
         let v = &self.vector;
         // The calibrator's ef grid starts at the smallest [`HNSW_EF_CANDIDATES`]
         // entry (128). A ceiling below that filters the grid to empty, so the
@@ -1277,6 +1834,12 @@ impl Config {
             return Err(ConfigError::Invalid(format!(
                 "vector.target_recall must be in (0.0, 1.0], got {}",
                 v.target_recall
+            )));
+        }
+        if v.admit_extension_mult < 1 {
+            return Err(ConfigError::Invalid(format!(
+                "vector.admit_extension_mult ({}) must be >= 1 (1 = width-only)",
+                v.admit_extension_mult
             )));
         }
         for (name, floor) in [
@@ -1398,6 +1961,43 @@ mod tests {
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
     }
 
+    /// Drain graph-assign ships on, and the kill-switch parses to `false`.
+    #[test]
+    fn drain_graph_assign_defaults_on_and_toggles() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert!(
+            cfg.vector.drain_graph_assign,
+            "graph-routed drain assign is the shipped default"
+        );
+        let off = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({ "vector": { "drain_graph_assign": false } })),
+        ))
+        .expect("kill-switch config loads");
+        assert!(
+            !off.vector.drain_graph_assign,
+            "drain_graph_assign: false must reach the exact path"
+        );
+    }
+
+    /// Fine-centroid drain placement ships on, and the isolation switch parses
+    /// to `false` (the coarse arm of a placement A/B).
+    #[test]
+    fn global_fine_drain_placement_defaults_on_and_toggles() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert!(
+            cfg.vector.global_fine_drain_placement,
+            "fine-centroid drain placement is the shipped default"
+        );
+        let off = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({ "vector": { "global_fine_drain_placement": false } })),
+        ))
+        .expect("isolation-switch config loads");
+        assert!(
+            !off.vector.global_fine_drain_placement,
+            "global_fine_drain_placement: false must force coarse cell-centroid placement"
+        );
+    }
+
     /// A retired key must FAIL the load, not be quietly dropped.
     ///
     /// Nothing in the deserializer objects to an unknown key — no
@@ -1496,7 +2096,7 @@ mod tests {
     }
 
     /// The `ivf_router = auto` thresholds default to the documented values and
-    /// round-trip through a yaml/json override; the default router is unchanged.
+    /// round-trip through a yaml/json override; the default router is `auto`.
     #[test]
     fn centroid_graph_auto_thresholds_default_and_override() {
         let cfg = Config::defaults().expect("defaults parse");
@@ -1504,22 +2104,22 @@ mod tests {
         assert_eq!(cfg.vector.centroid_graph_scale_floor_docs, 10_000_000);
         assert_eq!(
             cfg.vector.ivf_router,
-            IvfRouter::Stamped,
-            "the default router stays stamped"
+            IvfRouter::Auto,
+            "the default router is auto"
         );
 
         let overridden =
             Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
                 Serialized::defaults(json!({
                     "vector": {
-                        "ivf_router": "auto",
+                        "ivf_router": "stamped",
                         "centroid_graph_concentration_ratio": 0.25,
                         "centroid_graph_scale_floor_docs": 5_000_000
                     }
                 })),
             ))
             .expect("auto thresholds parse");
-        assert_eq!(overridden.vector.ivf_router, IvfRouter::Auto);
+        assert_eq!(overridden.vector.ivf_router, IvfRouter::Stamped);
         assert_eq!(overridden.vector.centroid_graph_concentration_ratio, 0.25);
         assert_eq!(overridden.vector.centroid_graph_scale_floor_docs, 5_000_000);
     }
@@ -1762,6 +2362,17 @@ storage:
     }
 
     #[test]
+    fn process_limit_defaults_to_unset_and_parses_a_value() {
+        // Unset means "take it from the cgroup", not "no limit".
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.process_limit_bytes, None);
+        let yaml = "memory:\n  process_limit_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.memory.process_limit_bytes, Some(1000));
+    }
+
+    #[test]
     fn thread_count_parses_auto_string() {
         let yaml = r#"
 commit_threshold_size_mb: 1024
@@ -1960,6 +2571,160 @@ supertable:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Auto);
     }
 
+    /// What a deployment that says nothing gets. The shipped file leaves the
+    /// key commented out, so this is the engine's own default arriving
+    /// through the loader rather than the file echoing itself back.
+    #[test]
+    fn the_shipped_default_is_auto() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.supertable.crc_policy(), CrcVerification::Auto);
+    }
+
+    /// Where each policy verifies. The two questions are independent, and
+    /// `Auto` is the only value that answers them differently: it is the
+    /// whole of what "verify when bytes move, not when they are read" means.
+    #[test]
+    fn each_policy_decides_where_it_verifies() {
+        let cases = [
+            (CrcVerification::Always, true, true),
+            (CrcVerification::Auto, false, true),
+            (CrcVerification::Never, false, false),
+        ];
+        for (policy, on_open, on_landing) in cases {
+            assert_eq!(policy.verifies_on_open(), on_open, "{policy:?} at an open");
+            assert_eq!(
+                policy.verifies_on_landing(),
+                on_landing,
+                "{policy:?} when bytes land"
+            );
+        }
+    }
+
+    /// `Never` means never, at either boundary. Worth its own assertion
+    /// because the landing check was added after the open check, and an
+    /// operator who turned verification off must not have it reappear
+    /// somewhere new.
+    #[test]
+    fn never_verifies_at_neither_boundary() {
+        assert!(!CrcVerification::Never.verifies_on_open());
+        assert!(!CrcVerification::Never.verifies_on_landing());
+    }
+
+    /// A configuration naming neither field gets the default policy. This is
+    /// the case every existing deployment without an opinion lands in.
+    #[test]
+    fn naming_neither_field_gives_the_default() {
+        let settings = SupertableSettings::default();
+        assert_eq!(settings.verify_crc_on_open, None);
+        assert_eq!(settings.crc_verification, None);
+        // Named, not compared against the constant: a test that reads the
+        // constant back cannot notice the constant changing, which is the
+        // one thing worth noticing here.
+        assert_eq!(settings.crc_policy(), CrcVerification::Auto);
+    }
+
+    /// A user file naming only the deprecated boolean, layered over the
+    /// shipped defaults the way a real deployment loads.
+    ///
+    /// This is the shape that matters, and the one a `Serialized` built from
+    /// scratch cannot reproduce: whatever the shipped file sets is already
+    /// present underneath, so a test that hands the loader a bare map proves
+    /// nothing about what an operator's own config does.
+    #[test]
+    fn a_user_file_naming_only_the_deprecated_boolean_is_honoured() {
+        for (set, expected) in [
+            (true, CrcVerification::Always),
+            (false, CrcVerification::Never),
+        ] {
+            let user_file = format!("supertable:\n  verify_crc_on_open: {set}\n");
+            let cfg = Config::from_figment(
+                Figment::new()
+                    .merge(Yaml::string(EMBEDDED_DEFAULT))
+                    .merge(Yaml::string(&user_file)),
+            )
+            .expect("a config naming only the deprecated field loads");
+            assert_eq!(
+                cfg.supertable.crc_policy(),
+                expected,
+                "verify_crc_on_open: {set} in a user file must still mean {expected:?}"
+            );
+        }
+    }
+
+    /// The deprecated boolean still decides the policy when it is the only
+    /// thing set. The loader drops unknown fields silently, so dropping this
+    /// field instead of honouring it would turn an operator's explicit choice
+    /// into a default without any diagnostic.
+    ///
+    /// Nothing here sets `crc_verification`, not even to null: setting it is
+    /// what hid this path in the first place, and a test that does it grades
+    /// a configuration no operator writes.
+    #[test]
+    fn the_deprecated_boolean_is_still_honoured() {
+        for (set, expected) in [
+            (true, CrcVerification::Always),
+            (false, CrcVerification::Never),
+        ] {
+            let cfg =
+                Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                    Serialized::defaults(json!({
+                        "supertable": { "verify_crc_on_open": set }
+                    })),
+                ))
+                .expect("config with the deprecated field loads");
+            assert_eq!(
+                cfg.supertable.crc_policy(),
+                expected,
+                "verify_crc_on_open: {set} must still mean {expected:?}"
+            );
+        }
+    }
+
+    /// With both set the current field wins, so a deployment can adopt the
+    /// new name without first deleting the old one.
+    #[test]
+    fn the_current_field_beats_the_deprecated_one() {
+        let cfg = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({
+                "supertable": { "verify_crc_on_open": true, "crc_verification": "never" }
+            })),
+        ))
+        .expect("config naming both loads");
+        assert_eq!(cfg.supertable.crc_policy(), CrcVerification::Never);
+    }
+
+    /// Every value parses from the spelling the configuration file uses.
+    #[test]
+    fn every_policy_parses_from_yaml() {
+        for (text, expected) in [
+            ("auto", CrcVerification::Auto),
+            ("always", CrcVerification::Always),
+            ("never", CrcVerification::Never),
+        ] {
+            let cfg =
+                Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+                    Serialized::defaults(json!({
+                        "supertable": { "crc_verification": text }
+                    })),
+                ))
+                .unwrap_or_else(|e| panic!("crc_verification: {text} must parse: {e}"));
+            assert_eq!(cfg.supertable.crc_policy(), expected);
+        }
+    }
+
+    /// What each policy decides at an open. Pinned per value rather than
+    /// left to the call sites, so moving any of them is a visible edit to a
+    /// test that states the answer rather than an incidental change.
+    #[test]
+    fn each_policy_decides_whether_an_open_verifies() {
+        assert!(CrcVerification::Always.verifies_on_open());
+        assert!(!CrcVerification::Never.verifies_on_open());
+        assert!(
+            !CrcVerification::Auto.verifies_on_open(),
+            "auto verifies where bytes arrive, so an open verifies nothing"
+        );
+    }
+
     #[test]
     fn embedded_default_diagnostics_all_off() {
         let cfg = Config::defaults().expect("embedded default must parse");
@@ -1991,5 +2756,66 @@ vector:
         assert_eq!(cfg.vector.drain_read_concurrency, ThreadCount::Fixed(12));
         // Untouched keys fall through to the embedded default.
         assert_eq!(cfg.vector.drain_batch_superfiles, 64);
+    }
+
+    /// An arbitrary per-merge input cap. The figure carries no meaning: the
+    /// test below asserts the derived width is INDEPENDENT of it.
+    const ANY_BUDGET_MB: u64 = 3072;
+
+    /// The derived width is a CPU ceiling, not a memory one.
+    ///
+    /// The memory bound belongs to the compaction runner, which admits merges
+    /// only while the host reports free memory. Deriving it here could only
+    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// rarely approach — so the width caps at the pool and nothing else.
+    #[test]
+    fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
+        let cfg = Config::default();
+        let derived = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB,
+            ..CompactionSettings::default()
+        });
+        // Never zero, whatever the host — a zero would stall the merge loop.
+        assert!(derived >= 1, "width must be at least one");
+        // Crucially it does NOT scale with the memory budget: a four-fold
+        // budget is the same width, because memory is judged downstream.
+        let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
+            max_memory_mb: ANY_BUDGET_MB * 4,
+            ..CompactionSettings::default()
+        });
+        assert_eq!(
+            derived, wide_budget,
+            "the config layer must not size width off the budget cap"
+        );
+    }
+
+    /// An explicit setting is honored as written, in both directions.
+    ///
+    /// Deliberately unclamped: the merges in flight never exceed the jobs the
+    /// pass planned, memory narrows it wherever the host reports any, and
+    /// input opens ride a process-wide semaphore. A ceiling here would only
+    /// second-guess an operator who asked for something specific.
+    #[test]
+    fn an_explicit_width_is_honored_as_written() {
+        let cfg = Config::default();
+        let serial = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(1),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(serial, 1, "an explicit 1 must stay serial");
+        /// Wider than any pool this would run on, to prove nothing trims it.
+        const VERY_WIDE: usize = 4096;
+        let wide = cfg.compaction_concurrency(&CompactionSettings {
+            max_concurrent_jobs: Some(VERY_WIDE),
+            ..CompactionSettings::default()
+        });
+        assert_eq!(wide, VERY_WIDE, "an explicit width must not be trimmed");
+    }
+
+    /// The shipped default derives the width rather than forcing one: a serial
+    /// pass was measured holding a 44-core box at a load average of 1.16.
+    #[test]
+    fn the_default_width_is_derived() {
+        assert_eq!(CompactionSettings::default().max_concurrent_jobs, None);
     }
 }

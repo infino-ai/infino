@@ -65,7 +65,7 @@
 use std::{
     env,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -79,8 +79,8 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
-    VectorSearchOptions,
-    config::OptimizeOptions,
+    Bm25SearchOptions, CompactionSettings, GcSettings, VectorSearchOptions,
+    config::{DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
     superfile::{
         builder::{FtsConfig, VectorConfig},
         vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -92,8 +92,8 @@ use infino::{
     test_helpers::{build_title_batch, default_supertable_options},
 };
 
-const ENV_DIR: &str = "INFINO_M12_CRASH_DIR";
-const ENV_KILL_POINT: &str = "INFINO_M12_CRASH_KILL_POINT";
+const ENV_DIR: &str = "INFINO_COMMIT_CRASH_DIR";
+const ENV_KILL_POINT: &str = "INFINO_COMMIT_CRASH_KILL_POINT";
 
 /// One named kill point. The child reads the env var and
 /// configures the `CrashStorage` to match.
@@ -102,6 +102,11 @@ const KP_LIST_FIRST: &str = "list-1";
 const KP_SEG_SECOND: &str = "seg-2";
 const KP_LIST_SECOND: &str = "list-2";
 const KP_POINTER_SECOND: &str = "pointer-2";
+/// A commit that adds a column: crash on its superfile PUT, before the
+/// list and pointer that would publish the schema naming it.
+const KP_SCHEMA_SEG: &str = "schema-seg";
+/// The same commit, crashing after its pointer lands: both halves durable.
+const KP_SCHEMA_POINTER: &str = "schema-pointer";
 
 /// Hidden vector-index kill points: crash inside the batched cell-split's
 /// window (child superfile upload → hidden list PUT → hidden pointer CAS).
@@ -121,6 +126,23 @@ const KP_HIDDEN_REPACK_SEG: &str = "hidden-repack-seg";
 /// Multi-batch variant: two sequential single-cell batches; crash inside
 /// batch 2's window, after batch 1's commit is durable.
 const KP_HIDDEN_SPLIT_SECOND_LIST: &str = "hidden-split-second-list";
+
+/// Compaction kill point: crash on the first superfile PUT a compaction
+/// batch's commit issues, i.e. with every input of the batch sealed, every
+/// merge finished, and the manifest pointer not yet moved. This is the
+/// window concurrent jobs widen -- one dead compactor now holds several
+/// sealed input sets and leaves several staged outputs behind.
+const KP_COMPACT_BATCH_SUPERFILE: &str = "compact-batch-superfile";
+/// Superfiles the compaction-crash fixture commits. Enough that the packer
+/// fills more than one job from them, so the crash really lands mid-batch.
+const COMPACT_CRASH_SUPERFILES: usize = 32;
+/// Rows per commit in that fixture: `build_title_batch` appended this many
+/// times, so each superfile is large enough that a handful fill a 1 MiB job.
+const COMPACT_CRASH_APPENDS: usize = 4096;
+/// Titles per append, so each superfile holds `APPENDS * 2` docs.
+const COMPACT_CRASH_TITLES: usize = 2;
+/// Merges the crashing pass keeps in flight.
+const COMPACT_CRASH_CONCURRENCY: usize = 2;
 
 /// Vector-commit kill point: crash on a USER-table superfile PUT issued by
 /// the pipelined publish, i.e. while the remaining shards of the same
@@ -239,6 +261,15 @@ impl StorageProvider for CrashStorage {
         let armed_at_start = self.armed.load(Ordering::SeqCst);
         let is_match = self.uri_matches(uri);
         let result = self.inner.put_atomic(uri, bytes).await;
+        self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
+        result
+    }
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        // Armed the same way as `put_atomic`: the superfile write goes
+        // through here now, and the crash contract covers it.
+        let armed_at_start = self.armed.load(Ordering::SeqCst);
+        let is_match = self.uri_matches(uri);
+        let result = self.inner.put_overwrite(uri, bytes).await;
         self.maybe_abort(uri, armed_at_start, is_match, result.is_ok());
         result
     }
@@ -468,6 +499,79 @@ fn run_vector_commit_crash_child(dir: PathBuf) -> ! {
     std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
 }
 
+/// Compaction settings for the batch-crash fixture: a 1 MiB target and a
+/// 1% fill floor so the tiny-ish superfiles are candidates, and more than one
+/// merge in flight so the crash interrupts a batch rather than a single job.
+/// `stale_seal_timeout_ms` is the caller's, because the child wants live
+/// seals and the recovering parent wants them stale.
+fn compact_crash_settings(stale_seal_timeout_ms: u64) -> CompactionSettings {
+    CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        max_concurrent_jobs: Some(COMPACT_CRASH_CONCURRENCY),
+        stale_seal_timeout_ms,
+        ..CompactionSettings::default()
+    }
+}
+
+/// Commit a table fragmented enough to plan several merge jobs, then abort
+/// inside the first batch's commit.
+fn run_compact_batch_crash_child(dir: PathBuf) -> ! {
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    // Disarmed: the fixture's own superfile PUTs must not shift the count.
+    let wrapped = Arc::new(CrashStorage::new_contains_disarmed(
+        local,
+        "data/",
+        1,
+        KP_COMPACT_BATCH_SUPERFILE,
+    ));
+    let storage: Arc<dyn StorageProvider> = Arc::<CrashStorage>::clone(&wrapped);
+    let st =
+        Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+
+    for i in 0..COMPACT_CRASH_SUPERFILES {
+        let titles: Vec<String> = (0..COMPACT_CRASH_TITLES)
+            .map(|t| format!("superfile {i} title {t}"))
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let batch = build_title_batch(&refs);
+        let mut w = st.writer().expect("writer");
+        for _ in 0..COMPACT_CRASH_APPENDS {
+            w.append(&batch).expect("append");
+        }
+        w.commit().expect("commit");
+    }
+
+    wrapped.arm();
+    let _ = st.optimize(&OptimizeOptions::compact(compact_crash_settings(
+        DEFAULT_STALE_SEAL_TIMEOUT_MS,
+    )));
+
+    eprintln!(
+        "CRASH-CHILD: compaction returned without aborting (kill_point={KP_COMPACT_BATCH_SUPERFILE}) — \
+         test configuration is wrong"
+    );
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
+}
+
+/// Every object under the table's superfile prefix, orphans included.
+fn data_objects(dir: &Path) -> usize {
+    let data = dir.join("data");
+    fn count(path: &Path) -> usize {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|e| match e.path().is_dir() {
+                true => count(&e.path()),
+                false => 1,
+            })
+            .sum()
+    }
+    count(&data)
+}
+
 /// Child path: build a Supertable on `CrashStorage` and run
 /// up to `n_commits` commits. The wrapper triggers
 /// `std::process::abort()` mid-flight in the last commit
@@ -551,6 +655,12 @@ fn dispatch_child_if_set() -> Option<()> {
         }
         if kp == KP_VECTOR_COMMIT_SEG {
             run_vector_commit_crash_child(PathBuf::from(dir));
+        }
+        if kp == KP_COMPACT_BATCH_SUPERFILE {
+            run_compact_batch_crash_child(PathBuf::from(dir));
+        }
+        if kp == KP_SCHEMA_SEG || kp == KP_SCHEMA_POINTER {
+            run_schema_commit_crash_child(PathBuf::from(dir), &kp);
         }
         run_crash_child(PathBuf::from(dir), &kp);
     }
@@ -1007,4 +1117,251 @@ fn crash_post_pointer_on_second_commit_yields_v2() {
         2,
         "v2 sees both commits' superfiles"
     );
+}
+
+/// Crash inside a CONCURRENT compaction batch's commit: several input sets
+/// sealed, several merges finished, one staged output on storage, and the
+/// manifest pointer never moved.
+///
+/// The batch is all-or-nothing, so the table must come back exactly as it
+/// was. What the crash does leave behind is the concurrency-specific
+/// residue: seals on every input the dead batch claimed, and staged outputs
+/// nothing references. A later optimize must take over those seals once they
+/// go stale and finish the work, and the sweep must reclaim the orphans.
+#[test]
+fn crash_mid_compaction_batch_recovers_and_reclaims_the_orphans() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_mid_compaction_batch_recovers_and_reclaims_the_orphans",
+        KP_COMPACT_BATCH_SUPERFILE,
+    );
+
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(&dir).expect("provider"));
+    let recovered = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("open recovers the table after a crashed compaction batch");
+
+    let expected_docs =
+        (COMPACT_CRASH_SUPERFILES * COMPACT_CRASH_APPENDS * COMPACT_CRASH_TITLES) as u64;
+    let listed = recovered
+        .reader()
+        .expect("reader")
+        .manifest()
+        .get_all_superfiles()
+        .len();
+    assert_eq!(
+        listed, COMPACT_CRASH_SUPERFILES,
+        "the batch never committed, so every input must still be listed"
+    );
+    assert_eq!(
+        recovered.reader().expect("reader").n_docs_total(),
+        expected_docs,
+        "a crashed batch must not cost the table a single doc"
+    );
+
+    // The dead batch staged at least one merged superfile nothing references.
+    let staged = data_objects(&dir);
+    assert!(
+        staged > listed,
+        "the crash must have left a staged output behind: {staged} objects for {listed} superfiles"
+    );
+
+    // Recovery: the dead compactor's seals are treated as stale, so this pass
+    // takes over its inputs instead of skipping them.
+    recovered
+        .optimize(
+            &OptimizeOptions::compact(compact_crash_settings(0))
+                .with_gc(GcSettings::default().with_safety_gap(Duration::ZERO)),
+        )
+        .expect("a later optimize takes over the stale seals");
+
+    let after = recovered
+        .reader()
+        .expect("reader")
+        .manifest()
+        .get_all_superfiles()
+        .len();
+    assert!(
+        after < COMPACT_CRASH_SUPERFILES,
+        "the recovery pass must have merged the inputs the dead batch had sealed, \
+         still {after} superfiles"
+    );
+    assert_eq!(
+        recovered.reader().expect("reader").n_docs_total(),
+        expected_docs,
+        "recovery must preserve every doc"
+    );
+
+    // And the orphans the crash left are gone: nothing on storage beyond what
+    // the manifest lists.
+    recovered.gc(Duration::ZERO).expect("sweep");
+    assert_eq!(
+        data_objects(&dir),
+        after,
+        "every object the crashed batch staged must have been reclaimed"
+    );
+}
+
+/// A commit that adds a column publishes the new schema and the rows that
+/// introduced it in one manifest list, so a crash leaves both or neither.
+///
+/// The second commit below carries a `score` the table has never had:
+/// `union_schema` adds it, and the superfile holding its values and the
+/// schema naming it land under one pointer. The two outcomes a reader may
+/// see are "no `score` column and no row carrying one" and "both"; a schema
+/// that names a column no file holds, or a file holding values under a
+/// column the schema has retired, is the state this pins against.
+fn run_schema_commit_crash_child(dir: PathBuf, kill_point: &str) -> ! {
+    let (prefix, nth, _) = schema_kill_point_config(kill_point);
+    let local = LocalFsStorageProvider::new(&dir).expect("local fs provider");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(CrashStorage::new(local, prefix, nth, kill_point));
+
+    let st = Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+
+    // Commit one: titles only, so the schema stays where `create` left it.
+    // Scoped, because the table takes one writer at a time and a shadowed
+    // binding lives to the end of the function.
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["first commit alpha"]))
+            .expect("append");
+        w.commit().expect("the first commit lands");
+    }
+
+    // Commit two: a column the table has never seen, so this one commit
+    // carries both the rows and the schema that names them.
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&title_and_score_batch(
+            "second commit beta",
+            SCHEMA_CRASH_SCORE,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
+    eprintln!(
+        "CRASH-CHILD: the schema commit completed without aborting \
+         (kill_point={kill_point}) — test configuration is wrong"
+    );
+    std::process::exit(MISCONFIGURED_KILL_POINT_EXIT_CODE);
+}
+
+/// The value the crashing commit writes into the column it adds, so the
+/// parent can tell the row apart from the first commit's.
+const SCHEMA_CRASH_SCORE: i64 = 42;
+
+/// `(trigger_prefix, nth_match)` for the schema-commit kill points. The
+/// counts follow [`kill_point_config`]: `create` writes the first
+/// `manifest/` and `_supertable/current` objects and no `data/` object, and
+/// the first commit writes one of each.
+fn schema_kill_point_config(kp: &str) -> (&'static str, usize, usize) {
+    match kp {
+        KP_SCHEMA_SEG => ("data/", 2, 2),
+        KP_SCHEMA_POINTER => ("_supertable/current", 3, 2),
+        other => panic!("unknown schema kill point {other}"),
+    }
+}
+
+/// A batch carrying `title` and a `score` the fixture schema does not have.
+fn title_and_score_batch(title: &str, score: i64) -> arrow_array::RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("score", DataType::Int64, true),
+    ]));
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::LargeStringArray::from(vec![title])),
+            Arc::new(arrow_array::Int64Array::from(vec![score])),
+        ],
+    )
+    .expect("batch shape matches its schema")
+}
+
+/// Reopen after a schema-commit crash and assert the one invariant: the
+/// column and the row that introduced it are both there or both absent.
+fn verify_schema_commit_crash(dir: &PathBuf, expect_landed: bool) {
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir).expect("provider"));
+    let recovered = Supertable::open(default_supertable_options().with_storage(storage))
+        .expect("open recovers the table");
+
+    let has_column = recovered
+        .schema()
+        .fields()
+        .iter()
+        .any(|f| f.name() == "score");
+    assert_eq!(
+        has_column,
+        expect_landed,
+        "the schema names `score` only when the commit that added it landed \
+         (manifest_id={}, fields={:?})",
+        recovered.manifest_id(),
+        recovered
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The first commit is durable either way: a crash in the second must
+    // not cost rows the first already published.
+    let reader = recovered.reader().expect("reader");
+    let rows_of = |term: &str| -> Vec<arrow_array::RecordBatch> {
+        reader
+            .bm25_search(
+                "title",
+                term,
+                SCHEMA_CRASH_TOP_K,
+                Bm25SearchOptions::new(),
+                None,
+            )
+            .expect("fts")
+    };
+    let count = |batches: &[arrow_array::RecordBatch]| -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    };
+    assert_eq!(
+        count(&rows_of("alpha")),
+        1,
+        "the first commit survives the second's crash"
+    );
+    assert_eq!(
+        count(&rows_of("beta")),
+        usize::from(expect_landed),
+        "the row carrying `score` is visible exactly when the column is"
+    );
+}
+
+/// Enough to retrieve either planted row; the fixture holds two.
+const SCHEMA_CRASH_TOP_K: usize = 10;
+
+#[test]
+fn crash_before_the_schema_commits_leaves_neither_column_nor_row() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_before_the_schema_commits_leaves_neither_column_nor_row",
+        KP_SCHEMA_SEG,
+    );
+    verify_schema_commit_crash(&dir, false);
+}
+
+#[test]
+fn crash_after_the_schema_commits_leaves_both_column_and_row() {
+    if dispatch_child_if_set().is_some() {
+        return;
+    }
+    let dir = spawn_crash_child(
+        "crash_after_the_schema_commits_leaves_both_column_and_row",
+        KP_SCHEMA_POINTER,
+    );
+    verify_schema_commit_crash(&dir, true);
 }

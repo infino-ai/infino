@@ -36,6 +36,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
     supertable::{
         SuperfileUri,
@@ -91,6 +92,10 @@ impl StorageProvider for CountingProxy {
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         self.inner.put_atomic(uri, bytes).await
+    }
+
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
     }
     async fn put_if_match(
         &self,
@@ -171,7 +176,7 @@ fn fresh_cache(
         mmap_cold_threshold_secs: 0,
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
-        verify_crc_on_open: true,
+        crc_verification: CrcVerification::Always,
         ..Default::default()
     };
     let store = DiskCacheStore::new_unpinned(storage, cfg).expect("store");

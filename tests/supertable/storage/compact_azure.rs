@@ -72,7 +72,7 @@ use infino::{
     },
     superfile::{
         builder::{FtsConfig, VectorConfig},
-        fts::reader::{Bm25Stats, BoolMode},
+        fts::reader::BoolMode,
         vector::{distance::Metric, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -291,9 +291,7 @@ fn run_bm25_queries(st: &Supertable) -> Vec<Vec<i128>> {
                     "title",
                     q,
                     BM25_K,
-                    Bm25SearchOptions::new()
-                        .with_mode(BoolMode::Or)
-                        .with_stats(Bm25Stats::Global),
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
                     None,
                 )
                 .unwrap_or_else(|e| panic!("bm25_search({q:?}) failed: {e}"));

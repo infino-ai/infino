@@ -507,9 +507,7 @@ async fn supertable_real_azure_round_trip() {
                 "title",
                 "alpha",
                 10,
-                Bm25SearchOptions::new()
-                    .with_mode(infino::superfile::fts::reader::BoolMode::Or)
-                    .with_stats(infino::Bm25Stats::Global),
+                Bm25SearchOptions::new().with_mode(infino::superfile::fts::reader::BoolMode::Or),
                 None,
             )
             .map_err(|e| format!("cold BM25 over real Azure: {e}"))?;
@@ -654,6 +652,9 @@ impl StorageProvider for CountingStorage {
         self.inner.put_atomic(uri, bytes).await
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(uri, bytes).await
+    }
     async fn put_if_match(
         &self,
         uri: &str,

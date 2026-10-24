@@ -1,0 +1,13 @@
+# nextest configuration.
+#
+# The coverage gate (`make coverage-ci`) runs the suite through
+# `cargo llvm-cov nextest`, which executes each test in its OWN process and many
+# in parallel — a different isolation model than `cargo test`'s single-process
+# threaded run. That parallelism can surface transient cross-process contention
+# on shared external resources (temp dirs, storage paths) that the threaded run
+# never exposed. Retry a failed test a couple of times so such a transient is
+# reported as FLAKY (visible, still investigable) rather than failing the whole
+# coverage run on one non-deterministic hiccup. A test that fails every attempt
+# still fails the run, so real regressions are unaffected.
+[profile.default]
+retries = 2

@@ -398,6 +398,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         ws.create(&wal_doc).await.expect("seed");
         let owner = SupertableHandleId(0xC0DE);
@@ -442,6 +443,7 @@ mod tests {
                 outcome: TombstoneOutcome::Tombstoned,
                 tombstoned_in_superfile: Some(Uuid::from_u128(0xCAFE)),
             }],
+            schema_id: None,
         };
         // ensure doc_id 1 doesn't collide if we re-run
         wal_doc.predicate_repr = "noop".into();
@@ -491,6 +493,7 @@ mod tests {
                 outcome: TombstoneOutcome::Pending,
                 tombstoned_in_superfile: None,
             }],
+            schema_id: None,
         };
         ws.create(&wal_doc).await.expect("seed");
         let report = scan_and_recover(&st, SupertableHandleId(0xBEEF), Duration::from_secs(30))

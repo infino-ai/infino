@@ -23,9 +23,11 @@ use arrow_array::{LargeStringArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
 use infino::{
+    config::CrcVerification,
     superfile::{
-        SuperfileReader,
+        OpenOptions, SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        format::fts::VERSION_CURRENT,
         vector::distance::normalize,
     },
     test_helpers::{decimal128_ids, default_vector_config},
@@ -36,8 +38,11 @@ const ID_DECIMAL_PRECISION: u8 = 38;
 const ID_DECIMAL_SCALE: i8 = 0;
 /// Random-rotation seed for the corruptable superfile's vector index.
 const CRC_TEST_ROT_SEED: u64 = 31;
-/// Doc count for the small corruptable superfile.
-const CRC_TEST_N_DOCS: u32 = 12;
+/// Doc count for the small corruptable superfile. Past one posting
+/// block, so the terms every doc shares take the long form (header, skip
+/// table, blocks) these tests aim their flips at; a single-block term is
+/// written in the short form instead.
+const CRC_TEST_N_DOCS: u32 = 140;
 /// Embedding dimension (matches `default_vector_config`'s dim).
 const CRC_TEST_EMB_DIM: usize = 16;
 /// Secondary one-hot axis weight planted in each doc vector.
@@ -48,8 +53,8 @@ const CRC_TEST_SECONDARY_AXIS_OFFSET: usize = 3;
 const CORRUPTION_FLIP_MASK: u8 = 0xFF;
 
 /// Positional variant of the corruptable superfile: same corpus, the
-/// FTS column records token positions, so the blob is v3 and carries a
-/// CRC-protected positions region (plus the position sub-index).
+/// FTS column records token positions, so the blob carries a non-empty,
+/// CRC-protected positions region.
 fn build_corruptable_positional_superfile() -> Vec<u8> {
     let schema = Arc::new(Schema::new(vec![
         Field::new(
@@ -135,6 +140,20 @@ fn locate_blobs(bytes: &[u8]) -> ((usize, usize), (usize, usize)) {
 
 /// Flip a single byte in the buffer (XOR with 0xFF) and try to reopen
 /// the superfile. Asserts that open returns Err.
+/// Offset of `postings_offset` within the FTS header.
+const FTS_POSTINGS_OFFSET: usize = 32;
+/// Offset of `doc_lengths_table_offset` within the FTS header.
+const FTS_DOC_LENGTHS_DIR_OFFSET: usize = 40;
+
+/// A `u64` header field, read relative to the FTS blob's start.
+fn header_u64(bytes: &[u8], fts_off: usize, field: usize) -> usize {
+    u64::from_le_bytes(
+        bytes[fts_off + field..fts_off + field + 8]
+            .try_into()
+            .expect("eight header bytes"),
+    ) as usize
+}
+
 fn assert_corruption_rejected(mut bytes: Vec<u8>, position: usize, label: &str) {
     bytes[position] ^= CORRUPTION_FLIP_MASK;
     let result = SuperfileReader::open(Bytes::from(bytes));
@@ -145,21 +164,20 @@ fn assert_corruption_rejected(mut bytes: Vec<u8>, position: usize, label: &str) 
 }
 
 #[test]
-fn corrupt_fts_fst_body_rejected() {
-    // Flip a byte well inside the FTS FST. The FST sits right after
-    // the 48-byte header, so byte (fts_off + 100) is firmly inside
-    // FST data — guaranteed to be CRC-protected.
+fn corrupt_fts_dict_body_rejected() {
+    // The term dictionary starts right after the 56-byte FTS header,
+    // so byte (fts_off + 100) lands in its CRC-protected body.
     let bytes = build_corruptable_superfile();
     let ((fts_off, _), _) = locate_blobs(&bytes);
     let target = fts_off + 100;
-    assert_corruption_rejected(bytes, target, "fts/fst body");
+    assert_corruption_rejected(bytes, target, "fts/dict body");
 }
 
 #[test]
 fn corrupt_fts_postings_region_rejected() {
-    // The postings region follows the FST. Read the FTS header at
-    // bytes [fts_off+32..+40] for postings_offset (relative to blob
-    // start). Flip a byte inside postings.
+    // The postings region follows the term dictionary. Read the FTS
+    // header at bytes [fts_off+32..+40] for postings_offset (relative
+    // to blob start). Flip a byte inside postings.
     let bytes = build_corruptable_superfile();
     let ((fts_off, _), _) = locate_blobs(&bytes);
     let postings_offset_rel = u64::from_le_bytes(
@@ -258,6 +276,128 @@ fn corrupt_parquet_trailing_magic_rejected() {
     assert_corruption_rejected(bytes, target, "parquet/trailing magic");
 }
 
+/// Each corruptible region, opened under each policy.
+///
+/// Both halves matter. `always` must still reject every region it rejects,
+/// or the strict mode has quietly stopped being strict; and `auto` must open
+/// every one of them, because it verifies where bytes arrive rather than
+/// where they are read, and a region it still scans is a cost being paid for
+/// nothing.
+///
+/// Every region is listed rather than one standing in for the rest: the
+/// checks are separate code paths behind one flag, and a flag that reaches
+/// some of them and not others would pass a single-region test. The
+/// doc-lengths directory is deliberately not among them; see the test below
+/// for why it behaves differently.
+#[test]
+fn always_rejects_every_region_that_auto_opens() {
+    /// A region to corrupt: a label, and where in the bytes it lives.
+    type Region = (&'static str, fn(&[u8]) -> usize);
+
+    let regions: [Region; 3] = [
+        ("fts/dict body", |b| locate_blobs(b).0.0 + 100),
+        ("fts/postings region", |b| {
+            let ((fts_off, _), _) = locate_blobs(b);
+            fts_off + header_u64(b, fts_off, FTS_POSTINGS_OFFSET) + 8
+        }),
+        ("fts/doc-lengths array", |b| {
+            let ((fts_off, fts_len), _) = locate_blobs(b);
+            fts_off + fts_len - 8
+        }),
+    ];
+
+    for (label, locate) in regions {
+        let clean = build_corruptable_superfile();
+        let target = locate(&clean);
+
+        let mut corrupt = clean.clone();
+        corrupt[target] ^= CORRUPTION_FLIP_MASK;
+
+        let strict = SuperfileReader::open_with(
+            Bytes::from(corrupt.clone()),
+            OpenOptions {
+                verify_crc: CrcVerification::Always.verifies_on_open(),
+            },
+        );
+        assert!(
+            strict.is_err(),
+            "always must still reject corruption at {label} (byte {target})"
+        );
+
+        let relaxed = SuperfileReader::open_with(
+            Bytes::from(corrupt),
+            OpenOptions {
+                verify_crc: CrcVerification::Auto.verifies_on_open(),
+            },
+        );
+        assert!(
+            relaxed.is_ok(),
+            "auto must open despite corruption at {label} (byte {target}); \
+             it verifies where bytes arrive, not here"
+        );
+    }
+}
+
+/// Corruption of a structural field is refused whatever the policy says,
+/// because it is not caught by a checksum at all.
+///
+/// The doc-lengths directory holds each column's absolute array offset. A
+/// flipped byte there makes the offset point outside the blob, and the open
+/// path's bounds checks reject it before any CRC is consulted. So `auto` is
+/// not blind: it gives up the checksums, not the structural validation.
+///
+/// That matters beyond the open itself, because the disk cache already acts
+/// on it: a cached copy that fails to open is unlinked and the read falls
+/// through to object storage for a clean one, which
+/// `unusable_cache_files_fall_through_to_source` covers. So under `auto` the
+/// structural check is not only the validation that remains, it is the one
+/// wired to a recovery rather than to an error.
+#[test]
+fn a_corrupt_structural_field_is_refused_under_every_policy() {
+    for policy in [
+        CrcVerification::Auto,
+        CrcVerification::Always,
+        CrcVerification::Never,
+    ] {
+        let mut bytes = build_corruptable_superfile();
+        let ((fts_off, _), _) = locate_blobs(&bytes);
+        let target = fts_off + header_u64(&bytes, fts_off, FTS_DOC_LENGTHS_DIR_OFFSET) + 8;
+        bytes[target] ^= CORRUPTION_FLIP_MASK;
+
+        let opened = SuperfileReader::open_with(
+            Bytes::from(bytes),
+            OpenOptions {
+                verify_crc: policy.verifies_on_open(),
+            },
+        );
+        assert!(
+            opened.is_err(),
+            "{policy:?} must refuse a corrupt doc-lengths directory: the \
+             offset it holds no longer addresses the blob"
+        );
+    }
+}
+
+/// A clean file opens under every policy. Guards the inverse of the test
+/// above: a strict mode that rejected healthy data would pass that one.
+#[test]
+fn a_clean_file_opens_under_every_policy() {
+    for policy in [
+        CrcVerification::Auto,
+        CrcVerification::Always,
+        CrcVerification::Never,
+    ] {
+        let bytes = build_corruptable_superfile();
+        let opened = SuperfileReader::open_with(
+            Bytes::from(bytes),
+            OpenOptions {
+                verify_crc: policy.verifies_on_open(),
+            },
+        );
+        assert!(opened.is_ok(), "{policy:?} must open an untouched file");
+    }
+}
+
 #[test]
 fn untouched_bytes_open_succeeds() {
     // Sanity baseline: the unmodified bytes do open. Catches a bug
@@ -300,7 +440,7 @@ fn corruption_at_random_interior_positions_rejected() {
 
 #[test]
 fn corrupt_fts_positions_region_rejected() {
-    // v4 blob: the positions-region offset lives at header bytes
+    // The positions-region offset lives at header bytes
     // [48..56] (relative to the blob). Flip a byte inside the region
     // body — the multi-doc terms guarantee it is non-empty.
     let bytes = build_corruptable_positional_superfile();
@@ -311,8 +451,8 @@ fn corrupt_fts_positions_region_rejected() {
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 5,
-        "positional superfile must embed a v5 FTS blob (coarse table; dense corpus ⇒ bitset blocks)"
+        version, VERSION_CURRENT,
+        "positional superfile must embed a current FTS blob (coarse table; dense corpus ⇒ bitset blocks)"
     );
     let positions_off_rel = u64::from_le_bytes(
         bytes[fts_off + 48..fts_off + 56]
@@ -334,47 +474,10 @@ fn corrupt_fts_positions_region_rejected() {
 
 #[test]
 fn uncorrupted_positional_superfile_opens() {
-    // Sanity twin of the corruption test: the same v4 bytes open
-    // cleanly when untouched.
+    // Sanity twin of the corruption test: the same bytes open cleanly
+    // when untouched.
     let bytes = build_corruptable_positional_superfile();
-    SuperfileReader::open(Bytes::from(bytes)).expect("clean v4 superfile opens");
-}
-
-#[test]
-fn corrupt_fts_position_subindex_rejected() {
-    // The v3 position run-offset sub-index is not a new CRC region — it
-    // rides inside each term's postings region, which is already
-    // CRC-protected. This pins that the new bytes are covered: land a flip
-    // squarely inside the first term's sub-index and confirm the reader
-    // rejects it at open.
-    //
-    // A v3 positional term's region is `[meta][skip table][sub-index]
-    // [blocks]`. The postings region holds only non-inline terms (inline
-    // df=1 terms live in the FST value), and the fixture's FTS column is
-    // positional, so its first postings term is a positional term whose
-    // sub-index begins right after its skip table.
-    let bytes = build_corruptable_positional_superfile();
-    let (fts_off, _) = locate_fts_blob_only(&bytes);
-    // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
-    let postings_offset_rel = u64::from_le_bytes(
-        bytes[fts_off + 32..fts_off + 40]
-            .try_into()
-            .expect("postings offset"),
-    ) as usize;
-    let term0 = fts_off + postings_offset_rel;
-    // Positional term header is 32 bytes; `num_blocks` is the u32 at its
-    // offset 16; each skip entry is 16 bytes. The sub-index starts right
-    // after the skip table.
-    const POSITIONAL_META: usize = 32;
-    const SKIP_ENTRY: usize = 16;
-    let num_blocks = u32::from_le_bytes(
-        bytes[term0 + 16..term0 + 20]
-            .try_into()
-            .expect("num_blocks"),
-    ) as usize;
-    assert!(num_blocks >= 1, "first postings term must have ≥1 block");
-    let subindex_start = term0 + POSITIONAL_META + num_blocks * SKIP_ENTRY;
-    assert_corruption_rejected(bytes, subindex_start + 1, "fts/position sub-index");
+    SuperfileReader::open(Bytes::from(bytes)).expect("clean superfile opens");
 }
 
 #[test]
@@ -382,19 +485,18 @@ fn corrupt_fts_bitset_block_rejected() {
     // The dense fixture (every doc shares the same terms) stores those common
     // terms' postings as BITSET blocks — a new on-disk shape. Those bytes ride
     // inside the already-CRC-protected postings region; this pins that a flip
-    // inside a bitset block's presence bitmap is caught at open, the bitset-block
-    // twin of `corrupt_fts_position_subindex_rejected`.
+    // inside a bitset block's presence bitmap is caught at open.
     let bytes = build_corruptable_superfile();
     let (fts_off, _) = locate_fts_blob_only(&bytes);
-    // Dense corpus ⇒ a v4 blob with at least one bitset block.
+    // Dense corpus ⇒ at least one bitset block.
     let version = u32::from_le_bytes(
         bytes[fts_off + 8..fts_off + 12]
             .try_into()
             .expect("version bytes"),
     );
     assert_eq!(
-        version, 5,
-        "dense corpus must embed a v5 FTS blob (coarse table; bitset blocks)"
+        version, VERSION_CURRENT,
+        "dense corpus must embed a current FTS blob (coarse table; bitset blocks)"
     );
     // postings_offset (relative to the blob) at FTS header bytes [+32..+40].
     let postings_offset_rel = u64::from_le_bytes(
@@ -403,33 +505,87 @@ fn corrupt_fts_bitset_block_rejected() {
             .expect("postings offset"),
     ) as usize;
     let term0 = fts_off + postings_offset_rel;
-    // A term is `[meta][skip table][blocks]`; the first block's offset *within
-    // the term* is recorded in skip entry 0's block-offset field, so read it
-    // directly instead of re-deriving the skip-table size. Non-positional term
-    // meta is 20 B (`TERM_META_SIZE`); a skip entry's block-offset u32 sits at
-    // its offset 4 (`BLOCK_OFFSET_OFF`).
+    // A term is `[meta][skip table][blocks]`. Skip entries carry block
+    // lengths, not offsets, so the first block starts right after the skip
+    // table: non-positional term meta is 20 B (`TERM_META_SIZE`), the block
+    // count sits at meta offset 16, and a positionless skip entry is 10 B.
     const TERM_META: usize = 20;
-    const SKIP_BLOCK_OFFSET_FIELD: usize = 4;
-    let block0_off_in_term = u32::from_le_bytes(
-        bytes[term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD
-            ..term0 + TERM_META + SKIP_BLOCK_OFFSET_FIELD + 4]
+    const NUM_BLOCKS_OFF: usize = 16;
+    const SKIP_ENTRY: usize = 10;
+    let num_blocks = u32::from_le_bytes(
+        bytes[term0 + NUM_BLOCKS_OFF..term0 + NUM_BLOCKS_OFF + 4]
             .try_into()
-            .expect("block offset"),
+            .expect("block count"),
     ) as usize;
-    let block0 = term0 + block0_off_in_term;
-    // Block header byte 3 is the encoding (`ENCODING_BITSET == 1`). Assert the
-    // first postings term's block really is a bitset — both a fixture sanity
-    // check and proof the flip below lands in a presence bitmap, not a PFOR block.
+    let block0 = term0 + TERM_META + num_blocks * SKIP_ENTRY;
+    // Header byte 3's low two bits are the encoding (`ENCODING_BITSET == 1`).
+    // Assert the first postings term's block really is a bitset — both a
+    // fixture sanity check and proof the flip below lands in a presence
+    // bitmap, not a PFOR block.
     const ENCODING_OFF: usize = 3;
+    const ENCODING_MASK: u8 = 0b11;
     const ENCODING_BITSET: u8 = 1;
-    const BLOCK_HEADER: usize = 8;
+    const BLOCK_HEADER: usize = 4;
     assert_eq!(
-        bytes[block0 + ENCODING_OFF],
+        bytes[block0 + ENCODING_OFF] & ENCODING_MASK,
         ENCODING_BITSET,
         "first postings term's block must be bitset-encoded on this dense corpus"
     );
-    // Flip a byte in the presence bitmap, just past the 8-byte block header.
+    // Flip a byte in the presence bitmap, just past the 4-byte block header.
     assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
+}
+
+#[test]
+fn corrupt_fts_short_term_body_rejected() {
+    // A single-block term is written in the short form — a header-less
+    // body in the postings region. It rides inside the region's CRC like
+    // every long-form term; pin that a flip inside such a body is caught
+    // at open. `alpha` is in every doc (long form, first in lex order);
+    // `pair` is in two docs (short form), so its body starts where
+    // `alpha`'s region ends — the length field at header offset 12.
+    let schema = Arc::new(Schema::new(vec![
+        Field::new(
+            "doc_id",
+            DataType::Decimal128(ID_DECIMAL_PRECISION, ID_DECIMAL_SCALE),
+            false,
+        ),
+        Field::new("title", DataType::LargeUtf8, false),
+    ]));
+    let opts = BuilderOptions::new(
+        schema.clone(),
+        "doc_id",
+        vec![FtsConfig::new("title")],
+        vec![],
+    );
+    let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+    let n = CRC_TEST_N_DOCS;
+    let ids = decimal128_ids(0..n as u64);
+    let titles = LargeStringArray::from(
+        (0..n)
+            .map(|i| if i < 2 { "alpha pair" } else { "alpha" })
+            .collect::<Vec<_>>(),
+    );
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(ids), Arc::new(titles)])
+        .expect("build RecordBatch");
+    b.add_batch(&batch, &[]).expect("add_batch");
+    let bytes = b.finish().expect("finish builder");
+    let (fts_off, _) = locate_fts_blob_only(&bytes);
+    let postings_offset_rel = u64::from_le_bytes(
+        bytes[fts_off + 32..fts_off + 40]
+            .try_into()
+            .expect("postings offset"),
+    ) as usize;
+    let term0 = fts_off + postings_offset_rel;
+    const POSTINGS_LENGTH_OFF: usize = 12;
+    let alpha_len = u32::from_le_bytes(
+        bytes[term0 + POSTINGS_LENGTH_OFF..term0 + POSTINGS_LENGTH_OFF + 4]
+            .try_into()
+            .expect("postings length"),
+    ) as usize;
+    let pair_body = term0 + alpha_len;
+    // The short body leads with its varint df: two docs.
+    assert_eq!(bytes[pair_body], 2, "short body must lead with df = 2");
+    assert_corruption_rejected(bytes, pair_body + 1, "fts/short-form term body");
 }
 
 /// FTS blob range only (the positional fixture has no vector blob, so

@@ -37,6 +37,12 @@
 //! so the module allows dead code rather than sprinkling per-item guards.
 #![allow(dead_code)]
 
+#[cfg(feature = "graph-index")]
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    mem::swap,
+};
 use std::{
     cmp::Reverse,
     collections::{BinaryHeap, HashSet},
@@ -49,9 +55,11 @@ use rayon::prelude::*;
 use crate::superfile::vector::{
     distance::{
         Metric, SQ4_CODE_MAX, SQ4_LOADING_SIGMAS, SQ4_RESIDUAL_CENTER, SQ4_RESIDUAL_DIVISOR,
-        SQ4_ROW_BLOCK, Sq4Kernel, Sq16Kernel, dequantize_sq16_into, distance, encode_sq16_row,
-        quantize_query_i8, sq8_walk_dot,
+        SQ4_ROW_BLOCK, Sq4Kernel, Sq16Kernel, dequantize_sq16_adaptive_into, dequantize_sq16_into,
+        distance, encode_sq16_adaptive_row, encode_sq16_row, quantize_query_i8, sq8_walk_dot,
+        sq16_adaptive_norm_sq,
     },
+    rerank_codec::SQ16_CODE_MAX,
     rotation::RandomRotation,
 };
 
@@ -124,18 +132,56 @@ impl Plane {
     }
 }
 
-/// Sq16 node scorer: one `u16` code per dimension on the fixed cosine
-/// grid, scored with the existing fused-dequant [`Sq16Kernel`] under the
-/// [`Metric::NegDot`] convention (`score = −dot`, so smaller is nearer).
+/// Single-`u16`-plane node scorer: one `u16` code per dimension, scored with
+/// the existing fused-dequant [`Sq16Kernel`]. It carries the column's [`Metric`]
+/// and one of two rulers, so [`Hnsw::build`] / [`Hnsw::search`] grade against
+/// the geometry the column was created with:
 ///
-/// The codes are stored row-major (`dim × 2` bytes per node) and scored
-/// straight from the code bytes — no per-candidate decode buffer.
+/// - **Fixed cosine grid** (`ruler == None`, `metric == NegDot`). The codes are
+///   the flat `[-1, 1]` Sq16 plane; scoring is `−dot`, smaller is nearer. This
+///   is the cosine data graph and the only ruler that existed before the
+///   metric-aware path — every existing constructor produces it, so cosine
+///   behaviour is byte-for-byte unchanged.
+/// - **Fitted global ruler** (`ruler == Some((scale, offset))`). The codes are a
+///   single `u16` plane quantized against ONE per-dim ruler fitted over the
+///   whole graph — the graph-wide counterpart of the IVF rerank path's
+///   per-cluster [`RerankCodec::Sq16Adaptive`](crate::superfile::vector::rerank_codec::RerankCodec::Sq16Adaptive).
+///   (A single ruler, not per-cluster: the plane is node-ordered across every
+///   cell with no cluster to key a ruler on — the same reason [`Sq4Scorer`] fits
+///   a global ruler. 16 bits keeps the intra-cluster resolution a global ruler
+///   spends elsewhere.) Scoring is the column's real `metric` (`L2Sq`/`NegDot`)
+///   via [`Sq16Kernel::new_adaptive`]; `norms` carries per-node `‖x̂‖²` for the
+///   `L2Sq` cross-term (empty for `NegDot`, where the norm cancels).
+///
+/// The codes are stored row-major (`dim × 2` bytes per node) and scored straight
+/// from the code bytes — no per-candidate decode buffer either way.
 pub(crate) struct Sq16Scorer {
     /// `len × dim × 2` little-endian `u16` codes, row-major — owned heap, or a
     /// zero-copy slice of the mapped graph bundle.
     codes: Plane,
     dim: usize,
     len: usize,
+    /// Distance the kernel ranks by. `NegDot` for the fixed cosine grid (its
+    /// `−dot` orders unit vectors the same as cosine); the column's own metric
+    /// for a fitted ruler.
+    metric: Metric,
+    /// `None` = the fixed `[-1, 1]` cosine grid; `Some` = a fitted global ruler.
+    /// Boxed so the cosine scorer — the overwhelming common case, and the one
+    /// embedded in the resident [`HnswIndex`] / `ResidentIndexKind` enum — pays
+    /// only a pointer, not the two ruler vectors plus the norm table inline.
+    adaptive: Option<Box<AdaptiveRuler>>,
+}
+
+/// The fitted-ruler data a metric-aware [`Sq16Scorer`] carries — absent for the
+/// fixed cosine grid.
+struct AdaptiveRuler {
+    /// Per-dim ruler: reconstruction is `x[d] = code[d]·scale[d] + offset[d]`
+    /// (vs the fixed grid's constants). Each `dim` long.
+    scale: Vec<f32>,
+    offset: Vec<f32>,
+    /// Per-node dequantized `‖x̂‖²`, present only for `L2Sq` (the kernel's L2
+    /// cross-term needs it); empty for `NegDot`.
+    norms: Vec<f32>,
 }
 
 impl Sq16Scorer {
@@ -149,11 +195,7 @@ impl Sq16Scorer {
             debug_assert_eq!(v.len(), dim);
             encode_sq16_row(v, &mut codes[i * stride..(i + 1) * stride]);
         }
-        Self {
-            codes: Plane::Owned(codes),
-            dim,
-            len: vectors.len(),
-        }
+        Self::cosine(Plane::Owned(codes), dim, vectors.len())
     }
 
     /// Adopt already-encoded Sq16 code bytes verbatim: `codes` is
@@ -161,11 +203,7 @@ impl Sq16Scorer {
     /// on-disk `full[]` Sq16 plane. No decode/re-encode round trip.
     pub(crate) fn from_codes(codes: Vec<u8>, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
-        Self {
-            codes: Plane::Owned(codes),
-            dim,
-            len,
-        }
+        Self::cosine(Plane::Owned(codes), dim, len)
     }
 
     /// Adopt an already-backed Sq16 code plane verbatim: the plane holds
@@ -174,7 +212,114 @@ impl Sq16Scorer {
     /// decode/re-encode round trip and, for the shared variant, no heap copy.
     pub(crate) fn from_plane(codes: Plane, dim: usize, len: usize) -> Self {
         debug_assert_eq!(codes.len(), len * dim * 2);
-        Self { codes, dim, len }
+        Self::cosine(codes, dim, len)
+    }
+
+    /// The fixed `[-1, 1]` cosine-grid scorer (`metric == NegDot`, no ruler,
+    /// no norms) — the one shape every legacy constructor produces.
+    fn cosine(codes: Plane, dim: usize, len: usize) -> Self {
+        Self {
+            codes,
+            dim,
+            len,
+            metric: Metric::NegDot,
+            adaptive: None,
+        }
+    }
+
+    /// Adopt a single-`u16` plane quantized against a fitted GLOBAL `(scale,
+    /// offset)` ruler (each `dim` long), scored under `metric`. `norms` are the
+    /// per-node dequantized `‖x̂‖²` and are required for `L2Sq` (the kernel's
+    /// cross-term reads them) and empty for `NegDot`. Cosine never takes this
+    /// path — it keeps the fixed grid.
+    pub(crate) fn from_adaptive_plane(
+        codes: Plane,
+        dim: usize,
+        len: usize,
+        metric: Metric,
+        scale: Vec<f32>,
+        offset: Vec<f32>,
+        norms: Vec<f32>,
+    ) -> Self {
+        debug_assert_eq!(codes.len(), len * dim * 2);
+        debug_assert_eq!(scale.len(), dim);
+        debug_assert_eq!(offset.len(), dim);
+        debug_assert!(metric != Metric::Cosine, "cosine keeps the fixed grid");
+        debug_assert_eq!(
+            norms.len(),
+            if metric == Metric::L2Sq { len } else { 0 },
+            "L2Sq needs one per-node norm; NegDot needs none"
+        );
+        Self {
+            codes,
+            dim,
+            len,
+            metric,
+            adaptive: Some(Box::new(AdaptiveRuler {
+                scale,
+                offset,
+                norms,
+            })),
+        }
+    }
+
+    /// Fit ONE global `(scale, offset)` ruler over `flat` (`len × dim` fp32,
+    /// row-major) and encode it to a single-`u16` adaptive plane scored under
+    /// `metric` — the non-cosine counterpart of [`Self::from_unit_vectors`]. The
+    /// ruler is per-dim `[min, max] → (scale = span/65535, offset = min)`, the
+    /// same fit the IVF per-cluster `Sq16Adaptive` uses, but taken once over the
+    /// whole graph (the plane is node-ordered across cells, with no cluster to
+    /// key a ruler on). A degenerate (constant) dim keeps `scale = 1` so decode
+    /// returns the offset exactly. Per-node `‖x̂‖²` is computed for `L2Sq`.
+    ///
+    /// The ruler is always fit fresh over `flat`. (A ruler-INHERITING variant —
+    /// delta rows landing on a prior plane's ruler, the first-input-ruler rule
+    /// the adaptive codecs follow on merge — belongs with the incremental extend
+    /// path, which does not yet support fitted-ruler graphs.)
+    pub(crate) fn from_fp32_metric(flat: &[f32], dim: usize, len: usize, metric: Metric) -> Self {
+        debug_assert_eq!(flat.len(), len * dim);
+        debug_assert_ne!(metric, Metric::Cosine, "cosine keeps the fixed grid");
+        let (scale, offset) = {
+            let mut lo = vec![f32::INFINITY; dim];
+            let mut hi = vec![f32::NEG_INFINITY; dim];
+            for i in 0..len {
+                let row = &flat[i * dim..(i + 1) * dim];
+                for (d, &x) in row.iter().enumerate() {
+                    lo[d] = lo[d].min(x);
+                    hi[d] = hi[d].max(x);
+                }
+            }
+            let mut scale = vec![1.0f32; dim];
+            let mut offset = vec![0.0f32; dim];
+            for d in 0..dim {
+                // A constant (or empty-plane) coordinate keeps unit scale so the
+                // stored ruler stays finite and round-trips; encode maps it to
+                // code 0 and decode returns `offset` exactly.
+                if lo[d].is_finite() && hi[d] > lo[d] {
+                    offset[d] = lo[d];
+                    scale[d] = (hi[d] - lo[d]) / SQ16_CODE_MAX;
+                } else if lo[d].is_finite() {
+                    offset[d] = lo[d];
+                }
+            }
+            (scale, offset)
+        };
+        let stride = dim * 2;
+        let mut codes = vec![0u8; len * stride];
+        let mut norms = if metric == Metric::L2Sq {
+            vec![0.0f32; len]
+        } else {
+            Vec::new()
+        };
+        for i in 0..len {
+            let src = &flat[i * dim..(i + 1) * dim];
+            let row = &mut codes[i * stride..(i + 1) * stride];
+            encode_sq16_adaptive_row(src, &scale, &offset, row);
+            if metric == Metric::L2Sq {
+                norms[i] = sq16_adaptive_norm_sq(row, dim, &scale, &offset);
+            }
+        }
+        Self::from_adaptive_plane(Plane::Owned(codes), dim, len, metric, scale, offset, norms)
     }
 
     /// The raw node-ordered Sq16 code plane — so an incremental build can
@@ -184,11 +329,70 @@ impl Sq16Scorer {
         self.codes.bytes()
     }
 
+    /// The distance the kernel ranks by (`NegDot` for the fixed cosine grid).
+    pub(crate) fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// The COLUMN metric this scorer serves: the fixed grid serves `Cosine` (its
+    /// `−dot` orders unit vectors the same way), a fitted ruler serves its own
+    /// `metric`. Distinct from [`Self::metric`] — the serving path compares this
+    /// to the column's declared metric to reject a graph built for another.
+    pub(crate) fn served_metric(&self) -> Metric {
+        if self.adaptive.is_none() {
+            Metric::Cosine
+        } else {
+            self.metric
+        }
+    }
+
+    /// The fitted global ruler `(scale, offset)`, or `None` for the fixed
+    /// cosine grid — so [`encode_hnsw`] can persist it.
+    pub(crate) fn ruler(&self) -> Option<(&[f32], &[f32])> {
+        self.adaptive
+            .as_ref()
+            .map(|a| (a.scale.as_slice(), a.offset.as_slice()))
+    }
+
+    /// Per-node dequantized `‖x̂‖²` (non-empty only for a fitted-ruler `L2Sq`
+    /// scorer) — so [`encode_hnsw`] can persist the norm table.
+    pub(crate) fn node_norms(&self) -> &[f32] {
+        self.adaptive.as_ref().map_or(&[], |a| a.norms.as_slice())
+    }
+
+    /// Whether calibration queries drawn from this plane should be
+    /// unit-normalized: yes for the fixed cosine grid (its geometry is
+    /// unit vectors), no for a fitted ruler (magnitude carries signal under
+    /// `L2Sq`/`NegDot`).
+    pub(crate) fn normalizes_queries(&self) -> bool {
+        self.adaptive.is_none()
+    }
+
+    /// Decode one node to fp32 through whichever ruler this scorer holds — the
+    /// fixed grid or the fitted `(scale, offset)`. Used to synthesize
+    /// calibration queries in the plane's own geometry.
+    pub(crate) fn decode_node_into(&self, node: u32, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), self.dim);
+        match &self.adaptive {
+            None => dequantize_sq16_into(self.row(node), out),
+            Some(a) => dequantize_sq16_adaptive_into(self.row(node), &a.scale, &a.offset, out),
+        }
+    }
+
     #[inline]
     fn row(&self, node: u32) -> &[u8] {
         let stride = self.dim * 2;
         let start = node as usize * stride;
         &self.codes.bytes()[start..start + stride]
+    }
+
+    /// Fold a query into the fused kernel through this scorer's ruler + metric.
+    #[inline]
+    fn kernel_for(&self, query: &[f32]) -> Sq16Kernel {
+        match &self.adaptive {
+            None => Sq16Kernel::new(self.metric, query),
+            Some(a) => Sq16Kernel::new_adaptive(self.metric, query, &a.scale, &a.offset),
+        }
     }
 }
 
@@ -206,7 +410,7 @@ impl NodeScorer for Sq16Scorer {
     }
 
     fn prepare(&self, query: &[f32]) -> Sq16Kernel {
-        Sq16Kernel::new(Metric::NegDot, query)
+        self.kernel_for(query)
     }
 
     fn prepare_node(&self, node: u32) -> Sq16Kernel {
@@ -214,16 +418,20 @@ impl NodeScorer for Sq16Scorer {
         // at build time) so it can act as the query for node-to-node
         // distance; candidate scoring below stays fused-from-codes.
         let mut decoded = vec![0.0f32; self.dim];
-        dequantize_sq16_into(self.row(node), &mut decoded);
-        Sq16Kernel::new(Metric::NegDot, &decoded)
+        self.decode_node_into(node, &mut decoded);
+        self.kernel_for(&decoded)
     }
 
     #[inline]
     fn score(&self, q: &Sq16Kernel, node: u32) -> f32 {
-        // NegDot: `distance_with_norm` returns `−dot`, computed by the
-        // fused `u16 → f32` dequant cross kernel straight off the code
-        // bytes — no per-candidate decode.
-        q.distance_with_norm(self.row(node), None)
+        // Fixed cosine grid / NegDot: `distance_with_norm` returns `−dot` with
+        // no norm term. A fitted-ruler L2Sq scorer feeds the node's stored
+        // `‖x̂‖²`; every case is the fused `u16 → f32` dequant cross kernel
+        // straight off the code bytes — no per-candidate decode.
+        let norm = (self.metric == Metric::L2Sq)
+            .then(|| self.adaptive.as_ref().map(|a| a.norms[node as usize]))
+            .flatten();
+        q.distance_with_norm(self.row(node), norm)
     }
 }
 
@@ -725,6 +933,14 @@ pub(crate) struct Hnsw {
     m0: usize,
     ef_construction: usize,
     len: usize,
+    /// Whether the base layer is written compact (offsets + ids) rather
+    /// than at a fixed `m0` stride: set by [`Self::from_adjacency`], whose
+    /// power-law degrees would pad every node to the hubs, and read back
+    /// from the section's magic. A built HNSW graph keeps the fixed stride
+    /// and its bytes. Only an adjacency graph is compact, so the form
+    /// exists only with the `graph-index` feature.
+    #[cfg(feature = "graph-index")]
+    compact_base: bool,
 }
 
 /// A `(node, distance)` pair ordered by distance (ties broken by id for
@@ -753,20 +969,20 @@ impl PartialOrd for Scored {
 
 /// Epoch-stamped visited set — O(1) reset by bumping the epoch, no
 /// per-search allocation and no hashing.
-struct VisitedSet {
+pub(crate) struct VisitedSet {
     stamp: Vec<u32>,
     epoch: u32,
 }
 
 impl VisitedSet {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             stamp: vec![0u32; n],
             epoch: 0,
         }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             // Wrapped: repaint so stale stamps can't alias the new epoch.
@@ -778,7 +994,7 @@ impl VisitedSet {
     /// Grow the stamp array to cover at least `n` nodes, preserving existing
     /// stamps. New slots are 0, which reads as unvisited under any live epoch
     /// (epochs start at 1 after the first `clear`).
-    fn ensure(&mut self, n: usize) {
+    pub(crate) fn ensure(&mut self, n: usize) {
         if self.stamp.len() < n {
             self.stamp.resize(n, 0);
         }
@@ -786,7 +1002,7 @@ impl VisitedSet {
 
     /// Mark `node` visited; return whether it was already visited.
     #[inline]
-    fn test_and_set(&mut self, node: u32) -> bool {
+    pub(crate) fn test_and_set(&mut self, node: u32) -> bool {
         let i = node as usize;
         if self.stamp[i] == self.epoch {
             true
@@ -832,7 +1048,26 @@ impl Hnsw {
     /// shared, lock-guarded adjacency (see [`ParBuild`]). The result is a
     /// plain immutable graph — identical in shape/semantics to a serial
     /// build, just not bit-identical across runs.
+    ///
+    /// Prefer [`build_serial`] where placement must be reproducible run to run
+    /// (e.g. the drain-assign coarse router, whose cell membership feeds the
+    /// cold-read block layout), at the cost of parallelism.
     pub(crate) fn build<S: NodeScorer + Sync>(scorer: &S, params: HnswParams) -> Hnsw {
+        Self::build_impl(scorer, params, true)
+    }
+
+    /// Deterministic counterpart to [`build`]: inserts nodes serially in id
+    /// order on one thread, so the finished graph is bit-identical run to run.
+    /// The seeded layer tower and diversity heuristic are already
+    /// order-independent; the concurrent insert reordering is the only source
+    /// of run-to-run variance in [`build`], and a serial insert removes it.
+    /// Costs parallelism — intended for small graphs (e.g. a few thousand cell
+    /// centroids) where reproducible placement matters more than build speed.
+    pub(crate) fn build_serial<S: NodeScorer + Sync>(scorer: &S, params: HnswParams) -> Hnsw {
+        Self::build_impl(scorer, params, false)
+    }
+
+    fn build_impl<S: NodeScorer + Sync>(scorer: &S, params: HnswParams, parallel: bool) -> Hnsw {
         let n = scorer.len();
         if n == 0 {
             return Hnsw {
@@ -843,6 +1078,8 @@ impl Hnsw {
                 m0: params.m0,
                 ef_construction: params.ef_construction,
                 len: 0,
+                #[cfg(feature = "graph-index")]
+                compact_base: false,
             };
         }
 
@@ -878,14 +1115,24 @@ impl Hnsw {
             ef_construction: params.ef_construction,
         };
 
-        // Insert nodes 1..n concurrently. `for_each_init` calls `init` once per
-        // job (a contiguous run of items a worker processes), not once per
+        // Insert nodes 1..n. In parallel mode `for_each_init` calls `init` once
+        // per job (a contiguous run of items a worker processes), not once per
         // element, so the O(n) epoch buffer is amortized across many inserts
-        // rather than allocated per insert.
-        (1..n as u32).into_par_iter().for_each_init(
-            || VisitedSet::new(n),
-            |visited, node| builder.insert(scorer, node, visited),
-        );
+        // rather than allocated per insert. In serial mode nodes go in fixed id
+        // order on one thread, making the finished graph bit-identical run to
+        // run — the concurrent insert reordering is the only nondeterminism in
+        // the parallel path.
+        if parallel {
+            (1..n as u32).into_par_iter().for_each_init(
+                || VisitedSet::new(n),
+                |visited, node| builder.insert(scorer, node, visited),
+            );
+        } else {
+            let mut visited = VisitedSet::new(n);
+            for node in 1..n as u32 {
+                builder.insert(scorer, node, &mut visited);
+            }
+        }
 
         let entry = builder
             .entry
@@ -908,6 +1155,8 @@ impl Hnsw {
             m0: params.m0,
             ef_construction: params.ef_construction,
             len: n,
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
         }
     }
 
@@ -989,6 +1238,8 @@ impl Hnsw {
             m0: params.m0,
             ef_construction: params.ef_construction,
             len: total,
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
         }
     }
 
@@ -1151,6 +1402,181 @@ impl Hnsw {
         self.m0
     }
 
+    /// A single-level graph from explicit adjacency lists: node `i`'s
+    /// base-layer neighbours are `lists[i]`, in the order given, of any
+    /// degree. What a knowledge graph is built from
+    /// (`superfile::vector::adjacency`): its edges are facts, not nearest
+    /// neighbours, so there is no tower, no entry descent and no neighbour
+    /// selection — only the base layer, which the walks below read. `m0` is
+    /// the largest degree, so [`Self::to_bytes`] writes such a graph in its
+    /// compact form rather than padding every node to the hubs.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn from_adjacency(lists: Vec<Vec<u32>>) -> Hnsw {
+        let len = lists.len();
+        let m0 = lists.iter().map(Vec::len).max().unwrap_or(0);
+        Hnsw {
+            neighbors: lists.into_iter().map(|list| vec![list]).collect(),
+            node_level: vec![0; len],
+            entry: 0,
+            m: 0,
+            m0,
+            ef_construction: 0,
+            len,
+            compact_base: true,
+        }
+    }
+
+    /// Node `node`'s base-layer neighbours.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn base_neighbors(&self, node: u32) -> &[u32] {
+        &self.neighbors[node as usize][0]
+    }
+
+    /// Heap the decoded adjacency occupies, for a residency log line.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.neighbors
+            .iter()
+            .map(|levels| {
+                levels.iter().map(|list| list.capacity() * 4).sum::<usize>()
+                    + levels.capacity() * size_of::<Vec<u32>>()
+            })
+            .sum::<usize>()
+            + self.neighbors.capacity() * size_of::<Vec<Vec<u32>>>()
+            + self.node_level.capacity() * 4
+    }
+
+    /// Every node within `hops` base-layer edges of `seeds`, nearest first,
+    /// at most `limit`, as `(node, hops)`: a breadth-first walk, so each node
+    /// is reported once with the fewest hops it takes; the seeds are hop 0,
+    /// and a seed past the graph is skipped. Ties within a hop keep the order
+    /// the walk reached them, which follows each node's neighbour order. The
+    /// visited set is the vector search's epoch-stamped one, kept per thread,
+    /// so a walk over a graph up to [`WALK_VISITED_KEEP_NODES`] allocates
+    /// nothing per call; a larger graph's set is dropped after the walk, so
+    /// a worker thread that once walked a huge graph does not hold its
+    /// stamps for the life of the process.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn walk_base(&self, seeds: &[u32], hops: u32, limit: usize) -> Vec<(u32, u32)> {
+        thread_local! {
+            static WALK_VISITED: RefCell<VisitedSet> = RefCell::new(VisitedSet::new(0));
+        }
+        WALK_VISITED.with(|cell| {
+            let mut visited = cell.borrow_mut();
+            visited.ensure(self.len);
+            visited.clear();
+            let mut out: Vec<(u32, u32)> = Vec::new();
+            let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+            for &seed in seeds {
+                if (seed as usize) < self.len && !visited.test_and_set(seed) {
+                    queue.push_back((seed, 0));
+                }
+            }
+            while let Some((node, hop)) = queue.pop_front() {
+                if out.len() >= limit {
+                    break;
+                }
+                out.push((node, hop));
+                if hop >= hops {
+                    continue;
+                }
+                for &next in self.base_neighbors(node) {
+                    if !visited.test_and_set(next) {
+                        queue.push_back((next, hop + 1));
+                    }
+                }
+            }
+            if self.len > WALK_VISITED_KEEP_NODES {
+                *visited = VisitedSet::new(0);
+            }
+            out
+        })
+    }
+
+    /// The nodes within `hops` of `seeds`, ranked by personalized PageRank
+    /// from the seeds over the subgraph those nodes span, at most `limit`,
+    /// highest score first (ties by fewer hops, then node), as
+    /// `(node, hops, score)`.
+    ///
+    /// A random surfer starts at a seed, follows a base-layer edge of its
+    /// node within the subgraph, and with probability `restart` jumps back
+    /// to a seed; a node with no edge in the subgraph sends its whole score
+    /// back to the seeds. A node's score is how often the surfer is there:
+    /// high for nodes many short paths from the seeds pass through, so a
+    /// hub's thousand neighbours do not outrank the few nodes the seeds
+    /// share. Scores sum to 1 over the whole subgraph, up to the residual of
+    /// `iterations` power steps (`(1 - restart)^iterations`); the `limit`
+    /// truncates the ranking after the fact, so the nodes returned sum to
+    /// less when it bites.
+    #[cfg(feature = "graph-index")]
+    pub(crate) fn rank_base(
+        &self,
+        seeds: &[u32],
+        hops: u32,
+        limit: usize,
+        restart: f64,
+        iterations: usize,
+    ) -> Vec<(u32, u32, f64)> {
+        let reached = self.walk_base(seeds, hops, usize::MAX);
+        let n = reached.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let local: HashMap<u32, usize> = reached
+            .iter()
+            .enumerate()
+            .map(|(i, &(node, _))| (node, i))
+            .collect();
+        let out: Vec<Vec<usize>> = reached
+            .iter()
+            .map(|&(node, _)| {
+                self.base_neighbors(node)
+                    .iter()
+                    .filter_map(|next| local.get(next).copied())
+                    .collect()
+            })
+            .collect();
+        let seed_locals: Vec<usize> = reached
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, hop))| *hop == 0)
+            .map(|(i, _)| i)
+            .collect();
+        let seed_share = 1.0 / seed_locals.len() as f64;
+        let mut score = vec![0.0f64; n];
+        for &s in &seed_locals {
+            score[s] = seed_share;
+        }
+        let mut next = vec![0.0f64; n];
+        for _ in 0..iterations {
+            next.iter_mut().for_each(|x| *x = 0.0);
+            let mut back_to_seeds = restart;
+            for (u, targets) in out.iter().enumerate() {
+                let walked = (1.0 - restart) * score[u];
+                if targets.is_empty() {
+                    back_to_seeds += walked;
+                    continue;
+                }
+                let each = walked / targets.len() as f64;
+                for &v in targets {
+                    next[v] += each;
+                }
+            }
+            for &s in &seed_locals {
+                next[s] += back_to_seeds * seed_share;
+            }
+            swap(&mut score, &mut next);
+        }
+        let mut ranked: Vec<(u32, u32, f64)> = reached
+            .iter()
+            .zip(&score)
+            .map(|(&(node, hop), &score)| (node, hop, score))
+            .collect();
+        ranked.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.1.cmp(&b.1)).then(a.0.cmp(&b.0)));
+        ranked.truncate(limit);
+        ranked
+    }
+
     /// A copy with the layer-0 (base) adjacency reduced to `m0` neighbors per
     /// node — a cheap way to evaluate a smaller base-layer degree without a
     /// native rebuild. Upper layers are untouched. The pruned graph is BOTH the
@@ -1205,6 +1631,8 @@ impl Hnsw {
             m0,
             ef_construction: self.ef_construction,
             len: self.len,
+            #[cfg(feature = "graph-index")]
+            compact_base: self.compact_base,
         }
     }
 }
@@ -1266,23 +1694,37 @@ pub(crate) fn calibration_queries(
 ) -> Vec<Vec<f32>> {
     let n = scorer.len();
     let dim = scorer.dim();
-    let stride = dim * 2;
     let mut rng = seed ^ SPLITMIX64_INCREMENT;
     let nq = n_queries.min(n);
+    // The fixed cosine grid's geometry is unit vectors: jitter by an absolute
+    // amount and renormalize. A fitted ruler (L2Sq/NegDot) is in the column's
+    // own un-normalized space — an absolute 0.05 nudge is negligible next to a
+    // raw vector's components, so recall would read falsely optimistic; scale
+    // the nudge to the vector's magnitude instead, and DON'T renormalize
+    // (magnitude carries signal).
+    let normalize = scorer.normalizes_queries();
     (0..nq)
         .map(|i| {
-            let node = i.wrapping_mul(CALIB_QUERY_STRIDE_MULT) % n;
+            let node = (i.wrapping_mul(CALIB_QUERY_STRIDE_MULT) % n) as u32;
             let mut v = vec![0.0f32; dim];
-            // Straight from the Sq16 codes: a query derived through a
+            // Decoded through the scorer's own ruler: a query derived through a
             // coarse plane would carry that plane's error into the probe.
-            dequantize_sq16_into(&scorer.codes()[node * stride..(node + 1) * stride], &mut v);
+            scorer.decode_node_into(node, &mut v);
+            let jitter = if normalize {
+                CALIB_QUERY_JITTER
+            } else {
+                let rms = (v.iter().map(|a| a * a).sum::<f32>() / dim as f32).sqrt();
+                CALIB_QUERY_JITTER * rms.max(1e-12)
+            };
             for x in &mut v {
                 let u = (splitmix64(&mut rng) >> 40) as f32 / (1u64 << 24) as f32; // [0,1)
-                *x += (u * 2.0 - 1.0) * CALIB_QUERY_JITTER;
+                *x += (u * 2.0 - 1.0) * jitter;
             }
-            let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
-            for x in &mut v {
-                *x /= norm;
+            if normalize {
+                let norm = v.iter().map(|a| a * a).sum::<f32>().sqrt().max(1e-12);
+                for x in &mut v {
+                    *x /= norm;
+                }
             }
             v
         })
@@ -1598,6 +2040,19 @@ const ADJ_SENTINEL: u32 = u32::MAX;
 
 /// On-disk magic for a serialized [`Hnsw`] graph section.
 const HNSW_GRAPH_MAGIC: &[u8; 8] = b"INFHNSW1";
+/// On-disk magic for a graph section whose base layer is written compact
+/// (offsets + ids) instead of at a fixed `m0` stride: the form of a
+/// [`Hnsw::from_adjacency`] graph, whose power-law degrees would pad every
+/// node to the hubs. A built HNSW graph keeps [`HNSW_GRAPH_MAGIC`];
+/// [`Hnsw::from_bytes`] reads both with the `graph-index` feature, and
+/// only the fixed stride without it.
+#[cfg(feature = "graph-index")]
+const HNSW_GRAPH_MAGIC_CSR: &[u8; 8] = b"INFHNSW2";
+/// Largest graph whose per-thread visited stamps a walk keeps for the next
+/// walk: four bytes a node, so 16 MiB a thread. Past it the stamps are
+/// dropped after each walk and re-grown by the next.
+#[cfg(feature = "graph-index")]
+const WALK_VISITED_KEEP_NODES: usize = 1 << 22;
 
 // ---------------- graph serialization ----------------
 //
@@ -1649,10 +2104,48 @@ impl Hnsw {
     /// sparse upper-layer lists (few nodes reach level ≥ 1). Paired with
     /// [`from_bytes`](Self::from_bytes).
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
-        let n = self.len;
+        #[cfg(feature = "graph-index")]
+        if self.compact_base {
+            return self.to_bytes_with(HNSW_GRAPH_MAGIC_CSR, Self::write_compact_base);
+        }
+        self.to_bytes_with(HNSW_GRAPH_MAGIC, Self::write_strided_base)
+    }
+
+    /// Layer 0 at the fixed `m0` stride: each node's list padded with
+    /// [`ADJ_SENTINEL`] to `m0` ids.
+    fn write_strided_base(&self, out: &mut Vec<u8>) {
         let m0 = self.m0.max(1);
-        let mut out = Vec::with_capacity(48 + n * (4 + m0 * 4));
-        out.extend_from_slice(HNSW_GRAPH_MAGIC);
+        for levels in &self.neighbors {
+            let l0 = &levels[0];
+            for slot in 0..m0 {
+                let id = l0.get(slot).copied().unwrap_or(ADJ_SENTINEL);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+    }
+
+    /// Layer 0 compact: `n + 1` rising offsets, then every node's ids.
+    #[cfg(feature = "graph-index")]
+    fn write_compact_base(&self, out: &mut Vec<u8>) {
+        let mut offset = 0u64;
+        out.extend_from_slice(&offset.to_le_bytes());
+        for levels in &self.neighbors {
+            offset += levels[0].len() as u64;
+            out.extend_from_slice(&offset.to_le_bytes());
+        }
+        for levels in &self.neighbors {
+            for &id in &levels[0] {
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+    }
+
+    /// The section under `magic`: the header, the node levels, layer 0 as
+    /// `base` writes it, then the upper layers.
+    fn to_bytes_with(&self, magic: &[u8; 8], base: fn(&Self, &mut Vec<u8>)) -> Vec<u8> {
+        let n = self.len;
+        let mut out = Vec::with_capacity(48 + n * 4 + n * self.m0.max(1) * 4);
+        out.extend_from_slice(magic);
         out.extend_from_slice(&(n as u64).to_le_bytes());
         out.extend_from_slice(&(self.m as u32).to_le_bytes());
         out.extend_from_slice(&(self.m0 as u32).to_le_bytes());
@@ -1662,14 +2155,7 @@ impl Hnsw {
         for &lvl in &self.node_level {
             out.extend_from_slice(&lvl.to_le_bytes());
         }
-        // Layer 0, fixed stride m0.
-        for node in 0..n {
-            let l0 = &self.neighbors[node][0];
-            for slot in 0..m0 {
-                let id = l0.get(slot).copied().unwrap_or(ADJ_SENTINEL);
-                out.extend_from_slice(&id.to_le_bytes());
-            }
-        }
+        base(self, &mut out);
         // Upper layers: [count u64] then (node u32, level u32, len u32, ids…).
         let mut upper: Vec<u8> = Vec::new();
         let mut upper_records: u64 = 0;
@@ -1696,25 +2182,109 @@ impl Hnsw {
     /// section degrades to a fallback rather than a panic.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Hnsw> {
         let mut c = Cursor::new(bytes);
-        if c.take(HNSW_GRAPH_MAGIC.len())? != HNSW_GRAPH_MAGIC {
+        let magic = c.take(HNSW_GRAPH_MAGIC.len())?;
+        if magic == HNSW_GRAPH_MAGIC {
+            return Self::from_bytes_with(c, false, Self::read_strided_base);
+        }
+        #[cfg(feature = "graph-index")]
+        if magic == HNSW_GRAPH_MAGIC_CSR {
+            return Self::from_bytes_with(c, true, Self::read_compact_base);
+        }
+        None
+    }
+
+    /// Layer 0 at the fixed `m0` stride, the inverse of
+    /// [`Self::write_strided_base`]: `n * m0` ids, [`ADJ_SENTINEL`] for an
+    /// unused slot. The block's length is checked against the bytes present
+    /// before anything is reserved.
+    fn read_strided_base(
+        c: &mut Cursor<'_>,
+        n: usize,
+        m0: usize,
+        neighbors: &mut [Vec<Vec<u32>>],
+    ) -> Option<()> {
+        if n.checked_mul(m0)?.checked_mul(4)? > c.remaining() {
             return None;
         }
+        for slot in neighbors.iter_mut() {
+            let mut l0 = Vec::with_capacity(m0);
+            for _ in 0..m0 {
+                let id = c.u32()?;
+                if id != ADJ_SENTINEL {
+                    if id as usize >= n {
+                        return None;
+                    }
+                    l0.push(id);
+                }
+            }
+            slot[0] = l0;
+        }
+        Some(())
+    }
+
+    /// Layer 0 compact, the inverse of [`Self::write_compact_base`]: `n + 1`
+    /// rising offsets, then the ids, each block checked against the bytes
+    /// present before it is reserved.
+    #[cfg(feature = "graph-index")]
+    fn read_compact_base(
+        c: &mut Cursor<'_>,
+        n: usize,
+        _m0: usize,
+        neighbors: &mut [Vec<Vec<u32>>],
+    ) -> Option<()> {
+        if n.checked_add(1)?.checked_mul(8)? > c.remaining() {
+            return None;
+        }
+        let mut offsets = Vec::with_capacity(n + 1);
+        for _ in 0..=n {
+            let offset = c.u64()? as usize;
+            if offsets.last().is_some_and(|&previous| offset < previous) {
+                return None;
+            }
+            offsets.push(offset);
+        }
+        let edges = *offsets.last()?;
+        if edges.checked_mul(4)? > c.remaining() {
+            return None;
+        }
+        for (node, slot) in neighbors.iter_mut().enumerate() {
+            let degree = offsets[node + 1] - offsets[node];
+            let mut l0 = Vec::with_capacity(degree);
+            for _ in 0..degree {
+                let id = c.u32()?;
+                if id as usize >= n {
+                    return None;
+                }
+                l0.push(id);
+            }
+            slot[0] = l0;
+        }
+        Some(())
+    }
+
+    /// The section after its magic: the header, the node levels, layer 0 as
+    /// `base` reads it, then the upper layers. `compact` says which form
+    /// the magic named; it is recorded on the graph so a round trip keeps
+    /// it. Every count is checked against the bytes present BEFORE
+    /// reserving, so a corrupt `n`/`m0` word cannot drive a huge
+    /// `with_capacity` (an `n` of u32::MAX would otherwise abort under
+    /// `handle_alloc_error`).
+    fn from_bytes_with(
+        mut c: Cursor<'_>,
+        compact: bool,
+        base: fn(&mut Cursor<'_>, usize, usize, &mut [Vec<Vec<u32>>]) -> Option<()>,
+    ) -> Option<Hnsw> {
         let n = c.u64()? as usize;
         let m = c.u32()? as usize;
         let m0 = c.u32()? as usize;
         let ef_construction = c.u32()? as usize;
         let entry = c.u32()?;
-        if n == 0 || entry as usize >= n || m0 == 0 {
+        // A compact graph may hold nodes with no edges at all (`m0 == 0`).
+        if n == 0 || entry as usize >= n || (m0 == 0 && !compact) {
             return None;
         }
-        // Cross-check the wire lengths against the bytes actually present
-        // BEFORE reserving, so a corrupt `n`/`m0` word cannot drive a huge
-        // `with_capacity` (an `n` of u32::MAX would otherwise abort under
-        // `handle_alloc_error`). The node-level block is `n * 4` bytes and the
-        // fixed-stride layer-0 block is `n * m0 * 4`; both must fit.
-        let node_level_bytes = n.checked_mul(4)?;
-        let l0_bytes = n.checked_mul(m0)?.checked_mul(4)?;
-        if node_level_bytes.checked_add(l0_bytes)? > c.remaining() {
+        // The node-level block is `n * 4` bytes; `base` checks its own.
+        if n.checked_mul(4)? > c.remaining() {
             return None;
         }
         let mut node_level = Vec::with_capacity(n);
@@ -1732,20 +2302,7 @@ impl Hnsw {
             .iter()
             .map(|&lvl| vec![Vec::new(); lvl as usize + 1])
             .collect();
-        // Layer 0, fixed stride m0.
-        for slot in neighbors.iter_mut() {
-            let mut l0 = Vec::with_capacity(m0);
-            for _ in 0..m0 {
-                let id = c.u32()?;
-                if id != ADJ_SENTINEL {
-                    if id as usize >= n {
-                        return None;
-                    }
-                    l0.push(id);
-                }
-            }
-            slot[0] = l0;
-        }
+        base(&mut c, n, m0, &mut neighbors)?;
         // Upper layers.
         let records = c.u64()?;
         for _ in 0..records {
@@ -1778,6 +2335,10 @@ impl Hnsw {
             }
             neighbors[node][level] = list;
         }
+        // Without the feature only the strided form is read, so `compact`
+        // is always false there and has nothing to record.
+        #[cfg(not(feature = "graph-index"))]
+        let _ = compact;
         Some(Hnsw {
             neighbors,
             node_level,
@@ -1786,6 +2347,8 @@ impl Hnsw {
             m0,
             ef_construction,
             len: n,
+            #[cfg(feature = "graph-index")]
+            compact_base: compact,
         })
     }
 }
@@ -1815,7 +2378,7 @@ const HNSW_DATA_MAGIC_V3: &[u8; 8] = b"INFDDG03";
 /// `k`) on `v03`/`v02` — today's exact behavior, no forced rebuild.
 const HNSW_DATA_MAGIC_V4: &[u8; 8] = b"INFDDG04";
 /// All magics are 8 bytes; the shared byte width of the leading tag.
-const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
+pub(crate) const HNSW_DATA_MAGIC_LEN: usize = HNSW_DATA_MAGIC_V4.len();
 /// Byte size of the fixed frame of a data bundle: magic(8) + n(u64) + dim(u32)
 /// + ef(u32) + col_len(u32) + graph_len(u64). The variable-length column name,
 /// doc-id map, Sq16/SQ8 planes, and graph bytes are added on top; naming it
@@ -1836,6 +2399,42 @@ const HNSW_DATA_FIXED_BYTES: usize = HNSW_DATA_MAGIC_LEN + 8 + 4 + 4 + 4 + 8;
 /// would take the column-name length out of the middle of the header and
 /// mis-slice every section after it.
 const HNSW_DATA_MAGIC_V5: &[u8; 8] = b"INFDDG05";
+
+/// `v06` makes the Sq16 refine plane metric-aware. It appends, after `v05`'s
+/// trailing k→ef curve, a metric byte and — for a non-cosine column — the
+/// single fitted global ruler (`scale[dim]`, `offset[dim]`) the plane was
+/// quantized against plus, for `L2Sq`, the per-node `‖x̂‖²` table. Cosine
+/// columns keep writing `v05` (fixed `[-1, 1]` grid, `−dot`), so every existing
+/// cosine bundle and reader is untouched; only L2Sq/NegDot columns — which
+/// `v05` and earlier declined to build a graph for at all — reach `v06`.
+///
+/// The ruler + norms ride at the END rather than the header so the entire
+/// `v05` sequential read (doc-ids, Sq16/walk planes, graph, curve) is byte-for
+/// -byte unchanged; `v06` reads three extra trailing sections and rebuilds a
+/// metric-aware scorer from them instead of the fixed-grid one.
+pub(crate) const HNSW_DATA_MAGIC_V6: &[u8; 8] = b"INFDDG06";
+
+/// Wire tag for the column metric stamped in a `v06` bundle. Local to the
+/// bundle format so the on-disk mapping cannot drift with an unrelated enum
+/// reorder elsewhere.
+fn metric_tag(metric: Metric) -> u8 {
+    match metric {
+        Metric::Cosine => 0,
+        Metric::L2Sq => 1,
+        Metric::NegDot => 2,
+    }
+}
+
+/// Inverse of [`metric_tag`]; `None` for an unknown tag (a newer build) so the
+/// bundle decodes to `None` and the query serves ivf rather than misreading it.
+fn metric_from_tag(tag: u8) -> Option<Metric> {
+    match tag {
+        0 => Some(Metric::Cosine),
+        1 => Some(Metric::L2Sq),
+        2 => Some(Metric::NegDot),
+        _ => None,
+    }
+}
 
 /// Which resident plane the graph walk scores candidates on.
 ///
@@ -1977,6 +2576,12 @@ pub(crate) struct HnswIndex {
 /// `sq4` must be `Some` exactly when `walk` names a 4-bit codec; the caller
 /// builds it from the same `sq16_codes` written here, so the two cannot
 /// describe different rows.
+///
+/// `ruler` makes the Sq16 refine plane metric-aware: `None` writes a `v05`
+/// bundle (the fixed `[-1, 1]` cosine grid, scored `−dot`); `Some((scale,
+/// offset))` writes a `v06` bundle stamping `metric` plus that single fitted
+/// global ruler and, for `L2Sq`, the per-node `‖x̂‖²` in `norms`. Cosine passes
+/// `None`, so its bytes are unchanged.
 pub(crate) fn encode_hnsw(
     sq16_codes: &[u8],
     doc_ids: &[i128],
@@ -1987,6 +2592,9 @@ pub(crate) fn encode_hnsw(
     column: &str,
     walk: WalkCodec,
     sq4: Option<&Sq4Scorer>,
+    metric: Metric,
+    ruler: Option<(&[f32], &[f32])>,
+    norms: &[f32],
 ) -> Vec<u8> {
     let n = doc_ids.len();
     debug_assert_eq!(sq16_codes.len(), n * dim * 2);
@@ -1994,6 +2602,19 @@ pub(crate) fn encode_hnsw(
         walk.is_sq4(),
         sq4.is_some(),
         "the 4-bit plane must be supplied exactly when the codec names it"
+    );
+    // A fitted ruler makes this a v06 (metric-aware) bundle; its absence is the
+    // fixed-grid cosine v05. Guard the shapes the two trailing sections assume.
+    let v6 = ruler.is_some();
+    if let Some((scale, offset)) = ruler {
+        debug_assert_ne!(metric, Metric::Cosine, "cosine keeps the fixed grid (v05)");
+        debug_assert_eq!(scale.len(), dim, "ruler scale length vs dim");
+        debug_assert_eq!(offset.len(), dim, "ruler offset length vs dim");
+    }
+    debug_assert_eq!(
+        norms.len(),
+        if v6 && metric == Metric::L2Sq { n } else { 0 },
+        "L2Sq stamps one norm per node; every other case stamps none"
     );
     let graph_bytes = graph.to_bytes();
     let col = column.as_bytes();
@@ -2010,6 +2631,13 @@ pub(crate) fn encode_hnsw(
     };
     // The trailing k→ef curve: a u16 count then `(u32 k, u32 ef)` per pair.
     let curve_len = 2 + ef_curve.len() * 8;
+    // v06 metric-aware trailer: metric byte, and for a fitted ruler the two
+    // f32 ruler vectors plus the per-node norm table (L2Sq only).
+    let meta_len = if v6 {
+        1 + dim * 2 * 4 + norms.len() * 4
+    } else {
+        0
+    };
     let mut out = Vec::with_capacity(
         HNSW_DATA_FIXED_BYTES
             + 1
@@ -2018,9 +2646,14 @@ pub(crate) fn encode_hnsw(
             + sq16_codes.len()
             + walk_len
             + graph_bytes.len()
-            + curve_len,
+            + curve_len
+            + meta_len,
     );
-    out.extend_from_slice(HNSW_DATA_MAGIC_V5);
+    out.extend_from_slice(if v6 {
+        HNSW_DATA_MAGIC_V6
+    } else {
+        HNSW_DATA_MAGIC_V5
+    });
     out.extend_from_slice(&(n as u64).to_le_bytes());
     out.extend_from_slice(&(dim as u32).to_le_bytes());
     // Was reserved / alignment; now the stamped recall@10 query beam (u32).
@@ -2081,6 +2714,21 @@ pub(crate) fn encode_hnsw(
         out.extend_from_slice(&k.to_le_bytes());
         out.extend_from_slice(&ef.to_le_bytes());
     }
+    // v06 metric-aware trailer, after the curve so the whole v05 layout above is
+    // untouched: metric byte, then (fitted ruler only) `scale`, `offset`, and
+    // the per-node norm table. Cosine wrote v05 and skips all of this.
+    if let Some((scale, offset)) = ruler {
+        out.push(metric_tag(metric));
+        for &s in scale {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        for &o in offset {
+            out.extend_from_slice(&o.to_le_bytes());
+        }
+        for &nsq in norms {
+            out.extend_from_slice(&nsq.to_le_bytes());
+        }
+    }
     out
 }
 
@@ -2124,24 +2772,28 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     let bytes: &[u8] = bundle.as_ref();
     let mut c = Cursor::new(bytes);
     let magic = c.take(HNSW_DATA_MAGIC_LEN)?;
-    // Two independent format axes, so three facts per magic:
-    //   - `walk_tag`: does the header carry the walk-codec byte? `v05` only.
+    // Independent format axes, so four facts per magic:
+    //   - `walk_tag`: does the header carry the walk-codec byte? `v05`/`v06`.
     //   - `implied_walk`: for the versions that predate that byte, the codec
     //     their layout implies — `v03`/`v04` always wrote the SQ8 section,
     //     `v02` wrote none, so SQ8 is derived on read.
-    //   - `has_curve`: is the trailing k→ef curve present? `v04`/`v05`. Older
-    //     bundles synthesize a degenerate 1-point curve from the single stamped
-    //     `ef` below.
+    //   - `has_curve`: is the trailing k→ef curve present? `v04`/`v05`/`v06`.
+    //     Older bundles synthesize a degenerate 1-point curve from the single
+    //     stamped `ef` below.
+    //   - `metric_aware`: does a metric + fitted-ruler trailer follow the curve?
+    //     `v06` only; every older bundle is the fixed `[-1, 1]` cosine grid.
     // Any other tag (e.g. a legacy `01`) is unsupported → `None`, and the query
     // serves ivf until the next drain rebuilds.
-    let (walk_tag, implied_walk, has_curve) = if magic == HNSW_DATA_MAGIC_V5 {
-        (true, WalkCodec::Sq16, true)
+    let (walk_tag, implied_walk, has_curve, metric_aware) = if magic == HNSW_DATA_MAGIC_V6 {
+        (true, WalkCodec::Sq16, true, true)
+    } else if magic == HNSW_DATA_MAGIC_V5 {
+        (true, WalkCodec::Sq16, true, false)
     } else if magic == HNSW_DATA_MAGIC_V4 {
-        (false, WalkCodec::Sq8, true)
+        (false, WalkCodec::Sq8, true, false)
     } else if magic == HNSW_DATA_MAGIC_V3 {
-        (false, WalkCodec::Sq8, false)
+        (false, WalkCodec::Sq8, false, false)
     } else if magic == HNSW_DATA_MAGIC_V2 {
-        (false, WalkCodec::Sq16, false)
+        (false, WalkCodec::Sq16, false, false)
     } else {
         return None;
     };
@@ -2198,7 +2850,11 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     let mut sq8_plane = Plane::Owned(Vec::new());
     match stored {
         WalkCodec::Sq16 => {
-            if want != WalkCodec::Sq16 {
+            // A metric-aware (fitted-ruler) bundle never serves a derived SQ8
+            // walk: the high byte of a per-dim adaptive code is not a valid
+            // proximity proxy, so the serve path walks the Sq16 plane directly.
+            // Deriving one anyway would just waste `n × dim` bytes.
+            if want != WalkCodec::Sq16 && !metric_aware {
                 sq8_plane = Plane::Owned(derive_sq8_plane(sq16_slice));
             }
         }
@@ -2292,7 +2948,46 @@ pub(crate) fn decode_hnsw(bundle: &Bytes, want: Option<WalkCodec>) -> Option<Hns
     } else {
         ef_curve
     };
-    let scorer = Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n);
+    // The refine scorer: the fixed cosine grid for every pre-`v06` bundle, or
+    // the fitted-ruler metric-aware plane read from the `v06` trailer. The Sq16
+    // plane bytes are identical either way — only the ruler/metric/norms the
+    // scorer scores them through differ.
+    let scorer = if metric_aware {
+        let metric = metric_from_tag(c.u8()?)?;
+        // A cosine tag in a v06 trailer is malformed (cosine writes v05); reject
+        // rather than build a fitted-ruler scorer that will not be exercised.
+        if metric == Metric::Cosine {
+            return None;
+        }
+        // Bound the ruler read (two f32 vectors) before taking it.
+        if dim.checked_mul(2)?.checked_mul(4)? > c.remaining() {
+            return None;
+        }
+        let scale = read_f32_le(c.take(dim.checked_mul(4)?)?);
+        let offset = read_f32_le(c.take(dim.checked_mul(4)?)?);
+        // Per-node norms follow for L2Sq only (the kernel's cross-term needs
+        // them); NegDot stamps none. Bound the read before taking it.
+        let norms = if metric == Metric::L2Sq {
+            let norm_bytes = n.checked_mul(4)?;
+            if norm_bytes > c.remaining() {
+                return None;
+            }
+            read_f32_le(c.take(norm_bytes)?)
+        } else {
+            Vec::new()
+        };
+        Sq16Scorer::from_adaptive_plane(
+            Plane::Shared(sq16_plane),
+            dim,
+            n,
+            metric,
+            scale,
+            offset,
+            norms,
+        )
+    } else {
+        Sq16Scorer::from_plane(Plane::Shared(sq16_plane), dim, n)
+    };
     Some(HnswIndex {
         scorer,
         graph,
@@ -2548,6 +3243,12 @@ pub(crate) enum PayloadKind {
     Graph = 1,
     /// A flat 4-bit index payload: nibble plane + ruler, no graph, no Sq16.
     Flat = 2,
+    /// A knowledge graph's adjacency (`superfile::vector::adjacency`): each
+    /// node's table and `_id` plus a single-level graph, no planes. Only a
+    /// build with the `graph-index` feature knows the kind; another reads
+    /// its tag as unknown and serves no resident index for the generation.
+    #[cfg(feature = "graph-index")]
+    Adjacency = 3,
 }
 
 impl PayloadKind {
@@ -2555,6 +3256,8 @@ impl PayloadKind {
         match tag {
             1 => Some(PayloadKind::Graph),
             2 => Some(PayloadKind::Flat),
+            #[cfg(feature = "graph-index")]
+            3 => Some(PayloadKind::Adjacency),
             _ => None,
         }
     }
@@ -2565,6 +3268,8 @@ impl PayloadKind {
         match self {
             PayloadKind::Graph => "hnsw",
             PayloadKind::Flat => "flat",
+            #[cfg(feature = "graph-index")]
+            PayloadKind::Adjacency => "adjacency",
         }
     }
 }
@@ -2939,7 +3644,7 @@ fn select_neighbors_heuristic<S: NodeScorer>(
 /// also the deterministic build the equality-sensitive tests use.
 #[cfg(test)]
 impl Hnsw {
-    fn build_serial<S: NodeScorer>(scorer: &S, params: HnswParams) -> Hnsw {
+    fn build_serial_reference<S: NodeScorer>(scorer: &S, params: HnswParams) -> Hnsw {
         let n = scorer.len();
         let mut g = Hnsw {
             neighbors: Vec::with_capacity(n),
@@ -2949,6 +3654,8 @@ impl Hnsw {
             m0: params.m0,
             ef_construction: params.ef_construction,
             len: n,
+            #[cfg(feature = "graph-index")]
+            compact_base: false,
         };
         if n == 0 {
             return g;
@@ -3041,6 +3748,12 @@ impl Hnsw {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "graph-index")]
+    use std::collections::BTreeMap;
+
+    #[cfg(feature = "graph-index")]
+    use proptest::prelude::*;
+
     use super::*;
 
     /// Fixed rotation seed for every Sq4 test plane.
@@ -3379,7 +4092,7 @@ mod tests {
         let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
         let (m0_small, m0_max, efc) = (8usize, 64usize, 200usize);
 
-        let native = Hnsw::build_serial(
+        let native = Hnsw::build_serial_reference(
             &scorer,
             HnswParams {
                 m0: m0_small,
@@ -3387,7 +4100,7 @@ mod tests {
                 ..HnswParams::default()
             },
         );
-        let base = Hnsw::build_serial(
+        let base = Hnsw::build_serial_reference(
             &scorer,
             HnswParams {
                 m0: m0_max,
@@ -3605,6 +4318,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         assert_eq!(
             &bytes[..HNSW_DATA_MAGIC_LEN],
@@ -3695,6 +4411,9 @@ mod tests {
                 "emb",
                 walk,
                 Some(&sq4),
+                Metric::Cosine,
+                None,
+                &[],
             );
             assert_eq!(
                 &bytes[..HNSW_DATA_MAGIC_LEN],
@@ -3722,6 +4441,78 @@ mod tests {
                     graph.search(original, q, 10, 64),
                     idx.graph.search(restored, q, 10, 64),
                     "restored Sq4 bundle search diverged"
+                );
+            }
+        }
+    }
+
+    /// The metric-aware `v06` bundle round-trips a fitted-ruler plane: the
+    /// metric, the single global `(scale, offset)` ruler, and — for L2Sq — the
+    /// per-node norm table, all recovered so a decoded graph scores exactly the
+    /// distances it was built on. Covers both non-cosine metrics: L2Sq (carries
+    /// norms) and NegDot (no norms).
+    #[test]
+    fn hnsw_bundle_roundtrip_v06_metric_aware() {
+        let dim = 20;
+        let n = 800;
+        for metric in [Metric::L2Sq, Metric::NegDot] {
+            // Non-unit vectors so the ruler spans a real range and, under L2Sq,
+            // the per-node norms actually vary.
+            let flat: Vec<f32> = random_unit_vectors(n, dim, 0xA11CE)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .map(|(i, x)| x * (1.0 + (i % 5) as f32))
+                .collect();
+            let scorer = Sq16Scorer::from_fp32_metric(&flat, dim, n, metric);
+            assert_eq!(scorer.served_metric(), metric);
+            assert!(scorer.ruler().is_some(), "a fitted ruler must be present");
+            assert_eq!(
+                scorer.node_norms().len(),
+                if metric == Metric::L2Sq { n } else { 0 },
+                "L2Sq stamps one norm per node; NegDot stamps none"
+            );
+            let graph = Hnsw::build(&scorer, HnswParams::default());
+            let doc_ids: Vec<i128> = (0..n as i128).map(|i| 500 + i * 3).collect();
+            let curve: Vec<(u32, u32)> = vec![(10, 128)];
+            let (rscale, roffset) = scorer.ruler().expect("ruler");
+            let bytes = encode_hnsw(
+                scorer.codes(),
+                &doc_ids,
+                &graph,
+                dim,
+                128,
+                &curve,
+                "emb",
+                WalkCodec::Sq16,
+                None,
+                metric,
+                Some((rscale, roffset)),
+                scorer.node_norms(),
+            );
+            assert_eq!(
+                &bytes[..HNSW_DATA_MAGIC_LEN],
+                HNSW_DATA_MAGIC_V6,
+                "a fitted-ruler bundle stamps the v06 magic"
+            );
+            let idx = decode_hnsw(&Bytes::from(bytes), Some(WalkCodec::Sq16)).expect("decode v06");
+            assert_eq!(idx.scorer.served_metric(), metric, "metric round-trips");
+            let (dscale, doffset) = idx.scorer.ruler().expect("ruler round-trips");
+            assert_eq!(dscale, rscale, "ruler scale round-trips");
+            assert_eq!(doffset, roffset, "ruler offset round-trips");
+            assert_eq!(
+                idx.scorer.node_norms(),
+                scorer.node_norms(),
+                "norm table round-trips"
+            );
+            // The decoded graph scores exactly what the built one does — the
+            // whole point of persisting the ruler + norms rather than a plane on
+            // the wrong grid.
+            for q in random_unit_vectors(15, dim, 0xF00D) {
+                assert_eq!(
+                    graph.search(&scorer, &q, 10, 64),
+                    idx.graph.search(&idx.scorer, &q, 10, 64),
+                    "{metric:?}: metric-aware bundle search diverged"
                 );
             }
         }
@@ -3770,6 +4561,9 @@ mod tests {
                 "emb",
                 walk,
                 sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             );
             let bundle = Bytes::from(bytes);
 
@@ -3856,6 +4650,9 @@ mod tests {
                 "emb",
                 walk,
                 sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             ));
 
             // What maintenance does: hydrate as stored, re-encode on the
@@ -3871,6 +4668,9 @@ mod tests {
                 &prior.column,
                 prior.stored_walk,
                 prior.sq4.as_ref(),
+                Metric::Cosine,
+                None,
+                &[],
             ));
             assert_eq!(
                 first, again,
@@ -3916,6 +4716,9 @@ mod tests {
             column,
             WalkCodec::Sq4,
             Some(&sq4),
+            Metric::Cosine,
+            None,
+            &[],
         );
 
         // Walk the header to the ruler's `step` vector and zero its first
@@ -4142,6 +4945,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         assert_eq!(&v5[..HNSW_DATA_MAGIC_LEN], HNSW_DATA_MAGIC_V5);
 
@@ -4259,6 +5065,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         let idx_off =
             decode_hnsw(&Bytes::from(v5_again), Some(WalkCodec::Sq16)).expect("decode v05 sq8-off");
@@ -4364,6 +5173,9 @@ mod tests {
             "emb",
             WalkCodec::Sq8,
             None,
+            Metric::Cosine,
+            None,
+            &[],
         );
         let idx = decode_hnsw(&Bytes::from(bytes), Some(WalkCodec::Sq8)).expect("decode bundle");
         assert!(
@@ -4508,7 +5320,7 @@ mod tests {
             PayloadKind::Flat as u8,
             "the tag sits directly after the centroid section"
         );
-        for unknown in [3u8, 9, u8::MAX] {
+        for unknown in [4u8, 9, u8::MAX] {
             blob[tag_at] = unknown;
             let got = decode_resident_envelope(&Bytes::from(blob.clone()), true)
                 .expect("an unknown kind must decline the SECTION, not the envelope");
@@ -4565,7 +5377,7 @@ mod tests {
         let threads = rayon::current_num_threads();
 
         let t = Instant::now();
-        let serial = Hnsw::build_serial(&scorer, HnswParams::default());
+        let serial = Hnsw::build_serial_reference(&scorer, HnswParams::default());
         let serial_s = t.elapsed().as_secs_f64();
 
         let t = Instant::now();
@@ -4607,5 +5419,207 @@ mod tests {
             parallel_recall >= serial_recall - 0.05,
             "parallel recall {parallel_recall:.3} regressed vs serial {serial_recall:.3}"
         );
+    }
+
+    // ---------------- single-level adjacency: from_adjacency, compact form, walks ----------------
+    // All behind `graph-index`, as the items they exercise are.
+
+    /// Nodes in the generated adjacency graphs; small, so random edges make
+    /// cycles.
+    #[cfg(feature = "graph-index")]
+    const ADJ_NODES: u32 = 40;
+    /// Edges per generated adjacency graph, at most.
+    #[cfg(feature = "graph-index")]
+    const ADJ_MAX_EDGES: usize = 120;
+    /// Hops a generated walk may take, at most.
+    #[cfg(feature = "graph-index")]
+    const ADJ_MAX_HOPS: u32 = 5;
+    /// Power steps both sides of the PageRank oracle run.
+    #[cfg(feature = "graph-index")]
+    const ADJ_ORACLE_STEPS: usize = 200;
+    /// The oracle's restart probability.
+    #[cfg(feature = "graph-index")]
+    const ADJ_RESTART: f64 = 0.15;
+    /// How far two float sums of the same terms in different orders may
+    /// drift apart.
+    #[cfg(feature = "graph-index")]
+    const ADJ_SCORE_TOLERANCE: f64 = 1e-9;
+
+    /// Adjacency lists over `ADJ_NODES` nodes from an edge list, in edge
+    /// order.
+    #[cfg(feature = "graph-index")]
+    fn adjacency_lists(edges: &[(u32, u32)]) -> Vec<Vec<u32>> {
+        let mut lists = vec![Vec::new(); ADJ_NODES as usize];
+        for &(s, d) in edges {
+            lists[s as usize].push(d);
+        }
+        lists
+    }
+
+    /// The textbook answer: repeated relaxation over the edge list until
+    /// nothing moves, each node's fewest hops from any seed.
+    #[cfg(feature = "graph-index")]
+    fn hop_oracle(edges: &[(u32, u32)], seeds: &[u32], hops: u32) -> BTreeMap<u32, u32> {
+        let mut best: BTreeMap<u32, u32> = seeds.iter().map(|&s| (s, 0)).collect();
+        loop {
+            let mut moved = false;
+            for &(s, d) in edges {
+                if let Some(&h) = best.get(&s)
+                    && h < hops
+                    && best.get(&d).is_none_or(|&cur| h + 1 < cur)
+                {
+                    best.insert(d, h + 1);
+                    moved = true;
+                }
+            }
+            if !moved {
+                return best;
+            }
+        }
+    }
+
+    /// PageRank from `seeds` over the subgraph within `hops`, the textbook
+    /// way: a dense count matrix, row-normalized, power-iterated.
+    #[cfg(feature = "graph-index")]
+    fn dense_pagerank(edges: &[(u32, u32)], seeds: &[u32], hops: u32) -> BTreeMap<u32, f64> {
+        let nodes: Vec<u32> = hop_oracle(edges, seeds, hops).into_keys().collect();
+        let at = |id: u32| nodes.iter().position(|&n| n == id);
+        let n = nodes.len();
+        let mut count = vec![vec![0.0f64; n]; n];
+        for &(s, d) in edges {
+            if let (Some(i), Some(j)) = (at(s), at(d)) {
+                count[i][j] += 1.0;
+            }
+        }
+        let start: Vec<f64> = nodes
+            .iter()
+            .map(|id| {
+                if seeds.contains(id) {
+                    1.0 / seeds.len() as f64
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let mut score = start.clone();
+        for _ in 0..ADJ_ORACLE_STEPS {
+            let mut next: Vec<f64> = start.iter().map(|s| ADJ_RESTART * s).collect();
+            for i in 0..n {
+                let degree: f64 = count[i].iter().sum();
+                let walked = (1.0 - ADJ_RESTART) * score[i];
+                if degree == 0.0 {
+                    for (j, s) in start.iter().enumerate() {
+                        next[j] += walked * s;
+                    }
+                } else {
+                    for j in 0..n {
+                        next[j] += walked * count[i][j] / degree;
+                    }
+                }
+            }
+            score = next;
+        }
+        nodes.into_iter().zip(score).collect()
+    }
+
+    /// A single-level adjacency graph serializes in the compact form and
+    /// reads back with every node's neighbours in order, a degree-0 node
+    /// included; a built HNSW graph keeps the fixed stride and its bytes.
+    #[cfg(feature = "graph-index")]
+    #[test]
+    fn an_adjacency_graph_round_trips_in_the_compact_form() {
+        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); 50];
+        lists[0] = (1..50).collect();
+        lists[3] = vec![0, 0, 7];
+        let graph = Hnsw::from_adjacency(lists.clone());
+        assert_eq!(graph.base_degree(), 49);
+        let bytes = graph.to_bytes();
+        assert_eq!(&bytes[..8], HNSW_GRAPH_MAGIC_CSR);
+        let back = Hnsw::from_bytes(&bytes).expect("decode");
+        for (node, list) in lists.iter().enumerate() {
+            assert_eq!(
+                back.base_neighbors(node as u32),
+                list.as_slice(),
+                "node {node}"
+            );
+        }
+        assert_eq!(back.len(), 50);
+        assert_eq!(back.to_bytes(), bytes, "the form survives a round trip");
+
+        let dim = 8;
+        let vectors = random_unit_vectors(64, dim, 0x5EED);
+        let scorer = Sq16Scorer::from_unit_vectors(&vectors, dim);
+        let built = Hnsw::build(&scorer, HnswParams::default()).to_bytes();
+        assert_eq!(
+            &built[..8],
+            HNSW_GRAPH_MAGIC,
+            "a built graph keeps the fixed stride"
+        );
+    }
+
+    #[cfg(feature = "graph-index")]
+    #[test]
+    fn a_walk_reports_each_node_once_at_its_fewest_hops() {
+        // 1→2→3→4, 2→5, 4→1: the cycle back to the seed does not re-report it.
+        let graph =
+            Hnsw::from_adjacency(adjacency_lists(&[(1, 2), (2, 3), (3, 4), (2, 5), (4, 1)]));
+        assert_eq!(
+            graph.walk_base(&[1], 3, usize::MAX),
+            vec![(1, 0), (2, 1), (3, 2), (5, 2), (4, 3)]
+        );
+        assert_eq!(
+            graph.walk_base(&[1], 3, 2).len(),
+            2,
+            "the limit cuts the nearest first"
+        );
+        assert!(
+            graph.walk_base(&[ADJ_NODES + 5], 3, 10).is_empty(),
+            "a seed past the graph"
+        );
+    }
+
+    #[cfg(feature = "graph-index")]
+    proptest! {
+        /// Against the relaxation oracle on random graphs with cycles,
+        /// self-loops and repeated edges: the same nodes, the same hops.
+        #[test]
+        fn a_walk_matches_the_oracle(
+            edges in prop::collection::vec((0..ADJ_NODES, 0..ADJ_NODES), 1..ADJ_MAX_EDGES),
+            seed_picks in prop::collection::vec(any::<prop::sample::Index>(), 1..4),
+            hops in 0..=ADJ_MAX_HOPS,
+        ) {
+            let graph = Hnsw::from_adjacency(adjacency_lists(&edges));
+            let seeds: Vec<u32> = seed_picks.iter().map(|p| edges[p.index(edges.len())].0).collect();
+            let got: BTreeMap<u32, u32> = graph.walk_base(&seeds, hops, usize::MAX).into_iter().collect();
+            prop_assert_eq!(got, hop_oracle(&edges, &seeds, hops));
+        }
+
+        /// Against a dense-matrix PageRank over the same subgraph — the
+        /// nodes the relaxation oracle reaches, every edge between them
+        /// counted with its multiplicity — run to the same number of steps:
+        /// the same score per node, and the scores sum to one.
+        #[test]
+        fn a_ranking_matches_the_dense_oracle(
+            edges in prop::collection::vec((0..ADJ_NODES, 0..ADJ_NODES), 1..ADJ_MAX_EDGES),
+            seed_picks in prop::collection::vec(any::<prop::sample::Index>(), 1..4),
+            hops in 0..=ADJ_MAX_HOPS,
+        ) {
+            let graph = Hnsw::from_adjacency(adjacency_lists(&edges));
+            let mut seeds: Vec<u32> = seed_picks.iter().map(|p| edges[p.index(edges.len())].0).collect();
+            seeds.sort_unstable();
+            seeds.dedup();
+            let got: BTreeMap<u32, f64> = graph
+                .rank_base(&seeds, hops, usize::MAX, ADJ_RESTART, ADJ_ORACLE_STEPS)
+                .into_iter()
+                .map(|(node, _, score)| (node, score))
+                .collect();
+            let want = dense_pagerank(&edges, &seeds, hops);
+            prop_assert_eq!(got.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>());
+            for (node, score) in &got {
+                prop_assert!((score - want[node]).abs() < ADJ_SCORE_TOLERANCE, "node {node}");
+            }
+            let total: f64 = got.values().sum();
+            prop_assert!((total - 1.0).abs() < ADJ_SCORE_TOLERANCE, "total {total}");
+        }
     }
 }

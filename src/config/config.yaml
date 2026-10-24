@@ -54,13 +54,25 @@ supertable:
   # than the core count. Set 0 to fall back to one piece per writer-pool thread.
   superfile_buffer_split_mb: 64
 
-  # Verify the trailing whole-blob CRC and per-subsection CRCs
-  # on every SuperfileReader::open. Defaults to true. Set to
-  # false only when the underlying storage already validates
-  # checksums (content-addressed object store, ZFS, etc.) —
-  # skipping the scan trades that storage-layer guarantee for
-  # faster cold opens.
-  verify_crc_on_open: true
+  # When the engine verifies a superfile's stored checksums.
+  #
+  #   auto   - verify where bytes arrive and not where they are read, which
+  #            is what Lucene, Elasticsearch and OpenSearch do. The default.
+  #   always - verify the whole blob and every subsection on each open. The
+  #            strictest and by far the most expensive setting.
+  #   never  - never verify; appropriate only where the storage beneath
+  #            already guarantees integrity end to end.
+  #
+  # Left commented deliberately. This file is merged underneath an
+  # operator's own, so setting the key here would make it present in every
+  # configuration, and the deprecated `verify_crc_on_open` below could then
+  # never be reached. Unset, the default comes from the engine instead.
+  # crc_verification: auto
+
+  # Deprecated, still honoured so a configuration naming it keeps the
+  # behaviour it asked for: true means `always`, false means `never`.
+  # `crc_verification` wins when both are set.
+  # verify_crc_on_open: true
 
 # Persistent storage wiring. Defaults to in-memory-only. Set
 # `backend: s3` plus `bucket` / `prefix` to make
@@ -91,6 +103,9 @@ storage:
   #     azure_storage_account_key: ...
   storage_options: {}
 
+  # Directory for temporary files.
+  # Defaults to the system temp directory.
+  scratch_root:
   # When set, storage-backed reads use DiskCacheStore. For S3,
   # lazy_foreground_with_background_fill is the object-store-native
   # cold path: foreground opens/searches with exact range GETs (or zero
@@ -204,31 +219,51 @@ vector:
   search_mode: ivf
 
   # For search_mode = ivf: the cluster router.
-  #   stamped        — DEFAULT. Grid routing to cells, then the manifest's
-  #                    stamped per-cell width. The established path. Honored
-  #                    verbatim (no per-table gating).
-  #   centroid_graph — EXPERIMENTAL: score fine centroids via an HNSW over the
+  #   auto           — DEFAULT. Pick per hidden-vector table at query time:
+  #                    centroid_graph only where it wins (a concentrated
+  #                    calibrated fanout at or above the scale floor), else
+  #                    stamped. The floor is kept equal to hnsw_max_docs so the
+  #                    graph takes over exactly where the resident HNSW drops
+  #                    out. See the two centroid_graph_* thresholds below.
+  #   stamped        — Grid routing to cells, then the manifest's stamped
+  #                    per-cell width. The established path; an explicit opt-out
+  #                    from auto, honored verbatim (no per-table gating).
+  #   centroid_graph — Opt-in: score fine centroids via an HNSW over the
   #                    resident fp32 fine centroids and read the top fanout
   #                    clusters, bypassing the grid. A cold-read win at scale
   #                    (10M+). Forced verbatim on every table.
-  #   auto           — EXPERIMENTAL: pick per hidden-vector table at query time
-  #                    — centroid_graph only where it wins (a concentrated
-  #                    calibrated fanout at large scale), else stamped. See the
-  #                    two centroid_graph_* thresholds below.
-  ivf_router: stamped
+  ivf_router: auto
 
   # For ivf_router = centroid_graph: the NUMBER of fine clusters the
   # query fans out to (globally scored), clamped to the table's cluster
   # total. Higher reads more clusters — more cold bytes, higher recall.
-  # 1024 is the ~0.99 point at 10M; it over-serves smaller tables and
-  # under-serves larger ones (the fanout for a recall target grows ~sqrt(N)),
-  # pending a per-table calibrated stamp. Ignored under ivf_router = stamped.
+  # The default (1024) defers to the per-table stamped fanout_for_k
+  # (auto-calibrated at drain, grows ~sqrt(N) with scale), using 1024 only when
+  # the table carries no stamp. An explicit non-default value overrides that
+  # stamp for the whole table (manual tuning / fanout sweeps), capped at
+  # centroid_graph_max_fanout; an explicit 0 also defers to the stamp so it
+  # never disables an engaged graph. Ignored under ivf_router = stamped.
   global_fine_fanout: 1024
 
   # For ivf_router = centroid_graph: exact-rerank over-fetch multiplier
-  # for this path only (a caller-set rerank_mult still wins). Scoped here so
-  # tuning it never touches the ivf / filtered / user-table defaults.
-  global_fine_rerank_mult: 128
+  # (a caller-set rerank_mult still wins). With global_fine_per_cluster_budget
+  # on (default), applied PER FINE CLUSTER: each scanned cluster keeps
+  # k*rerank_mult candidates, pool = fanout*k*rerank_mult (grid-independent),
+  # all reranked. 12 => ~120/cluster (the 1B knee, recall@10 ~0.98). Scoped to
+  # this path only.
+  global_fine_rerank_mult: 12
+
+  # For ivf_router = centroid_graph: per-cluster rerank budget + rerank-all
+  # (grid-independent) vs the legacy per-cell budget + global 1-bit cut.
+  # On by default.
+  global_fine_per_cluster_budget: true
+
+  # For ivf_router = centroid_graph (per-cluster budget on): minimum pooled,
+  # fully reranked candidate count. Boosts the per-cluster budget at small N
+  # so recall does not turn depth-limited; a no-op at large N. Higher trades
+  # latency for recall, and the cost scales with the vector width (candidate
+  # count, not a byte budget).
+  global_fine_rerank_pool_floor: 30000
 
   # For ivf_router = centroid_graph: coalesce the selected clusters within
   # each cell into contiguous reads. Ignored under ivf_router = stamped.
@@ -247,7 +282,8 @@ vector:
 
   # For ivf_router = auto: the scale floor (hidden-table doc count) below which
   # auto picks stamped. The selected clusters coalesce into a cold-read win only
-  # at large N (measured win at 10M+, loss at 1M). Documented starting point.
+  # at large N (measured win at 10M+, loss at 1M). Documented starting point; a 0
+  # value is rejected at load and reverts to this default.
   centroid_graph_scale_floor_docs: 10000000
 
   # Ceiling on the fanout the router's recall calibration considers: the widest
@@ -256,6 +292,16 @@ vector:
   # of corpus size (total fine clusters grow with N); the width x fine prior
   # stays the sweep's lower seed. Default 4096 (~= 512 * sqrt(N/1e6) at 100M).
   centroid_graph_max_fanout: 4096
+
+  # For ivf_router = auto: how far below hnsw_register_floor the router-fanout
+  # calibration's acceptance bar may relax toward the router's OWN measured
+  # recall ceiling. The router scores the same Sq16 codes as the stamped grid,
+  # so it shares the grid's within-cell recall ceiling; on hard/high-dim data
+  # that ceiling sits below 0.98 (laion-100M: router ~0.973, grid ~0.975), and
+  # an absolute bar would reject the router at parity with the grid it replaces.
+  # 0.03 accepts a router up to 3pt under the floor when that is its ceiling
+  # while still rejecting a collapsed graph. 0 keeps the strict absolute floor.
+  centroid_graph_parity_gap: 0.03
 
   # For search_mode = hnsw_ivf: upper bound on the calibration ef grid. The drain
   # sweeps the ef candidates up to this ceiling and stamps the winning per-table
@@ -393,6 +439,13 @@ vector:
   # Set 0.0 to fall back to the fixed-grid path (cap trigger only).
   cell_split_modality_d: 8.0
 
+  # How much the corpus must grow since the last full recalibration before
+  # optimize runs another one. A split or a lagging rerank law also trigger
+  # it; a drain that only appended rows does not. 0.0 recalibrates on any
+  # growth. Recalibration scans the whole index, so a larger value means
+  # fewer scans on a long incremental build.
+  recal_growth_fraction: 0.5
+
   # How user-superfile clusters align to the global cell grid:
   #   local  — per-superfile k-means (default).
   #   global — cluster c == cell c, so the drain routes cluster → cell
@@ -419,6 +472,21 @@ vector:
   #   kmeans — re-cluster each cell's rows (default).
   #   splice — keep each superfile's local clusters verbatim.
   drain_consolidate: kmeans
+
+  # Drain-side cell assignment path:
+  #   true  — route each row through a centroid HNSW built once per drain
+  #           (default). Reaches the same placement as the exact path but far
+  #           faster as the grid grows; small grids fall back to exact.
+  #   false — kill-switch back to the 1-bit shortlist + exact rescore path.
+  drain_graph_assign: true
+  # Place each drained row in the cell of its nearest FINE centroid (walking the
+  # centroid-router graph, read from the hidden slow-state section) instead of the
+  # nearest coarse cell centroid, so placement matches how the centroid_graph
+  # router routes. Only takes effect when the router resolves to centroid_graph and
+  # the drain graph-assign path is active.
+  #   true  — fine-centroid placement (default).
+  #   false — coarse cell-centroid placement (the isolation switch for a placement A/B).
+  global_fine_drain_placement: true
 
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the
@@ -476,6 +544,12 @@ diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false
 
+  # Emit top-level optimize() phase timers ([optphase]: drain / split / merge /
+  # recalibrate / settle / compact_total / router_cache) and the merge
+  # splice-vs-rebuild split ([optmerge]). A measuring stick for compaction
+  # scaling work.
+  optimize_phase_timers: false
+
   # Emit the FTS builder's finish-phase profile.
   fts_profile: false
 
@@ -506,3 +580,12 @@ memory:
   # A positive value enforces the ceiling (the engine reserves at 90% of it,
   # leaving headroom for small untracked allocations).
   connection_budget_bytes: 0
+
+  # Process-wide limit for SQL, in bytes of anonymous resident memory: a
+  # running statement is refused once the process passes it. The batches a
+  # plan streams between operators are not reserved against the connection
+  # budget above; this is what bounds them. Unset (default) takes 90% of the
+  # process's cgroup memory limit (the lower of memory.high and memory.max up
+  # its cgroup v2 hierarchy), and no limit where there is none. 0 sets no
+  # limit; a positive value is the limit.
+  # process_limit_bytes: 6442450944

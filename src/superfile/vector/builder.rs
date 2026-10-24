@@ -18,39 +18,44 @@ use std::{
     mem::size_of,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use rayon::prelude::*;
-use tempfile::{tempdir, tempdir_in};
+use tempfile::{Builder, TempDir, tempdir_in};
 
-use crate::superfile::{
-    BuildError,
-    format::{
-        self, FST_SEPARATOR, RESERVED_PREFIX,
-        checksum::{crc32c, crc32c_append},
-        vec::{
-            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
-            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+use crate::{
+    config::scratch_root,
+    superfile::{
+        BuildError,
+        format::{
+            self, RESERVED_PREFIX,
+            checksum::{crc32c, crc32c_append},
+            vec::{
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
+                MAGIC_BYTES, U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+            },
+        },
+        vector::{
+            cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
+            distance::{
+                Metric, distance, encode_sq16_adaptive_row, encode_sq16_row,
+                mean_f32_cluster_major, normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
+            },
+            ivf_merge::MergedIvfSubsection,
+            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
+            quant::BitQuantizer,
+            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+            rotation::RandomRotation,
+            spill::{
+                ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+                SpilledCellRows,
+            },
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
     },
-    vector::{
-        cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-        distance::{
-            Metric, distance, encode_sq16_adaptive_row, encode_sq16_row, mean_f32_cluster_major,
-            normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
-        },
-        ivf_merge::MergedIvfSubsection,
-        kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
-        quant::BitQuantizer,
-        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
-        rotation::RandomRotation,
-        spill::{
-            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
-            SpilledCellRows,
-        },
-        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
-    },
+    utils::{terms::validate_column_name, trace::record},
 };
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
@@ -394,7 +399,7 @@ struct ColumnState {
 #[derive(Default)]
 struct ScratchDir {
     parent: Option<PathBuf>,
-    tempdir: Option<tempfile::TempDir>,
+    tempdir: Option<TempDir>,
 }
 
 impl ScratchDir {
@@ -415,9 +420,12 @@ impl ScratchDir {
     fn path(&mut self) -> Result<&Path, BuildError> {
         if self.tempdir.is_none() {
             let tmp = if let Some(parent) = &self.parent {
-                tempfile::TempDir::new_in(parent)?
+                TempDir::new_in(parent)?
             } else {
-                tempfile::tempdir()?
+                let scratch_root = scratch_root();
+                Builder::new()
+                    .prefix("infino-vector-")
+                    .tempdir_in(scratch_root)?
             };
             self.tempdir = Some(tmp);
         }
@@ -451,8 +459,8 @@ impl Default for VectorBuilder {
 }
 
 impl VectorBuilder {
-    /// Construct a builder with the default scratch directory
-    /// (under `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// Construct a builder with the scratch directory at `storage.scratch_root`
+    /// (defaults to the system temp dir when unset) and the
     /// default 256 MiB spill threshold.
     ///
     /// The scratch tempdir is created lazily when the build first
@@ -499,7 +507,7 @@ impl VectorBuilder {
     /// Register a logical vector index up-front. Returns the assigned
     /// `column_id` (declaration order).
     pub fn register_column(&mut self, config: VectorConfig) -> Result<u32, BuildError> {
-        if config.column.as_bytes().contains(&FST_SEPARATOR) {
+        if !validate_column_name(&config.column) {
             return Err(BuildError::ReservedSeparatorInColumnName(config.column));
         }
         if config.column.starts_with(RESERVED_PREFIX) {
@@ -2151,6 +2159,9 @@ fn sample_fp32_rows(vectors: &[f32], sample_size: usize, dim: usize, seed: u64) 
 /// to disk. The single builder behind the drain (spilled rows), the
 /// commit-time cell pack (fp32 buffer), and maintenance rebuilds (in-RAM
 /// encoded rows).
+///
+/// Nothing is fsynced: a caller that reopens the files after a crash syncs
+/// them itself.
 pub(crate) fn build_cell_subsection_from_source(
     cfg: VectorConfig,
     requested_n_cent: usize,
@@ -2224,6 +2235,14 @@ pub(crate) fn build_cell_subsection_from_source(
         partition_kmeans_sample_size(effective_n_cent, n_docs).min(n_docs)
     };
     let chunk_rows = materialized_chunk_rows_for_dim(dim);
+    // Each phase's wall time is recorded on the caller's span; only a span
+    // that declares these fields keeps them (the per-cell drain, merge and
+    // split spans do).
+    let mut phase = Instant::now();
+    let mut end_phase = |field: &'static str| {
+        record(field, phase.elapsed().as_millis() as u64);
+        phase = Instant::now();
+    };
     let sample = match &source {
         CellPackSource::Spilled(spill) => {
             sample_spilled_materialized_rows(spill, sample_size, chunk_rows, cfg.rot_seed)?
@@ -2235,9 +2254,12 @@ pub(crate) fn build_cell_subsection_from_source(
             sample_fp32_rows(vectors, sample_size, dim, cfg.rot_seed)
         }
     };
+    end_phase("sample_ms");
     let (n_cent, centroids) = build_phase_timers::timed(&build_phase_timers::TRAIN_US, || {
         materialized_centroids(&cfg, requested_n_cent, n_docs, &sample)
     });
+    end_phase("train_ms");
+    record("n_cent", n_cent);
     let summary_centroid = mean_f32_cluster_major(&centroids, dim, n_cent);
     let code_bytes = dim.div_ceil(u8::BITS as usize);
     let bucket_dir = tempdir_in(scratch)?;
@@ -2298,13 +2320,12 @@ pub(crate) fn build_cell_subsection_from_source(
         ),
     })?;
     stable_ids.flush()?;
-    stable_ids.get_ref().sync_all()?;
-    for writer in bucket_writers {
-        writer
-            .into_inner()
-            .map_err(|error| BuildError::Io(error.into_error()))?
-            .sync_all()?;
+    // Buckets are read back in this call and dropped with the temp dir, so a
+    // flush to the page cache is enough.
+    for mut writer in bucket_writers {
+        writer.flush()?;
     }
+    end_phase("bucket_ms");
     let quantizers: Vec<(Vec<f32>, Vec<f32>)> = if fit_quantizer {
         (0..n_cent)
             .map(|centroid| {
@@ -2416,6 +2437,7 @@ pub(crate) fn build_cell_subsection_from_source(
         )?;
     }
     output.flush()?;
+    end_phase("write_ms");
     output.seek(SeekFrom::Start(0))?;
     let mut remaining = layout.total_size_before_crc;
     let mut crc = 0u32;
@@ -2429,7 +2451,7 @@ pub(crate) fn build_cell_subsection_from_source(
     output.seek(SeekFrom::Start(layout.total_size_before_crc as u64))?;
     output.write_all(&crc.to_le_bytes())?;
     output.flush()?;
-    output.sync_all()?;
+    end_phase("crc_ms");
     Ok(StreamedIvfSubsection {
         n_docs: n_docs as u32,
         rerank_codec: codec,
@@ -2474,16 +2496,18 @@ fn build_cell_subsection_in_memory(
     requested_n_cent: usize,
     source: CellPackSource<'_>,
 ) -> Result<MergedIvfSubsection, BuildError> {
-    let scratch = tempdir()?;
-    let subsection_path = scratch.path().join("cell.ivf");
-    let stable_ids_path = scratch.path().join("cell.ids");
+    let scratch_dir = tempfile::Builder::new()
+        .prefix("cell-")
+        .tempdir_in(scratch_root())?;
+    let subsection_path = scratch_dir.path().join("cell.ivf");
+    let stable_ids_path = scratch_dir.path().join("cell.ids");
     let built = build_cell_subsection_from_source(
         cfg,
         requested_n_cent,
         source,
         &subsection_path,
         &stable_ids_path,
-        scratch.path(),
+        scratch_dir.path(),
     )?;
     let bytes = fs::read(&subsection_path)?;
     if bytes.len() as u64 != built.subsection_len {
@@ -3773,8 +3797,11 @@ mod tests {
         let reader_b = VectorReader::open(blob_b, &json).expect("open B");
 
         // Merge: B's local ids shift by `na` (its doc_id_offset).
-        let merged = merge_sq8_ivf_subsections(&[(&reader_a, "v", 0), (&reader_b, "v", na as u32)])
-            .expect("merge");
+        let merged = merge_sq8_ivf_subsections(&[
+            (&reader_a, "v", 0, None),
+            (&reader_b, "v", na as u32, None),
+        ])
+        .expect("merge");
         assert_eq!(merged.n_docs as usize, na + nb);
 
         let mut wb = VectorBuilder::new();

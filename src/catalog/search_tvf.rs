@@ -33,9 +33,13 @@ use datafusion::{
 };
 
 use super::Connection;
+#[cfg(feature = "graph-index")]
+use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
+    InfinoError,
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
+        error::QueryError,
         handle::SupertableReader,
         query::exec::{
             common::arg_to_string,
@@ -46,6 +50,24 @@ use crate::{
         },
     },
 };
+
+/// Why the table a search names could not be opened, as a DataFusion error that
+/// keeps its cause: a name that resolves to nothing is the caller's mistake (a
+/// plan error); a storage or credential failure while opening it is not, and
+/// crosses the plan typed.
+fn open_table_error(name: &str, e: InfinoError) -> DataFusionError {
+    let opening = |detail: &str| format!("opening table {name:?} for a search: {detail}");
+    match e {
+        InfinoError::NotFound(detail) => {
+            DataFusionError::Plan(format!("search over unknown table {name:?}: {detail}"))
+        }
+        InfinoError::Io(detail) => QueryError::Store(opening(&detail)).into(),
+        InfinoError::PermissionDenied(detail) => {
+            QueryError::PermissionDenied(opening(&detail)).into()
+        }
+        other => QueryError::Internal(opening(&other.to_string())).into(),
+    }
+}
 
 /// A resolved table's pinned snapshot: the reader the search kernels run
 /// against plus its scalar schema (the TVF's output columns).
@@ -93,24 +115,27 @@ impl TableResolver {
         {
             return Ok(t.clone());
         }
-        let table = self.conn.open_table_handle(name).map_err(|e| {
-            DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
-        })?;
+        let table = self
+            .conn
+            .open_table_handle(name)
+            .map_err(|e| open_table_error(name, e))?;
         // `reader()` applies the read-consistency freshness check itself (and,
         // under Strong, fails rather than serving a stale snapshot), so there
-        // is no separate `ensure_fresh` call here.
-        let mut reader = table.reader().map_err(|e| {
-            DataFusionError::Plan(format!("search over unknown table {name:?}: {e}"))
-        })?;
+        // is no separate `ensure_fresh` call here. A failure is classified
+        // like the open's, so a table purged in between is an unknown table
+        // here too, not a separate `NotFound`.
+        let mut reader = table
+            .reader()
+            .map_err(|e| open_table_error(name, InfinoError::from(e)))?;
         // The mint ran on a runtime thread where the scope's thread-local
         // is invisible; hand it the collector captured at registration.
         reader.op_stats = self.op_stats.clone();
         let resolved = ResolvedTable {
-            reader: Arc::new(reader),
             // Stored shape: search TVF output columns resolve against
             // what Parquet actually holds (index-only FTS columns are
             // not projectable).
-            scalar_schema: table.options().stored_schema(),
+            scalar_schema: reader.manifest().stored_schema(),
+            reader: Arc::new(reader),
         };
         self.cache
             .lock()
@@ -176,6 +201,77 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
         HYBRID_SEARCH_UDTF,
         Arc::new(HybridSearchCatalogFunc { resolver }),
     );
+}
+
+/// Register `graph_walk` / `graph_rank` on `ctx`: the rows of a table of
+/// `tables` within some hops of seed rows, walked over the edge table of
+/// `graph`. Without `edge_table` the functions take the edge table's name
+/// first (`graph_walk('edges', table, seed_table, seed_ids, hops, k)`),
+/// like every search function names its table; with it they take
+/// `(table, seed_table, seed_ids, hops, k)` over that one edge table — the
+/// form a graph attached from another catalog is served in
+/// (`Connection::attach_graph`), where the edge table is not one the
+/// statement could name. Under one catalog `graph` and `tables` are the
+/// same connection.
+#[cfg(feature = "graph-index")]
+pub(crate) fn register_graph_tvfs(
+    ctx: &SessionContext,
+    graph: Connection,
+    tables: Connection,
+    edge_table: Option<String>,
+) {
+    let graph = Arc::new(TableResolver::new(graph));
+    let tables = Arc::new(TableResolver::new(tables));
+    for traversal in [Traversal::Walk, Traversal::Rank] {
+        ctx.register_udtf(
+            traversal.name(),
+            Arc::new(GraphCatalogFunc {
+                graph: Arc::clone(&graph),
+                tables: Arc::clone(&tables),
+                edge_table: edge_table.clone(),
+                traversal,
+            }),
+        );
+    }
+}
+
+#[cfg(feature = "graph-index")]
+#[derive(Debug)]
+struct GraphCatalogFunc {
+    /// Resolves the edge table.
+    graph: Arc<TableResolver>,
+    /// Resolves the table whose rows a walk returns.
+    tables: Arc<TableResolver>,
+    /// The edge table, when fixed at registration; else the leading argument.
+    edge_table: Option<String>,
+    traversal: Traversal,
+}
+
+#[cfg(feature = "graph-index")]
+impl TableFunctionImpl for GraphCatalogFunc {
+    fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
+        let name = self.traversal.name();
+        let (edges, rest) = match &self.edge_table {
+            Some(edge_table) => (self.graph.resolve(edge_table)?, args.exprs()),
+            None => self.graph.split_leading(args.exprs(), name)?,
+        };
+        let first = rest.first().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{name} expects the table whose rows to return: {name}('table', ...)"
+            ))
+        })?;
+        let target_name = arg_to_string(first, &format!("{name} table"))?;
+        let target = self.tables.resolve(&target_name)?;
+
+        GraphFunc::new(
+            edges.reader,
+            target.reader,
+            target_name,
+            target.scalar_schema,
+            self.traversal,
+        )
+        .call_with_args(TableFunctionArgs::new(&rest[1..], args.session()))
+    }
 }
 
 #[derive(Debug)]
@@ -255,5 +351,34 @@ impl TableFunctionImpl for ExactMatchCatalogFunc {
 
         ExactMatchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::datafusion_error;
+
+    /// Only a table name that resolves to nothing is the caller's mistake. A
+    /// table that exists but failed to open is ours, and keeps its cause.
+    #[test]
+    fn a_search_over_a_table_that_failed_to_open_keeps_its_cause() {
+        let public = |e| datafusion_error(&open_table_error("docs", e));
+        assert!(matches!(
+            public(InfinoError::NotFound("docs".into())),
+            InfinoError::Query(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::Io("bucket timed out".into())),
+            InfinoError::Io(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::PermissionDenied("refused".into())),
+            InfinoError::PermissionDenied(_)
+        ));
+        assert!(matches!(
+            public(InfinoError::Backend("manifest list unreadable".into())),
+            InfinoError::Backend(_)
+        ));
     }
 }

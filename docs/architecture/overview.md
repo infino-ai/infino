@@ -22,7 +22,7 @@ Think of three ideas:
 1. **The data is just files.** Every chunk of the table is one
   self-contained file — a *superfile* — that holds the raw columns
    *and* the search indexes (keyword + vector) together. There are no
-   sidecar index files to keep in sync, and the file is also a valid
+   per-file sidecar indexes to keep in sync, and the file is also a valid
    Apache Parquet file, so standard analytics tools (DuckDB,
    DataFusion, pandas/pyarrow) can read it directly.
 2. **Files are never edited, only added.** A *supertable* is described

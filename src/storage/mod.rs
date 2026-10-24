@@ -30,10 +30,14 @@
 //! specifically, re-reads the pointer to capture the winner's
 //! state, and retries the commit on top of it.
 
-use std::{fmt, ops::Range, path::PathBuf, sync::Arc, time::SystemTime};
+use std::{
+    collections::BTreeSet, error::Error as StdError, fmt, io, iter, ops::Range, path::PathBuf,
+    sync::Arc, time::SystemTime,
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use object_store::{ObjectStore, Result as ObjectStoreResult, path::Path as ObjPath};
 use thiserror::Error;
 
 pub mod azure;
@@ -157,10 +161,27 @@ impl StorageError {
 /// *before* it is flattened, so the classification stays typed rather than
 /// matching on message text. Every link in the chain must declare its
 /// `#[source]` / `#[from]` for the walk to reach the bottom.
-pub(crate) fn permission_denied_in_chain(e: &(dyn std::error::Error + 'static)) -> bool {
-    std::iter::successors(Some(e), |e| e.source()).any(|link| {
+pub(crate) fn permission_denied_in_chain(e: &(dyn StdError + 'static)) -> bool {
+    error_chain(e).any(|link| {
         link.downcast_ref::<StorageError>()
             .is_some_and(StorageError::is_permission_denied)
+    })
+}
+
+/// `e` and every error under it, outermost first, for classifying an error by
+/// what caused it.
+///
+/// Steps into an [`io::Error`] by hand: its `source()` returns the source of
+/// the error it wraps, not that error itself, so a storage error carried in an
+/// `io::Error` (as a superfile read carries one) would otherwise be skipped.
+pub(crate) fn error_chain<'a>(
+    e: &'a (dyn StdError + 'static),
+) -> impl Iterator<Item = &'a (dyn StdError + 'static)> {
+    iter::successors(Some(e), |&link| match link.downcast_ref::<io::Error>() {
+        Some(wrapper) => wrapper
+            .get_ref()
+            .map(|inner| inner as &(dyn StdError + 'static)),
+        None => link.source(),
     })
 }
 
@@ -478,6 +499,15 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// absent" on the subsequent [`put_if_match`].
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError>;
 
+    /// Unconditional write — replaces the object if it is already there.
+    ///
+    /// For bytes whose key is derived rather than freshly minted, so a
+    /// retry can legitimately arrive with different content at the same
+    /// key. [`put_atomic`](Self::put_atomic) is the default; reach for this
+    /// only where an existing object is known to be a superseded attempt
+    /// that nothing references.
+    async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError>;
+
     /// Conditional write — succeeds only if the target's
     /// current ETag matches `expected_etag`.
     ///
@@ -554,6 +584,32 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
             .collect())
     }
 
+    /// The names of the immediate child directories of `prefix`, one path
+    /// segment each: the first segment below `prefix` of every object
+    /// stored deeper than a direct child. `""` names the provider's root.
+    /// An open-time primitive, like the listings above; a table uses it to
+    /// find the hidden tables stored under it.
+    ///
+    /// The default derives the names from a full listing under `prefix`.
+    /// The object-store backed providers override it with one delimiter
+    /// listing, which returns the names without listing every object.
+    async fn list_child_prefixes(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let base = match prefix.trim_end_matches('/') {
+            "" => String::new(),
+            trimmed => format!("{trimmed}/"),
+        };
+        let mut names = BTreeSet::new();
+        for (key, _) in self.list_with_prefix_metadata(prefix).await? {
+            if let Some((child, _)) = key
+                .strip_prefix(base.as_str())
+                .and_then(|rest| rest.split_once('/'))
+            {
+                names.insert(child.to_owned());
+            }
+        }
+        Ok(names.into_iter().collect())
+    }
+
     /// Expose the underlying `object_store` handle plus the object
     /// key that `uri` maps to within it, when this provider is backed
     /// by a store DataFusion can range-GET directly.
@@ -604,6 +660,24 @@ pub(crate) fn logical_list_key(provider_prefix: &str, location: &str) -> String 
         .strip_prefix(&prefix)
         .expect("listed object remains under provider prefix")
         .to_owned()
+}
+
+/// The names of the immediate child directories of `path` in `store`: the
+/// common prefixes one delimiter listing returns, each as its last segment.
+/// An empty `path` lists the store's root. Shared by the object-store backed
+/// providers' [`StorageProvider::list_child_prefixes`].
+pub(crate) async fn child_prefix_names(
+    store: &dyn ObjectStore,
+    path: &ObjPath,
+) -> ObjectStoreResult<Vec<String>> {
+    let prefix = (!path.as_ref().is_empty()).then_some(path);
+    let listed = store.list_with_delimiter(prefix).await?;
+    Ok(listed
+        .common_prefixes
+        .iter()
+        .filter_map(ObjPath::filename)
+        .map(str::to_owned)
+        .collect())
 }
 
 /// A wrapper that prepends a sub-prefix to every URI before delegating to an
@@ -673,6 +747,10 @@ impl StorageProvider for PrefixedStorageProvider {
         self.inner.put_atomic(&self.prefixed(uri), bytes).await
     }
 
+    async fn put_overwrite(&self, uri: &str, bytes: bytes::Bytes) -> Result<(), StorageError> {
+        self.inner.put_overwrite(&self.prefixed(uri), bytes).await
+    }
+
     async fn put_if_match(
         &self,
         uri: &str,
@@ -722,6 +800,12 @@ impl StorageProvider for PrefixedStorageProvider {
             .collect())
     }
 
+    async fn list_child_prefixes(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        // The names are single segments below the prefix, so there is
+        // nothing of the sub-prefix to strip from them.
+        self.inner.list_child_prefixes(&self.prefixed(prefix)).await
+    }
+
     fn object_store_handle(
         &self,
         uri: &str,
@@ -745,6 +829,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use object_store::MultipartUpload;
 
     use super::*;
 
@@ -885,6 +970,11 @@ mod tests {
                 Some(b) => Ok(b.slice(range.start as usize..range.end as usize)),
                 None => Err(not_found(uri)),
             }
+        }
+
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.objects.lock().expect("lock").insert(uri.into(), bytes);
+            Ok(())
         }
 
         async fn put_atomic(
@@ -1228,5 +1318,108 @@ mod tests {
         let all = prefixed.list_with_prefix("").await.expect("list all");
         assert_eq!(all.len(), 3);
         assert!(all.iter().all(|k| !k.contains("_infino_test_vector_index")));
+    }
+
+    /// A provider that forwards what it must to a local directory and
+    /// leaves `list_child_prefixes` at the trait default, so the default's
+    /// answer can be held against the delimiter listing's.
+    #[derive(Debug)]
+    struct DefaultChildListing(LocalFsStorageProvider);
+
+    #[async_trait]
+    impl StorageProvider for DefaultChildListing {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.0.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.0.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.0.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.0.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.0.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.0.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.0.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.0.delete(uri).await
+        }
+        async fn list_with_prefix_metadata(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, ObjectMeta)>, StorageError> {
+            self.0.list_with_prefix_metadata(prefix).await
+        }
+    }
+
+    /// The child directories of a prefix are its first-level directory
+    /// names, objects directly under it left out; the delimiter listing,
+    /// the full-listing default and the prefixed wrapper all agree.
+    #[tokio::test]
+    async fn list_child_prefixes_names_the_first_level_directories() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let local = LocalFsStorageProvider::new(dir.path()).expect("localfs");
+        for key in [
+            "top.bin",
+            "_supertable/current",
+            "_infino_a_vector_index/_supertable/current",
+            "_infino_b_ledger/data/x.bin",
+            "_infino_b_ledger/data/y.bin",
+        ] {
+            local
+                .put_atomic(key, Bytes::from_static(b"x"))
+                .await
+                .expect("put");
+        }
+        let want = vec![
+            "_infino_a_vector_index".to_string(),
+            "_infino_b_ledger".to_string(),
+            "_supertable".to_string(),
+        ];
+        let mut got = local.list_child_prefixes("").await.expect("delimiter list");
+        got.sort();
+        assert_eq!(got, want);
+
+        let fallback =
+            DefaultChildListing(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let mut got = fallback
+            .list_child_prefixes("")
+            .await
+            .expect("default list");
+        got.sort();
+        assert_eq!(got, want);
+        assert_eq!(
+            fallback
+                .list_child_prefixes("_infino_b_ledger/")
+                .await
+                .expect("default list below"),
+            vec!["data".to_string()]
+        );
+
+        let prefixed = PrefixedStorageProvider::new(Arc::new(local), "_infino_b_ledger");
+        assert_eq!(
+            prefixed
+                .list_child_prefixes("")
+                .await
+                .expect("prefixed list"),
+            vec!["data".to_string()]
+        );
     }
 }

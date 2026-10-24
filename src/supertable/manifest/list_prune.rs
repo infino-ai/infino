@@ -34,9 +34,13 @@
 
 use crate::{
     superfile::fts::reader::BoolMode,
-    supertable::manifest::{
-        list::{Manifest, ManifestPartEntry},
-        part::PartId,
+    supertable::{
+        manifest::{
+            list::{Manifest, ManifestPartEntry},
+            part::PartId,
+            term_range::prefix_upper_bound,
+        },
+        schema::FieldId,
     },
 };
 
@@ -47,7 +51,7 @@ use crate::{
 /// Parts without an `fts_summary_agg` entry for this column
 /// (no info) survive — same "always-keep" treatment the
 /// list-level pruner gives to missing aggregates.
-pub fn prune_parts_for_fts_prefix(list: &Manifest, column: &str, prefix: &[u8]) -> Vec<PartId> {
+pub fn prune_parts_for_fts_prefix(list: &Manifest, column: FieldId, prefix: &[u8]) -> Vec<PartId> {
     let upper = prefix_upper_bound(prefix);
     list.parts
         .iter()
@@ -63,16 +67,16 @@ pub fn prune_parts_for_fts_prefix(list: &Manifest, column: &str, prefix: &[u8]) 
 
 fn part_overlaps_prefix(
     entry: &ManifestPartEntry,
-    column: &str,
+    column: FieldId,
     prefix: &[u8],
     upper: Option<&[u8]>,
 ) -> bool {
-    let Some(agg) = entry.fts_summary_agg.get(column) else {
+    let Some(agg) = entry.fts_summary_agg.get(&column) else {
         // No info → always-keep.
         return true;
     };
     let Some((min_term, max_term)) = agg.term_range.as_ref() else {
-        // Every superfile had an empty FST for this column;
+        // Every superfile had an empty dictionary for this column;
         // nothing to match. Skip.
         return false;
     };
@@ -82,27 +86,6 @@ fn part_overlaps_prefix(
         return false;
     }
     !matches!(upper, Some(u) if min_term.as_slice() >= u)
-}
-
-/// Compute the lex-upper-bound for a prefix: the smallest
-/// byte string that doesn't start with `prefix`. `None`
-/// signals "no upper bound" (e.g., a prefix of all 0xFF
-/// bytes — every byte string starts with that or has no
-/// successor in lex order).
-///
-/// `[prefix, prefix_upper_bound())` is the set of all byte
-/// strings starting with `prefix`.
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut out = prefix.to_vec();
-    while let Some(&b) = out.last() {
-        if b == 0xff {
-            out.pop();
-        } else {
-            *out.last_mut().expect("non-empty") = b + 1;
-            return Some(out);
-        }
-    }
-    None
 }
 
 /// Filter the list's parts to those whose
@@ -124,7 +107,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 /// `fts_bloom_skip` (applied after a part is loaded).
 pub fn prune_parts_for_fts_terms(
     list: &Manifest,
-    column: &str,
+    column: FieldId,
     query_terms: &[&str],
     mode: BoolMode,
 ) -> Vec<PartId> {
@@ -145,11 +128,11 @@ pub fn prune_parts_for_fts_terms(
 
 fn part_matches_terms(
     entry: &ManifestPartEntry,
-    column: &str,
+    column: FieldId,
     query_terms: &[&str],
     mode: BoolMode,
 ) -> bool {
-    let Some(agg) = entry.fts_summary_agg.get(column) else {
+    let Some(agg) = entry.fts_summary_agg.get(&column) else {
         return true; // no info → always-keep
     };
     let Some(bloom) = agg.term_bloom.as_ref() else {
@@ -193,23 +176,20 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::supertable::{
-        FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
-        manifest::{
-            aggregates,
-            bloom::BloomBuilder,
-            list::{FORMAT_VERSION, PartitionStrategy},
-            part::ContentHash,
+    use crate::{
+        superfile::fts::reader::ColumnLengthStats,
+        supertable::{
+            FtsSummaryAgg, ScalarStatsAgg, SuperfileEntry, SuperfileUri, VectorSummary,
+            manifest::{
+                ScalarStats, aggregates,
+                bloom::BloomBuilder,
+                list::{FORMAT_VERSION, PartitionStrategy},
+                part::ContentHash,
+            },
+            schema::FieldId,
         },
+        test_helpers::fid,
     };
-
-    #[test]
-    fn prefix_upper_bound_basic() {
-        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
-        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
-        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
-        assert_eq!(prefix_upper_bound(b""), None);
-    }
 
     // ---- Helpers for the aggregates::compute and
     //      prune_parts_for_* tests below.
@@ -239,18 +219,20 @@ mod tests {
                 )
             };
             fts.insert(
-                "title".into(),
+                fid("title"),
                 FtsSummaryAgg::new_with_params(
-                    bloom.finish(),
+                    Some(bloom.finish()),
                     title_terms.len() as u32,
                     term_range,
+                    ColumnLengthStats::default(),
+                    None,
                 ),
             );
         }
         let mut vec_summary = HashMap::new();
         if let Some(c) = vec_centroid {
             vec_summary.insert(
-                "emb".into(),
+                fid("emb"),
                 VectorSummary {
                     centroid: c,
                     cells: Vec::new(),
@@ -258,6 +240,7 @@ mod tests {
             );
         }
         Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -265,7 +248,7 @@ mod tests {
             n_docs: ((id_max - id_min) + 1) as u64,
             id_min,
             id_max,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: fts,
             vector_summary: vec_summary,
             partition_key: Vec::new(),
@@ -288,6 +271,8 @@ mod tests {
             id_range: aggs.id_range,
             scalar_stats_agg: aggs.scalar_stats_agg,
             fts_summary_agg: aggs.fts_summary_agg,
+            fts_length_totals: None,
+            summaries: None,
         }
     }
 
@@ -297,25 +282,27 @@ mod tests {
             global_vector_index: None,
             tombstone_seqs: Default::default(),
             superseded_cells: Default::default(),
+            split_checks: Default::default(),
             format_version: FORMAT_VERSION.into(),
             manifest_id: 1,
             options_hash: ContentHash([0u8; 32]),
-            schema: Vec::new(),
+            schema: None,
             id_column: "_id".into(),
-            fts_columns: vec![],
-            vector_columns: vec![],
+            commit_token: Uuid::nil(),
             partition_strategy: PartitionStrategy::Hash {
                 column: "_id".into(),
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
+            term_index: None,
+            term_index_complete: false,
             parts: entries,
         }
     }
@@ -342,20 +329,23 @@ mod tests {
     #[test]
     fn aggregates_compute_fts_term_range_union() {
         // Three superfiles with different term ranges; the
-        // empty-FST one contributes nothing to the union.
+        // empty-dictionary one contributes nothing to the union.
         let s_a = seg(0, 10, &["alpha", "bravo", "charlie"], None);
         let s_b = seg(11, 20, &["bravo", "charlie", "delta"], None);
         let id = Uuid::new_v4();
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
-            "title".into(),
+            fid("title"),
             FtsSummaryAgg::new_with_params(
-                BloomBuilder::with_n_blocks(16).finish(),
+                Some(BloomBuilder::with_n_blocks(16).finish()),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
+                None,
             ),
         );
         let s_c = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -363,7 +353,7 @@ mod tests {
             n_docs: 5,
             id_min: 21,
             id_max: 25,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -373,10 +363,10 @@ mod tests {
         });
 
         let aggs = aggregates::compute(&[s_a, s_b, s_c], None);
-        let fts_agg = aggs.fts_summary_agg.get("title").expect("title agg");
+        let fts_agg = aggs.fts_summary_agg.get(&fid("title")).expect("title agg");
         let (mn, mx) = fts_agg.term_range.as_ref().expect("range");
-        assert_eq!(mn, b"alpha", "min of mins across non-empty FSTs");
-        assert_eq!(mx, b"delta", "max of maxes across non-empty FSTs");
+        assert_eq!(mn, b"alpha", "min of mins across non-empty dictionaries");
+        assert_eq!(mx, b"delta", "max of maxes across non-empty dictionaries");
     }
 
     #[test]
@@ -384,14 +374,17 @@ mod tests {
         let id = Uuid::new_v4();
         let mut empty_fts = HashMap::new();
         empty_fts.insert(
-            "title".into(),
+            fid("title"),
             FtsSummaryAgg::new_with_params(
-                BloomBuilder::with_n_blocks(16).finish(),
+                Some(BloomBuilder::with_n_blocks(16).finish()),
                 0,
                 (Vec::new(), Vec::new()),
+                ColumnLengthStats::default(),
+                None,
             ),
         );
         let s = Arc::new(SuperfileEntry {
+            physical_schema: None,
             stem: None,
             birth_version: 0,
             superfile_id: id,
@@ -399,7 +392,7 @@ mod tests {
             n_docs: 0,
             id_min: 0,
             id_max: 0,
-            scalar_stats: HashMap::new(),
+            scalar_stats: ScalarStats::default(),
             fts_summary: empty_fts,
             vector_summary: HashMap::new(),
             partition_key: Vec::new(),
@@ -412,10 +405,10 @@ mod tests {
         // Column not in the map (skipped entirely) — list-
         // level pruner treats this as "no info, always-keep".
         assert!(
-            !aggs.fts_summary_agg.contains_key("title")
+            !aggs.fts_summary_agg.contains_key(&fid("title"))
                 || aggs
                     .fts_summary_agg
-                    .get("title")
+                    .get(&fid("title"))
                     .expect("agg")
                     .term_range
                     .is_none()
@@ -427,11 +420,12 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_min: i128, ts_lo: i64, ts_hi: i64) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
+            let mut cols: Map<FieldId, ScalarStatsAgg> = Map::new();
             let mn: ArrayRef = Arc::new(Int64Array::from(vec![ts_lo]));
             let mx: ArrayRef = Arc::new(Int64Array::from(vec![ts_hi]));
-            cols.insert("ts".into(), ScalarStatsAgg::from_min_max(mn, mx));
+            cols.insert(fid("ts"), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                physical_schema: None,
                 stem: None,
                 birth_version: 0,
                 superfile_id: id,
@@ -439,7 +433,7 @@ mod tests {
                 n_docs: 1,
                 id_min,
                 id_max: id_min,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -452,7 +446,7 @@ mod tests {
         let aggs = aggregates::compute(&segs, None);
         let s = aggs
             .scalar_stats_agg
-            .get("ts")
+            .get(&fid("ts"))
             .expect("ts scalar agg present");
         // The aggregate min/max are length-1 arrays of the column type.
         assert_eq!(s.min.len(), 1, "ts min must be a length-1 array");
@@ -467,7 +461,7 @@ mod tests {
         use std::collections::HashMap as Map;
         fn make(id_lo: i128, id_hi: i128) -> Arc<SuperfileEntry> {
             let id = Uuid::new_v4();
-            let mut cols: Map<String, ScalarStatsAgg> = Map::new();
+            let mut cols: Map<FieldId, ScalarStatsAgg> = Map::new();
             let mn: ArrayRef = Arc::new(
                 Decimal128Array::from(vec![id_lo])
                     .with_precision_and_scale(38, 0)
@@ -478,8 +472,9 @@ mod tests {
                     .with_precision_and_scale(38, 0)
                     .expect("decimal128"),
             );
-            cols.insert("_id".into(), ScalarStatsAgg::from_min_max(mn, mx));
+            cols.insert(fid("_id"), ScalarStatsAgg::from_min_max(mn, mx));
             Arc::new(SuperfileEntry {
+                physical_schema: None,
                 stem: None,
                 birth_version: 0,
                 superfile_id: id,
@@ -487,7 +482,7 @@ mod tests {
                 n_docs: 1,
                 id_min: id_lo,
                 id_max: id_hi,
-                scalar_stats: cols,
+                scalar_stats: cols.into(),
                 fts_summary: HashMap::new(),
                 vector_summary: HashMap::new(),
                 partition_key: Vec::new(),
@@ -499,7 +494,7 @@ mod tests {
         let segs = vec![make(0, 99), make(100, 199), make(200, 299)];
         let aggs = aggregates::compute(&segs, None);
         assert_eq!(aggs.id_range, (0, 299));
-        assert!(aggs.scalar_stats_agg.contains_key("_id"));
+        assert!(aggs.scalar_stats_agg.contains_key(&fid("_id")));
     }
 
     // ---- list_prune — query-shape correctness.
@@ -526,7 +521,7 @@ mod tests {
         let part2 = entry_from_superfiles(&[seg(21, 30, &["hotel", "kilo", "lima"], None)], 2);
         let list = list_with(vec![part0, part1.clone(), part2]);
 
-        let survivors = prune_parts_for_fts_prefix(&list, "title", b"echo");
+        let survivors = prune_parts_for_fts_prefix(&list, fid("title"), b"echo");
         assert_eq!(survivors.len(), 1);
         assert_eq!(survivors[0], part1.part_id);
     }
@@ -537,7 +532,7 @@ mod tests {
         // always-keep.
         let part = entry_from_superfiles(&[seg(0, 10, &[], None)], 0);
         let list = list_with(vec![part.clone()]);
-        let survivors = prune_parts_for_fts_prefix(&list, "missing", b"any");
+        let survivors = prune_parts_for_fts_prefix(&list, fid("missing"), b"any");
         assert_eq!(survivors, vec![part.part_id]);
     }
 
@@ -559,13 +554,13 @@ mod tests {
         let part1 = entry_from_superfiles(&segs_part1, 1);
         let list = list_with(vec![part0.clone(), part1.clone()]);
 
-        let survivors = prune_parts_for_fts_prefix(&list, "title", b"ban");
+        let survivors = prune_parts_for_fts_prefix(&list, fid("title"), b"ban");
         assert!(
             survivors.contains(&part0.part_id),
             "must keep matching part"
         );
 
-        let survivors2 = prune_parts_for_fts_prefix(&list, "title", b"ec");
+        let survivors2 = prune_parts_for_fts_prefix(&list, fid("title"), b"ec");
         assert!(survivors2.contains(&part1.part_id));
     }
 }

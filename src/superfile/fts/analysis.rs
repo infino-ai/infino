@@ -1,21 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! The per-column analysis chain: a base tokenizer plus optional
+//! The per-column analysis chain: the `standard` tokenizer plus optional
 //! stopword removal and stemming, in that order.
 //!
 //! ## Shape
 //!
-//! A word on names. Here *tokenizer* means the thing that splits text
-//! — `standard` or `ascii_lower` — and *analyzer* means the whole
-//! chain: that tokenizer plus its filters. The public builder's option
-//! is spelled `.analyzer(...)` for historical reasons but takes a
-//! tokenizer name, and the persisted field is spelled `"tokenizer"`,
-//! which is accurate. Before filters existed the two words were
-//! interchangeable for this engine; they no longer are.
+//! Here *tokenizer* means the thing that splits text and *analyzer*
+//! means the whole chain: that tokenizer plus its filters.
 //!
-//! One base tokenizer ([`AsciiLowerTokenizer`] or
-//! [`StandardTokenizer`]) followed by up to two token filters:
+//! The base is always [`StandardTokenizer`], followed by up to two token
+//! filters:
 //! stopwords are removed from the *unstemmed* token, then what
 //! survives is stemmed. The order is not configurable and is baked
 //! into the chain's name, so there is exactly one canonical spelling
@@ -31,9 +26,7 @@
 //!
 //! A column that declares no filter is not wrapped at all
 //! ([`chain_tokenizer`] hands back the bare base tokenizer), keeps its
-//! plain tokenizer name, and takes the same monomorphized ingest scan
-//! it always did. So the default column is byte-identical and
-//! code-path-identical to one declared before chains existed.
+//! plain tokenizer name, and takes the plain monomorphized ingest scan.
 //!
 //! That matters because the default is the parity surface, and it is
 //! not this module's to move. `standard` — tokenize and lowercase,
@@ -46,12 +39,12 @@
 //!
 //! ## Persistence: two additive fields, and a derived identity
 //!
-//! A column persists its base tokenizer name plus, only when set, a
-//! `stopwords` and a `stemmer` field. Both are ordinary additive
-//! fields: absent means the filter is off, which is the one thing a
-//! file written before the filter existed can mean, so a current
-//! reader infers the right analysis from an old file with no special
-//! handling.
+//! A column persists, only when set, a `stopwords` and a `stemmer`
+//! field; the base is not recorded because there is only one. A
+//! recorded `tokenizer` name is checked on read
+//! ([`check_recorded_tokenizer`]): absent or `standard` opens, any
+//! other name refuses the table. Absent `stopwords` / `stemmer` means
+//! the filter is off.
 //!
 //! The chain also has a **name** — `"standard+stop=english+stem=english"`
 //! from [`chain_name`] — but it is derived in memory and never written.
@@ -100,15 +93,14 @@ use std::{any::Any, borrow::Cow, sync::Arc};
 
 use rust_stemmers::{Algorithm, Stemmer as Snowball};
 
-use super::tokenize::{
-    ASCII_LOWER_TOKENIZER, AsciiLowerTokenizer, STANDARD_TOKENIZER, StandardTokenizer, Tokenizer,
-};
+use super::tokenize::{STANDARD_TOKENIZER, StandardTokenizer, Tokenizer};
+use crate::superfile::error::ReadError;
 
 /// Stopword set applied to a column, after the base tokenizer and
 /// before the stemmer.
 ///
 /// Named built-ins only. A user-supplied word list would have to
-/// persist beside the tokenizer name, which is exactly the
+/// persist beside the filter name, which is exactly the
 /// additive-and-ignorable shape the composite name exists to avoid; the
 /// extension path stays open as a future `+stop=custom` name whose
 /// sibling word list an older engine rejects on the unknown name.
@@ -184,6 +176,16 @@ pub(crate) const ENGLISH_STOPWORDS: &[&str] = &[
 const ENGLISH_STOPWORD_MAX_LEN: usize = 5;
 
 impl Stopwords {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The shipped list has not changed since it was introduced, so a
+    /// column filtered by it holds the same terms it always did.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// Whether `token` — already lowercased by the base tokenizer, and
     /// not yet stemmed — is in this set.
     #[inline]
@@ -198,68 +200,54 @@ impl Stopwords {
     }
 }
 
-/// The base tokenizer a chain is built on — the two shipped analyzers,
-/// as a closed enum so the chain can call each one's monomorphized
-/// inherent scan instead of dispatching through `dyn Tokenizer` per
-/// token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Base {
-    /// [`AsciiLowerTokenizer`].
-    AsciiLower,
-    /// [`StandardTokenizer`].
-    Standard,
-}
+/// The `standard` tokenizer's analysis revision (see [`chain_revision`]).
+///
+/// At 1: the token-length cap applies, every entry point folds through
+/// one emitter, and emoji are emitted as tokens. A revision numbers a
+/// chain's output, not the changes that produced it.
+const STANDARD_REVISION: u32 = 1;
 
-impl Base {
-    /// This base's own plain tokenizer name — the chain identity with
-    /// no filters.
-    pub(crate) fn name(self) -> &'static str {
-        chain_name(self, Stopwords::None, Stemmer::None)
-    }
-
-    /// Resolve a base tokenizer name.
-    pub(crate) fn from_name(name: &str) -> Option<Self> {
-        match name {
-            ASCII_LOWER_TOKENIZER => Some(Base::AsciiLower),
-            STANDARD_TOKENIZER => Some(Base::Standard),
-            _ => None,
-        }
-    }
-
-    /// Scan `text` into `(token, position)` pairs where `position` is
-    /// the **gap-inclusive** ordinal: a run the base tokenizer itself
-    /// drops (`ascii_lower`'s non-ASCII rule) still consumes one.
-    ///
-    /// Monomorphized over `F` for the same reason the base tokenizers'
-    /// own `tokenize_each_inline` methods are: the ingest path's
-    /// interning closure has to inline into the scan loop.
-    #[inline]
-    fn scan_positioned<F: FnMut(&str, u64)>(self, text: &str, mut f: F) {
-        match self {
-            Base::AsciiLower => AsciiLowerTokenizer.tokenize_each_inline_positioned(text, f),
-            // `standard` drops nothing — every segment carrying an
-            // alphanumeric is emitted — so its emission ordinal is
-            // already the gap-inclusive position.
-            Base::Standard => {
-                let mut position = 0u64;
-                StandardTokenizer.tokenize_each_inline(text, |tok| {
-                    f(tok, position);
-                    position += 1;
-                });
-            }
-        }
+/// Accept the base-tokenizer name a column recorded, if any.
+///
+/// Only `standard` is reproducible. Aliasing another name to it would
+/// query an index split one way with terms split another, so any other
+/// name refuses the table instead.
+pub(crate) fn check_recorded_tokenizer(
+    column: &str,
+    recorded: Option<&str>,
+) -> Result<(), ReadError> {
+    match recorded {
+        None | Some(STANDARD_TOKENIZER) => Ok(()),
+        Some(name) => Err(ReadError::RemovedAnalyzer {
+            column: column.to_string(),
+            analyzer: name.to_string(),
+        }),
     }
 }
 
-/// A base tokenizer plus its stopword set and stemmer.
+/// Scan `text` with the base tokenizer into `(token, position)` pairs.
+///
+/// `standard` drops nothing — every segment carrying an alphanumeric is
+/// emitted — so its emission ordinal is already the gap-inclusive
+/// position. Monomorphized over `F` so the ingest path's interning
+/// closure inlines into the scan loop.
+#[inline]
+fn scan_positioned<F: FnMut(&str, u64)>(text: &str, mut f: F) {
+    let mut position = 0u64;
+    StandardTokenizer.tokenize_each_inline(text, |tok| {
+        f(tok, position);
+        position += 1;
+    });
+}
+
+/// The base tokenizer plus its stopword set and stemmer.
 ///
 /// Constructed only through [`chain_tokenizer`],
 /// so a `ChainTokenizer` always carries at least one active filter — a
 /// chain with neither is the base tokenizer itself, under the base's own
 /// plain name, and must not be wrapped (wrapping it would change the
-/// persisted name and give up the base's downcast fast path for nothing).
+/// reported name and give up the base's downcast fast path for nothing).
 pub struct ChainTokenizer {
-    base: Base,
     stopwords: Stopwords,
     /// This chain's canonical composite name, from the static table in
     /// [`chain_name`] — which is what keeps [`Tokenizer::name`] able to
@@ -308,13 +296,13 @@ impl ChainTokenizer {
     /// stopword filter removes advances the ordinal without emitting —
     /// the phrase hole.
     ///
-    /// Same role as [`AsciiLowerTokenizer::tokenize_each_inline_positioned`],
-    /// and reached the same way: the FTS build path downcasts through
+    /// Same role as [`StandardTokenizer::tokenize_each_inline`], and
+    /// reached the same way: the FTS build path downcasts through
     /// [`Tokenizer::as_any`] so the interning closure inlines into the
     /// scan instead of paying an indirect call per token.
     #[inline]
     pub fn tokenize_each_inline_positioned<F: FnMut(&str, u64)>(&self, text: &str, mut f: F) {
-        self.base.scan_positioned(text, |tok, position| {
+        scan_positioned(text, |tok, position| {
             if let Some(t) = self.filter(tok) {
                 f(&t, position);
             }
@@ -355,7 +343,7 @@ impl Tokenizer for ChainTokenizer {
     /// [`Self::tokenize_each_inline_positioned`] and not the base's
     /// unfiltered scan; and the `LIKE` lowering, which recognizes a
     /// column's analyzer by [`Tokenizer::name`] and must not mistake a
-    /// stemming column for a plain one (see `Analyzer::of`).
+    /// stemming column for a plain one (see `is_plain_standard`).
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -384,8 +372,8 @@ impl Tokenizer for ChainTokenizer {
     }
 }
 
-/// A chain's identity as one string — the base's plain name when no
-/// filter is active, otherwise the base followed by its filters.
+/// A chain's identity as one string — `standard` when no filter is
+/// active, otherwise `standard` followed by its filters.
 ///
 /// **Derived, never persisted.** It is what [`Tokenizer::name`] reports,
 /// so the three places that reason about a column's analysis as a single
@@ -394,49 +382,70 @@ impl Tokenizer for ChainTokenizer {
 /// back — a chain is only ever built from its components.
 ///
 /// Every reachable string is a `&'static str` here because the built-in
-/// sets are a closed set: two bases × two stopword settings × two
-/// stemmer settings. Component order is fixed (`stop` before `stem`,
+/// sets are a closed set: two stopword settings × two stemmer settings. Component order is fixed (`stop` before `stem`,
 /// matching the order the filters run), so one chain has exactly one
 /// spelling and the options-hash is stable.
-pub(crate) fn chain_name(base: Base, stopwords: Stopwords, stemmer: Stemmer) -> &'static str {
-    match (base, stopwords, stemmer) {
-        (Base::Standard, Stopwords::None, Stemmer::None) => STANDARD_TOKENIZER,
-        (Base::Standard, Stopwords::English, Stemmer::None) => "standard+stop=english",
-        (Base::Standard, Stopwords::None, Stemmer::English) => "standard+stem=english",
-        (Base::Standard, Stopwords::English, Stemmer::English) => {
-            "standard+stop=english+stem=english"
-        }
-        (Base::AsciiLower, Stopwords::None, Stemmer::None) => ASCII_LOWER_TOKENIZER,
-        (Base::AsciiLower, Stopwords::English, Stemmer::None) => "ascii_lower+stop=english",
-        (Base::AsciiLower, Stopwords::None, Stemmer::English) => "ascii_lower+stem=english",
-        (Base::AsciiLower, Stopwords::English, Stemmer::English) => {
-            "ascii_lower+stop=english+stem=english"
-        }
+pub(crate) fn chain_name(stopwords: Stopwords, stemmer: Stemmer) -> &'static str {
+    match (stopwords, stemmer) {
+        (Stopwords::None, Stemmer::None) => STANDARD_TOKENIZER,
+        (Stopwords::English, Stemmer::None) => "standard+stop=english",
+        (Stopwords::None, Stemmer::English) => "standard+stem=english",
+        (Stopwords::English, Stemmer::English) => "standard+stop=english+stem=english",
     }
 }
 
-/// Build the tokenizer for a chain: the bare base tokenizer when no
-/// filter is active, otherwise a [`ChainTokenizer`].
+/// The revision of the terms a chain emits.
 ///
-/// A filterless chain must *not* be wrapped — the wrapper would persist
-/// under a composite name no plain column has and would hide the base
-/// from the build path's downcast, costing ingest throughput for no
-/// behaviour change.
-pub(crate) fn chain_tokenizer(
-    base: Base,
-    stopwords: Stopwords,
-    stemmer: Stemmer,
-) -> Arc<dyn Tokenizer> {
+/// A column's analysis name says *which* analysis produced its postings;
+/// it cannot say which **version** of that analysis, because a name does
+/// not change when the tokens behind it do. Two files can name
+/// `standard` and hold different terms for the same text, and nothing in
+/// the file distinguishes them — so a query analyzed by today's chain can
+/// look up a term an older index never wrote, and match nothing.
+///
+/// This number closes that gap: it is stamped per column and compared
+/// rather than inferred. Bump the component that actually moved whenever a
+/// change can alter the tokens a chain emits for any input — a new
+/// boundary rule, a different fold, a cap, a filter's word list. A change
+/// that cannot alter output (a faster path over identical tokens) leaves it
+/// alone.
+///
+/// The chain's revision is the sum of its parts', so each part moves it
+/// independently — see [`combine_revisions`].
+pub(crate) fn chain_revision(stopwords: Stopwords, stemmer: Stemmer) -> u32 {
+    combine_revisions(STANDARD_REVISION, stopwords.revision(), stemmer.revision())
+}
+
+/// The revision to credit terms whose own is unknown.
+///
+/// The oldest, so a column recording no revision can never read as
+/// current on the strength of an assumption.
+pub(crate) const UNKNOWN_ANALYSIS_REVISION: u32 = 0;
+
+/// Fold a chain's part revisions into the one number the format stores.
+///
+/// Summing rather than taking the maximum is what makes a filter bump
+/// visible: under a maximum, a stemmer moving from 0 to 1 is swallowed by
+/// a base already at 1, so the chain keeps its old revision and every file
+/// analyzed by the old stemmer reads as current.
+fn combine_revisions(base: u32, stopwords: u32, stemmer: u32) -> u32 {
+    base + stopwords + stemmer
+}
+
+/// Build the tokenizer for a chain: the bare [`StandardTokenizer`] when
+/// no filter is active, otherwise a [`ChainTokenizer`].
+///
+/// A filterless chain must *not* be wrapped — the wrapper would report a
+/// composite name no plain column has and would hide the base from the
+/// build path's downcast, costing ingest throughput for no behaviour
+/// change.
+pub(crate) fn chain_tokenizer(stopwords: Stopwords, stemmer: Stemmer) -> Arc<dyn Tokenizer> {
     if stopwords == Stopwords::None && stemmer == Stemmer::None {
-        return match base {
-            Base::AsciiLower => Arc::new(AsciiLowerTokenizer),
-            Base::Standard => Arc::new(StandardTokenizer),
-        };
+        return Arc::new(StandardTokenizer);
     }
     Arc::new(ChainTokenizer {
-        base,
         stopwords,
-        name: chain_name(base, stopwords, stemmer),
+        name: chain_name(stopwords, stemmer),
         snowball: match stemmer {
             Stemmer::None => None,
             Stemmer::English => Some(Snowball::create(Algorithm::English)),
@@ -477,6 +486,16 @@ impl Stopwords {
 }
 
 impl Stemmer {
+    /// This filter's analysis revision (see [`chain_revision`]).
+    ///
+    /// The algorithm is Snowball English via `rust-stemmers`, unchanged
+    /// since it was introduced.
+    pub(crate) fn revision(self) -> u32 {
+        match self {
+            Self::None | Self::English => 0,
+        }
+    }
+
     /// The name this stemmer persists under; see
     /// [`Stopwords::as_str`].
     pub(crate) fn as_str(self) -> Option<&'static str> {
@@ -499,17 +518,16 @@ impl Stemmer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::superfile::format::fts::REPAIR_RELEASE;
 
     /// Build the chain whose derived name is `name`. A test lookup, not
     /// a parser — nothing in the engine turns a name back into
     /// components, because the format stores the components.
     fn chain(name: &str) -> Arc<dyn Tokenizer> {
-        for base in [Base::AsciiLower, Base::Standard] {
-            for stop in [Stopwords::None, Stopwords::English] {
-                for stem in [Stemmer::None, Stemmer::English] {
-                    if chain_name(base, stop, stem) == name {
-                        return chain_tokenizer(base, stop, stem);
-                    }
+        for stop in [Stopwords::None, Stopwords::English] {
+            for stem in [Stemmer::None, Stemmer::English] {
+                if chain_name(stop, stem) == name {
+                    return chain_tokenizer(stop, stem);
                 }
             }
         }
@@ -640,14 +658,12 @@ mod tests {
         // Not merely an optimization: the wrapper would persist under a
         // name no plain column carries, so the round-trip below is the
         // format guarantee that a default column is unchanged.
-        for base in [Base::AsciiLower, Base::Standard] {
-            let tok = chain_tokenizer(base, Stopwords::None, Stemmer::None);
-            assert_eq!(tok.name(), chain_name(base, Stopwords::None, Stemmer::None));
-            assert!(
-                tok.as_any().downcast_ref::<ChainTokenizer>().is_none(),
-                "a filterless chain must not wrap"
-            );
-        }
+        let tok = chain_tokenizer(Stopwords::None, Stemmer::None);
+        assert_eq!(tok.name(), chain_name(Stopwords::None, Stemmer::None));
+        assert!(
+            tok.as_any().downcast_ref::<ChainTokenizer>().is_none(),
+            "a filterless chain must not wrap"
+        );
     }
 
     /// Every chain has a distinct derived name, and the tokenizer built
@@ -658,25 +674,102 @@ mod tests {
     #[test]
     fn every_chain_has_a_distinct_derived_name() {
         let mut seen: Vec<&str> = Vec::new();
-        for base in [Base::AsciiLower, Base::Standard] {
-            for stop in [Stopwords::None, Stopwords::English] {
-                for stem in [Stemmer::None, Stemmer::English] {
-                    let name = chain_name(base, stop, stem);
-                    assert!(!seen.contains(&name), "{name:?} is not unique");
-                    seen.push(name);
-                    assert_eq!(
-                        chain_tokenizer(base, stop, stem).name(),
-                        name,
-                        "{name:?}: the built tokenizer must report its own name"
-                    );
-                }
+        for stop in [Stopwords::None, Stopwords::English] {
+            for stem in [Stemmer::None, Stemmer::English] {
+                let name = chain_name(stop, stem);
+                assert!(!seen.contains(&name), "{name:?} is not unique");
+                seen.push(name);
+                assert_eq!(
+                    chain_tokenizer(stop, stem).name(),
+                    name,
+                    "{name:?}: the built tokenizer must report its own name"
+                );
             }
         }
-        assert_eq!(
-            seen.len(),
-            8,
-            "two bases x two stopword sets x two stemmers"
-        );
+        assert_eq!(seen.len(), 4, "two stopword sets x two stemmers");
+    }
+
+    /// Every shipped chain emits exactly these tokens. A change here is a
+    /// format change: columns already built hold the old terms and would
+    /// be queried with the new ones. Bump the part that moved
+    /// ([`STANDARD_REVISION`] and friends) so a reindex can repair them —
+    /// do not re-record the expectations.
+    ///
+    /// The text covers what separates the chains: case, a hyphen split, a
+    /// digit run, a stopword, an inflected word, and non-ASCII including
+    /// an emoji, which `standard` emits as a token.
+    #[test]
+    fn every_chain_emits_its_recorded_tokens() {
+        const TEXT: &str = "The Quick brown-foxes JUMPED over 42 lazy dogs! Café ☕ naïve";
+        let expected: [(&str, &[&str]); 4] = [
+            (
+                "standard",
+                &[
+                    "the", "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs",
+                    "café", "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stop=english",
+                &[
+                    "quick", "brown", "foxes", "jumped", "over", "42", "lazy", "dogs", "café",
+                    "☕", "naïve",
+                ],
+            ),
+            (
+                "standard+stem=english",
+                &[
+                    "the", "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café",
+                    "☕", "naïv",
+                ],
+            ),
+            (
+                "standard+stop=english+stem=english",
+                &[
+                    "quick", "brown", "fox", "jump", "over", "42", "lazi", "dog", "café", "☕",
+                    "naïv",
+                ],
+            ),
+        ];
+        for (name, want) in expected {
+            assert_eq!(
+                tokens(name, TEXT),
+                want,
+                "{name:?} changed what it emits. This is a format change: \
+                 bump the part that moved rather than re-recording this."
+            );
+        }
+    }
+
+    /// Every chain is at revision 1 today, which is what makes summing the
+    /// parts a no-op for existing files: no column's recorded revision
+    /// changes meaning under the new rule.
+    #[test]
+    fn every_shipped_chain_is_at_revision_one() {
+        for stop in [Stopwords::None, Stopwords::English] {
+            for stem in [Stemmer::None, Stemmer::English] {
+                let name = chain_name(stop, stem);
+                assert_eq!(
+                    chain_revision(stop, stem),
+                    1,
+                    "{name:?} moved off revision 1 — every file it wrote \
+                     reads as stale, so this needs to be deliberate"
+                );
+            }
+        }
+    }
+
+    /// A bump in any one part must move the chain's revision. Taking the
+    /// maximum instead hides a filter bump behind a higher base, so a
+    /// column whose stemmer moved keeps reporting the revision it had and
+    /// a reindex leaves its terms stale.
+    #[test]
+    fn a_chain_revision_moves_when_any_single_part_moves() {
+        let flat = combine_revisions(1, 0, 0);
+        assert_eq!(combine_revisions(2, 0, 0), flat + 1, "base moved");
+        assert_eq!(combine_revisions(1, 1, 0), flat + 1, "stopwords moved");
+        assert_eq!(combine_revisions(1, 0, 1), flat + 1, "stemmer moved");
+        assert_eq!(combine_revisions(2, 1, 1), flat + 3, "every part moved");
     }
 
     /// The persisted field values round-trip, and a value this engine
@@ -738,12 +831,6 @@ mod tests {
 
     #[test]
     fn the_base_tokenizer_still_decides_the_token_alphabet() {
-        // `ascii_lower` drops a non-ASCII run whole and leaves its
-        // ordinal as a hole; the filters run on what survives that.
-        assert_eq!(
-            positioned("ascii_lower+stem=english", "Running café STUDIES"),
-            vec![("run".to_string(), 0), ("studi".to_string(), 2)]
-        );
         // `standard` keeps non-ASCII, and the English stemmer leaves a
         // word it has no rule for alone.
         assert_eq!(
@@ -763,7 +850,6 @@ mod tests {
             "standard+stop=english",
             "standard+stem=english",
             "standard+stop=english+stem=english",
-            "ascii_lower+stop=english+stem=english",
         ] {
             let tok = chain(name);
             let via_tokenize: Vec<String> = tok.tokenize(text).collect();
@@ -780,5 +866,22 @@ mod tests {
                 "{name}: tokenize vs positioned"
             );
         }
+    }
+
+    #[test]
+    fn only_an_absent_or_standard_recorded_tokenizer_is_accepted() {
+        check_recorded_tokenizer("body", None).expect("absent opens");
+        check_recorded_tokenizer("body", Some(STANDARD_TOKENIZER)).expect("standard opens");
+        let msg = check_recorded_tokenizer("body", Some("ascii_lower"))
+            .expect_err("a removed analyzer is refused")
+            .to_string();
+        assert!(
+            msg.contains("\"ascii_lower\"")
+                && msg.contains(&format!(
+                    "copy the table's rows out with infino {REPAIR_RELEASE}"
+                ))
+                && msg.contains("re-create"),
+            "the error names the analyzer, the release to copy out with, and the fix: {msg}"
+        );
     }
 }
