@@ -563,77 +563,116 @@ fn must_lead_should_walk(
         }
     };
     let mut threshold = bar(heap);
-    // The one-optional-term batch's scratch: the block's candidates, their
-    // required scores, and the optional term's tfs at them.
+    // The block batch's scratch: the block's candidates, their required
+    // scores and running sums, the optional terms' tfs at the candidates
+    // still alive, each candidate's contribution per optional term, and each
+    // optional term's maximum over the block with its suffix sums in probe
+    // order.
     let mut cand_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut partial: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut alive: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
+    let mut probe_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut contribs: Vec<f32> = Vec::with_capacity(m * BLOCK_LEN);
+    let mut win = vec![0.0_f32; m];
+    let mut win_suffix = vec![0.0_f32; m + 1];
     while !lead.is_exhausted() {
         let start = lead.current_doc_id();
         let block_end = lead.current_block_last_doc_id();
-        let mut window = f32::INFINITY;
-        if threshold > f32::NEG_INFINITY {
-            window = shoulds
-                .iter_mut()
-                .map(|c| c.block_max_in_range(start, block_end))
-                .sum();
+        let pruning = threshold > f32::NEG_INFINITY;
+        if pruning {
+            for (w, c) in win.iter_mut().zip(shoulds.iter_mut()) {
+                *w = c.block_max_in_range(start, block_end);
+            }
+            let window: f32 = win.iter().sum();
             if lead.current_block_max_bm25() + window <= threshold {
                 lead.skip_to(block_end.saturating_add(1));
                 continue;
             }
         }
-        // One optional term: score the rest of the required block at once,
-        // keep the docs that can clear the bar with the optional term at its
-        // maximum over the block (the walk's own test, against a bound never
-        // tighter than its per-doc one), and probe the optional term for all
-        // of them in one sorted pass. A doc without it adds exactly 0, so the
-        // score is the walk's bits; the bar is the block's opening one, which
-        // admits a superset of what the walk would, each offer checked as the
-        // walk checks it.
-        if m == 1 && filter.is_none() && lead.holds_whole_block() {
+        // The rest of the required block at once: score it, keep the docs
+        // that can clear the bar with every optional term at its maximum over
+        // the block, and probe the optional terms strongest first, each in one
+        // sorted pass over the docs still alive, dropping a doc once what it
+        // has plus what is still unprobed cannot clear the bar. That is the
+        // walk's own test against bounds never tighter than its per-doc ones
+        // (each a block maximum, summed the same way) and a bar never higher
+        // (the block's opening one), so it drops only docs the walk drops.
+        // Contributions are summed in query order, as the walk sums them, a
+        // missing term adding exactly 0, and every offer is checked as the
+        // walk checks it, so the heap ends the same.
+        if filter.is_none() && lead.holds_whole_block() {
             let (from, to) = (lead.pos, lead.block_n);
             cand_docs.clear();
             cand_scores.clear();
             for j in from..to {
                 let d = lead.block_doc_ids[j];
-                let s = bm25::score_with_dl_norm_k1(
+                cand_docs.push(d);
+                cand_scores.push(bm25::score_with_dl_norm_k1(
                     lead.idf_weight,
                     lead.block_tfs[j],
                     dl_norm_k1.get(d),
-                );
-                cand_docs.push(d);
-                cand_scores.push(s);
+                ));
             }
             lead.advance_by(to - from);
-            if threshold > f32::NEG_INFINITY {
-                let mut w = 0usize;
-                for r in 0..cand_docs.len() {
-                    let (d, s) = (cand_docs[r], cand_scores[r]);
-                    cand_docs[w] = d;
-                    cand_scores[w] = s;
-                    w += usize::from(s + window > threshold);
+            let n = cand_docs.len();
+            if pruning {
+                win_suffix[m] = 0.0;
+                for rank in (0..m).rev() {
+                    win_suffix[rank] = win_suffix[rank + 1] + win[order[rank]];
                 }
-                cand_docs.truncate(w);
-                cand_scores.truncate(w);
             }
-            if cand_docs.is_empty() {
-                continue;
+            alive.clear();
+            for (i, &s) in cand_scores.iter().enumerate() {
+                alive.push(i as u16);
+                alive
+                    .truncate(alive.len() - usize::from(pruning && s + win_suffix[0] <= threshold));
             }
-            let should = &mut shoulds[0];
-            cand_tfs.clear();
-            cand_tfs.resize(cand_docs.len(), 0);
-            should.probe_tfs(&cand_docs, &mut cand_tfs);
-            for ((&d, &lead_score), &tf) in cand_docs.iter().zip(&cand_scores).zip(&cand_tfs) {
-                let contrib = match tf {
-                    0 => 0.0,
-                    _ => bm25::score_with_dl_norm_k1(should.idf_weight, tf, dl_norm_k1.get(d)),
-                };
-                let score = lead_score + contrib;
+            partial.clear();
+            partial.extend_from_slice(&cand_scores);
+            contribs.clear();
+            contribs.resize(m * n, 0.0);
+            for (rank, &si) in order.iter().enumerate() {
+                if alive.is_empty() {
+                    break;
+                }
+                let c = &mut shoulds[si];
+                probe_docs.clear();
+                probe_docs.extend(alive.iter().map(|&i| cand_docs[usize::from(i)]));
+                cand_tfs.clear();
+                cand_tfs.resize(probe_docs.len(), 0);
+                c.probe_tfs(&probe_docs, &mut cand_tfs);
+                let mut w = 0usize;
+                for r in 0..alive.len() {
+                    let i = usize::from(alive[r]);
+                    let tf = cand_tfs[r];
+                    let x = match tf {
+                        0 => 0.0,
+                        _ => bm25::score_with_dl_norm_k1(
+                            c.idf_weight,
+                            tf,
+                            dl_norm_k1.get(cand_docs[i]),
+                        ),
+                    };
+                    contribs[si * n + i] = x;
+                    partial[i] += x;
+                    alive[w] = alive[r];
+                    w += usize::from(!(pruning && partial[i] + win_suffix[rank + 1] <= threshold));
+                }
+                alive.truncate(w);
+            }
+            for &i in &alive {
+                let i = usize::from(i);
+                let mut score = cand_scores[i];
+                for si in 0..m {
+                    score += contribs[si * n + i];
+                }
                 if threshold > f32::NEG_INFINITY && score <= threshold {
                     continue;
                 }
                 if score > floor_eff {
-                    and_heap_push(heap, k, None, score, d);
+                    and_heap_push(heap, k, None, score, cand_docs[i]);
                     threshold = bar(heap);
                 }
             }
