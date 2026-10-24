@@ -998,6 +998,25 @@ const BUFFERED_TOPK_MIN_K: usize = 512;
 /// the general must+should walk.
 const MAX_SHOULDS_LED: usize = 16;
 
+/// A rare-led walk's answer when it proved complete, else the floor the
+/// general walk may start from: just under the walk's k-th best. Those `k`
+/// documents are in the union, so the true k-th best is at least that score;
+/// a document tied with it may still win on its id, so the floor sits one
+/// step below. With fewer than `k` documents found there is no floor.
+fn seed_or_hits(
+    hits: Vec<(FtsDocId, f32)>,
+    complete: bool,
+    k: usize,
+) -> Result<Vec<(FtsDocId, f32)>, f32> {
+    if complete {
+        return Ok(hits);
+    }
+    match hits.get(k.wrapping_sub(1)) {
+        Some(&(_, kth)) if k > 0 => Err(kth.next_down()),
+        _ => Err(f32::NEG_INFINITY),
+    }
+}
+
 /// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
 /// every remaining candidate is a doc of `strong`, scored with `weak`'s tf
 /// when the block bound allows and `weak` holds the doc. `weak` is only
@@ -3563,28 +3582,35 @@ impl FtsReader {
             && no_floor
             && two_term_has_rare_anchor(&cursors)
         {
-            if let Some(hits) = self.rare_led_pair(column_id, &cursors, k) {
-                return Ok(hits);
+            match self.rare_led_pair(column_id, &cursors, k) {
+                Ok(hits) => Ok(hits),
+                Err(seed) if seed > f32::NEG_INFINITY => {
+                    self.run_windowed_maxscore(column_id, cursors, k, None, seed, 0, u32::MAX)
+                }
+                Err(_) => self.run_wand_bmw(column_id, cursors, k),
             }
-            self.run_wand_bmw(column_id, cursors, k)
         } else {
+            let mut floor = floor_eff;
             if cursors.len() > 2
                 && cursors.len() - 1 <= MAX_SHOULDS_LED
                 && k <= WAND_BMW_2TERM_MAX_K
                 && filter.is_none()
                 && no_floor
-                && let Some(hits) = self.rare_led(column_id, &cursors, k)
             {
-                return Ok(hits);
+                match self.rare_led(column_id, &cursors, k) {
+                    Ok(hits) => return Ok(hits),
+                    Err(seed) => floor = seed,
+                }
             }
-            self.run_windowed_maxscore(column_id, cursors, k, filter, floor_eff, 0, u32::MAX)
+            self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
         }
     }
 
     /// [`Self::rare_led_pair`] for three or more terms: one term much rarer
-    /// than every other, and first in the windowed kernel's order, leads, the others are probed at its documents, and
-    /// the result stands when the k-th best is strictly above the sum of the
-    /// others' maxima, which bounds any document without the rare term. The
+    /// than every other, and first in the windowed kernel's order, leads,
+    /// the others are probed at its documents, and the result stands when
+    /// the k-th best is strictly above the sum of the others' maxima, which
+    /// bounds any document without the rare term. The
     /// bound is a sum of bounds, rounded, so it may only equal such a
     /// document's score: strictly above, not at, is what rules a tie out.
     fn rare_led(
@@ -3592,7 +3618,7 @@ impl FtsReader {
         column_id: u32,
         cursors: &[TermCursor],
         k: usize,
-    ) -> Option<Vec<(FtsDocId, f32)>> {
+    ) -> Result<Vec<(FtsDocId, f32)>, f32> {
         // The terms in the order the windowed kernel sums them (descending
         // by term maximum, the same sort on the same input, so the same
         // permutation): the walk adds the lead first and the others in the
@@ -3607,14 +3633,14 @@ impl FtsReader {
         });
         let rare = &cursors[order[0]];
         if rare.df == 0 || rare.df > RARE_LED_MAX_DF {
-            return None;
+            return Err(f32::NEG_INFINITY);
         }
         let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
         if others
             .iter()
             .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
         {
-            return None;
+            return Err(f32::NEG_INFINITY);
         }
         let others_max: f32 = others.iter().map(|c| c.term_max_bm25).sum();
         let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
@@ -3629,7 +3655,7 @@ impl FtsReader {
             );
             heap.len() >= k && heap.peek().expect("full heap").0 > others_max
         });
-        complete.then_some(hits)
+        seed_or_hits(hits, complete, k)
     }
 
     /// A two-term OR of a rare term and a much commoner one, answered from
@@ -3650,13 +3676,13 @@ impl FtsReader {
         column_id: u32,
         cursors: &[TermCursor],
         k: usize,
-    ) -> Option<Vec<(FtsDocId, f32)>> {
+    ) -> Result<Vec<(FtsDocId, f32)>, f32> {
         let (rare, common) = match cursors[0].df <= cursors[1].df {
             true => (&cursors[0], &cursors[1]),
             false => (&cursors[1], &cursors[0]),
         };
         if rare.df > RARE_LED_MAX_DF {
-            return None;
+            return Err(f32::NEG_INFINITY);
         }
         let common_max = common.term_max_bm25;
         let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
@@ -3671,7 +3697,7 @@ impl FtsReader {
             );
             heap.len() >= k && heap.peek().expect("full heap").0 >= common_max
         });
-        complete.then_some(hits)
+        seed_or_hits(hits, complete, k)
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
