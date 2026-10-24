@@ -6,17 +6,19 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
-use std::str::from_utf8;
+use std::{collections::BinaryHeap, str::from_utf8};
 
 #[cfg(any(test, feature = "test-helpers"))]
-use super::cursor::{TermCursor, TermMeta};
+use super::cursor::TermMeta;
 use super::{
     core::*,
-    cursor::CursorUse,
+    cursor::{CursorUse, TermCursor},
     filter::AtomExcludeFilter,
+    metadata::NormTable,
     options::BoolMode,
     phrase::AnyCursor,
     search::FetchedTermMemo,
+    sink::{TopKEntry, finish_head},
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
 #[cfg(any(test, feature = "test-helpers"))]
@@ -48,11 +50,27 @@ fn dictionary_fetches(tokens: &[&str], prefetched: Option<&FetchedTermMemo>) -> 
 pub(crate) struct TermIndexFact {
     /// Documents in this superfile containing the term.
     pub(crate) df: u64,
-    /// Upper bound on the term's BM25 score here, at this superfile's own
-    /// statistics.
+    /// The largest key — the length-normalized term frequency at this
+    /// superfile's own average length and parameters, the factor a score
+    /// multiplies the idf by — of a document of the term here.
     pub(crate) bound: f32,
     /// The term's dictionary entry: where its postings sit.
     pub(crate) entry: DictEntry,
+    /// The term's best documents here, to the depth the caller asked for.
+    pub(crate) head: TermHead,
+}
+
+/// What one term contributes to the term index's tier from this
+/// superfile: its best documents by impact and what it holds back.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct TermHead {
+    /// `(row, term frequency, length bucket)` in descending impact, at
+    /// most the depth asked for.
+    pub(crate) docs: Vec<(u32, u32, u8)>,
+    /// The length-normalized term frequency — `tf / (tf + norm)` at this
+    /// file's average length and parameters — of the best document not in
+    /// `docs`; `0.0` when `docs` is the term's whole posting list here.
+    pub(crate) tail: f32,
 }
 
 impl FtsReader {
@@ -420,7 +438,7 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let dict_bytes = self.dict_bytes_async().await?;
-        self.term_index_facts_with(&dict_bytes, column, tokens)
+        self.term_index_facts_with(&dict_bytes, column, tokens, 0)
             .await
     }
 
@@ -431,6 +449,7 @@ impl FtsReader {
         dict_bytes: &[u8],
         column: &str,
         tokens: &[&str],
+        head_depth: usize,
     ) -> Result<Vec<Option<TermIndexFact>>, FtsError> {
         self.debug_assert_own_dict(dict_bytes);
         let column_id = self.resolve_column_id(column)?;
@@ -454,18 +473,66 @@ impl FtsReader {
                 Some(dict_bytes),
             )
             .await?;
+        let norms = col_meta.dl_norm_k1();
         Ok(entries
             .into_iter()
             .zip(cursors)
             .map(|(entry, cursor)| {
-                let cursor = cursor?;
+                let mut cursor = cursor?;
+                // A depth of zero is read as one: an empty head would read
+                // as a term no document carries.
+                let (head, bound) = self.head_of(&mut cursor, norms, head_depth.max(1));
                 Some(TermIndexFact {
                     df: cursor.df,
-                    bound: cursor.term_max_bm25,
+                    bound,
                     entry: entry?,
+                    head,
                 })
             })
             .collect())
+    }
+
+    /// The best `depth` documents of a scored cursor by impact, with the
+    /// best impact left out as the tail, and the largest key among them —
+    /// the term's bound here. Blocks whose maximum cannot beat the running
+    /// `depth`-th impact are skipped undecoded, as the single-term search
+    /// skips them; the cursor is consumed.
+    fn head_of(&self, cursor: &mut TermCursor, norms: &NormTable, depth: usize) -> (TermHead, f32) {
+        // Most terms have a document or two: the heap is sized by what the
+        // term has, up to the depth and the tail.
+        let mut heap: BinaryHeap<TopKEntry<(FtsDocId, u32)>> =
+            BinaryHeap::with_capacity((depth + 1).min(cursor.df as usize + 1));
+        while !cursor.is_exhausted() {
+            if heap.len() > depth
+                && let Some(TopKEntry(min, _)) = heap.peek()
+                && cursor.current_block_max_bm25() <= *min
+            {
+                cursor.skip_blocks_under(0.0, *min, u32::MAX);
+                continue;
+            }
+            let doc = cursor.current_doc_id();
+            let tf = cursor.current_tf();
+            let score = bm25::score_with_dl_norm_k1(cursor.idf_weight, tf, norms.get(doc));
+            if heap.len() <= depth {
+                heap.push(TopKEntry(score, (FtsDocId::new(doc), tf)));
+            } else if let Some(mut worst) = heap.peek_mut()
+                && score > worst.0
+            {
+                *worst = TopKEntry(score, (FtsDocId::new(doc), tf));
+            }
+            cursor.next();
+        }
+        // The key of a document, as the term index orders its tiers, at
+        // the average length and parameters this file scores at.
+        let key = |(id, tf): (FtsDocId, u32)| bm25::tf_factor(tf, norms.get(id.get()));
+        let mut hits = Vec::new();
+        let (bound, tail) = finish_head(&mut heap, depth, &mut hits, key);
+        let buckets = norms.buckets();
+        let docs = hits
+            .into_iter()
+            .map(|((id, tf), _)| (self.row_of(id).get(), tf, buckets[id.get() as usize]))
+            .collect();
+        (TermHead { docs, tail }, bound)
     }
 
     /// Up to `limit` of `column`'s terms after `after` (from the first when
@@ -481,6 +548,7 @@ impl FtsReader {
         column: &str,
         after: Option<&[u8]>,
         limit: usize,
+        head_depth: usize,
     ) -> Result<Vec<(Vec<u8>, Option<TermIndexFact>)>, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         // The walk starts at `after` itself, which the caller already has.
@@ -496,31 +564,31 @@ impl FtsReader {
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
         let col_meta = &self.columns[column_id as usize];
-        // What a cursor built for an inline term would score it at: this
-        // superfile's own idf for df = 1, unweighted.
-        //
-        // A column no row in this superfile filled has no scored documents
-        // and so no inline term to score — `df = 1` against `n_docs = 0` is
-        // not a ratio, so it is not computed. Reachable on a table where one
-        // indexed column is sparse enough to miss a whole superfile.
-        let inline_idf = match col_meta.scored_doc_count() {
-            0 => 0.0,
-            scored => bm25::idf(scored, 1),
-        };
-
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();
         for (term, entry) in entries {
             let fact = match entry {
-                DictEntry::Inline { doc_id, tf } => Some(TermIndexFact {
-                    df: 1,
-                    bound: bm25::score_with_dl_norm_k1(
-                        inline_idf,
-                        col_meta.inline_tf(tf),
-                        col_meta.dl_norm_k1().get(doc_id),
-                    ),
-                    entry,
-                }),
+                DictEntry::Inline { doc_id, tf } => {
+                    // The one posting is the whole list: its key is the
+                    // bound, the head is that document, and nothing is left
+                    // out.
+                    let tf = col_meta.inline_tf(tf);
+                    let bound = bm25::tf_factor(tf, col_meta.dl_norm_k1().get(doc_id));
+                    let head = TermHead {
+                        docs: vec![(
+                            self.row_of(FtsDocId::new(doc_id)).get(),
+                            tf,
+                            col_meta.dl_norm_k1().buckets()[doc_id as usize],
+                        )],
+                        tail: 0.0,
+                    };
+                    Some(TermIndexFact {
+                        df: 1,
+                        bound,
+                        entry,
+                        head,
+                    })
+                }
                 DictEntry::Pfor { .. } => {
                     with_postings.push(out.len());
                     None
@@ -535,7 +603,7 @@ impl FtsReader {
                 .map(|&i| from_utf8(&out[i].0))
                 .collect::<Result<Vec<&str>, _>>()
                 .map_err(|_| FtsError::Read(ReadError::Malformed("non-utf8 term".into())))?;
-            self.term_index_facts_with(dict_bytes, column, &terms)
+            self.term_index_facts_with(dict_bytes, column, &terms, head_depth)
                 .await?
         };
         for (i, fact) in with_postings.into_iter().zip(facts) {
@@ -1327,6 +1395,104 @@ mod tests {
     /// computing an idf for it.
     ///
     /// Sparse columns miss whole superfiles — a compaction or a repair
+    /// The head the term-index walk reports for a term is the engine's own
+    /// top-m for that term, with the first document left out as the tail:
+    /// the same documents, scores and order the ranked search gives.
+    #[tokio::test]
+    async fn term_heads_match_the_single_term_ranking() {
+        const N_DOCS: u32 = 3_000;
+        const DEPTH: usize = 7;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            // A common term in every doc with a varying length, a mid term
+            // in every third doc, a rare term in two, a hapax in one.
+            let mut text = String::from("common");
+            for _ in 0..(i % 11) {
+                text.push_str(" filler");
+            }
+            if i % 3 == 0 {
+                text.push_str(" mid");
+            }
+            if i == 70 || i == 1900 {
+                text.push_str(" rare");
+            }
+            if i == 1234 {
+                text.push_str(" hapax");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let dict_bytes = r.dict_bytes_async().await.expect("dict");
+        let facts = r
+            .term_index_facts_after(&dict_bytes, "body", None, 64, DEPTH)
+            .await
+            .expect("facts");
+        assert_eq!(facts.len(), 5, "common, filler, hapax, mid, rare");
+        for (term, fact) in facts {
+            let term = std::str::from_utf8(&term).expect("utf8").to_owned();
+            let fact = fact.expect("every term has a fact");
+            let ranked = r
+                .search_with_floor("body", &[&term], DEPTH + 1, BoolMode::Or, f32::NEG_INFINITY)
+                .await
+                .expect("ranked");
+            // The head carries facts; scored with the file's own norms and
+            // idf they are the ranking's scores, bit for bit.
+            let norms = r.columns[0].dl_norm_k1();
+            let idf = bm25::idf(u64::from(N_DOCS), fact.df);
+            let got: Vec<(u32, f32)> = fact
+                .head
+                .docs
+                .iter()
+                .map(|&(row, tf, bucket)| {
+                    assert_eq!(bucket, norms.buckets()[row as usize], "{term:?} row {row}");
+                    (row, bm25::score_with_dl_norm_k1(idf, tf, norms.get(row)))
+                })
+                .collect();
+            let want: Vec<(u32, f32)> = ranked
+                .iter()
+                .take(DEPTH)
+                .map(|(row, s)| (row.get(), *s))
+                .collect();
+            assert_eq!(got, want, "head of {term:?} is the top-{DEPTH}");
+            let df = fact.df as usize;
+            assert_eq!(
+                fact.head.tail == 0.0,
+                df <= DEPTH,
+                "{term:?}: df {df} leaves a tail only past the depth"
+            );
+            // The tail is the key of the first document left out: its score
+            // over the idf, which the ranking only knows as a product.
+            let want_tail = match ranked.get(DEPTH) {
+                Some((_, s)) => *s,
+                None => 0.0,
+            };
+            let tail_score = fact.head.tail * idf;
+            assert!(
+                (tail_score - want_tail).abs() <= want_tail.abs() * 1e-5,
+                "tail of {term:?} is the first document left out: {tail_score} vs {want_tail}"
+            );
+            // The bound is the largest key of the term's documents: at
+            // least every head document's, and the tail's.
+            let head_max_key = fact
+                .head
+                .docs
+                .iter()
+                .map(|&(row, tf, _)| bm25::tf_factor(tf, norms.get(row)))
+                .fold(0.0f32, f32::max);
+            assert_eq!(
+                fact.bound, head_max_key,
+                "{term:?}: the bound is the best key"
+            );
+            assert!(
+                fact.head.tail <= fact.bound,
+                "{term:?}: the tail is under the bound"
+            );
+        }
+    }
+
     /// that lands such a shard would otherwise ask for `df = 1` against
     /// `n_docs = 0`, which is not a ratio and trips the scorer's
     /// precondition.
@@ -1348,7 +1514,7 @@ mod tests {
         let dict_bytes = r.dict_bytes_async().await.expect("dict");
 
         let walked = r
-            .term_index_facts_after(&dict_bytes, "empty", None, 16)
+            .term_index_facts_after(&dict_bytes, "empty", None, 16, 0)
             .await
             .expect("walking an empty column must not panic");
         assert!(
@@ -1358,7 +1524,7 @@ mod tests {
 
         // The filled column beside it still reports its terms.
         let filled = r
-            .term_index_facts_after(&dict_bytes, "filled", None, 16)
+            .term_index_facts_after(&dict_bytes, "filled", None, 16, 0)
             .await
             .expect("walk");
         assert!(!filled.is_empty(), "the filled column still has terms");
@@ -1394,7 +1560,7 @@ mod tests {
             let mut after: Option<Vec<u8>> = None;
             loop {
                 let chunk = r
-                    .term_index_facts_after(&dict_bytes, column, after.as_deref(), CHUNK)
+                    .term_index_facts_after(&dict_bytes, column, after.as_deref(), CHUNK, 0)
                     .await
                     .expect("walk");
                 let done = chunk.len() < CHUNK;

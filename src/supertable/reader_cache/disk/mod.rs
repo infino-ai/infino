@@ -441,6 +441,12 @@ pub(crate) use fetch::skip_background_fill;
 pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
 
 impl DiskCacheStore {
+    /// Where a build may spill its scratch: beside the cache, on the disk
+    /// sized for the table, rather than in the system temporary directory.
+    pub(crate) fn scratch_root(&self) -> PathBuf {
+        self.config.cache_root.join("scratch")
+    }
+
     /// Construct a new disk cache rooted at `config.cache_root`
     /// (created if absent) backed by `storage`. `pinned_fn`
     /// returns the currently-pinned URI set on each eviction

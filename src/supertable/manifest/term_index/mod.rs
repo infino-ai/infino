@@ -32,35 +32,38 @@
 
 pub(crate) mod build;
 pub(crate) mod format;
+pub(crate) mod tier;
 
 use std::{
     collections::{HashMap, HashSet},
     fs, io,
     iter::repeat_n,
-    path::{Path, PathBuf},
+    path::Path,
     sync::Arc,
 };
 
-#[cfg(test)]
-pub(crate) use build::build;
 use build::build_segment;
+#[cfg(test)]
+pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, Contribution, ContributionWriter, build_onto, merge_segments,
+    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
+    HeadSink, SliceFile, build, build_onto, merge_segments, scratch_dir, tier_path,
 };
 use bytes::Bytes;
 use format::Segment;
-pub(crate) use format::{Location, Posting, Root, Slice};
+#[cfg(test)]
+pub(crate) use format::TierRef;
+pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
 use thiserror::Error;
-use tokio::fs as async_fs;
+pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
+use tokio::{fs as async_fs, task};
 use uuid::Uuid;
 
 use crate::{
+    runtime_bridge::run_on_pool,
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
-    superfile::{
-        FtsError,
-        fts::{bm25::idf as bm25_idf, reader::BoolMode},
-    },
+    superfile::{FtsError, fts::reader::BoolMode},
     supertable::{
         error::QueryError,
         manifest::{
@@ -83,6 +86,11 @@ pub(crate) const STORAGE_PREFIX: &str = "term-index/";
 /// slice is re-read from the manifest disk cache (a local read) only after
 /// it has fallen out.
 const RESIDENT_SLICE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Most bytes one ranged read of a tier takes: a term's chunks lie back to
+/// back in the tier object and a merge wants them all, so a miss reads a
+/// run of them at once; a longer run is read in pieces this big.
+const TIER_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 /// A stored bound is exact, but a ceiling reaches the query through a
 /// handful of roundings — the idf ratio, its product with the bound, a
@@ -254,6 +262,49 @@ pub(crate) fn slice_uri(hash: &ContentHash) -> String {
     object_uri("slice", hash)
 }
 
+/// Storage URI of a slice's tier object with this content hash.
+/// One chunk of a tier as a merge reads it: its directory and every
+/// block's body, in block order.
+pub(crate) struct TierChunkData {
+    pub(crate) dir: Arc<TierDirectory>,
+    pub(crate) bodies: Vec<Bytes>,
+}
+
+impl TierChunkData {
+    /// Bytes the chunk holds resident: its bodies (the directory is small
+    /// beside them).
+    fn weight(data: &Arc<Self>) -> usize {
+        data.bodies.iter().map(Bytes::len).sum()
+    }
+}
+
+/// The resident tier chunks, keyed by tier object and offset. Tier objects
+/// are content-addressed, so the cache is shared across the roots a table
+/// goes through: a delta commit replaces the root, not the tiers already
+/// read.
+pub(crate) type TierChunkCache = Arc<tokio::sync::Mutex<TierChunks>>;
+
+/// The tier chunks in memory, and the ones a read in flight is about to
+/// put there: a query of a term whose chunks another query is reading
+/// treats them as resident, and its merge then waits for that read rather
+/// than overlapping its opens.
+pub(crate) struct TierChunks {
+    resident: Resident<(ContentHash, u64), Arc<TierChunkData>>,
+    in_flight: HashSet<(ContentHash, u64)>,
+}
+
+/// A tier chunk cache of the resident byte budget.
+pub(crate) fn new_tier_chunk_cache() -> TierChunkCache {
+    Arc::new(tokio::sync::Mutex::new(TierChunks {
+        resident: Resident::new(RESIDENT_SLICE_BUDGET_BYTES, TierChunkData::weight),
+        in_flight: HashSet::new(),
+    }))
+}
+
+pub(crate) fn tier_uri(hash: &ContentHash) -> String {
+    object_uri("tier", hash)
+}
+
 async fn put_content_addressed(
     storage: &dyn StorageProvider,
     kind: &str,
@@ -265,14 +316,6 @@ async fn put_content_addressed(
         bytes,
     )
     .await?)
-}
-
-/// Persist one slice; idempotent by content hash.
-pub(crate) async fn write_slice(
-    storage: &dyn StorageProvider,
-    bytes: Vec<u8>,
-) -> Result<RoutingRef, TermIndexError> {
-    put_content_addressed(storage, "slice", bytes).await
 }
 
 /// Persist the root; idempotent by content hash. Call after every slice it
@@ -296,10 +339,38 @@ pub(crate) async fn write_root(
 )]
 pub(crate) async fn write_slices(
     storage: &dyn StorageProvider,
-    slices: Vec<(ContentHash, Vec<u8>)>,
+    slices: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
-    stream::iter(slices.into_iter().map(|(hash, bytes)| async move {
-        let reference = write_slice(storage, bytes).await?;
+    write_objects(storage, "slice", slices).await
+}
+
+/// Persist every tier chunk and tier list of a build; idempotent by
+/// content hash. Written before the slices that name them, like slices
+/// before the root.
+#[cfg_attr(
+    feature = "detailed-tracing",
+    tracing::instrument(skip_all, fields(tiers = tiers.len()))
+)]
+pub(crate) async fn write_tiers(
+    storage: &dyn StorageProvider,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    write_objects(storage, "tier", tiers).await
+}
+
+async fn write_objects(
+    storage: &dyn StorageProvider,
+    kind: &'static str,
+    objects: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    // A spilled object is read back only as its upload starts, so at most
+    // the uploads in flight are resident at once.
+    stream::iter(objects.into_iter().map(|(hash, built)| async move {
+        let bytes = match built {
+            BuiltBytes::Resident(bytes) => bytes,
+            BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+        };
+        let reference = put_content_addressed(storage, kind, bytes).await?;
         debug_assert_eq!(reference.content_hash, hash);
         Ok::<(), TermIndexError>(())
     }))
@@ -315,6 +386,7 @@ pub(crate) async fn write_built(
     storage: &dyn StorageProvider,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     write_root(storage, &built.root).await
 }
@@ -333,6 +405,7 @@ pub(crate) async fn append_delta(
     policy: &BuildPolicy,
 ) -> Result<RoutingRef, TermIndexError> {
     let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     write_root(storage, &built.root).await
 }
@@ -375,6 +448,7 @@ pub(crate) async fn reserve_segment(
         ordinal_base = base,
     )
     .in_scope(|| build_segment(contributions, policy, base))?;
+    write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
     Ok(ReservedSegment {
         base,
@@ -480,13 +554,15 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
 /// Download every slice of `segments` into `dir`, verified against its
 /// hash, [`SLICE_FETCH_CONCURRENCY`] at a time, and return each segment's
 /// slice files in key order. A slice two segments share is fetched once.
-/// The bytes skip the manifest disk cache: a merge reads each slice once,
-/// and filling the cache with the whole index would evict what queries use.
+/// Each slice's tier object lands in `dir` too, named by [`tier_path`],
+/// so a merge finds it beside the slice. The bytes skip the manifest
+/// disk cache: a merge reads each object once, and filling the cache with
+/// the whole index would evict what queries use.
 pub(crate) async fn download_segments(
     storage: &dyn StorageProvider,
     segments: &[Segment],
     dir: &Path,
-) -> Result<Vec<Vec<PathBuf>>, TermIndexError> {
+) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let path_of = |hash: &ContentHash| dir.join(format!("{}.slice", hash.to_hex()));
     let mut unique: HashSet<ContentHash> = HashSet::new();
     let fetches = segments
@@ -495,6 +571,7 @@ pub(crate) async fn download_segments(
         .filter(|slice| unique.insert(slice.content_hash))
         .map(|slice| {
             let path = path_of(&slice.content_hash);
+            let tier_file = tier_path(dir, &slice.content_hash);
             async move {
                 let bytes = fetch_verified(
                     storage,
@@ -504,6 +581,10 @@ pub(crate) async fn download_segments(
                 )
                 .await?;
                 async_fs::write(&path, &bytes).await?;
+                if let Some(tier) = &slice.tier {
+                    let bytes = fetch_verified(storage, None, &tier_uri(tier), tier).await?;
+                    async_fs::write(&tier_file, &bytes).await?;
+                }
                 Ok::<(), TermIndexError>(())
             }
         });
@@ -517,26 +598,126 @@ pub(crate) async fn download_segments(
             segment
                 .slices
                 .iter()
-                .map(|slice| path_of(&slice.content_hash))
+                .map(|slice| SliceFile {
+                    path: path_of(&slice.content_hash),
+                    first_key: slice.first_key.clone(),
+                    last_key: slice.last_key.clone(),
+                })
                 .collect()
         })
         .collect())
 }
 
-/// Write freshly built slices into `dir`, in order, so a merge can read
-/// them like downloaded ones.
+/// Write freshly built slices into `dir`, each with the key range its
+/// segment entry in `refs` records, so a merge finds them where
+/// [`download_segments`] would have put them.
 pub(crate) fn spill_slices(
     dir: &Path,
-    slices: Vec<(ContentHash, Vec<u8>)>,
-) -> Result<Vec<PathBuf>, TermIndexError> {
+    refs: &[format::SliceRef],
+    slices: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<Vec<SliceFile>, TermIndexError> {
+    let keys_of: HashMap<ContentHash, (&[u8], &[u8])> = refs
+        .iter()
+        .map(|r| {
+            (
+                r.content_hash,
+                (r.first_key.as_slice(), r.last_key.as_slice()),
+            )
+        })
+        .collect();
     slices
         .into_iter()
-        .map(|(hash, bytes)| {
+        .map(|(hash, built)| {
+            let (first_key, last_key) = keys_of.get(&hash).ok_or_else(|| {
+                TermIndexError::Build("a built slice its segment does not list".into())
+            })?;
             let path = dir.join(format!("{}.slice", hash.to_hex()));
-            fs::write(&path, bytes)?;
-            Ok(path)
+            place_built(&path, built)?;
+            Ok(SliceFile {
+                path,
+                first_key: first_key.to_vec(),
+                last_key: last_key.to_vec(),
+            })
         })
         .collect()
+}
+
+/// Put `built` at `path`: a resident object is written, a spilled one is
+/// linked or copied from where the build left it.
+fn place_built(path: &Path, built: BuiltBytes) -> Result<(), TermIndexError> {
+    match built {
+        BuiltBytes::Resident(bytes) => fs::write(path, bytes)?,
+        BuiltBytes::Spilled { path: from, .. } => {
+            if from != path && fs::hard_link(&from, path).is_err() {
+                fs::copy(&from, path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One ranged read of a tier object: the chunks of `refs`, which lie in
+/// `start..end` back to back, parsed and every block verified on the pool.
+/// Returns the bytes fetched and the chunks, each with its place among
+/// the run's chunks.
+async fn read_span(
+    storage: Arc<dyn StorageProvider>,
+    uri: &str,
+    start: u64,
+    end: Option<u64>,
+    refs: Vec<(usize, TierChunkRef)>,
+) -> Result<(u64, Vec<(usize, Arc<TierChunkData>)>), TermIndexError> {
+    let end = end.ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+    let bytes = storage.get_range(uri, start..end).await?;
+    if bytes.len() as u64 != end - start {
+        return Err(TermIndexError::Malformed("short tier read".into()));
+    }
+    let fetched = bytes.len() as u64;
+    let chunks = run_on_pool(None, "tier chunk verify", move || {
+        let mut out = Vec::with_capacity(refs.len());
+        for (i, chunk) in refs {
+            let at = (chunk.offset - start) as usize;
+            let chunk_bytes = bytes.slice(at..at + chunk.len as usize);
+            let dir = Arc::new(TierDirectory::parse(&chunk_bytes, chunk.n_blocks)?);
+            if dir.chunk_len() as u64 != chunk.len {
+                return Err(TermIndexError::Malformed(
+                    "tier chunk directory does not match the run's chunk length".into(),
+                ));
+            }
+            let mut bodies = Vec::with_capacity(dir.n_blocks());
+            for b in 0..dir.n_blocks() {
+                let body = chunk_bytes.slice(dir.block_range(b));
+                dir.verify_block(b, &body)?;
+                bodies.push(body);
+            }
+            out.push((i, Arc::new(TierChunkData { dir, bodies })));
+        }
+        Ok::<_, TermIndexError>(out)
+    })
+    .await
+    .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+    Ok((fetched, chunks))
+}
+
+/// Write freshly built tier objects into `dir`, each beside the spilled
+/// slice of `slices` that names it, so a merge finds them where
+/// [`download_segments`] would have put them.
+pub(crate) fn spill_tiers(
+    dir: &Path,
+    slices: &[format::SliceRef],
+    tiers: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    let slice_of: HashMap<ContentHash, ContentHash> = slices
+        .iter()
+        .filter_map(|s| Some((s.tier?, s.content_hash)))
+        .collect();
+    for (hash, built) in tiers {
+        let slice = slice_of
+            .get(&hash)
+            .ok_or_else(|| TermIndexError::Build("a built tier object no slice names".into()))?;
+        place_built(&tier_path(dir, slice), built)?;
+    }
+    Ok(())
 }
 
 /// Fetch a content-addressed object, through the manifest disk cache when
@@ -582,6 +763,19 @@ pub(crate) async fn load_root(
     Root::decode(&bytes)
 }
 
+/// A term's run from one slice, with the slice's tier object when the
+/// slice has one: what a run's chunk offsets are relative to.
+#[derive(Debug, Clone)]
+pub(crate) struct SliceRun {
+    pub(crate) tier_object: Option<ContentHash>,
+    pub(crate) run: Run,
+}
+
+/// A term's postings across its runs, in segment order.
+pub(crate) fn postings_of(runs: &[SliceRun]) -> impl Iterator<Item = &Posting> {
+    runs.iter().flat_map(|r| r.run.postings.iter())
+}
+
 /// The resident half of the index plus a cache of fetched slices.
 ///
 /// A slice is fetched whole on first use and kept; slices are immutable
@@ -601,15 +795,20 @@ pub(crate) struct TermIndex {
     disk_cache: Option<Arc<ManifestDiskCache>>,
     /// Fetched slices by content hash; see [`RESIDENT_SLICE_BUDGET_BYTES`].
     slices: tokio::sync::Mutex<Resident<ContentHash, Bytes>>,
+    /// Fetched tier chunks — directory and bodies — by `(tier object, chunk
+    /// offset)`, under the same byte budget as the slices. A chunk is the
+    /// unit so a merge's reads cost the set a lookup per region, not per
+    /// block.
+    tier_chunks: TierChunkCache,
     /// Decoded runs by key; see [`RESIDENT_RUNS`]. A std mutex: nothing
     /// awaits while it is held.
-    runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<Posting>>>>,
+    runs: std::sync::Mutex<Resident<Vec<u8>, Arc<Vec<SliceRun>>>>,
 }
 
 /// A bounded resident set, least recently used first out: `weigh` gives
 /// each value's cost against `budget`, and a read refreshes recency, so a
 /// burst that cycles through more than fits keeps what it keeps touching.
-struct Resident<K, V> {
+pub(crate) struct Resident<K, V> {
     map: HashMap<K, (V, u64)>,
     by_use: std::collections::BTreeMap<u64, K>,
     tick: u64,
@@ -628,6 +827,11 @@ impl<K: Eq + std::hash::Hash + Clone, V: Clone> Resident<K, V> {
             budget,
             weigh,
         }
+    }
+
+    /// Whether `key` is held, without counting a use.
+    fn holds(&self, key: &K) -> bool {
+        self.map.contains_key(key)
     }
 
     fn get(&mut self, key: &K) -> Option<V> {
@@ -679,8 +883,16 @@ impl TermIndex {
             storage,
             disk_cache,
             slices: tokio::sync::Mutex::new(Resident::new(RESIDENT_SLICE_BUDGET_BYTES, Bytes::len)),
+            tier_chunks: new_tier_chunk_cache(),
             runs: std::sync::Mutex::new(Resident::new(RESIDENT_RUNS, |_| 1)),
         }
+    }
+
+    /// This index reading tier chunks through `cache`, shared with the
+    /// indexes of the roots before and after it.
+    pub(crate) fn with_tier_chunk_cache(mut self, cache: TierChunkCache) -> Self {
+        self.tier_chunks = cache;
+        self
     }
 
     /// Fetch, verify and parse the root a manifest references, through the
@@ -765,9 +977,8 @@ impl TermIndex {
         mode: BoolMode,
     ) -> Result<HashSet<Uuid>, TermIndexError> {
         let mut out: Option<HashSet<Uuid>> = None;
-        for run in self.postings_many(column, terms).await? {
-            let set: HashSet<Uuid> = run
-                .iter()
+        for runs in self.runs_many(column, terms).await? {
+            let set: HashSet<Uuid> = postings_of(&runs)
                 .filter_map(|p| self.superfile_id(p.superfile))
                 .collect();
             out = Some(match (out, mode) {
@@ -802,47 +1013,42 @@ impl TermIndex {
         terms: &[&str],
         phrases: &[Vec<&str>],
         entries: &[Arc<SuperfileEntry>],
-        idf_used: &(dyn Fn(&str, f32) -> f32 + Sync),
+        idf_used: &(dyn Fn(&str) -> f32 + Sync),
     ) -> Result<HashMap<Uuid, f32>, TermIndexError> {
-        let scored_docs: HashMap<Uuid, u64> = entries
-            .iter()
-            .map(|e| {
-                let n = e
-                    .fts_summary
-                    .get(&column_id)
-                    .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
-                    .unwrap_or(e.n_docs);
-                (e.superfile_id, n)
-            })
-            .collect();
-        // Per term: superfile → (bound rescaled to the query's idf, bound / local idf).
-        let mut per_term: HashMap<&str, HashMap<Uuid, (f32, f32)>> = HashMap::new();
+        // A segment of the layout before tiers stores a bound as a score
+        // at the superfile's own idf: each superfile's scored document
+        // count turns it into the key the current layout stores.
+        let scored_docs = |id: Uuid| -> u64 {
+            entries
+                .iter()
+                .find(|e| e.superfile_id == id)
+                .map_or(0, |e| {
+                    e.fts_summary
+                        .get(&column_id)
+                        .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                        .unwrap_or(e.n_docs)
+                })
+        };
+        // Per term: superfile → the key of its best document there.
+        let mut per_term: HashMap<&str, HashMap<Uuid, f32>> = HashMap::new();
         let mut all_terms: Vec<&str> = terms.to_vec();
         all_terms.extend(phrases.iter().flatten().copied());
         all_terms.sort_unstable();
         all_terms.dedup();
-        let runs = self.postings_many(column_id, &all_terms).await?;
-        for (term, run) in all_terms.into_iter().zip(runs) {
+        let runs = self.runs_many(column_id, &all_terms).await?;
+        for (term, runs) in all_terms.into_iter().zip(runs) {
             let mut by_sf = HashMap::new();
-            for p in run.iter() {
-                let Some(id) = self.superfile_id(p.superfile) else {
-                    continue;
-                };
-                let Some(&n) = scored_docs.get(&id) else {
-                    continue;
-                };
-                let local_idf = bm25_idf(n, p.df.min(n));
-                let ratio = if local_idf > 0.0 {
-                    idf_used(term, local_idf) / local_idf
-                } else {
-                    1.0
-                };
-                let scaled = if local_idf > 0.0 {
-                    p.bound / local_idf
-                } else {
-                    p.bound
-                };
-                by_sf.insert(id, (p.bound * ratio, scaled));
+            for slice_run in runs.iter() {
+                for p in &slice_run.run.postings {
+                    let Some(id) = self.superfile_id(p.superfile) else {
+                        continue;
+                    };
+                    let key = match slice_run.run.legacy_bound {
+                        true => legacy_bound_as_key(p.bound, p.df, scored_docs(id)),
+                        false => p.bound,
+                    };
+                    by_sf.insert(id, key);
+                }
             }
             per_term.insert(term, by_sf);
         }
@@ -855,8 +1061,8 @@ impl TermIndex {
             }
             let mut ceiling = 0.0f32;
             for term in terms {
-                if let Some((rescaled, _)) = per_term.get(term).and_then(|m| m.get(&id)) {
-                    ceiling += rescaled;
+                if let Some(bound) = per_term.get(term).and_then(|m| m.get(&id)) {
+                    ceiling += bound * idf_used(term);
                 }
             }
             for phrase in phrases {
@@ -865,17 +1071,9 @@ impl TermIndex {
                 let mut complete = true;
                 for member in phrase {
                     match per_term.get(member).and_then(|m| m.get(&id)) {
-                        Some((rescaled, scaled)) => {
-                            // rescaled = bound × (idf_used / local_idf); recover idf_used
-                            // from the pair without a second idf call.
-                            let local_scaled = *scaled;
-                            let idf = if local_scaled > 0.0 {
-                                rescaled / local_scaled
-                            } else {
-                                0.0
-                            };
-                            idf_sum += idf;
-                            min_scaled = min_scaled.min(local_scaled);
+                        Some(bound) => {
+                            idf_sum += idf_used(member);
+                            min_scaled = min_scaled.min(*bound);
                         }
                         None => {
                             complete = false;
@@ -912,9 +1110,9 @@ impl TermIndex {
             .filter(|id| self.is_indexed(id))
             .collect();
         let mut out: HashMap<Uuid, Vec<(String, u64, Location)>> = HashMap::new();
-        let runs = self.postings_many(column, terms).await?;
-        for (term, run) in terms.iter().zip(runs) {
-            for p in run.iter() {
+        let runs = self.runs_many(column, terms).await?;
+        for (term, runs) in terms.iter().zip(runs) {
+            for p in postings_of(&runs) {
                 let Some(id) = self.superfile_id(p.superfile) else {
                     continue;
                 };
@@ -975,9 +1173,11 @@ impl TermIndex {
         &self,
         column: FieldId,
         term: &str,
-    ) -> Result<Arc<Vec<Posting>>, TermIndexError> {
-        let mut runs = self.postings_many(column, &[term]).await?;
-        Ok(runs.pop().expect("one run per term asked"))
+    ) -> Result<Vec<Posting>, TermIndexError> {
+        let mut runs = self.runs_many(column, &[term]).await?;
+        Ok(postings_of(&runs.pop().expect("one run per term asked"))
+            .cloned()
+            .collect())
     }
 
     /// [`Self::postings`] for each of `terms`, in the same order.
@@ -991,31 +1191,33 @@ impl TermIndex {
     /// a slice shared by two terms if the resident set evicted it between
     /// them. Each slice's bytes are dropped once its terms are decoded, so
     /// the batch holds at most the in-flight slices beyond the resident set.
-    pub(crate) async fn postings_many(
+    pub(crate) async fn runs_many(
         &self,
         column: FieldId,
         terms: &[&str],
-    ) -> Result<Vec<Arc<Vec<Posting>>>, TermIndexError> {
+    ) -> Result<Vec<Arc<Vec<SliceRun>>>, TermIndexError> {
         let keys: Vec<Vec<u8>> = terms.iter().map(|t| column.term_key(t)).collect();
-        let mut out: Vec<Option<Arc<Vec<Posting>>>> = {
+        let mut out: Vec<Option<Arc<Vec<SliceRun>>>> = {
             let mut resident = self.runs.lock().expect("resident runs lock");
             keys.iter().map(|k| resident.get(k)).collect()
         };
-        // Per missing term, the slices that can hold it in segment order;
-        // per distinct slice, the missing terms it can hold.
+        // Per missing term, the slices that can hold it in segment order,
+        // each with its tier object; per distinct slice, the missing terms
+        // it can hold.
         let mut wanted: Vec<(usize, Vec<ContentHash>)> = Vec::new();
-        let mut by_slice: HashMap<ContentHash, Vec<usize>> = HashMap::new();
+        let mut by_slice: HashMap<ContentHash, (Option<ContentHash>, Vec<usize>)> = HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             if out[i].is_some() {
                 continue;
             }
-            let hashes: Vec<ContentHash> = self
-                .root
-                .slices_for_key(key)
-                .map(|r| r.content_hash)
-                .collect();
-            for hash in &hashes {
-                by_slice.entry(*hash).or_default().push(i);
+            let mut hashes = Vec::new();
+            for r in self.root.slices_for_key(key) {
+                by_slice
+                    .entry(r.content_hash)
+                    .or_insert_with(|| (r.tier, Vec::new()))
+                    .1
+                    .push(i);
+                hashes.push(r.content_hash);
             }
             wanted.push((i, hashes));
         }
@@ -1027,14 +1229,20 @@ impl TermIndex {
                 .collect());
         }
         let keys = &keys;
-        let mut decoded: HashMap<(usize, ContentHash), Vec<Posting>> = stream::iter(by_slice)
-            .map(|(hash, terms_here)| async move {
+        let mut decoded: HashMap<(usize, ContentHash), SliceRun> = stream::iter(by_slice)
+            .map(|(hash, (tier_object, terms_here))| async move {
                 let bytes = self.slice_bytes(&hash).await?;
                 let slice = Slice::open(&bytes)?;
                 let mut found = Vec::new();
                 for i in terms_here {
-                    if let Some(run) = slice.postings(&keys[i])? {
-                        found.push(((i, hash), run));
+                    if let Some(run) = slice.run(&keys[i])? {
+                        let chunked = run.tier.as_ref().is_some_and(|t| !t.chunks.is_empty());
+                        if chunked && tier_object.is_none() {
+                            return Err(TermIndexError::Malformed(
+                                "a run has tier chunks but its slice names no tier object".into(),
+                            ));
+                        }
+                        found.push(((i, hash), SliceRun { tier_object, run }));
                     }
                 }
                 Ok::<_, TermIndexError>(found)
@@ -1047,20 +1255,157 @@ impl TermIndex {
             .await?;
         let mut resident = self.runs.lock().expect("resident runs lock");
         for (i, hashes) in wanted {
-            let mut run = Vec::new();
-            for hash in hashes {
-                if let Some(part) = decoded.remove(&(i, hash)) {
-                    run.extend(part);
-                }
-            }
-            let run = Arc::new(run);
-            resident.insert(keys[i].clone(), Arc::clone(&run));
-            out[i] = Some(run);
+            let runs: Vec<SliceRun> = hashes
+                .into_iter()
+                .filter_map(|hash| decoded.remove(&(i, hash)))
+                .collect();
+            let runs = Arc::new(runs);
+            resident.insert(keys[i].clone(), Arc::clone(&runs));
+            out[i] = Some(runs);
         }
         Ok(out
             .into_iter()
             .map(|run| run.expect("every term resolved above"))
             .collect())
+    }
+
+    /// Every entry of a tier, block by block, in tier order (descending
+    /// impact by block). A query reads a prefix instead; this is the whole
+    /// thing, for tests.
+    #[cfg(test)]
+    pub(crate) async fn tier_entries(
+        &self,
+        object: &ContentHash,
+        tier: &TierRef,
+    ) -> Result<Vec<TierEntry>, TermIndexError> {
+        let mut out = tier.inline.clone();
+        let mut block = Vec::new();
+        let (chunks, _) = self.tier_chunks(object, &tier.chunks).await?;
+        for chunk in &chunks {
+            for (i, body) in chunk.bodies.iter().enumerate() {
+                chunk.dir.decode_block(i, body, &mut block)?;
+                out.extend_from_slice(&block);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The chunks of one term's tier — each its parsed directory and every
+    /// block's body — with the bytes the call fetched. Chunks not resident
+    /// are read in as few ranged reads as their layout allows: the chunks
+    /// of a term lie back to back, so a whole tier is one read of up to
+    /// [`TIER_READ_MAX_BYTES`]. Every directory is verified by its own CRC
+    /// and every block by its own, and all of it is resident afterwards.
+    /// Whether every one of `chunks` in `object` is in memory or being
+    /// read into it, so a read of them costs no storage round trip of this
+    /// query's own.
+    pub(crate) async fn tier_chunks_resident(
+        &self,
+        object: &ContentHash,
+        chunks: &[TierChunkRef],
+    ) -> bool {
+        let cache = self.tier_chunks.lock().await;
+        chunks.iter().all(|c| {
+            let key = (*object, c.offset);
+            cache.resident.holds(&key) || cache.in_flight.contains(&key)
+        })
+    }
+
+    pub(crate) async fn tier_chunks(
+        &self,
+        object: &ContentHash,
+        chunks: &[TierChunkRef],
+    ) -> Result<(Vec<Arc<TierChunkData>>, u64), TermIndexError> {
+        let mut out: Vec<Option<Arc<TierChunkData>>> = Vec::with_capacity(chunks.len());
+        {
+            let mut cache = self.tier_chunks.lock().await;
+            for chunk in chunks {
+                out.push(cache.resident.get(&(*object, chunk.offset)));
+            }
+        }
+        if out.iter().all(Option::is_some) {
+            return Ok((out.into_iter().flatten().collect(), 0));
+        }
+        // Spans of missing chunks that are contiguous in the object.
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if out[i].is_some() {
+                continue;
+            }
+            let end = chunk
+                .offset
+                .checked_add(chunk.len)
+                .ok_or_else(|| TermIndexError::Malformed("tier chunk past its object".into()))?;
+            match spans.last_mut() {
+                Some((first, last))
+                    if *last + 1 == i
+                        && chunks[*last].offset.checked_add(chunks[*last].len)
+                            == Some(chunk.offset)
+                        && end - chunks[*first].offset <= TIER_READ_MAX_BYTES =>
+                {
+                    *last = i;
+                }
+                _ => spans.push((i, i)),
+            }
+        }
+        // Each span: one ranged read, then its chunks parsed and every
+        // block verified on the pool, off this task and off the lock. The
+        // read runs as its own task and lands in the cache when it is done,
+        // whether or not the query that asked still waits: a query whose
+        // opens all finished first moves on, and the next query of the
+        // term finds its chunks in memory.
+        let uri = tier_uri(object);
+        {
+            let mut cache = self.tier_chunks.lock().await;
+            for &(first, last) in &spans {
+                for c in &chunks[first..=last] {
+                    cache.in_flight.insert((*object, c.offset));
+                }
+            }
+        }
+        let fetches: Vec<_> = spans
+            .into_iter()
+            .map(|(first, last)| {
+                let uri = uri.clone();
+                let refs: Vec<(usize, TierChunkRef)> = chunks
+                    .iter()
+                    .enumerate()
+                    .take(last + 1)
+                    .skip(first)
+                    .map(|(i, c)| (i, c.clone()))
+                    .collect();
+                let start = chunks[first].offset;
+                let end = chunks[last].offset.checked_add(chunks[last].len);
+                let storage = Arc::clone(&self.storage);
+                let cache = Arc::clone(&self.tier_chunks);
+                let object = *object;
+                let keys: Vec<(ContentHash, u64)> =
+                    refs.iter().map(|(_, c)| (object, c.offset)).collect();
+                task::spawn(async move {
+                    let read = read_span(storage, &uri, start, end, refs).await;
+                    let mut cache = cache.lock().await;
+                    for key in &keys {
+                        cache.in_flight.remove(key);
+                    }
+                    let (fetched, chunks) = read?;
+                    for (key, (_, data)) in keys.iter().zip(&chunks) {
+                        cache.resident.insert(*key, Arc::clone(data));
+                    }
+                    Ok::<_, TermIndexError>((fetched, chunks))
+                })
+            })
+            .collect();
+        let mut fetched = 0u64;
+        for handle in fetches {
+            let (bytes, span_chunks) = handle
+                .await
+                .map_err(|e| TermIndexError::Open(QueryError::Internal(e.to_string())))??;
+            fetched += bytes;
+            for (i, data) in span_chunks {
+                out[i] = Some(data);
+            }
+        }
+        Ok((out.into_iter().flatten().collect(), fetched))
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until
@@ -1109,12 +1454,14 @@ mod tests {
     use tokio::time::sleep;
 
     use super::{
+        build::TIER_INLINE_MAX,
         format::{ROOT_MAGIC, Segment, SliceRef},
         *,
     };
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions,
         storage::{LocalFsStorageProvider, ObjectMeta},
+        superfile::fts::bm25,
         supertable::{
             Supertable,
             manifest::{
@@ -1157,22 +1504,691 @@ mod tests {
                     len: 800,
                 },
             };
-            w.push(key, *df, f32::INFINITY, location).expect("push");
+            w.push(key, *df, f32::INFINITY, location, 0.0, &[])
+                .expect("push");
         }
         w.finish().expect("finish")
+    }
+
+    /// A contribution whose terms carry heads: `(column, term, docs)` with
+    /// each doc `(row, weight)`; df is the doc count and the head is
+    /// complete when `complete_up_to` covers it.
+    /// The facts a fixture document of weight `w` is planted with: a term
+    /// frequency of a hundred times the weight at length bucket zero, so
+    /// the key orders like the weight.
+    fn facts_of(w: f32) -> (u32, u8) {
+        ((w * 100.0).round() as u32, 0)
+    }
+
+    /// The tier key of a fixture document of weight `w`, at the scoring
+    /// the fixtures plant their heads at.
+    fn key_of(w: f32) -> f32 {
+        let (tf, len) = facts_of(w);
+        ColumnScoring::default().key(tf, len)
+    }
+
+    fn contribution_with_heads(
+        dir: &TempDir,
+        id: u128,
+        terms: &[(&str, &str, Vec<(u32, f32)>)],
+        complete_up_to: usize,
+    ) -> Contribution {
+        let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(id), id as i128 * 1000)
+            .expect("create");
+        let mut keyed: Vec<(Vec<u8>, &str, &Vec<(u32, f32)>)> = terms
+            .iter()
+            .map(|(c, t, docs)| (fid(c).term_key(t), *c, docs))
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        for (key, column, docs) in keyed {
+            w.set_scoring(fid(column), ColumnScoring::default());
+            let mut sorted = docs.clone();
+            sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let bound = sorted.first().map(|d| key_of(d.1)).unwrap_or(0.0);
+            let complete = sorted.len() <= complete_up_to;
+            let kept: Vec<(u32, u32, u8)> = sorted
+                .iter()
+                .take(complete_up_to)
+                .map(|&(row, w)| {
+                    let (tf, len) = facts_of(w);
+                    (row, tf, len)
+                })
+                .collect();
+            let tail = if complete {
+                0.0
+            } else {
+                key_of(sorted[complete_up_to].1)
+            };
+            w.push(&key, docs.len() as u64, bound, Location::None, tail, &kept)
+                .expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// A built object's bytes, wherever the build kept them.
+    fn bytes_of(built: &BuiltBytes) -> Vec<u8> {
+        built.read().expect("built bytes")
+    }
+
+    /// The entries of `tier`: inline, or read from the first slice's tier
+    /// object among `built_tiers` (these fixtures build one slice).
+    fn tier_entries_of(
+        segment: &Segment,
+        built_tiers: &[(ContentHash, BuiltBytes)],
+        tier: &format::TierRef,
+    ) -> Vec<tier::TierEntry> {
+        if tier.chunks.is_empty() {
+            return tier.inline.clone();
+        }
+        let object = segment.slices[0]
+            .tier
+            .as_ref()
+            .expect("the slice has a tier object");
+        let bytes = bytes_of(
+            &built_tiers
+                .iter()
+                .find(|(h, _)| h == object)
+                .expect("the tier object is among the built")
+                .1,
+        );
+        let mut out = Vec::new();
+        for chunk in &tier.chunks {
+            let range = chunk.offset as usize..(chunk.offset + chunk.len) as usize;
+            tier::TierChunk::verify(&bytes[range.clone()], chunk.n_blocks).expect("crc");
+            tier::TierChunk::open(&bytes[range], chunk.n_blocks)
+                .expect("open chunk")
+                .entries(&mut out)
+                .expect("decode");
+        }
+        out
+    }
+
+    #[test]
+    fn a_build_pools_the_heads_into_a_tier_and_raises_tails_when_it_truncates() {
+        let dir = TempDir::new().expect("tempdir");
+        // Three superfiles; "alpha" has three docs in each, "beta" one.
+        let docs = |base: f32| vec![(1, base + 0.3), (5, base + 0.2), (9, base + 0.1)];
+        let a = contribution_with_heads(
+            &dir,
+            1,
+            &[
+                ("body", "alpha", docs(1.0)),
+                ("body", "beta", vec![(2, 0.5)]),
+            ],
+            8,
+        );
+        let b = contribution_with_heads(&dir, 2, &[("body", "alpha", docs(2.0))], 8);
+        let c = contribution_with_heads(&dir, 3, &[("body", "alpha", docs(3.0))], 8);
+        let policy = BuildPolicy {
+            slice_target_bytes: usize::MAX,
+            tier_entries_per_term: 4,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[a, b, c], &policy).expect("build");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
+        let alpha = slice
+            .run(&fid("body").term_key("alpha"))
+            .expect("run")
+            .expect("alpha is indexed");
+        let tier = alpha.tier.expect("alpha has a tier");
+        // Nine entries over three superfiles against a budget of four: the
+        // depth drops to one for every superfile alike, so each keeps its
+        // best document and the tier holds three.
+        assert_eq!(tier.inline.len(), 3, "one per superfile under the budget");
+        assert!(
+            alpha.postings.iter().all(|p| p.tail > 0.0),
+            "a truncated tier leaves every superfile a tail"
+        );
+        let entries = tier_entries_of(&built.root.segments[0], &built.tiers, &tier);
+        let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![(0, 1), (1, 1), (2, 1)], "each superfile's best");
+        // Each superfile's tail is the key of the best document it dropped.
+        let tail = |sf: u32| {
+            alpha
+                .postings
+                .iter()
+                .find(|p| p.superfile == sf)
+                .expect("posting")
+                .tail
+        };
+        assert_eq!(tail(0), key_of(1.2));
+        assert_eq!(tail(1), key_of(2.2));
+        assert_eq!(tail(2), key_of(3.2));
+        let beta = slice
+            .run(&fid("body").term_key("beta"))
+            .expect("run")
+            .expect("beta is indexed");
+        let beta_tier = beta.tier.expect("beta has a tier");
+        assert!(
+            beta.postings.iter().all(|p| p.tail == 0.0),
+            "one doc under the budget leaves no tail"
+        );
+        assert_eq!(
+            tier_entries_of(&built.root.segments[0], &built.tiers, &beta_tier).len(),
+            1
+        );
+        // Both tiers are a few entries: they ride in their runs, and the
+        // slice has no tier object.
+        assert!(tier.chunks.is_empty() && beta_tier.chunks.is_empty());
+        let segment = &built.root.segments[0];
+        assert_eq!(segment.slices.len(), 1);
+        assert!(segment.slices[0].tier.is_none(), "nothing to chunk");
+        assert!(built.tiers.is_empty());
+    }
+
+    /// Six hundred terms in one contribution, docs scored off `id`: with
+    /// slices cut small there are many boundaries to shard at, and heads
+    /// both inline and chunked.
+    fn shard_contribution(dir: &TempDir, id: u128) -> Contribution {
+        let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = terms
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                (
+                    "body",
+                    t.as_str(),
+                    docs(id as f32 + i as f32 * 0.001, 2 + (i % 20) as u32),
+                )
+            })
+            .collect();
+        contribution_with_heads(dir, id, &entries, 64)
+    }
+
+    /// The policy the shard tests build and merge under: slices cut small.
+    fn shard_policy() -> BuildPolicy {
+        BuildPolicy {
+            slice_target_bytes: 2048,
+            tier_entries_per_term: 100_000,
+            ..BuildPolicy::default()
+        }
+    }
+
+    /// Every term of a merged output: its postings and its tier's entries.
+    fn merged_terms(
+        m: &build::MergedSegment,
+    ) -> Vec<(Vec<u8>, Vec<Posting>, Vec<(u32, u32, u32, u8)>)> {
+        let mut out = Vec::new();
+        for (i, (_, bytes)) in m.slices.iter().enumerate() {
+            let bytes = bytes_of(bytes);
+            let slice = Slice::open(&bytes).expect("open");
+            for (key, run) in slice.terms_after(None, usize::MAX).expect("terms") {
+                let mut entries: Vec<tier::TierEntry> = match &run.tier {
+                    None => Vec::new(),
+                    Some(t) if t.chunks.is_empty() => t.inline.clone(),
+                    Some(t) => {
+                        let object = m.segment.slices[i].tier.expect("a tier object");
+                        let object = bytes_of(
+                            &m.tiers
+                                .iter()
+                                .find(|(h, _)| *h == object)
+                                .expect("the tier object is among the built")
+                                .1,
+                        );
+                        let mut all = Vec::new();
+                        for chunk in &t.chunks {
+                            let range = chunk.offset as usize..(chunk.offset + chunk.len) as usize;
+                            let mut block = Vec::new();
+                            tier::TierChunk::open(&object[range], chunk.n_blocks)
+                                .expect("chunk")
+                                .entries(&mut block)
+                                .expect("entries");
+                            all.extend(block);
+                        }
+                        all
+                    }
+                };
+                let mut entries: Vec<(u32, u32, u32, u8)> = entries
+                    .drain(..)
+                    .map(|e| (e.superfile, e.doc_id, e.tf, e.len))
+                    .collect();
+                entries.sort_unstable();
+                out.push((key, run.postings, entries));
+            }
+        }
+        out
+    }
+
+    /// A merge of `sources` in four shards writes the terms the one-writer
+    /// merge writes, each with the same postings and tier entries, in
+    /// slices that follow each other in key order.
+    fn assert_shards_match_one_writer(
+        sources: &[Vec<SliceFile>],
+        ordinals: &[Option<u32>],
+        policy: &BuildPolicy,
+    ) {
+        let merge = |shards: usize| {
+            let policy = BuildPolicy {
+                merge_shards: Some(shards),
+                ..policy.clone()
+            };
+            merge_segments(sources, ordinals, &policy).expect("merge")
+        };
+        let (one, many) = (merge(1), merge(4));
+        assert!(
+            many.segment.slices.len() >= 4,
+            "{} slices from the shards",
+            many.segment.slices.len()
+        );
+        let ranges: Vec<(&[u8], &[u8])> = many
+            .segment
+            .slices
+            .iter()
+            .map(|s| (s.first_key.as_slice(), s.last_key.as_slice()))
+            .collect();
+        assert!(
+            ranges.windows(2).all(|w| w[0].1 < w[1].0),
+            "the shards' slices follow each other in key order"
+        );
+        let (a, b) = (merged_terms(&one), merged_terms(&many));
+        assert_eq!(a.len(), b.len(), "the same terms");
+        assert_eq!(a, b, "the same postings and entries per term");
+    }
+
+    /// A merge cut into key-range shards writes the terms one writer over
+    /// everything writes: every key's postings and tier entries agree, and
+    /// the shards' slices follow each other in key order.
+    #[test]
+    fn a_sharded_merge_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = shard_policy();
+        let built = build(
+            &[shard_contribution(&dir, 1), shard_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let segment = built.root.segments[0].clone();
+        assert!(segment.slices.len() >= 8, "{} slices", segment.slices.len());
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
+        let sources = vec![
+            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
+        ];
+        assert_shards_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
+    }
+
+    /// The same over two source segments, a base and a delta built onto
+    /// it, whose slices are cut at different keys: each shard takes the
+    /// slices of each segment that reach into it and interleaves them.
+    #[test]
+    fn a_sharded_merge_over_two_segments_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = shard_policy();
+        let base = build(&[shard_contribution(&dir, 1)], &policy).expect("base");
+        let delta = build_onto(
+            base.root.clone(),
+            &[shard_contribution(&dir, 2), shard_contribution(&dir, 3)],
+            &policy,
+        )
+        .expect("delta");
+        let (base_refs, delta_refs) = (
+            &base.root.segments[0].slices,
+            &delta.root.segments[1].slices,
+        );
+        assert!(base_refs.len() >= 4 && delta_refs.len() >= 4);
+        assert_ne!(
+            base_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
+            delta_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
+            "the segments' slices are cut at different keys"
+        );
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), base_refs, base.tiers).expect("place base tiers");
+        spill_tiers(scratch.path(), delta_refs, delta.tiers).expect("place delta tiers");
+        let sources = vec![
+            spill_slices(scratch.path(), base_refs, base.slices).expect("place base"),
+            spill_slices(scratch.path(), delta_refs, delta.slices).expect("place delta"),
+        ];
+        assert_shards_match_one_writer(&sources, &[Some(0), Some(1), Some(2)], &policy);
+    }
+
+    /// A tier of more than a few entries is chunked into the slice's tier
+    /// object; one of a few rides in the run. A merge keeps each where it
+    /// belongs and renumbers the inline entries like the chunked ones.
+    #[test]
+    fn a_tier_of_a_few_entries_rides_in_the_run() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let per_file = (TIER_INLINE_MAX / 2 + 1) as u32;
+        let make = |id: u128| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "common", docs(id as f32, per_file)),
+                    ("body", "rare", docs(0.5, 2)),
+                ],
+                1000,
+            )
+        };
+        let policy = BuildPolicy {
+            slice_target_bytes: usize::MAX,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[make(1), make(2)], &policy).expect("build");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
+        let run_of = |term: &str| {
+            slice
+                .run(&fid("body").term_key(term))
+                .expect("run")
+                .expect("indexed")
+        };
+        let common = run_of("common").tier.expect("tier");
+        let rare = run_of("rare").tier.expect("tier");
+        assert!(
+            !common.chunks.is_empty() && common.inline.is_empty(),
+            "more than a few entries are chunked"
+        );
+        assert!(
+            rare.chunks.is_empty() && rare.inline.len() == 4,
+            "a few entries ride in the run: {rare:?}"
+        );
+        assert!(
+            run_of("rare")
+                .postings
+                .iter()
+                .chain(run_of("common").postings.iter())
+                .all(|p| p.tail == 0.0),
+            "whole heads leave no tail"
+        );
+        let segment = &built.root.segments[0];
+        assert_eq!(
+            built.tiers.len(),
+            1,
+            "one tier object, for the chunked tier"
+        );
+        assert_eq!(
+            tier_entries_of(segment, &built.tiers, &common).len(),
+            2 * per_file as usize
+        );
+        let mut inline_ids: Vec<(u32, u32)> = rare
+            .inline
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        inline_ids.sort_unstable();
+        assert_eq!(inline_ids, vec![(0, 0), (0, 3), (1, 0), (1, 3)]);
+
+        // A merge that drops the first superfile renumbers the second to
+        // ordinal 0 in the inline entries as in the chunked ones.
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
+        let sources = vec![
+            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
+        ];
+        let merged = merge_segments(&sources, &[None, Some(0)], &policy).expect("merge");
+        let merged_bytes = bytes_of(&merged.slices[0].1);
+        let merged_slice = Slice::open(&merged_bytes).expect("open");
+        let rare = merged_slice
+            .run(&fid("body").term_key("rare"))
+            .expect("run")
+            .expect("indexed")
+            .tier
+            .expect("tier");
+        let mut ids: Vec<(u32, u32)> = rare
+            .inline
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![(0, 0), (0, 3)]);
+        let common = merged_slice
+            .run(&fid("body").term_key("common"))
+            .expect("run")
+            .expect("indexed")
+            .tier
+            .expect("tier");
+        assert_eq!(
+            common.chunks.is_empty(),
+            per_file as usize <= TIER_INLINE_MAX,
+            "the merged tier is placed by its merged size"
+        );
+        let entries = tier_entries_of(&merged.segment, &merged.tiers, &common);
+        assert!(entries.iter().all(|e| e.superfile == 0));
+        assert_eq!(entries.len(), per_file as usize);
+    }
+
+    /// A build that spills writes each slice and tier object to a scratch
+    /// file as it is cut and keeps none of their bytes; what it spills is
+    /// byte for byte what a resident build keeps, and a merge over the
+    /// spilled files reads them where it would find downloaded ones.
+    #[test]
+    fn a_spilling_build_writes_what_a_resident_build_keeps() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let make = |id: u128, n: u32| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "alpha", docs(id as f32, n)),
+                    ("body", "beta", docs(0.5, 2)),
+                    ("body", "gamma", docs(1.5, n)),
+                    ("body", "delta", docs(2.5, 3)),
+                ],
+                1000,
+            )
+        };
+        let resident = BuildPolicy {
+            slice_target_bytes: 48,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let spilling = BuildPolicy {
+            spill_to_disk: true,
+            ..resident.clone()
+        };
+        let kept = build(&[make(1, 60), make(2, 60)], &resident).expect("resident build");
+        let spilled = build(&[make(1, 60), make(2, 60)], &spilling).expect("spilling build");
+        assert!(kept.slices.len() > 1, "several slices, so several files");
+        assert_eq!(kept.slices, spilled.slices, "same slices, byte for byte");
+        assert_eq!(
+            kept.tiers, spilled.tiers,
+            "same tier objects, byte for byte"
+        );
+        assert!(
+            spilled
+                .slices
+                .iter()
+                .chain(&spilled.tiers)
+                .all(|(_, b)| matches!(b, BuiltBytes::Spilled { .. })),
+            "every object of the spilling build is on disk"
+        );
+        assert!(
+            kept.slices
+                .iter()
+                .chain(&kept.tiers)
+                .all(|(_, b)| matches!(b, BuiltBytes::Resident(_))),
+            "every object of the resident build is in memory"
+        );
+        // The spilled files feed a merge as downloaded ones would.
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(
+            scratch.path(),
+            &spilled.root.segments[0].slices,
+            spilled.tiers,
+        )
+        .expect("place tiers");
+        let sources = vec![
+            spill_slices(
+                scratch.path(),
+                &spilled.root.segments[0].slices,
+                spilled.slices,
+            )
+            .expect("place slices"),
+        ];
+        let merged = merge_segments(&sources, &[Some(0), Some(1)], &resident).expect("merge");
+        assert_eq!(
+            merged.slices, kept.slices,
+            "a merge of the spilled files rebuilds the same slices"
+        );
+    }
+
+    #[test]
+    fn merging_segments_with_tiers_writes_what_a_fresh_build_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let make = |id: u128, n: u32| {
+            contribution_with_heads(
+                &dir,
+                id,
+                &[
+                    ("body", "alpha", docs(id as f32, n)),
+                    ("body", "gamma", docs(0.5, 2)),
+                ],
+                1000,
+            )
+        };
+        // No source truncates at this budget, so the merge sees every entry
+        // a fresh build would and must write the same bytes.
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let base = build(&[make(1, 60), make(2, 60)], &policy).expect("base");
+        let delta = build_onto(base.root.clone(), &[make(3, 90)], &policy).expect("delta");
+        spill_tiers(
+            dir.path(),
+            &base.root.segments[0].slices,
+            base.tiers.clone(),
+        )
+        .expect("spill base tiers");
+        spill_tiers(
+            dir.path(),
+            &delta.root.segments[1].slices,
+            delta.tiers.clone(),
+        )
+        .expect("spill delta tiers");
+        let sources = vec![
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
+        ];
+        // Drop the middle superfile; the merge renumbers the survivors.
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let expected = build(&[make(1, 60), make(3, 90)], &policy).expect("survivors");
+        assert_eq!(merged.slices, expected.slices, "slices are byte-identical");
+        assert_eq!(
+            merged.tiers, expected.tiers,
+            "the tier objects are byte-identical"
+        );
+        assert_eq!(merged.segment, expected.root.segments[0]);
+    }
+
+    /// A source that already truncated cannot give a merge the entries it
+    /// dropped, so a merge of truncated sources is not a fresh build; what
+    /// it must still be is sound: every posting's tail bounds the keys of
+    /// that superfile's documents the merged tier does not hold.
+    #[test]
+    fn merging_truncated_tiers_keeps_every_tail_an_upper_bound() {
+        let dir = TempDir::new().expect("tempdir");
+        let docs = |base: f32, n: u32| {
+            (0..n)
+                .map(|i| (i * 3, base + i as f32 * 0.01))
+                .collect::<Vec<_>>()
+        };
+        let heads: Vec<(u128, Vec<(u32, f32)>)> =
+            vec![(1, docs(1.0, 60)), (2, docs(2.0, 60)), (3, docs(1.5, 90))];
+        let make = |id: u128| {
+            let d = &heads.iter().find(|h| h.0 == id).expect("heads").1;
+            contribution_with_heads(&dir, id, &[("body", "alpha", d.clone())], 1000)
+        };
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 40,
+            ..BuildPolicy::default()
+        };
+        let base = build(&[make(1), make(2)], &policy).expect("base");
+        let delta = build_onto(base.root.clone(), &[make(3)], &policy).expect("delta");
+        spill_tiers(
+            dir.path(),
+            &base.root.segments[0].slices,
+            base.tiers.clone(),
+        )
+        .expect("spill base tiers");
+        spill_tiers(
+            dir.path(),
+            &delta.root.segments[1].slices,
+            delta.tiers.clone(),
+        )
+        .expect("spill delta tiers");
+        let sources = vec![
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
+        ];
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let slice_bytes = bytes_of(&merged.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
+        let run = slice
+            .run(&fid("body").term_key("alpha"))
+            .expect("run")
+            .expect("alpha");
+        let tier = run.tier.expect("tier");
+        assert!(
+            run.postings.iter().any(|p| p.tail > 0.0),
+            "a truncated tier leaves a tail"
+        );
+        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.segment, &merged.tiers, &tier)
+            .iter()
+            .map(|e| (e.superfile, e.doc_id))
+            .collect();
+        assert_eq!(held.len(), 40);
+        // New ordinal 0 is superfile 1, new ordinal 1 is superfile 3.
+        for (ordinal, id) in [(0u32, 1u128), (1, 3)] {
+            let posting = run
+                .postings
+                .iter()
+                .find(|p| p.superfile == ordinal)
+                .expect("posting");
+            for &(row, w) in &heads.iter().find(|h| h.0 == id).expect("heads").1 {
+                if !held.contains(&(ordinal, row)) {
+                    assert!(
+                        posting.tail >= key_of(w),
+                        "superfile {id} row {row}: key {} above tail {}",
+                        key_of(w),
+                        posting.tail
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn contribution_rejects_out_of_order_keys() {
         let dir = TempDir::new().expect("tempdir");
         let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(1), 0).expect("create");
-        w.push(b"b", 1, 1.0, Location::None).expect("first");
+        w.push(b"b", 1, 1.0, Location::None, 0.0, &[])
+            .expect("first");
         assert!(matches!(
-            w.push(b"a", 1, 1.0, Location::None),
+            w.push(b"a", 1, 1.0, Location::None, 0.0, &[]),
             Err(TermIndexError::Build(m)) if m.contains("ascending")
         ));
         assert!(
-            w.push(b"b", 1, 1.0, Location::None).is_err(),
+            w.push(b"b", 1, 1.0, Location::None, 0.0, &[]).is_err(),
             "equal keys are not ascending"
         );
     }
@@ -1196,6 +2212,7 @@ mod tests {
         let c = contribution(&dir, 3, &[("body", "alpha", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: usize::MAX,
+            ..BuildPolicy::default()
         };
         let built = build(&[a, b, c], &policy).expect("build");
         assert_eq!(
@@ -1204,7 +2221,8 @@ mod tests {
         );
         assert_eq!(built.root.segments.len(), 1);
         assert_eq!(built.slices.len(), 1, "everything fits one slice");
-        let slice = Slice::open(&built.slices[0].1).expect("open");
+        let slice_bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&slice_bytes).expect("open");
 
         let alpha = slice
             .postings(&fid("body").term_key("alpha"))
@@ -1260,8 +2278,10 @@ mod tests {
         all_keys.sort();
         assert_eq!(s.first_key, all_keys[0]);
         assert_eq!(s.last_key, all_keys[3]);
-        assert_eq!(s.content_hash, ContentHash::of(&built.slices[0].1));
-        assert_eq!(s.len as usize, built.slices[0].1.len());
+        assert_eq!(
+            s.content_hash,
+            ContentHash::of(&bytes_of(&built.slices[0].1))
+        );
     }
 
     /// Slices are cut at term boundaries once the target is reached, so
@@ -1280,6 +2300,7 @@ mod tests {
         let a = contribution(&dir, 1, &refs);
         let policy = BuildPolicy {
             slice_target_bytes: 600,
+            ..BuildPolicy::default()
         };
         let built = build(&[a], &policy).expect("build");
         let slices = &built.root.segments[0].slices;
@@ -1294,7 +2315,11 @@ mod tests {
                 "slices are disjoint and ordered"
             );
         }
-        let by_hash: HashMap<_, _> = built.slices.iter().cloned().collect();
+        let by_hash: HashMap<_, _> = built
+            .slices
+            .iter()
+            .map(|(h, b)| (*h, bytes_of(b)))
+            .collect();
         for (c, t, d) in &terms {
             let key = fid(c).term_key(t);
             let hits: Vec<_> = built.root.slices_for_key(&key).collect();
@@ -1330,16 +2355,19 @@ mod tests {
         // Small slices, so the merge has to cut where the build cuts.
         let policy = BuildPolicy {
             slice_target_bytes: 256,
+            ..BuildPolicy::default()
         };
 
         let base = build(&[first, gone], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[last], &policy).expect("delta");
         let sources = vec![
-            spill_slices(dir.path(), base.slices).expect("spill base"),
-            spill_slices(dir.path(), delta.slices).expect("spill delta"),
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
         ];
-        let (segment, slices) =
-            merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let (segment, slices) = (merged.segment, merged.slices);
 
         let first = make(1, terms(0..60, 1));
         let last = make(3, terms(0..90, 2));
@@ -1368,6 +2396,7 @@ mod tests {
         let b = contribution(&dir, 8, &[("body", "ab005", 9), ("body", "zz", 1)]);
         let policy = BuildPolicy {
             slice_target_bytes: 800,
+            ..BuildPolicy::default()
         };
         let built = build(&[a, b], &policy).expect("build");
         let n_slices = built.root.segments[0].slices.len();
@@ -1531,6 +2560,125 @@ mod tests {
         w.append(&batch).expect("append");
         w.commit().expect("commit");
         alpha
+    }
+
+    /// A term index written by the layout before tiers — a root at its
+    /// version naming slices at theirs — serves ceilings as that layout
+    /// did: each stored score over the superfile's own idf, times the
+    /// query's idf. Nothing opens more than it did before the upgrade.
+    #[test]
+    fn a_term_index_of_the_layout_before_tiers_serves_ceilings_as_before() {
+        let (_dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        commit_segment(&st, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reader = st.reader().expect("reader");
+        let entries: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
+        assert_eq!(entries.len(), 2);
+        let key = title_id().term_key("shared");
+        let slice = format::encode_legacy_slice(&[(
+            key.clone(),
+            vec![(0, 5, 2.5, Location::None), (1, 7, 1.9, Location::None)],
+        )]);
+        let hash = ContentHash::of(&slice);
+        rt.block_on(put_content_addressed(
+            storage.as_ref(),
+            "slice",
+            slice.clone(),
+        ))
+        .expect("slice stored");
+        let root = Root {
+            superfiles: entries.iter().map(|e| e.superfile_id).collect(),
+            id_mins: entries.iter().map(|e| e.id_min).collect(),
+            segments: vec![Segment {
+                slices: vec![format::SliceRef {
+                    first_key: key.clone(),
+                    last_key: key.clone(),
+                    content_hash: hash,
+                    tier: None,
+                }],
+            }],
+        };
+        let root = Root::decode(&format::encode_legacy_root(&root, &[slice.len() as u64]))
+            .expect("a legacy root decodes");
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let idf_used = |_: &str| 1.7f32;
+        let ceilings = rt
+            .block_on(index.query_ceilings(title_id(), &["shared"], &[], &entries, &idf_used))
+            .expect("ceilings");
+        for (e, (df, bound)) in entries.iter().zip([(5u64, 2.5f32), (7, 1.9)]) {
+            let n = e
+                .fts_summary
+                .get(&title_id())
+                .and_then(|s| s.length_stats.as_ref().map(|l| l.n_scored_docs))
+                .unwrap_or(e.n_docs);
+            let expected = bound / bm25::idf(n, df.min(n)) * 1.7 * CEILING_SLACK;
+            let got = ceilings[&e.superfile_id];
+            assert!(
+                (got - expected).abs() <= expected * 1e-5,
+                "superfile {}: ceiling {got}, expected {expected}",
+                e.superfile_id
+            );
+        }
+        // Its runs serve postings and are not mistaken for tiers.
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
+        assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
+    }
+
+    /// A merge that rewrites a segment of the layout before tiers writes
+    /// its bounds as the keys the current layout stores, through each
+    /// superfile's scored document count.
+    #[test]
+    fn a_merge_writes_a_legacy_segments_bounds_as_keys() {
+        let key = title_id().term_key("shared");
+        let slice = format::encode_legacy_slice(&[(
+            key.clone(),
+            vec![(0, 5, 2.5, Location::None), (1, 7, 1.9, Location::None)],
+        )]);
+        let scratch = TempDir::new().expect("scratch");
+        let path = scratch.path().join("legacy.slice");
+        fs::write(&path, &slice).expect("place slice");
+        let sources = vec![vec![build::SliceFile {
+            path,
+            first_key: key.clone(),
+            last_key: key.clone(),
+        }]];
+        let scoring = |n: u64| {
+            std::collections::BTreeMap::from([(
+                title_id(),
+                tier::ColumnScoring {
+                    scored_docs: n,
+                    ..tier::ColumnScoring::default()
+                },
+            )])
+        };
+        let policy = BuildPolicy {
+            scoring_by_ordinal: Arc::new(vec![scoring(100), scoring(1000)]),
+            ..BuildPolicy::default()
+        };
+        let merged = merge_segments(&sources, &[Some(0), Some(1)], &policy).expect("merge");
+        let bytes = bytes_of(&merged.slices[0].1);
+        let run = Slice::open(&bytes)
+            .expect("open")
+            .run(&key)
+            .expect("run")
+            .expect("indexed");
+        assert!(!run.legacy_bound, "written on in the current layout");
+        let keys: Vec<f32> = run.postings.iter().map(|p| p.bound).collect();
+        assert_eq!(
+            keys,
+            vec![
+                legacy_bound_as_key(2.5, 5, 100),
+                legacy_bound_as_key(1.9, 7, 1000)
+            ]
+        );
+        assert!(
+            run.postings.iter().all(|p| p.tail == f32::INFINITY),
+            "nothing below a legacy bound is known"
+        );
     }
 
     /// Optimize options that merge nothing: the maintenance passes alone.
@@ -2244,7 +3392,7 @@ mod tests {
                 first_key: vec![tag],
                 last_key: vec![tag],
                 content_hash: ContentHash::of(&[tag]),
-                len: 1,
+                tier: None,
             }],
         }
     }
@@ -2881,7 +4029,7 @@ mod tests {
                     .iter()
                     .map(|p| p.df)
                     .sum();
-                (term, bm25_idf(scored_total, df))
+                (term, bm25::idf(scored_total, df))
             })
             .collect();
         // (query, plain terms, phrases)
@@ -2898,7 +4046,7 @@ mod tests {
         ];
         for (query, terms, phrases) in &queries {
             let phrases: Vec<Vec<&str>> = phrases.iter().map(|p| p.to_vec()).collect();
-            let idf_used = |term: &str, _local: f32| global_idf[term];
+            let idf_used = |term: &str| global_idf[term];
             let ceilings = rt
                 .block_on(index.query_ceilings(title, terms, &phrases, &entries, &idf_used))
                 .expect("ceilings");
@@ -2966,7 +4114,7 @@ mod tests {
             subsection_offsets: None,
         });
         let entries = vec![entry];
-        let local = |_: &str, idf: f32| idf;
+        let local = |_: &str| 1.0f32;
         // The contribution keyed `title` by the test's stable id; the entry
         // has no summary, so that id reads the same as any other there.
         let title = fid("title");
@@ -3001,7 +4149,7 @@ mod tests {
             runtime_metrics::op_stats::{self, with_op_stats},
         };
 
-        let (_dir, _storage, st) = fresh_table_with_open_window(1);
+        let (_dir, _storage, st) = fresh_table_with_open_window_no_tiers(1);
         // Every title is three tokens, so length normalization is identical
         // everywhere and `alpha shared x` scores the same in both superfiles
         // under table-wide statistics. The second superfile's tf-2 title
@@ -3285,6 +4433,160 @@ mod tests {
         );
     }
 
+    /// The tier objects under `dir`, by name.
+    fn tier_objects(dir: &TempDir) -> HashSet<String> {
+        fs::read_dir(dir.path().join(STORAGE_PREFIX))
+            .map(|entries| {
+                entries
+                    .map(|e| {
+                        e.expect("dir entry")
+                            .file_name()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .filter(|name| name.starts_with("tier-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// What the current root names: every slice, tier list and tier chunk.
+    fn objects_named_by(root: &Root) -> HashSet<String> {
+        let mut named: HashSet<String> = root
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter())
+            .map(|s| {
+                slice_uri(&s.content_hash)
+                    .trim_start_matches(STORAGE_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        named.extend(
+            root.segments
+                .iter()
+                .flat_map(|s| s.slices.iter())
+                .filter_map(|s| s.tier.as_ref())
+                .map(|t| format!("tier-{}.bin", t.to_hex())),
+        );
+        named
+    }
+
+    /// Every commit writes its segment's tier chunks and names them from the
+    /// root; the rebuild carries them into the base; a sweep past the gap
+    /// keeps what the current root names and nothing a replaced root named.
+    #[test]
+    fn commits_write_tiers_the_rebuild_keeps_and_the_sweep_respects() {
+        let (dir, storage, st) = fresh_table();
+        commit_segment(&st, 0);
+        commit_segment(&st, 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let current_ref = || {
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_ref()
+                .cloned()
+                .expect("a term-index reference")
+        };
+        let root = rt
+            .block_on(load_root(storage.as_ref(), &current_ref()))
+            .expect("root");
+        assert_eq!(root.segments.len(), 2, "two deltas");
+        assert!(
+            root.segments
+                .iter()
+                .all(|s| s.slices.iter().any(|slice| slice.tier.is_some())),
+            "each delta has a tier object"
+        );
+        let after_commits = tier_objects(&dir);
+        let named = objects_named_by(&root);
+        let with_tier = root
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter())
+            .filter(|s| s.tier.is_some())
+            .count();
+        assert!(
+            after_commits.iter().all(|o| named.contains(o)) && after_commits.len() == with_tier,
+            "every tier object on disk is a slice's and named: {after_commits:?}"
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
+        assert_eq!(runs.len(), 2, "one run per delta");
+        let mut held = 0;
+        for SliceRun { tier_object, run } in runs.iter() {
+            let tier = run.tier.as_ref().expect("a term in every title has a tier");
+            let object = tier_object.unwrap_or_else(|| ContentHash::of(b""));
+            held += rt
+                .block_on(index.tier_entries(&object, tier))
+                .expect("tier entries")
+                .len() as u64;
+            assert!(
+                run.postings.iter().all(|p| p.tail == 0.0),
+                "complete heads leave no tail"
+            );
+        }
+        assert_eq!(
+            held,
+            2 * DOCS_PER_SEGMENT as u64,
+            "the deltas' tiers cover every document"
+        );
+
+        st.optimize(&maintenance_only_options()).expect("optimize");
+        let rebuilt = rt
+            .block_on(load_root(storage.as_ref(), &current_ref()))
+            .expect("root");
+        assert_eq!(rebuilt.segments.len(), 1, "the rebuild folds the deltas");
+        assert!(
+            rebuilt.segments[0]
+                .slices
+                .iter()
+                .any(|slice| slice.tier.is_some())
+        );
+        let index = TermIndex::new(rebuilt.clone(), String::new(), Arc::clone(&storage), None);
+        let runs = rt
+            .block_on(index.runs_many(title_id(), &["shared"]))
+            .expect("runs")
+            .remove(0);
+        assert_eq!(runs.len(), 1, "one run in the rebuilt base");
+        let object = runs[0].tier_object.expect("the slice has a tier object");
+        let tier = runs[0]
+            .run
+            .tier
+            .as_ref()
+            .expect("the merged run has a tier");
+        let entries = rt
+            .block_on(index.tier_entries(&object, tier))
+            .expect("tier entries");
+        assert_eq!(
+            entries.len(),
+            2 * DOCS_PER_SEGMENT,
+            "the base tier covers every document"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|e| index.superfile_id(e.superfile).is_some()),
+            "every tier entry names a listed superfile"
+        );
+
+        st.gc(Duration::ZERO).expect("gc");
+        let kept = tier_objects(&dir);
+        let named: HashSet<String> = rt
+            .block_on(async { objects_named_by(&rebuilt) })
+            .into_iter()
+            .filter(|o| o.starts_with("tier-"))
+            .collect();
+        assert_eq!(
+            kept, named,
+            "the sweep keeps exactly the tier objects the current root names"
+        );
+    }
+
     /// A commit against a table whose pointer is gone refuses before it
     /// writes any term-index object: the pointer fence runs first, so a
     /// purged table gains no orphans.
@@ -3476,7 +4778,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let c = contribution(&dir, 1, &[("title", "alpha", 5)]);
         let built = build(&[c], &BuildPolicy::default()).expect("build");
-        let mut bytes = built.slices[0].1.clone();
+        let mut bytes = bytes_of(&built.slices[0].1);
         assert!(Slice::open(&bytes).is_ok());
         bytes.push(0);
         assert!(
@@ -3726,6 +5028,8 @@ mod tests {
                         offset: 100 * i as u64,
                         len: 64,
                     },
+                    0.0,
+                    &[],
                 )
                 .expect("push");
                 w.finish().expect("finish")
@@ -3735,8 +5039,8 @@ mod tests {
         let run: Vec<Posting> = built
             .slices
             .iter()
-            .filter_map(|(_, bytes)| {
-                Slice::open(bytes)
+            .filter_map(|(_, built)| {
+                Slice::open(&bytes_of(built))
                     .expect("open")
                     .postings(&fid("body").term_key("common"))
                     .expect("ok")
@@ -3774,12 +5078,15 @@ mod tests {
                 .map(|(i, terms)| {
                     let mut w = ContributionWriter::create(dir.path(), Uuid::from_u128(i as u128 + 1), i as i128).expect("create");
                     for t in terms {
-                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None).expect("push");
+                        w.push(&fid("body").term_key(&alphabet[*t]), 1 + *t as u64, f32::INFINITY, Location::None, 0.0, &[]).expect("push");
                     }
                     w.finish().expect("finish")
                 })
                 .collect();
-            let policy = BuildPolicy { slice_target_bytes: 512 };
+            let policy = BuildPolicy {
+            slice_target_bytes: 512 ,
+            ..BuildPolicy::default()
+        };
             let built = build(&contributions, &policy).expect("build");
             let store_dir = TempDir::new().expect("store dir");
             let storage: Arc<dyn StorageProvider> =
@@ -3903,14 +5210,26 @@ mod tests {
                 (e.superfile_id, sf)
             })
             .collect();
+        let n_docs: HashMap<Uuid, u64> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|e| (e.superfile_id, e.n_docs))
+            .collect();
         for term in ["shared", "alpha", "beta", "s1d00", "s2d04"] {
             let postings = rt
                 .block_on(index.postings(title_id(), term))
                 .expect("lookup");
             assert!(!postings.is_empty(), "{term} is indexed");
+            // A posting's bound is a key; at the superfile's own idf it
+            // bounds the superfile's own scores, an ulp of rounding aside.
             let bounds: HashMap<Uuid, f32> = postings
                 .iter()
-                .map(|p| (index.superfile_id(p.superfile).expect("ordinal"), p.bound))
+                .map(|p| {
+                    let sf = index.superfile_id(p.superfile).expect("ordinal");
+                    let ceiling = p.bound * bm25::idf(n_docs[&sf], p.df) * CEILING_SLACK;
+                    (sf, ceiling)
+                })
                 .collect();
             for (sf, b) in &bounds {
                 assert!(
@@ -3955,6 +5274,23 @@ mod tests {
         crate::supertable::Supertable,
     ) {
         table_with(|o| o.with_bound_ordered_open_window(window))
+    }
+
+    /// A table whose index keeps no tiers, so a ranked query takes the
+    /// ceiling-ordered path and opens superfiles: what the open-count tests
+    /// of that path exercise. With tiers the same queries are answered from
+    /// the index without opening anything.
+    fn fresh_table_with_open_window_no_tiers(
+        window: usize,
+    ) -> (
+        TempDir,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        table_with(|o| {
+            o.with_bound_ordered_open_window(window)
+                .with_term_tier_entries_per_term(0)
+        })
     }
 
     fn commit_titles(st: &crate::supertable::Supertable, titles: &[String]) {
@@ -4007,7 +5343,7 @@ mod tests {
             runtime_metrics::op_stats::{self, with_op_stats},
         };
 
-        let (_dir, _storage, st) = fresh_table_with_open_window(1);
+        let (_dir, _storage, st) = fresh_table_with_open_window_no_tiers(1);
         // Segment 0 carries `alpha` three times per title — a clearly higher
         // ceiling than the single occurrence in segments 1 and 2.
         for segment in 0..3 {
@@ -4554,6 +5890,32 @@ mod tests {
             assert_eq!(indexed, 1, "only the new superfile is indexed");
         }
         let mixed_answers = answers(&st);
+        // At a pruning k: an index that does not list every superfile
+        // serves no tier, and the rebuilt one answers the same. (The old
+        // superfiles record no baked average length, so the merge declines
+        // them even then: a bound needs the average a head was keyed at.)
+        let probe = |st: &Supertable| {
+            crate::runtime_metrics::op_stats::with_op_stats(|| {
+                st.reader()
+                    .expect("reader")
+                    .bm25_hits(
+                        "title",
+                        "alpha shared",
+                        10,
+                        Bm25SearchOptions::new().with_mode(BoolMode::And),
+                    )
+                    .expect("search")
+                    .iter()
+                    .map(|h| (h.superfile, h.local_doc_id, h.score))
+                    .collect::<Vec<_>>()
+            })
+        };
+        let (mixed_top, mixed_stats) = probe(&st);
+        assert!(!mixed_top.is_empty());
+        assert_eq!(
+            mixed_stats.tier_entries, 0,
+            "an index that does not cover the table serves no tier"
+        );
 
         // Cell 3: a maintenance rebuild covers everything and flips the flag.
         maintenance_only_optimize(&st);
@@ -4565,6 +5927,8 @@ mod tests {
             );
         }
         let rebuilt_answers = answers(&st);
+        let (rebuilt_top, _) = probe(&st);
+        assert_eq!(rebuilt_top, mixed_top, "the same answer at a pruning k");
 
         // Cell 4: the same rows written entirely by the current writer.
         let (_d, _s, fresh) = fresh_table();
@@ -4655,6 +6019,7 @@ mod tests {
                 superfile: 0,
                 df: 1,
                 bound: 1.0,
+                tail: 1.0,
                 location: Location::None,
             }]),
         );
@@ -4673,20 +6038,16 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let a = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("first");
-        let b = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("second");
+        let ask = |term: &str| {
+            rt.block_on(index.runs_many(title_id(), &[term]))
+                .expect("runs")
+                .remove(0)
+        };
+        let (a, b) = (ask("shared"), ask("shared"));
         assert!(Arc::ptr_eq(&a, &b), "the second ask is the resident run");
-        let absent = rt
-            .block_on(index.postings(title_id(), "absent"))
-            .expect("absent");
+        let absent = ask("absent");
         assert!(absent.is_empty());
-        let again = rt
-            .block_on(index.postings(title_id(), "absent"))
-            .expect("absent again");
+        let again = ask("absent");
         assert!(
             Arc::ptr_eq(&absent, &again),
             "an absent term is remembered too"
@@ -4796,6 +6157,7 @@ mod tests {
             .collect();
         let policy = BuildPolicy {
             slice_target_bytes: BATCH_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
         };
         let store_dir = TempDir::new().expect("store dir");
         let local: Arc<dyn StorageProvider> =
@@ -4826,16 +6188,20 @@ mod tests {
         let slow = SlowGets::wrap(Arc::clone(&local));
         let batched_index = TermIndex::new(root.clone(), String::new(), slow.clone(), None);
         let batched = batched_index
-            .postings_many(fid("body"), &asked)
+            .runs_many(fid("body"), &asked)
             .await
             .expect("batched");
         let single_index = TermIndex::new(root.clone(), String::new(), Arc::clone(&local), None);
-        for (term, run) in asked.iter().zip(&batched) {
+        for (term, runs) in asked.iter().zip(&batched) {
             let one = single_index
                 .postings(fid("body"), term)
                 .await
                 .expect("single");
-            assert_eq!(run.as_slice(), one.as_slice(), "{term}");
+            assert_eq!(
+                postings_of(runs).cloned().collect::<Vec<_>>(),
+                one,
+                "{term}"
+            );
         }
         let spans_both = batched_index
             .postings(fid("body"), &terms[0])
@@ -4889,14 +6255,26 @@ mod tests {
             keys.iter().map(|k| ("record_key", k.as_str(), 1)).collect();
         let policy = BuildPolicy {
             slice_target_bytes: RANDOM_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
         };
         let built = build(&[contribution(&dir, 1, &terms)], &policy).expect("build");
         let slices = &built.root.segments[0].slices;
         assert!(slices.len() > 2, "the keys fill several slices");
         // Every slice but the last was cut when the next term would not
         // fit, so it is within one term of the target, above or below.
+        let bytes_by_hash = |s: &SliceRef| {
+            bytes_of(
+                &built
+                    .slices
+                    .iter()
+                    .find(|(h, _)| *h == s.content_hash)
+                    .expect("slice bytes")
+                    .1,
+            )
+            .len()
+        };
         for s in &slices[..slices.len() - 1] {
-            let len = s.len as usize;
+            let len = bytes_by_hash(s);
             assert!(
                 len <= RANDOM_SLICE_TARGET_BYTES + RANDOM_SLICE_TOLERANCE_BYTES,
                 "slice of {len} bytes overshoots the {RANDOM_SLICE_TARGET_BYTES}-byte target"

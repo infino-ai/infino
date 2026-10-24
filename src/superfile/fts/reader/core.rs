@@ -1188,6 +1188,13 @@ impl FtsReader {
         Some(self.columns[id as usize].baked_avgdl)
     }
 
+    /// The parameters `column` declares: what its bounds, and the heads a
+    /// term index takes from it, are scored at.
+    pub(crate) fn column_params(&self, column: &str) -> Option<bm25::Bm25Params> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].declared_params)
+    }
+
     test_visible! {
     /// A column's stored per-document lengths, one per local doc id: the
     /// array the norm table is quantized from, as the build wrote it
@@ -4045,7 +4052,7 @@ mod tests {
         loop {
             batches += 1;
             let chunk = r
-                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH)
+                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH, 0)
                 .await
                 .expect("facts batch");
             let done = chunk.len() < BATCH;

@@ -48,6 +48,7 @@ use crate::{
     storage::StorageError,
     superfile::{
         builder::{BuilderOptions, MergeInput, SuperfileBuilder},
+        fts::builder::TermHeadSink,
         stats::SuperfileStats as BuiltSuperfileStats,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
     },
@@ -73,8 +74,8 @@ use crate::{
             CommitFence, CommitListMetadata, NewEntryBirthVersions, PreparedSuperfile, ShardOutput,
             backoff_delay, finalize_compaction_commit, maint_pool, orphaned_id_floor,
             persist_list_metadata_async, prepare_superfile_named, recalibrate_probe_laws,
-            refresh_slow_vector_state, split_overflow_cells, try_commit_attempt,
-            write_superfile_list,
+            refresh_slow_vector_state, split_overflow_cells, term_head_sink_for,
+            try_commit_attempt, write_superfile_list,
         },
     },
     utils::trace::{RegionUsage, detail_span, record},
@@ -173,6 +174,11 @@ pub(crate) struct MergeInputs<'a> {
     /// order. A build that carries rows unchanged takes its output stats
     /// from here rather than recomputing them from decoded rows.
     pub(crate) entries: &'a [Arc<SuperfileEntry>],
+    /// A sink the build hands each term's facts to as it writes, with the
+    /// head depth, for a merge that writes postings; a build that takes it
+    /// leaves `None` behind, so the caller knows whether anything was
+    /// gathered.
+    pub(crate) term_heads: Option<&'a mut Option<(Box<dyn TermHeadSink>, usize)>>,
     /// Per input, the hidden-index cells its rows have been superseded in.
     pub(crate) superseded: &'a [BTreeSet<u32>],
     /// The output's options: the table's schema and index config as the
@@ -204,6 +210,7 @@ impl SuperfileMerge for CompactionMerge {
             inputs,
             superseded,
             builder_options,
+            term_heads,
             ..
         } = inputs;
         let first_vec = inputs.first().and_then(|input| input.reader.vec());
@@ -230,7 +237,12 @@ impl SuperfileMerge for CompactionMerge {
             // FTS/scalar inputs (no vector index) whose indexes match the
             // output's: carry each input's already-built posting lists
             // across instead of re-tokenizing the whole corpus.
-            SuperfileBuilder::build_from_readers_fts_merge_to(inputs, builder_options, output)?
+            SuperfileBuilder::build_from_readers_fts_merge_with_heads(
+                inputs,
+                builder_options,
+                output,
+                term_heads.and_then(|slot| slot.take()),
+            )?
         } else {
             // A vector index is present but not IVF-mergeable (e.g. an fp32
             // rerank codec), or an input's full-text index does not match
@@ -495,6 +507,7 @@ impl Supertable {
                         .unwrap_or(0),
                     n_docs: entry.n_docs,
                     tombstoned_docs,
+                    id_min: entry.id_min,
                     sealed_by_other,
                     birth_version: entry.birth_version,
                     stale_type: !unconverted_columns(entry, &schema, &manifest.options.id_column)
@@ -776,6 +789,12 @@ impl Supertable {
         // the merge included — is owned before it crosses over.
         let entries: Vec<Arc<SuperfileEntry>> = superfiles.to_vec();
         let merge = Arc::clone(&merge);
+        // The merged superfile replaces its inputs; a merge that writes
+        // postings gathers the term-index contribution as it goes.
+        let head_sink = term_head_sink_for(&manifest)?;
+        let mut term_heads: Option<(Box<dyn TermHeadSink>, usize)> = head_sink
+            .as_ref()
+            .map(|(sink, depth)| (Box::new(sink.clone()) as Box<dyn TermHeadSink>, *depth));
         let (merged_bytes, superfile_stats) = run_on_pool(
             Some(maint_pool()?),
             "compaction merge",
@@ -805,6 +824,7 @@ impl Supertable {
                         MergeInputs {
                             inputs: &inputs,
                             entries: &entries,
+                            term_heads: Some(&mut term_heads),
                             superseded: &superseded_per_reader,
                             builder_options,
                         },
@@ -825,13 +845,23 @@ impl Supertable {
         .await
         .map_err(|e| BuildError::Store(e.to_string()))??;
 
-        let shard = ShardOutput::new_with_params(
+        let mut shard = ShardOutput::new_with_params(
             merged_bytes,
             superfile_stats.n_docs,
             superfile_stats.id_min,
             superfile_stats.id_max,
             superfile_stats.scalar_stats,
         );
+        // A merge that drove the sink to its end hands the contribution
+        // over; one that wrote no postings leaves the superfile's terms to
+        // be read from its bytes.
+        if let Some((sink, _)) = head_sink
+            && let Some(contribution) = sink
+                .into_contribution(shard.superfile_id(), superfile_stats.id_min)
+                .map_err(|e| BuildError::Store(e.to_string()))?
+        {
+            shard = shard.with_term_contribution(contribution);
+        }
 
         // A merge keeps a source stem only when every input carries the same
         // one. Inputs from different sources, or any unnamed input, produce
@@ -847,6 +877,7 @@ impl Supertable {
             // load. A merge runs for minutes, so a schema change can land
             // while it does; deriving the entry's summaries from a newer
             // snapshot would key them to columns the output does not hold.
+            // The merge replaces its inputs with one superfile.
             prepare_superfile_named(self.inner().as_ref(), &manifest, shard, stem)?
         };
 

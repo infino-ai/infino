@@ -4,6 +4,14 @@
 //! Little-endian fixed-width reads over a byte slice, bounds-checked.
 //! Shared by the superfile format parser and the term dictionary.
 
+/// Little-endian `u16` at `at`, `None` past the end of `bytes`.
+#[inline]
+pub(crate) fn u16_le_at(bytes: &[u8], at: usize) -> Option<u16> {
+    bytes
+        .get(at..at + 2)
+        .map(|s| u16::from_le_bytes(s.try_into().expect("2 bytes")))
+}
+
 /// Little-endian `u32` at `at`, `None` past the end of `bytes`.
 #[inline]
 pub(crate) fn u32_le_at(bytes: &[u8], at: usize) -> Option<u32> {

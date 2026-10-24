@@ -111,7 +111,7 @@ use crate::{
             bm25,
             positions::{TermRuns, encode_group, encode_run, skip_run},
             posting::{BLOCK_LEN, Block, EncodedBlock, encode_block},
-            reader::ColumnLengthStats,
+            reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
             tokenize::{StandardTokenizer, Tokenizer},
@@ -1396,6 +1396,111 @@ pub struct FtsBuilder {
     /// instead of reading the accumulator (the compaction merge). Empty
     /// for every other build.
     sorted_inputs: Vec<SortedInput>,
+    /// Where each written term's facts go — its document frequency, score
+    /// bound, dictionary entry and best documents — when a caller wants
+    /// them as the blob is written rather than read back from it.
+    head_sink: Option<Box<dyn TermHeadSink>>,
+    /// Best documents per term handed to the sink; `0` keeps none.
+    head_depth: usize,
+}
+
+/// Receives each term's facts as the blob is written: what a table-level
+/// term index records per `(term, superfile)`, produced in the pass that
+/// writes the postings instead of a second pass that reads them back.
+/// Terms arrive in dictionary order within a column, columns in the
+/// builder's order.
+pub(crate) trait TermHeadSink: Send {
+    fn term(
+        &mut self,
+        column: &str,
+        term: &str,
+        facts: &TermHeadFacts<'_>,
+    ) -> Result<(), BuildError>;
+    /// Every term has been handed over.
+    fn finish(&mut self) -> Result<(), BuildError>;
+}
+
+/// One term's facts for a [`TermHeadSink`].
+pub(crate) struct TermHeadFacts<'a> {
+    /// Documents carrying the term in this blob.
+    pub(crate) df: u64,
+    /// The largest key — the length-normalized term frequency at this
+    /// blob's average length and parameters, the factor a score multiplies
+    /// the idf by — of a document of the term in this blob.
+    pub(crate) bound: f32,
+    /// The dictionary entry written for the term.
+    pub(crate) entry: DictEntry,
+    /// The best documents by impact as `(row, term frequency, length
+    /// bucket)`, in descending impact then ascending blob document id, at
+    /// most the sink's depth.
+    pub(crate) head: &'a [(u32, u32, u8)],
+    /// The length-normalized term frequency — `tf / (tf + norm)` at this
+    /// blob's average length and parameters, the factor a score multiplies
+    /// the idf by — of the best document `head` left out; `0.0` when it
+    /// holds them all.
+    pub(crate) tail: f32,
+    /// The average length this blob scores the column at, and so the
+    /// average `tail` and the heads' keys are at.
+    pub(crate) avgdl: f32,
+    /// The column's parameters, likewise.
+    pub(crate) params: bm25::Bm25Params,
+}
+
+/// A term's head as the encoder gathers it.
+#[derive(Default)]
+struct HeadOut {
+    df: u64,
+    docs: Vec<(u32, u32, u8)>,
+    bound: f32,
+    tail: f32,
+    /// The average length and parameters `tail` is keyed at.
+    avgdl: f32,
+    params: bm25::Bm25Params,
+    /// The documents kept, drained from the heap: `(doc, tf)` with the
+    /// score, in descending score.
+    kept: Vec<((u32, u32), f32)>,
+}
+
+/// Keep a term's best `depth` documents by `scores` (one per posting, as
+/// a reader scores them), the way a reader's single-term search ranks
+/// them: `depth + 1` are kept so the first document left out is the tail,
+/// exactly. The heap entry is the reader's own, so a tie keeps the smaller
+/// document id as a reader's top-k does.
+fn term_head(
+    pairs: &[(u32, u32)],
+    scores: &[f32],
+    enc: &TermEncoding<'_>,
+    heap: &mut BinaryHeap<TopKEntry<(u32, u32)>>,
+    out: &mut HeadOut,
+) {
+    let depth = enc.head_depth;
+    heap.clear();
+    out.df = pairs.len() as u64;
+    for (&(doc, tf), &score) in pairs.iter().zip(scores) {
+        if heap.len() <= depth {
+            heap.push(TopKEntry(score, (doc, tf)));
+        } else if let Some(mut worst) = heap.peek_mut()
+            && score > worst.0
+        {
+            *worst = TopKEntry(score, (doc, tf));
+        }
+    }
+    // The key of a document: what the term index orders its tiers by.
+    let key = |(doc, tf): (u32, u32)| {
+        bm25::tf_factor(
+            tf,
+            enc.params
+                .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
+        )
+    };
+    (out.bound, out.tail) = finish_head(heap, depth, &mut out.kept, key);
+    out.docs.clear();
+    out.docs.extend(out.kept.iter().map(|&((doc, tf), _)| {
+        let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
+        (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
+    }));
+    out.avgdl = enc.avgdl;
+    out.params = enc.params;
 }
 
 impl Default for FtsBuilder {
@@ -1458,12 +1563,21 @@ impl FtsBuilder {
             bump: Bump::new(),
             doc_map: None,
             sorted_inputs: Vec::new(),
+            head_sink: None,
+            head_depth: 0,
         }
     }
 
     /// Have the finish merge these inputs' postings term by term instead of
     /// reading the accumulator, which must stay empty. Inputs are in output
     /// row order; their doc lengths are appended separately.
+    /// Hand every written term's facts to `sink`, with its best `depth`
+    /// documents by impact.
+    pub(crate) fn set_term_head_sink(&mut self, sink: Box<dyn TermHeadSink>, depth: usize) {
+        self.head_sink = Some(sink);
+        self.head_depth = depth;
+    }
+
     pub(crate) fn set_sorted_inputs(&mut self, inputs: Vec<SortedInput>) {
         self.sorted_inputs = inputs;
     }
@@ -2673,6 +2787,8 @@ impl FtsBuilder {
             bump,
             doc_map,
             sorted_inputs: _,
+            mut head_sink,
+            head_depth,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2743,6 +2859,9 @@ impl FtsBuilder {
                 avgdl,
                 params,
                 n_scored_docs: n_scored,
+                heads: head_sink.is_some(),
+                head_depth,
+                rows: doc_map.as_deref(),
             };
 
             // In-RAM path invariant: dispatcher checked
@@ -2796,6 +2915,7 @@ impl FtsBuilder {
                     term_positions,
                     &mut finish_profile,
                     &mut term_scratch,
+                    &mut head_sink,
                 )?;
                 n_terms_total_usize += 1;
             }
@@ -2803,6 +2923,9 @@ impl FtsBuilder {
             doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
         }
 
+        if let Some(sink) = head_sink.as_mut() {
+            sink.finish()?;
+        }
         assemble_and_write_blob(
             BlobAssemblyInputs {
                 postings_writer,
@@ -2851,6 +2974,8 @@ impl FtsBuilder {
             bump,
             doc_map,
             sorted_inputs,
+            mut head_sink,
+            head_depth,
         } = self;
         drop(doc_tf);
         drop(doc_pos_head);
@@ -2960,6 +3085,9 @@ impl FtsBuilder {
                 avgdl,
                 params,
                 n_scored_docs: n_scored,
+                heads: head_sink.is_some(),
+                head_depth,
+                rows: doc_map.as_deref(),
             };
 
             // The compaction merge: the accumulator is empty (checked in
@@ -3010,6 +3138,7 @@ impl FtsBuilder {
                             encoded,
                             body,
                             positions,
+                            head: mem::take(&mut scratch.head),
                         })
                     },
                     |term, mut merged| {
@@ -3028,6 +3157,8 @@ impl FtsBuilder {
                             Some(&mut dict_streaming),
                             col_positions.then_some(&mut positions_sink),
                             &mut finish_profile,
+                            &merged.head,
+                            &mut head_sink,
                         )
                     },
                 )?;
@@ -3084,6 +3215,7 @@ impl FtsBuilder {
                                 term_positions,
                                 &mut finish_profile,
                                 &mut term_scratch,
+                                &mut head_sink,
                             )?;
                             n_terms_total_usize += 1;
                         }
@@ -3249,6 +3381,7 @@ impl FtsBuilder {
                                 &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
+                                &mut head_sink,
                             )?,
                             SpillStore::Positional { blobs, .. } => {
                                 // mmap each partition's positions blob so
@@ -3284,6 +3417,7 @@ impl FtsBuilder {
                                     &mut positions_sink,
                                     &mut finish_profile,
                                     &mut term_scratch,
+                                    &mut head_sink,
                                 )?
                             }
                         };
@@ -3380,6 +3514,9 @@ impl FtsBuilder {
             doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
         }
 
+        if let Some(sink) = head_sink.as_mut() {
+            sink.finish()?;
+        }
         assemble_and_write_blob(
             BlobAssemblyInputs {
                 postings_writer,
@@ -3805,6 +3942,11 @@ fn assemble_and_write_blob<W: Write>(
 /// chunk (same allocation, just `Vec::clear` between iterations).
 #[derive(Default)]
 struct TermScratch {
+    /// The term's head for the sink, when one is attached, and each
+    /// posting's score, computed once for the head and the block maxima.
+    head: HeadOut,
+    head_heap: BinaryHeap<TopKEntry<(u32, u32)>>,
+    scores: Vec<f32>,
     /// Per-block doc_id column passed to `encode_block`. Re-used by
     /// taking it into a Block, encoding, and taking it back. Capacity
     /// stabilises at `BLOCK_LEN` after the first dense term.
@@ -3864,6 +4006,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
+    head_sink: &mut Option<Box<dyn TermHeadSink>>,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -3973,6 +4116,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
             term_positions,
             finish_profile,
             term_scratch,
+            head_sink,
         )?;
         n_emitted += 1;
     }
@@ -4012,6 +4156,7 @@ fn encode_and_emit_term<W: Write>(
     term_positions: Option<(&mut PositionsSink, TermRuns<'_>)>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
+    head_sink: &mut Option<Box<dyn TermHeadSink>>,
 ) -> Result<(), BuildError> {
     let (sink, runs) = match term_positions {
         Some((sink, runs)) => (Some(sink), Some(runs)),
@@ -4032,6 +4177,8 @@ fn encode_and_emit_term<W: Write>(
         dict_streaming,
         sink,
         profile,
+        &scratch.head,
+        head_sink,
     )
 }
 
@@ -4059,6 +4206,11 @@ struct TermEncoding<'a> {
     avgdl: f32,
     params: bm25::Bm25Params,
     n_scored_docs: u32,
+    /// Whether a head is gathered for each term, and how deep.
+    heads: bool,
+    head_depth: usize,
+    /// The row each blob document id stands for, when they differ.
+    rows: Option<&'a [u32]>,
 }
 
 /// A term encoded on a worker thread, its bytes taken out of that
@@ -4067,6 +4219,7 @@ struct MergedTerm {
     encoded: EncodedTerm,
     body: Vec<u8>,
     positions: Vec<u8>,
+    head: HeadOut,
 }
 
 /// What [`encode_term`] made of one term. A body sits in the scratch's
@@ -4096,6 +4249,7 @@ fn encode_term(
         avgdl,
         params,
         n_scored_docs,
+        ..
     } = *enc;
     scratch.term_buf.clear();
     scratch.pos_out.clear();
@@ -4106,6 +4260,32 @@ fn encode_term(
     );
 
     let df = pairs.len() as u64;
+    // Every posting's score, as a reader scores it: the heads rank by it
+    // and a long list's blocks take their maxima from it. A short list
+    // without a head to gather is not scored.
+    let idf_t = bm25::idf(n_scored_docs as u64, df);
+    let score_all = |scratch: &mut TermScratch| {
+        scratch.scores.clear();
+        scratch.scores.extend(pairs.iter().map(|&(doc, tf)| {
+            bm25::score(
+                idf_t,
+                tf,
+                bm25::stored_len(col_doc_lengths[doc as usize]),
+                avgdl,
+                params,
+            )
+        }));
+    };
+    if enc.heads {
+        score_all(scratch);
+        term_head(
+            pairs,
+            &scratch.scores,
+            enc,
+            &mut scratch.head_heap,
+            &mut scratch.head,
+        );
+    }
 
     // A df=1 posting inlines into the dictionary entry when the WHOLE
     // posting fits: a positionless column always does (doc_id + tf);
@@ -4165,7 +4345,9 @@ fn encode_term(
         EncodedTerm::Short
     } else {
         profile.encode_pfor += 1;
-        let idf_t = bm25::idf(n_scored_docs as u64, df);
+        if !enc.heads {
+            score_all(scratch);
+        }
         // Reuse `scratch.encoded_blocks` / `scratch.min_dl_per_block`
         // across every dense term in the column (one allocation amortised
         // over ~5K terms / ~1M blocks at 1M docs, vs `Vec::new` per term).
@@ -4190,7 +4372,7 @@ fn encode_term(
         if block_tfs.capacity() < BLOCK_LEN {
             block_tfs.reserve(BLOCK_LEN - block_tfs.capacity());
         }
-        for chunk in pairs.chunks(BLOCK_LEN) {
+        for (at, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
             block_doc_ids.clear();
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
@@ -4210,19 +4392,9 @@ fn encode_term(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            let block_max = block_doc_ids
+            let block_max = scratch.scores[at * BLOCK_LEN..at * BLOCK_LEN + chunk.len()]
                 .iter()
-                .zip(block_tfs.iter())
-                .map(|(&d, &t)| {
-                    bm25::score(
-                        idf_t,
-                        t,
-                        bm25::stored_len(col_doc_lengths[d as usize]),
-                        avgdl,
-                        params,
-                    )
-                })
-                .fold(0.0f32, f32::max);
+                .fold(0.0f32, |m, &s| m.max(s));
             block_maxes.push(block_max);
             let block = Block {
                 doc_ids: mem::take(&mut block_doc_ids),
@@ -4398,6 +4570,8 @@ fn write_term<W: Write>(
     mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
     positions_sink: Option<&mut PositionsSink>,
     profile: &mut FinishProfile,
+    head: &HeadOut,
+    head_sink: &mut Option<Box<dyn TermHeadSink>>,
 ) -> Result<(), BuildError> {
     let write_start = profile.enabled.then(Instant::now);
     key_buf.clear();
@@ -4432,6 +4606,23 @@ fn write_term<W: Write>(
         }
     };
 
+    if let Some(sink) = head_sink.as_mut() {
+        let column = std::str::from_utf8(col_name_bytes)
+            .map_err(|_| BuildError::Io(Error::other("fts: non-utf8 column name")))?;
+        sink.term(
+            column,
+            term,
+            &TermHeadFacts {
+                df: head.df,
+                bound: head.bound,
+                entry: dict_entry,
+                head: &head.docs,
+                tail: head.tail,
+                avgdl: head.avgdl,
+                params: head.params,
+            },
+        )?;
+    }
     let dict_insert_start = profile.enabled.then(Instant::now);
     if let Some(db) = dict_entries_inram {
         db.insert(key_buf, dict_entry);

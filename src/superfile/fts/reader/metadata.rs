@@ -292,9 +292,7 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
-    /// The buckets this table scores by. Test-only: the query path indexes
-    /// them and never needs the slice.
-    #[cfg(test)]
+    /// The buckets this table scores by.
     pub(super) fn buckets(&self) -> &[u8] {
         &self.bytes
     }
@@ -324,7 +322,7 @@ impl NormTable {
 /// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
 /// place on the heap so the 256 `f32`s are not built on the stack and
 /// moved.
-fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+pub(crate) fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
     let mut lut = Box::new([0.0_f32; 256]);
     for (bucket, slot) in lut.iter_mut().enumerate() {
         let dl = bm25::dequantize_len(bucket as u8);

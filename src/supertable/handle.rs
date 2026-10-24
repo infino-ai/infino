@@ -18,7 +18,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64},
+    },
     time::{Duration, Instant},
 };
 
@@ -138,6 +141,20 @@ pub(super) struct SupertableInner {
     /// writes. Cross-process coordination happens at the sidecar-seal
     /// level.
     pub(super) compaction_outstanding: AtomicBool,
+    /// What opening one superfile for a ranked query costs on this table,
+    /// in nanoseconds of query wall time: a running average over the
+    /// ceiling-ordered fan-outs, each contributing its wall divided by
+    /// the superfiles it opened. Zero until a fan-out has run. The tier
+    /// merge reads on while a round's exclusions are worth more than the
+    /// round itself at this price.
+    pub(super) open_cost_ns: AtomicU64,
+    /// What one tier entry costs a merge on this table, in nanoseconds of
+    /// query wall: a running average over merges of their rounds' wall
+    /// divided by the entries decoded. Zero until a merge has run.
+    pub(super) tier_entry_cost_ns: AtomicU64,
+    /// Whether a ranked query merges its tiers, learned per class of query
+    /// from the cost of both ways on this table.
+    pub(super) tier_policy: crate::supertable::query::tier::TierPolicy,
     /// Generator for the supertable-injected `_id` column.
     /// Each `append()` locks the mutex once, reserves
     /// `batch.num_rows()` ids as spans, and unlocks before
@@ -2187,6 +2204,9 @@ async fn build_handle(
         writer_slot: WriterSlot::default(),
         append_queue: AppendQueue::default(),
         compaction_outstanding: AtomicBool::new(false),
+        open_cost_ns: AtomicU64::new(0),
+        tier_entry_cost_ns: AtomicU64::new(0),
+        tier_policy: crate::supertable::query::tier::TierPolicy::new(),
         id_generator: Mutex::new(id_generator),
         sql_session_cache: Mutex::new(None),
         sql_logical_plan_cache: Mutex::new(None),
@@ -2500,6 +2520,44 @@ impl WeakReader {
 }
 
 impl SupertableReader {
+    /// The running cost of one superfile open on this table (see
+    /// `SupertableInner::open_cost_ns`); zero until a fan-out has run.
+    pub(crate) fn open_cost_ns(&self) -> u64 {
+        self.inner
+            .open_cost_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fold one ceiling-ordered fan-out's cost per open into the running
+    /// average: a quarter of the way from the old value to the sample, so
+    /// a cold outlier neither sets nor erases it.
+    pub(crate) fn note_open_cost(&self, sample_ns: u64) {
+        Self::fold(&self.inner.open_cost_ns, sample_ns);
+    }
+
+    /// The table's learned merge policy (see `SupertableInner::tier_policy`).
+    pub(crate) fn tier_policy(&self) -> &crate::supertable::query::tier::TierPolicy {
+        &self.inner.tier_policy
+    }
+
+    /// The running cost of one tier entry to a merge on this table (see
+    /// `SupertableInner::tier_entry_cost_ns`); zero until a merge has run.
+    pub(crate) fn tier_entry_cost_ns(&self) -> u64 {
+        self.inner
+            .tier_entry_cost_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Fold one merge's cost per entry into the running average, as
+    /// [`Self::note_open_cost`] folds an open's.
+    pub(crate) fn note_tier_entry_cost(&self, sample_ns: u64) {
+        Self::fold(&self.inner.tier_entry_cost_ns, sample_ns);
+    }
+
+    fn fold(cell: &AtomicU64, sample_ns: u64) {
+        crate::supertable::query::tier::fold_mean(cell, sample_ns, 2);
+    }
+
     /// ManifestSnapshot id pinned at construction. Useful for asserting
     /// reader-vs-writer visibility ordering in tests.
     pub fn manifest_id(&self) -> u64 {

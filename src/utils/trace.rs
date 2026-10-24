@@ -361,6 +361,9 @@ impl CloseOut {
             span.record("rows_materialized", stats.rows_materialized);
             span.record("kernel_cpu_ns", stats.kernel_cpu_ns);
             span.record("fts_postings_bytes", stats.fts_postings_bytes);
+            span.record("tier_bytes", stats.tier_bytes);
+            span.record("tier_entries", stats.tier_entries);
+            span.record("superfiles_resolved", stats.superfiles_resolved);
             span.record("vector_cells_scanned", stats.vector_cells_scanned);
             span.record("vector_candidates_scanned", stats.vector_candidates_scanned);
             span.record("vector_rows_reranked", stats.vector_rows_reranked);

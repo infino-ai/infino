@@ -1,0 +1,74 @@
+{
+  "format_version": "3.0",
+  "manifest_id": 2,
+  "options_hash": "blake3:c9e7fc9e3f52b5067babce99a7c27fc003888033cfc8becd882788e24da5242c",
+  "schema": {
+    "fields": [
+      {
+        "id": 1,
+        "index": {
+          "analyzer": "standard",
+          "b": 0.75,
+          "k1": 1.2000000476837158,
+          "kind": "fts",
+          "positions": true,
+          "stored": true
+        },
+        "name": "body",
+        "nullable": true,
+        "type": "large_utf8"
+      }
+    ],
+    "last_field_id": 1,
+    "max_depth": 20,
+    "max_fields": 10000,
+    "schema_id": 1,
+    "tombstoned": []
+  },
+  "id_column": "_id",
+  "commit_token": "69a2d3e1-0a44-4f18-a3b7-bd5b088560ab",
+  "vector_index_storage_prefix": null,
+  "deleted_user_ids_inline_b64": null,
+  "slow_vector_state_uri": null,
+  "slow_vector_state_content_hash": null,
+  "term_index_uri": "term-index/root-7df394f3c8ecf53d0abbbd55150df44f14c489d4d34e5e3dc274d08060aab95c.bin",
+  "term_index_content_hash": "blake3:7df394f3c8ecf53d0abbbd55150df44f14c489d4d34e5e3dc274d08060aab95c",
+  "term_index_complete": true,
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "global_vector_index": null,
+  "drained_ranges": [],
+  "parts": [
+    {
+      "part_id": "11d5448b-d913-4a9f-a754-0dce59cbadb3",
+      "uri": "manifest-parts/part-b19ae44615d1558514a354d5b92e959c3ceabb532015a175c3427c306af59a34.avro.zst",
+      "n_superfiles": 2,
+      "size_bytes_compressed": 7128,
+      "size_bytes_uncompressed": 7128,
+      "content_hash": "blake3:b19ae44615d1558514a354d5b92e959c3ceabb532015a175c3427c306af59a34",
+      "routing_uri": "manifest-parts/part-b19ae44615d1558514a354d5b92e959c3ceabb532015a175c3427c306af59a34.avro.zst",
+      "routing_content_hash": "blake3:b19ae44615d1558514a354d5b92e959c3ceabb532015a175c3427c306af59a34",
+      "id_range": [
+        "33070200183811457270617542230016",
+        "33070200184254179128386571468839"
+      ],
+      "scalar_stats_agg": {},
+      "scalar_stats_agg_ipc": "/////+ABAAAQAAAAAAAKAAwACgAJAAQACgAAABAAAAAAAQQACAAIAAAABAAIAAAABAAAAAgAAAB4AQAAOAEAAAQBAADUAAAAqAAAAHQAAAA8AAAABAAAALj+//8QAAAAFAAAAAAAAQIQAAAAov7//0AAAAAAAAAADwAAADQyOTQ5NjcyOTVfX21heADs/v//EAAAABQAAAAAAAECEAAAANb+//9AAAAAAAAAAA8AAAA0Mjk0OTY3Mjk1X19taW4AIP///xAAAAAUAAAAAAABAhAAAAAK////QAAAAAAAAAAIAAAAMV9fbnVsbHMAAAAAUP///xQAAAAMAAAAAAABFAwAAAAAAAAA2P///wYAAAAxX19tYXgAAHj///8YAAAADAAAAAAAARQQAAAAAAAAAAQABAAEAAAABgAAADFfX21pbgAApP///xAAAAAUAAAAAAABAhAAAACO////QAAAAAAAAAAIAAAAMF9fbnVsbHMAAAAA1P///xQAAAAMAAAAAAABBxAAAAAAAAAAwv///yYAAAAGAAAAMF9fbWF4AAAQABQAEAAOAA8ABAAAAAgAEAAAABwAAAAMAAAAAAABBxgAAAAAAAAAAAAGAAgABAAGAAAAJgAAAAYAAAAwX19taW4AAAAAAAD/////+AEAABAAAAAMABoAGAAXAAQACAAMAAAAIAAAANAAAAAAAAAAAAAAAAAAAAMEAAoAGAAMAAgABAAKAAAAnAAAABAAAAABAAAAAAAAAAAAAAAIAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAEgAAAAAAAAAAAAAAAQAAAAAAAAAIAAAAAAAAABAAAAAAAAAAGAAAAAAAAAABAAAAAAAAACAAAAAAAAAAEAAAAAAAAAAwAAAAAAAAAAEAAAAAAAAAOAAAAAAAAAAIAAAAAAAAAEAAAAAAAAAAAQAAAAAAAABIAAAAAAAAABAAAAAAAAAAWAAAAAAAAAAmAAAAAAAAAIAAAAAAAAAAAQAAAAAAAACIAAAAAAAAABAAAAAAAAAAmAAAAAAAAAAHAAAAAAAAAKAAAAAAAAAAAQAAAAAAAACoAAAAAAAAAAgAAAAAAAAAsAAAAAAAAAABAAAAAAAAALgAAAAAAAAACAAAAAAAAADAAAAAAAAAAAEAAAAAAAAAyAAAAAAAAAAIAAAAAAAAAP8AAAAAAAAAAAAAG0lmDPL+cZRnoQEAAP8AAAAAAAAAJwAAG0lmDPIWcpRnoQEAAP8AAAAAAAAAAAAAAAAAAAD/AAAAAAAAAAAAAAAAAAAAJgAAAAAAAAB0aGUgZGF0YSBkYXRhIGRhdGEgZmlsbGVyIGZpbGxlciB6ZWJyYQAA/wAAAAAAAAAAAAAAAAAAAAcAAAAAAAAAdGhlIHlhawD/AAAAAAAAAAAAAAAAAAAA/wAAAAAAAAABAAAAAAAAAP8AAAAAAAAAAgAAAAAAAAD/////AAAAAA==",
+      "fts_summary_agg": {},
+      "fts_length_totals": {
+        "1": {
+          "total_tokens": 628,
+          "n_scored_docs": 80
+        }
+      },
+      "summaries_uri": "manifest-summaries/summ-1f10776032f9fc479a57b542b46105c89b81add86465c1433720c92a3deff0ad.bin",
+      "summaries_content_hash": "blake3:1f10776032f9fc479a57b542b46105c89b81add86465c1433720c92a3deff0ad",
+      "summaries_size_bytes": 9372
+    }
+  ],
+  "tombstone_seqs": {},
+  "superseded_cells": {},
+  "split_checks": {}
+}

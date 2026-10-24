@@ -71,7 +71,10 @@ impl LiveFloor {
 /// Tie-break: larger doc_id is "greater", so on equal scores the
 /// smaller doc_id survives in the heap.
 #[derive(Debug, Copy, Clone)]
-pub(super) struct TopKEntry<I = FtsDocId>(pub(super) f32, pub(super) I);
+pub(in crate::superfile::fts) struct TopKEntry<I = FtsDocId>(
+    pub(in crate::superfile::fts) f32,
+    pub(in crate::superfile::fts) I,
+);
 impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0 && self.1 == other.1
@@ -96,6 +99,30 @@ impl<I: Ord> Ord for TopKEntry<I> {
             .unwrap_or(Ordering::Equal)
             .then_with(|| self.1.cmp(&other.1))
     }
+}
+
+/// What a `depth + 1` heap kept, as a term's head. `kept` receives the
+/// documents in descending score, ascending id on a tie — a reader's
+/// top-k order. The bound is the largest key among them; when more than
+/// `depth` were kept, the last is popped as the tail, the first document
+/// left out by its key, else the tail is zero. Returns `(bound, tail)`.
+pub(in crate::superfile::fts) fn finish_head<I: Ord + Copy>(
+    heap: &mut BinaryHeap<TopKEntry<I>>,
+    depth: usize,
+    kept: &mut Vec<(I, f32)>,
+    key: impl Fn(I) -> f32,
+) -> (f32, f32) {
+    let complete = heap.len() <= depth;
+    kept.clear();
+    kept.extend(heap.drain().map(|TopKEntry(s, d)| (d, s)));
+    kept.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+    let bound = kept.iter().map(|&(d, _)| key(d)).fold(0.0f32, f32::max);
+    let tail = if complete {
+        0.0
+    } else {
+        kept.pop().map(|(d, _)| key(d)).unwrap_or(0.0)
+    };
+    (bound, tail)
 }
 
 /// Drain a top-k min-heap into the public result order: descending
