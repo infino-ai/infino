@@ -15,7 +15,7 @@
 //! writers, and released via `Drop`.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
     sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
@@ -26,18 +26,20 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use arrow_schema::SchemaRef;
 use chrono::Utc;
 use datafusion::{execution::context::SessionContext, logical_expr::LogicalPlan};
+use futures::future::join_all;
 use tokio::runtime::Runtime;
 use tracing::{Instrument, debug, warn};
-use uuid::Uuid;
 
 use super::{
+    companion::{VECTOR_INDEX_SUFFIX, companion_purpose_of, hidden_table_prefix},
     error::{BuildError, CommitError, OpenError},
     hidden_deleted::{self, HiddenDeletedError},
     manifest::{
         ManifestSnapshot,
-        list::{CellRoutingParams, PartitionStrategy},
+        list::{CellRoutingParams, PartitionStrategy, decode as decode_list},
     },
     options::SupertableOptions,
+    schema::LegacyNames,
 };
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -45,9 +47,9 @@ use crate::{
     config,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
-    storage::{PrefixedStorageProvider, StorageError},
+    storage::{PrefixedStorageProvider, StorageError, StorageProvider},
     superfile::{
-        builder::{BuilderOptions, VectorConfig},
+        builder::{BuilderOptions, FtsConfig, VectorConfig},
         vector::{kmeans::kmeans, rerank_codec::RerankCodec},
     },
     supertable::{
@@ -189,6 +191,11 @@ pub(super) struct SupertableInner {
     /// Hidden sibling supertable storing vectors only, partitioned by
     /// global centroids so unfiltered search can route by nearest cell.
     pub(super) vector_index_table: Option<Arc<Supertable>>,
+    /// Hidden companion tables beside this one, by purpose: those the
+    /// manifest recorded at open, and any re-attached since. Empty on a
+    /// table without companions and on every hidden table. See
+    /// [`CompanionSlot`].
+    pub(super) companions: Mutex<BTreeMap<String, CompanionSlot>>,
     /// Set once at open when the hidden vector index is **configured and
     /// materialized** (its storage pointer exists) but fails to load/open — i.e.
     /// present-but-broken, distinct from never-configured or not-yet-drained
@@ -231,6 +238,24 @@ pub(super) struct SupertableInner {
     /// top: decode the inline bytes once per manifest version, not once per
     /// query. Keyed by `manifest_id`, which bumps on every deleted-id stamp.
     pub(super) hidden_deleted_cache: Mutex<Option<(u64, Arc<Vec<i128>>)>>,
+}
+
+/// What a table handle knows of one hidden companion table.
+#[derive(Clone)]
+pub(super) enum CompanionSlot {
+    /// Open, at `prefix` under the table's storage.
+    Open {
+        prefix: String,
+        table: Arc<Supertable>,
+    },
+    /// Recorded at `prefix` but not open: its open failed, at the table's
+    /// open or on the last ask. The next ask opens it again, so a
+    /// transient failure heals without reopening the table.
+    Unopened { prefix: String },
+    /// Looked for and not there: the manifest records no companion of the
+    /// purpose and none is stored under the table. Companions are made only
+    /// when a table is created, so this holds for the handle's life.
+    Absent,
 }
 
 impl SupertableInner {
@@ -496,6 +521,15 @@ impl Supertable {
 
     /// Async open kernel. Sync [`Supertable::open`] bridges here.
     pub(crate) async fn open_async(options: SupertableOptions) -> Result<Self, OpenError> {
+        Self::open_with_role(options, TableRole::User).await
+    }
+
+    /// [`Self::open_async`] for a table playing `role`: the user's table,
+    /// or a companion opened beside one.
+    async fn open_with_role(
+        options: SupertableOptions,
+        role: TableRole,
+    ) -> Result<Self, OpenError> {
         let storage = options
             .storage
             .as_ref()
@@ -537,6 +571,7 @@ impl Supertable {
                                 hidden_arc,
                                 hidden_manifest,
                                 None,
+                                BTreeMap::new(),
                                 TableRole::VectorIndex,
                             )
                             .await
@@ -564,7 +599,15 @@ impl Supertable {
                 // handle materializes the index.
                 Ok(None) if options_arc.summary_centroids_from_superfiles => (None, None),
                 Ok(None) => {
-                    match create_table_async(hidden_opts, None, None, TableRole::VectorIndex).await
+                    match create_table_async(
+                        hidden_opts,
+                        None,
+                        None,
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        TableRole::VectorIndex,
+                    )
+                    .await
                     {
                         Ok(table) => (Some(Arc::new(table)), None),
                         Err(e) => {
@@ -584,8 +627,13 @@ impl Supertable {
         } else {
             (None, None)
         };
+        // Companions open beside the table but never fail its open: a
+        // companion no query of this table reads must not make the table
+        // unreachable. One that fails is logged and left for the caller that
+        // asks for it ([`Self::companion`]) to see the error.
+        let companions = open_recorded_companions(options_arc.as_ref(), &manifest).await;
         let handle =
-            open_table_async(options_arc, manifest, vector_index_table, TableRole::User).await?;
+            open_table_async(options_arc, manifest, vector_index_table, companions, role).await?;
         if let Some(err) = hidden_index_broken {
             let _ = handle.inner.hidden_index_open_error.set(err);
         }
@@ -602,10 +650,19 @@ impl Supertable {
 
     /// Async create kernel. Sync [`Supertable::create`] bridges here.
     pub(crate) async fn create_async(options: SupertableOptions) -> Result<Self, OpenError> {
+        Self::create_with_role(options, TableRole::User).await
+    }
+
+    /// [`Self::create_async`] for a table playing `role`: the user's table,
+    /// or a companion created beside one.
+    async fn create_with_role(
+        options: SupertableOptions,
+        role: TableRole,
+    ) -> Result<Self, OpenError> {
         if let Some(storage) = options.storage.as_ref() {
             let probe = Arc::clone(storage);
             match read_pointer(&*probe).await {
-                Ok(Some(_pointer)) => return Self::open_async(options).await,
+                Ok(Some(_pointer)) => return Self::open_with_role(options, role).await,
                 Ok(None) => {}
                 Err(e) => {
                     return Err(OpenError::Storage(StorageError::Permanent {
@@ -629,6 +686,8 @@ impl Supertable {
                         hidden_opts,
                         None,
                         Some(prefix.clone()),
+                        BTreeMap::new(),
+                        BTreeMap::new(),
                         TableRole::VectorIndex,
                     )
                     .await?,
@@ -639,11 +698,38 @@ impl Supertable {
         } else {
             None
         };
+        // Companions are hidden tables made the same way: each created
+        // first under its own prefix, then recorded on the user manifest the
+        // create below persists, so a manifest never names a companion that
+        // does not exist.
+        let mut companion_prefixes = BTreeMap::new();
+        let mut companions = BTreeMap::new();
+        for spec in &options.companions {
+            let prefix = hidden_table_prefix(&spec.purpose);
+            let opts = hidden_table_options(
+                &options,
+                &prefix,
+                Arc::clone(&spec.schema),
+                spec.fts_columns.clone(),
+                spec.vector_columns.clone(),
+            )?;
+            let table = Box::pin(Self::create_with_role(opts, TableRole::Companion)).await?;
+            companion_prefixes.insert(spec.purpose.clone(), prefix.clone());
+            companions.insert(
+                spec.purpose.clone(),
+                CompanionSlot::Open {
+                    prefix,
+                    table: Arc::new(table),
+                },
+            );
+        }
         create_table_async(
             options,
             vector_index_table,
             vector_index_storage_prefix,
-            TableRole::User,
+            companion_prefixes,
+            companions,
+            role,
         )
         .await
     }
@@ -748,6 +834,113 @@ impl Supertable {
     fn vector_index_table(&self) -> Option<&Arc<Supertable>> {
         self.inner.vector_index_table.as_ref()
     }
+    }
+
+    /// The hidden companion of `purpose` beside this table: `Ok(None)` when
+    /// the table has none, `Err` when it has one that does not open.
+    ///
+    /// A companion the manifest recorded was opened with the table; one
+    /// whose open failed then is opened again here, so the error is current.
+    /// A purpose the manifest does not record is looked for under the
+    /// table and re-attached when exactly one is stored there (see
+    /// [`find_unrecorded_companion`]): the record is lost when an engine
+    /// older than companions commits the table, and the directory name says
+    /// what the record said. Either way the record is restored on the
+    /// in-memory manifest, so this handle's next commit writes it back.
+    pub(crate) fn companion(&self, purpose: &str) -> Result<Option<Supertable>, OpenError> {
+        bridge_on_runtime(self.companion_async(purpose), &shared_io_runtime())
+    }
+
+    async fn companion_async(&self, purpose: &str) -> Result<Option<Supertable>, OpenError> {
+        let slot = self
+            .inner
+            .companions
+            .lock()
+            .expect("companions mutex poisoned")
+            .get(purpose)
+            .cloned();
+        let (prefix, table) = match slot {
+            Some(CompanionSlot::Open { prefix, table }) => (prefix, table),
+            Some(CompanionSlot::Absent) => return Ok(None),
+            Some(CompanionSlot::Unopened { prefix }) => {
+                let table = open_companion(&self.inner.options, &prefix)
+                    .await
+                    .map_err(|e| companion_open_error(purpose, e))?;
+                (prefix, Arc::new(table))
+            }
+            None => {
+                let manifest = self.inner.manifest.load_full();
+                match find_unrecorded_companion(&self.inner.options, &manifest, purpose)
+                    .await
+                    .map_err(|e| companion_open_error(purpose, e))?
+                {
+                    Some((prefix, table)) => {
+                        warn!(
+                            purpose = %purpose,
+                            prefix = %prefix,
+                            "supertable: re-attached a companion the manifest had lost"
+                        );
+                        (prefix, Arc::new(table))
+                    }
+                    None => {
+                        self.inner
+                            .companions
+                            .lock()
+                            .expect("companions mutex poisoned")
+                            .insert(purpose.to_owned(), CompanionSlot::Absent);
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        // A concurrent ask may have opened it first; serve that one so every
+        // caller shares one handle.
+        let table = {
+            let mut slots = self
+                .inner
+                .companions
+                .lock()
+                .expect("companions mutex poisoned");
+            match slots.get(purpose) {
+                Some(CompanionSlot::Open { table, .. }) => Arc::clone(table),
+                _ => {
+                    slots.insert(
+                        purpose.to_owned(),
+                        CompanionSlot::Open {
+                            prefix: prefix.clone(),
+                            table: Arc::clone(&table),
+                        },
+                    );
+                    table
+                }
+            }
+        };
+        self.restore_companion_record(purpose, &prefix);
+        Ok(Some(Supertable::clone(&table)))
+    }
+
+    /// Record the companion of `purpose` at `prefix` on the in-memory
+    /// manifest when the manifest the handle holds has lost it — re-attached
+    /// after an older engine's commit, or dropped again by one since — so
+    /// this handle's next commit writes it back. Changes nothing when the
+    /// manifest already records the purpose.
+    fn restore_companion_record(&self, purpose: &str, prefix: &str) {
+        if self
+            .inner
+            .manifest
+            .load()
+            .companion_prefix(purpose)
+            .is_some()
+        {
+            return;
+        }
+        self.inner.manifest.rcu(|current| {
+            if current.companion_prefix(purpose).is_some() {
+                Arc::clone(current)
+            } else {
+                Arc::new(current.with_companion(purpose, prefix))
+            }
+        });
     }
 
     test_visible! {
@@ -1704,7 +1897,7 @@ pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
 }
 
 fn generate_vector_index_storage_prefix() -> String {
-    format!("_infino_{}_vector_index", Uuid::new_v4())
+    hidden_table_prefix(VECTOR_INDEX_SUFFIX)
 }
 
 fn resolve_vector_index_storage_prefix(
@@ -1733,10 +1926,6 @@ fn build_vector_index_options(
 ) -> Option<SupertableOptions> {
     let storage_prefix =
         resolve_vector_index_storage_prefix(user_opts, user_manifest, create_prefix)?;
-    let storage = user_opts.storage.as_ref()?;
-    let sub_storage: Arc<dyn crate::storage::StorageProvider> = Arc::new(
-        PrefixedStorageProvider::new(Arc::clone(storage), storage_prefix.as_str()),
-    );
     let mut fields: Vec<arrow_schema::FieldRef> = Vec::new();
     for vc in &user_opts.vector_columns {
         let item_field = Arc::new(arrow_schema::Field::new(
@@ -1767,15 +1956,15 @@ fn build_vector_index_options(
             ..vc.clone()
         })
         .collect();
-    let mut hidden_opts =
-        SupertableOptions::new(hidden_schema, vec![], hidden_vector_columns).ok()?;
-    hidden_opts = hidden_opts
-        .with_storage(Arc::clone(&sub_storage))
-        .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf)
-        .with_reader_pool(Arc::clone(&user_opts.reader_pool))
-        .with_writer_pool(Arc::clone(&user_opts.writer_pool))
-        .with_read_consistency(user_opts.read_consistency);
-    hidden_opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
+    let mut hidden_opts = hidden_table_options(
+        user_opts,
+        storage_prefix.as_str(),
+        hidden_schema,
+        vec![],
+        hidden_vector_columns,
+    )
+    .ok()?
+    .with_vector_layout(crate::superfile::vector::layout::VectorLayout::Ivf);
     // Hidden-manifest summaries hydrate stripped unconditionally (the fp32
     // wire home is the slow-CAS centroid section), so the consumer memory
     // mode has nothing left to gate there. Keep it off on the derived
@@ -1787,9 +1976,6 @@ fn build_vector_index_options(
     // paths resolve counts through its own options.
     hidden_opts.user_cell_count = user_opts.user_cell_count;
     hidden_opts.hidden_cell_count = user_opts.hidden_cell_count;
-    if let Some(cache) = user_opts.disk_cache.as_ref() {
-        hidden_opts = hidden_opts.with_disk_cache(Arc::clone(cache));
-    }
     if let Some(manifest) = user_manifest
         && let Some(clusters) =
             train_global_centroids(manifest, hidden_vector_cell_count(user_opts))
@@ -1805,6 +1991,177 @@ fn build_vector_index_options(
     Some(hidden_opts)
 }
 
+/// The storage of a hidden table at `prefix` under the user table's.
+fn hidden_storage(
+    user_opts: &SupertableOptions,
+    prefix: &str,
+) -> Result<Arc<dyn StorageProvider>, BuildError> {
+    let storage = user_opts.storage.as_ref().ok_or_else(|| {
+        BuildError::Store(format!("hidden table {prefix} requires options.storage"))
+    })?;
+    Ok(Arc::new(PrefixedStorageProvider::new(
+        Arc::clone(storage),
+        prefix,
+    )))
+}
+
+/// Options for a hidden table at `prefix` under the user table's storage,
+/// running on the user table's pools, read consistency, memory budget and
+/// disk cache. Shared by the vector index and the companions, so every
+/// hidden table is made the same way.
+fn hidden_table_options(
+    user_opts: &SupertableOptions,
+    prefix: &str,
+    schema: SchemaRef,
+    fts_columns: Vec<FtsConfig>,
+    vector_columns: Vec<VectorConfig>,
+) -> Result<SupertableOptions, BuildError> {
+    let sub_storage = hidden_storage(user_opts, prefix)?;
+    let mut opts = SupertableOptions::new(schema, fts_columns, vector_columns)?
+        .with_storage(sub_storage)
+        .with_reader_pool(Arc::clone(&user_opts.reader_pool))
+        .with_writer_pool(Arc::clone(&user_opts.writer_pool))
+        .with_read_consistency(user_opts.read_consistency);
+    opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
+    if let Some(cache) = user_opts.disk_cache.as_ref() {
+        opts = opts.with_disk_cache(Arc::clone(cache));
+    }
+    Ok(opts)
+}
+
+/// Open the companion stored at `prefix` beside a table opened with
+/// `user_opts`.
+///
+/// A companion's schema and indexes are its own, so the options it opens
+/// with are built from the schema document on its own manifest list, read
+/// first; that is also how a companion whose schema was patched since it
+/// was created opens as patched. A prefix with no manifest pointer is an
+/// error: every companion is created, pointer and all, before the manifest
+/// that records it.
+async fn open_companion(
+    user_opts: &SupertableOptions,
+    prefix: &str,
+) -> Result<Supertable, OpenError> {
+    let storage = hidden_storage(user_opts, prefix)?;
+    let Some((pointer, _)) = read_pointer(storage.as_ref()).await? else {
+        return Err(ManifestLoadError::PointerNotFound.into());
+    };
+    let (list_bytes, _) = storage.get(&pointer.manifest_uri).await?;
+    let list = decode_list(&list_bytes, &LegacyNames::none())
+        .map_err(|e| OpenError::ManifestListParse(e.to_string()))?;
+    let schema = list.schema.ok_or_else(|| {
+        OpenError::ManifestListParse(format!(
+            "the companion list at {prefix} carries no schema document"
+        ))
+    })?;
+    let opts = hidden_table_options(
+        user_opts,
+        prefix,
+        schema.user_schema(),
+        schema.fts_configs(),
+        schema.vector_configs(),
+    )?;
+    // Boxed: opening a table opens its companions, so the future recurses.
+    Box::pin(Supertable::open_with_role(opts, TableRole::Companion)).await
+}
+
+/// Open every companion `manifest` records, concurrently. One that fails is
+/// logged and kept as [`CompanionSlot::Unopened`] rather than failing the
+/// table's open; the caller that asks for it gets the error.
+async fn open_recorded_companions(
+    user_opts: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+) -> BTreeMap<String, CompanionSlot> {
+    let opens = manifest
+        .companions()
+        .into_iter()
+        .map(|(purpose, prefix)| async move {
+            let slot = match open_companion(user_opts, &prefix).await {
+                Ok(table) => CompanionSlot::Open {
+                    prefix,
+                    table: Arc::new(table),
+                },
+                Err(e) => {
+                    warn!(
+                        purpose = %purpose,
+                        prefix = %prefix,
+                        "supertable: companion table failed to open: {e}"
+                    );
+                    CompanionSlot::Unopened { prefix }
+                }
+            };
+            (purpose, slot)
+        });
+    join_all(opens).await.into_iter().collect()
+}
+
+/// Look under the table for a companion of `purpose` that its manifest does
+/// not record, and open it when there is exactly one.
+///
+/// The record is lost when an engine older than companions commits the
+/// table: it rewrites the manifest list without the field it does not know.
+/// The companion itself is untouched, and its directory name,
+/// `_infino_<uuid>_<purpose>`, says what the record said. So: list the
+/// directories directly under the table (one delimiter listing); keep each
+/// whose name reads as a companion of `purpose` ([`companion_purpose_of`];
+/// the vector index's name never does) and that no record on the manifest
+/// names; and of those, keep each holding a manifest pointer, which a
+/// directory a purge emptied does not. One left is the lost companion. None
+/// left means the table has no companion of `purpose`. More than one cannot
+/// be told apart — a create that lost a race to another leaves its own
+/// companion behind — so none is attached:
+/// [`OpenError::CompanionAmbiguous`].
+async fn find_unrecorded_companion(
+    user_opts: &SupertableOptions,
+    manifest: &ManifestSnapshot,
+    purpose: &str,
+) -> Result<Option<(String, Supertable)>, OpenError> {
+    let Some(storage) = user_opts.storage.as_ref() else {
+        return Ok(None);
+    };
+    let recorded: HashSet<String> = manifest
+        .companions()
+        .into_values()
+        .chain(manifest.vector_index_storage_prefix().map(str::to_owned))
+        .collect();
+    let mut candidates = Vec::new();
+    for name in storage.list_child_prefixes("").await? {
+        if companion_purpose_of(&name) != Some(purpose) || recorded.contains(&name) {
+            continue;
+        }
+        if read_pointer(hidden_storage(user_opts, &name)?.as_ref())
+            .await?
+            .is_some()
+        {
+            candidates.push(name);
+        }
+    }
+    if candidates.len() > 1 {
+        warn!(
+            purpose = %purpose,
+            candidates = ?candidates,
+            "supertable: several unrecorded companions of one purpose; attaching none"
+        );
+        return Err(OpenError::CompanionAmbiguous {
+            purpose: purpose.to_owned(),
+            candidates,
+        });
+    }
+    let Some(prefix) = candidates.pop() else {
+        return Ok(None);
+    };
+    let table = open_companion(user_opts, &prefix).await?;
+    Ok(Some((prefix, table)))
+}
+
+/// `err`, as the error of the companion of `purpose`.
+fn companion_open_error(purpose: &str, err: OpenError) -> OpenError {
+    OpenError::Companion {
+        purpose: purpose.to_owned(),
+        source: Box::new(err),
+    }
+}
+
 /// Build one supertable handle. Leaf — never creates a hidden sibling.
 #[cfg_attr(
     feature = "detailed-tracing",
@@ -1817,6 +2174,7 @@ async fn build_handle(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    companions: BTreeMap<String, CompanionSlot>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let tombstone_cache = build_tombstone_cache(&options, &manifest);
@@ -1837,6 +2195,7 @@ async fn build_handle(
         tombstone_cache,
         handle_id,
         vector_index_table,
+        companions: Mutex::new(companions),
         hidden_index_open_error: std::sync::OnceLock::new(),
         last_pointer_check: Mutex::new(None),
         last_pointer_etag: Mutex::new(None),
@@ -1865,6 +2224,8 @@ async fn create_table_async(
     options: SupertableOptions,
     vector_index_table: Option<Arc<Supertable>>,
     vector_index_storage_prefix: Option<String>,
+    companion_prefixes: BTreeMap<String, String>,
+    companions: BTreeMap<String, CompanionSlot>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
     let options = Arc::new(options);
@@ -1874,30 +2235,33 @@ async fn create_table_async(
     // another process (`open` requires a pointer). This doesn't shift the id
     // sequence: the first append still commits `manifest_id 1`. An in-memory
     // table keeps the lighter in-process-only empty snapshot.
-    let (manifest, vector_index_table) = if let Some(storage) = options.storage.clone() {
+    let (manifest, vector_index_table, companions) = if let Some(storage) = options.storage.clone()
+    {
         let materialized = Arc::new(
             ManifestSnapshot::materialized_empty_with_vector_index_prefix(
                 options.clone(),
                 vector_index_storage_prefix,
+                companion_prefixes,
             ),
         );
         // `expected_prev_etag = None` is the initial-commit shape: no prior
         // pointer to fence on.
         match materialized.write(storage.as_ref(), None, &[]).await {
-            Ok(()) => (materialized, vector_index_table),
+            Ok(()) => (materialized, vector_index_table, companions),
             // Lost the initial-pointer race to a concurrent creator on the
             // same storage: adopt their committed manifest rather than
             // failing — `create` is create-or-open, and a pointer that
             // appeared between the caller's probe and this write is the same
             // as "pointer already present". Drop the loser's pre-built
-            // hidden handle (it used a freshly generated prefix the durable
+            // hidden handles (they used freshly generated prefixes the durable
             // manifest does not track) and reopen against the winner's
-            // stamped prefix.
+            // stamped prefixes.
             Err(CommitError::WriteContentionExhausted) => {
                 let adopted = ManifestSnapshot::load(None, storage, Some(options.clone())).await?;
                 let reconciled =
                     reconcile_vector_index_table_to_manifest(options.as_ref(), &adopted).await?;
-                (adopted, reconciled)
+                let companions = open_recorded_companions(options.as_ref(), &adopted).await;
+                (adopted, reconciled, companions)
             }
             Err(e) => return Err(e.into()),
         }
@@ -1908,9 +2272,10 @@ async fn create_table_async(
                 vector_index_storage_prefix,
             )),
             vector_index_table,
+            companions,
         )
     };
-    build_handle(options, manifest, vector_index_table, role).await
+    build_handle(options, manifest, vector_index_table, companions, role).await
 }
 
 /// After a lost create-race, open (or bootstrap) the hidden vector-index
@@ -1934,7 +2299,14 @@ async fn reconcile_vector_index_table_to_manifest(
             let hidden_manifest =
                 ManifestSnapshot::load(None, hidden_storage, Some(hidden_arc.clone())).await?;
             Ok(Some(Arc::new(
-                open_table_async(hidden_arc, hidden_manifest, None, TableRole::VectorIndex).await?,
+                open_table_async(
+                    hidden_arc,
+                    hidden_manifest,
+                    None,
+                    BTreeMap::new(),
+                    TableRole::VectorIndex,
+                )
+                .await?,
             )))
         }
         Ok(None) => {
@@ -1947,6 +2319,7 @@ async fn reconcile_vector_index_table_to_manifest(
                     ManifestSnapshot::materialized_empty_with_vector_index_prefix(
                         Arc::clone(&hidden_arc),
                         None,
+                        BTreeMap::new(),
                     ),
                 );
                 match materialized.write(storage.as_ref(), None, &[]).await {
@@ -1963,7 +2336,14 @@ async fn reconcile_vector_index_table_to_manifest(
                 ))
             };
             Ok(Some(Arc::new(
-                build_handle(hidden_arc, manifest, None, TableRole::VectorIndex).await?,
+                build_handle(
+                    hidden_arc,
+                    manifest,
+                    None,
+                    BTreeMap::new(),
+                    TableRole::VectorIndex,
+                )
+                .await?,
             )))
         }
         Err(e) => Err(OpenError::Storage(StorageError::Permanent {
@@ -1978,9 +2358,10 @@ async fn open_table_async(
     options: Arc<SupertableOptions>,
     manifest: Arc<ManifestSnapshot>,
     vector_index_table: Option<Arc<Supertable>>,
+    companions: BTreeMap<String, CompanionSlot>,
     role: TableRole,
 ) -> Result<Supertable, OpenError> {
-    build_handle(options, manifest, vector_index_table, role).await
+    build_handle(options, manifest, vector_index_table, companions, role).await
 }
 
 fn install_disk_cache_pinning(inner: &Arc<SupertableInner>) {

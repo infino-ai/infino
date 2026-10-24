@@ -10934,9 +10934,11 @@ where
 /// earlier build to catch up from.
 ///
 /// The full build runs once. When commits land before it publishes, a retry
-/// folds their delta segments onto it ([`fold_term_index`]), or, when that
-/// cannot list every live superfile, indexes only the superfiles the last
-/// build lacks on top of it.
+/// stacks their delta segments on it as they are (`term_index::rebase`),
+/// which writes only a root. When the build lists more superfiles than the
+/// root it was made from, it folds them in instead ([`fold_term_index`]).
+/// When neither lists every live superfile, it indexes only the superfiles
+/// the last build lacks on top of it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10975,12 +10977,34 @@ pub(in crate::supertable) async fn stamp_term_index(
             };
             let folded = match (&last, &current) {
                 (Some((base, Some(prior))), Some(current)) => {
-                    match fold_term_index(&old, base, prior, current, &entries).await {
-                        Ok(folded) => folded,
-                        Err(e) => {
-                            warn!("term index: folding new commits failed, catching up instead: {e}");
-                            None
+                    // Merging the new deltas in costs time in proportion to
+                    // them, so under steady commits each retry falls further
+                    // behind. Stacking them on the build costs one root.
+                    match term_index::rebase(base, prior, current) {
+                        // The rebase lists every superfile a fold would, so
+                        // a fold would miss the same ones: catch up instead.
+                        Some(root) if !unlisted(&root, &entries).is_empty() => None,
+                        Some(root) => {
+                            let deltas = root.segments.len() - base.segments.len();
+                            if deltas > 0 {
+                                info!(
+                                    deltas,
+                                    "term index: publish lost a race, rebased the build onto the commits since"
+                                );
+                            }
+                            Some(term_index::Built {
+                                root,
+                                slices: Vec::new(),
+                            })
                         }
+                        None => match fold_term_index(&old, base, prior, current, &entries).await
+                        {
+                            Ok(folded) => folded,
+                            Err(e) => {
+                                warn!("term index: folding new commits failed, catching up instead: {e}");
+                                None
+                            }
+                        },
                     }
                 }
                 _ => None,
@@ -12318,7 +12342,12 @@ pub(crate) async fn try_commit_attempt(
             contributions = term_contributions.len(),
         ))
         .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+        // A storage error keeps its kind, so a caller can tell a retried
+        // fault from refused credentials.
+        .map_err(|e| match e {
+            TermIndexError::Storage(source) => SupertableCommitError::Storage(source),
+            other => BuildError::Store(other.to_string()).into(),
+        })?;
         new_manifest = new_manifest.with_term_index_ref(reference, complete);
     } else if !every_new_covered
         && current_manifest.term_index_complete()

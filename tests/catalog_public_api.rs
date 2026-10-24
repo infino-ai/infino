@@ -13,16 +13,24 @@
 
 #![deny(clippy::unwrap_used)]
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
+use datafusion::prelude::{col, lit};
 use infino::{
-    BoolMode, IndexSpec, Metric, OptimizeOptions,
+    BoolMode, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
     arrow_array::{
         Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
+        UInt64Array,
     },
     arrow_schema::{DataType, Field, Schema, SchemaRef},
     connect,
 };
+use serde_json::Value;
 use tempfile::TempDir;
 
 /// Embedding width for the vector column — the engine's minimum.
@@ -36,6 +44,42 @@ const FIRST_BATCH: &[&str] = &["the quick brown fox", "a lazy sleeping dog"];
 /// Titles committed in the second batch, so maintenance has two
 /// superfiles to compact.
 const SECOND_BATCH: &[&str] = &["a red clever fox fox", "an old grey wolf"];
+
+// Companion fixtures.
+/// The purpose of the companion most tests declare: a ledger of what has
+/// been loaded into the table.
+const LEDGER: &str = "ledger";
+/// A second companion's purpose.
+const AUDIT: &str = "audit";
+/// What every hidden table's directory name under its table starts with.
+const HIDDEN_DIR_PREFIX: &str = "_infino_";
+/// Directory-name suffix of the hidden vector index under a table.
+const VECTOR_INDEX_DIR_SUFFIX: &str = "_vector_index";
+/// The manifest-list key recording a table's companions.
+const COMPANIONS_KEY: &str = "companions";
+/// The directory holding a table's manifest pointer, and the pointer's name.
+const POINTER_DIR: &str = "_supertable";
+const POINTER_FILE: &str = "current";
+/// The pointer line naming the current manifest list.
+const MANIFEST_URI_LINE: &str = "manifest_uri=";
+/// Keys the ledger records, and the rows each yielded.
+const LEDGER_KEYS: [&str; 2] = [
+    "events/2026-01-01/part-0.json",
+    "events/2026-01-02/part-0.json",
+];
+const LEDGER_ROWS: [u64; 2] = [690, 12];
+/// Events the audit companion records.
+const AUDIT_EVENTS: [&str; 2] = ["loaded", "replaced"];
+/// The column a schema patch adds to the ledger, and the value written to it.
+const NOTE: &str = "note";
+const NOTE_VALUE: &str = "rewritten upstream";
+/// A purpose length one past the 64 characters a purpose may have.
+const TOO_LONG_PURPOSE: usize = 65;
+/// A uuid in the shape the engine names a companion's directory with, for a
+/// second, unrecorded copy of one.
+const STRAY_UUID: &str = "00000000-0000-4000-8000-000000000000";
+/// What the error for an ambiguous re-attach says.
+const AMBIGUOUS_MARK: &str = "none is attached";
 
 fn vector_field(dim: usize) -> DataType {
     DataType::FixedSizeList(
@@ -251,4 +295,607 @@ fn open_table_returns_a_live_handle_on_a_fresh_connection() {
         )
         .expect("vector_search");
     assert_eq!(first_title(&hits), FIRST_BATCH[1]);
+}
+
+/// A title-only schema: a table with no vector column, so no vector index.
+fn title_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "title",
+        DataType::LargeUtf8,
+        false,
+    )]))
+}
+
+fn title_batch(titles: &[&str]) -> RecordBatch {
+    RecordBatch::try_new(
+        title_schema(),
+        vec![Arc::new(LargeStringArray::from(titles.to_vec()))],
+    )
+    .expect("title batch")
+}
+
+/// The ledger companion's schema, as a caller declares it: a key, full-text
+/// indexed so exact matches run on it, and a row count.
+fn ledger_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("key", DataType::LargeUtf8, false),
+        Field::new("rows", DataType::UInt64, true),
+    ]))
+}
+
+fn ledger_indexes() -> IndexSpec {
+    IndexSpec::new().fts("key")
+}
+
+/// The audit companion's schema: one indexed event name.
+fn audit_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "event",
+        DataType::LargeUtf8,
+        false,
+    )]))
+}
+
+/// The docs table declared with the ledger companion.
+fn docs_with_ledger() -> IndexSpec {
+    IndexSpec::new()
+        .fts("title")
+        .companion(LEDGER, ledger_schema(), ledger_indexes())
+}
+
+/// One ledger row per fixture key.
+fn ledger_batch(ledger: &Supertable) -> RecordBatch {
+    RecordBatch::try_new(
+        ledger.schema(),
+        vec![
+            Arc::new(LargeStringArray::from(LEDGER_KEYS.to_vec())),
+            Arc::new(UInt64Array::from(LEDGER_ROWS.to_vec())),
+        ],
+    )
+    .expect("ledger rows match the ledger schema")
+}
+
+/// The `rows` of every ledger row an exact match on `key` returns.
+fn rows_for(ledger: &Supertable, key: &str) -> Vec<u64> {
+    ledger
+        .exact_match("key", key, Some(&["rows"]))
+        .expect("exact_match on key")
+        .iter()
+        .flat_map(|b| {
+            let arr = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("rows is u64");
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Rows of `table` a token match for `word` on `column` finds.
+fn matches(table: &Supertable, column: &str, word: &str) -> usize {
+    table
+        .token_match(column, word, BoolMode::Or, None)
+        .expect("token_match")
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}
+
+/// A connection's ledger handle, which the test expects to exist.
+fn ledger_of(docs: &Supertable) -> Supertable {
+    docs.companion(LEDGER)
+        .expect("the ledger opens")
+        .expect("the table has a ledger")
+}
+
+/// Every directory under `root` named like a hidden table with `suffix`.
+fn hidden_dirs(root: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.starts_with(HIDDEN_DIR_PREFIX) && name.ends_with(suffix) {
+                found.push(path.clone());
+            }
+            stack.push(path);
+        }
+    }
+    found
+}
+
+/// The directory-name suffix of a companion of `purpose`.
+fn companion_suffix(purpose: &str) -> String {
+    format!("_{purpose}")
+}
+
+/// Files anywhere under `root`.
+fn files_under(root: &Path) -> usize {
+    let mut n = 0;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// The user table's directory under `root`: the one holding a manifest
+/// pointer outside every hidden table's directory.
+fn table_dir(root: &Path) -> PathBuf {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if dir.join(POINTER_DIR).join(POINTER_FILE).is_file() {
+            found.push(dir.clone());
+        }
+        for entry in fs::read_dir(&dir).expect("read_dir") {
+            let path = entry.expect("dir entry").path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() && !name.starts_with(HIDDEN_DIR_PREFIX) {
+                stack.push(path);
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "one user table under {root:?}: {found:?}");
+    found.remove(0)
+}
+
+/// The manifest list the pointer of the table at `dir` names.
+fn current_list(dir: &Path) -> PathBuf {
+    let pointer =
+        fs::read_to_string(dir.join(POINTER_DIR).join(POINTER_FILE)).expect("read pointer");
+    let uri = pointer
+        .lines()
+        .find_map(|line| line.strip_prefix(MANIFEST_URI_LINE))
+        .expect("the pointer names a list");
+    dir.join(uri)
+}
+
+/// The table's current manifest list, as JSON.
+fn current_list_json(root: &Path) -> Value {
+    let bytes = fs::read(current_list(&table_dir(root))).expect("read list");
+    serde_json::from_slice(&bytes).expect("the list is JSON")
+}
+
+/// The prefix the table's current manifest list records for `purpose`.
+fn recorded_companion(root: &Path, purpose: &str) -> Option<String> {
+    current_list_json(root)
+        .get(COMPANIONS_KEY)
+        .and_then(|companions| companions.get(purpose))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Rewrite the table's current manifest list without its companions, as an
+/// engine older than companions writes it on its next commit.
+fn drop_companions_from_list(root: &Path) {
+    let path = current_list(&table_dir(root));
+    let mut list: Value =
+        serde_json::from_slice(&fs::read(&path).expect("read list")).expect("the list is JSON");
+    let removed = list
+        .as_object_mut()
+        .expect("the list is an object")
+        .remove(COMPANIONS_KEY);
+    assert!(removed.is_some(), "the list recorded companions");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&list).expect("encode list"),
+    )
+    .expect("write list");
+}
+
+/// Copy the directory `from` to `to`, files and all.
+fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create_dir");
+    for entry in fs::read_dir(from).expect("read_dir") {
+        let path = entry.expect("dir entry").path();
+        let target = to.join(path.file_name().expect("a name"));
+        if path.is_dir() {
+            copy_dir(&path, &target);
+        } else {
+            fs::copy(&path, &target).expect("copy");
+        }
+    }
+}
+
+/// A table created with a companion has one: written and read through the
+/// handle the table gives, recorded on the table's manifest, reopened from
+/// it by a fresh connection, never listed, and purged with the table.
+#[test]
+fn a_companion_is_hidden_reopened_and_purged_with_its_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table("docs", title_schema(), docs_with_ledger())
+            .expect("create_table with a companion");
+        let ledger = ledger_of(&docs);
+        ledger.append(&ledger_batch(&ledger)).expect("append");
+        assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
+        assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
+    }
+    let ledger_dirs = hidden_dirs(dir.path(), &companion_suffix(LEDGER));
+    assert_eq!(ledger_dirs.len(), 1, "one companion under the table");
+    assert!(
+        files_under(&ledger_dirs[0]) > 0,
+        "the companion holds objects"
+    );
+    assert!(
+        hidden_dirs(dir.path(), VECTOR_INDEX_DIR_SUFFIX).is_empty(),
+        "no vector columns, no vector index"
+    );
+    let recorded = recorded_companion(dir.path(), LEDGER).expect("the manifest records it");
+    assert!(ledger_dirs[0].ends_with(&recorded));
+
+    // A fresh connection finds the companion from the manifest alone, and
+    // a row can be replaced: delete it, append the new one.
+    let db = connect(&uri).expect("reconnect");
+    assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
+    let ledger = ledger_of(&db.open_table("docs").expect("open_table"));
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[1]), vec![LEDGER_ROWS[1]]);
+    let stats = ledger
+        .delete(col("rows").eq(lit(LEDGER_ROWS[1])))
+        .expect("delete a row");
+    assert_eq!(stats.n_tombstoned(), 1);
+    assert!(rows_for(&ledger, LEDGER_KEYS[1]).is_empty());
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
+
+    db.drop_table("docs", true).expect("drop_table purge");
+    // Purge deletes objects; a local directory may outlive its last file.
+    assert_eq!(
+        hidden_dirs(dir.path(), &companion_suffix(LEDGER))
+            .iter()
+            .map(|d| files_under(d))
+            .sum::<usize>(),
+        0,
+        "purge removes the companion's objects with the table"
+    );
+}
+
+/// A table created without companions has none, finds none under its
+/// location, and its manifest list carries no key for them: it is the list
+/// an engine without companions writes.
+#[test]
+fn a_table_without_companions_has_none_and_an_unchanged_list() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    let db = connect(&uri).expect("connect");
+    let docs = db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    docs.append(&title_batch(FIRST_BATCH)).expect("append");
+    assert!(docs.companion(LEDGER).expect("no error").is_none());
+    let reopened = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("open_table");
+    assert!(reopened.companion(LEDGER).expect("no error").is_none());
+    assert!(hidden_dirs(dir.path(), "").is_empty());
+    assert!(
+        current_list_json(dir.path()).get(COMPANIONS_KEY).is_none(),
+        "no companions writes no key"
+    );
+}
+
+/// Two companions of different purposes live side by side, each with its
+/// own schema and its own full-text index, and both reopen.
+#[test]
+fn two_companions_each_keep_their_own_schema_and_index() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table(
+                "docs",
+                title_schema(),
+                docs_with_ledger().companion(AUDIT, audit_schema(), IndexSpec::new().fts("event")),
+            )
+            .expect("create_table with two companions");
+        let ledger = ledger_of(&docs);
+        ledger
+            .append(&ledger_batch(&ledger))
+            .expect("append ledger");
+        let audit = docs
+            .companion(AUDIT)
+            .expect("audit opens")
+            .expect("audit exists");
+        audit
+            .append(
+                &RecordBatch::try_new(
+                    audit.schema(),
+                    vec![Arc::new(LargeStringArray::from(AUDIT_EVENTS.to_vec()))],
+                )
+                .expect("audit rows"),
+            )
+            .expect("append audit");
+        assert_eq!(db.list_tables().expect("list"), vec!["docs".to_string()]);
+    }
+    assert_eq!(hidden_dirs(dir.path(), &companion_suffix(LEDGER)).len(), 1);
+    assert_eq!(hidden_dirs(dir.path(), &companion_suffix(AUDIT)).len(), 1);
+
+    let docs = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("open_table");
+    let ledger = ledger_of(&docs);
+    let audit = docs
+        .companion(AUDIT)
+        .expect("audit opens")
+        .expect("audit exists");
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
+    assert_eq!(matches(&audit, "event", AUDIT_EVENTS[1]), 1);
+    assert!(ledger.schema().index_of("event").is_err());
+    assert!(audit.schema().index_of("key").is_err());
+    assert!(docs.companion("unknown").expect("no error").is_none());
+}
+
+/// A companion declaration the engine cannot honor is refused at create,
+/// and nothing is registered.
+#[test]
+fn an_invalid_companion_declaration_is_refused() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let ledger = |purpose: &str| {
+        IndexSpec::new()
+            .fts("title")
+            .companion(purpose, ledger_schema(), ledger_indexes())
+    };
+    let refused = [
+        ("an empty purpose", ledger("")),
+        ("an uppercase purpose", ledger("Ledger")),
+        ("a purpose with a dash", ledger("source-files")),
+        ("the vector index's suffix", ledger("vector_index")),
+        (
+            "a purpose past the bound",
+            ledger(&"a".repeat(TOO_LONG_PURPOSE)),
+        ),
+        (
+            "a purpose declared twice",
+            ledger(LEDGER).companion(LEDGER, ledger_schema(), ledger_indexes()),
+        ),
+        (
+            "a companion with a companion",
+            IndexSpec::new().fts("title").companion(
+                LEDGER,
+                ledger_schema(),
+                ledger_indexes().companion(AUDIT, audit_schema(), IndexSpec::new()),
+            ),
+        ),
+    ];
+    for (what, spec) in refused {
+        let err = db
+            .create_table("docs", title_schema(), spec)
+            .expect_err(what);
+        assert!(matches!(err, InfinoError::Config(_)), "{what}: {err:?}");
+    }
+    assert!(db.list_tables().expect("list").is_empty());
+
+    let docs = db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    let err = docs.companion("Ledger").expect_err("an invalid purpose");
+    assert!(matches!(err, InfinoError::Config(_)), "got {err:?}");
+}
+
+/// A companion whose pointer is gone does not stop its table opening: the
+/// table reads and writes as before, and only the caller asking for the
+/// companion sees its error.
+#[test]
+fn a_companion_that_fails_to_open_leaves_its_table_usable() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table("docs", title_schema(), docs_with_ledger())
+            .expect("create_table");
+        docs.append(&title_batch(FIRST_BATCH)).expect("append");
+        let ledger = ledger_of(&docs);
+        ledger.append(&ledger_batch(&ledger)).expect("append");
+    }
+    let ledger_dir = hidden_dirs(dir.path(), &companion_suffix(LEDGER)).remove(0);
+    fs::remove_file(ledger_dir.join(POINTER_DIR).join(POINTER_FILE)).expect("remove pointer");
+
+    let docs = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("the table opens without its companion");
+    let err = docs
+        .companion(LEDGER)
+        .expect_err("the companion does not open");
+    assert!(
+        err.to_string().contains(LEDGER),
+        "names the companion: {err}"
+    );
+    assert_eq!(matches(&docs, "title", "fox"), 1);
+    docs.append(&title_batch(SECOND_BATCH))
+        .expect("the table still takes writes");
+    assert_eq!(matches(&docs, "title", "fox"), 2);
+    // The table's commits keep the record, so a repaired companion is found
+    // again.
+    assert!(recorded_companion(dir.path(), LEDGER).is_some());
+}
+
+/// The manifest's record of a companion, dropped as an engine without
+/// companions drops it on commit, is recovered from the companion's
+/// storage location: the companion re-attaches with its rows, and the
+/// table's next commit records it again.
+#[test]
+fn a_lost_companion_record_is_reattached_and_written_back() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table("docs", title_schema(), docs_with_ledger())
+            .expect("create_table");
+        let ledger = ledger_of(&docs);
+        ledger.append(&ledger_batch(&ledger)).expect("append");
+    }
+    drop_companions_from_list(dir.path());
+    assert!(recorded_companion(dir.path(), LEDGER).is_none());
+
+    let docs = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("open_table");
+    let ledger = ledger_of(&docs);
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[1]), vec![LEDGER_ROWS[1]]);
+
+    docs.append(&title_batch(FIRST_BATCH)).expect("append");
+    let recorded = recorded_companion(dir.path(), LEDGER).expect("the commit records it");
+    assert!(hidden_dirs(dir.path(), &companion_suffix(LEDGER))[0].ends_with(&recorded));
+}
+
+/// When the record is lost and two companions of the purpose are stored
+/// under the table, neither is a safe guess: none is attached.
+#[test]
+fn two_unrecorded_companions_of_one_purpose_attach_neither() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        db.create_table("docs", title_schema(), docs_with_ledger())
+            .expect("create_table");
+    }
+    let ledger_dir = hidden_dirs(dir.path(), &companion_suffix(LEDGER)).remove(0);
+    let stray = ledger_dir
+        .parent()
+        .expect("under the table")
+        .join(format!("{HIDDEN_DIR_PREFIX}{STRAY_UUID}_{LEDGER}"));
+    copy_dir(&ledger_dir, &stray);
+    drop_companions_from_list(dir.path());
+
+    let docs = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("open_table");
+    let err = docs.companion(LEDGER).expect_err("ambiguous");
+    let message = err.to_string();
+    assert!(message.contains(LEDGER), "names the purpose: {message}");
+    assert!(
+        message.contains(AMBIGUOUS_MARK) && message.contains(STRAY_UUID),
+        "says why and names the candidates: {message}"
+    );
+}
+
+/// A companion's schema evolves through its own handle, and the companion
+/// reopens with the evolved schema.
+#[test]
+fn a_companion_schema_evolves_through_its_handle() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    {
+        let db = connect(&uri).expect("connect");
+        let docs = db
+            .create_table("docs", title_schema(), docs_with_ledger())
+            .expect("create_table");
+        let ledger = ledger_of(&docs);
+        ledger.append(&ledger_batch(&ledger)).expect("append");
+        let patch = SchemaPatch::new(vec![
+            FieldPatch::named(NOTE)
+                .with_type(DataType::LargeUtf8)
+                .with_nullable(true),
+        ]);
+        let doc = ledger.apply_schema(&patch, None).expect("apply_schema");
+        assert!(doc.fields().iter().any(|f| f.name == NOTE));
+        let schema = ledger.schema();
+        assert!(schema.index_of(NOTE).is_ok());
+        let row = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(vec![
+                    "events/2026-01-03/part-0.json",
+                ])),
+                Arc::new(UInt64Array::from(vec![LEDGER_ROWS[0]])),
+                Arc::new(LargeStringArray::from(vec![NOTE_VALUE])),
+            ],
+        )
+        .expect("a row in the evolved schema");
+        ledger.append(&row).expect("append evolved");
+    }
+
+    let docs = connect(&uri)
+        .expect("reconnect")
+        .open_table("docs")
+        .expect("open_table");
+    let ledger = ledger_of(&docs);
+    assert!(ledger.schema().index_of(NOTE).is_ok());
+    let notes = ledger
+        .exact_match("key", "events/2026-01-03/part-0.json", Some(&[NOTE]))
+        .expect("exact_match");
+    let note = notes
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .expect("the evolved row")
+        .column(0)
+        .as_any()
+        .downcast_ref::<LargeStringArray>()
+        .expect("note is utf8")
+        .value(0)
+        .to_string();
+    assert_eq!(note, NOTE_VALUE);
+    assert_eq!(rows_for(&ledger, LEDGER_KEYS[0]), vec![LEDGER_ROWS[0]]);
+}
+
+/// A table with vector columns and a companion carries both hidden tables,
+/// and vector search still runs over its own index.
+#[test]
+fn a_table_with_vectors_and_a_companion_has_both_hidden_tables() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = table_schema();
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", EMB_DIM, Metric::Cosine)
+                .companion(LEDGER, ledger_schema(), ledger_indexes()),
+        )
+        .expect("create_table");
+    docs.append(&build_batch(schema, FIRST_BATCH, 0))
+        .expect("append");
+    let ledger = ledger_of(&docs);
+    ledger.append(&ledger_batch(&ledger)).expect("append");
+    assert_eq!(hidden_dirs(dir.path(), &companion_suffix(LEDGER)).len(), 1);
+    assert_eq!(hidden_dirs(dir.path(), VECTOR_INDEX_DIR_SUFFIX).len(), 1);
+    let hits = docs
+        .vector_search(
+            "emb",
+            &unit_embedding(1),
+            SEARCH_TOP_K,
+            None,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("vector_search");
+    assert_eq!(first_title(&hits), FIRST_BATCH[1]);
+}
+
+/// A connection with no storage refuses companions rather than creating a
+/// table without the companion it was asked for.
+#[test]
+fn a_memory_connection_refuses_companions() {
+    let db = connect("memory://").expect("connect");
+    let err = db
+        .create_table("docs", title_schema(), docs_with_ledger())
+        .expect_err("no storage, no companion");
+    assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
+    assert!(db.list_tables().expect("list").is_empty());
 }

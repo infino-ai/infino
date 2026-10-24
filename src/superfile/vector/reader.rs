@@ -3665,6 +3665,13 @@ impl VectorReader {
         score_only: Option<&[u32]>,
         rerank_mult: usize,
         cold_rerank_mult: usize,
+        // When set, the per-cell shortlist budget is scaled by the number
+        // of scanned fine clusters in each cell
+        // (`k·rerank_mult·clusters_in_cell`), so the pooled candidate count
+        // is `fanout·k·rerank_mult` regardless of how clusters group into
+        // coarse cells — the grid-independent per-cluster budget the
+        // global-fine path uses. `false` keeps the legacy per-cell budget.
+        budget_per_cluster: bool,
         allow: Option<Arc<RoaringBitmap>>,
         deny: Option<Arc<RoaringBitmap>>,
         pool: Option<Arc<ThreadPool>>,
@@ -3881,7 +3888,13 @@ impl VectorReader {
                         pool,
                         budget,
                     };
-                    let coarse_limit = k.saturating_mul(rerank_mult);
+                    let coarse_limit = if budget_per_cluster {
+                        k.saturating_mul(rerank_mult)
+                            .saturating_mul(cluster_meta.len())
+                            .max(1)
+                    } else {
+                        k.saturating_mul(rerank_mult)
+                    };
                     // Timed like the immediate path's shortlist below: this
                     // warm deferred scan is the read the width pin certifies
                     // (whole-cell depth), which made it the dominant span of
@@ -10449,6 +10462,7 @@ mod tests {
                 None,
                 rerank_mult,
                 rerank_mult,
+                false,
                 None,
                 None,
                 None,
@@ -10503,6 +10517,7 @@ mod tests {
                 None,
                 rerank_mult,
                 rerank_mult,
+                false,
                 None,
                 None,
                 None,
@@ -10547,6 +10562,7 @@ mod tests {
                 Some(&selected),
                 rerank_mult,
                 rerank_mult,
+                false,
                 None,
                 None,
                 None,
@@ -10618,6 +10634,7 @@ mod tests {
                 None,
                 8,
                 8,
+                false,
                 None,
                 None,
                 None,
@@ -10643,6 +10660,7 @@ mod tests {
                     Some(&[flat]),
                     8,
                     8,
+                    false,
                     None,
                     None,
                     None,

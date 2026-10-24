@@ -148,7 +148,7 @@ pub(crate) const CACHE_HOLE_EXTENSION: &str = ".hole";
 /// Characters a hyphenated uuid renders to (`8-4-4-4-12`). The fixed width
 /// is what makes the `<stem>-<uuid>` key grammar unambiguous whatever the
 /// stem contains: the uuid is always the last this many bytes of the body.
-const UUID_TEXT_LEN: usize = 36;
+pub(crate) const UUID_TEXT_LEN: usize = 36;
 
 /// Longest stem a source name contributes to an object key. Object stores
 /// allow keys of a kilobyte, so this is not a storage limit; it keeps the key
@@ -540,10 +540,13 @@ impl ManifestSnapshot {
     /// `manifest_id` sequence (the first append still commits `manifest_id 1`).
     /// `vector_index_storage_prefix` is the hidden-sibling subtree the caller
     /// generated at create (`None` for tables without vector columns, and for
-    /// the hidden sibling itself).
+    /// the hidden sibling itself); `companions` likewise maps each hidden
+    /// companion the caller created to its prefix (empty unless the table
+    /// was declared with companions).
     pub(crate) fn materialized_empty_with_vector_index_prefix(
         options: Arc<SupertableOptions>,
         vector_index_storage_prefix: Option<String>,
+        companions: BTreeMap<String, String>,
     ) -> Self {
         let strategy = options.effective_partition_strategy();
         let list = Self::build_list(
@@ -552,6 +555,7 @@ impl ManifestSnapshot {
             0,
             Vec::new(),
             vector_index_storage_prefix.clone(),
+            companions,
             BTreeMap::new(),
             BTreeMap::new(),
         );
@@ -591,6 +595,7 @@ impl ManifestSnapshot {
         manifest_id: u64,
         parts: Vec<ManifestPartEntry>,
         vector_index_storage_prefix: Option<String>,
+        companions: BTreeMap<String, String>,
         tombstone_seqs: BTreeMap<Uuid, u64>,
         superseded_cells: BTreeMap<Uuid, BTreeSet<u32>>,
     ) -> Manifest {
@@ -603,6 +608,7 @@ impl ManifestSnapshot {
             commit_token: Uuid::new_v4(),
             partition_strategy: strategy,
             vector_index_storage_prefix,
+            companions,
             global_vector_index: None,
             drained_ranges: Default::default(),
             deleted_user_ids_inline: None,
@@ -950,6 +956,36 @@ impl ManifestSnapshot {
             return Some(prefix);
         }
         self.superfile_list.vector_index_storage_prefix.as_deref()
+    }
+
+    /// The hidden companions recorded on this manifest's list, purpose to
+    /// storage prefix. Only a durable table has any: a companion is created
+    /// on storage, so an in-process-only manifest (no list) records none.
+    pub(crate) fn companions(&self) -> BTreeMap<String, String> {
+        self.list
+            .as_ref()
+            .map(|list| list.companions.clone())
+            .unwrap_or_default()
+    }
+
+    /// The prefix this manifest records for the companion of `purpose`.
+    pub(crate) fn companion_prefix(&self, purpose: &str) -> Option<&str> {
+        self.list
+            .as_ref()
+            .and_then(|list| list.companions.get(purpose))
+            .map(String::as_str)
+    }
+
+    /// This snapshot, id unchanged, with the companion of `purpose`
+    /// recorded at `prefix` when the list records no companion of that
+    /// purpose, so the next commit writes it. A purpose already recorded is
+    /// kept as it is.
+    pub(crate) fn with_companion(&self, purpose: &str, prefix: &str) -> Self {
+        self.with_list_edited(false, |list| {
+            list.companions
+                .entry(purpose.to_owned())
+                .or_insert_with(|| prefix.to_owned());
+        })
     }
 
     fn stamp_vector_index_storage_prefix(&self, has_vector_columns: bool) -> Option<String> {
@@ -2335,6 +2371,26 @@ impl ManifestSnapshot {
             .find(|id| ids.contains(id))
     }
 
+    /// The parts that hold any of `ids`, found without loading a part. A
+    /// complete flat view lists every part's superfiles in list order, so
+    /// each run of `n_superfiles` entries is one part. `None` when the flat
+    /// view is incomplete, as on a lazily loaded manifest.
+    fn parts_holding(&self, ids: &HashSet<Uuid>) -> Option<HashSet<PartId>> {
+        let mut rest = self.complete_flat_superfiles()?;
+        let mut holding = HashSet::new();
+        for part in self.get_all_list_entries() {
+            let (in_part, after) = rest.split_at_checked(part.n_superfiles as usize)?;
+            if in_part
+                .iter()
+                .any(|entry| ids.contains(&entry.superfile_id))
+            {
+                holding.insert(part.part_id);
+            }
+            rest = after;
+        }
+        Some(holding)
+    }
+
     async fn update_inner(
         &self,
         new_entries: &[Arc<SuperfileEntry>],
@@ -2539,25 +2595,31 @@ impl ManifestSnapshot {
                 cache.by_source.clear();
                 cache.bytes = 0;
             }
-            // A base part whose birth-version range holds none of the removed
-            // superfiles' versions cannot hold them, so it is kept without
-            // being loaded. If that pass finds fewer removed superfiles than
-            // asked for, an entry's version disagreed with its part's range:
-            // run again over every part rather than leave one listed.
+            // Only the base parts that may hold a removed superfile are
+            // loaded; the rest are kept as they are. Those parts come from
+            // the flat view when it is complete, else from each part's
+            // birth-version range. If that pass finds fewer removed
+            // superfiles than asked for, run again over every part rather
+            // than leave one listed.
+            let holding_parts = self.parts_holding(&removal_ids);
             let mut removal_versions: Vec<u64> =
                 entries_to_remove.iter().map(|r| r.birth_version).collect();
             removal_versions.sort_unstable();
             removal_versions.dedup();
             let parts_written_before_removal = parts_to_write.clone();
-            for skip_by_birth_version in [true, false] {
-                if !skip_by_birth_version {
+            for skip_parts in [true, false] {
+                if !skip_parts {
                     parts_to_write = parts_written_before_removal.clone();
                     out_list_entries_after_removal.clear();
                 }
                 let mut skipped_any = false;
                 let mut n_removed = 0;
                 let may_hold_removal = |entry: &ManifestPartEntry| {
-                    !skip_by_birth_version || may_hold_birth_version(entry, &removal_versions)
+                    !skip_parts
+                        || match &holding_parts {
+                            Some(parts) => parts.contains(&entry.part_id),
+                            None => may_hold_birth_version(entry, &removal_versions),
+                        }
                 };
                 // Load the base parts the loop reads, a bounded number at a
                 // time, so its loads below find them in their cells instead of
@@ -2696,7 +2758,7 @@ impl ManifestSnapshot {
                 warn!(
                     found = n_removed,
                     asked = removal_ids.len(),
-                    "skipping parts by birth version missed removed superfiles; scanning every part"
+                    "skipping parts missed removed superfiles; scanning every part"
                 );
             }
         }
@@ -2758,6 +2820,9 @@ impl ManifestSnapshot {
             } else {
                 self.stamp_vector_index_storage_prefix(!self.vector_configs().is_empty())
             },
+            // Set at create and carried on every commit after; a hidden
+            // table never has any, so nothing to guard here.
+            companions: self.companions(),
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self
                 .list
@@ -6468,6 +6533,7 @@ mod tests {
                     n_buckets: 64,
                 },
                 vector_index_storage_prefix: None,
+                companions: Default::default(),
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -6880,6 +6946,71 @@ mod tests {
             assert_eq!(storage.get_call_count(), parts.len());
         }
 
+        /// A complete flat view places each removed superfile in its part,
+        /// so only those parts are loaded, even with no birth-version
+        /// ranges recorded to skip by. The result matches the full scan.
+        #[tokio::test]
+        async fn removal_loads_only_the_parts_the_flat_view_places_it_in() {
+            let parts = removal_test_parts();
+            let n_parts = parts.len();
+            let (objects, entries) = encode_and_index(&parts);
+            let original_hashes: HashSet<ContentHash> =
+                entries.iter().map(|e| e.content_hash).collect();
+            let removed = vec![
+                Arc::clone(&parts[5].superfiles[0]),
+                Arc::clone(&parts[n_parts - 1].superfiles[0]),
+            ];
+            let expected = full_scan_removal(&parts, &entries, &removed).await;
+
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let mut snapshot = build_manifest_with_loader(fresh_list(entries), storage.clone());
+            snapshot.superfile_list.superfiles = parts
+                .iter()
+                .flat_map(|part| part.superfiles.iter().cloned())
+                .collect();
+            let (after, written) = snapshot
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update");
+
+            assert_eq!(
+                storage.get_call_count(),
+                removed.len(),
+                "only the parts holding a removed superfile are loaded"
+            );
+            assert_eq!(removal_shape(&after, &written, &original_hashes), expected);
+        }
+
+        /// A flat view that places a removed superfile in the wrong part
+        /// finds too few, so every part is scanned and it is still removed.
+        #[tokio::test]
+        async fn removal_scans_every_part_when_the_flat_view_misplaces_it() {
+            let parts = removal_test_parts();
+            let (objects, entries) = encode_and_index(&parts);
+            let original_hashes: HashSet<ContentHash> =
+                entries.iter().map(|e| e.content_hash).collect();
+            let removed = vec![Arc::clone(&parts[5].superfiles[0])];
+            let expected = full_scan_removal(&parts, &entries, &removed).await;
+
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let mut snapshot = build_manifest_with_loader(fresh_list(entries), storage.clone());
+            let mut flat: Vec<_> = parts
+                .iter()
+                .flat_map(|part| part.superfiles.iter().cloned())
+                .collect();
+            // Parts 5 and 6 hold one superfile each; swapping them places
+            // the removed one in part 6.
+            flat.swap(5, 6);
+            snapshot.superfile_list.superfiles = flat;
+            let (after, written) = snapshot
+                .update_preserving_birth_versions(&[], &removed, None)
+                .await
+                .expect("update");
+
+            assert_eq!(removal_shape(&after, &written, &original_hashes), expected);
+            assert_eq!(storage.get_call_count(), parts.len());
+        }
+
         #[tokio::test]
         async fn part_load_is_bounded_and_order_preserving() {
             let in_flight = Arc::new(AtomicUsize::new(0));
@@ -7207,6 +7338,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7394,6 +7526,7 @@ mod tests {
                     n_buckets: 1,
                 },
                 vector_index_storage_prefix: None,
+                companions: Default::default(),
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -7538,6 +7671,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7618,6 +7752,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
@@ -8225,6 +8360,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
@@ -8440,6 +8576,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -8963,6 +9100,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9141,6 +9279,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9303,6 +9442,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9519,6 +9659,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9629,6 +9770,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9766,6 +9908,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9893,6 +10036,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10038,6 +10182,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10193,6 +10338,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10362,6 +10508,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10597,6 +10744,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10704,6 +10852,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10827,6 +10976,7 @@ mod tests {
                 n_buckets: 2,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10975,6 +11125,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11120,6 +11271,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11217,6 +11369,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11333,6 +11486,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11476,6 +11630,7 @@ mod tests {
                 n_buckets: 1,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11731,6 +11886,34 @@ mod tests {
             .block_on(winner.update_preserving_birth_versions(&[], &other, Some(&mut rebuilt)))
             .expect("other removals");
         assert_ne!(fresh[0].part.part_id, first[0].part.part_id);
+    }
+
+    /// Removals load only the parts the flat view places them in, so the
+    /// flat view must stay in part order through appends, part splits and
+    /// removals.
+    #[test]
+    fn the_flat_view_places_each_superfile_in_its_part() {
+        let (_dir, st) = multi_part_table();
+        let rt = Runtime::new().expect("runtime");
+        let base = st.inner().manifest.load_full();
+        let removed: Vec<Arc<SuperfileEntry>> = vec![Arc::clone(&base.get_all_superfiles()[0])];
+        let (after_removal, _) = rt
+            .block_on(base.update_preserving_birth_versions(&[], &removed, None))
+            .expect("update");
+
+        for manifest in [&*base, &after_removal] {
+            for entry in manifest.get_all_list_entries() {
+                let part = rt
+                    .block_on(manifest.get_part_by_id(entry.part_id))
+                    .expect("part");
+                let in_part: HashSet<Uuid> =
+                    part.superfiles.iter().map(|s| s.superfile_id).collect();
+                assert_eq!(
+                    manifest.parts_holding(&in_part),
+                    Some(HashSet::from([entry.part_id])),
+                );
+            }
+        }
     }
 
     #[test]

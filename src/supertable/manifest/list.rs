@@ -157,6 +157,13 @@ pub struct Manifest {
     /// supertable (e.g. `_infino_<uuid>_vector_index/`). Set at
     /// create when vector columns are configured; immutable.
     pub vector_index_storage_prefix: Option<String>,
+    /// Hidden companion tables beside this one, by purpose: each purpose
+    /// maps to the object-storage prefix its companion lives at
+    /// (`_infino_<uuid>_<purpose>`). Set at create from the companions the
+    /// table was declared with and carried on every commit after. Empty on
+    /// every other table, and then absent from the wire, so a list without
+    /// companions encodes exactly as before the field existed.
+    pub companions: BTreeMap<String, String>,
     /// Global vector cell-index coordination state, owned by THIS (the user)
     /// table. Source of truth for the immutable cell grids trained from the
     /// first committed batch: `grid` at `hidden_cell_count` cells (read
@@ -1490,6 +1497,8 @@ struct ManifestDto {
     commit_token: Option<String>,
     #[serde(default)]
     vector_index_storage_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    companions: BTreeMap<String, String>,
     #[serde(default)]
     deleted_user_ids_inline_b64: Option<String>, // base64 of encoded id set
     #[serde(default)]
@@ -2127,6 +2136,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         commit_token: Some(l.commit_token.to_string()),
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
+        companions: l.companions.clone(),
         global_vector_index: l
             .global_vector_index
             .as_ref()
@@ -2211,6 +2221,7 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
         commit_token,
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
+        companions: d.companions,
         global_vector_index: d
             .global_vector_index
             .map(|g| -> Result<GlobalVectorIndex, ListParseError> {
@@ -3105,6 +3116,7 @@ mod tests {
                 n_buckets: 64,
             },
             vector_index_storage_prefix: None,
+            companions: Default::default(),
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -3238,6 +3250,7 @@ mod tests {
         assert_eq!(a.id_column, b.id_column);
         assert_eq!(a.commit_token, b.commit_token);
         assert_eq!(a.vector_index_storage_prefix, b.vector_index_storage_prefix);
+        assert_eq!(a.companions, b.companions);
         assert_eq!(a.partition_strategy, b.partition_strategy);
         assert_eq!(a.parts.len(), b.parts.len());
         for (a_e, b_e) in a.parts.iter().zip(b.parts.iter()) {
@@ -4393,6 +4406,34 @@ mod tests {
         assert_eq!(
             got.vector_index_storage_prefix,
             list.vector_index_storage_prefix
+        );
+    }
+
+    /// Companion prefixes survive the wire, and a list without companions
+    /// carries no key for them. Serde writes the other fields in
+    /// declaration order either way, so a list without companions is the
+    /// bytes it was before the field existed.
+    #[test]
+    fn companions_roundtrip_and_absent_when_empty() {
+        let mut list = empty_list();
+        let without = encode(&list).expect("encode");
+        let v: serde_json::Value = serde_json::from_slice(&without).expect("json");
+        assert!(
+            !v.as_object().expect("object").contains_key("companions"),
+            "no companions writes no key"
+        );
+        list.companions
+            .insert("sync".into(), "_infino_deadbeef_sync".into());
+        list.companions
+            .insert("audit".into(), "_infino_feedface_audit".into());
+        let got = decode(&encode(&list).expect("encode"), &LegacyNames::none()).expect("decode");
+        assert_eq!(got.companions, list.companions);
+        // A list written by an engine without the field reads as none.
+        assert!(
+            decode(&without, &LegacyNames::none())
+                .expect("decode")
+                .companions
+                .is_empty()
         );
     }
 

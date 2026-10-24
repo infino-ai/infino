@@ -446,6 +446,37 @@ pub(crate) fn segments_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a 
     .then(|| &current.segments[prior.segments.len()..])
 }
 
+/// `base`, a rebuild made from `prior`, with the delta segments committed on
+/// top of `prior` to reach `current` appended as they are. For a rebuild
+/// that lost its publish to those commits: no slice is read or written, so
+/// a retry costs one root however fast commits land.
+///
+/// The deltas name ordinals at or past `prior`'s length (see
+/// [`segments_since`]), so `base` is padded with nil entries up to that
+/// length and `current`'s superfiles past it are carried over. `None` when
+/// `current` was not built on `prior`, or when `base` lists more superfiles
+/// than `prior` and its ordinals would collide with the deltas'.
+pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> {
+    let deltas = segments_since(prior, current)?;
+    let len = prior.superfiles.len();
+    if base.superfiles.len() > len {
+        return None;
+    }
+    // Nothing landed on top of `prior`: the rebuild stands alone, unpadded.
+    if deltas.is_empty() && current.superfiles.len() == len {
+        return Some(base.clone());
+    }
+    let padding = len - base.superfiles.len();
+    let mut root = base.clone();
+    root.superfiles.extend(repeat_n(Uuid::nil(), padding));
+    root.superfiles
+        .extend_from_slice(&current.superfiles[len..]);
+    root.id_mins.extend(repeat_n(0, padding));
+    root.id_mins.extend_from_slice(&current.id_mins[len..]);
+    root.segments.extend_from_slice(deltas);
+    Some(root)
+}
+
 /// Download every slice of `segments` into `dir`, verified against its
 /// hash, [`SLICE_FETCH_CONCURRENCY`] at a time, and return each segment's
 /// slice files in key order. A slice two segments share is fetched once.
@@ -1065,7 +1096,7 @@ mod tests {
         fs,
         ops::Range,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -2254,12 +2285,51 @@ mod tests {
         assert_eq!(segments_since(&prior, &id_mins_differ), None);
     }
 
-    /// A commit that lands while optimize rebuilds the index is folded in,
-    /// not rebuilt over: its delta merges into one segment after the
-    /// rebuild, numbered past it, and the removed superfile leaves no
-    /// padding behind.
+    /// The rebuild is padded to `prior`'s length and the deltas committed
+    /// since go on top as they are, so their ordinals still name their
+    /// superfiles.
     #[test]
-    fn a_commit_during_the_rebuild_is_folded_in() {
+    fn rebase_stacks_the_deltas_on_the_padded_rebuild() {
+        let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
+        // The rebuild dropped 1 and 4, which were removed.
+        let base = tagged_root(&[2, 3], &[9]);
+        // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
+        let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
+        assert_eq!(
+            rebase(&base, &prior, &current),
+            Some(tagged_root(&[2, 3, 0, 0, 5, 6], &[9, 2, 3]))
+        );
+    }
+
+    /// With nothing committed on top of `prior`, the rebuild stands as it is.
+    #[test]
+    fn rebase_without_new_commits_is_the_rebuild() {
+        let prior = tagged_root(&[1, 2, 3], &[0, 1]);
+        let base = tagged_root(&[2, 3], &[9]);
+        assert_eq!(rebase(&base, &prior, &prior), Some(base));
+    }
+
+    /// No rebase onto a root not built on `prior`, nor of a rebuild listing
+    /// more superfiles than `prior`, whose ordinals would collide with the
+    /// deltas'.
+    #[test]
+    fn rebase_refuses_what_it_cannot_stack() {
+        let prior = tagged_root(&[1, 2], &[0]);
+        let base = tagged_root(&[1, 2], &[9]);
+        let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
+        assert_eq!(rebase(&base, &prior, &rebuilt_elsewhere), None);
+
+        let longer = tagged_root(&[1, 2, 7], &[9]);
+        let current = tagged_root(&[1, 2, 5], &[0, 1]);
+        assert_eq!(rebase(&longer, &prior, &current), None);
+    }
+
+    /// A commit that lands while optimize rebuilds the index is stacked on
+    /// the rebuild as it was committed, not merged in: the retry writes no
+    /// slice, the delta's ordinals still name its superfile, and the
+    /// removed superfile leaves padding until the next rebuild drops it.
+    #[test]
+    fn a_commit_during_the_rebuild_is_rebased_onto() {
         let (dir, faults, storage, st) = fault_table();
         for segment in 0..SEGMENTS {
             commit_segment(&st, segment);
@@ -2273,25 +2343,63 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (before, _) = live_and_covered(&st, &storage, &rt);
 
-        // Another process commits just before the rebuild publishes.
+        // Another process commits just before the rebuild publishes. From
+        // then on a slice write fails, so the retry must not write one.
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        let peer_ref = Arc::new(Mutex::new(None));
+        let hook_peer_ref = Arc::clone(&peer_ref);
+        let hook_faults = Arc::clone(&faults);
         faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
-            thread::spawn(move || commit_segment(&other, SEGMENTS))
-                .join()
-                .expect("peer commit");
+            let reference = thread::spawn(move || {
+                commit_segment(&other, SEGMENTS);
+                other
+                    .reader()
+                    .expect("reader")
+                    .manifest()
+                    .term_index_ref()
+                    .cloned()
+            })
+            .join()
+            .expect("peer commit");
+            *hook_peer_ref.lock().expect("peer ref") = reference;
+            hook_faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
         });
         maintenance_only_optimize(&st);
+        faults.clear();
+        assert_eq!(faults.fired(), 0, "the retry wrote no slice");
 
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-        assert_eq!(listed, live, "no padding, and nothing removed");
-        assert_eq!(root.superfiles.len(), live.len());
+        let listed: HashSet<Uuid> = root
+            .superfiles
+            .iter()
+            .copied()
+            .filter(|id| !id.is_nil())
+            .collect();
+        assert_eq!(listed, live, "every live superfile, and nothing removed");
+        assert_eq!(
+            root.superfiles.len(),
+            live.len() + 1,
+            "the removed superfile's ordinal is padded"
+        );
         assert_eq!(
             root.segments.len(),
             2,
-            "the rebuild, then the commit's folded delta"
+            "the rebuild, then the commit's delta"
+        );
+        let peer_ref = peer_ref
+            .lock()
+            .expect("peer ref")
+            .clone()
+            .expect("the peer published a root");
+        let peer_root = rt
+            .block_on(load_root(storage.as_ref(), &peer_ref))
+            .expect("peer root");
+        assert_eq!(
+            root.segments.last(),
+            peer_root.segments.last(),
+            "the delta is stacked as the peer committed it"
         );
         assert!(
             st.reader()
@@ -2324,6 +2432,95 @@ mod tests {
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(root.segments.len(), 1, "the next rebuild is one segment");
         assert_eq!(root.superfiles.len(), live.len());
+    }
+
+    /// Arm `faults` so that a peer commits segment `next`, then `next + 1`,
+    /// and so on, before each of the next `rounds` root writes: every publish
+    /// in that window loses its race. A slice write after the first of them
+    /// fails.
+    fn commit_before_each_root_write(
+        faults: &Arc<FaultStorage>,
+        peer: crate::supertable::Supertable,
+        next: usize,
+        rounds: usize,
+    ) {
+        if rounds == 0 {
+            return;
+        }
+        let hook_faults = Arc::clone(faults);
+        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+            let committer = peer.clone();
+            thread::spawn(move || commit_segment(&committer, next))
+                .join()
+                .expect("peer commit");
+            hook_faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
+            commit_before_each_root_write(&hook_faults, peer, next + 1, rounds - 1);
+        });
+    }
+
+    /// Commits landing before every publish do not starve the rebuild: each
+    /// retry stacks what landed and writes only a root, and the index it
+    /// finally publishes resolves every commit's terms.
+    #[test]
+    fn a_rebuild_publishes_while_commits_keep_landing() {
+        const ROUNDS: usize = 4;
+        let (dir, faults, storage, st) = fault_table();
+        for segment in 0..SEGMENTS {
+            commit_segment(&st, segment);
+        }
+        // A removed superfile stays listed, so every rebase pads.
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles();
+        commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
+        st.block_on_query(st.refresh()).expect("refresh");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        commit_before_each_root_write(&faults, other, SEGMENTS, ROUNDS);
+        maintenance_only_optimize(&st);
+        faults.clear();
+        assert_eq!(faults.fired(), 0, "no retry wrote a slice");
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root.segments.len(),
+            1 + ROUNDS,
+            "the rebuild, then each commit's delta"
+        );
+        assert_eq!(
+            root.superfiles.len(),
+            live.len() + 1,
+            "the removed superfile's ordinal is padded"
+        );
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let resolve = |term: &str| -> HashSet<Uuid> {
+            rt.block_on(index.postings(title_id(), term))
+                .expect("lookup")
+                .iter()
+                .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+                .collect()
+        };
+        assert_eq!(
+            resolve("shared"),
+            live,
+            "`shared` is in every live superfile"
+        );
+        for segment in SEGMENTS..SEGMENTS + ROUNDS {
+            let found = resolve(&format!("s{segment}d00"));
+            assert_eq!(
+                found.len(),
+                1,
+                "segment {segment}'s own term is in one superfile"
+            );
+            assert!(found.is_subset(&live), "and it is a live one");
+        }
     }
 
     /// An incomplete index is rebuilt by walking only the superfiles it
