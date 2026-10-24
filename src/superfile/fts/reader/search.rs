@@ -1972,15 +1972,14 @@ mod tests {
     }
 
     /// The exact-count walk on a corpus large enough that whole blocks and
-    /// windows fall under the k-th best, where it counts without scoring:
+    /// windows fall under the k-th best, which it must still score and count:
     /// a single near-every-doc term, and unions of it with mid and rare
     /// terms. The top-k must agree with the pruned search and the count must
     /// be exact. Run over two corpora: one uniform, and one front-loaded,
     /// whose strong documents all sit in its first windows, so the later
-    /// windows' block maxima together stay under the k-th best and are
-    /// counted unscored.
+    /// windows' block maxima together stay under the k-th best.
     #[tokio::test]
-    async fn exact_count_counts_unscored_blocks_and_windows_exactly() {
+    async fn exact_count_is_exact_where_blocks_and_windows_cannot_beat_the_kth_best() {
         let mut x: u64 = 0xA076_1D64_78BD_642F;
         let mut rng = move || {
             x ^= x << 13;
