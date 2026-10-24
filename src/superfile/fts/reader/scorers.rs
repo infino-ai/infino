@@ -194,6 +194,41 @@ fn score_noness_batched(
     }
 }
 
+/// One term's BM25 at each `(docs[i], tfs[i])` into `out` (cleared first),
+/// eight per SIMD call. A tf of 0 scores exactly 0. The same bits as scoring
+/// each posting alone.
+fn score_postings(
+    idf_weight: f32,
+    docs: &[u32],
+    tfs: &[u32],
+    dl_norm: &NormTable,
+    out: &mut Vec<f32>,
+) {
+    debug_assert_eq!(docs.len(), tfs.len());
+    out.clear();
+    let mut i = 0usize;
+    while i + 8 <= docs.len() {
+        let dids: [u32; 8] = docs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let tf8: [u32; 8] = tfs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        out.extend_from_slice(&bm25::score_one_term_x8(
+            idf_weight,
+            tf8,
+            dl_norm.get8(dids),
+        ));
+        i += 8;
+    }
+    for (&d, &tf) in docs[i..].iter().zip(&tfs[i..]) {
+        out.push(match tf {
+            0 => 0.0,
+            _ => bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm.get(d)),
+        });
+    }
+}
+
 /// The largest doc id any of `cursors` holds.
 pub(super) fn cursors_max_doc(cursors: &[TermCursor]) -> u32 {
     cursors
@@ -574,6 +609,7 @@ fn must_lead_should_walk(
     let mut alive: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
     let mut probe_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
+    let mut cand_contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut contribs: Vec<f32> = Vec::with_capacity(m * BLOCK_LEN);
     let mut win = vec![0.0_f32; m];
     let mut win_suffix = vec![0.0_f32; m + 1];
@@ -605,16 +641,14 @@ fn must_lead_should_walk(
         if filter.is_none() && lead.holds_whole_block() {
             let (from, to) = (lead.pos, lead.block_n);
             cand_docs.clear();
-            cand_scores.clear();
-            for j in from..to {
-                let d = lead.block_doc_ids[j];
-                cand_docs.push(d);
-                cand_scores.push(bm25::score_with_dl_norm_k1(
-                    lead.idf_weight,
-                    lead.block_tfs[j],
-                    dl_norm_k1.get(d),
-                ));
-            }
+            cand_docs.extend_from_slice(&lead.block_doc_ids[from..to]);
+            score_postings(
+                lead.idf_weight,
+                &cand_docs,
+                &lead.block_tfs[from..to],
+                dl_norm_k1,
+                &mut cand_scores,
+            );
             lead.advance_by(to - from);
             let n = cand_docs.len();
             if m == 1 {
@@ -634,11 +668,16 @@ fn must_lead_should_walk(
                 cand_tfs.clear();
                 cand_tfs.resize(w, 0);
                 should.probe_tfs(&cand_docs, &mut cand_tfs);
-                for ((&d, &lead_score), &tf) in cand_docs.iter().zip(&cand_scores).zip(&cand_tfs) {
-                    let contrib = match tf {
-                        0 => 0.0,
-                        _ => bm25::score_with_dl_norm_k1(should.idf_weight, tf, dl_norm_k1.get(d)),
-                    };
+                score_postings(
+                    should.idf_weight,
+                    &cand_docs,
+                    &cand_tfs,
+                    dl_norm_k1,
+                    &mut cand_contribs,
+                );
+                for ((&d, &lead_score), &contrib) in
+                    cand_docs.iter().zip(&cand_scores).zip(&cand_contribs)
+                {
                     let score = lead_score + contrib;
                     if threshold > f32::NEG_INFINITY && score <= threshold {
                         continue;
@@ -676,18 +715,17 @@ fn must_lead_should_walk(
                 cand_tfs.clear();
                 cand_tfs.resize(probe_docs.len(), 0);
                 c.probe_tfs(&probe_docs, &mut cand_tfs);
+                score_postings(
+                    c.idf_weight,
+                    &probe_docs,
+                    &cand_tfs,
+                    dl_norm_k1,
+                    &mut cand_contribs,
+                );
                 let mut w = 0usize;
                 for r in 0..alive.len() {
                     let i = usize::from(alive[r]);
-                    let tf = cand_tfs[r];
-                    let x = match tf {
-                        0 => 0.0,
-                        _ => bm25::score_with_dl_norm_k1(
-                            c.idf_weight,
-                            tf,
-                            dl_norm_k1.get(cand_docs[i]),
-                        ),
-                    };
+                    let x = cand_contribs[r];
                     contribs[si * n + i] = x;
                     partial[i] += x;
                     alive[w] = alive[r];
