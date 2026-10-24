@@ -2143,13 +2143,16 @@ impl FtsReader {
         dl_norm_k1: &NormTable,
         heap: &mut C,
     ) {
-        // The per-candidate walk wins where the bar prunes; at a large `k`
-        // the bar stays low and the general walk's sequential completion is
-        // cheaper with several optional terms. With one optional term the
-        // walk's single batched probe per block wins at every `k`.
+        // The per-candidate walk wins where the bar prunes. At a large `k`
+        // the bar stays low: with one optional term the walk's single batched
+        // probe per block still wins, and with three or more its strongest-
+        // first probing, which drops a doc once the rest cannot close the gap,
+        // saves more probes than the general walk's one batch probe of every
+        // term; with exactly two, the general walk is cheaper (measured).
+        let optional = should_cursors.len();
         if must_cursors.len() == 1
-            && should_cursors.len() <= MAX_SHOULDS_LED
-            && (k <= WAND_BMW_2TERM_MAX_K || should_cursors.len() == 1)
+            && optional <= MAX_SHOULDS_LED
+            && (k <= WAND_BMW_2TERM_MAX_K || optional != 2)
         {
             let lead = must_cursors.pop().expect("one must cursor");
             must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
