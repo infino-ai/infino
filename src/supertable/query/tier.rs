@@ -126,8 +126,8 @@ pub(crate) struct TierPolicy {
     /// Per class, how many queries each way has been measured over.
     samples: Vec<[AtomicU32; 2]>,
     trials: Vec<AtomicU32>,
-    /// Per class, merges in a row that reported and ruled nothing out nor
-    /// answered for anything; reset by one that did.
+    /// Per class, merges in a row that reported and ruled nothing out,
+    /// answered for nothing and seeded no threshold; reset by one that did.
     fruitless: Vec<AtomicU32>,
 }
 
@@ -146,10 +146,12 @@ impl TierPolicy {
     const MIN_SAMPLES: u32 = 8;
     /// The average's reach: each sample moves it a `2^-SMOOTHING` of the way.
     const SMOOTHING: u32 = 3;
-    /// Merges in a row that found nothing to rule out or answer for, after
-    /// which the class stops merging until an explore tick finds otherwise.
-    /// The merge is there to prune; where it prunes nothing it only costs,
-    /// and that is known the moment it reports, with no timing to average.
+    /// Merges in a row that ruled nothing out, answered for nothing and
+    /// seeded no threshold, after which the class stops merging until an
+    /// explore tick finds otherwise. Such a merge changes nothing about the
+    /// opens or the kernels and only costs, and that is known the moment it
+    /// reports, with no timing to average; a merge that did any of the three
+    /// is left to the timed comparison.
     const FRUITLESS_LIMIT: u32 = 2;
 
     pub(crate) fn new() -> Self {
@@ -233,10 +235,11 @@ impl TierPolicy {
 
     /// Fold a ranked search's wall into its class's average for the way
     /// it went: an eighth of the way from the old value to the sample.
-    /// `pruned` says what a merge that reported found: `Some(true)` when it
-    /// ruled a superfile out or answered for one, `Some(false)` when it
-    /// found nothing, `None` when it did not report (declined, or the opens
-    /// finished first), which says nothing about its worth.
+    /// `pruned` says what a merge that reported did: `Some(true)` when it
+    /// ruled a superfile out, answered for one, or seeded a threshold,
+    /// `Some(false)` when none of those, `None` when it did not report
+    /// (declined, or the opens finished first), which says nothing about
+    /// its worth.
     pub(crate) fn note(&self, class: usize, merged: bool, pruned: Option<bool>, wall_ns: u64) {
         let arm = usize::from(merged);
         self.samples[class][arm].fetch_add(1, Ordering::Relaxed);

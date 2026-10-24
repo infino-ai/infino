@@ -1203,8 +1203,10 @@ impl SupertableReader {
         // floor. What the merge needs is gathered here and it is started
         // at the fan-out; `selected` records that it reported in time.
         let selected = AtomicBool::new(false);
-        // Whether the merge, having reported, ruled a superfile out or
-        // answered for one: what the policy learns from, timing aside.
+        // Whether the merge, having reported, did anything the opens
+        // would not have: ruled a superfile out, answered for one, or
+        // seeded a threshold the kernels prune against. What the policy
+        // learns from, timing aside.
         let pruned = AtomicBool::new(false);
         let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
         let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
@@ -1866,7 +1868,10 @@ impl SupertableReader {
                     span.record("resolved", resolved);
                     span.record("ruled_out", ruled_out);
                     selected.store(true, AtomicOrdering::Relaxed);
-                    pruned.store(resolved + ruled_out > 0, AtomicOrdering::Relaxed);
+                    pruned.store(
+                        resolved + ruled_out > 0 || selection.theta_lb.is_finite(),
+                        AtomicOrdering::Relaxed,
+                    );
                     (keep.into_iter().map(|(e, p, _)| (e, p)).collect(), settled)
                 })
             };
