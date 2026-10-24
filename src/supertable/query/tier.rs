@@ -126,6 +126,9 @@ pub(crate) struct TierPolicy {
     /// Per class, how many queries each way has been measured over.
     samples: Vec<[AtomicU32; 2]>,
     trials: Vec<AtomicU32>,
+    /// Per class, merges in a row that reported and ruled nothing out nor
+    /// answered for anything; reset by one that did.
+    fruitless: Vec<AtomicU32>,
 }
 
 impl TierPolicy {
@@ -143,6 +146,11 @@ impl TierPolicy {
     const MIN_SAMPLES: u32 = 8;
     /// The average's reach: each sample moves it a `2^-SMOOTHING` of the way.
     const SMOOTHING: u32 = 3;
+    /// Merges in a row that found nothing to rule out or answer for, after
+    /// which the class stops merging until an explore tick finds otherwise.
+    /// The merge is there to prune; where it prunes nothing it only costs,
+    /// and that is known the moment it reports, with no timing to average.
+    const FRUITLESS_LIMIT: u32 = 2;
 
     pub(crate) fn new() -> Self {
         Self {
@@ -153,6 +161,7 @@ impl TierPolicy {
                 .map(|_| [AtomicU32::new(0), AtomicU32::new(0)])
                 .collect(),
             trials: (0..Self::CLASSES).map(|_| AtomicU32::new(0)).collect(),
+            fruitless: (0..Self::CLASSES).map(|_| AtomicU32::new(0)).collect(),
         }
     }
 
@@ -204,6 +213,12 @@ impl TierPolicy {
     /// Whether a query of `class` merges its tiers this time.
     pub(crate) fn merge(&self, class: usize) -> bool {
         let trial = self.trials[class].fetch_add(1, Ordering::Relaxed);
+        let explore = trial.is_multiple_of(Self::EXPLORE_EVERY);
+        // A class whose merges keep finding nothing to prune does not merge,
+        // whatever the walls say, except to look again now and then.
+        if self.fruitless[class].load(Ordering::Relaxed) >= Self::FRUITLESS_LIMIT {
+            return explore;
+        }
         let n_without = self.samples[class][0].load(Ordering::Relaxed);
         let n_with = self.samples[class][1].load(Ordering::Relaxed);
         if n_without < Self::MIN_SAMPLES || n_with < Self::MIN_SAMPLES {
@@ -213,19 +228,26 @@ impl TierPolicy {
         let without = self.walls[class][0].load(Ordering::Relaxed);
         let with = self.walls[class][1].load(Ordering::Relaxed);
         let favoured = with <= without;
-        if trial.is_multiple_of(Self::EXPLORE_EVERY) {
-            !favoured
-        } else {
-            favoured
-        }
+        if explore { !favoured } else { favoured }
     }
 
     /// Fold a ranked search's wall into its class's average for the way
     /// it went: an eighth of the way from the old value to the sample.
-    pub(crate) fn note(&self, class: usize, merged: bool, wall_ns: u64) {
+    /// `pruned` says what a merge that reported found: `Some(true)` when it
+    /// ruled a superfile out or answered for one, `Some(false)` when it
+    /// found nothing, `None` when it did not report (declined, or the opens
+    /// finished first), which says nothing about its worth.
+    pub(crate) fn note(&self, class: usize, merged: bool, pruned: Option<bool>, wall_ns: u64) {
         let arm = usize::from(merged);
         self.samples[class][arm].fetch_add(1, Ordering::Relaxed);
         fold_mean(&self.walls[class][arm], wall_ns, Self::SMOOTHING);
+        match pruned {
+            Some(true) => self.fruitless[class].store(0, Ordering::Relaxed),
+            Some(false) => {
+                self.fruitless[class].fetch_add(1, Ordering::Relaxed);
+            }
+            None => {}
+        }
     }
 }
 /// Entries the merge reads per query before it stops regardless of what is
@@ -1396,8 +1418,13 @@ mod tests {
         for _ in 0..(2 * TierPolicy::MIN_SAMPLES) {
             let with = policy.merge(class);
             ways.push(with);
-            // Merging costs ten times what not merging costs.
-            policy.note(class, with, if with { 10_000 } else { 1_000 });
+            // Merging costs ten times what not merging costs, and prunes.
+            policy.note(
+                class,
+                with,
+                with.then_some(true),
+                if with { 10_000 } else { 1_000 },
+            );
         }
         assert_eq!(
             ways,
@@ -1419,6 +1446,48 @@ mod tests {
         assert!(
             policy.merge(other),
             "another class starts its own measurement"
+        );
+    }
+
+    /// Two merges in a row that prune nothing stop a class merging, whatever
+    /// the walls say; the explore tick asks again, and a merge that prunes
+    /// starts the count over. A merge that did not report changes nothing.
+    #[test]
+    fn a_class_whose_merges_prune_nothing_stops_merging() {
+        let policy = TierPolicy::new();
+        let class = TierPolicy::class(true, false, 100, 2, 3.0);
+        // Merging is cheap here, so the walls alone would keep it.
+        assert!(policy.merge(class));
+        policy.note(class, true, Some(false), 1_000);
+        assert!(!policy.merge(class));
+        policy.note(class, false, None, 10_000);
+        assert!(policy.merge(class));
+        policy.note(class, true, Some(false), 1_000);
+        let next: Vec<bool> = (0..3).map(|_| policy.merge(class)).collect();
+        assert_eq!(next, vec![false, false, false], "fruitless twice: off");
+        for _ in 0..3 {
+            policy.note(class, false, None, 10_000);
+        }
+        // Trials so far: 6; the sixteenth asks again.
+        let until_explore: Vec<bool> = (6..TierPolicy::EXPLORE_EVERY)
+            .map(|_| {
+                let m = policy.merge(class);
+                policy.note(class, m, None, 10_000);
+                m
+            })
+            .collect();
+        assert!(until_explore.iter().all(|m| !m));
+        assert!(policy.merge(class), "the explore tick merges");
+        policy.note(class, true, Some(true), 1_000);
+        assert!(
+            policy.merge(class),
+            "a merge that pruned starts the count over"
+        );
+        policy.note(class, true, None, 1_000);
+        policy.note(class, true, Some(false), 1_000);
+        assert!(
+            policy.merge(class),
+            "an unreported merge is neutral, and one fruitless merge does not stop the class"
         );
     }
 

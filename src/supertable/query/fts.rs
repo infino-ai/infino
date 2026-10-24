@@ -1203,6 +1203,9 @@ impl SupertableReader {
         // floor. What the merge needs is gathered here and it is started
         // at the fan-out; `selected` records that it reported in time.
         let selected = AtomicBool::new(false);
+        // Whether the merge, having reported, ruled a superfile out or
+        // answered for one: what the policy learns from, timing aside.
+        let pruned = AtomicBool::new(false);
         let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
         let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
         let merge_kept: Vec<Arc<SuperfileEntry>> = match merge_now {
@@ -1783,6 +1786,7 @@ impl SupertableReader {
             let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
             let reader = self;
             let selected = &selected;
+            let pruned = &pruned;
             // What a selection does to the units it is handed: the
             // superfiles the index answers for are settled and their
             // scores folded into the floor, the ruled-out dropped, the rest
@@ -1862,6 +1866,7 @@ impl SupertableReader {
                     span.record("resolved", resolved);
                     span.record("ruled_out", ruled_out);
                     selected.store(true, AtomicOrdering::Relaxed);
+                    pruned.store(resolved + ruled_out > 0, AtomicOrdering::Relaxed);
                     (keep.into_iter().map(|(e, p, _)| (e, p)).collect(), settled)
                 })
             };
@@ -1966,9 +1971,11 @@ impl SupertableReader {
         // then ran: a shape it declines every time is thereby measured as
         // the cost of asking, and the class settles on not asking.
         if tiers_serve && learned {
+            let reported = selected.load(AtomicOrdering::Relaxed);
             self.tier_policy().note(
                 policy_class,
                 merge_now,
+                reported.then(|| pruned.load(AtomicOrdering::Relaxed)),
                 ranked_started.elapsed().as_nanos() as u64,
             );
         }
