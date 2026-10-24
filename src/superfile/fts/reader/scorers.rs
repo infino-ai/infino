@@ -1040,14 +1040,33 @@ fn seed_or_hits(
     hits: Vec<(FtsDocId, f32)>,
     complete: bool,
     k: usize,
-) -> Result<Vec<(FtsDocId, f32)>, f32> {
+    rare: usize,
+) -> Result<Vec<(FtsDocId, f32)>, RareLedFallback> {
     if complete {
         return Ok(hits);
     }
     match hits.get(k.wrapping_sub(1)) {
-        Some(&(_, kth)) if k > 0 => Err(kth.next_down()),
-        _ => Err(f32::NEG_INFINITY),
+        Some(&(_, kth)) if k > 0 => Err(RareLedFallback::Seed(kth.next_down())),
+        // Fewer than `k` found: the heap never filled, so nothing was pruned
+        // and these are every rare-term document, fully scored.
+        _ if k > 0 => Err(RareLedFallback::Split { rare, hits }),
+        _ => Err(RareLedFallback::Walk),
     }
+}
+
+/// What a rare-led walk that cannot stand on its own hands the general walk.
+pub(super) enum RareLedFallback {
+    /// Start from this floor: just under the walk's k-th best.
+    Seed(f32),
+    /// The rare term (cursor `rare`) held fewer than `k` documents, all in
+    /// `hits` with their full scores: the other terms can be ranked alone and
+    /// merged in.
+    Split {
+        rare: usize,
+        hits: Vec<(FtsDocId, f32)>,
+    },
+    /// Nothing to start from.
+    Walk,
 }
 
 /// Tail of the two-term WAND once `weak` cannot reach the threshold alone:
@@ -3626,25 +3645,13 @@ impl FtsReader {
         {
             match self.rare_led_pair(column_id, &cursors, k) {
                 Ok(hits) => Ok(hits),
-                Err(seed) if seed > f32::NEG_INFINITY => {
+                Err(RareLedFallback::Seed(seed)) => {
                     self.run_windowed_maxscore(column_id, cursors, k, None, seed, 0, u32::MAX)
                 }
-                // The rare term walked but held fewer documents than `k`, so
-                // there is no seed: the windowed kernel scores the common term
-                // a block at a time where WAND would walk it a document at a
-                // time.
-                Err(_) if cursors.iter().map(|c| c.df).min().unwrap_or(0) <= RARE_LED_MAX_DF => {
-                    self.run_windowed_maxscore(
-                        column_id,
-                        cursors,
-                        k,
-                        None,
-                        f32::NEG_INFINITY,
-                        0,
-                        u32::MAX,
-                    )
+                Err(RareLedFallback::Split { rare, hits }) => {
+                    self.rare_split(column_id, cursors, rare, hits, k)
                 }
-                Err(_) => self.run_wand_bmw(column_id, cursors, k),
+                Err(RareLedFallback::Walk) => self.run_wand_bmw(column_id, cursors, k),
             }
         } else {
             let mut floor = floor_eff;
@@ -3656,11 +3663,45 @@ impl FtsReader {
             {
                 match self.rare_led(column_id, &cursors, k) {
                     Ok(hits) => return Ok(hits),
-                    Err(seed) => floor = seed,
+                    Err(RareLedFallback::Seed(seed)) => floor = seed,
+                    Err(RareLedFallback::Split { rare, hits }) => {
+                        return self.rare_split(column_id, cursors, rare, hits, k);
+                    }
+                    Err(RareLedFallback::Walk) => {}
                 }
             }
             self.run_windowed_maxscore(column_id, cursors, k, filter, floor, 0, u32::MAX)
         }
+    }
+
+    /// The top `k` of a union whose rare term (cursor `rare`) holds fewer than
+    /// `k` documents, all of them already in `rare_hits` with full scores.
+    /// The other terms are ranked alone to `k`, the rare documents dropped
+    /// from that list and the two merged. A document without the rare term
+    /// scores the same in both, summed in the same order (removing a term
+    /// keeps the others' order). One that makes the final top `k` is in the
+    /// others' top `k`: were `k` documents ahead of it there, each would still
+    /// be ahead with its full score, the rare term only adding to it.
+    fn rare_split(
+        &self,
+        column_id: u32,
+        mut cursors: Vec<TermCursor>,
+        rare: usize,
+        rare_hits: Vec<(FtsDocId, f32)>,
+        k: usize,
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
+        cursors.remove(rare);
+        let rest = self.dispatch_or_algo(column_id, cursors, k, None, f32::NEG_INFINITY)?;
+        let mut rare_ids: Vec<FtsDocId> = rare_hits.iter().map(|&(d, _)| d).collect();
+        rare_ids.sort_unstable();
+        let mut merged = rare_hits;
+        merged.extend(
+            rest.into_iter()
+                .filter(|(d, _)| rare_ids.binary_search(d).is_err()),
+        );
+        merged.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        merged.truncate(k);
+        Ok(merged)
     }
 
     /// [`Self::rare_led_pair`] for three or more terms: one term much rarer
@@ -3675,7 +3716,7 @@ impl FtsReader {
         column_id: u32,
         cursors: &[TermCursor],
         k: usize,
-    ) -> Result<Vec<(FtsDocId, f32)>, f32> {
+    ) -> Result<Vec<(FtsDocId, f32)>, RareLedFallback> {
         // The terms in the order the windowed kernel sums them (descending
         // by term maximum, the same sort on the same input, so the same
         // permutation): the walk adds the lead first and the others in the
@@ -3690,14 +3731,14 @@ impl FtsReader {
         });
         let rare = &cursors[order[0]];
         if rare.df == 0 || rare.df > RARE_LED_MAX_DF {
-            return Err(f32::NEG_INFINITY);
+            return Err(RareLedFallback::Walk);
         }
         let others: Vec<TermCursor> = order[1..].iter().map(|&i| cursors[i].clone()).collect();
         if others
             .iter()
             .any(|c| c.df < rare.df.saturating_mul(WAND_BMW_2TERM_DF_RATIO))
         {
-            return Err(f32::NEG_INFINITY);
+            return Err(RareLedFallback::Walk);
         }
         let others_max: f32 = others.iter().map(|c| c.term_max_bm25).sum();
         let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
@@ -3712,7 +3753,7 @@ impl FtsReader {
             );
             heap.len() >= k && heap.peek().expect("full heap").0 > others_max
         });
-        seed_or_hits(hits, complete, k)
+        seed_or_hits(hits, complete, k, order[0])
     }
 
     /// A two-term OR of a rare term and a much commoner one, answered from
@@ -3733,13 +3774,11 @@ impl FtsReader {
         column_id: u32,
         cursors: &[TermCursor],
         k: usize,
-    ) -> Result<Vec<(FtsDocId, f32)>, f32> {
-        let (rare, common) = match cursors[0].df <= cursors[1].df {
-            true => (&cursors[0], &cursors[1]),
-            false => (&cursors[1], &cursors[0]),
-        };
+    ) -> Result<Vec<(FtsDocId, f32)>, RareLedFallback> {
+        let rare_at = usize::from(cursors[0].df > cursors[1].df);
+        let (rare, common) = (&cursors[rare_at], &cursors[1 - rare_at]);
         if rare.df > RARE_LED_MAX_DF {
-            return Err(f32::NEG_INFINITY);
+            return Err(RareLedFallback::Walk);
         }
         let common_max = common.term_max_bm25;
         let (hits, complete) = self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
@@ -3754,7 +3793,7 @@ impl FtsReader {
             );
             heap.len() >= k && heap.peek().expect("full heap").0 >= common_max
         });
-        seed_or_hits(hits, complete, k)
+        seed_or_hits(hits, complete, k, rare_at)
     }
 
     /// Bench/dev helper: force the multi-term OR path to use a specific
@@ -3856,6 +3895,53 @@ mod tests {
             .expect("boolean")
             .0;
         assert_eq!(bm25, boolean, "boolean Or doc set == bm25 doc set");
+    }
+
+    #[tokio::test]
+    async fn a_rare_term_with_fewer_docs_than_k_merges_with_the_others_alone() {
+        // A rare word under `k` documents, every one of them also heavy in the
+        // common words, so the common words ranked alone put the rare
+        // documents at their top: the merge must drop those copies and still
+        // fill `k`, answering exactly as the exhaustive walk does.
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false)
+            .expect("register column");
+        let mut texts = Vec::new();
+        for i in 0..3000u32 {
+            texts.push(match i {
+                _ if i % 150 == 7 => "kalakaua music music music city city".to_string(),
+                _ if i % 3 == 0 => format!("music filler{} word", i % 17),
+                _ if i % 5 == 0 => format!("city filler{} music", i % 13),
+                _ => format!("filler{} other words here", i % 29),
+            });
+        }
+        for (i, text) in texts.iter().enumerate() {
+            b.add_doc(0, i as u32, text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        for terms in [&["music", "kalakaua"][..], &["music", "kalakaua", "city"]] {
+            for k in [25usize, 60, 128] {
+                let got: Vec<(u32, u32)> = r
+                    .search("body", terms, k, BoolMode::Or)
+                    .await
+                    .expect("search")
+                    .into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect();
+                let want: Vec<(u32, u32)> = r
+                    .search_with_algo_for_bench("body", terms, k, OrAlgo::Exhaustive)
+                    .await
+                    .expect("exhaustive")
+                    .into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect();
+                assert_eq!(got.len(), k.min(want.len()), "{terms:?} k {k}");
+                let docs = |v: &[(u32, u32)]| v.iter().map(|&(d, _)| d).collect::<Vec<_>>();
+                assert_eq!(docs(&got), docs(&want), "{terms:?} k {k}");
+            }
+        }
     }
 
     #[tokio::test]

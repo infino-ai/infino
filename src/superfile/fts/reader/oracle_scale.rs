@@ -321,7 +321,10 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 let near_df = df(rare)
                     .saturating_sub(RARE_PAIR_K_SLACK)
                     .min(RARE_PAIR_MAX_K);
-                for k in [10, 50, 128, near_df] {
+                // Past the rare word's documents too: the walk then holds every
+                // one of them and the common word is ranked alone and merged.
+                let past_df = (df(rare) + RARE_PAIR_K_SLACK).min(RARE_PAIR_MAX_K);
+                for k in [10, 50, 128, near_df, past_df] {
                     queries.push(Query {
                         shoulds: vec![common.to_string(), rare.to_string()],
                         k: k.max(1),
@@ -338,7 +341,8 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 let near_df = df(rare)
                     .saturating_sub(RARE_PAIR_K_SLACK)
                     .min(RARE_PAIR_MAX_K);
-                for k in [10, 50, near_df] {
+                let past_df = (df(rare) + RARE_PAIR_K_SLACK).min(RARE_PAIR_MAX_K);
+                for k in [10, 50, near_df, past_df] {
                     let mut shoulds: Vec<String> = commons.iter().map(|w| w.to_string()).collect();
                     shoulds.insert(1, rare.to_string());
                     queries.push(Query {
