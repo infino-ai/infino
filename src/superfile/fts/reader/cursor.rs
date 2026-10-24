@@ -1293,6 +1293,52 @@ impl TermCursor {
         block_tfs[rank]
     }
 
+    /// The postings in `[lo, hi]`, appended to `docs` and `tfs` in doc
+    /// order. Moves the block cursor forward as [`Self::probe_tfs`] does, so
+    /// the two can share a cursor while each asks only about docs past every
+    /// doc or range asked before. Decodes only blocks that overlap the range.
+    pub(super) fn collect_range(
+        &mut self,
+        lo: u32,
+        hi: u32,
+        docs: &mut Vec<u32>,
+        tfs: &mut Vec<u32>,
+    ) {
+        if self.predecoded {
+            let ids = &self.block_doc_ids[..self.block_n];
+            let (a, b) = (
+                ids.partition_point(|&d| d < lo),
+                ids.partition_point(|&d| d <= hi),
+            );
+            docs.extend_from_slice(&ids[a..b]);
+            tfs.extend_from_slice(&self.block_tfs[a..b]);
+            return;
+        }
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < lo
+        {
+            self.current_block += 1;
+        }
+        while self.current_block < self.blocks.len() {
+            if self.decoded_block != self.current_block || self.lazy_bit != u32::MAX {
+                self.decode_current_block();
+            }
+            let n = self.block_n;
+            let ids = &self.block_doc_ids[..n];
+            let (a, b) = (
+                ids.partition_point(|&d| d < lo),
+                ids.partition_point(|&d| d <= hi),
+            );
+            docs.extend_from_slice(&ids[a..b]);
+            tfs.extend_from_slice(&self.block_tfs[a..b]);
+            if self.blocks[self.current_block].last_doc_id >= hi {
+                self.pos = b.min(n.saturating_sub(1));
+                return;
+            }
+            self.current_block += 1;
+        }
+    }
+
     /// [`Self::bitset_probe_tf`] over an ascending batch: `out[i]` is the tf
     /// of `docs[i]` in this term, or `0` when the term does not hold it. The
     /// block covering the next doc is found from the skip table without a

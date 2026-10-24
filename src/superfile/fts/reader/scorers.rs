@@ -601,6 +601,39 @@ fn must_lead_should_count(
     count
 }
 
+/// How many times fewer postings the optional terms must have over a
+/// required block's range than the block itself, for the must-led walk to
+/// collect theirs and score only the required docs among them.
+const OPTIONAL_FIRST_RATIO: f32 = 2.0;
+
+/// Bit `p` set for each position `p` of `ids` (ascending, at most 128) whose
+/// doc is in `docs` (ascending).
+fn positions_held(ids: &[u32], docs: &[u32]) -> u128 {
+    debug_assert!(ids.len() <= 128);
+    let (mut p, mut q, mut bits) = (0usize, 0usize, 0u128);
+    while p < ids.len() && q < docs.len() {
+        let (a, b) = (ids[p], docs[q]);
+        bits |= u128::from(a == b) << p;
+        p += usize::from(a <= b);
+        q += usize::from(b <= a);
+    }
+    bits
+}
+
+/// The tf at each of `docs` (ascending) in a term whose postings over their
+/// range are `(term_docs, term_tfs)`, `0` where it holds none, into `out`.
+fn tfs_at(docs: &[u32], term_docs: &[u32], term_tfs: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    let mut q = 0usize;
+    for &d in docs {
+        q += term_docs[q..].partition_point(|&x| x < d);
+        out.push(match term_docs.get(q) {
+            Some(&x) if x == d => term_tfs[q],
+            _ => 0,
+        });
+    }
+}
+
 /// One required term with optional terms: the required term drives, one
 /// block at a time, and the optional terms are only probed at its docs.
 ///
@@ -669,6 +702,9 @@ fn must_lead_should_walk<C: Collector>(
     let mut probe_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    // Each optional term's postings over a block's range, for optional-first.
+    let mut opt_docs: Vec<Vec<u32>> = vec![Vec::with_capacity(BLOCK_LEN); m];
+    let mut opt_tfs: Vec<Vec<u32>> = vec![Vec::with_capacity(BLOCK_LEN); m];
     let mut contribs: Vec<f32> = Vec::with_capacity(m * BLOCK_LEN);
     let mut win = vec![0.0_f32; m];
     let mut win_suffix = vec![0.0_f32; m + 1];
@@ -699,6 +735,69 @@ fn must_lead_should_walk<C: Collector>(
         // walk checks it, so the heap ends the same.
         if filter.is_none() && lead.holds_whole_block() {
             let (from, to) = (lead.pos, lead.block_n);
+            // Optional first. When the required term's block maximum alone
+            // cannot beat the bar, a doc of this block reaches the top-k only
+            // with some optional term, so the candidates are the required
+            // docs the optional terms hold. When those terms have far fewer
+            // postings over the block's range, collect theirs and score only
+            // the required docs among them, instead of scoring the whole block
+            // and probing at every doc. A required-only doc scores at most the
+            // block maximum, which cannot enter, so the heap ends the same.
+            if pruning && lead.current_block_max_bm25() <= threshold {
+                let range_end = lead.block_doc_ids[to - 1];
+                let optional_docs: f32 = shoulds
+                    .iter_mut()
+                    .map(|c| c.block_max_and_density_in_range(start, range_end).1)
+                    .sum();
+                if optional_docs * OPTIONAL_FIRST_RATIO < (to - from) as f32 {
+                    let ids = &lead.block_doc_ids[from..to];
+                    let mut held = 0u128;
+                    for (si, c) in shoulds.iter_mut().enumerate() {
+                        opt_docs[si].clear();
+                        opt_tfs[si].clear();
+                        c.collect_range(start, range_end, &mut opt_docs[si], &mut opt_tfs[si]);
+                        held |= positions_held(ids, &opt_docs[si]);
+                    }
+                    cand_docs.clear();
+                    cand_tfs.clear();
+                    let mut bits = held;
+                    while bits != 0 {
+                        let p = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        cand_docs.push(ids[p]);
+                        cand_tfs.push(lead.block_tfs[from + p]);
+                    }
+                    score_postings(
+                        lead.idf_weight,
+                        &cand_docs,
+                        &cand_tfs,
+                        dl_norm_k1,
+                        &mut cand_scores,
+                    );
+                    // Optional contributions in query order, as the walk adds them.
+                    for si in 0..m {
+                        tfs_at(&cand_docs, &opt_docs[si], &opt_tfs[si], &mut cand_tfs);
+                        score_postings(
+                            shoulds[si].idf_weight,
+                            &cand_docs,
+                            &cand_tfs,
+                            dl_norm_k1,
+                            &mut cand_contribs,
+                        );
+                        for (s, &x) in cand_scores.iter_mut().zip(&cand_contribs) {
+                            *s += x;
+                        }
+                    }
+                    for (&d, &score) in cand_docs.iter().zip(&cand_scores) {
+                        if score > floor_eff {
+                            heap.offer(k, &mut kth, score, d);
+                            threshold = bar(heap, kth);
+                        }
+                    }
+                    lead.advance_by(to - from);
+                    continue;
+                }
+            }
             cand_docs.clear();
             cand_docs.extend_from_slice(&lead.block_doc_ids[from..to]);
             score_postings(
