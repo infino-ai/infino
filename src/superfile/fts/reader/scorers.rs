@@ -1130,11 +1130,15 @@ fn accumulate_segment(
 /// Eight postings of a dense term usually span fewer than 16 documents; their
 /// contributions are then expanded into those 16 slots under a bit mask and
 /// added with one 16-wide read-modify-write, in place of eight scalar ones,
-/// and the same mask marks them present. Every slot still receives exactly
-/// its own contribution (the others add `0.0` to a non-negative score), so
-/// the window holds the same bits as through [`mark_lanes`].
+/// and the same mask marks them present. Their norms' buckets are then 16
+/// contiguous bytes too: one load, compressed under the mask to the eight
+/// docs' buckets, and one gather from the decode table, in place of eight
+/// dependent loads of each. Every slot still receives exactly its own
+/// contribution (the others add `0.0` to a non-negative score), at the norm
+/// [`NormTable::get`] gives, so the window holds the same bits as through
+/// [`mark_lanes`].
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx512f,avx2")]
 unsafe fn accumulate_run_avx512(
     idf_weight: f32,
     ids: &[u32],
@@ -1147,6 +1151,7 @@ unsafe fn accumulate_run_avx512(
     use std::arch::x86_64::*;
     let scores = &mut scores[..OR_WINDOW as usize];
     let present = &mut present[..OR_WINDOW_WORDS];
+    let (buckets, lut) = dl_norm_k1.parts();
     let mut i = 0usize;
     while i + 8 <= ids.len() {
         let dids: [u32; 8] = ids[i..i + 8]
@@ -1155,19 +1160,37 @@ unsafe fn accumulate_run_avx512(
         let tf8: [u32; 8] = tfs[i..i + 8]
             .try_into()
             .expect("invariant: an 8-wide slice");
-        let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
         let first = (dids[0] - base) as usize;
-        if dids[7] - dids[0] < 16 && first + 16 <= OR_WINDOW as usize {
+        if dids[7] - dids[0] < 16
+            && first + 16 <= OR_WINDOW as usize
+            && dids[0] as usize + 16 <= buckets.len()
+        {
             let mut mask = 0u32;
             for d in dids {
                 mask |= 1 << (d - dids[0]);
             }
-            // SAFETY: avx512f is enabled on this function, which the caller
-            // reaches only behind `is_x86_feature_detected!("avx512f")`. The
-            // 16-lane load and store cover `[first, first + 16)`, inside the
-            // window slice by the check above; both are unaligned forms. The
-            // expand reads only the low eight source lanes (the mask has eight
-            // bits set), all of them defined by the 256-bit load.
+            // SAFETY: avx512f and avx2 are enabled on this function, which the
+            // caller reaches only behind `is_x86_feature_detected!("avx512f")`
+            // (avx512f implies avx2). The 16-byte bucket load covers
+            // `[dids[0], dids[0] + 16)`, inside `buckets` by the check above.
+            // The compress keeps the eight lanes the mask selects, in order, so
+            // the low eight lanes are the eight docs' buckets, each below 256:
+            // the gather reads only inside the 256-entry table.
+            let norms = unsafe {
+                let bytes = _mm_loadu_si128(buckets.as_ptr().add(dids[0] as usize).cast());
+                let picked = _mm512_maskz_compress_epi32(mask as u16, _mm512_cvtepu8_epi32(bytes));
+                let gathered =
+                    _mm256_i32gather_ps::<4>(lut.as_ptr(), _mm512_castsi512_si256(picked));
+                let mut norms = [0.0f32; 8];
+                _mm256_storeu_ps(norms.as_mut_ptr(), gathered);
+                norms
+            };
+            let contributions = bm25::score_one_term_x8(idf_weight, tf8, norms);
+            // SAFETY: as above for the target features. The 16-lane load and
+            // store cover `[first, first + 16)`, inside the window slice by the
+            // check above; both are unaligned forms. The expand reads only the
+            // low eight source lanes (the mask has eight bits set), all of them
+            // defined by the 256-bit load.
             unsafe {
                 let src = _mm512_castps256_ps512(_mm256_loadu_ps(contributions.as_ptr()));
                 let add = _mm512_maskz_expand_ps(mask as u16, src);
@@ -1182,6 +1205,7 @@ unsafe fn accumulate_run_avx512(
                 present[word + 1] |= u64::from(mask) >> (64 - bit);
             }
         } else {
+            let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
             mark_lanes(scores, present, base, dids, contributions);
         }
         i += 8;

@@ -292,6 +292,14 @@ impl NormTable {
         self.lut[self.bytes[doc as usize] as usize]
     }
 
+    /// The per-doc buckets and the bucket-to-norm table, for a SIMD lookup
+    /// that reads a run of docs' buckets at once. `get(d)` is
+    /// `lut[buckets[d]]`.
+    #[inline(always)]
+    pub(super) fn parts(&self) -> (&[u8], &[f32; 256]) {
+        (&self.bytes, &self.lut)
+    }
+
     /// [`Self::get`] for eight docs. A loop the compiler always inlines:
     /// `[u32; 8]::map` with a closure is left out of line under code-size
     /// pressure, a call per eight postings on the hottest paths.
