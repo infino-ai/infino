@@ -995,6 +995,21 @@ fn word_beats(slots: &[f32], threshold: f32) -> bool {
     hit.iter().fold(0, |a, &h| a | h) != 0
 }
 
+/// Whether any of one presence word's 64 window slots reaches `bar`
+/// (`>=`), compared eight lanes at a time like [`word_beats`].
+fn word_reaches(slots: &[f32], bar: f32) -> bool {
+    let slots: &[f32; 64] = slots
+        .try_into()
+        .expect("invariant: a presence word spans 64 slots");
+    let mut hit = [0u32; 8];
+    for chunk in slots.chunks_exact(8) {
+        for (h, &x) in hit.iter_mut().zip(chunk) {
+            *h |= u32::from(x >= bar);
+        }
+    }
+    hit.iter().fold(0, |a, &h| a | h) != 0
+}
+
 /// Add `c`'s next postings into a union window whose slot 0 is doc `base`:
 /// eight per SIMD call where the block and the window both allow, else
 /// four, else one, then move the cursor past them. One step; the caller
@@ -3051,6 +3066,9 @@ impl FtsReader {
         // The non-essentials' tfs at the window's survivors, reused.
         let mut noness_tfs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
         let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
+        // A window drain's candidates: at most one per window slot.
+        let mut cand_docs = vec![0u32; OR_WINDOW as usize];
+        let mut cand_scores = vec![0.0f32; OR_WINDOW as usize];
         // Per-window block-level upper bounds and their suffix sums, in the
         // same term-max order as `partial_max`.
         // Non-essential block-max bound for the single-essential path, and its
@@ -3543,24 +3561,45 @@ impl FtsReader {
                 }
                 continue;
             }
-            win_docs.clear();
-            win_scores.clear();
+            // Collect the window's candidates. Once the heap is full, the first
+            // completion pass keeps only a doc whose essential score reaches
+            // `threshold - partial_win[f_win]`, so a doc below it is never
+            // collected and a presence word with none reaching it is cleared
+            // unvisited: the list the completion starts from is the same. The
+            // docs go into fixed buffers at a count held in a register, written
+            // unconditionally and kept by the comparison.
+            let collect_bar = match heap_full {
+                true => threshold - partial_win[f_win],
+                false => f32::NEG_INFINITY,
+            };
+            let mut n_cand = 0usize;
             for (word_idx, word) in present[..words].iter_mut().enumerate() {
                 let mut bits = *word;
                 *word = 0;
+                if bits == 0 {
+                    continue;
+                }
+                let slots = &mut scores[word_idx << 6..(word_idx + 1) << 6];
+                if heap_full && !word_reaches(slots, collect_bar) {
+                    slots.fill(0.0);
+                    continue;
+                }
                 while bits != 0 {
                     let b = bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let local = (word_idx << 6) | b;
-                    let doc = base + local as u32;
-                    let score = std::mem::take(&mut scores[local]);
+                    let doc = base + ((word_idx << 6) | b) as u32;
+                    let score = std::mem::take(&mut slots[b]);
+                    if score < collect_bar {
+                        continue;
+                    }
                     if let Some(f) = filter.as_deref_mut()
                         && !f.admits(doc)
                     {
                         continue;
                     }
-                    win_docs.push(doc);
-                    win_scores.push(score);
+                    cand_docs[n_cand] = doc;
+                    cand_scores[n_cand] = score;
+                    n_cand += 1;
                 }
             }
 
@@ -3570,21 +3609,20 @@ impl FtsReader {
             // budget) before each and batch-scoring matches — so weaker terms
             // touch a shrinking survivor set. While filling, every doc must be
             // admitted, so score all non-essentials over every candidate.
-            if heap_full && !non_ess.is_empty() {
+            if heap_full {
                 let nn = non_ess.len();
                 for jj in 0..nn {
                     // Max score still obtainable from non-essentials jj..nn.
                     let bar = threshold - partial_win[f_win + jj];
-                    let sv = filter_survivors(&mut win_docs, &mut win_scores, bar);
-                    win_docs.truncate(sv);
-                    win_scores.truncate(sv);
-                    if win_docs.is_empty() {
+                    n_cand =
+                        filter_survivors(&mut cand_docs[..n_cand], &mut cand_scores[..n_cand], bar);
+                    if n_cand == 0 {
                         break;
                     }
                     score_noness_batched(
                         &mut non_ess[jj],
-                        &win_docs,
-                        &mut win_scores,
+                        &cand_docs[..n_cand],
+                        &mut cand_scores[..n_cand],
                         dl_norm_k1,
                         &mut noness_tfs,
                     );
@@ -3593,8 +3631,8 @@ impl FtsReader {
                 for c in non_ess.iter_mut() {
                     score_noness_batched(
                         c,
-                        &win_docs,
-                        &mut win_scores,
+                        &cand_docs[..n_cand],
+                        &mut cand_scores[..n_cand],
                         dl_norm_k1,
                         &mut noness_tfs,
                     );
@@ -3609,8 +3647,7 @@ impl FtsReader {
             }
 
             // Collect the fully-scored candidates (ascending doc order).
-            for (idx, &doc) in win_docs.iter().enumerate() {
-                let score = win_scores[idx];
+            for (&doc, &score) in cand_docs[..n_cand].iter().zip(&cand_scores[..n_cand]) {
                 heap.offer(k, &mut threshold, score, doc);
             }
         }
