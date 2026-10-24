@@ -621,7 +621,7 @@ const PROBE_GALLOP: usize = 16;
 /// apart (the intersection probe); where the next one is usually a step or
 /// two on (the phrase filter), plain stepping measured faster.
 #[inline(always)]
-fn seek_sorted<const WIDE: bool>(ids: &[u32], mut p: usize, t: u32) -> usize {
+pub(super) fn seek_sorted<const WIDE: bool>(ids: &[u32], mut p: usize, t: u32) -> usize {
     let n = ids.len();
     if p + PROBE_GALLOP < n && ids[p + PROBE_GALLOP] < t {
         p += PROBE_GALLOP + ids[p + PROBE_GALLOP..].partition_point(|&x| x < t);

@@ -14,7 +14,7 @@ use wide::f32x8;
 
 use super::{
     core::*,
-    cursor::{CursorUse, TermCursor},
+    cursor::{CursorUse, TermCursor, seek_sorted},
     filter::ExcludeFilter,
     metadata::{NormTable, unscored_norm_table},
     sink::{
@@ -610,12 +610,15 @@ const OPTIONAL_FIRST_RATIO: f32 = 2.0;
 /// doc is in `docs` (ascending).
 fn positions_held(ids: &[u32], docs: &[u32]) -> u128 {
     debug_assert!(ids.len() <= 128);
-    let (mut p, mut q, mut bits) = (0usize, 0usize, 0u128);
-    while p < ids.len() && q < docs.len() {
-        let (a, b) = (ids[p], docs[q]);
-        bits |= u128::from(a == b) << p;
-        p += usize::from(a <= b);
-        q += usize::from(b <= a);
+    // `docs` is the shorter list (the caller collects it only when it is):
+    // walk it and search forward in `ids`, rather than stepping both.
+    let (mut p, mut bits) = (0usize, 0u128);
+    for &d in docs {
+        p = seek_sorted::<true>(ids, p, d);
+        if p >= ids.len() {
+            break;
+        }
+        bits |= u128::from(ids[p] == d) << p;
     }
     bits
 }
