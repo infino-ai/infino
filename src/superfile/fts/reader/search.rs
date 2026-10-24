@@ -1377,13 +1377,12 @@ impl FtsReader {
         // lower bound on the k-th — never a top-k or tied-at-k doc. The seed
         // does not touch `heap`; the main walk re-decodes any seed block it
         // needs and admits in doc-id order, so the top-k (and its tie-break)
-        // is bit-identical to the un-seeded walk. Only applied without a
-        // negation filter (so the seed's admitted set matches the final one)
-        // and on lists long enough to have waste to prune.
-        let seed_threshold: f32 = if coarse_enabled
-            && filter.is_none()
-            && term_meta.num_blocks >= seed::MIN_BLOCKS
-        {
+        // is bit-identical to the un-seeded walk. Under a filter the seed
+        // admits through a copy of it, in ascending doc order as a filter
+        // requires, so its docs are a subset of the walk's admitted ones and
+        // the k-th stays a lower bound. Only on lists long enough to have
+        // waste to prune.
+        let seed_threshold: f32 = if coarse_enabled && term_meta.num_blocks >= seed::MIN_BLOCKS {
             let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
             // Seed depth scales with k: a fixed handful of blocks gives a
             // tight k-th only at small k; at k=100/1000 the top-k spreads
@@ -1409,6 +1408,10 @@ impl FtsReader {
             }
             let m = m_want.min(cand.len());
             cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+            let mut seed_filter = filter.as_deref().map(ExcludeFilter::duplicate);
+            if seed_filter.is_some() {
+                cand[..m].sort_unstable_by_key(|&(_, bi)| bi);
+            }
             // Decode those blocks, score, keep a k-sized seed heap. Clamp the
             // preallocation to the corpus size: `k` is caller-controlled and may
             // be `usize::MAX` (an unbounded "return everything" request), which
@@ -1422,6 +1425,11 @@ impl FtsReader {
                 let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
                 let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
                 for j in 0..n {
+                    if let Some(f) = seed_filter.as_mut()
+                        && !f.admits(buf_d[j])
+                    {
+                        continue;
+                    }
                     let score =
                         bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
                     if score <= floor_eff {
@@ -2048,6 +2056,70 @@ mod tests {
                     assert_eq!(count, matches, "count for {label}");
                 }
             }
+        }
+    }
+
+    /// A single term long enough for the threshold seed, negated by a term
+    /// that sits on exactly its strongest documents, all in its first blocks:
+    /// the seed admits through
+    /// the negation too, so its bar comes from documents the walk can return,
+    /// and the top-k matches the unpruned ranking with the negated documents
+    /// removed. A seed that ignored the negation would take its bar from the
+    /// excluded documents and skip the blocks holding the real top-k.
+    #[tokio::test]
+    async fn a_seeded_single_term_walk_admits_its_seed_through_the_negation() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let n_docs = 40_000u32;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..n_docs {
+            // The first quarter holds the strongest documents (most
+            // occurrences, shortest bodies), all negated; the blocks after it
+            // are weaker, and hold the real top-k.
+            let strong = i < n_docs / 4;
+            let mut text = String::from("doc");
+            if rng() % 100 < 90 {
+                let reps = if strong { 4 } else { 1 + rng() % 3 };
+                for _ in 0..reps {
+                    text.push_str(" common");
+                }
+                if strong {
+                    text.push_str(" strong");
+                }
+                let filler = if strong { 0 } else { rng() % 30 };
+                for _ in 0..filler {
+                    text.push_str(" filler");
+                }
+            }
+            b.add_doc(0, i, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+        let lists = || ClauseLists {
+            shoulds: &["common"],
+            negatives: &["strong"],
+            ..ClauseLists::default()
+        };
+        // Every admitted match, ranked: a k as large as the corpus leaves the
+        // seed heap short of k, so nothing is pruned.
+        let every = r
+            .search_excluding("body", lists(), n_docs as usize, f32::NEG_INFINITY)
+            .await
+            .expect("every match");
+        for k in [1usize, 10, 100, 1000] {
+            let hits = r
+                .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                .await
+                .expect("ranked search");
+            let want = &every[..k.min(every.len())];
+            assert_same_top_k(&hits, want, &format!("k={k}"));
         }
     }
 

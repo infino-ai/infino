@@ -144,6 +144,18 @@ impl ExcludeFilter {
         }
     }
 
+    /// A second gate over the same exclusions, at this one's position: for
+    /// a pass that tests its own ascending run of docs ahead of the walk
+    /// that uses this gate.
+    pub(super) fn duplicate(&self) -> Self {
+        Self {
+            cursors: self.cursors.clone(),
+            allow: self.allow.clone(),
+            doc_map: self.doc_map.clone(),
+            last_doc: self.last_doc,
+        }
+    }
+
     /// Posting-list bytes the negation cursors index into — see
     /// [`PreparedClauses::postings_bytes`].
     pub(super) fn postings_bytes(&self) -> u64 {
