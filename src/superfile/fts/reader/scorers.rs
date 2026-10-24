@@ -2948,7 +2948,6 @@ impl FtsReader {
         let mut noness_suffix = vec![0.0_f32; n + 1];
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
-        let mut win_all = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
         // Sum of every term's UB — the reference for the essential-side
         // block-max skip below.
@@ -3278,45 +3277,36 @@ impl FtsReader {
             // bounded by the others' window maxima rather than their term
             // maxima. Measured once per window, before any cursor moves.
             let windowed = prune && !sole;
-            // The non-essentials' maxima over this window, summed: what they
-            // can add to any doc in it, never more than their term maxima.
+            // Each term's bound and doc estimate over the window are read
+            // once: the non-essentials' sum (what they can add to any doc in
+            // the window, never more than their term maxima), the block skip
+            // and the demotion test all use the same values.
             let mut noness_win = partial_max[f_essential];
+            let mut win_all_sum = 0.0_f32;
             if prune {
                 let win_last = window_end.saturating_sub(1);
-                let mut sum = 0.0_f32;
-                for i in f_essential..n {
-                    win_ub[i] = cursors[i].block_max_in_range(base, win_last);
-                    sum += win_ub[i];
-                }
-                noness_win = sum.min(partial_max[f_essential]);
-            }
-            let mut win_all_sum = 0.0_f32;
-            if windowed {
-                let win_last = window_end.saturating_sub(1);
                 for (i, c) in cursors.iter_mut().enumerate() {
-                    win_all[i] = c.block_max_in_range(base, win_last);
-                    win_all_sum += win_all[i];
+                    let (ub, docs) = c.block_max_and_density_in_range(base, win_last);
+                    win_ub[i] = ub;
+                    win_docs_est[i] = docs;
+                }
+                noness_win = win_ub[f_essential..]
+                    .iter()
+                    .sum::<f32>()
+                    .min(partial_max[f_essential]);
+                if windowed {
+                    win_all_sum = win_ub.iter().sum();
                 }
             }
             let f_win = if sole {
                 partial_win.copy_from_slice(&partial_max);
                 f_essential
             } else if prune {
-                let win_last = window_end.saturating_sub(1);
                 let weakest = f_essential - 1;
-                let (weakest_ub, weakest_docs) =
-                    cursors[weakest].block_max_and_density_in_range(base, win_last);
-                if weakest_ub + noness_win > threshold {
+                if win_ub[weakest] + noness_win > threshold {
                     partial_win.copy_from_slice(&partial_max);
                     f_essential
                 } else {
-                    win_ub[weakest] = weakest_ub;
-                    win_docs_est[weakest] = weakest_docs;
-                    for (i, c) in cursors.iter_mut().enumerate().take(weakest) {
-                        let (ub, docs) = c.block_max_and_density_in_range(base, win_last);
-                        win_ub[i] = ub;
-                        win_docs_est[i] = docs;
-                    }
                     partial_win[n] = 0.0;
                     for i in (0..n).rev() {
                         partial_win[i] = partial_win[i + 1] + win_ub[i];
@@ -3368,7 +3358,7 @@ impl FtsReader {
                         let inside = c.current_block_last_doc_id() < window_end;
                         let others_ub = match (sole, windowed && inside) {
                             (true, _) => noness_win,
-                            (false, true) => (win_all_sum - win_all[ci]).min(global_ub),
+                            (false, true) => (win_all_sum - win_ub[ci]).min(global_ub),
                             (false, false) => global_ub,
                         };
                         #[cfg(test)]
