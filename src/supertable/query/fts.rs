@@ -1130,41 +1130,14 @@ impl SupertableReader {
         // so the merge reads past them, and a kernel admits only the live
         // rows, so its k best are live. A sidecar that cannot be read
         // leaves the query to its ceilings and the kernel's own filter.
-        let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
-        let mut deny_known = true;
-        if let Some(cache) = &self.tombstone_cache {
-            let now = Instant::now();
-            let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
-            cache.prefetch(&ids, now).await;
-            for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
-                match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
-                    Ok(set) => *slot = set,
-                    Err(_) => {
-                        deny_known = false;
-                        break;
-                    }
-                }
-            }
-        }
-        // A unit whose superfile has deleted rows builds its live-row set
-        // from the kept set's row counts; a sidecar that could not be read
-        // leaves later units to their own lookups, which may find deleted
-        // rows, so the counts are built then too.
-        let tombstoned = !deny_known || deny.iter().any(Option::is_some);
-        // The deny sets the merge reads, by superfile, for the units to
-        // admit rows by: the threshold the merge seeds counts a row against
-        // these sets, and a unit that read the sidecar afresh after a delete
-        // committed in between could drop a row the threshold still counts.
-        // Unreadable sidecars leave every unit to its own lookup.
-        let deny_by_superfile: Arc<HashMap<Uuid, Arc<RoaringBitmap>>> =
-            Arc::new(match deny_known {
-                true => kept
-                    .iter()
-                    .zip(&deny)
-                    .map(|(e, d)| (e.superfile_id, d.clone().unwrap_or_default()))
-                    .collect(),
-                false => HashMap::new(),
-            });
+        // Whether any kept superfile has deleted rows, from the sidecar
+        // cache's view of the manifest and without reading a sidecar: a
+        // unit whose superfile has them builds its live-row set from the
+        // kept set's row counts.
+        let tombstoned = self
+            .tombstone_cache
+            .as_ref()
+            .is_some_and(|c| kept.iter().any(|e| c.may_have_tombstones(e.superfile_id)));
         // A scope that admits only some rows of a superfile is one the
         // index cannot see, and the merge's threshold is the k-th score
         // over every row: seeding the floor with it, or ruling a superfile
@@ -1193,6 +1166,37 @@ impl SupertableReader {
         let ranked_started = Instant::now();
         let learned = manifest.options.tier_merge_gate;
         let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
+        // The deny sets, resolved only for a merge: it reads past the
+        // deleted rows, and the units then admit rows by the same sets, so
+        // a delete committed between the two reads cannot leave the
+        // threshold counting a row a kernel drops. Without a merge each
+        // unit looks its own up, as before. A sidecar that cannot be read
+        // leaves the merge unprepared and every unit to its own lookup.
+        let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
+        let mut deny_known = true;
+        if merge_now && let Some(cache) = &self.tombstone_cache {
+            let now = Instant::now();
+            let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+            for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
+                match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
+                    Ok(set) => *slot = set,
+                    Err(_) => {
+                        deny_known = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let deny_by_superfile: Arc<HashMap<Uuid, Arc<RoaringBitmap>>> =
+            Arc::new(match merge_now && deny_known {
+                true => kept
+                    .iter()
+                    .zip(&deny)
+                    .map(|(e, d)| (e.superfile_id, d.clone().unwrap_or_default()))
+                    .collect(),
+                false => HashMap::new(),
+            });
         // The merge, when it runs, runs beside the first opens rather than
         // before them: its tier reads are a round trip of their own on a
         // cold store, and spent ahead of the opens they would cost what
@@ -1768,13 +1772,6 @@ impl SupertableReader {
             )
         });
         let fanout_records = fanout_span.clone();
-        // Units per superfile: a superfile the index answers for is
-        // answered only when none of its units was issued — an issued
-        // unit's kernel answers for its rows, and the rest open as planned.
-        let units_of: HashMap<Uuid, usize> = units.iter().fold(HashMap::new(), |mut m, (e, _)| {
-            *m.entry(e.superfile_id).or_insert(0) += 1;
-            m
-        });
         // The merge, prepared here. With its tier chunks in memory it runs
         // first: it costs no round trip, and the kernels it spares cost
         // more than the wait. With chunks to read from storage it runs
@@ -1790,6 +1787,14 @@ impl SupertableReader {
             let merger = merge_floor;
             // The kept superfiles in the order the merge bounds them.
             let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
+            // Units per superfile: a superfile the index answers for is
+            // answered only when none of its units was issued — an issued
+            // unit's kernel answers for its rows, and the rest open as planned.
+            let units_of: HashMap<Uuid, usize> =
+                units.iter().fold(HashMap::new(), |mut m, (e, _)| {
+                    *m.entry(e.superfile_id).or_insert(0) += 1;
+                    m
+                });
             let reader = self;
             let selected = &selected;
             let pruned = &pruned;
