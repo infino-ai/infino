@@ -617,6 +617,39 @@ fn must_lead_should_walk(
             }
             lead.advance_by(to - from);
             let n = cand_docs.len();
+            if m == 1 {
+                // One optional term, the rare-led pair: filter by its block
+                // maximum, probe it once, offer; none of the per-term
+                // bookkeeping below.
+                let mut w = 0usize;
+                for r in 0..n {
+                    let (d, s) = (cand_docs[r], cand_scores[r]);
+                    cand_docs[w] = d;
+                    cand_scores[w] = s;
+                    w += usize::from(!(pruning && s + win[0] <= threshold));
+                }
+                cand_docs.truncate(w);
+                cand_scores.truncate(w);
+                let should = &mut shoulds[0];
+                cand_tfs.clear();
+                cand_tfs.resize(w, 0);
+                should.probe_tfs(&cand_docs, &mut cand_tfs);
+                for ((&d, &lead_score), &tf) in cand_docs.iter().zip(&cand_scores).zip(&cand_tfs) {
+                    let contrib = match tf {
+                        0 => 0.0,
+                        _ => bm25::score_with_dl_norm_k1(should.idf_weight, tf, dl_norm_k1.get(d)),
+                    };
+                    let score = lead_score + contrib;
+                    if threshold > f32::NEG_INFINITY && score <= threshold {
+                        continue;
+                    }
+                    if score > floor_eff {
+                        and_heap_push(heap, k, None, score, d);
+                        threshold = bar(heap);
+                    }
+                }
+                continue;
+            }
             if pruning {
                 win_suffix[m] = 0.0;
                 for rank in (0..m).rev() {
