@@ -2891,11 +2891,14 @@ mod tests {
             source.owns_accounting(),
             "the entry's source is the second open's, which charges its own blocks"
         );
+        // The entry is not in the cache while the opens run, so both block sources read
+        // straight from storage and write nothing: no block file, nothing to charge.
         let opened = source.filled_bytes_handle().load(Ordering::Acquire);
+        assert_eq!(opened, 0, "the opens leave nothing filled");
         assert_eq!(
             store.stats().current_bytes,
-            opened,
-            "what the opens left is charged once, by the entry's source"
+            0,
+            "and nothing charged before the first read"
         );
 
         // A block no open read: the entry's source fetches it and charges it.
