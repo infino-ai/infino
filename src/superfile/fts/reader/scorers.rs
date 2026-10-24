@@ -705,6 +705,10 @@ fn must_lead_should_walk<C: Collector>(
     // Each optional term's postings over a block's range, for optional-first.
     let mut opt_docs: Vec<Vec<u32>> = vec![Vec::with_capacity(BLOCK_LEN); m];
     let mut opt_tfs: Vec<Vec<u32>> = vec![Vec::with_capacity(BLOCK_LEN); m];
+    // The optional terms by their maximum over a block's range, ascending,
+    // and which of them drive the block.
+    let mut by_win: Vec<usize> = Vec::with_capacity(m);
+    let mut driver: Vec<bool> = Vec::with_capacity(m);
     let mut contribs: Vec<f32> = Vec::with_capacity(m * BLOCK_LEN);
     let mut win = vec![0.0_f32; m];
     let mut win_suffix = vec![0.0_f32; m + 1];
@@ -743,11 +747,35 @@ fn must_lead_should_walk<C: Collector>(
             // the required docs among them, instead of scoring the whole block
             // and probing at every doc. A required-only doc scores at most the
             // block maximum, which cannot enter, so the heap ends the same.
-            if pruning && lead.current_block_max_bm25() <= threshold {
+            let lead_max = lead.current_block_max_bm25();
+            if pruning && lead_max <= threshold {
                 let range_end = lead.block_doc_ids[to - 1];
-                let optional_docs: f32 = shoulds
-                    .iter_mut()
-                    .map(|c| c.block_max_and_density_in_range(start, range_end).1)
+                // The drivers: the optional terms a doc needs. The weakest
+                // over the block's range are left out while the required
+                // maximum plus theirs still cannot beat the bar, so a doc
+                // holding none of the drivers cannot enter. Only the drivers'
+                // postings are collected; the others are probed at the docs
+                // the drivers find.
+                by_win.clear();
+                by_win.extend(0..m);
+                by_win.sort_unstable_by(|&a, &b| win[a].total_cmp(&win[b]));
+                driver.clear();
+                driver.resize(m, true);
+                let mut reach = lead_max;
+                for &si in &by_win {
+                    if reach + win[si] > threshold {
+                        break;
+                    }
+                    reach += win[si];
+                    driver[si] = false;
+                }
+                let optional_docs: f32 = (0..m)
+                    .filter(|&si| driver[si])
+                    .map(|si| {
+                        shoulds[si]
+                            .block_max_and_density_in_range(start, range_end)
+                            .1
+                    })
                     .sum();
                 if optional_docs * OPTIONAL_FIRST_RATIO < (to - from) as f32 {
                     let ids = &lead.block_doc_ids[from..to];
@@ -755,8 +783,10 @@ fn must_lead_should_walk<C: Collector>(
                     for (si, c) in shoulds.iter_mut().enumerate() {
                         opt_docs[si].clear();
                         opt_tfs[si].clear();
-                        c.collect_range(start, range_end, &mut opt_docs[si], &mut opt_tfs[si]);
-                        held |= positions_held(ids, &opt_docs[si]);
+                        if driver[si] {
+                            c.collect_range(start, range_end, &mut opt_docs[si], &mut opt_tfs[si]);
+                            held |= positions_held(ids, &opt_docs[si]);
+                        }
                     }
                     cand_docs.clear();
                     cand_tfs.clear();
@@ -776,7 +806,14 @@ fn must_lead_should_walk<C: Collector>(
                     );
                     // Optional contributions in query order, as the walk adds them.
                     for si in 0..m {
-                        tfs_at(&cand_docs, &opt_docs[si], &opt_tfs[si], &mut cand_tfs);
+                        match driver[si] {
+                            true => tfs_at(&cand_docs, &opt_docs[si], &opt_tfs[si], &mut cand_tfs),
+                            false => {
+                                cand_tfs.clear();
+                                cand_tfs.resize(cand_docs.len(), 0);
+                                shoulds[si].probe_tfs(&cand_docs, &mut cand_tfs);
+                            }
+                        }
                         score_postings(
                             shoulds[si].idf_weight,
                             &cand_docs,
