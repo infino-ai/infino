@@ -1023,6 +1023,53 @@ fn accumulate_step(
     c.next();
 }
 
+/// [`accumulate_step`] for the rest of the cursor's block inside the window
+/// at once: the postings before `window_end` found once, scored and marked
+/// eight at a time with no per-step bound or block checks, the cursor moved
+/// past them once. Each posting gets the same operations as in a step, so
+/// the same bits. Falls back to one step on a lazily held block, whose
+/// buffer shows a single doc.
+#[inline(always)]
+fn accumulate_segment(
+    c: &mut TermCursor,
+    base: u32,
+    window_end: u32,
+    scores: &mut [f32],
+    present: &mut [u64],
+    dl_norm_k1: &NormTable,
+) {
+    if !c.holds_whole_block() {
+        accumulate_step(c, base, window_end, scores, present, dl_norm_k1);
+        return;
+    }
+    let (pos, n) = (c.pos, c.block_n);
+    let ids = &c.block_doc_ids[..n];
+    let to = match ids[n - 1] < window_end {
+        true => n,
+        false => pos + ids[pos..].partition_point(|&d| d < window_end),
+    };
+    let tfs = &c.block_tfs[..n];
+    let mut i = pos;
+    while i + 8 <= to {
+        let dids: [u32; 8] = ids[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let tf8: [u32; 8] = tfs[i..i + 8]
+            .try_into()
+            .expect("invariant: an 8-wide slice");
+        let contributions = bm25::score_one_term_x8(c.idf_weight, tf8, dl_norm_k1.get8(dids));
+        mark_lanes(scores, present, base, dids, contributions);
+        i += 8;
+    }
+    for j in i..to {
+        let d = ids[j];
+        let local = (d - base) as usize;
+        scores[local] += bm25::score_with_dl_norm_k1(c.idf_weight, tfs[j], dl_norm_k1.get(d));
+        present[local >> 6] |= 1u64 << (local & 63);
+    }
+    c.advance_by(to - pos);
+}
+
 /// Smallest `k` at which the windowed MaxScore kernel collects into a
 /// buffer rather than a heap.
 const BUFFERED_TOPK_MIN_K: usize = 512;
@@ -2576,7 +2623,7 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_segment(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
                 }
             }
 
@@ -2733,7 +2780,7 @@ impl FtsReader {
                     if d >= window_end {
                         break;
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_segment(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
                 }
             }
             for (word_idx, word) in present.iter_mut().enumerate() {
@@ -3338,7 +3385,7 @@ impl FtsReader {
                             continue;
                         }
                     }
-                    accumulate_step(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
+                    accumulate_segment(c, base, window_end, &mut scores, &mut present, dl_norm_k1);
                 }
             }
 
