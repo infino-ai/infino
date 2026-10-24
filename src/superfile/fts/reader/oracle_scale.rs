@@ -353,6 +353,28 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 }
             }
         }
+        // A required term with several optional ones at a large `k`: the
+        // general must+should walk, its collector at `k` past the heap's
+        // range, and the batch pre-filter by the optional terms' range maxima;
+        // a common required word with rarer optional ones also drives the
+        // must-led walk by its optional terms. With and without an exclusion.
+        for (musts, shoulds) in [
+            (&["every"][..], &["music", "city", "band"][..]),
+            (&["the"], &["stone", "river"]),
+            (&["every"], &["of", "onyx"]),
+        ] {
+            for k in [200, 600, 1000] {
+                for negatives in [&[][..], &["quartz"][..]] {
+                    queries.push(Query {
+                        musts: musts.iter().map(|w| w.to_string()).collect(),
+                        shoulds: shoulds.iter().map(|w| w.to_string()).collect(),
+                        negatives: negatives.iter().map(|w| w.to_string()).collect(),
+                        k,
+                        ..Query::default()
+                    });
+                }
+            }
+        }
         // Unions with an excluded term at small `k`: an exclusion keeps the
         // single-leader walk on its per-candidate path, which the batched
         // leader block otherwise takes over once the heap is full.
