@@ -12,8 +12,10 @@ use std::{
     sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
 };
 
-use super::{cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable};
-use crate::superfile::{fts::bm25, id_space::FtsDocId};
+use super::{
+    cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable, scorers::score_noness_batched,
+};
+use crate::superfile::id_space::FtsDocId;
 
 /// A monotonically rising score floor shared by every segment of one
 /// query's fan-out, readable and raisable lock-free mid-walk.
@@ -301,7 +303,6 @@ pub(super) struct ShouldBatch {
     shoulds: Vec<TermCursor>,
     docs: Vec<u32>,
     scores: Vec<f32>,
-    norms: Vec<f32>,
     tfs: Vec<u32>,
 }
 
@@ -311,7 +312,6 @@ impl ShouldBatch {
             shoulds,
             docs: Vec::with_capacity(SHOULD_BATCH),
             scores: Vec::with_capacity(SHOULD_BATCH),
-            norms: Vec::with_capacity(SHOULD_BATCH),
             tfs: Vec::with_capacity(SHOULD_BATCH),
         }
     }
@@ -327,18 +327,8 @@ impl ShouldBatch {
     /// Add every should term's BM25 to each held doc's score; the held
     /// docs with their full scores, in ascending doc order.
     fn score(&mut self, dl_norm_k1: &NormTable) -> (&[u32], &[f32]) {
-        let n = self.docs.len();
-        self.norms.clear();
-        self.norms
-            .extend(self.docs.iter().map(|&d| dl_norm_k1.get(d)));
-        self.tfs.resize(n, 0);
         for c in &mut self.shoulds {
-            c.probe_tfs(&self.docs, &mut self.tfs);
-            for ((score, &tf), &norm) in self.scores.iter_mut().zip(&self.tfs).zip(&self.norms) {
-                if tf != 0 {
-                    *score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
-                }
-            }
+            score_noness_batched(c, &self.docs, &mut self.scores, dl_norm_k1, &mut self.tfs);
         }
         (&self.docs, &self.scores)
     }

@@ -157,12 +157,9 @@ pub(super) struct BoundClaim {
 const DEMOTE_DENSITY: f32 = 8.0;
 
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
-/// `docs[i]` the term contains, eight per SIMD call. `docs` must be ascending:
-/// the probe advances the cursor monotonically. Every survivor is scored and
-/// added without a branch on whether the term holds it, which the predictor
-/// cannot learn: a tf of 0 scores exactly 0, so it leaves the sum unchanged.
-/// `tfs` is scratch.
-fn score_noness_batched(
+/// `docs[i]` the term contains. `docs` must be ascending: the probe advances
+/// the cursor monotonically. `tfs` is scratch.
+pub(super) fn score_noness_batched(
     c: &mut TermCursor,
     docs: &[u32],
     scores: &mut [f32],
@@ -172,6 +169,22 @@ fn score_noness_batched(
     tfs.clear();
     tfs.resize(docs.len(), 0);
     c.probe_tfs(docs, tfs);
+    add_term_scores(c.idf_weight, docs, tfs, dl_norm, scores);
+}
+
+/// Add one term's BM25 at each `(docs[i], tfs[i])` to `scores[i]`, eight per
+/// SIMD call. Every slot is scored and added without a branch on whether the
+/// term holds the doc, which the predictor cannot learn: a tf of 0 scores
+/// exactly 0, so it leaves the sum unchanged. The same bits as adding each
+/// posting's score alone.
+fn add_term_scores(
+    idf_weight: f32,
+    docs: &[u32],
+    tfs: &[u32],
+    dl_norm: &NormTable,
+    scores: &mut [f32],
+) {
+    debug_assert_eq!(docs.len(), tfs.len());
     let scores = &mut scores[..docs.len()];
     let mut i = 0usize;
     while i + 8 <= docs.len() {
@@ -181,7 +194,7 @@ fn score_noness_batched(
         let tf8: [u32; 8] = tfs[i..i + 8]
             .try_into()
             .expect("invariant: an 8-wide slice");
-        let add = bm25::score_one_term_x8(c.idf_weight, tf8, dl_norm.get8(dids));
+        let add = bm25::score_one_term_x8(idf_weight, tf8, dl_norm.get8(dids));
         for (s, a) in scores[i..i + 8].iter_mut().zip(add) {
             *s += a;
         }
@@ -189,7 +202,7 @@ fn score_noness_batched(
     }
     for ((s, &d), &tf) in scores[i..].iter_mut().zip(&docs[i..]).zip(&tfs[i..]) {
         if tf != 0 {
-            *s += bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm.get(d));
+            *s += bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm.get(d));
         }
     }
 }
@@ -484,7 +497,6 @@ fn must_lead_should_count(
     let mut docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
-    let mut contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     while !lead.is_exhausted() {
         if lead.decoded_block != lead.current_block {
             let start = lead.current_doc_id();
@@ -502,13 +514,7 @@ fn must_lead_should_count(
             &mut scores,
         );
         for c in &mut shoulds {
-            tfs.clear();
-            tfs.resize(docs.len(), 0);
-            c.probe_tfs(&docs, &mut tfs);
-            score_postings(c.idf_weight, &docs, &tfs, dl_norm_k1, &mut contribs);
-            for (s, &x) in scores.iter_mut().zip(&contribs) {
-                *s += x;
-            }
+            score_noness_batched(c, &docs, &mut scores, dl_norm_k1, &mut tfs);
         }
         count += docs.len() as u64;
         for (&doc, &score) in docs.iter().zip(&scores) {
@@ -734,23 +740,25 @@ fn must_lead_should_walk<C: Collector>(
                     );
                     // Optional contributions in query order, as the walk adds them.
                     for si in 0..m {
+                        let c = &mut shoulds[si];
                         match driver[si] {
-                            true => tfs_at(&cand_docs, &opt_docs[si], &opt_tfs[si], &mut cand_tfs),
-                            false => {
-                                cand_tfs.clear();
-                                cand_tfs.resize(cand_docs.len(), 0);
-                                shoulds[si].probe_tfs(&cand_docs, &mut cand_tfs);
+                            true => {
+                                tfs_at(&cand_docs, &opt_docs[si], &opt_tfs[si], &mut cand_tfs);
+                                add_term_scores(
+                                    c.idf_weight,
+                                    &cand_docs,
+                                    &cand_tfs,
+                                    dl_norm_k1,
+                                    &mut cand_scores,
+                                );
                             }
-                        }
-                        score_postings(
-                            shoulds[si].idf_weight,
-                            &cand_docs,
-                            &cand_tfs,
-                            dl_norm_k1,
-                            &mut cand_contribs,
-                        );
-                        for (s, &x) in cand_scores.iter_mut().zip(&cand_contribs) {
-                            *s += x;
+                            false => score_noness_batched(
+                                c,
+                                &cand_docs,
+                                &mut cand_scores,
+                                dl_norm_k1,
+                                &mut cand_tfs,
+                            ),
                         }
                     }
                     for (&d, &score) in cand_docs.iter().zip(&cand_scores) {
@@ -984,31 +992,14 @@ fn and_membership_scored_batched<S: AndSink>(
         }
         let (from, to) = (driver.pos, driver.block_n);
         docs.clear();
-        scores.clear();
-        // Eight lanes per call: the same operations in the same order as
-        // the scalar score, so the same bits.
-        let mut j = from;
-        while j + 8 <= to {
-            let d: [u32; 8] = driver.block_doc_ids[j..j + 8]
-                .try_into()
-                .expect("invariant: an 8-wide slice");
-            let t: [u32; 8] = driver.block_tfs[j..j + 8]
-                .try_into()
-                .expect("invariant: an 8-wide slice");
-            let lanes = bm25::score_one_term_x8(driver.idf_weight, t, dl_norm_k1.get8(d));
-            docs.extend_from_slice(&d);
-            scores.extend_from_slice(&lanes);
-            j += 8;
-        }
-        for j in j..to {
-            let d = driver.block_doc_ids[j];
-            docs.push(d);
-            scores.push(bm25::score_with_dl_norm_k1(
-                driver.idf_weight,
-                driver.block_tfs[j],
-                dl_norm_k1.get(d),
-            ));
-        }
+        docs.extend_from_slice(&driver.block_doc_ids[from..to]);
+        score_postings(
+            driver.idf_weight,
+            &docs,
+            &driver.block_tfs[from..to],
+            dl_norm_k1,
+            &mut scores,
+        );
         driver.advance_by(to - from);
         if pruning {
             let n = filter_survivors(&mut docs, &mut scores, bar - suffix[0]);
