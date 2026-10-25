@@ -118,11 +118,14 @@ const UNALIGNED_DRIVER_DOCS: [u64; 6] = [1, 64, 65, 128, 129, 300];
 /// Documents in the density-transition corpus.
 const DENSITY_DOCS: u64 = 6_000;
 /// Where the dense run of `frontdense` ends (sixteen full blocks of
-/// consecutive documents, all bitset).
+/// consecutive documents, all run blocks).
 const DENSITY_FRONT_END: u64 = 2_048;
 /// The dense run of `backdense`, placed after a sparse head.
 const DENSITY_BACK_START: u64 = 2_048;
 const DENSITY_BACK_END: u64 = 4_096;
+/// Every this-many-th document is left out of `backdense`'s dense run, so
+/// its blocks are bitsets rather than runs of consecutive documents.
+const DENSITY_BACK_HOLE_STRIDE: u64 = 61;
 /// Stride of both terms outside their dense run: sparse enough that
 /// those blocks pack (thirteen presence words against two-bit deltas).
 const DENSITY_SPARSE_STRIDE: u64 = 10;
@@ -515,10 +518,11 @@ async fn bitset_block_with_an_unaligned_origin_agrees_with_the_oracle() {
 }
 
 /// Two lists that change encoding mid-way: `frontdense` is every
-/// document for sixteen blocks and then every tenth, `backdense` every
-/// tenth, then every document for sixteen blocks, then every tenth
-/// again. A cursor seeking across the change must switch between the
-/// bitset probe and the packed decode in both directions; a stale
+/// document for sixteen blocks (run blocks) and then every tenth,
+/// `backdense` every tenth, then nearly every document for sixteen blocks
+/// (bitset blocks), then every tenth again. A cursor seeking across the
+/// change must switch between the dense probes and the packed decode in
+/// both directions; a stale
 /// block cache or a probe helper applied to a packed block would skip
 /// or duplicate documents at the seam. Graded as an intersection with
 /// a rarer driver, as a negated list, and as a union of the two.
@@ -529,7 +533,9 @@ async fn lists_that_change_density_mid_way_agree_with_the_oracle() {
         if d < DENSITY_FRONT_END || d % DENSITY_SPARSE_STRIDE == 0 {
             t.push("frontdense");
         }
-        if (DENSITY_BACK_START..DENSITY_BACK_END).contains(&d) || d % DENSITY_SPARSE_STRIDE == 0 {
+        let back_run = (DENSITY_BACK_START..DENSITY_BACK_END).contains(&d)
+            && d % DENSITY_BACK_HOLE_STRIDE != 0;
+        if back_run || d % DENSITY_SPARSE_STRIDE == 0 {
             t.push("backdense");
         }
         if d % DENSITY_DRIVER_STRIDE == 0 {
