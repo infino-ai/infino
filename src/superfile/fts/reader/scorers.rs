@@ -702,6 +702,11 @@ fn must_lead_should_walk<C: Collector>(
     let mut cand_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut partial: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut alive: Vec<u16> = Vec::with_capacity(BLOCK_LEN);
+    // The candidates still alive after an optional term, written apart from
+    // `alive` so the compaction never reads a slot it may just have written.
+    // A fixed array and a count in a register, as a `Vec`'s length would
+    // sit in memory between a push and its truncate.
+    let mut alive_next = [0u16; BLOCK_LEN];
     let mut probe_docs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     let mut cand_contribs: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
@@ -920,16 +925,18 @@ fn must_lead_should_walk<C: Collector>(
                     dl_norm_k1,
                     &mut cand_contribs,
                 );
+                let rest = win_suffix[rank + 1];
                 let mut w = 0usize;
-                for r in 0..alive.len() {
-                    let i = usize::from(alive[r]);
-                    let x = cand_contribs[r];
+                for (&a, &x) in alive.iter().zip(&cand_contribs) {
+                    let i = usize::from(a);
                     contribs[si * n + i] = x;
-                    partial[i] += x;
-                    alive[w] = alive[r];
-                    w += usize::from(!(pruning && partial[i] + win_suffix[rank + 1] <= threshold));
+                    let p = partial[i] + x;
+                    partial[i] = p;
+                    alive_next[w] = a;
+                    w += usize::from(!(pruning && p + rest <= threshold));
                 }
-                alive.truncate(w);
+                alive.clear();
+                alive.extend_from_slice(&alive_next[..w]);
             }
             for &i in &alive {
                 let i = usize::from(i);
