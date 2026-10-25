@@ -2719,7 +2719,7 @@ mod tests {
             ]
         };
         for floor in floors {
-            for k in [10, BUFFERED_TOPK_MIN_K + 100] {
+            for k in [10, BUFFERED_TOPK_MIN_K + 100, all] {
                 let got = r
                     .search_with_floor("body", &["w"], k, BoolMode::Or, floor)
                     .await
@@ -2744,14 +2744,12 @@ mod tests {
             )
         };
         let unfloored = and(all, f32::NEG_INFINITY).await.expect("unfloored and");
-        let k = BUFFERED_TOPK_MIN_K + 100;
-        for floor in [f32::NEG_INFINITY, unfloored[unfloored.len() / 2].1] {
-            let got = and(k, floor).await.expect("floored and");
-            assert_eq!(
-                got,
-                cut(unfloored.clone(), floor, k),
-                "and with a negation, floor={floor}"
-            );
+        for k in [BUFFERED_TOPK_MIN_K + 100, all] {
+            for floor in [f32::NEG_INFINITY, unfloored[unfloored.len() / 2].1] {
+                let got = and(k, floor).await.expect("floored and");
+                let want = cut(unfloored.clone(), floor, k);
+                assert_eq!(got, want, "and with a negation, k={k} floor={floor}");
+            }
         }
     }
 
