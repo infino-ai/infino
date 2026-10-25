@@ -1471,11 +1471,11 @@ impl FtsReader {
         let hits = match k >= BUFFERED_TOPK_MIN_K {
             true => walk.run(
                 TopKBuffer::with_capacity(k, capacity),
-                filter.as_deref_mut(),
+                filter,
             ),
             false => walk.run(
                 <BinaryHeap<TopKEntry> as Collector>::with_capacity(k, capacity),
-                filter.as_deref_mut(),
+                filter,
             ),
         };
 
