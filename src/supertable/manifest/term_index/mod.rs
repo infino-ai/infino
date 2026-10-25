@@ -51,8 +51,9 @@ use bytes::Bytes;
 use format::Segment;
 pub(crate) use format::{Location, Posting, Root, Slice};
 use futures::{StreamExt, TryStreamExt, stream};
+use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
-use tokio::fs as async_fs;
+use tokio::{fs as async_fs, task::spawn_blocking};
 use uuid::Uuid;
 
 use crate::{
@@ -118,6 +119,16 @@ const SLICE_WRITE_CONCURRENCY: usize = 8;
 /// costs one rebuild of the segment, never correctness. Each unused slot
 /// is a nil entry (32 bytes) in the root until the next full rebuild.
 const RESERVED_ORDINAL_SLACK: u32 = 256;
+
+/// Fan-out of the tiered fold a commit applies to its root's newest
+/// segments (see [`fold_tail`]). A lookup opens one slice per segment, so
+/// a root that only ever appended would cost one slice per commit since
+/// the last optimize; folding every run of this many like-sized segments
+/// into one keeps the count near this many per size tier, a logarithmic
+/// number in all, while a commit pays a fold only once per this many
+/// commits at each tier. Eight keeps a 200-commit root to about twenty
+/// segments and a 10k-commit root to about forty.
+const FOLD_FAN_OUT: usize = 8;
 
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
@@ -334,7 +345,7 @@ pub(crate) async fn append_delta(
 ) -> Result<RoutingRef, TermIndexError> {
     let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
     write_slices(storage, built.slices).await?;
-    write_root(storage, &built.root).await
+    publish_root(storage, built.root, policy).await
 }
 
 /// A delta segment built and written once, numbered from a reserved
@@ -388,7 +399,8 @@ pub(crate) async fn reserve_segment(
 /// [`append_delta`] for a commit that may retry: the segment is built once,
 /// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
-/// ordinal and appends it, writing only the root. The segment is built
+/// ordinal and appends it, writing only the root unless the appended
+/// segment completes a run [`fold_tail`] merges. The segment is built
 /// again only when `prior` has grown past the reserved ordinal, or the
 /// contributions are not the ones it was built from. An `exact` segment is
 /// never padded: it is reused only at `prior`'s exact length and otherwise
@@ -427,7 +439,98 @@ pub(crate) async fn append_reserved(
     root.id_mins.extend(repeat_n(0, padding));
     root.id_mins.extend_from_slice(&segment.id_mins);
     root.segments.push(segment.segment.clone());
+    publish_root(storage, root, policy).await
+}
+
+/// Fold `root`'s newest segments where they have piled up, then write it
+/// and return its reference. What every delta writer ends with.
+async fn publish_root(
+    storage: &dyn StorageProvider,
+    mut root: Root,
+    policy: &BuildPolicy,
+) -> Result<RoutingRef, TermIndexError> {
+    fold_tail(storage, &mut root, policy).await?;
     write_root(storage, &root).await
+}
+
+/// Merge the newest segments of `root` into one wherever
+/// [`FOLD_FAN_OUT`] or more of them are within that factor of one another
+/// in size, repeating while the merged segment makes such a run with the
+/// ones before it. Sizes are the slice bytes the root records, so no slice
+/// is read to decide. Ordinals are unchanged: a fold is the same postings
+/// in fewer slices, so every reader of the folded root answers as it did.
+///
+/// This is what keeps a lookup cheap on a table taking a stream of
+/// commits: each commit appends one segment, a lookup opens one slice per
+/// segment, and only optimize rebuilds the index whole. Folded this way
+/// the root holds about [`FOLD_FAN_OUT`] segments per size tier, and tiers
+/// grow by that factor, so the count stays logarithmic in the commits since
+/// the last optimize; the merge work a commit pays is amortized to the same
+/// logarithm, as each posting is rewritten once per tier it climbs.
+///
+/// A folded root no longer extends the one it came from segment for
+/// segment, so a rebuild racing these commits cannot stack its deltas by
+/// `segments_since` and catches up by reading the superfiles it lacks
+/// instead, which is the rebuild's existing fallback.
+pub(crate) async fn fold_tail(
+    storage: &dyn StorageProvider,
+    root: &mut Root,
+    policy: &BuildPolicy,
+) -> Result<(), TermIndexError> {
+    loop {
+        let Some(start) = foldable_tail(root) else {
+            return Ok(());
+        };
+        let scratch = TempDirBuilder::new()
+            .prefix("infino-term-index-fold-")
+            .tempdir()?;
+        let sources = download_segments(storage, &root.segments[start..], scratch.path()).await?;
+        // Every ordinal keeps its place: the fold renumbers nothing.
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let policy = *policy;
+        let (segment, slices) = spawn_blocking(move || {
+            let merged = merge_segments(&sources, &ordinals, &policy);
+            // The slice files are read; the scratch directory can go with
+            // the task rather than outlive the fold.
+            drop(scratch);
+            merged
+        })
+        .await
+        .map_err(|e| TermIndexError::Build(format!("fold task: {e}")))??;
+        write_slices(storage, slices).await?;
+        root.segments.truncate(start);
+        root.segments.push(segment);
+    }
+}
+
+/// The index of the first segment of the run [`fold_tail`] merges next:
+/// the newest [`FOLD_FAN_OUT`] or more segments whose sizes lie within
+/// that factor of one another. `None` when the newest segments make no
+/// such run.
+fn foldable_tail(root: &Root) -> Option<usize> {
+    let size = |segment: &Segment| -> u64 {
+        segment
+            .slices
+            .iter()
+            .map(|slice| slice.len)
+            .sum::<u64>()
+            .max(1)
+    };
+    let mut start = root.segments.len();
+    let mut smallest = u64::MAX;
+    let mut largest = 0u64;
+    while start > 0 {
+        let s = size(&root.segments[start - 1]);
+        let smallest_with = smallest.min(s);
+        let largest_with = largest.max(s);
+        if largest_with > smallest_with.saturating_mul(FOLD_FAN_OUT as u64) {
+            break;
+        }
+        smallest = smallest_with;
+        largest = largest_with;
+        start -= 1;
+    }
+    (root.segments.len() - start >= FOLD_FAN_OUT).then_some(start)
 }
 
 /// The delta segments committed on top of `prior` to reach `current`, or
@@ -4956,6 +5059,74 @@ mod tests {
             .await
             .expect("write base");
         (store_dir, local, root)
+    }
+
+    /// A stream of delta commits folds its segments as they pile up, so the
+    /// root holds a logarithmic number of them rather than one per commit,
+    /// and every term still routes to exactly the superfiles that hold it,
+    /// in commit order. Folds happen at the fan-out, so the count is checked
+    /// just before and just after one, and the final root is checked
+    /// against the one appending without folding would hold.
+    #[tokio::test]
+    async fn delta_commits_fold_their_segments_and_route_the_same() {
+        /// Enough commits for a fold of folds: past the fan-out squared.
+        const COMMITS: u128 = (FOLD_FAN_OUT * FOLD_FAN_OUT + 3) as u128;
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let mut root = base;
+        let mut segments_before_first_fold = 0;
+        for id in 2..=COMMITS {
+            let delta = [contribution(
+                &dir,
+                id,
+                &[("body", "shared", 2), ("body", &format!("own{id}"), 1)],
+            )];
+            let reference = append_delta(local.as_ref(), Some(root), &delta, &policy)
+                .await
+                .expect("append");
+            root = load_root(local.as_ref(), &reference).await.expect("root");
+            let appended = id as usize; // the base plus this many deltas
+            if appended == FOLD_FAN_OUT - 1 {
+                segments_before_first_fold = root.segments.len();
+            }
+            if appended == FOLD_FAN_OUT {
+                assert_eq!(
+                    segments_before_first_fold,
+                    FOLD_FAN_OUT - 1,
+                    "nothing folds before a run of the fan-out exists"
+                );
+                assert_eq!(
+                    root.segments.len(),
+                    1,
+                    "the first run folds into one segment"
+                );
+            }
+        }
+        assert!(
+            root.segments.len() <= 2 * FOLD_FAN_OUT,
+            "{} commits left {} segments; folding should keep it near the fan-out per tier",
+            COMMITS,
+            root.segments.len()
+        );
+        assert_eq!(
+            root.superfiles.len(),
+            COMMITS as usize,
+            "ordinals are untouched"
+        );
+        let expected: Vec<Uuid> = (1..=COMMITS).map(Uuid::from_u128).collect();
+        assert_eq!(
+            posted_superfiles(&root, &local, "shared").await,
+            expected,
+            "a term in every commit routes to every superfile in commit order"
+        );
+        for id in (2..=COMMITS).step_by(FOLD_FAN_OUT - 1) {
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                [Uuid::from_u128(id)],
+                "a term of one commit routes to that superfile alone"
+            );
+        }
     }
 
     /// A retry appends the segment it already built onto the winner's root:
