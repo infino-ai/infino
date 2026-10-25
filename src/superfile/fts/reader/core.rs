@@ -2034,8 +2034,10 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     // runs whichever of probing and folding reads less, so the union never
     // pays for a walk of its own.
     if cursors.len() == 2 {
-        let both = cursors[0].df + cursors[1].df;
-        return both - count_and_planned(cursors);
+        // Saturating: a df comes from the term's stored metadata, and a
+        // corrupt one must not wrap the count.
+        let both = cursors[0].df.saturating_add(cursors[1].df);
+        return both.saturating_sub(count_and_planned(cursors));
     }
     // Fast path: when one term's list dwarfs the rest, count it as
     // `df(dominant) + |others \ dominant|` instead of walking the
@@ -4721,5 +4723,82 @@ mod tests {
         assert!(column.norms_loaded(), "the retry must fill the norms cell");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
+    }
+
+    /// The union count's helpers on inputs the corpora above do not reach.
+    mod union_count_edges {
+        use super::*;
+
+        /// `body` cursors for `terms` over `docs`, for a count.
+        async fn count_cursors(docs: &[&str], terms: &[&str]) -> Vec<TermCursor> {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for (i, text) in docs.iter().enumerate() {
+                b.add_doc(0, i as u32, text).expect("add doc");
+            }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            r.build_term_cursors(0, terms, QueryIdf::ThisFile, CursorUse::Count, None, None)
+                .await
+                .expect("cursors")
+        }
+
+        /// A two-term union counts `df(a) + df(b) - |a ∩ b|` from the stored
+        /// dfs; a corrupt df must saturate the count, not wrap it.
+        #[tokio::test]
+        async fn a_two_term_union_count_saturates_on_corrupt_dfs() {
+            let docs: Vec<&str> = (0..300)
+                .map(|i| if i % 3 == 0 { "a b" } else { "a" })
+                .collect();
+            let cursors = count_cursors(&docs, &["a", "b"]).await;
+            assert_eq!(
+                or_count_unranked(cursors.clone()),
+                300,
+                "premise: sound dfs"
+            );
+            let mut huge = cursors.clone();
+            huge[0].df = u64::MAX;
+            assert_eq!(or_count_unranked(huge), u64::MAX - 100);
+            let mut zero = cursors;
+            zero[0].df = 0;
+            zero[1].df = 0;
+            assert_eq!(or_count_unranked(zero), 0);
+        }
+
+        /// An empty or inverted range sets nothing; a range across words
+        /// sets exactly its bits.
+        #[test]
+        fn set_bit_range_sets_exactly_the_range() {
+            let mut dest = [0u64; 4];
+            for (from, to) in [(0, 0), (64, 64), (70, 5), (200, 1)] {
+                set_bit_range(&mut dest, from, to);
+                assert_eq!(dest, [0; 4], "[{from}, {to})");
+            }
+            set_bit_range(&mut dest, 3, 130);
+            assert_eq!(dest, [u64::MAX << 3, u64::MAX, 0b11, 0]);
+        }
+
+        /// A short-form cursor has no blocks to read: its decoded docs inside
+        /// the window are marked, the rest left out.
+        #[tokio::test]
+        async fn or_blocks_into_window_marks_a_predecoded_cursor() {
+            let planted = [3usize, 70, OR_WINDOW as usize + 4, OR_WINDOW as usize + 904];
+            let docs: Vec<&str> = (0..2 * OR_WINDOW as usize)
+                .map(|i| if planted.contains(&i) { "rare" } else { "x" })
+                .collect();
+            let cursors = count_cursors(&docs, &["rare"]).await;
+            assert!(cursors[0].predecoded, "premise: a short-form term");
+            let mut scratch = [0u32; BLOCK_LEN];
+            for (base, want) in [(0u32, [3usize, 70]), (OR_WINDOW, [4, 904])] {
+                let mut dest = [0u64; OR_WINDOW_WORDS];
+                let mut from_block = 0usize;
+                or_blocks_into_window(&cursors[0], &mut from_block, base, &mut dest, &mut scratch);
+                let mut expect = [0u64; OR_WINDOW_WORDS];
+                for local in want {
+                    expect[local / 64] |= 1 << (local % 64);
+                }
+                assert_eq!(dest, expect, "window at {base}");
+            }
+        }
     }
 }
