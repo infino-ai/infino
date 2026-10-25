@@ -72,6 +72,7 @@ fn filter_survivors(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usi
 }
 
 /// [`filter_survivors`] on any target, and where AVX2 is absent.
+#[inline(always)]
 fn filter_survivors_scalar(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
     let mut out = 0usize;
     for i in 0..docs.len() {
@@ -195,6 +196,7 @@ const DEMOTE_DENSITY: f32 = 8.0;
 /// Add one non-essential term's contribution to `scores[i]` for every survivor
 /// `docs[i]` the term contains. `docs` must be ascending: the probe advances
 /// the cursor monotonically. `tfs` is scratch.
+#[inline(always)]
 pub(super) fn score_noness_batched(
     c: &mut TermCursor,
     docs: &[u32],
