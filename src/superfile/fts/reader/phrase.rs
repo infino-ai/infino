@@ -26,9 +26,9 @@ pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
     /// A second cursor over the same postings for the block-at-a-time
     /// alignment: it filters a whole block of the rarest member's docs
-    /// ([`TermCursor::retain_contained`]) and so runs ahead of `cursor`,
-    /// which only ever moves to the docs that survive, for their tf and
-    /// positions.
+    /// ([`TermCursor::retain_contained_located`]) and records where this
+    /// member holds each survivor, so the survivors' tfs and positions are
+    /// read at those locations without moving `cursor`.
     pub(super) probe: TermCursor,
     /// The term's complete position groups (empty for an inline df=1
     /// member, whose single position is `inline_position`).
@@ -440,9 +440,10 @@ impl PhraseCursor {
     /// Advance to the first verified phrase match at doc ≥ `from`, a block
     /// of the rarest member at a time. The rarest member's current block
     /// is the candidate list; every other member filters it in one pass
-    /// ([`TermCursor::retain_contained`]: bit-tests on a bitset block, one
-    /// decode and a merge on a packed block) and only the survivors are
-    /// aligned doc by doc for their tf and positions. The candidates left
+    /// ([`TermCursor::retain_contained_located`]: a rank on a dense block,
+    /// one decode and a merge on a packed block), recording where it holds
+    /// each survivor, and only the survivors are verified, each member's
+    /// positions read at its recorded location. The candidates left
     /// over after a match are kept for the next call. When `bar` is
     /// finite, a block whose phrase bound is under the bar is skipped
     /// before it is filtered, and a survivor is pre-screened without
@@ -509,10 +510,7 @@ impl PhraseCursor {
             }
             // A skip into a dense block may hold just the one doc it landed
             // on; the batch needs the whole block.
-            if d.decoded_block != d.current_block {
-                d.decode_current_block();
-                d.materialize_at(start);
-            }
+            d.hold_whole_block();
             let first = d.current_doc_id();
             let block_last = d.current_block_last_doc_id();
             self.refill_from = block_last.checked_add(1);
@@ -1332,8 +1330,6 @@ mod tests {
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
-    /// A phrase built to match, not rank, carries no idf and a 0 bound:
-    /// dividing its members' bounds by their 0 idf would make the bound NaN.
     /// Phrases whose matching occurrence lies deep in a common member's run,
     /// past any short prefix of it a reader might stop at.
     /// Docs repeat a common word up to ~60 times and hold a rarer word once
@@ -1405,6 +1401,8 @@ mod tests {
         }
     }
 
+    /// A phrase built to match, not rank, carries no idf and a 0 bound:
+    /// dividing its members' bounds by their 0 idf would make the bound NaN.
     #[tokio::test]
     async fn an_unscored_phrase_has_no_idf_and_a_zero_bound() {
         let r = open_positional(["x y", "y x", "x y z"].into_iter().map(String::from));
@@ -1468,6 +1466,36 @@ mod tests {
                 .expect("seek");
         }
         assert_eq!(seen, vec![(0, 2), (2, 1), (4, 3)]);
+    }
+
+    /// A ranked walk under a finite bar pre-screens each candidate by the
+    /// score at its members' smallest tf. An inline member (one doc, one
+    /// occurrence) has no stored tf to read; it counts as one, so its doc
+    /// clears a bar under that score and is verified.
+    #[tokio::test]
+    async fn a_finite_bar_reads_an_inline_member_as_tf_one() {
+        let r = open_positional((0..300).map(|d| match d {
+            150 => "x solo".to_string(),
+            _ => "x".to_string(),
+        }));
+        let norms = r.columns[0].dl_norm_k1();
+        let mut pc = phrase_cursor(&r, &["x", "solo"], CursorUse::Score).await;
+        assert!(
+            pc.members[1].inline_position.is_some(),
+            "premise: an inline member"
+        );
+        // Construction verified the one candidate unranked; rewind the batch
+        // so the ranked walk reads it again, now under a bar at half its
+        // score.
+        assert_eq!(
+            (pc.current_doc_id(), pc.cands.as_slice()),
+            (150, &[150][..])
+        );
+        let bar = pc.score_current(norms.get(150)) / 2.0;
+        pc.cand_next = 0;
+        pc.current_doc = 0;
+        pc.seek_match(0, bar, Some(norms)).expect("seek");
+        assert_eq!((pc.current_doc_id(), pc.current_tf), (150, 1));
     }
 
     /// A three-member phrase matches only where all three are adjacent in

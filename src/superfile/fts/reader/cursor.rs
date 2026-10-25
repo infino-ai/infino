@@ -34,7 +34,7 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_BITSET, ENCODING_RUN, block_encoding, decode_block,
+            BLOCK_LEN, BlockHeader, ENCODING_RUN, block_encoding, decode_block,
             decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
@@ -467,12 +467,12 @@ pub(crate) struct TermCursor {
     /// not be used where tfs are read.
     pub(super) purpose: CursorUse,
     /// Which block index is currently decoded into `block_doc_ids`
-    /// (`usize::MAX` = none). Lets [`Self::contains`] skip re-decoding a
+    /// ([`NO_BLOCK`] = none). Lets [`Self::contains`] skip re-decoding a
     /// PACKED block it already holds while probing membership across a
     /// run of ascending target docs.
     pub(super) decoded_block: usize,
     /// Which block index has its tf array decoded into `block_tfs`
-    /// (`usize::MAX` = none). Set whenever `block_tfs` is filled — by a full
+    /// ([`NO_BLOCK`] = none). Set whenever `block_tfs` is filled — by a full
     /// [`Self::decode_current_block`] (non-count) or by a tf-only decode in
     /// [`Self::bitset_probe_tf`], which reads a single doc's tf by rank
     /// without expanding the block's doc ids. Lets the probe reuse the
@@ -489,7 +489,7 @@ pub(crate) struct TermCursor {
     header_cache: Option<(usize, BlockHeader)>,
     /// Set-bit index within the current block while the cursor sits on a
     /// bitset block it entered by a skip and has not expanded: the decoded
-    /// buffers then hold exactly one doc (`block_n == 1`). `u32::MAX` when
+    /// buffers then hold exactly one doc (`block_n == 1`). [`NOT_LAZY`] when
     /// the current block is fully decoded (or not a bitset block).
     lazy_bit: u32,
     /// Consecutive `advance_block` steps taken inside the lazy block. A
@@ -506,13 +506,37 @@ pub(crate) struct TermCursor {
     /// [`EAGER_RETRY_BLOCKS`] of them one lazy probe is tried again, so a
     /// cursor whose caller turned sparse can leave eager mode.
     eager_blocks: u8,
-    /// Scratch for the phrase filter's bitmap ranks, reused across blocks.
-    rank_scratch: Vec<u32>,
-    /// Set bits before each presence word of bitset block
-    /// `bitset_prefix_block`, so a probe ranks a doc with one lookup and one
-    /// popcount instead of counting every word before it.
-    bitset_prefix: Vec<u32>,
-    bitset_prefix_block: usize,
+    /// The batch probes' buffers, reused across blocks.
+    scratch: ProbeScratch,
+}
+
+/// `decoded_block`, `tf_decoded_block` and a prefix table's block when no
+/// block is held.
+const NO_BLOCK: usize = usize::MAX;
+
+/// `lazy_bit` when the current block is not held lazily.
+const NOT_LAZY: u32 = u32::MAX;
+
+/// Buffers the batch probes reuse from block to block.
+#[derive(Clone)]
+struct ProbeScratch {
+    /// The phrase filter's bitmap ranks.
+    ranks: Vec<u32>,
+    /// Set bits before each presence word of bitset block `prefix_block`,
+    /// so a probe ranks a doc with one lookup and one popcount instead of
+    /// counting every word before it.
+    prefix: Vec<u32>,
+    prefix_block: usize,
+}
+
+impl Default for ProbeScratch {
+    fn default() -> Self {
+        Self {
+            ranks: Vec::new(),
+            prefix: Vec::new(),
+            prefix_block: NO_BLOCK,
+        }
+    }
 }
 
 /// Targets in one bitset block at or above which the batch probe ranks them
@@ -726,17 +750,15 @@ impl TermCursor {
             inspect_block: 0,
             bytes: term_bytes,
             purpose,
-            decoded_block: usize::MAX,
-            tf_decoded_block: usize::MAX,
+            decoded_block: NO_BLOCK,
+            tf_decoded_block: NO_BLOCK,
             predecoded: false,
             header_cache: None,
-            lazy_bit: u32::MAX,
+            lazy_bit: NOT_LAZY,
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            rank_scratch: Vec::new(),
-            bitset_prefix: Vec::new(),
-            bitset_prefix_block: usize::MAX,
+            scratch: ProbeScratch::default(),
         };
         if !cursor.blocks.is_empty() {
             cursor.decode_current_block();
@@ -830,13 +852,11 @@ impl TermCursor {
             tf_decoded_block: 0,
             predecoded: true,
             header_cache: None,
-            lazy_bit: u32::MAX,
+            lazy_bit: NOT_LAZY,
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            rank_scratch: Vec::new(),
-            bitset_prefix: Vec::new(),
-            bitset_prefix_block: usize::MAX,
+            scratch: ProbeScratch::default(),
         })
     }
 
@@ -906,13 +926,11 @@ impl TermCursor {
             tf_decoded_block: 0,
             predecoded: true,
             header_cache: None,
-            lazy_bit: u32::MAX,
+            lazy_bit: NOT_LAZY,
             lazy_steps: 0,
             dense_streak: 0,
             eager_blocks: 0,
-            rank_scratch: Vec::new(),
-            bitset_prefix: Vec::new(),
-            bitset_prefix_block: usize::MAX,
+            scratch: ProbeScratch::default(),
         })
     }
 
@@ -959,7 +977,7 @@ impl TermCursor {
     #[inline(never)]
     pub(super) fn decode_current_block(&mut self) {
         debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
-        self.lazy_bit = u32::MAX;
+        self.lazy_bit = NOT_LAZY;
         let block = self.blocks[self.current_block];
         // Borrow in place rather than clone an owned `Bytes` (disjoint from the
         // `&mut self.block_*` decode targets, which are separate fields).
@@ -980,6 +998,26 @@ impl TermCursor {
         }
     }
 
+    /// Move the block cursor forward to the first block whose last doc is at
+    /// or past `doc`, reading only the skip table. `false` when every block
+    /// ends before `doc`, which leaves the cursor exhausted.
+    #[inline(always)]
+    fn advance_current_block_to(&mut self, doc: u32) -> bool {
+        while self.current_block < self.blocks.len()
+            && self.blocks[self.current_block].last_doc_id < doc
+        {
+            self.current_block += 1;
+        }
+        self.current_block < self.blocks.len()
+    }
+
+    /// Whether the cursor holds its current block lazily: one doc of a
+    /// dense block it entered by a skip, the rest not expanded.
+    #[inline(always)]
+    fn is_lazy(&self) -> bool {
+        self.lazy_bit != NOT_LAZY
+    }
+
     /// Membership probe: does this term contain `doc`? Advances the block
     /// cursor forward to the block that could hold `doc` (targets arrive
     /// ascending on the AND-count leapfrog) and, on a **bitset block**,
@@ -988,12 +1026,7 @@ impl TermCursor {
     /// only by the count leapfrog; it moves `current_block`, so a cursor
     /// probed with `contains` must not also be iterated.
     pub(super) fn contains(&mut self, doc: u32) -> bool {
-        while self.current_block < self.blocks.len()
-            && self.blocks[self.current_block].last_doc_id < doc
-        {
-            self.current_block += 1;
-        }
-        if self.current_block >= self.blocks.len() {
+        if !self.advance_current_block_to(doc) {
             return false;
         }
         // Pre-decoded (inline or short-form) cursor: the whole list is in
@@ -1012,14 +1045,8 @@ impl TermCursor {
         // only reads the encoding byte before falling to the decode cache).
         let hdr = self.current_header();
         let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if hdr.encoding == ENCODING_RUN {
-            // The block selection already put `doc` at or below its last.
-            doc >= hdr.base
-        } else if hdr.encoding == ENCODING_BITSET {
-            match Self::bitset_word(raw, &hdr, doc) {
-                Some((bit, word, _)) => (word >> (bit % 64)) & 1 == 1,
-                None => false,
-            }
+        if is_dense_encoding(hdr.encoding) {
+            Self::dense_contains(raw, &hdr, doc)
         } else {
             // Borrow of `raw` ends above; the decode needs `&mut self`.
             if self.decoded_block != self.current_block {
@@ -1045,10 +1072,11 @@ impl TermCursor {
     /// and positions without walking a second cursor to the doc.
     ///
     /// The block-at-a-time form of [`Self::contains`]: the block cursor
-    /// advances forward once per block, a bitset block is bit-tested with
+    /// advances forward once per block, a dense block ranks each doc with
     /// its header parsed once, and a packed block is decoded once and merged
-    /// against the list. Like `contains` it moves `current_block`, so a
-    /// cursor filtered this way must not also be iterated.
+    /// (or ranked by bitmap) against the list. Like `contains` it moves
+    /// `current_block`, so a cursor filtered this way must not also be
+    /// iterated.
     pub(super) fn retain_contained_located(
         &mut self,
         docs: &mut Vec<u32>,
@@ -1079,40 +1107,21 @@ impl TermCursor {
         }
         while r < n {
             let doc = docs[r];
-            while self.current_block < self.blocks.len()
-                && self.blocks[self.current_block].last_doc_id < doc
-            {
-                self.current_block += 1;
-            }
-            if self.current_block >= self.blocks.len() {
+            if !self.advance_current_block_to(doc) {
                 break;
             }
             let b = self.current_block as u32;
             let block = self.blocks[self.current_block];
             let block_last = block.last_doc_id;
             let hdr = self.current_header();
-            if hdr.encoding == ENCODING_RUN {
-                while r < n && docs[r] <= block_last {
-                    let d = docs[r];
-                    if d >= hdr.base {
-                        docs[w] = d;
-                        w += 1;
-                        locs.push((b, d - hdr.base));
-                        kept.push(r as u32);
-                    }
-                    r += 1;
-                }
-            } else if hdr.encoding == ENCODING_BITSET {
+            if is_dense_encoding(hdr.encoding) {
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 while r < n && docs[r] <= block_last {
                     let d = docs[r];
-                    if let Some((bit, word, bitset_end)) = Self::bitset_word(raw, &hdr, d)
-                        && (word >> (bit % 64)) & 1 == 1
-                    {
-                        let rank = Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end);
+                    if let Some(rank) = Self::dense_rank(raw, &hdr, d) {
                         docs[w] = d;
                         w += 1;
-                        locs.push((b, rank));
+                        locs.push((b, rank as u32));
                         kept.push(r as u32);
                     }
                     r += 1;
@@ -1128,7 +1137,7 @@ impl TermCursor {
                 // bisection or two per candidate is cheaper.
                 let r_end = r + docs[r..].partition_point(|&d| d <= block_last);
                 if (r_end - r) * FILTER_BITMAP_RATIO >= ids.len() {
-                    let ranks = &mut self.rank_scratch;
+                    let ranks = &mut self.scratch.ranks;
                     ranks.clear();
                     ranks.resize(r_end - r, 0);
                     if rank_by_bitmap(ids, &docs[r..r_end], ranks) {
@@ -1198,21 +1207,18 @@ impl TermCursor {
         }
     }
 
-    /// Ranked-OR non-essential membership probe returning the doc's tf
-    /// **without expanding the block's doc ids**. On a dense (bitset) block it
-    /// bit-tests presence and, on a hit, reads the one tf by popcount-rank into
-    /// the tf array (decoded once per block) — never materializing the 128 doc
-    /// ids, which is the dominant cost of the ranked-OR non-essential
-    /// completion on common terms. On a PACKED block there is no rank shortcut
-    /// (the doc ids must be decoded to locate the doc), so it falls back to
-    /// `skip_to` + `current_tf`. Like [`Self::contains`] it advances
-    /// `current_block`, so a cursor probed this way must not also be iterated.
-    /// Rank of the doc at in-block position `bit` among a bitset block's presence
-    /// bits — the count of set bits before `bit`, i.e. that doc's index into the
-    /// block's doc-order tf array. `word` is the presence word already loaded at
-    /// `bit`'s position; `bitset_end` is the end of the presence bitmap (start of
-    /// the tf array). Shared by [`Self::bitset_probe_tf`] (which first checks the
-    /// bit is set) and [`Self::tf_at_contained`] (which knows it is).
+    /// Make the buffers hold the whole current block with the cursor still
+    /// on its current doc: a block held lazily, or only probed, is decoded
+    /// and `pos` brought back to that doc. A no-op when the block is already
+    /// decoded. Callers that read the block's pair index or positions need
+    /// this first.
+    pub(super) fn hold_whole_block(&mut self) {
+        if self.decoded_block != self.current_block {
+            let doc = self.current_doc_id();
+            self.materialize_at(doc);
+        }
+    }
+
     /// Locate `doc` in a bitset block: its bit index within the presence
     /// bitset, the word holding it and where the bitset ends (the tf
     /// array's start). `None` when `doc` lies below the block's origin or
@@ -1232,10 +1238,23 @@ impl TermCursor {
         Some((bit, word, bitset_end))
     }
 
+    /// Whether a dense (bitset or run) block holds `doc`: a bit test, or a
+    /// range check for a run. Unlike [`Self::dense_rank`] it counts no
+    /// presence bits.
+    #[inline(always)]
+    fn dense_contains(raw: &[u8], hdr: &BlockHeader, doc: u32) -> bool {
+        if hdr.encoding == ENCODING_RUN {
+            return doc
+                .checked_sub(hdr.base)
+                .is_some_and(|rank| (rank as usize) < hdr.count());
+        }
+        Self::bitset_word(raw, hdr, doc).is_some_and(|(bit, word, _)| (word >> (bit % 64)) & 1 == 1)
+    }
+
     /// Rank of `doc` among a dense (bitset or run) block's docs, which is
     /// its index into the block's tf array, or `None` when the block does
     /// not hold it.
-    #[inline]
+    #[inline(always)]
     fn dense_rank(raw: &[u8], hdr: &BlockHeader, doc: u32) -> Option<usize> {
         if hdr.encoding == ENCODING_RUN {
             let rank = doc.checked_sub(hdr.base)? as usize;
@@ -1246,6 +1265,12 @@ impl TermCursor {
             .then(|| Self::bitset_tf_rank(raw, hdr.payload(), bit, word, bitset_end) as usize)
     }
 
+    /// Rank of the doc at in-block position `bit` among a bitset block's
+    /// presence bits — the count of set bits before `bit`, i.e. that doc's
+    /// index into the block's doc-order tf array. `word` is the presence word
+    /// already loaded at `bit`'s position; `bitset_end` is the end of the
+    /// presence bitmap (start of the tf array). The caller has checked the
+    /// bit is set.
     #[inline]
     fn bitset_tf_rank(raw: &[u8], payload: usize, bit: usize, word: u64, bitset_end: usize) -> u32 {
         let word_idx = bit / 64;
@@ -1313,13 +1338,9 @@ impl TermCursor {
             tfs.extend_from_slice(&self.block_tfs[a..b]);
             return;
         }
-        while self.current_block < self.blocks.len()
-            && self.blocks[self.current_block].last_doc_id < lo
-        {
-            self.current_block += 1;
-        }
+        self.advance_current_block_to(lo);
         while self.current_block < self.blocks.len() {
-            if self.decoded_block != self.current_block || self.lazy_bit != u32::MAX {
+            if self.decoded_block != self.current_block || self.is_lazy() {
                 self.decode_current_block();
             }
             let n = self.block_n;
@@ -1358,12 +1379,7 @@ impl TermCursor {
         let mut k = 0usize;
         while k < n_docs {
             let d = docs[k];
-            while self.current_block < self.blocks.len()
-                && self.blocks[self.current_block].last_doc_id < d
-            {
-                self.current_block += 1;
-            }
-            if self.current_block >= self.blocks.len() {
+            if !self.advance_current_block_to(d) {
                 out[k..].fill(0);
                 return;
             }
@@ -1371,7 +1387,7 @@ impl TermCursor {
             let last = block.last_doc_id;
             let hdr = self.current_header();
             if is_dense_encoding(hdr.encoding) {
-                let lazy = self.lazy_bit != u32::MAX;
+                let lazy = self.is_lazy();
                 let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
                 // Several targets in this block (or its table already built):
                 // count the presence words once. A lone target counts only
@@ -1379,27 +1395,28 @@ impl TermCursor {
                 let in_block = docs[k..].partition_point(|&d| d <= last);
                 if hdr.encoding != ENCODING_RUN
                     && (in_block >= BITSET_PREFIX_MIN_TARGETS
-                        || self.bitset_prefix_block == self.current_block)
+                        || self.scratch.prefix_block == self.current_block)
                 {
-                    if self.bitset_prefix_block != self.current_block {
+                    if self.scratch.prefix_block != self.current_block {
                         let bitset_end = raw.len() - hdr.tfs_size();
                         let presence = &raw[hdr.payload()..bitset_end];
-                        self.bitset_prefix.clear();
-                        self.bitset_prefix.resize(presence.len() / 8, 0);
+                        self.scratch.prefix.clear();
+                        self.scratch.prefix.resize(presence.len() / 8, 0);
                         let mut acc = 0u32;
-                        for (slot, w) in self.bitset_prefix.iter_mut().zip(presence.chunks_exact(8))
+                        for (slot, w) in
+                            self.scratch.prefix.iter_mut().zip(presence.chunks_exact(8))
                         {
                             *slot = acc;
                             acc += u64::from_le_bytes(w.try_into().expect("8 bytes")).count_ones();
                         }
-                        self.bitset_prefix_block = self.current_block;
+                        self.scratch.prefix_block = self.current_block;
                     }
                     while k < n_docs && docs[k] <= last {
                         let rank =
                             Self::bitset_word(raw, &hdr, docs[k]).and_then(|(bit, word, _)| {
                                 let below = (1u64 << (bit % 64)).wrapping_sub(1);
                                 ((word >> (bit % 64)) & 1 == 1).then(|| {
-                                    (self.bitset_prefix[bit / 64] + (word & below).count_ones())
+                                    (self.scratch.prefix[bit / 64] + (word & below).count_ones())
                                         as usize
                                 })
                             });
@@ -1436,18 +1453,20 @@ impl TermCursor {
                 }
                 continue;
             }
-            if self.decoded_block != self.current_block || self.lazy_bit != u32::MAX {
+            if self.decoded_block != self.current_block || self.is_lazy() {
                 self.decode_current_block();
             }
             let n = self.block_n;
             let ids = &self.block_doc_ids[..n];
             let mut p = self.pos.min(n);
             // Targets in this block about as dense as its postings (a
-            // balanced pair): a branch-free merge, which writes every target's
-            // answer and advances whichever side is behind by its comparison.
-            // The stepping loop below mispredicts on nearly every step when
-            // the two lists interleave; it stays for sparse targets, where it
-            // skips long stretches of postings.
+            // balanced pair): rank them all against the block's remaining
+            // postings by bitmap, no target waiting on another; when their
+            // span is too wide for the bitmap, a branch-free merge, which
+            // writes every target's answer and advances whichever side is
+            // behind by its comparison. The stepping loop below mispredicts
+            // on nearly every step when the two lists interleave; it stays
+            // for sparse targets, where it skips long stretches of postings.
             let k_end = k + docs[k..].partition_point(|&d| d <= last);
             if (k_end - k) * BALANCED_PROBE_RATIO >= n - p {
                 let tfs = &self.block_tfs[..n];
@@ -1487,13 +1506,18 @@ impl TermCursor {
         }
     }
 
+    /// Membership probe returning the doc's tf **without expanding the
+    /// block's doc ids**, `None` when the term does not hold `doc`. On a
+    /// dense (bitset or run) block it locates the doc by rank and reads its
+    /// one tf from the tf array (decoded once per block) — never
+    /// materializing the 128 doc ids, which is the dominant cost of a
+    /// completion probe on common terms. On a packed block there is no rank
+    /// shortcut (the doc ids must be decoded to locate the doc), so it falls
+    /// back to `skip_to` + `current_tf`. Like [`Self::contains`] it advances
+    /// `current_block`, so a cursor probed this way must not also be
+    /// iterated.
     pub(super) fn bitset_probe_tf(&mut self, doc: u32) -> Option<u32> {
-        while self.current_block < self.blocks.len()
-            && self.blocks[self.current_block].last_doc_id < doc
-        {
-            self.current_block += 1;
-        }
-        if self.current_block >= self.blocks.len() {
+        if !self.advance_current_block_to(doc) {
             return None;
         }
         // Pre-decoded (inline or short-form) cursor: locate in the buffer.
@@ -1524,7 +1548,7 @@ impl TermCursor {
         // Present: the r-th doc maps to the r-th tf in doc order.
         let rank = Self::dense_rank(raw, &hdr, doc)?;
         Some(Self::bitset_tf_for_probe(
-            self.lazy_bit != u32::MAX,
+            self.is_lazy(),
             self.current_block,
             &mut self.tf_decoded_block,
             &mut self.block_tfs,
@@ -1539,7 +1563,7 @@ impl TermCursor {
     #[inline]
     pub(super) fn holds_whole_block(&self) -> bool {
         !self.is_exhausted()
-            && self.lazy_bit == u32::MAX
+            && !self.is_lazy()
             && self.decoded_block == self.current_block
             && self.purpose.decodes_tfs()
     }
@@ -1578,7 +1602,7 @@ impl TermCursor {
     pub(super) fn current_tf(&self) -> u32 {
         debug_assert!(!self.is_exhausted() && self.pos < self.block_n);
         debug_assert!(
-            self.lazy_bit == u32::MAX || self.tf_decoded_block != self.current_block,
+            !self.is_lazy() || self.tf_decoded_block != self.current_block,
             "a lazily held block's tf buffer was replaced by a whole-block unpack"
         );
         self.block_tfs[self.pos]
@@ -1760,7 +1784,7 @@ impl TermCursor {
     /// exhausted when the current block is the last one.
     #[inline(never)]
     pub(super) fn advance_block(&mut self) {
-        if self.lazy_bit != u32::MAX && self.step_within_lazy_block() {
+        if self.is_lazy() && self.step_within_lazy_block() {
             return;
         }
         self.current_block += 1;
@@ -1817,8 +1841,8 @@ impl TermCursor {
         // the whole block — `materialize_at`, the phrase path's pair index
         // and tf run, the tf probes' unpack — must see it as undecoded and
         // expand. `decode_current_positions` asserts this on entry.
-        self.decoded_block = usize::MAX;
-        self.tf_decoded_block = usize::MAX;
+        self.decoded_block = NO_BLOCK;
+        self.tf_decoded_block = NO_BLOCK;
     }
 
     /// Skip forward so `current_doc_id() >= target`. Uses the skip
@@ -1877,18 +1901,14 @@ impl TermCursor {
     #[cold]
     pub(super) fn skip_to_cross_block(&mut self, target: u32) {
         let from_block = self.current_block;
-        while self.current_block < self.blocks.len()
-            && self.blocks[self.current_block].last_doc_id < target
-        {
-            self.current_block += 1;
-        }
+        self.advance_current_block_to(target);
         if self.current_block > self.inspect_block {
             self.inspect_block = self.current_block;
         }
         if self.is_exhausted() {
             return;
         }
-        let left_lazy = self.lazy_bit != u32::MAX && self.current_block != from_block;
+        let left_lazy = self.is_lazy() && self.current_block != from_block;
         if left_lazy || self.current_block > from_block + 1 {
             // A probe that leaves a lazy block after one doc, or jumps past
             // whole blocks, is sparse: serve the next bitset block lazily.
@@ -1913,7 +1933,7 @@ impl TermCursor {
             // the doc after it), so two lazy probes are allowed; a third
             // skip into the same block is a caller walking it by skips (a
             // stopword AND), which the expansion serves better.
-            let again = self.lazy_bit != u32::MAX && self.current_block == from_block;
+            let again = self.is_lazy() && self.current_block == from_block;
             let steps = match again {
                 true => self.lazy_steps + 1,
                 false => 0,
@@ -1970,7 +1990,7 @@ impl TermCursor {
         if is_dense_encoding(hdr.encoding) {
             let rank = Self::dense_rank(raw, &hdr, doc).expect("contains(doc) confirmed presence");
             Self::bitset_tf_for_probe(
-                self.lazy_bit != u32::MAX,
+                self.is_lazy(),
                 self.current_block,
                 &mut self.tf_decoded_block,
                 &mut self.block_tfs,
@@ -2015,6 +2035,18 @@ impl TermCursor {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rand_distr::{Distribution, LogNormal};
+
+    use super::*;
+    use crate::superfile::fts::{
+        bm25,
+        builder::FtsBuilder,
+        posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+        reader::{FtsReader, QueryIdf},
+    };
+
     #[test]
     fn seek_sorted_lands_where_a_partition_point_does() {
         let mut x: u64 = 0x2545_F491_4F6C_DD1D;
@@ -2083,9 +2115,8 @@ mod tests {
             targets.sort_unstable();
             targets.dedup();
             let mut out = vec![u32::MAX; targets.len()];
-            if !super::probe_by_bitmap(&ids, &tfs, &targets, &mut out) {
-                continue;
-            }
+            // At most 128 ids at most seven apart: always inside the bitmap.
+            assert!(super::probe_by_bitmap(&ids, &tfs, &targets, &mut out));
             for (t, o) in targets.iter().zip(&out) {
                 let want = ids.binary_search(t).map_or(0, |i| tfs[i]);
                 assert_eq!(*o, want, "case {case} target {t}");
@@ -2093,17 +2124,18 @@ mod tests {
         }
     }
 
-    use bytes::Bytes;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use rand_distr::{Distribution, LogNormal};
-
-    use super::*;
-    use crate::superfile::fts::{
-        bm25,
-        builder::FtsBuilder,
-        posting::{ENCODING_PACKED, ENCODING_PATCHED},
-        reader::{FtsReader, QueryIdf},
-    };
+    #[test]
+    fn rank_by_bitmap_refuses_an_empty_block_or_a_span_past_the_bitmap() {
+        let mut out = [7u32; 2];
+        assert!(!rank_by_bitmap(&[], &[1, 2], &mut out));
+        // Ids one bit past the bitmap's span apart: refused.
+        let span = (PROBE_BITMAP_WORDS * 64) as u32;
+        assert!(!rank_by_bitmap(&[0, span], &[0, span], &mut out));
+        assert_eq!(out, [7, 7], "nothing written on a refusal");
+        // One bit less fits, and ranks both ends.
+        assert!(rank_by_bitmap(&[0, span - 1], &[0, span - 1], &mut out));
+        assert_eq!(out, [1, 2]);
+    }
 
     /// The per-block BM25 upper bound stored in the skip table must be a
     /// valid upper bound over the *query-time* score of every document in
@@ -2240,7 +2272,6 @@ mod tests {
     /// position throughout.
     #[tokio::test]
     async fn packed_block_tf_probes_match_the_walk() {
-        use crate::superfile::fts::posting::{ENCODING_BITSET, block_encoding};
         let mut b = FtsBuilder::new();
         b.register_column("flat".into(), false).expect("register");
         let tf_of = |doc: u32| doc.is_multiple_of(37).then(|| 1 + doc % 5);
