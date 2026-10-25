@@ -20,7 +20,7 @@ use super::{
     metadata::NormTable,
     options::BoolMode,
     phrase::AnyCursor,
-    scorers::BUFFERED_TOPK_MIN_K,
+    scorers::{BUFFERED_TOPK_MIN_K, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
         MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
@@ -1820,6 +1820,7 @@ impl SingleTermWalk<'_> {
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let mut buf_d = [0u32; BLOCK_LEN];
         let mut buf_t = [0u32; BLOCK_LEN];
+        let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
         let mut threshold = f32::NEG_INFINITY;
         // Two skip levels. The coarse table bounds a whole span of
         // `COARSE_BLOCK_MAX_SPAN` blocks with a single entry, so a span
@@ -1894,10 +1895,16 @@ impl SingleTermWalk<'_> {
             //  Actual number of real docs in that block.
             let n = decode_block(block_bytes, &hdr, &mut buf_d, &mut buf_t);
 
-            for j in 0..n {
-                let doc_id = buf_d[j];
-                let tf = buf_t[j];
-                let score = bm25::score_with_dl_norm_k1(idf_weight, tf, dl_norm_k1.get(doc_id));
+            // The whole block scored eight postings at a time, the same bits
+            // as one at a time; the per-doc tests below then read the scores.
+            score_postings(
+                idf_weight,
+                &buf_d[..n],
+                &buf_t[..n],
+                dl_norm_k1,
+                &mut scores,
+            );
+            for (&doc_id, &score) in buf_d[..n].iter().zip(&scores) {
                 // Floor gate: strictly-below-floor docs are dead to the
                 // caller; keeping them out also keeps the heap's min
                 // (the BMW skip bar) honest.

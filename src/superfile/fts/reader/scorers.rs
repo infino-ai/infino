@@ -197,7 +197,7 @@ fn score_noness_batched(
 /// One term's BM25 at each `(docs[i], tfs[i])` into `out` (cleared first),
 /// eight per SIMD call. A tf of 0 scores exactly 0. The same bits as scoring
 /// each posting alone.
-fn score_postings(
+pub(super) fn score_postings(
     idf_weight: f32,
     docs: &[u32],
     tfs: &[u32],
