@@ -1922,6 +1922,23 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.token_match_hits_async(column, query, mode, true).await
+    }
+
+    /// [`Self::token_match_async`] with a say over whether every hit
+    /// leaves carrying its stable `_id`. A caller that never reads the
+    /// ids, an aggregate over the match that projects only scalar
+    /// columns, passes `false` and skips the per-hit stamping, which on a
+    /// match of a few hundred thousand rows is most of what producing the
+    /// hits costs. Hits then carry a stable id only where the fan-out
+    /// tagged one for free, and must not be asked for `_id`.
+    pub(crate) async fn token_match_hits_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        stamp_stable_ids: bool,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -2051,7 +2068,9 @@ impl SupertableReader {
         for unit in per_unit {
             hits.extend(unit);
         }
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        if stamp_stable_ids {
+            dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        }
         Ok(hits)
     }
 
