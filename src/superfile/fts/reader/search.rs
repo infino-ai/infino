@@ -2742,6 +2742,18 @@ mod tests {
             )
         };
         let unfloored = and(all, f32::NEG_INFINITY).await.expect("unfloored and");
+        // The match set itself, independent of the walk: `v` where `i % 3 != 0`,
+        // `x` where `i % 7 == 0`.
+        let matches = |i: u32| i % 3 != 0 && i % 7 != 0;
+        assert_eq!(
+            unfloored.len(),
+            (0..N_DOCS).filter(|&i| matches(i)).count(),
+            "and match count"
+        );
+        assert!(
+            unfloored.iter().all(|h| matches(h.0.get())),
+            "and returned an excluded doc"
+        );
         for k in [BUFFERED_TOPK_MIN_K + 100, all] {
             for floor in [f32::NEG_INFINITY, unfloored[unfloored.len() / 2].1] {
                 let got = and(k, floor).await.expect("floored and");
