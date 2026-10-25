@@ -17,8 +17,10 @@
 //!
 //! The reader exposes no accessor for the encoding a block took, so
 //! each corpus is planted from the encoder's own selection rules
-//! (`posting::encode_block`): a block is a bitset when its presence
-//! words are no larger than its tightest delta packing, patched when
+//! (`posting::encode_block_with`): a block of consecutive ids is a run;
+//! otherwise it is a bitset when its presence words are no larger than
+//! its tightest delta packing (larger by the builder's bias on its
+//! commonest terms, which these corpora stay below), patched when
 //! the term is granted patching (document frequency at or under the
 //! builder's cap) and the packed-plus-exceptions form is smaller than
 //! plain packing, and short-form when the whole list fits one block.

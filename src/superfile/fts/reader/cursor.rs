@@ -34,9 +34,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_BITSET, ENCODING_RUN, bitset_next_doc, bitset_tf_at,
-            block_encoding, decode_block, decode_block_doc_ids, decode_block_tfs,
-            is_dense_encoding,
+            BLOCK_LEN, BlockHeader, ENCODING_BITSET, ENCODING_RUN, block_encoding, decode_block,
+            decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
     },
@@ -1284,7 +1283,7 @@ impl TermCursor {
         rank: usize,
     ) -> u32 {
         if lazy {
-            return bitset_tf_at(raw, hdr, rank);
+            return dense_tf_at(raw, hdr, rank);
         }
         if *tf_decoded_block != current_block {
             decode_block_tfs(raw, hdr, block_tfs);
@@ -1784,7 +1783,7 @@ impl TermCursor {
         let raw = &self.bytes[range];
         if self.lazy_steps == 0 {
             self.lazy_steps = 1;
-            return match bitset_next_doc(raw, &hdr, cur.saturating_add(1)) {
+            return match dense_next_doc(raw, &hdr, cur.saturating_add(1)) {
                 Some((doc, rank)) => {
                     self.publish_lazy(doc, rank);
                     true
@@ -1809,7 +1808,7 @@ impl TermCursor {
         let raw = &self.bytes[range];
         self.block_doc_ids[0] = doc;
         if self.purpose.decodes_tfs() {
-            self.block_tfs[0] = bitset_tf_at(raw, &hdr, rank);
+            self.block_tfs[0] = dense_tf_at(raw, &hdr, rank);
         }
         self.block_n = 1;
         self.pos = 0;
@@ -1922,7 +1921,7 @@ impl TermCursor {
             if steps < 2 {
                 let (hdr, range) = self.current_block_bytes();
                 let raw = &self.bytes[range];
-                if let Some((doc, rank)) = bitset_next_doc(raw, &hdr, target) {
+                if let Some((doc, rank)) = dense_next_doc(raw, &hdr, target) {
                     self.publish_lazy(doc, rank);
                     self.lazy_steps = steps;
                     return;

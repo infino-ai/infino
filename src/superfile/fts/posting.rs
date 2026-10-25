@@ -116,7 +116,7 @@ pub const ENCODING_PACKED: u8 = 0;
 /// exceptions are patched in — the sorted bit-packer's fused prefix sum
 /// cannot see a patch — about 15 ns more per block than the plain
 /// decode. Taken only when the writer allows it for the term (see
-/// `encode_block`'s `patchable`), when it is smaller than plain packing
+/// [`encode_block_with`]'s `patchable`), when it is smaller than plain packing
 /// and when the bitset did not claim the block, so a block with uniform
 /// widths stays [`ENCODING_PACKED`] and decodes exactly as before.
 pub const ENCODING_PATCHED: u8 = 2;
@@ -254,7 +254,6 @@ impl BlockHeader {
         header
     }
 
-    /// Real `(doc_id, tf)` pairs in the block.
     /// Reject a corrupt header before its widths reach an unpacker.
     #[inline]
     pub fn check_widths(&self) {
@@ -264,6 +263,7 @@ impl BlockHeader {
         );
     }
 
+    /// Real `(doc_id, tf)` pairs in the block.
     #[inline]
     pub fn count(&self) -> usize {
         usize::from(self.count)
@@ -381,6 +381,14 @@ fn compact_header(
 /// whose blocks every intersection and union walks in bulk. `scratch`
 /// holds the planners' buffers, reused from block to block.
 ///
+/// A run of consecutive doc ids always takes [`ENCODING_RUN`]. Otherwise
+/// the presence bitset is taken whenever it is at most `bitset_bias` times
+/// the size of the packed deltas (`1.0`: only when it is no larger). A
+/// bitset block is folded into a count a word at a time and probed by a
+/// bit test, where a packed one is decoded doc by doc, so the writer pays
+/// a few bytes for it on the terms that unions and intersections read in
+/// bulk.
+///
 /// # Panics
 ///
 /// - `b.doc_ids.is_empty()` — can't encode an empty block.
@@ -388,21 +396,6 @@ fn compact_header(
 /// - `b.doc_ids.len() > BLOCK_LEN`.
 /// - (debug) `b.doc_ids` not strictly ascending, or not above
 ///   `prev_last_doc_id`.
-pub fn encode_block(
-    b: &Block,
-    prev_last_doc_id: Option<u32>,
-    patchable: bool,
-    scratch: &mut PackScratch,
-) -> EncodedBlock {
-    encode_block_with(b, prev_last_doc_id, patchable, 1.0, scratch)
-}
-
-/// [`encode_block`], taking the presence bitset whenever it is at most
-/// `bitset_bias` times the size of the packed deltas rather than only when
-/// it is no larger. A bitset block is folded into a count a word at a time
-/// and probed by a bit test, where a packed one is decoded doc by doc, so
-/// the writer pays a few bytes for it on the terms that unions and
-/// intersections read in bulk.
 pub fn encode_block_with(
     b: &Block,
     prev_last_doc_id: Option<u32>,
@@ -812,21 +805,16 @@ fn restore_tfs(dest_tfs: &mut [u32], hdr: &BlockHeader) {
     }
 }
 
-/// Decode only the doc ids of a block into `dest_doc_ids`, skipping the
-/// tf half. Returns the block's doc count. The unranked count kernels
-/// never read a tf, so they take this instead of [`decode_block`].
+/// The first doc of a dense block (see [`is_dense_encoding`]) at or after
+/// `from`, as `(doc, rank)` where `rank` is the doc's index in the block's
+/// tf array. `None` when no doc of the block is `>= from`.
 ///
-/// # Panics
-///
-/// As [`decode_block`], minus the `dest_tfs` checks.
-/// The first set bit of a bitset block at or after `from`, as `(doc, rank)`
-/// where `rank` is the number of set bits before it — the doc's index in
-/// the block's tf array. `None` when no doc of the block is `>= from`.
-///
-/// A probe that skips into a bitset block needs one doc, not the 128 the
-/// full expansion writes; this scans the block's words from the target's
-/// word with a masked `trailing_zeros`, at most a handful of u64s.
-pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u32, usize)> {
+/// A probe that skips into a dense block needs one doc, not the 128 the
+/// full expansion writes. A run block answers by arithmetic; a bitset
+/// block scans its words from the target's word with a masked
+/// `trailing_zeros`, at most a handful of u64s, `rank` being the number of
+/// set bits before the doc.
+pub fn dense_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u32, usize)> {
     if hdr.encoding == ENCODING_RUN {
         // Every id from the origin on, `count` of them: arithmetic.
         let doc = from.max(hdr.base);
@@ -838,7 +826,7 @@ pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u3
     let tfs_size = hdr.tfs_size();
     assert!(
         bytes.len() >= hdr.payload() + tfs_size,
-        "bitset_next_doc: bytes shorter than header+tfs"
+        "dense_next_doc: bytes shorter than header+tfs"
     );
     let words = &bytes[hdr.payload()..bytes.len() - tfs_size];
     let bit = from.saturating_sub(hdr.base) as usize;
@@ -864,15 +852,16 @@ pub fn bitset_next_doc(bytes: &[u8], hdr: &BlockHeader, from: u32) -> Option<(u3
     None
 }
 
-/// One tf out of a bitset block without unpacking the other 127: the tf of
-/// the doc with set-bit index `rank`. Bitset blocks carry plain packed tfs
-/// (never patched). `BitPacker4x` interleaves four 32-bit lanes: value `i`
+/// One tf out of a dense block (see [`is_dense_encoding`]) without
+/// unpacking the other 127: the tf of the doc at index `rank` (its set-bit
+/// index in a bitset block, its offset from the origin in a run). Dense
+/// blocks carry plain packed tfs (never patched). `BitPacker4x` interleaves four 32-bit lanes: value `i`
 /// lives in lane `i % 4` at bit `(i / 4) * width` of that lane's stream,
 /// whose 32-bit words sit at every fourth word of the payload.
 ///
 /// For a *walk* over a block the full unpack into the tf array wins (one
 /// unpack serves every doc); this is for a *probe* that touches one doc.
-pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
+pub fn dense_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
     debug_assert!(hdr.encoding == ENCODING_BITSET || hdr.encoding == ENCODING_RUN);
     debug_assert!(rank < BLOCK_LEN);
     hdr.check_widths();
@@ -883,7 +872,7 @@ pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
     let tfs_size = hdr.tfs_size();
     assert!(
         bytes.len() >= hdr.payload() + tfs_size,
-        "bitset_tf_at: bytes shorter than header+tfs"
+        "dense_tf_at: bytes shorter than header+tfs"
     );
     let packed = &bytes[bytes.len() - tfs_size..];
     let lane = rank % 4;
@@ -902,6 +891,14 @@ pub fn bitset_tf_at(bytes: &[u8], hdr: &BlockHeader, rank: usize) -> u32 {
     (v & ((1u64 << width) - 1)) as u32 + u32::from(hdr.tf_bias)
 }
 
+/// Decode only the doc ids of a block into `dest_doc_ids`, skipping the
+/// tf half. Returns the block's doc count. The unranked count kernels
+/// never read a tf, so they take this instead of [`decode_block`].
+///
+/// # Panics
+///
+/// As [`decode_block`], minus the `dest_tfs` checks, and when a run
+/// block's ids would pass `u32::MAX`.
 pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut [u32]) -> usize {
     hdr.check_widths();
     assert!(
@@ -912,12 +909,16 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
 
     if hdr.encoding == ENCODING_RUN {
         // `origin..origin + count`; padding lanes repeat the last doc, as a
-        // packed block's zero deltas do.
-        let last = hdr.base + count as u32 - 1;
+        // packed block's zero deltas do. A corrupt origin could put the
+        // last id past `u32::MAX`, which would wrap to small ids.
+        let last = hdr.base.checked_add(count as u32 - 1);
+        assert!(
+            last.is_some(),
+            "decode_block_doc_ids: run block passes u32::MAX"
+        );
         for (i, d) in dest_doc_ids[..BLOCK_LEN].iter_mut().enumerate() {
             *d = hdr.base + (i as u32).min(count as u32 - 1);
         }
-        debug_assert_eq!(dest_doc_ids[count - 1], last);
         return count;
     }
 
@@ -992,7 +993,13 @@ mod tests {
 
     /// Encode with fresh scratch.
     fn encode_one(b: &Block, prev_last_doc_id: Option<u32>, patchable: bool) -> EncodedBlock {
-        encode_block(b, prev_last_doc_id, patchable, &mut PackScratch::default())
+        encode_block_with(
+            b,
+            prev_last_doc_id,
+            patchable,
+            1.0,
+            &mut PackScratch::default(),
+        )
     }
 
     /// Build a Block from parallel slices.
@@ -1180,7 +1187,7 @@ mod tests {
             );
             if is_dense_encoding(hdr.encoding) {
                 for (rank, &tf) in tfs.iter().enumerate() {
-                    assert_eq!(bitset_tf_at(&enc.bytes, &hdr, rank), tf, "rank {rank}");
+                    assert_eq!(dense_tf_at(&enc.bytes, &hdr, rank), tf, "rank {rank}");
                 }
             }
             // The same block as this crate writes it decodes identically.
@@ -1270,17 +1277,51 @@ mod tests {
             let n = decode_block(&enc.bytes, &hdr, &mut ids, &mut got_tfs);
             for target in (hdr.base - 5)..=(doc_ids[n - 1] + 3) {
                 let want = ids[..n].iter().position(|&d| d >= target);
-                let got = bitset_next_doc(&enc.bytes, &hdr, target);
+                let got = dense_next_doc(&enc.bytes, &hdr, target);
                 match want {
                     None => assert!(got.is_none(), "target {target}"),
                     Some(r) => {
                         let (doc, rank) = got.expect("a doc >= target");
                         assert_eq!((doc, rank), (ids[r], r), "target {target}");
-                        assert_eq!(bitset_tf_at(&enc.bytes, &hdr, rank), got_tfs[r]);
+                        assert_eq!(dense_tf_at(&enc.bytes, &hdr, rank), got_tfs[r]);
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn run_probe_helpers_agree_with_the_full_expansion() {
+        // A run block answers the one-doc probes by arithmetic: every
+        // target around and inside the run lands where the expansion says.
+        let doc_ids: Vec<u32> = (500..560).collect();
+        let tfs: Vec<u32> = (0..doc_ids.len() as u32).map(|i| 1 + i % 6).collect();
+        let enc = encode_one(&block(&doc_ids, &tfs), Some(10), true);
+        let hdr = BlockHeader::parse(&enc.bytes, Some(10));
+        assert_eq!(hdr.encoding, ENCODING_RUN);
+        for target in 490..570 {
+            let want = doc_ids.iter().position(|&d| d >= target);
+            let got = dense_next_doc(&enc.bytes, &hdr, target);
+            assert_eq!(got, want.map(|r| (doc_ids[r], r)), "target {target}");
+            if let Some(r) = want {
+                assert_eq!(dense_tf_at(&enc.bytes, &hdr, r), tfs[r], "rank {r}");
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "run block passes u32::MAX")]
+    fn a_run_block_whose_ids_pass_u32_max_is_refused() {
+        // A corrupt origin four short of `u32::MAX` under a five-doc run:
+        // the last id does not fit, and must not wrap to small ids.
+        let doc_ids: Vec<u32> = (5..10).collect();
+        let mut enc = encode_one(&block(&doc_ids, &[1; 5]), None, false);
+        assert_eq!(block_encoding(&enc.bytes), ENCODING_RUN);
+        enc.bytes[COMPACT_HEADER_SIZE..COMPACT_HEADER_SIZE + ORIGIN_BYTES]
+            .copy_from_slice(&(u32::MAX - 3).to_le_bytes());
+        let hdr = BlockHeader::parse(&enc.bytes, None);
+        let mut ids = vec![0u32; BLOCK_LEN];
+        decode_block_doc_ids(&enc.bytes, &hdr, &mut ids);
     }
 
     #[test]
@@ -1298,7 +1339,7 @@ mod tests {
         enc.bytes[..4].copy_from_slice(&word.to_le_bytes());
         let hdr = BlockHeader::parse(&enc.bytes, Some(200));
         assert_eq!(hdr.tf_bits, 33);
-        let _ = bitset_next_doc(&enc.bytes, &hdr, 256);
+        let _ = dense_next_doc(&enc.bytes, &hdr, 256);
     }
 
     #[test]
@@ -1880,7 +1921,7 @@ mod tests {
 
     /// The bitset probes at the docs that sit on 64-bit word edges: the
     /// first and last bit of a word, and the two bits either side of a
-    /// word boundary. `bitset_next_doc` must not lose the last bit of a
+    /// word boundary. `dense_next_doc` must not lose the last bit of a
     /// word to the mask of the next, and the rank (the tf index) must
     /// count every set bit of the earlier words. Absent docs on the
     /// other side of each edge must resolve to the next present one.
@@ -1918,12 +1959,12 @@ mod tests {
         ] {
             let rank = rank_of(edge);
             assert_eq!(
-                bitset_next_doc(&enc.bytes, &hdr, edge),
+                dense_next_doc(&enc.bytes, &hdr, edge),
                 Some((edge, rank)),
                 "edge doc {edge}"
             );
             assert_eq!(
-                bitset_tf_at(&enc.bytes, &hdr, rank),
+                dense_tf_at(&enc.bytes, &hdr, rank),
                 tfs[rank],
                 "tf at edge doc {edge}"
             );
@@ -1934,19 +1975,19 @@ mod tests {
             (WORD_ALIGNED_BASE + 126, WORD_ALIGNED_BASE + 127),
         ] {
             assert_eq!(
-                bitset_next_doc(&enc.bytes, &hdr, from),
+                dense_next_doc(&enc.bytes, &hdr, from),
                 Some((next, rank_of(next))),
                 "absent doc {from} resolves to {next}"
             );
         }
         // An absent doc just after an edge resolves to the one after it.
         assert_eq!(
-            bitset_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 65),
+            dense_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 65),
             Some((WORD_ALIGNED_BASE + 66, rank_of(WORD_ALIGNED_BASE + 66)))
         );
         // Past the last bit: nothing.
         assert_eq!(
-            bitset_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 128),
+            dense_next_doc(&enc.bytes, &hdr, WORD_ALIGNED_BASE + 128),
             None
         );
     }
