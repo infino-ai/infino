@@ -469,11 +469,7 @@ fn must_lead_should_count(
     let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     while !lead.is_exhausted() {
-        if lead.decoded_block != lead.current_block {
-            let start = lead.current_doc_id();
-            lead.decode_current_block();
-            lead.materialize_at(start);
-        }
+        lead.hold_whole_block();
         let (from, to) = (lead.pos, lead.block_n);
         docs.clear();
         docs.extend_from_slice(&lead.block_doc_ids[from..to]);
@@ -967,10 +963,7 @@ fn and_membership_scored_batched<S: AndSink>(
                 continue;
             }
         }
-        if driver.decoded_block != driver.current_block {
-            driver.decode_current_block();
-            driver.materialize_at(start);
-        }
+        driver.hold_whole_block();
         let (from, to) = (driver.pos, driver.block_n);
         docs.clear();
         docs.extend_from_slice(&driver.block_doc_ids[from..to]);
@@ -2695,11 +2688,7 @@ impl FtsReader {
         if let [c] = cursors.as_mut_slice() {
             let mut lane_scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
             while !c.is_exhausted() {
-                if c.decoded_block != c.current_block {
-                    let start = c.current_doc_id();
-                    c.decode_current_block();
-                    c.materialize_at(start);
-                }
+                c.hold_whole_block();
                 let (from, to) = (c.pos, c.block_n);
                 score_postings(
                     c.idf_weight,
