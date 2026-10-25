@@ -2142,51 +2142,54 @@ mod tests {
     /// A same-block tf probe on a lazily held cursor must not disturb the
     /// published doc: `current_tf()` still answers for `current_doc_id()`.
     /// The corpus varies tf within a block, so a buffer overwritten by a
-    /// whole-block unpack would show a different doc's tf.
+    /// whole-block unpack would show a different doc's tf. Checked on a
+    /// term in every doc (run blocks) and one with holes (bitset blocks).
     #[tokio::test]
     async fn same_block_tf_probes_leave_the_lazy_doc_intact() {
+        const HOLE_EVERY: u32 = 61;
         let mut b = FtsBuilder::new();
         b.register_column("flat".into(), false).expect("register");
         for doc_id in 0..6000u32 {
             let mut text = String::new();
             for _ in 0..(1 + doc_id % 5) {
                 text.push_str("common ");
+                if doc_id % HOLE_EVERY != 0 {
+                    text.push_str("holey ");
+                }
             }
             b.add_doc(0, doc_id, text.trim_end()).expect("add");
         }
         let json = r#"[{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
         let view = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let cursors = view
-            .build_term_cursors(
-                0,
-                &["common"],
-                QueryIdf::ThisFile,
-                CursorUse::Score,
-                None,
-                None,
-            )
-            .await
-            .expect("cursors");
         let tf_of = |doc: u32| 1 + doc % 5;
-        let mut c = cursors[0].clone();
-        c.skip_to(4_100);
-        assert_eq!(c.block_n, 1, "lazy hold");
-        assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
-        let got = c.bitset_probe_tf(4_105).expect("present");
-        assert_eq!(got, tf_of(4_105));
-        assert_eq!(
-            (c.current_doc_id(), c.current_tf()),
-            (4_100, tf_of(4_100)),
-            "the lazy doc must be intact after the probe"
-        );
-        // And the walk on from the lazy doc stays exact.
-        for d in 4_100..4_400 {
+        for (term, holds) in [
+            ("common", (|_| true) as fn(u32) -> bool),
+            ("holey", |d| d % HOLE_EVERY != 0),
+        ] {
+            let cursors = view
+                .build_term_cursors(0, &[term], QueryIdf::ThisFile, CursorUse::Score, None, None)
+                .await
+                .expect("cursors");
+            let mut c = cursors[0].clone();
+            c.skip_to(4_100);
+            assert_eq!(c.block_n, 1, "{term}: lazy hold");
+            assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
+            let got = c.bitset_probe_tf(4_105).expect("present");
+            assert_eq!(got, tf_of(4_105), "{term}");
             assert_eq!(
                 (c.current_doc_id(), c.current_tf()),
-                (d, tf_of(d)),
-                "walk {d}"
+                (4_100, tf_of(4_100)),
+                "{term}: the lazy doc must be intact after the probe"
             );
-            c.next();
+            // And the walk on from the lazy doc stays exact.
+            for d in (4_100..4_400).filter(|&d| holds(d)) {
+                assert_eq!(
+                    (c.current_doc_id(), c.current_tf()),
+                    (d, tf_of(d)),
+                    "{term}: walk {d}"
+                );
+                c.next();
+            }
         }
     }
 
