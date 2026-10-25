@@ -115,6 +115,15 @@ fn complete_survivors(
     }
 }
 
+/// [`filter_survivors`] eight entries per step: one compare of eight scores
+/// against the bar, then each survivor's doc and score left-packed in place.
+///
+/// # Safety
+///
+/// The caller must have detected AVX2 at runtime. Given that, every load and
+/// store lies inside the `n`-entry slices, and the in-place left-pack never
+/// overwrites an entry before it is read (the write cursor never passes the
+/// read cursor, and each group is held in registers before it is stored).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn filter_survivors_avx2(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
@@ -1206,6 +1215,15 @@ fn accumulate_segment(
 /// contribution (the others add `0.0` to a non-negative score), at the norm
 /// [`NormTable::get`] gives, so the window holds the same bits as through
 /// [`mark_lanes`].
+///
+/// # Safety
+///
+/// The caller must have detected both AVX-512F and AVX2 at runtime. Given
+/// that, every access is bounds-checked before it is made: a 16-slot
+/// read-modify-write only when the run's first slot plus 16 fits the window,
+/// and a 16-byte bucket load only when it fits the norm table; gather indices
+/// are bytes into a 256-entry table. Ids that are not ascending give wrong
+/// sums or a panic, never an out-of-bounds access.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx2")]
 unsafe fn accumulate_run_avx512(

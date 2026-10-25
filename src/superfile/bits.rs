@@ -297,6 +297,15 @@ const SIMD_UNPACK_MAX_WIDTH: u8 = 25;
 /// built once. Returns how many lanes it wrote (whole groups, from the
 /// front); it stops where a load would pass the payload's end and the
 /// scalar copy finishes the rest.
+///
+/// # Safety
+///
+/// The caller must have detected AVX2 at runtime. Given that, the function
+/// reads and writes only in bounds for any input: each step's two 16-byte
+/// loads lie inside `payload` (the loop runs while `byte + half + 16` fits),
+/// each store lies inside `out` (while `done + 8` fits), and `width` is at
+/// most [`SIMD_UNPACK_MAX_WIDTH`], so every shuffle index stays inside its
+/// 16-byte lane and every shift plus width inside 32 bits.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn unpack_groups_avx2(
