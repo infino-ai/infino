@@ -2764,6 +2764,79 @@ mod tests {
         }
     }
 
+    /// Pruning compares bounds summed in one order with a bar, while the
+    /// scores they cover are summed in another, so near-ties a few ulps apart
+    /// are where a bound rounds under the score it covers. Corpora dense in
+    /// such near-ties: every pruned ranking must equal the unpruned
+    /// exact-count walk's top-k, bit for bit for an AND (one walk sums both),
+    /// and up to summation order where the union kernels differ.
+    #[tokio::test]
+    async fn pruned_rankings_agree_with_the_unpruned_walk_at_near_ties() {
+        const TERMS: [&str; 5] = ["ta", "tb", "tc", "td", "te"];
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..60 {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            let n_docs = 200 + (next() % 2_000) as u32;
+            for i in 0..n_docs {
+                let mut text = String::new();
+                for t in TERMS {
+                    if next() % 10 < 8 {
+                        for _ in 0..1 + next() % 3 {
+                            text.push_str(t);
+                            text.push(' ');
+                        }
+                    }
+                }
+                text.push_str(&"pad ".repeat((next() % 40) as usize));
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            for (musts, shoulds) in [
+                (&TERMS[..], &[][..]),
+                (&[][..], &TERMS[..]),
+                (&TERMS[..3], &TERMS[3..]),
+            ] {
+                let lists = || ClauseLists {
+                    musts,
+                    shoulds,
+                    ..ClauseLists::default()
+                };
+                for k in [1usize, 2, 3, 5, 10, 40, 600] {
+                    let pruned = r
+                        .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                        .await
+                        .expect("pruned");
+                    let (counted, _) = r
+                        .search_excluding_with_count("body", lists(), k)
+                        .await
+                        .expect("counted");
+                    let label = format!("trial {trial} musts {musts:?} shoulds {shoulds:?} k {k}");
+                    match shoulds.is_empty() {
+                        // One walk sums an AND either way: the same bits.
+                        true => {
+                            let bits = |h: &[(RowId, f32)]| {
+                                h.iter()
+                                    .map(|&(d, s)| (d.get(), s.to_bits()))
+                                    .collect::<Vec<_>>()
+                            };
+                            assert_eq!(bits(&pruned), bits(&counted), "{label}");
+                        }
+                        // The union kernels add terms in different orders.
+                        false => assert_same_top_k(&counted, &pruned, &label),
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn search_multi_weights_and_combines_columns() {
         let mut b = FtsBuilder::new();

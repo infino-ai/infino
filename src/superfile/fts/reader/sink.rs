@@ -178,6 +178,13 @@ pub(super) trait AndSink {
     /// unranked count over a large intersection cheaper than ranking it.
     fn needs_score(&self) -> bool;
 
+    /// How many terms the sink adds to a doc's score beyond the walk's own,
+    /// so the walk's pruning bar allows for summing them in another order
+    /// (see `pruning_bar`).
+    fn added_terms(&self) -> usize {
+        0
+    }
+
     /// Record one doc in the intersection. `score` is meaningful only
     /// when [`needs_score`](AndSink::needs_score) returns `true`;
     /// otherwise it is `0.0` and ignored.
@@ -243,6 +250,10 @@ pub(super) struct MustShouldSink<'a, C: Collector> {
 }
 
 impl<C: Collector> AndSink for MustShouldSink<'_, C> {
+    fn added_terms(&self) -> usize {
+        self.shoulds.len()
+    }
+
     fn bar(&self) -> f32 {
         // The AND walk's block-max arithmetic bounds the MUST portion
         // of a doc's score only, so the pruning bar is lowered by the
@@ -307,6 +318,11 @@ pub(super) struct ShouldBatch {
 }
 
 impl ShouldBatch {
+    /// The number of should terms.
+    pub(super) fn len(&self) -> usize {
+        self.shoulds.len()
+    }
+
     pub(super) fn new(shoulds: Vec<TermCursor>) -> Self {
         Self {
             shoulds,

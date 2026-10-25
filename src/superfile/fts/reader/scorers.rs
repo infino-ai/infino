@@ -515,6 +515,20 @@ fn must_lead_should_count(
 /// addition rounds by at most half an ulp, on either sum.
 const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
 
+/// The bar a bound is pruned against: `bar` lowered by the most a sum of
+/// `terms` non-negative scores changes with the order it is added in. A
+/// pruning test sums a doc's bounds in one order while its score is summed
+/// in another, so a bound can round a few ulps under the score it covers;
+/// pruning at this bar never drops a doc that beats `bar`, and admission
+/// still compares the real score with the real bar.
+#[inline(always)]
+pub(super) fn pruning_bar(bar: f32, terms: usize) -> f32 {
+    match bar.is_finite() {
+        true => bar - bar.abs() * (REASSOCIATION_ULPS_PER_TERM * terms as f32 * f32::EPSILON),
+        false => bar,
+    }
+}
+
 /// How many times fewer postings the optional terms must have over a
 /// required block's range than the block itself, for the must-led walk to
 /// collect theirs and score only the required docs among them.
@@ -598,18 +612,15 @@ fn must_lead_should_walk<C: Collector>(
     // The bar a doc must beat: the collector's k-th best once it is full (a
     // heap keeps it exact, a buffer at its last cut, never above the true
     // one), else the floor (`NEG_INFINITY` when there is none, which prunes
-    // nothing). Pruning sums a doc's bounds strongest term first while its
-    // score is summed in query order, so a bound can round a few ulps below
-    // the score it covers: prune against the bar lowered by that much, and
-    // leave admission to the collector's own test on the real score.
+    // nothing), lowered for pruning (see [`pruning_bar`]): bounds are summed
+    // strongest term first and scores in query order.
     let mut kth = f32::NEG_INFINITY;
-    let slack = REASSOCIATION_ULPS_PER_TERM * (m + 1) as f32 * f32::EPSILON;
     let bar = |heap: &C, kth: f32| -> f32 {
         let bar = match heap.is_full(k) {
             true => kth.max(floor_eff),
             false => floor_eff,
         };
-        bar - bar.abs() * slack
+        pruning_bar(bar, m + 1)
     };
     let mut threshold = bar(heap, kth);
     // The block batch's scratch: the block's candidates, their required
@@ -962,7 +973,7 @@ fn and_membership_scored_batched<S: AndSink>(
     let mut scores: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
     let mut tfs: Vec<u32> = Vec::with_capacity(BLOCK_LEN);
     while !driver.is_exhausted() {
-        let bar = sink.bar();
+        let bar = pruning_bar(sink.bar(), m + 1);
         let pruning = bar > f32::NEG_INFINITY;
         let start = driver.current_doc_id();
         let block_end = driver.current_block_last_doc_id();
@@ -1453,7 +1464,7 @@ impl FtsReader {
             let mut pivot_j: Option<usize> = None;
             for (j, &ci) in idx.iter().enumerate() {
                 accum_term_ub += cursors[ci].term_max_bm25;
-                if accum_term_ub > threshold {
+                if accum_term_ub > pruning_bar(threshold, cursors.len()) {
                     pivot_j = Some(j);
                     break;
                 }
@@ -1491,7 +1502,7 @@ impl FtsReader {
                 accum_block_ub += cursors[ci].inspect_block_max_bm25();
             }
 
-            if accum_block_ub <= threshold {
+            if accum_block_ub <= pruning_bar(threshold, cursors.len()) {
                 // No doc in [pivot_doc, smallest_pivot_block_end]
                 // can beat the kth-best score. Advance the leftmost
                 // cursor to the next interesting doc — either one
@@ -1953,7 +1964,7 @@ impl FtsReader {
             // doc can't beat the bar, skip to the smallest block boundary
             // across all cursors (past which a bound may rise). See
             // `block_max_and_bound`.
-            let bar = sink.bar();
+            let bar = pruning_bar(sink.bar(), cursors.len() + sink.added_terms());
             if bar > f32::NEG_INFINITY {
                 let leader_doc = cursors[0].current_doc_id();
                 let leader_block_max = cursors[0].current_block_max_bm25();
@@ -2107,7 +2118,7 @@ impl FtsReader {
             // Block-Max-AND pruning (scoring sinks only). Bound `c1` by the
             // single block covering the leader doc; if it can't beat the bar,
             // skip to the nearer block boundary. See `block_max_and_bound`.
-            let bar = sink.bar();
+            let bar = pruning_bar(sink.bar(), 2 + sink.added_terms());
             if bar > f32::NEG_INFINITY {
                 let leader_doc = c0.current_doc_id();
                 let leader_block_max = c0.current_block_max_bm25();
@@ -2252,6 +2263,10 @@ impl FtsReader {
         // starts from the floor instead of from zero. BM25 scores are
         // positive, so an unfloored run keeps the original 0.0 seed.
         let mut threshold: f32 = floor_eff.max(0.0);
+        // Bounds are tested against the threshold lowered for summing order
+        // (see [`pruning_bar`]); offers compare real scores with it.
+        let n_terms = cursors.len();
+        let pb = |t: f32| pruning_bar(t, n_terms);
 
         let recompute_f = |partial_max: &[f32], threshold: f32| -> usize {
             // Essential boundary: smallest f such that
@@ -2267,7 +2282,7 @@ impl FtsReader {
         // With a zero threshold only partial_max[n]=0 satisfies, so
         // f=n (all terms essential); a seeded floor can already shrink
         // the essential set before the first doc is scored.
-        let mut f_essential: usize = recompute_f(&partial_max, threshold);
+        let mut f_essential: usize = recompute_f(&partial_max, pb(threshold));
 
         // Total term-level UB. Used for the block-skip bound on
         // essential cursors below.
@@ -2292,7 +2307,7 @@ impl FtsReader {
                 // can't beat threshold, skip the block.
                 let block_ub = cursors[0].current_block_max_bm25()
                     + (total_term_ub - cursors[0].term_max_bm25);
-                if block_ub <= threshold {
+                if block_ub <= pb(threshold) {
                     let end = cursors[0].current_block_last_doc_id();
                     cursors[0].skip_to(end.saturating_add(1));
                     continue;
@@ -2331,7 +2346,7 @@ impl FtsReader {
                         c.shallow_advance_block_to(candidate);
                         others_ub += c.inspect_block_max_bm25();
                     }
-                    if essential_score + others_ub <= threshold {
+                    if essential_score + others_ub <= pb(threshold) {
                         cursors[0].next();
                         continue;
                     }
@@ -2358,7 +2373,7 @@ impl FtsReader {
                     }
 
                     if offer_top_k(&mut heap, k, &mut threshold, score, candidate) {
-                        let new_f = recompute_f(&partial_max, threshold);
+                        let new_f = recompute_f(&partial_max, pb(threshold));
                         if new_f != f_essential {
                             f_essential = new_f;
                             f_changed = true;
@@ -2434,7 +2449,7 @@ impl FtsReader {
                 }
                 others_ub += c.block_max_in_range(candidate, last_in_block);
             }
-            if leftmost_block_ub + others_ub <= threshold {
+            if leftmost_block_ub + others_ub <= pb(threshold) {
                 cursors[leftmost_essential].skip_to(last_in_block.saturating_add(1));
                 continue;
             }
@@ -2484,7 +2499,7 @@ impl FtsReader {
                 // but spares the `skip_to` cursor advances themselves —
                 // those are the dominant per-doc cost.
                 let non_essentials_term_ub = partial_max[f_essential];
-                if score + non_essentials_term_ub > threshold {
+                if score + non_essentials_term_ub > pb(threshold) {
                     // Tighter pre-bail using non-essential block_max
                     // (which is tighter than term_max). Use shallow
                     // advance — moves the lightweight inspect-block
@@ -2497,10 +2512,10 @@ impl FtsReader {
                         remaining_block_ub += cursor.inspect_block_max_bm25();
                     }
 
-                    if score + remaining_block_ub > threshold {
+                    if score + remaining_block_ub > pb(threshold) {
                         for cursor in cursors.iter_mut().skip(f_essential) {
                             let block_ub = cursor.inspect_block_max_bm25();
-                            if score + remaining_block_ub <= threshold {
+                            if score + remaining_block_ub <= pb(threshold) {
                                 break;
                             }
                             // Locate + score the non-essential without expanding
@@ -2525,7 +2540,7 @@ impl FtsReader {
                 // (max(): a seeded floor must never be lowered by a
                 // weaker local kth-best.)
                 if offer_top_k(&mut heap, k, &mut threshold, score, candidate) {
-                    f_essential = recompute_f(&partial_max, threshold);
+                    f_essential = recompute_f(&partial_max, pb(threshold));
                 }
             }
 
@@ -2897,6 +2912,9 @@ impl FtsReader {
             top_k_initial_capacity(k, u64::from(self.n_docs), Some((doc_id_start, doc_id_end)));
         let mut heap = C::with_capacity(k, initial_cap);
         let mut threshold: f32 = floor_eff.max(0.0);
+        // Bounds are tested against the threshold lowered for summing order
+        // (see [`pruning_bar`]); offers compare real scores with it.
+        let pb = |t: f32| pruning_bar(t, n);
         let mut scores = vec![0.0f32; OR_WINDOW as usize];
         let mut present = [0u64; OR_WINDOW_WORDS];
         // Leader-block positions that survive the batch bar, reused per block.
@@ -2931,7 +2949,7 @@ impl FtsReader {
         loop {
             // Continuous partition: recompute the essential set from the live
             // threshold. `threshold` only rises, so `f_essential` only shrinks.
-            let f_essential = recompute_f(&partial_max, threshold);
+            let f_essential = recompute_f(&partial_max, pb(threshold));
 
             // f==1 fast path: a single dominant essential. Process its blocks
             // per-candidate (block-skip + non-essential completion) with no
@@ -2955,7 +2973,7 @@ impl FtsReader {
                         .iter_mut()
                         .map(|c| c.block_max_in_range(start, end))
                         .sum();
-                    if lead[0].current_block_max_bm25() + others_ub <= threshold {
+                    if lead[0].current_block_max_bm25() + others_ub <= pb(threshold) {
                         lead[0].skip_to(end.saturating_add(1));
                         continue;
                     }
@@ -2991,7 +3009,7 @@ impl FtsReader {
                         // positions written left-packed from the mask: no
                         // lane's slot waits on the count of the lane before.
                         let keep = (f32x8::from(lanes) + f32x8::splat(block_others_ub))
-                            .simd_gt(f32x8::splat(threshold))
+                            .simd_gt(f32x8::splat(pb(threshold)))
                             .to_bitmask() as usize;
                         let pack = &LEFT_PACK[keep];
                         for (slot, &lane) in
@@ -3010,7 +3028,7 @@ impl FtsReader {
                             bm25::score_with_dl_norm_k1(c.idf_weight, tf, dl_norm_k1.get(d));
                         *slot = score;
                         survivors[n_survivors] = j as u16;
-                        n_survivors += usize::from(score + block_others_ub > threshold);
+                        n_survivors += usize::from(score + block_others_ub > pb(threshold));
                     }
                     // Complete the survivors the way a window drain does:
                     // strongest non-essential first, the survivors re-filtered
@@ -3039,14 +3057,16 @@ impl FtsReader {
                     complete_survivors(
                         non_ess,
                         &noness_suffix,
-                        threshold,
+                        pb(threshold),
                         &mut win_docs,
                         &mut win_scores,
                         dl_norm_k1,
                         &mut noness_tfs,
                     );
                     for (&doc, &score) in win_docs.iter().zip(&win_scores) {
-                        if heap.offer(k, &mut threshold, score, doc) && total_term_ub <= threshold {
+                        if heap.offer(k, &mut threshold, score, doc)
+                            && total_term_ub <= pb(threshold)
+                        {
                             // Not even every term at its maximum can beat the
                             // bar now: no later doc can either.
                             break;
@@ -3109,7 +3129,7 @@ impl FtsReader {
                         }
                         have_bound = true;
                     }
-                    if essential_score + others_ub <= threshold {
+                    if essential_score + others_ub <= pb(threshold) {
                         c0.next();
                         continue;
                     }
@@ -3131,7 +3151,7 @@ impl FtsReader {
                         if let Some(tf) = c.bitset_probe_tf(candidate) {
                             score += bm25::score_with_dl_norm_k1(c.idf_weight, tf, norm);
                         }
-                        if score + noness_suffix[i + 1] <= threshold {
+                        if score + noness_suffix[i + 1] <= pb(threshold) {
                             abandoned = true;
                             break;
                         }
@@ -3147,7 +3167,7 @@ impl FtsReader {
                     // doc can qualify at all. (Re-checking the partition per
                     // candidate — an O(n) scan — was the f==1 path's dominant
                     // cost on dense leader queries.)
-                    if raised && total_term_ub <= threshold {
+                    if raised && total_term_ub <= pb(threshold) {
                         break;
                     }
                 }
@@ -3252,7 +3272,7 @@ impl FtsReader {
                 f_essential
             } else if prune {
                 let weakest = f_essential - 1;
-                if win_ub[weakest] + noness_win > threshold {
+                if win_ub[weakest] + noness_win > pb(threshold) {
                     partial_win.copy_from_slice(&partial_max);
                     f_essential
                 } else {
@@ -3260,7 +3280,7 @@ impl FtsReader {
                     for i in (0..n).rev() {
                         partial_win[i] = partial_win[i + 1] + win_ub[i];
                     }
-                    let f = recompute_f(&partial_win, threshold);
+                    let f = recompute_f(&partial_win, pb(threshold));
                     let kept: f32 = win_docs_est[..f].iter().sum();
                     let demoted: f32 = win_docs_est[f..f_essential].iter().sum();
                     if f == 0 || demoted >= DEMOTE_DENSITY * kept.max(1.0) {
@@ -3321,9 +3341,10 @@ impl FtsReader {
                                 bound: c.current_block_max_bm25() + others_ub,
                             })
                         });
-                        if c.current_block_max_bm25() + others_ub <= threshold && (!sole || inside)
+                        if c.current_block_max_bm25() + others_ub <= pb(threshold)
+                            && (!sole || inside)
                         {
-                            c.skip_blocks_under(others_ub, threshold, window_end);
+                            c.skip_blocks_under(others_ub, pb(threshold), window_end);
                             continue;
                         }
                     }
@@ -3407,7 +3428,7 @@ impl FtsReader {
                 complete_survivors(
                     non_ess,
                     &partial_win[f_win..],
-                    threshold,
+                    pb(threshold),
                     &mut win_docs,
                     &mut win_scores,
                     dl_norm_k1,
@@ -5023,11 +5044,12 @@ mod tests {
         }
     }
 
-    /// The must-led walk prunes on a bound summed in one order and admits on a
-    /// score summed in another; its bar's slack must cover the gap. Sums of the
-    /// same non-negative terms in two orders stay within that slack of each other.
+    /// Pruning tests a bound summed in one order against a bar that a score
+    /// summed in another order must beat; [`pruning_bar`] must cover the gap.
+    /// Sums of the same non-negative terms in two orders stay above each
+    /// other's pruning bar.
     #[test]
-    fn reassociation_slack_covers_summing_in_another_order() {
+    fn pruning_bar_covers_summing_in_another_order() {
         let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
             x ^= x << 13;
@@ -5046,9 +5068,10 @@ mod tests {
             }
             let a: f32 = terms.iter().sum();
             let b: f32 = shuffled.iter().fold(0.0, |acc, &t| acc + t);
-            let slack = REASSOCIATION_ULPS_PER_TERM * n as f32 * f32::EPSILON;
+            // A sum in one order is never under the pruning bar of the same
+            // terms summed in another, so pruning never drops it.
             assert!(
-                a <= b + b * slack && b <= a + a * slack,
+                a > pruning_bar(b, n) && b > pruning_bar(a, n),
                 "{terms:?}: {a} vs {b}"
             );
         }
