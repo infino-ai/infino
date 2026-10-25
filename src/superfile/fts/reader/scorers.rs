@@ -1141,78 +1141,31 @@ fn word_beats(slots: &[f32], threshold: f32) -> bool {
     hit.iter().fold(0, |a, &h| a | h) != 0
 }
 
-/// Add `c`'s next postings into a union window whose slot 0 is doc `base`:
-/// eight per SIMD call where the block and the window both allow, else
-/// four, else one, then move the cursor past them. One step; the caller
-/// loops while the cursor is inside the window, checking whatever per-block
-/// bound it applies between steps. The cursor's current doc must be at or
-/// past `base` and before `window_end`.
+/// Add `c`'s current posting into a union window whose slot 0 is doc
+/// `base`, then move the cursor past it: the path for a lazily held block,
+/// whose buffer shows one doc. The cursor's current doc must be at or past
+/// `base` and before the window's end.
 #[inline(always)]
-fn accumulate_step(
+fn accumulate_one(
     c: &mut TermCursor,
     base: u32,
-    window_end: u32,
     scores: &mut [f32],
     present: &mut [u64],
     dl_norm_k1: &NormTable,
 ) {
     let d = c.current_doc_id();
-    let pos = c.pos;
-    // Eight postings per SIMD call where the block and window allow,
-    // then four, then one.
-    if pos + 8 <= c.block_n {
-        let dids: [u32; 8] = c.block_doc_ids[pos..pos + 8]
-            .try_into()
-            .expect("invariant: an 8-wide slice");
-        if dids[7] < window_end {
-            let tfs: [u32; 8] = c.block_tfs[pos..pos + 8]
-                .try_into()
-                .expect("invariant: an 8-wide slice");
-            let contributions = bm25::score_one_term_x8(c.idf_weight, tfs, dl_norm_k1.get8(dids));
-            mark_lanes(scores, present, base, dids, contributions);
-            c.advance_by(8);
-            return;
-        }
-    }
-    if pos + bm25::SCORE_SIMD_LANES <= c.block_n {
-        // Bind the 4-wide window as one subslice per array:
-        // the guard proves `pos + LANES <= block_n <= len`,
-        // so this is a single range check and the lane reads
-        // off the fixed-length-4 slice carry none — replacing
-        // the eight separate element bounds checks the direct
-        // `block_doc_ids[pos+i]` / `block_tfs[pos+i]` indexing
-        // emitted in this per-block SIMD group.
-        let dids = &c.block_doc_ids[pos..pos + bm25::SCORE_SIMD_LANES];
-        let doc_ids = [dids[0], dids[1], dids[2], dids[3]];
-        if doc_ids[bm25::SCORE_SIMD_LANES - 1] < window_end {
-            let tfs = &c.block_tfs[pos..pos + bm25::SCORE_SIMD_LANES];
-            let contributions = bm25::score_one_term_x4(
-                c.idf_weight,
-                [tfs[0], tfs[1], tfs[2], tfs[3]],
-                [
-                    dl_norm_k1.get(doc_ids[0]),
-                    dl_norm_k1.get(doc_ids[1]),
-                    dl_norm_k1.get(doc_ids[2]),
-                    dl_norm_k1.get(doc_ids[3]),
-                ],
-            );
-            mark_lanes(scores, present, base, doc_ids, contributions);
-            c.advance_by(bm25::SCORE_SIMD_LANES);
-            return;
-        }
-    }
     let local = (d - base) as usize;
     scores[local] += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), dl_norm_k1.get(d));
     present[local >> 6] |= 1u64 << (local & 63);
     c.next();
 }
 
-/// [`accumulate_step`] for the rest of the cursor's block inside the window
-/// at once: the postings before `window_end` found once, scored and marked
-/// eight at a time with no per-step bound or block checks, the cursor moved
-/// past them once. Each posting gets the same operations as in a step, so
-/// the same bits. Falls back to one step on a lazily held block, whose
-/// buffer shows a single doc.
+/// Add the rest of the cursor's block inside the window at once: the
+/// postings before `window_end` found once, scored and marked eight at a
+/// time with no per-posting bound or block checks, the cursor moved past
+/// them once. Each posting gets the same operations as scored alone, so the
+/// same bits. A lazily held block, whose buffer shows a single doc, adds
+/// that one posting.
 #[inline(always)]
 fn accumulate_segment(
     c: &mut TermCursor,
@@ -1223,7 +1176,7 @@ fn accumulate_segment(
     dl_norm_k1: &NormTable,
 ) {
     if !c.holds_whole_block() {
-        accumulate_step(c, base, window_end, scores, present, dl_norm_k1);
+        accumulate_one(c, base, scores, present, dl_norm_k1);
         return;
     }
     let (pos, n) = (c.pos, c.block_n);
