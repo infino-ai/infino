@@ -34,8 +34,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_RUN, block_encoding, decode_block,
-            decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
+            BLOCK_LEN, BlockHeader, ENCODING_RUN, decode_block, decode_block_doc_ids,
+            decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
     },
@@ -1963,74 +1963,6 @@ impl TermCursor {
             }
         }
     }
-
-    /// Tf for `doc` on a cursor a preceding [`Self::contains(doc)`] just confirmed
-    /// present. `contains` already advanced `current_block` to `doc`'s block (and,
-    /// on a PACKED block, decoded it), so this skips the block-advance and the
-    /// presence bit-test that [`Self::bitset_probe_tf`] repeats, doing only the tf
-    /// lookup: a popcount-rank into the tf array on a bitset block, or a binary
-    /// search over the decoded doc ids on a PACKED one. Only valid immediately
-    /// after `contains(doc)` returned `true` with no intervening advance.
-    ///
-    /// Kept at the end of the impl, past the doc-cursor hot methods
-    /// (`skip_to`, `next`, `decode_current_block`, `current_doc_id`), so adding
-    /// it doesn't shift their code offsets — those methods drive the flat-merge
-    /// AND path, which is measurably sensitive to its own instruction layout.
-    pub(super) fn tf_at_contained(&mut self, doc: u32) -> u32 {
-        // Pre-decoded (inline or short-form) cursor: locate in the buffer.
-        if self.predecoded {
-            let pos = self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .expect("contains(doc) confirmed presence");
-            return self.block_tfs[pos];
-        }
-        let block = self.blocks[self.current_block];
-        let hdr = self.current_header();
-        let raw = &self.bytes[block.block_byte_offset..block.block_byte_end];
-        if is_dense_encoding(hdr.encoding) {
-            let rank = Self::dense_rank(raw, &hdr, doc).expect("contains(doc) confirmed presence");
-            Self::bitset_tf_for_probe(
-                self.is_lazy(),
-                self.current_block,
-                &mut self.tf_decoded_block,
-                &mut self.block_tfs,
-                raw,
-                &hdr,
-                rank,
-            )
-        } else {
-            // PACKED: `contains` or a bare `seek_block` put the block cursor
-            // here; decode once if needed and locate the doc.
-            if self.decoded_block != self.current_block {
-                self.decode_current_block();
-            }
-            let pos = self.block_doc_ids[..self.block_n]
-                .binary_search(&doc)
-                .expect("doc confirmed present");
-            self.block_tfs[pos]
-        }
-    }
-
-    /// Whether this term's postings are stored in the dense **bitset** encoding,
-    /// sampled from the first block's encoding byte (a dense term's blocks are
-    /// uniformly bitset). When true, [`Self::contains`] answers by an O(1)
-    /// bit-test instead of a block decode — the signal a 2-term AND uses to
-    /// decide the membership walk beats the flat-merge's block expansion.
-    ///
-    /// `#[cold]`: called once per query at dispatch, not in a per-doc loop —
-    /// out-of-line so it stays clear of the hot doc-cursor methods' layout.
-    #[cold]
-    pub(super) fn is_bitset_dense(&self) -> bool {
-        if self.predecoded {
-            return false; // inline / short-form cursor: no block bytes
-        }
-        match self.blocks.first() {
-            Some(block) => is_dense_encoding(block_encoding(
-                &self.bytes[block.block_byte_offset..block.block_byte_end],
-            )),
-            None => false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -2043,7 +1975,7 @@ mod tests {
     use crate::superfile::fts::{
         bm25,
         builder::FtsBuilder,
-        posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+        posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, block_encoding},
         reader::{FtsReader, QueryIdf},
     };
 
@@ -2236,33 +2168,25 @@ mod tests {
             .await
             .expect("cursors");
         let tf_of = |doc: u32| 1 + doc % 5;
-        for probe in ["tf_at_contained", "bitset_probe_tf"] {
-            let mut c = cursors[0].clone();
-            c.skip_to(4_100);
-            assert_eq!(c.block_n, 1, "lazy hold");
-            assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
-            let got = match probe {
-                "tf_at_contained" => {
-                    assert!(c.contains(4_105));
-                    c.tf_at_contained(4_105)
-                }
-                _ => c.bitset_probe_tf(4_105).expect("present"),
-            };
-            assert_eq!(got, tf_of(4_105), "{probe}");
+        let mut c = cursors[0].clone();
+        c.skip_to(4_100);
+        assert_eq!(c.block_n, 1, "lazy hold");
+        assert_eq!((c.current_doc_id(), c.current_tf()), (4_100, tf_of(4_100)));
+        let got = c.bitset_probe_tf(4_105).expect("present");
+        assert_eq!(got, tf_of(4_105));
+        assert_eq!(
+            (c.current_doc_id(), c.current_tf()),
+            (4_100, tf_of(4_100)),
+            "the lazy doc must be intact after the probe"
+        );
+        // And the walk on from the lazy doc stays exact.
+        for d in 4_100..4_400 {
             assert_eq!(
                 (c.current_doc_id(), c.current_tf()),
-                (4_100, tf_of(4_100)),
-                "{probe}: the lazy doc must be intact after the probe"
+                (d, tf_of(d)),
+                "walk {d}"
             );
-            // And the walk on from the lazy doc stays exact.
-            for d in 4_100..4_400 {
-                assert_eq!(
-                    (c.current_doc_id(), c.current_tf()),
-                    (d, tf_of(d)),
-                    "{probe} walk {d}"
-                );
-                c.next();
-            }
+            c.next();
         }
     }
 
@@ -2316,8 +2240,8 @@ mod tests {
 
     /// A lazily published block must expand on demand for the callers
     /// that need the whole block: `materialize_at` (positions read the
-    /// block's tf array by pair index), `contains` and `tf_at_contained`
-    /// on the same block, and the doc-at-a-time walk that follows.
+    /// block's tf array by pair index), `contains` and `bitset_probe_tf` on
+    /// the same block, and the doc-at-a-time walk that follows.
     #[tokio::test]
     async fn lazy_block_expands_for_materialize_contains_and_walk() {
         let view = two_column_reader();
@@ -2358,11 +2282,11 @@ mod tests {
             c.next();
         }
 
-        // contains / tf_at_contained on a lazily entered block.
+        // contains / bitset_probe_tf on a lazily entered block.
         let mut c = cursors[0].clone();
         c.skip_to(4_100);
         assert!(c.contains(4_105));
-        assert_eq!(c.tf_at_contained(4_105), tf_of(4_105));
+        assert_eq!(c.bitset_probe_tf(4_105), Some(tf_of(4_105)));
         assert!(!c.contains(4_105 + 7_000));
     }
 
@@ -3126,7 +3050,10 @@ mod tests {
         let walked = walk_all(&cursors[0]);
         let expect_at = |t: u32| walked.iter().find(|(d, _)| *d >= t).copied();
         let mut c = cursors[0].clone();
-        assert!(c.is_bitset_dense(), "premise: a bitset-encoded term");
+        assert!(
+            is_dense_encoding(c.block_header(0).encoding),
+            "premise: a dense term"
+        );
         // The first block is decoded at construction, so the streak is
         // built in later blocks: a third skip into the same bitset block
         // expands it, and two such expansions in a row make the cursor
