@@ -68,6 +68,11 @@ fn filter_survivors(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usi
             return unsafe { filter_survivors_avx2(docs, scores, min_score) };
         }
     }
+    filter_survivors_scalar(docs, scores, min_score)
+}
+
+/// [`filter_survivors`] on any target, and where AVX2 is absent.
+fn filter_survivors_scalar(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usize {
     let mut out = 0usize;
     for i in 0..docs.len() {
         let keep = scores[i] >= min_score;
@@ -76,6 +81,35 @@ fn filter_survivors(docs: &mut [u32], scores: &mut [f32], min_score: f32) -> usi
         out += keep as usize;
     }
     out
+}
+
+/// [`filter_survivors`] over a candidate list, cut to its survivors.
+fn retain_survivors(docs: &mut Vec<u32>, scores: &mut Vec<f32>, min_score: f32) {
+    let n = filter_survivors(docs, scores, min_score);
+    docs.truncate(n);
+    scores.truncate(n);
+}
+
+/// Complete `docs`' scores with the non-essential `terms`, strongest first:
+/// before each term, drop the docs that cannot beat `threshold` even with
+/// that term and every later one at its bound (`suffix[i]` bounds `terms[i..]`),
+/// so each weaker term is probed over a shrinking list. `tfs` is scratch.
+fn complete_survivors(
+    terms: &mut [TermCursor],
+    suffix: &[f32],
+    threshold: f32,
+    docs: &mut Vec<u32>,
+    scores: &mut Vec<f32>,
+    dl_norm: &NormTable,
+    tfs: &mut Vec<u32>,
+) {
+    for (i, c) in terms.iter_mut().enumerate() {
+        retain_survivors(docs, scores, threshold - suffix[i]);
+        if docs.is_empty() {
+            break;
+        }
+        score_noness_batched(c, docs, scores, dl_norm, tfs);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1002,9 +1036,7 @@ fn and_membership_scored_batched<S: AndSink>(
         );
         driver.advance_by(to - from);
         if pruning {
-            let n = filter_survivors(&mut docs, &mut scores, bar - suffix[0]);
-            docs.truncate(n);
-            scores.truncate(n);
+            retain_survivors(&mut docs, &mut scores, bar - suffix[0]);
         }
         for (i, o) in others.iter_mut().enumerate() {
             if docs.is_empty() {
@@ -1046,9 +1078,7 @@ fn and_membership_scored_batched<S: AndSink>(
             docs.truncate(w);
             scores.truncate(w);
             if pruning && i + 1 < m {
-                let n = filter_survivors(&mut docs, &mut scores, bar - suffix[i + 1]);
-                docs.truncate(n);
-                scores.truncate(n);
+                retain_survivors(&mut docs, &mut scores, bar - suffix[i + 1]);
             }
         }
         for (&d, &s) in docs.iter().zip(scores.iter()) {
@@ -3126,25 +3156,15 @@ impl FtsReader {
                         noness_suffix[i] =
                             noness_suffix[i + 1] + non_ess[i].block_max_in_range(start, end);
                     }
-                    for (jj, c) in non_ess.iter_mut().enumerate() {
-                        let sv = filter_survivors(
-                            &mut win_docs,
-                            &mut win_scores,
-                            threshold - noness_suffix[jj],
-                        );
-                        win_docs.truncate(sv);
-                        win_scores.truncate(sv);
-                        if win_docs.is_empty() {
-                            break;
-                        }
-                        score_noness_batched(
-                            c,
-                            &win_docs,
-                            &mut win_scores,
-                            dl_norm_k1,
-                            &mut noness_tfs,
-                        );
-                    }
+                    complete_survivors(
+                        non_ess,
+                        &noness_suffix,
+                        threshold,
+                        &mut win_docs,
+                        &mut win_scores,
+                        dl_norm_k1,
+                        &mut noness_tfs,
+                    );
                     for (&doc, &score) in win_docs.iter().zip(&win_scores) {
                         if heap.offer(k, &mut threshold, score, doc) && total_term_ub <= threshold {
                             // Not even every term at its maximum can beat the
@@ -3523,25 +3543,16 @@ impl FtsReader {
             // budget) before each and batch-scoring matches — so weaker terms
             // touch a shrinking survivor set. While filling, every doc must be
             // admitted, so score all non-essentials over every candidate.
-            if heap_full && !non_ess.is_empty() {
-                let nn = non_ess.len();
-                for jj in 0..nn {
-                    // Max score still obtainable from non-essentials jj..nn.
-                    let bar = threshold - partial_win[f_win + jj];
-                    let sv = filter_survivors(&mut win_docs, &mut win_scores, bar);
-                    win_docs.truncate(sv);
-                    win_scores.truncate(sv);
-                    if win_docs.is_empty() {
-                        break;
-                    }
-                    score_noness_batched(
-                        &mut non_ess[jj],
-                        &win_docs,
-                        &mut win_scores,
-                        dl_norm_k1,
-                        &mut noness_tfs,
-                    );
-                }
+            if heap_full {
+                complete_survivors(
+                    non_ess,
+                    &partial_win[f_win..],
+                    threshold,
+                    &mut win_docs,
+                    &mut win_scores,
+                    dl_norm_k1,
+                    &mut noness_tfs,
+                );
             } else {
                 for c in non_ess.iter_mut() {
                     score_noness_batched(
@@ -5148,6 +5159,34 @@ mod tests {
         let mut s3 = scores0.clone();
         assert_eq!(filter_survivors(&mut d3, &mut s3, f32::NEG_INFINITY), 40);
         assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
+    }
+
+    /// The dispatched filter (AVX2 where present) and the scalar one keep the
+    /// same entries in the same order, across lengths that end on and off an
+    /// eight-lane boundary and bars that keep none, some and all.
+    #[test]
+    fn filter_survivors_dispatch_agrees_with_scalar() {
+        let mut x: u32 = 0x9E37_79B9;
+        for n in [0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 128, 129] {
+            let docs0: Vec<u32> = (0..n as u32).map(|i| i * 3).collect();
+            let scores0: Vec<f32> = (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x % 1000) as f32 / 100.0
+                })
+                .collect();
+            for min_score in [f32::NEG_INFINITY, 0.0, 2.5, 5.0, 9.99, f32::INFINITY] {
+                let (mut d1, mut s1) = (docs0.clone(), scores0.clone());
+                let (mut d2, mut s2) = (docs0.clone(), scores0.clone());
+                let n1 = filter_survivors(&mut d1, &mut s1, min_score);
+                let n2 = filter_survivors_scalar(&mut d2, &mut s2, min_score);
+                assert_eq!(n1, n2, "count at n={n} bar={min_score}");
+                assert_eq!(&d1[..n1], &d2[..n2], "docs at n={n} bar={min_score}");
+                assert_eq!(&s1[..n1], &s2[..n2], "scores at n={n} bar={min_score}");
+            }
+        }
     }
 
     #[tokio::test]
