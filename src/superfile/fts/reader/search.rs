@@ -1469,10 +1469,7 @@ impl FtsReader {
         // At a large `k` most docs the walk scores are admitted, and a heap's
         // sift per admission dominates; the buffer pays an append instead.
         let hits = match k >= BUFFERED_TOPK_MIN_K {
-            true => walk.run(
-                TopKBuffer::with_capacity(k, capacity),
-                filter,
-            ),
+            true => walk.run(TopKBuffer::with_capacity(k, capacity), filter),
             false => walk.run(
                 <BinaryHeap<TopKEntry> as Collector>::with_capacity(k, capacity),
                 filter,
@@ -2671,6 +2668,91 @@ mod tests {
             .await
             .expect("floored search");
         assert!(hits.is_empty(), "floor above all scores prunes everything");
+    }
+
+    /// A caller's floor prunes what scores at or below it and nothing else:
+    /// a floored search returns the unfloored ranking cut at the floor. The
+    /// corpus puts whole coarse spans of a long term under the floor (long
+    /// documents), one block inside such a span over it (short documents),
+    /// and the rest in between, so the walk skips by span, by block and by
+    /// document. Checked for one term, at a heap's `k` and a buffer's, and
+    /// for an AND with a negation at a buffer's `k`.
+    #[tokio::test]
+    async fn a_caller_floor_cuts_the_unfloored_ranking() {
+        const N_DOCS: u32 = 24_000;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let short = i >= N_DOCS / 2 || (5_000..5_128).contains(&i);
+            let mut text = String::from("w ");
+            if i % 3 != 0 {
+                text.push_str("v ");
+            }
+            if i % 7 == 0 {
+                text.push_str("x ");
+            }
+            let pad = if short {
+                i as usize % 4
+            } else {
+                40 + i as usize % 40
+            };
+            text.push_str(&"pad ".repeat(pad));
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let all = N_DOCS as usize;
+        let cut = |hits: Vec<(RowId, f32)>, floor: f32, k: usize| -> Vec<(RowId, f32)> {
+            hits.into_iter().filter(|h| h.1 > floor).take(k).collect()
+        };
+        let unfloored = r
+            .search_with_floor("body", &["w"], all, BoolMode::Or, f32::NEG_INFINITY)
+            .await
+            .expect("unfloored");
+        let floors = {
+            let mut scores: Vec<f32> = unfloored.iter().map(|h| h.1).collect();
+            scores.dedup();
+            [
+                scores[scores.len() / 4],
+                scores[scores.len() / 2],
+                scores[3 * scores.len() / 4],
+            ]
+        };
+        for floor in floors {
+            for k in [10, BUFFERED_TOPK_MIN_K + 100] {
+                let got = r
+                    .search_with_floor("body", &["w"], k, BoolMode::Or, floor)
+                    .await
+                    .expect("floored");
+                assert_eq!(
+                    got,
+                    cut(unfloored.clone(), floor, k),
+                    "single term k={k} floor={floor}"
+                );
+            }
+        }
+        let and = |k, floor| {
+            r.search_excluding(
+                "body",
+                ClauseLists {
+                    musts: &["w", "v"],
+                    negatives: &["x"],
+                    ..ClauseLists::default()
+                },
+                k,
+                floor,
+            )
+        };
+        let unfloored = and(all, f32::NEG_INFINITY).await.expect("unfloored and");
+        let k = BUFFERED_TOPK_MIN_K + 100;
+        for floor in [f32::NEG_INFINITY, unfloored[unfloored.len() / 2].1] {
+            let got = and(k, floor).await.expect("floored and");
+            assert_eq!(
+                got,
+                cut(unfloored.clone(), floor, k),
+                "and with a negation, floor={floor}"
+            );
+        }
     }
 
     #[tokio::test]
