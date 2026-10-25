@@ -32,7 +32,7 @@ use super::{
         ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
     },
     phrase::{AnyCursor, PhraseCursor},
-    scorers::count_and_planned,
+    scorers::{count_and_planned, df_total},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
@@ -281,7 +281,7 @@ impl PreparedClauses {
             PreparedClauses::MustShould { must_cursors, .. } => {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
-            PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
+            PreparedClauses::Or { cursors, .. } => df_total(cursors),
         }
     }
 
@@ -2049,7 +2049,7 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
     // ids into one doc-space bitset and popcount. Avoids the per-window
     // bookkeeping the walk below pays per doc.
-    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    let total_df = df_total(&cursors);
     let max_doc = cursors
         .iter()
         .filter_map(|c| c.blocks.last())

@@ -84,6 +84,7 @@ fn filter_survivors_scalar(docs: &mut [u32], scores: &mut [f32], min_score: f32)
 }
 
 /// [`filter_survivors`] over a candidate list, cut to its survivors.
+#[inline(always)]
 fn retain_survivors(docs: &mut Vec<u32>, scores: &mut Vec<f32>, min_score: f32) {
     let n = filter_survivors(docs, scores, min_score);
     docs.truncate(n);
@@ -94,6 +95,7 @@ fn retain_survivors(docs: &mut Vec<u32>, scores: &mut Vec<f32>, min_score: f32) 
 /// before each term, drop the docs that cannot beat `threshold` even with
 /// that term and every later one at its bound (`suffix[i]` bounds `terms[i..]`),
 /// so each weaker term is probed over a shrinking list. `tfs` is scratch.
+#[inline(always)]
 fn complete_survivors(
     terms: &mut [TermCursor],
     suffix: &[f32],
@@ -211,6 +213,7 @@ pub(super) fn score_noness_batched(
 /// term holds the doc, which the predictor cannot learn: a tf of 0 scores
 /// exactly 0, so it leaves the sum unchanged. The same bits as adding each
 /// posting's score alone.
+#[inline(always)]
 fn add_term_scores(
     idf_weight: f32,
     docs: &[u32],
@@ -291,6 +294,12 @@ pub(super) fn cursors_max_doc(cursors: &[TermCursor]) -> u32 {
 /// What probing costs, in postings read: the rarest term's every document,
 /// times each other term it is tested against, at
 /// [`count_probe_postings`] a test.
+/// The terms' document frequencies summed, saturating: a df comes from the
+/// term's stored metadata, and a corrupt one must not wrap a plan's cost.
+pub(super) fn df_total(cursors: &[TermCursor]) -> u64 {
+    cursors.iter().fold(0u64, |t, c| t.saturating_add(c.df))
+}
+
 pub(super) fn probe_cost(driver_df: u64, probes: usize) -> u64 {
     driver_df
         .saturating_mul(probes as u64)
@@ -301,8 +310,10 @@ pub(super) fn probe_cost(driver_df: u64, probes: usize) -> u64 {
 /// doc-space bitset, plus each bitset's words written and combined.
 pub(super) fn fold_cost(cursors: &[TermCursor], max_doc: u32) -> u64 {
     let words = u64::from(max_doc) / 64 + 1;
-    let reads: u64 = cursors.iter().map(|c| c.df).sum();
-    words.saturating_mul(cursors.len() as u64) + reads
+    let reads = df_total(cursors);
+    words
+        .saturating_mul(cursors.len() as u64)
+        .saturating_add(reads)
 }
 
 /// Intersection cardinality by whichever plan reads less: probe the other
@@ -341,9 +352,9 @@ pub(super) fn count_excluding(pos: Vec<TermCursor>, all: bool, neg: Vec<TermCurs
             pos.iter().map(|c| c.df).min().unwrap_or(0),
             pos.len() - 1 + neg.len(),
         ),
-        false => (pos.iter().map(|c| c.df).sum(), neg.len()),
+        false => (df_total(&pos), neg.len()),
     };
-    let fold = fold_cost(&pos, max_doc) + fold_cost(&neg, max_doc);
+    let fold = fold_cost(&pos, max_doc).saturating_add(fold_cost(&neg, max_doc));
     match fold < probe_cost(candidates, probes) {
         true => count_excluding_fold(pos, all, neg, max_doc),
         false => count_excluding_probe(pos, all, neg),
@@ -373,6 +384,9 @@ fn count_excluding_fold(
                 }
             }
         }
+    }
+    if neg.is_empty() {
+        return positive.iter().map(|w| u64::from(w.count_ones())).sum();
     }
     term.fill(0);
     for c in &neg {
