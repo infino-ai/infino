@@ -2686,10 +2686,10 @@ mod tests {
         for i in 0..N_DOCS {
             let short = i >= N_DOCS / 2 || (5_000..5_128).contains(&i);
             let mut text = String::from("w ");
-            if i % 3 != 0 {
+            if !i.is_multiple_of(3) {
                 text.push_str("v ");
             }
-            if i % 7 == 0 {
+            if i.is_multiple_of(7) {
                 text.push_str("x ");
             }
             let pad = if short {
@@ -2744,7 +2744,7 @@ mod tests {
         let unfloored = and(all, f32::NEG_INFINITY).await.expect("unfloored and");
         // The match set itself, independent of the walk: `v` where `i % 3 != 0`,
         // `x` where `i % 7 == 0`.
-        let matches = |i: u32| i % 3 != 0 && i % 7 != 0;
+        let matches = |i: u32| !i.is_multiple_of(3) && !i.is_multiple_of(7);
         assert_eq!(
             unfloored.len(),
             (0..N_DOCS).filter(|&i| matches(i)).count(),
