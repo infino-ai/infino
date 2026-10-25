@@ -53,7 +53,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
 
@@ -457,6 +457,16 @@ pub struct SupertableOptions {
     /// scan. Contiguous entries resolve by arithmetic and are never cached (no
     /// RAM). The interim of a write-time on-disk index (#556).
     pub(crate) gapped_id_placement_cache: Arc<TokioMutex<GappedIdPlacementCache>>,
+    /// User superfiles whose stable-id sidecar failed its checks, so cold
+    /// `_id` reads go straight to the column without fetching or warning
+    /// again. Superfiles are immutable, so a damaged sidecar stays damaged;
+    /// this outlives any one reader, which the cache can evict or stream.
+    pub(crate) damaged_id_sidecars: Arc<Mutex<HashSet<SuperfileUri>>>,
+    /// Rows per Parquet row group in the superfiles this table writes, in
+    /// place of the builder's default, so a test reaches several row groups
+    /// with a few thousand rows.
+    #[cfg(test)]
+    pub(crate) row_group_size: Option<usize>,
     /// Single-slot cache for the user table's fp32 fine centroids, hydrated
     /// once per manifest generation from the FULL manifest parts on the
     /// first stripped-summary rescore (consumers open with routing parts,
@@ -791,6 +801,9 @@ impl SupertableOptions {
             centroid_router_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             centroid_router_build_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
+            damaged_id_sidecars: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            row_group_size: None,
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
             prepopulate_cache_on_commit: true,
             partition_strategy: None,
@@ -1315,7 +1328,7 @@ pub(crate) fn builder_options_for(
         )
         .filter_map(|column| Some((column.to_owned(), schema.id_of(column)?)))
         .collect();
-    BuilderOptions::new(
+    let builder = BuilderOptions::new(
         schema.scalar_schema(&options.id_column),
         options.id_column.clone(),
         fts_configs,
@@ -1323,7 +1336,13 @@ pub(crate) fn builder_options_for(
     )
     .with_vector_layout(options.vector_layout)
     .with_schema_id(schema.schema_id())
-    .with_field_ids_outside_schema(outside_schema)
+    .with_field_ids_outside_schema(outside_schema);
+    #[cfg(test)]
+    let builder = BuilderOptions {
+        row_group_size: options.row_group_size.unwrap_or(builder.row_group_size),
+        ..builder
+    };
+    builder
 }
 
 impl SupertableOptions {

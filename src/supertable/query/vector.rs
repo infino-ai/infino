@@ -84,7 +84,7 @@ use datafusion::logical_expr::Expr;
 use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
-use tracing::Instrument;
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 pub use crate::superfile::reader::VectorSearchOptions;
@@ -99,6 +99,7 @@ use crate::{
     storage::io_counters,
     superfile::{
         SuperfileReader,
+        error::ReadError,
         fts::reader::BoolMode,
         id_space::RowId,
         vector::{
@@ -1921,9 +1922,10 @@ async fn build_gapped_placement_index(
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> Result<Arc<GappedPlacementIndex>, QueryError> {
     let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-    // Every row, so the scalar `_id` column: one contiguous chunk per row
-    // group. The inline region is stored per cell, so reading all of it costs
-    // one small read per cell, each rounded up to a whole cache block.
+    // Every row, so never the inline region: it is stored per cell, so
+    // reading all of it costs one small read per cell, each rounded up to a
+    // whole cache block. A cold file serves every row from its stable-id
+    // sidecar in one range; see `read_ids_for_locals`.
     let ids = read_ids_for_locals(manifest, entry, &locals, id_column, false, op_stats).await?;
     // Build scratch only, released the moment the sorted arrays are extracted.
     // The transient peak holds all three vectors at once — the decoded `ids`
@@ -2022,17 +2024,20 @@ pub(crate) async fn stable_ids_by_local_for_routing(
 /// superfile. Routed through the disk cache as a resident (mmap) read when a
 /// cache is attached; falls back to object-store range GETs on lazy readers.
 ///
-/// Both sources hold the same ids in the same row order; `allow_inline_region`
+/// Every source holds the same ids in the same row order; `allow_inline_region`
 /// picks the cheaper one for the rows asked for:
 ///
 ///   - `true`: the vector blob's inline `_id` region, stored once per cell.
 ///     Free when resident; cold, it costs one read per cell the rows touch,
 ///     so it suits a few rows.
-///   - `false`: the scalar `_id` column, one contiguous chunk per row group,
-///     so it suits many rows or a whole file.
+///   - `false`: the scalar `_id` column, one chunk per row group, read
+///     through its page index, so it suits rows spread over a file.
 ///
+/// Every row of a cold file comes from the packed stable-id sidecar instead,
+/// whichever is asked for: one contiguous range of a few bytes per row,
+/// where either source above costs a read per cell or per column chunk.
 /// A file whose vector blob carries rows the Parquet body does not (boundary
-/// stubs) always reads the scalar column; the inline order would not match.
+/// stubs) never reads the inline region; its order would not match.
 async fn read_ids_for_locals(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
@@ -2055,8 +2060,9 @@ async fn read_ids_for_locals(
     // diverges from Parquet row order and the shortcut would pair ids with
     // the wrong locals. Hidden cells keep the shortcut — their replicas are
     // real Parquet rows, so the counts (and orders) match.
-    let inline_is_parquet_ordered = reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
-    if allow_inline_region && inline_is_parquet_ordered {
+    let inline_usable =
+        allow_inline_region && reader.vec().is_none_or(|v| v.n_docs() == reader.n_docs());
+    if inline_usable {
         // The inline-region read is one planned range per file — the plan
         // requests it identically whether it resolves resident or cold.
         // Hidden cell superfiles inline the stable `_id` in the IVF blob — resolve
@@ -2092,6 +2098,17 @@ async fn read_ids_for_locals(
             }
             return Ok(ids);
         }
+    }
+    // Cold, and asked for every row: the sidecar holds them all in one
+    // range of a few bytes per row, where the inline region costs a read per
+    // cell and the column a read per row-group chunk (`id_sidecar_serves`
+    // says when it applies).
+    if reader.id_sidecar_serves(local_ids, id_column)
+        && let Some(ids) = ids_from_sidecar(manifest, entry, &reader, local_ids, op_stats).await?
+    {
+        return Ok(ids);
+    }
+    if inline_usable {
         // Cold path: fetch the inline region async when present but not resident.
         if let Some(v) = reader.vec()
             && let Some(ids) = v.inline_stable_ids_for_locals_async(local_ids).await?
@@ -2132,6 +2149,95 @@ async fn read_ids_for_locals(
         .await
         .map_err(QueryError::DataFusion)?;
     id_values_from_batch(&batch)
+}
+
+/// The `_id`s of `local_ids` from `reader`'s stable-id sidecar: one ranged
+/// read for the whole sidecar, decoded and checked on the reader pool
+/// (`IdSidecar::verified_ids`). `None` sends the caller to another source,
+/// which holds the same ids in the same row order:
+///
+///   - no sidecar, or one this table already found damaged;
+///   - the read failed: nothing is known about the sidecar's bytes, so it is
+///     not marked and a later read tries it again;
+///   - it does not decode or fails its checks: recorded in the table, so no
+///     later read fetches or warns about it again, through this reader or
+///     any that replaces it once the cache evicts this one.
+///
+/// A doc past the file's end is the caller's error, returned as such, and
+/// leaves the sidecar unmarked.
+async fn ids_from_sidecar(
+    manifest: &ManifestSnapshot,
+    entry: &SuperfileEntry,
+    reader: &SuperfileReader,
+    local_ids: &Arc<Vec<u32>>,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> Result<Option<Vec<i128>>, QueryError> {
+    let damaged = &manifest.options.damaged_id_sidecars;
+    if damaged.lock().is_ok_and(|set| set.contains(&entry.uri)) {
+        return Ok(None);
+    }
+    let sidecar = match reader.fetch_id_sidecar().await {
+        Ok(Some(sidecar)) => sidecar,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            warn!(
+                uri = ?entry.uri,
+                %error,
+                "reading _id from the column this time, the id sidecar fetch failed"
+            );
+            return Ok(None);
+        }
+    };
+    let locals = Arc::clone(local_ids);
+    let metadata = Arc::clone(reader.parquet_metadata());
+    let id_column = reader.id_column().to_string();
+    let id_range = (entry.id_min, entry.id_max);
+    let (decoded, decode_ns) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "id sidecar decode: reader pool dropped result",
+        move || {
+            op_stats::timed_section(|| {
+                let every = sidecar.verified_ids(&metadata, &id_column, id_range)?;
+                locals
+                    .iter()
+                    .map(|&doc_id| {
+                        every
+                            .get(doc_id as usize)
+                            .copied()
+                            .ok_or(ReadError::DocIdOutOfRange {
+                                doc_id,
+                                n_docs: every.len() as u64,
+                            })
+                    })
+                    .collect::<Result<Vec<i128>, ReadError>>()
+            })
+        },
+    )
+    .await
+    .map_err(|e| QueryError::Internal(e.to_string()))?;
+    if let Some(stats) = op_stats {
+        stats.add_kernel_cpu_ns(decode_ns);
+    }
+    match decoded {
+        Ok(ids) => {
+            if let Some(stats) = op_stats {
+                stats.add_planned_read_ranges(1);
+            }
+            Ok(Some(ids))
+        }
+        Err(error @ ReadError::DocIdOutOfRange { .. }) => Err(QueryError::from(error)),
+        Err(error) => {
+            if let Ok(mut set) = damaged.lock() {
+                set.insert(entry.uri);
+            }
+            warn!(
+                uri = ?entry.uri,
+                %error,
+                "reading _id from the column, the id sidecar is damaged"
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// Remap step 1 (deduped): resolve the user `_id` that dual-write stamped into
@@ -7979,11 +8085,18 @@ mod tests {
     use std::{
         borrow::Cow,
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-        sync::Arc,
+        fs,
+        path::Path,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use arrow::array::Array;
+    use async_trait::async_trait;
     use bytes::Bytes;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     use super::IndexOutcome;
     use crate::{
@@ -8009,24 +8122,27 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     use super::{
-        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, SCORE_COLUMN,
-        ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
+        CentroidRouterGraph, IndexUnavailable, RABITQ_ADMIT_CELL_SHORTLIST_MIN, ReadIntent,
+        SCORE_COLUMN, ScanCandidate, VectorFilter, VectorSearchOptions, admit_extension_round,
         admit_shortlist_window, apply_width_pin, assemble_flat_sections, assemble_hnsw_sections,
         build_centroid_router, calibrated_query_for, cells_ranked_by_fine_score,
-        decode_centroid_router_section, encode_centroid_router_section, free_column_slot,
+        decode_centroid_router_section, dispatch, encode_centroid_router_section, free_column_slot,
         free_columns_unambiguous, gate_fine_candidates_by_fragment, gfc_prepare_for_metric,
         gfc_unit_normalize, hidden_hits_user_ids, id_score_projection_indices,
-        is_hidden_vector_manifest, law_floor_serve_selection, lookup_user_placements_by_id,
-        postings_by_cell_from_summaries, read_ids_for_locals, rerank_mult_from_law,
-        score_fine_candidates, select_global_shortlist, union_cell_selection,
+        id_values_from_batch, is_hidden_vector_manifest, law_floor_serve_selection,
+        lookup_user_placements_by_id, postings_by_cell_from_summaries, read_ids_for_locals,
+        rerank_mult_from_law, score_fine_candidates, select_global_shortlist,
+        take_rows_byte_source, union_cell_selection,
     };
     use crate::{
         BoolMode, InfinoError,
         config::{CompactionSettings, OptimizeOptions},
         superfile::{
-            SuperfileReader,
+            BytesLazyByteSource, LazyByteSource, LazyByteSourceError, SuperfileReader,
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             error::{ReadError, VectorError},
+            format::{footer::read_kv_metadata, kv},
+            ids::{with_damaged_id_block, with_shifted_id_block},
             vector::{
                 distance::Metric,
                 flat::Sq4FlatIndex,
@@ -8043,10 +8159,13 @@ mod tests {
                 list::{CellRoutingParams, PartitionStrategy},
             },
             query::vector::global_fine_shortlist_limit,
+            reader_cache::{ReaderCacheError, SuperfileReaderCache},
             slow_vector_state::{ResidentIndexKind, write_resident_index_blob},
             writer::{recalibrate_probe_laws, split_overflow_cell},
         },
-        test_helpers::{distinct_unit_vectors, lazy_foreground_disk_cache},
+        test_helpers::{
+            distinct_unit_vectors, lazy_disk_cache_without_promotion, lazy_foreground_disk_cache,
+        },
     };
 
     /// Drive an async future to completion on a throwaway current-thread
@@ -9140,12 +9259,11 @@ mod tests {
     /// Vector width in the cold placement-build test; wide vectors spread the
     /// cells' inline `_id` regions across the blob.
     const COLD_PLACEMENT_DIM: usize = 128;
-    /// GETs the cold placement build may take: the `_id` chunk of the one row
-    /// group, plus its page index if the open did not already fetch it.
-    const COLD_PLACEMENT_MAX_GETS: u64 = 2;
+    /// GETs the cold placement build may take: the id sidecar's one range.
+    const COLD_PLACEMENT_MAX_GETS: u64 = 1;
 
     #[test]
-    fn a_cold_placement_build_reads_the_id_column_not_every_cell() {
+    fn a_cold_placement_build_reads_ids_in_one_range_not_every_cell() {
         let dim = COLD_PLACEMENT_DIM;
         let schema = schema_with_vector(dim);
         let dir = TempDir::new().expect("tempdir");
@@ -9188,14 +9306,442 @@ mod tests {
         ))
         .expect("placements");
         let io = local.usage_meter().snapshot().since(&before);
-        // The `_id` chunk of the file's one row group. Reading the cells'
-        // inline regions instead took 109 GETs and 56 MB here.
+        // One range for every id. Reading the cells' inline regions instead
+        // took 109 GETs and 56 MB here.
         assert!(
             io.get_count <= COLD_PLACEMENT_MAX_GETS,
-            "a cold placement build must read the `_id` column, not every cell: {io:?}"
+            "a cold placement build must read ids in one range, not every cell: {io:?}"
         );
 
         assert_places_every_row(manifest);
+    }
+
+    /// Row groups in the cold sidecar tests' file, so the `_id` column is
+    /// that many chunks with the other columns' between them.
+    const SIDECAR_PLACEMENT_ROW_GROUPS: usize = 4;
+    /// Rows per row group in the cold sidecar tests: few, so the file builds
+    /// in well under a second.
+    const SIDECAR_PLACEMENT_ROW_GROUP_ROWS: usize = 2048;
+    /// Rows in the cold sidecar tests' file.
+    const SIDECAR_PLACEMENT_ROWS: usize =
+        SIDECAR_PLACEMENT_ROW_GROUPS * SIDECAR_PLACEMENT_ROW_GROUP_ROWS;
+    /// Seed for the cold sidecar tests' random titles, so a run is
+    /// repeatable.
+    const SIDECAR_PLACEMENT_SEED: u64 = 7;
+    /// Vector width in the cold sidecar tests; the smallest the options
+    /// accept, since only the id read is measured.
+    const SIDECAR_PLACEMENT_DIM: usize = 16;
+    /// Random 64-bit words per title in the cold sidecar tests: enough
+    /// incompressible text that each row group's title chunk outgrows the
+    /// smallest GET, so the `_id` chunks are fetched apart, as they are on any
+    /// table that stores text.
+    const SIDECAR_PLACEMENT_TITLE_WORDS: usize = 20;
+    /// GETs a cold every-row id read may take once the file carries an id
+    /// sidecar: the one contiguous sidecar range.
+    const SIDECAR_PLACEMENT_MAX_GETS: u64 = 1;
+
+    /// `n` rows whose titles are random hex, `SIDECAR_PLACEMENT_TITLE_WORDS`
+    /// words each, deterministic per row; vectors as `build_vector_batch`.
+    fn wide_title_batch(n: usize, dim: usize, schema: Arc<Schema>) -> RecordBatch {
+        // Seeded random words: they neither compress nor change between runs.
+        let mut rng = StdRng::seed_from_u64(SIDECAR_PLACEMENT_SEED);
+        let titles: Vec<String> = (0..n)
+            .map(|_| {
+                (0..SIDECAR_PLACEMENT_TITLE_WORDS)
+                    .map(|_| format!("{:016x}", rng.random::<u64>()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        let vectors = build_vector_batch(0, n, dim, Arc::clone(&schema));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::clone(vectors.column(1)),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// Options for the cold sidecar tests: one superfile per commit, with
+    /// row groups of `SIDECAR_PLACEMENT_ROW_GROUP_ROWS` rows.
+    fn sidecar_test_options() -> SupertableOptions {
+        let mut opts = options_one_superfile_per_commit(SIDECAR_PLACEMENT_DIM);
+        opts.row_group_size = Some(SIDECAR_PLACEMENT_ROW_GROUP_ROWS);
+        opts
+    }
+
+    /// Commit the cold sidecar tests' one file to `storage`.
+    fn write_sidecar_test_file(storage: &Arc<dyn StorageProvider>) {
+        let st = Supertable::create(sidecar_test_options().with_storage(Arc::clone(storage)))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&wide_title_batch(
+            SIDECAR_PLACEMENT_ROWS,
+            SIDECAR_PLACEMENT_DIM,
+            schema_with_vector(SIDECAR_PLACEMENT_DIM),
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// The table in `storage` over a fresh disk cache that never promotes a
+    /// held reader, so every read starts cold and stays lazy. The directory
+    /// guard keeps the cache alive.
+    fn open_cold(storage: &Arc<dyn StorageProvider>) -> (Supertable, TempDir) {
+        let cache_dir = TempDir::new().expect("cache dir");
+        let cache = lazy_disk_cache_without_promotion(Arc::clone(storage), cache_dir.path());
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(Arc::clone(storage))
+                .with_disk_cache(cache),
+        )
+        .expect("open cold");
+        (st, cache_dir)
+    }
+
+    /// Open `entry`'s reader the way the id read does, so a test can count
+    /// only the GETs of the read itself.
+    fn open_entry(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Arc<SuperfileReader> {
+        block_on(dispatch::open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        ))
+        .expect("open the superfile")
+    }
+
+    /// Every row's `_id` of the superfile at `path`, read from its Parquet
+    /// `_id` column straight from the file's bytes: an oracle that shares no
+    /// reader or cache with the read it checks.
+    fn column_ids_of(path: &Path) -> Vec<i128> {
+        let bytes = Bytes::from(fs::read(path).expect("read the superfile"));
+        let reader = SuperfileReader::open(bytes).expect("open the superfile");
+        let every: Vec<u32> = (0..reader.n_docs() as u32).collect();
+        let id_column = reader.id_column().to_string();
+        let batch = reader
+            .take_by_local_doc_ids_from_parquet(&every, &[id_column.as_str()])
+            .expect("read the `_id` column");
+        id_values_from_batch(&batch).expect("decimal `_id`")
+    }
+
+    /// Every row's `_id` of `entry`, read the way a placement build reads it.
+    fn every_row_id(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Vec<i128> {
+        let every = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+        block_on(read_ids_for_locals(
+            manifest,
+            entry,
+            &every,
+            &manifest.options.id_column,
+            false,
+            &None,
+        ))
+        .expect("every row's id")
+    }
+
+    /// The one superfile under `root`'s data directory, found without opening
+    /// the table, so nothing reads it before a test edits it.
+    fn only_data_file(root: &Path) -> std::path::PathBuf {
+        let mut files: Vec<_> = fs::read_dir(root.join("data"))
+            .expect("data directory")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(files.len(), 1, "one superfile");
+        files.remove(0)
+    }
+
+    /// Where the superfile at `path` keeps its id sidecar, from its footer.
+    fn sidecar_range_of(path: &Path) -> (u64, u64) {
+        let bytes = fs::read(path).expect("read the superfile");
+        let kvs = read_kv_metadata(&bytes).expect("superfile footer");
+        let at = |key: &str| -> u64 { kvs[key].parse().expect("a byte offset") };
+        let offset = at(kv::IDS_OFFSET);
+        (offset, offset + at(kv::IDS_LENGTH))
+    }
+
+    /// A cold placement build over a file with several row groups reads the
+    /// stable-id sidecar, one range of a few bytes per row, rather than the
+    /// `_id` column's chunk in every row group.
+    #[test]
+    fn a_cold_placement_build_reads_the_id_sidecar_in_one_range() {
+        let dir = TempDir::new().expect("tempdir");
+        let local = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), UsageMeter::new()).expect("storage"),
+        );
+        let storage: Arc<dyn StorageProvider> = local.clone();
+        write_sidecar_test_file(&storage);
+
+        let (st, _cache_dir) = open_cold(&storage);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(entry.vector_layout, VectorLayout::MultiCellIvf);
+        open_entry(manifest, &entry);
+        let before = local.usage_meter().snapshot();
+        block_on(lookup_user_placements_by_id(
+            manifest,
+            &[entry.id_min, entry.id_max],
+            &None,
+        ))
+        .expect("placements");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The `_id` column instead costs a GET per row-group chunk, and more
+        // where its pages are fetched apart.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "a cold placement build must read the id sidecar in one range: {io:?}"
+        );
+        assert_places_every_row(manifest);
+
+        // Routing asks for every row with the inline region allowed; cold, the
+        // sidecar still serves it in one range rather than a read per cell.
+        let (st, _cache_dir) = open_cold(&storage);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        open_entry(manifest, &entry);
+        let every_row = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
+        let before = local.usage_meter().snapshot();
+        let ids = block_on(read_ids_for_locals(
+            manifest,
+            &entry,
+            &every_row,
+            &manifest.options.id_column,
+            true,
+            &None,
+        ))
+        .expect("every row's id");
+        let io = local.usage_meter().snapshot().since(&before);
+        // The inline region instead costs a GET per cell.
+        assert!(
+            io.get_count <= SIDECAR_PLACEMENT_MAX_GETS,
+            "an every-row read must take the sidecar before the inline region: {io:?}"
+        );
+        assert_eq!(
+            ids,
+            parquet_column_ids(manifest, &entry),
+            "the sidecar's ids, row for row, are the `_id` column's"
+        );
+    }
+
+    /// A source over a superfile's bytes that counts the reads of exactly its
+    /// id sidecar (the open's own footer read may overlap the sidecar and is
+    /// not one) and can fail them, standing in for object storage so a test
+    /// decides what the sidecar read returns.
+    struct SidecarSource {
+        inner: BytesLazyByteSource,
+        sidecar: (u64, u64),
+        fail: bool,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for SidecarSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            if (start, start + len) == self.sidecar {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.fail {
+                    return Err(LazyByteSourceError::OutOfBounds {
+                        start,
+                        len,
+                        size: 0,
+                    });
+                }
+            }
+            self.inner.range(start, len).await
+        }
+    }
+
+    /// A reader cache that holds one prebuilt reader, so a table's own id
+    /// read goes through a reader whose byte source the test controls.
+    struct OneReader {
+        uri: SuperfileUri,
+        reader: StdMutex<Arc<SuperfileReader>>,
+    }
+
+    impl OneReader {
+        fn new(uri: SuperfileUri, reader: Arc<SuperfileReader>) -> Self {
+            Self {
+                uri,
+                reader: StdMutex::new(reader),
+            }
+        }
+
+        /// Swap in `reader`, as the cache does when it evicts a file and
+        /// opens it again.
+        fn replace(&self, reader: Arc<SuperfileReader>) {
+            *self.reader.lock().expect("lock") = reader;
+        }
+    }
+
+    impl SuperfileReaderCache for OneReader {
+        fn reader(&self, uri: &SuperfileUri) -> Result<Arc<SuperfileReader>, ReaderCacheError> {
+            match *uri == self.uri {
+                true => Ok(Arc::clone(&self.reader.lock().expect("lock"))),
+                false => Err(ReaderCacheError::NotFound { uri: *uri }),
+            }
+        }
+
+        fn insert(&self, _uri: SuperfileUri, _bytes: Bytes) -> Result<(), ReaderCacheError> {
+            Ok(())
+        }
+
+        fn resident_bytes(&self) -> usize {
+            0
+        }
+    }
+
+    /// A lazy reader over `source`.
+    fn lazy_reader_over(source: &Arc<SidecarSource>) -> Arc<SuperfileReader> {
+        let source: Arc<dyn LazyByteSource> = source.clone();
+        Arc::new(block_on(SuperfileReader::open_lazy(source)).expect("open lazy"))
+    }
+
+    /// What the cold sidecar tests read through: the table, its one-reader
+    /// cache, the source behind that reader, the `_id` column of the file as
+    /// written (read straight from its bytes), and the table's directory.
+    struct SidecarTable {
+        st: Supertable,
+        cache: Arc<OneReader>,
+        source: Arc<SidecarSource>,
+        want: Vec<i128>,
+        _dir: TempDir,
+    }
+
+    /// The cold sidecar tests' file read through a lazy reader over its bytes
+    /// (as written, or damaged by `damage`), whose sidecar reads fail when
+    /// `fail` is set.
+    fn table_over_sidecar_source(
+        damage: Option<fn(&[u8], usize) -> Vec<u8>>,
+        fail: bool,
+    ) -> SidecarTable {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        write_sidecar_test_file(&storage);
+        let path = only_data_file(dir.path());
+        let want = column_ids_of(&path);
+        let written = fs::read(&path).expect("read the superfile");
+        let bytes = match damage {
+            Some(damage) => damage(&written, 0),
+            None => written,
+        };
+        let source = Arc::new(SidecarSource {
+            inner: BytesLazyByteSource::new(Bytes::from(bytes)),
+            sidecar: sidecar_range_of(&path),
+            fail,
+            reads: AtomicUsize::new(0),
+        });
+        let probe = Supertable::open(sidecar_test_options().with_storage(Arc::clone(&storage)))
+            .expect("open");
+        let uri = probe.reader().expect("reader").manifest().superfiles[0].uri;
+        let cache = Arc::new(OneReader::new(uri, lazy_reader_over(&source)));
+        let store: Arc<dyn SuperfileReaderCache> = cache.clone();
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(storage)
+                .with_store(store),
+        )
+        .expect("open over the test's reader");
+        SidecarTable {
+            st,
+            cache,
+            source,
+            want,
+            _dir: dir,
+        }
+    }
+
+    /// A sidecar read that fails falls back to the `_id` column for that read
+    /// only: the answer is the column's, the sidecar is not taken for
+    /// damaged, and the next read tries the sidecar again.
+    #[test]
+    fn a_failed_sidecar_fetch_reads_the_column_and_keeps_the_sidecar() {
+        let SidecarTable {
+            st,
+            source,
+            want,
+            _dir: _keep_dir,
+            ..
+        } = table_over_sidecar_source(None, true);
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(every_row_id(manifest, &entry), want, "the column answers");
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "the sidecar was tried"
+        );
+        assert!(
+            !manifest
+                .options
+                .damaged_id_sidecars
+                .lock()
+                .expect("lock")
+                .contains(&entry.uri),
+            "a failed read says nothing about the sidecar's bytes"
+        );
+        assert_eq!(every_row_id(manifest, &entry), want);
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            2,
+            "the next read tries the sidecar again"
+        );
+    }
+
+    /// A sidecar that does not decode, or decodes to ids the footer disagrees
+    /// with, is read once: the answer is the column's, the table remembers
+    /// the file, and a later read does not fetch the sidecar again, even
+    /// through a new reader after the cache evicted the first.
+    #[test]
+    fn a_damaged_sidecar_is_read_once_then_the_column_answers() {
+        type Damage = fn(&[u8], usize) -> Vec<u8>;
+        let damages: [(&str, Damage); 2] = [
+            ("a block that does not decode", with_damaged_id_block),
+            ("a block of wrong ids", with_shifted_id_block),
+        ];
+        for (what, damage) in damages {
+            let SidecarTable {
+                st,
+                cache,
+                source,
+                want,
+                _dir: _keep_dir,
+            } = table_over_sidecar_source(Some(damage), false);
+            let reader = st.reader().expect("reader");
+            let manifest = reader.manifest();
+            let entry = Arc::clone(&manifest.superfiles[0]);
+            assert_eq!(
+                every_row_id(manifest, &entry),
+                want,
+                "{what}: the column answers"
+            );
+            assert_eq!(source.reads.load(Ordering::Relaxed), 1, "{what}");
+            assert!(
+                manifest
+                    .options
+                    .damaged_id_sidecars
+                    .lock()
+                    .expect("lock")
+                    .contains(&entry.uri),
+                "{what}: the table remembers the damaged sidecar"
+            );
+            cache.replace(lazy_reader_over(&source));
+            assert_eq!(every_row_id(manifest, &entry), want, "{what}");
+            assert_eq!(
+                source.reads.load(Ordering::Relaxed),
+                1,
+                "{what}: a damaged sidecar is not fetched again"
+            );
+        }
     }
 
     /// Rows per commit in the merged-file placement test.
@@ -9250,17 +9796,90 @@ mod tests {
         assert_places_every_row(manifest);
     }
 
+    /// A sidecar written by compaction is read cold like a commit's: from the
+    /// sidecar, once, with the same ids, row for row, as the merged file's
+    /// `_id` column.
+    #[test]
+    fn a_merged_files_sidecar_is_read_cold() {
+        let dim = SIDECAR_PLACEMENT_DIM;
+        let schema = schema_with_vector(dim);
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let uri = {
+            let st = Supertable::create(sidecar_test_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+            for _ in 0..MERGED_PLACEMENT_COMMITS {
+                let mut w = st.writer().expect("writer");
+                w.append(&wide_title_batch(
+                    SIDECAR_PLACEMENT_ROW_GROUP_ROWS,
+                    dim,
+                    schema.clone(),
+                ))
+                .expect("append");
+                w.commit().expect("commit");
+            }
+            st.optimize(&OptimizeOptions::compact(CompactionSettings {
+                min_superfiles_for_merge: MERGE_AT_FRAGMENTS,
+                ..CompactionSettings::default()
+            }))
+            .expect("optimize");
+            let reader = st.reader().expect("reader");
+            assert_eq!(reader.manifest().superfiles.len(), 1, "the commits merged");
+            reader.manifest().superfiles[0].uri
+        };
+        let path = dir.path().join(uri.storage_path());
+        let source = Arc::new(SidecarSource {
+            inner: BytesLazyByteSource::new(Bytes::from(fs::read(&path).expect("read"))),
+            sidecar: sidecar_range_of(&path),
+            fail: false,
+            reads: AtomicUsize::new(0),
+        });
+        let st = Supertable::open(
+            sidecar_test_options()
+                .with_storage(storage)
+                .with_store(Arc::new(OneReader::new(uri, lazy_reader_over(&source)))),
+        )
+        .expect("open over the test's reader");
+        let reader = st.reader().expect("reader");
+        let manifest = reader.manifest();
+        let entry = Arc::clone(&manifest.superfiles[0]);
+        assert_eq!(every_row_id(manifest, &entry), column_ids_of(&path));
+        assert_eq!(
+            source.reads.load(Ordering::Relaxed),
+            1,
+            "the cold read took the merged file's sidecar"
+        );
+    }
+
+    /// Every row's `_id` of `entry`, read from the Parquet `_id` column
+    /// itself: the oracle the placement map is checked against, independent
+    /// of the stable-id sidecar the map is built from.
+    fn parquet_column_ids(manifest: &ManifestSnapshot, entry: &SuperfileEntry) -> Vec<i128> {
+        let reader = block_on(dispatch::open_reader(
+            &manifest.options.store,
+            manifest.options.disk_cache.as_ref(),
+            manifest.options.storage.as_ref(),
+            entry,
+            ReadIntent::Stream,
+        ))
+        .expect("open the superfile");
+        let locals: Vec<u32> = (0..entry.n_docs as u32).collect();
+        let batch = block_on(take_rows_byte_source(
+            &reader,
+            &locals,
+            &[manifest.options.id_column.as_str()],
+        ))
+        .expect("read the `_id` column");
+        id_values_from_batch(&batch).expect("decimal `_id`")
+    }
+
     /// Place every id in the table and check each lands on its own row. The
-    /// rows' ids are read from the cells' inline `_id` regions, the source the
-    /// map no longer reads, so the two must agree on row order.
+    /// rows' ids come from the Parquet `_id` column, not the sidecar the map
+    /// is built from, so the two must agree on row order.
     fn assert_places_every_row(manifest: &ManifestSnapshot) {
-        let id_column = manifest.options.id_column.as_str();
         for entry in manifest.superfiles.iter() {
-            let locals = Arc::new((0..entry.n_docs as u32).collect::<Vec<u32>>());
-            let ids = block_on(read_ids_for_locals(
-                manifest, entry, &locals, id_column, true, &None,
-            ))
-            .expect("inline ids");
+            let ids = parquet_column_ids(manifest, entry);
             let placed =
                 block_on(lookup_user_placements_by_id(manifest, &ids, &None)).expect("placements");
             for (local, (owner, placed_local)) in placed.iter().enumerate() {

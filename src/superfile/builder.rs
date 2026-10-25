@@ -710,7 +710,7 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
 fn rebuild_id_sidecar(source: &SuperfileReader) -> Result<Vec<u8>, BuildError> {
     let docs: Vec<u32> = (0..source.n_docs() as u32).collect();
     let batch = source
-        .take_by_local_doc_ids(&docs, &[source.id_column()])
+        .take_by_local_doc_ids_from_parquet(&docs, &[source.id_column()])
         .map_err(Error::other)?;
     let mut raw = Vec::new();
     if !append_stable_id_sidecar(&mut raw, &batch, source.id_column()) {

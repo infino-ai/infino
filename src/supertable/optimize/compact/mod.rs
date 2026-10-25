@@ -12,6 +12,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     mem,
+    pin::pin,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -22,7 +23,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::{
-    future::BoxFuture,
+    future::{BoxFuture, Fuse, FusedFuture, FutureExt},
     stream::{self, StreamExt},
 };
 use rand::random_range;
@@ -1412,22 +1413,45 @@ impl Supertable {
     /// commit each as it finishes.
     ///
     /// Merges are admitted one at a time against the host and committed when
-    /// ready, taking along whatever else has finished, so a serial pass (the
-    /// default `concurrency` of 1) is prepare-commit-refresh per job, exactly
-    /// as before. A merge that fails, or a batch whose commit is dropped, does
-    /// not cost the others their work: the rest still merge and commit. The
-    /// first failed merge, lost input, or the dropped batch that stopped the
-    /// pass surfaces after. Otherwise returns how many jobs were dropped at
-    /// commit.
+    /// ready, taking along whatever else has finished. One commit runs at a
+    /// time, beside the merges rather than in front of them: while it runs,
+    /// merges keep starting and the ones that finish wait for the next batch.
+    /// A finished merge holds its output in memory until it commits, so the
+    /// ones waiting count against `concurrency` just like the ones running.
+    /// A merge that fails, or a batch whose commit is dropped, does not cost
+    /// the others their work: the rest still merge and commit. The first
+    /// failed merge, lost input, or the dropped batch that stopped the pass
+    /// surfaces after. Otherwise returns how many jobs were dropped at commit.
     async fn run_compaction_jobs(
         &self,
         jobs: Vec<CompactionJob>,
         stale_seal_timeout: Duration,
         concurrency: usize,
     ) -> Result<usize, CompactionError> {
+        self.run_compaction_jobs_with(
+            jobs,
+            stale_seal_timeout,
+            concurrency,
+            host_has_room_for_another_merge,
+        )
+        .await
+    }
+
+    /// As [`Self::run_compaction_jobs`], with the host memory check injected.
+    async fn run_compaction_jobs_with(
+        &self,
+        jobs: Vec<CompactionJob>,
+        stale_seal_timeout: Duration,
+        concurrency: usize,
+        host_check: fn() -> bool,
+    ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
+        // Finished merges waiting for the next commit.
+        let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
+        // The one commit in flight; terminated when none is.
+        let mut committing = pin!(Fuse::terminated());
         let mut first_error: Option<CompactionError> = None;
         let mut fatal: Option<CompactionError> = None;
         // Merges and commits that failed since a batch last committed.
@@ -1444,11 +1468,26 @@ impl Supertable {
         // the admit log shows how long memory held the next merge back.
         let mut held_back = 0u64;
 
-        while !queued.is_empty() || !merging.is_empty() {
+        while !queued.is_empty()
+            || !merging.is_empty()
+            || !committing.is_terminated()
+            || !ready.is_empty()
+        {
+            if committing.is_terminated() && !ready.is_empty() {
+                // Plan order within the batch, which is as much of it as
+                // committing merges when they finish can preserve.
+                ready.sort_by_key(|(plan_index, _)| *plan_index);
+                let batch: Vec<PreparedJob> = mem::take(&mut ready)
+                    .into_iter()
+                    .map(|(_, prepared)| prepared)
+                    .collect();
+                committing.set(self.commit_and_refresh(batch).fuse());
+            }
+
             // Nothing running: start one without consulting the host. A table
             // whose single job does not fit still has to compact, and stalling
             // it would strand exactly the tables that most need compacting.
-            if merging.is_empty() {
+            if merging.is_empty() && committing.is_terminated() {
                 if stop_admitting {
                     break;
                 }
@@ -1467,24 +1506,64 @@ impl Supertable {
             // admitting the rest of the plan only burns each job's retries to
             // reach the same error. One failure on its own is usually that
             // job's, and the rest of the plan still runs.
-            let may_admit = !stop_admitting
-                && admits_another_merge(merging.len(), concurrency, queued.len(), true);
+            // Merges waiting for the commit hold their outputs in memory, so
+            // they take a slot until it lands.
+            let holding = merging.len() + ready.len();
+            let may_admit =
+                !stop_admitting && admits_another_merge(holding, concurrency, queued.len(), true);
+            let is_committing = !committing.is_terminated();
+            let has_merges = !merging.is_empty();
             let joined = tokio::select! {
-                // Completions first: a merge that has finished should commit
-                // and free its slot rather than wait behind an admission.
+                // A settled commit first, so the next batch goes out without
+                // waiting and its outcome counts before anything is admitted.
                 biased;
-                joined = merging.join_next() => joined,
+                (batch_jobs, commit, refreshed) = &mut committing, if is_committing => {
+                    // Both failures leave by the same door: merges are still
+                    // running, and returning here would drop their tasks with
+                    // their seals placed and nothing to clear them until they
+                    // went stale. The refresh also runs after a dropped batch,
+                    // so storage that cannot be read ends the pass here. One
+                    // that only refuses writes is stopped by
+                    // `MAX_FAILURES_IN_A_ROW` instead.
+                    if let Err(e) = refreshed {
+                        fatal = Some(CompactionError::Refresh(e));
+                        break;
+                    }
+                    match commit {
+                        Ok(()) => failures_in_a_row = 0,
+                        // Another writer replaced some inputs, which is a race
+                        // rather than a sick table. The rest of the batch may
+                        // have committed.
+                        Err(e @ CompactionError::SuperfileNotFound(_)) => {
+                            failures_in_a_row = 0;
+                            first_error.get_or_insert(e);
+                        }
+                        Err(e @ CompactionError::BatchDropped(_)) => {
+                            dropped.record(batch_jobs, e);
+                            failures_in_a_row += 1;
+                        }
+                        Err(e) => {
+                            fatal = Some(e);
+                            break;
+                        }
+                    }
+                    stop_admitting |= failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
+                    continue;
+                }
+                // A merge that has finished should join the next batch and
+                // free its slot rather than wait behind an admission.
+                joined = merging.join_next(), if has_merges => joined,
                 // The settle runs with every admitted merge in flight, so the
                 // reading that follows it sees their allocations rather than
                 // an idle host. That is the whole feedback loop: admit, let it
                 // land, look at what is left, decide again.
                 _ = time::sleep_until(next_admission), if may_admit => {
-                    if admits_another_merge(
-                        merging.len(),
-                        concurrency,
-                        queued.len(),
-                        host_has_room_for_another_merge(),
-                    ) {
+                    // Something is always running here, a merge or a commit,
+                    // so this merge always needs the host's room.
+                    let host_has_room = host_check();
+                    if host_has_room
+                        && admits_another_merge(holding, concurrency, queued.len(), true)
+                    {
                         let (plan_index, job) = queued.pop_front().expect("guarded above");
                         log_merge_admitted(merging.len(), queued.len(), held_back);
                         held_back = 0;
@@ -1503,7 +1582,6 @@ impl Supertable {
                 continue;
             };
 
-            let mut ready: Vec<(usize, PreparedJob)> = Vec::new();
             if collect_merge(joined, &mut ready, &mut first_error, &mut dropped) {
                 failures_in_a_row += 1;
             }
@@ -1513,44 +1591,6 @@ impl Supertable {
             while let Some(next) = merging.try_join_next() {
                 if collect_merge(next, &mut ready, &mut first_error, &mut dropped) {
                     failures_in_a_row += 1;
-                }
-            }
-            stop_admitting |= failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
-            if ready.is_empty() {
-                continue;
-            }
-            // Plan order within the batch, which is as much of it as
-            // committing merges when they finish can preserve.
-            ready.sort_by_key(|(plan_index, _)| *plan_index);
-            let batch: Vec<PreparedJob> = ready.into_iter().map(|(_, prepared)| prepared).collect();
-            let batch_jobs = batch.len();
-
-            let commit = self.commit_compaction_batch(batch).await;
-            // Both failures leave by the same door: merges are still running,
-            // and returning here would drop their tasks with their seals
-            // placed and nothing to clear them until they went stale. The
-            // refresh also runs after a dropped batch, so storage that cannot
-            // be read ends the pass here. One that only refuses writes is
-            // stopped by `MAX_FAILURES_IN_A_ROW` instead.
-            if let Err(e) = self.refresh().await {
-                fatal = Some(CompactionError::Refresh(e.to_string()));
-                break;
-            }
-            match commit {
-                Ok(()) => failures_in_a_row = 0,
-                // Another writer replaced some inputs, which is a race rather
-                // than a sick table. The rest of the batch may have committed.
-                Err(e @ CompactionError::SuperfileNotFound(_)) => {
-                    failures_in_a_row = 0;
-                    first_error.get_or_insert(e);
-                }
-                Err(e @ CompactionError::BatchDropped(_)) => {
-                    dropped.record(batch_jobs, e);
-                    failures_in_a_row += 1;
-                }
-                Err(e) => {
-                    fatal = Some(e);
-                    break;
                 }
             }
             stop_admitting |= failures_in_a_row >= MAX_FAILURES_IN_A_ROW;
@@ -1568,10 +1608,10 @@ impl Supertable {
             first_error.get_or_insert(e);
         }
         if let Some(e) = fatal {
-            // Merges still running hold seals this pass will not commit. Let
-            // them finish and clear their own, rather than dropping the tasks
-            // and leaving the seals to age out.
-            self.unseal_remaining(merging).await;
+            // Finished merges waiting for a commit, and merges still running,
+            // hold seals this pass will not commit. Clear them rather than
+            // leave them to age out.
+            self.unseal_remaining(ready, merging).await;
             return Err(e);
         }
         if let Some(e) = first_error {
@@ -1580,11 +1620,19 @@ impl Supertable {
         Ok(dropped.jobs)
     }
 
+    /// Commit one batch, then refresh, so the pass sees what landed.
+    async fn commit_and_refresh(&self, batch: Vec<PreparedJob>) -> CommitOutcome {
+        let jobs = batch.len();
+        let commit = self.commit_compaction_batch(batch).await;
+        let refreshed = self.refresh().await.map(|_| ()).map_err(|e| e.to_string());
+        (jobs, commit, refreshed)
+    }
+
     /// Start one merge, tagged with its position in the plan.
     ///
-    /// Spawned rather than held in a future this loop polls: the loop awaits a
-    /// commit between admissions, and a merge parked in an unpolled future
-    /// would make no progress while that commit ran.
+    /// Spawned rather than held in a future this loop polls: the loop handles
+    /// one event at a time, and a merge parked in a future polled only by it
+    /// would stall while the loop works on something else.
     fn spawn_merge(
         &self,
         merging: &mut JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
@@ -1639,17 +1687,22 @@ impl Supertable {
         }
     }
 
-    /// Drain merges still running after a pass has given up, clearing the
-    /// seals they placed. Their staged outputs are orphans for gc, exactly as
-    /// a job dropped from a batch leaves behind.
+    /// Clear the seals of finished merges that never committed, and drain
+    /// the merges still running after a pass has given up, clearing theirs.
+    /// Their staged outputs are orphans for gc, exactly as a job dropped from
+    /// a batch leaves behind.
     async fn unseal_remaining(
         &self,
+        ready: Vec<(usize, PreparedJob)>,
         mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
     ) {
         let Some(storage) = self.inner().manifest.load_full().options.storage.clone() else {
             return;
         };
         let wal_store = WalStore::new(storage);
+        if !ready.is_empty() {
+            unseal_batch(&wal_store, ready.into_iter().map(|(_, p)| p).collect()).await;
+        }
         while let Some(joined) = merging.join_next().await {
             if let Ok((_, Ok(prepared))) = joined {
                 unseal_batch(&wal_store, vec![prepared]).await;
@@ -1846,6 +1899,10 @@ fn collect_merge(
     first_error.get_or_insert(failure);
     counts
 }
+
+/// What one batch commit in a pass hands back: how many jobs it carried,
+/// how the commit went, and the refresh after it.
+type CommitOutcome = (usize, Result<(), CompactionError>, Result<(), String>);
 
 /// Jobs a pass dropped without committing, and the last reason why.
 #[derive(Default)]
@@ -2451,7 +2508,7 @@ mod tests {
         mem,
         ops::Range,
         str,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicUsize},
         thread,
         time::Duration,
     };
@@ -6744,21 +6801,26 @@ mod tests {
         let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
         let st = Supertable::create(default_supertable_options().with_storage(storage))
             .expect("create supertable");
+        let planned = pair_jobs(&st, jobs);
+        (faults, st, planned)
+    }
+
+    /// Commit `jobs` pairs of mergeable superfiles to `st`, and plan one
+    /// two-input job per pair.
+    fn pair_jobs(st: &Supertable, jobs: usize) -> Vec<CompactionJob> {
         for i in 0..jobs * PAIR {
-            commit_titles(&st, &[&format!("doc{i} first"), &format!("doc{i} second")]);
+            commit_titles(st, &[&format!("doc{i} first"), &format!("doc{i} second")]);
         }
-        let live = listed_ids(&st);
+        let live = listed_ids(st);
         assert_eq!(live.len(), jobs * PAIR, "fixture");
-        let planned = live
-            .chunks(PAIR)
+        live.chunks(PAIR)
             .map(|pair| CompactionJob {
                 partition_key: Vec::new(),
                 inputs: pair.to_vec(),
                 estimated_output_bytes: 0,
                 merge_memory_mb: None,
             })
-            .collect();
-        (faults, st, planned)
+            .collect()
     }
 
     /// A storage error on one batch's commit costs that batch only. The
@@ -6988,6 +7050,168 @@ mod tests {
             "unexpected error: {err:?}"
         );
         assert_untouched(&dir, &st, &all_inputs).await;
+    }
+
+    /// Width of the held-commit test's pass.
+    const HELD_COMMIT_WIDTH: usize = 1;
+    /// Uploads while the first commit is held: its own, and one merge per slot
+    /// beside it.
+    const HELD_COMMIT_UPLOADS: usize = HELD_COMMIT_WIDTH + 1;
+    /// Jobs in the held-commit test: one more than can upload while the commit
+    /// is held, to show the width caps the merges waiting for it.
+    const HELD_COMMIT_JOBS: usize = HELD_COMMIT_UPLOADS + 1;
+    /// How long the held-commit test waits for the merges beside it to upload.
+    const HELD_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How long the held-commit test then waits for a merge that must not
+    /// start: several admission settles.
+    const HELD_COMMIT_SETTLE: Duration = Duration::from_secs(1);
+    /// How often the held-commit test checks the upload count.
+    const HELD_COMMIT_POLL: Duration = Duration::from_millis(20);
+
+    /// Storage whose pointer swaps wait at a gate once `hold` is set. From
+    /// then on it counts superfile uploads, and the pointer swaps in flight.
+    #[derive(Debug)]
+    struct HeldPointerStorage {
+        inner: LocalFsStorageProvider,
+        hold: AtomicBool,
+        gate: Semaphore,
+        uploads: AtomicUsize,
+        swaps_in_flight: AtomicUsize,
+        max_swaps_in_flight: AtomicUsize,
+    }
+
+    impl HeldPointerStorage {
+        fn new(dir: &TempDir) -> Arc<Self> {
+            Arc::new(Self {
+                inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+                hold: AtomicBool::new(false),
+                gate: Semaphore::new(0),
+                uploads: AtomicUsize::new(0),
+                swaps_in_flight: AtomicUsize::new(0),
+                max_swaps_in_flight: AtomicUsize::new(0),
+            })
+        }
+
+        fn release(&self) {
+            self.gate.add_permits(Semaphore::MAX_PERMITS);
+        }
+    }
+
+    #[async_trait]
+    impl StorageProvider for HeldPointerStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await?;
+            if uri.contains(SUPERFILE_UPLOAD) && self.hold.load(Ordering::SeqCst) {
+                self.uploads.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            if !uri.contains(POINTER_PATH) || !self.hold.load(Ordering::SeqCst) {
+                return self.inner.put_if_match(uri, bytes, expected_etag).await;
+            }
+            let in_flight = self.swaps_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_swaps_in_flight
+                .fetch_max(in_flight, Ordering::SeqCst);
+            drop(self.gate.acquire().await.expect("gate never closes"));
+            let result = self.inner.put_if_match(uri, bytes, expected_etag).await;
+            self.swaps_in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// A slow commit must not stop merges from starting, but the merges that
+    /// finish beside it still count against the width. With the first job's
+    /// pointer swap held in a serial pass, the next job merges and uploads
+    /// beside it and the one after waits. Commits stay one at a time, and
+    /// every job lands once the swap is let through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merges_start_beside_a_held_commit_up_to_the_width() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldPointerStorage::new(&dir);
+        let provider: Arc<dyn StorageProvider> = Arc::<HeldPointerStorage>::clone(&storage);
+        let st = Supertable::create(default_supertable_options().with_storage(provider))
+            .expect("create supertable");
+        let jobs = pair_jobs(&st, HELD_COMMIT_JOBS);
+        storage.hold.store(true, Ordering::SeqCst);
+
+        // Not spawned: the pass's future is not `Send`. The checker runs
+        // beside it on this task and always lets the swap through, so a
+        // pass that never starts the other merges fails rather than hangs.
+        let check = async {
+            let beside_uploaded = time::timeout(HELD_COMMIT_TIMEOUT, async {
+                while storage.swaps_in_flight.load(Ordering::SeqCst) == 0
+                    || storage.uploads.load(Ordering::SeqCst) < HELD_COMMIT_UPLOADS
+                {
+                    time::sleep(HELD_COMMIT_POLL).await;
+                }
+            })
+            .await
+            .is_ok();
+            time::sleep(HELD_COMMIT_SETTLE).await;
+            let uploads_held = storage.uploads.load(Ordering::SeqCst);
+            let swaps_held = storage.swaps_in_flight.load(Ordering::SeqCst);
+            storage.release();
+            (beside_uploaded, uploads_held, swaps_held)
+        };
+        // The host always has room, so only the width decides.
+        let (pass, (beside_uploaded, uploads_held, swaps_held)) = tokio::join!(
+            st.run_compaction_jobs_with(
+                jobs,
+                DEFAULT_STALE_SEAL_TIMEOUT,
+                HELD_COMMIT_WIDTH,
+                || true
+            ),
+            check
+        );
+        assert!(
+            beside_uploaded,
+            "a merge must start and upload while the first commit is held"
+        );
+        assert_eq!(
+            uploads_held, HELD_COMMIT_UPLOADS,
+            "a merge waiting for the commit holds its slot"
+        );
+        assert_eq!(swaps_held, 1, "only the first commit is out");
+        let dropped = pass.expect("the pass must commit every job");
+        assert_eq!(dropped, 0, "no job was dropped");
+        assert_eq!(
+            storage.max_swaps_in_flight.load(Ordering::SeqCst),
+            1,
+            "commits must stay one at a time"
+        );
+        assert_eq!(
+            listed_ids(&st).len(),
+            HELD_COMMIT_JOBS,
+            "every pair merged into one superfile"
+        );
     }
 
     /// Only a lost race or a storage error the provider already retried

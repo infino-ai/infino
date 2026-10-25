@@ -131,7 +131,7 @@ impl DiskCacheStore {
         });
         let mut reader =
             SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false }).await?;
-        reader.install_resident_parquet(bytes)?;
+        reader.install_resident_parquet(bytes, (hole_start, hole_len))?;
 
         let charge = if vector_source.owns_accounting() {
             size.saturating_sub(hole_len)
@@ -1706,9 +1706,13 @@ mod tests {
             manifest::{SubsectionOffsets, SuperfileUri},
             reader_cache::{
                 OpenTier,
-                block_source::{BlockCachedSource, CACHE_BLOCK_BYTES, SourceLayout},
+                block_source::{
+                    BlockCachedSource, CACHE_BLOCK_BYTES, SourceLayout, indexed_filled_bytes,
+                },
                 config::{ColdFetchMode, DiskCacheConfig},
-                disk::{fetch::*, sources::mmap_readonly_with_handle, test_support::*},
+                disk::{
+                    EntryAccounting, fetch::*, sources::mmap_readonly_with_handle, test_support::*,
+                },
             },
         },
     };
@@ -1718,6 +1722,9 @@ mod tests {
 
     /// How long a read that must finish gets before the test calls it stuck.
     const READ_DEADLINE: Duration = Duration::from_secs(5);
+
+    /// Bytes the unknown-size refusal test reads from a block no open touched.
+    const REFUSAL_READ_BYTES: u64 = 4096;
 
     /// A store over recording storage holding one vector superfile, with a Warm open whose fill is
     /// parked at the only fill permit. Returns the held reader, the permit and the vector hole.
@@ -2853,6 +2860,98 @@ mod tests {
             );
             store.assert_budget_consistent();
         }
+    }
+
+    /// The unknown-size Warm open the budget refuses, step by step: the first open learns the
+    /// size on a block source that rides on a whole-file reserve and so charges nothing, the
+    /// reserve fails, that source is dropped, and the file is opened once more as a Stream open
+    /// whose block source charges what it fills. The entry is that second source's - charged by
+    /// its blocks, nothing on disk outside the charge - so a block a later read fills is charged
+    /// as it lands, and the next open rides the entry. The budget holds blocks, never the whole
+    /// file.
+    #[tokio::test]
+    async fn an_unknown_size_warm_open_past_the_budget_charges_its_own_blocks() {
+        let bytes = multi_block_superfile_bytes();
+        let size = bytes.len() as u64;
+        assert!(
+            size > 2 * CACHE_BLOCK_BYTES,
+            "the fixture spans several blocks"
+        );
+        let (_dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+            cfg.disk_budget_bytes = size - 1;
+        });
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, bytes.clone()).await;
+
+        let (first, tier) = store
+            .open_for_query_tiered(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("served past the budget");
+        assert_eq!(tier, OpenTier::Source, "opened against the object store");
+        store.block_writes_settled().await;
+
+        let entry = store
+            .cached
+            .get(&uri)
+            .map(|e| Arc::clone(e.value()))
+            .expect("an entry");
+        assert_eq!(
+            entry.accounting,
+            EntryAccounting::SourceOwned,
+            "the entry is charged by its blocks, not by a whole-file reserve"
+        );
+        let source = entry
+            .block_source()
+            .cloned()
+            .expect("a lazy entry and its block source");
+        assert!(
+            source.owns_accounting(),
+            "the entry's source is the second open's, which charges its own blocks"
+        );
+        // The entry is not in the cache while the opens run, so both block sources read
+        // straight from storage and write nothing: no block file, nothing to charge.
+        let opened = source.filled_bytes_handle().load(Ordering::Acquire);
+        assert_eq!(opened, 0, "the opens leave nothing filled");
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "and nothing charged before the first read"
+        );
+
+        // A block no open read: the entry's source fetches it and charges it.
+        let (start, len) = (CACHE_BLOCK_BYTES, REFUSAL_READ_BYTES);
+        let want = bytes.slice(start as usize..(start + len) as usize);
+        assert!(
+            source.range(start, len).await.expect("read") == want,
+            "the read returns the file's bytes"
+        );
+        store.block_writes_settled().await;
+        let filled = source.filled_bytes_handle().load(Ordering::Acquire);
+        assert!(filled > opened, "the read filled a block");
+        assert_eq!(
+            store.stats().current_bytes,
+            filled,
+            "the block the read filled is charged, by the entry's source"
+        );
+        let mut idx_path = store.blocks_path(&uri).into_os_string();
+        idx_path.push(".idx");
+        if let Ok(idx) = fs::read(PathBuf::from(idx_path)) {
+            let (_, on_disk) = indexed_filled_bytes(size, &idx).expect("a valid block index");
+            assert!(
+                on_disk <= filled,
+                "no block on disk outside the charge ({on_disk} > {filled})"
+            );
+        }
+        store.assert_budget_consistent();
+
+        let (second, tier) = store
+            .open_for_query_tiered(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+            .await
+            .expect("served again");
+        assert_eq!(tier, OpenTier::Lazy, "the next open rides the entry");
+        assert!(Arc::ptr_eq(&first, &second), "the same reader");
+        assert_eq!(store.stats().n_cold_fetches, 1, "one cold fetch for both");
     }
 
     #[tokio::test]

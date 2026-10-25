@@ -22,6 +22,16 @@ check:
 	# only the feature uses must be gated with it, or those lanes see dead
 	# code. Lint the feature-off build so that surfaces here, not there.
 	cargo clippy --all-targets --features test-helpers -- -D warnings
+	# The lines above lint the ROOT package only: this workspace has a root
+	# package, so a bare `cargo clippy` selects it and nothing else, and
+	# `infino-bench-utils` — the other member, where every bench and the FTS
+	# quality oracle live — is never built. It went uncompiled for days after
+	# #753 gave phrases their offsets and left the oracle handing
+	# `Vec<Vec<String>>` to a `&[Phrase<String>]`; `make check` stayed green on
+	# main the whole time. Its own `--all-targets` is what catches that, and the
+	# feature is namespaced because the flag names a feature of `infino`, not of
+	# this member.
+	cargo clippy -p infino-bench-utils --all-targets --features infino/test-helpers -- -D warnings
 	# `detailed-tracing` and `metering` are off by default, so neither line
 	# above compiles the `tracing::instrument` attributes they gate. Those
 	# attributes name a function's parameters, so a signature change breaks
