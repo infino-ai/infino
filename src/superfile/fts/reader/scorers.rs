@@ -1156,8 +1156,11 @@ fn accumulate_segment(
     let mut i = pos;
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f") {
-            // SAFETY: avx512f is present (checked above).
+        if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx2")
+        {
+            // SAFETY: both features the kernel enables are present (checked
+            // above).
             i += unsafe {
                 accumulate_run_avx512(
                     c.idf_weight,
@@ -1236,8 +1239,8 @@ unsafe fn accumulate_run_avx512(
                 mask |= 1 << (d - dids[0]);
             }
             // SAFETY: avx512f and avx2 are enabled on this function, which the
-            // caller reaches only behind `is_x86_feature_detected!("avx512f")`
-            // (avx512f implies avx2). The 16-byte bucket load covers
+            // caller reaches only after detecting both at runtime (a virtual
+            // machine may mask one off). The 16-byte bucket load covers
             // `[dids[0], dids[0] + 16)`, inside `buckets` by the check above.
             // The compress keeps the eight lanes the mask selects, in order, so
             // the low eight lanes are the eight docs' buckets, each below 256:
@@ -4984,7 +4987,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn accumulate_run_avx512_matches_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx512f") {
+        if !(std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx2"))
+        {
             return;
         }
         let mut b = FtsBuilder::new();
