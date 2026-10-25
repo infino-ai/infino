@@ -2670,8 +2670,9 @@ mod tests {
         assert!(hits.is_empty(), "floor above all scores prunes everything");
     }
 
-    /// A caller's floor prunes what scores at or below it and nothing else:
-    /// a floored search returns the unfloored ranking cut at the floor. The
+    /// A caller's floor prunes what scores below it and nothing else: a
+    /// floored search returns the unfloored ranking cut at the floor, ties
+    /// with the floor kept. The
     /// corpus puts whole coarse spans of a long term under the floor (long
     /// documents), one block inside such a span over it (short documents),
     /// and the rest in between, so the walk skips by span, by block and by
@@ -2703,7 +2704,7 @@ mod tests {
         let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
         let all = N_DOCS as usize;
         let cut = |hits: Vec<(RowId, f32)>, floor: f32, k: usize| -> Vec<(RowId, f32)> {
-            hits.into_iter().filter(|h| h.1 > floor).take(k).collect()
+            hits.into_iter().filter(|h| h.1 >= floor).take(k).collect()
         };
         let unfloored = r
             .search_with_floor("body", &["w"], all, BoolMode::Or, f32::NEG_INFINITY)
@@ -2724,11 +2725,8 @@ mod tests {
                     .search_with_floor("body", &["w"], k, BoolMode::Or, floor)
                     .await
                     .expect("floored");
-                assert_eq!(
-                    got,
-                    cut(unfloored.clone(), floor, k),
-                    "single term k={k} floor={floor}"
-                );
+                let want = cut(unfloored.clone(), floor, k);
+                assert_eq!(got, want, "single term k={k} floor={floor}");
             }
         }
         let and = |k, floor| {
