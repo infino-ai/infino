@@ -2139,7 +2139,7 @@ fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
 /// doc ids; a **PACKED** block is decoded doc-ids-only (no tf) and scattered; an
 /// inline (df=1) cursor scatters its single pre-decoded doc. `scratch` is a
 /// reused `BLOCK_LEN` decode buffer. Shared by the union count
-/// ([`or_count_bitset`]) and the intersection count (`count_and_intersect_bitset`)
+/// ([`or_count_bitset`]) and the counts with exclusions (`count_excluding`)
 /// so a common term's dense blocks are merged at memory bandwidth either way.
 pub(super) fn or_cursor_into_bitset(
     dest: &mut [u64],

@@ -16,7 +16,7 @@ use super::{
     filter::AtomExcludeFilter,
     options::BoolMode,
     phrase::AnyCursor,
-    scorers::count_excluding,
+    scorers::{count_and_planned, count_excluding},
     search::FetchedTermMemo,
     work::{MatchWork, atom_cursor_bytes, atom_planned_ranges},
 };
@@ -424,7 +424,7 @@ impl FtsReader {
                 if cursors.len() != tokens.len() {
                     return 0;
                 }
-                self.count_and_intersect(cursors)
+                count_and_planned(cursors)
             }
             BoolMode::Or => or_count_unranked(cursors),
         });

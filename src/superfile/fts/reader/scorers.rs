@@ -315,8 +315,8 @@ pub(super) fn count_and_planned(cursors: Vec<TermCursor>) -> u64 {
     let max_doc = cursors_max_doc(&cursors);
     let min_df = cursors.iter().map(|c| c.df).min().unwrap_or(0);
     match fold_cost(&cursors, max_doc) < probe_cost(min_df, cursors.len() - 1) {
-        true => count_and_intersect_bitset(cursors, max_doc),
-        false => count_and_intersect_membership(cursors),
+        true => count_excluding_fold(cursors, true, Vec::new(), max_doc),
+        false => count_excluding_probe(cursors, true, Vec::new()),
     }
 }
 
@@ -424,69 +424,6 @@ fn count_excluding_probe(mut pos: Vec<TermCursor>, all: bool, mut neg: Vec<TermC
         }
     }
     n
-}
-
-/// Intersection cardinality by a rarest-driven membership walk: iterate the
-/// term with the fewest blocks and count docs the others all contain. Each
-/// membership probe is `TermCursor::contains`, which bit-tests a bitset
-/// block with no decode — so a common (bitset) term's blocks are never
-/// expanded.
-fn count_and_intersect_membership(mut cursors: Vec<TermCursor>) -> u64 {
-    // Drive by the rarest term (fewest blocks) to minimise membership
-    // probes. Ties don't matter; any driver yields the same count.
-    let driver_idx = cursors
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, c)| c.block_count())
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    let mut driver = cursors.swap_remove(driver_idx);
-    let mut others = cursors;
-    // Probe the most selective term first: `all(contains)` short-circuits on the
-    // first miss, so ordering the others rarest-first (ascending df, i.e. lowest
-    // presence probability) rejects a non-matching driver doc in the fewest
-    // probes — and, crucially, avoids touching a very common term's large
-    // presence structure (e.g. `the`) for the majority of driver docs that a
-    // rarer companion already excludes.
-    others.sort_by_key(|c| c.df);
-    let mut n = 0u64;
-    while !driver.is_exhausted() {
-        let doc = driver.current_doc_id();
-        if others.iter_mut().all(|o| o.contains(doc)) {
-            n += 1;
-        }
-        driver.next();
-    }
-    n
-}
-
-/// Intersection cardinality via bitset AND: build each term's doc presence into
-/// a doc-space bitset (byte-level — a dense term's bitset blocks are word-copied,
-/// never expanded to doc ids), AND them together, and popcount. Word-parallel, so
-/// its cost is `n_terms × max_doc/64` regardless of how many docs the rarest term
-/// holds — the opposite of the rarest-driven membership walk, which iterates the
-/// rarest term doc by doc. Wins when *every* term is common (dense), where the
-/// membership driver is itself a long list. `max_doc` is the largest doc id
-/// across the terms, so `acc`/`scratch` span every term's presence.
-fn count_and_intersect_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
-    let words = max_doc as usize / 64 + 1;
-    let mut acc = vec![0u64; words];
-    let mut scratch = vec![0u64; words];
-    let mut decode = [0u32; BLOCK_LEN];
-    let mut cursors = cursors.iter();
-    // The first term seeds the accumulator; the rest AND their presence in.
-    let Some(first) = cursors.next() else {
-        return 0;
-    };
-    or_cursor_into_bitset(&mut acc, first, &mut decode);
-    for c in cursors {
-        scratch.iter_mut().for_each(|w| *w = 0);
-        or_cursor_into_bitset(&mut scratch, c, &mut decode);
-        for (a, s) in acc.iter_mut().zip(scratch.iter()) {
-            *a &= *s;
-        }
-    }
-    acc.iter().map(|w| w.count_ones() as u64).sum()
 }
 
 /// Block-Max-AND bound on the **non-leader** terms at the leader's doc, valid
@@ -1959,16 +1896,6 @@ impl FtsReader {
         // A collect never scores, so it needs none of the column's norms.
         self.and_flat_merge(&mut cursors, unscored_norm_table(), &mut sink);
         sink.out
-    }
-
-    /// Unranked multi-term AND **count**: the size of the intersection,
-    /// tallied rather than collected — no `Vec<u32>` materialized. A
-    /// common term's blocks may be bitset-encoded, where decoding (set-bit
-    /// expansion) is slower than probing them, so the flat-merge
-    /// [`collect_and_intersect`](Self::collect_and_intersect) uses is not
-    /// the shape here.
-    pub(super) fn count_and_intersect(&self, cursors: Vec<TermCursor>) -> u64 {
-        count_and_planned(cursors)
     }
 
     /// Dispatch to the 2-term specialization or the general `n >= 3`
@@ -5833,69 +5760,14 @@ mod tests {
                     );
                     assert_eq!(planned, want, "planned: {what}");
                     if neg.is_empty() && pos.len() >= 2 {
-                        match all {
-                            true => {
-                                let max_doc = cursors_max_doc(&cursors(pos.clone()).await);
-                                assert_eq!(
-                                    count_and_intersect_bitset(cursors(pos.clone()).await, max_doc),
-                                    want,
-                                    "and fold: {what}"
-                                );
-                                assert_eq!(
-                                    count_and_intersect_membership(cursors(pos.clone()).await),
-                                    want,
-                                    "and probe: {what}"
-                                );
-                            }
-                            false => assert_eq!(
-                                or_count_unranked(cursors(pos.clone()).await),
-                                want,
-                                "or: {what}"
-                            ),
-                        }
+                        let planned = match all {
+                            true => count_and_planned(cursors(pos.clone()).await),
+                            false => or_count_unranked(cursors(pos.clone()).await),
+                        };
+                        assert_eq!(planned, want, "no exclusions: {what}");
                     }
                 }
             }
-        }
-    }
-
-    /// What opening one cursor on a stopword-sized term costs: a 4M-doc
-    /// column where the term is in ~84% of documents (~26K blocks).
-    /// Timing only; run in release with `--ignored --nocapture`.
-    #[tokio::test]
-    #[ignore = "timing probe"]
-    async fn stopword_cursor_open_cost() {
-        let mut b = FtsBuilder::new();
-        b.register_column("body".into(), false).expect("register");
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        for i in 0..4_000_000u32 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let text = match x % 100 < 84 {
-                true => "the w",
-                false => "w",
-            };
-            b.add_doc(0, i, text).expect("add doc");
-        }
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        for purpose in [CursorUse::Score, CursorUse::Count] {
-            let runs = 200u32;
-            let t = std::time::Instant::now();
-            let mut blocks = 0usize;
-            for _ in 0..runs {
-                let c = r
-                    .build_term_cursors(0, &["the"], QueryIdf::ThisFile, purpose, None, None)
-                    .await
-                    .expect("cursor");
-                blocks += c[0].block_count();
-            }
-            println!(
-                "{purpose:?}: {:.1} us per open, {} blocks",
-                t.elapsed().as_secs_f64() * 1e6 / f64::from(runs),
-                blocks / runs as usize
-            );
         }
     }
 
