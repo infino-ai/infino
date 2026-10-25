@@ -2138,6 +2138,7 @@ mod tests {
             (&[], &["rust", "java"], &["tokio"]),
             (&["rust"], &[], &["tokio"]),
             (&["rust", "zzz"], &[], &[]),
+            (&["rust", "zzz"], &[], &["tokio"]),
             (&[], &["zzz"], &[]),
         ];
         for &(musts, shoulds, negatives) in shapes {

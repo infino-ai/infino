@@ -5492,6 +5492,43 @@ mod tests {
         );
     }
 
+    /// The exhaustive baseline scores four or more terms at one doc in packs
+    /// of four and the rest alone; it must rank a five-term union as the
+    /// production kernel does (the same docs, scores equal up to summation
+    /// order).
+    #[tokio::test]
+    async fn exhaustive_union_of_five_terms_agrees_with_the_production_kernel() {
+        let words = ["alpha", "beta", "gamma", "delta", "omega"];
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..2_000u32 {
+            let text: Vec<&str> = words
+                .iter()
+                .enumerate()
+                .filter(|&(w, _)| i % (w as u32 + 2) == 0 || i % 97 == 0)
+                .map(|(_, &t)| t)
+                .chain(["filler"])
+                .collect();
+            b.add_doc(0, i, &text.join(" ")).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        for k in [5usize, 50] {
+            let got = r
+                .search("body", &words, k, BoolMode::Or)
+                .await
+                .expect("search");
+            let want = r
+                .search_with_algo_for_bench("body", &words, k, OrAlgo::Exhaustive)
+                .await
+                .expect("exhaustive");
+            assert_eq!(got.len(), want.len(), "k {k}");
+            for ((dg, sg), (dw, sw)) in got.iter().zip(&want) {
+                assert!((sg - sw).abs() < 1e-4, "k {k}: {dg:?} {sg} vs {dw:?} {sw}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn search_with_algo_empty_and_zero_k_short_circuit() {
         let (blob, json) = build_blob();
