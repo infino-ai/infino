@@ -196,10 +196,11 @@ pub(crate) fn status_to_error(op: &str, code: u16, body: &str) -> InfinoError {
         // Both say the key was not accepted for this call: 401 that it is not
         // a key the service knows, 403 that it is one and may not do this — a
         // capability it lacks, or a limit of the account behind it that the
-        // body names. The code stays in the message, as on every other
-        // status, so a caller can tell the two apart.
+        // body names. The code stays in the message in the same shape as
+        // every other status (`server returned NNN: `, which the bindings
+        // read the number off), so a caller can tell the two apart.
         401 | 403 => InfinoError::Backend(format!(
-            "{op}: server returned {code} (the key was refused for this call): {body}"
+            "{op}: server returned {code}: the key was refused for this call: {body}"
         )),
         _ => InfinoError::Backend(format!("{op}: server returned {code}: {body}")),
     }
