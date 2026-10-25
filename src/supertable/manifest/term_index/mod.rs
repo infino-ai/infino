@@ -399,8 +399,8 @@ pub(crate) async fn reserve_segment(
 /// [`append_delta`] for a commit that may retry: the segment is built once,
 /// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
-/// ordinal and appends it, writing only the root unless the appended
-/// segment completes a run [`fold_tail`] merges. The segment is built
+/// ordinal and appends it, writing only the root unless the segments
+/// beneath it make a run [`fold_tail`] merges. The segment is built
 /// again only when `prior` has grown past the reserved ordinal, or the
 /// contributions are not the ones it was built from. An `exact` segment is
 /// never padded: it is reused only at `prior`'s exact length and otherwise
@@ -453,12 +453,14 @@ async fn publish_root(
     write_root(storage, &root).await
 }
 
-/// Merge the newest segments of `root` into one wherever
+/// Merge the segments just beneath `root`'s newest into one wherever
 /// [`FOLD_FAN_OUT`] or more of them are within that factor of one another
 /// in size, repeating while the merged segment makes such a run with the
-/// ones before it. Sizes are the slice bytes the root records, so no slice
-/// is read to decide. Ordinals are unchanged: a fold is the same postings
-/// in fewer slices, so every reader of the folded root answers as it did.
+/// ones before it; the newest segment, the one this publish appends, stays
+/// as it is (see [`foldable_tail`] for why). Sizes are the slice bytes the
+/// root records, so no slice is read to decide. Ordinals are unchanged: a
+/// fold is the same postings in fewer slices, so every reader of the
+/// folded root answers as it did.
 ///
 /// This is what keeps a lookup cheap on a table taking a stream of
 /// commits: each commit appends one segment, a lookup opens one slice per
@@ -481,6 +483,10 @@ pub(crate) async fn fold_tail(
         let Some(start) = foldable_tail(root) else {
             return Ok(());
         };
+        let newest = root
+            .segments
+            .pop()
+            .expect("a foldable tail lies beneath a newest segment");
         let scratch = TempDirBuilder::new()
             .prefix("infino-term-index-fold-")
             .tempdir()?;
@@ -500,13 +506,21 @@ pub(crate) async fn fold_tail(
         write_slices(storage, slices).await?;
         root.segments.truncate(start);
         root.segments.push(segment);
+        root.segments.push(newest);
     }
 }
 
 /// The index of the first segment of the run [`fold_tail`] merges next:
-/// the newest [`FOLD_FAN_OUT`] or more segments whose sizes lie within
-/// that factor of one another. `None` when the newest segments make no
+/// the [`FOLD_FAN_OUT`] or more segments just beneath the newest whose
+/// sizes lie within that factor of one another. `None` when they make no
 /// such run.
+///
+/// The newest segment itself is never in the run. Its slices were written
+/// by the publish that is still under way and no root names them yet; a
+/// fold that retired them would leave objects no root ever named, which
+/// the sweep could not find. Every segment beneath it was named by the
+/// root this publish replaces, so the slices a fold retires are exactly
+/// the ones the sweep reclaims from that root.
 fn foldable_tail(root: &Root) -> Option<usize> {
     let size = |segment: &Segment| -> u64 {
         segment
@@ -516,7 +530,8 @@ fn foldable_tail(root: &Root) -> Option<usize> {
             .sum::<u64>()
             .max(1)
     };
-    let mut start = root.segments.len();
+    let beneath = root.segments.len().checked_sub(1)?;
+    let mut start = beneath;
     let mut smallest = u64::MAX;
     let mut largest = 0u64;
     while start > 0 {
@@ -530,7 +545,7 @@ fn foldable_tail(root: &Root) -> Option<usize> {
         largest = largest_with;
         start -= 1;
     }
-    (root.segments.len() - start >= FOLD_FAN_OUT).then_some(start)
+    (beneath - start >= FOLD_FAN_OUT).then_some(start)
 }
 
 /// The delta segments committed on top of `prior` to reach `current`, or
@@ -5086,20 +5101,19 @@ mod tests {
                 .await
                 .expect("append");
             root = load_root(local.as_ref(), &reference).await.expect("root");
-            let appended = id as usize; // the base plus this many deltas
-            if appended == FOLD_FAN_OUT - 1 {
+            let appended = id as usize; // segments so far: the base plus the deltas
+            if appended == FOLD_FAN_OUT {
                 segments_before_first_fold = root.segments.len();
             }
-            if appended == FOLD_FAN_OUT {
+            if appended == FOLD_FAN_OUT + 1 {
                 assert_eq!(
-                    segments_before_first_fold,
-                    FOLD_FAN_OUT - 1,
-                    "nothing folds before a run of the fan-out exists"
+                    segments_before_first_fold, FOLD_FAN_OUT,
+                    "nothing folds before a run of the fan-out lies beneath the newest segment"
                 );
                 assert_eq!(
                     root.segments.len(),
-                    1,
-                    "the first run folds into one segment"
+                    2,
+                    "the first run folds into one segment beneath the newest"
                 );
             }
         }
