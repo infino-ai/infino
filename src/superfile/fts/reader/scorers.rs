@@ -2257,25 +2257,10 @@ impl FtsReader {
     }
 
     /// MaxScore+BMM constrained to the doc_id half-open range
-    /// `[doc_id_start, doc_id_end)`. Used by the supertable layer's
-    /// intra-superfile parallel fan-out: when the reader pool has more
-    /// threads than superfiles, each superfile is split into N sub-ranges
-    /// and the per-sub-range searches run in parallel, each producing
-    /// its own top-K heap that the caller merges.
-    ///
-    /// Setting `doc_id_start == 0` and `doc_id_end == u32::MAX`
-    /// reproduces the un-ranged BMM walk byte-for-byte (the seek is
-    /// a no-op and the upper-bound check trivially never fires).
-    ///
-    /// **Pruning trade**: each sub-range maintains an independent
-    /// top-K heap + BMM threshold. The threshold tightens slower than
-    /// in the un-ranged walk because each sub-range sees only `1/N`
-    /// of the docs, so the per-sub-range BMW block-skip fires less
-    /// aggressively. Net wall-time win comes from spreading the
-    /// scoring work across more cores; the per-sub-range work loss
-    /// from looser pruning is bounded by the bookkeeping path (and
-    /// in practice ~10–20% of single-thread serial), well below the
-    /// 2× cores-doubled headroom.
+    /// `[doc_id_start, doc_id_end)`. [`Self::run_max_score_bmm`] runs it over
+    /// the whole range, which reproduces the un-ranged walk exactly (the seek
+    /// is a no-op and the upper-bound check never fires); the ranged form is
+    /// the oracle the ranged windowed kernel is checked against.
     pub(super) fn run_max_score_bmm_range(
         &self,
         column_id: u32,
@@ -2753,7 +2738,7 @@ impl FtsReader {
     /// only the comparison with the k-th best decides what the heap sees.
     ///
     /// A window of [`OR_WINDOW`] documents at a time: each term adds its
-    /// scores into the window four postings per SIMD call and marks
+    /// scores into the window eight postings per SIMD call and marks
     /// presence, then the window is drained in ascending document order,
     /// counted a word at a time and offered to the heap only where a score
     /// beats the k-th best. A single term needs no window: each block is
@@ -2997,13 +2982,13 @@ impl FtsReader {
         // The non-essentials' tfs at the window's survivors, reused.
         let mut noness_tfs: Vec<u32> = Vec::with_capacity(OR_WINDOW as usize);
         let mut win_scores: Vec<f32> = Vec::with_capacity(OR_WINDOW as usize);
-        // Per-window block-level upper bounds and their suffix sums, in the
-        // same term-max order as `partial_max`.
         // Non-essential block-max bound for the single-essential path, and its
         // suffix sums, both rebuilt only when a candidate leaves the doc range
         // the bound was measured over.
         let mut noness_ub = vec![0.0_f32; n];
         let mut noness_suffix = vec![0.0_f32; n + 1];
+        // Per-window bounds and doc estimates and their suffix sums, in the
+        // same term-max order as `partial_max`.
         let mut win_ub = vec![0.0_f32; n];
         let mut win_docs_est = vec![0.0_f32; n];
         let mut partial_win = vec![0.0_f32; n + 1];
@@ -3296,39 +3281,26 @@ impl FtsReader {
             // Block-max skip fires only once the heap is full (threshold is a
             // real k-th score); hoisted so the per-posting loop doesn't re-test.
             let prune = heap.is_full(k);
-            // Block-level partition for this window. A term whose block
-            // maxima over the window cannot lift the weaker terms past the
-            // threshold is non-essential *here*, even if its term max keeps
-            // it essential overall: a stopword's dense blocks are then
-            // probed for the other terms' candidates instead of scored doc
-            // by doc. Suffix sums over the fixed term-max order keep the
-            // bound valid (block maxima never exceed term maxima, so
-            // `f_win <= f_essential`); a window whose total bound is under
-            // the threshold holds no competitive doc and is skipped whole.
-            // Block-level partition for this window, gated on the weakest
-            // essential term alone: the suffix sums only grow towards the
-            // stronger terms, so unless its window bound plus the
-            // non-essential suffix is under the threshold no term can be
-            // demoted and the window keeps the term-max partition.
-            // Demotion trades accumulating the term's docs (a few ns each,
-            // SIMD) for a probe per remaining candidate (tens of ns), so a
-            // term is only demoted when its estimated docs in the window
-            // outnumber the remaining essentials' by `DEMOTE_DENSITY` — the
-            // stopword shape; two mid-frequency terms are cheaper scored
-            // together. (Windows end at an essential block boundary, so a
-            // window is often one stopword block against a sliver of a rare
-            // term's block: the estimate is by doc share, not block count.)
-            // A window whose total bound is under the threshold holds no
-            // competitive doc and is skipped whole regardless.
-            // Every term's maximum over this window, for the essential
-            // block skip below: a block that ends inside the window is
-            // bounded by the others' window maxima rather than their term
-            // maxima. Measured once per window, before any cursor moves.
+            // Block-level partition for this window. A term whose block maxima
+            // over the window cannot lift the weaker terms past the threshold
+            // is non-essential *here*, even if its term max keeps it essential
+            // overall: a stopword's dense blocks are then probed for the other
+            // terms' candidates instead of scored doc by doc. Suffix sums over
+            // the fixed term-max order keep the bound valid (block maxima never
+            // exceed term maxima, so `f_win <= f_essential`). Only the weakest
+            // essential term needs testing first: unless its window bound plus
+            // the non-essentials' is under the threshold, no term can be
+            // demoted. Demotion trades accumulating a term's docs (SIMD, a few
+            // ns each) for a probe per remaining candidate (tens of ns), so a
+            // term is demoted only when its estimated docs in the window
+            // outnumber the remaining essentials' by `DEMOTE_DENSITY`. A window
+            // whose total bound is under the threshold holds no competitive doc
+            // and is skipped whole.
+            //
+            // Each term's bound and doc estimate over the window are read once,
+            // before any cursor moves; the non-essentials' sum, the essential
+            // block skip below and the demotion test all use them.
             let windowed = prune && !sole;
-            // Each term's bound and doc estimate over the window are read
-            // once: the non-essentials' sum (what they can add to any doc in
-            // the window, never more than their term maxima), the block skip
-            // and the demotion test all use the same values.
             let mut noness_win = partial_max[f_essential];
             let mut win_all_sum = 0.0_f32;
             if prune {
@@ -3386,16 +3358,12 @@ impl FtsReader {
                         break;
                     }
                     // Block-max skip, checked once per block (not per posting):
-                    // skip a whole block whose docs cannot beat threshold even
-                    // carrying every other term at its term-max — the bound
-                    // per-candidate MaxScore uses, applied to the essential
-                    // accumulate so the dense OR-sum still prunes at small k.
-                    // Never fires while the heap is filling, so a doc that must
-                    // be admitted is never dropped.
-                    // In a sole-essential window the other essentials have no
-                    // docs before `window_end`, so the bound carries only the
-                    // non-essentials, and a block that reaches past the window
-                    // is scored up to it rather than skipped.
+                    // skip a whole block whose docs cannot beat the threshold
+                    // with every other term at its bound below, so the dense
+                    // OR-sum still prunes at small k. Never fires while the
+                    // heap is filling, so a doc that must be admitted is never
+                    // dropped. A block that reaches past a sole-essential
+                    // window is scored up to the window's end, not skipped.
                     if prune && c.current_block != checked_block {
                         checked_block = c.current_block;
                         // The tightest bound valid for the whole block: the
@@ -3545,59 +3513,11 @@ impl FtsReader {
         Ok(heap.into_sorted())
     }
 
-    /// Exhaustive union walk for multi-term OR. No threshold-driven
-    /// block skipping — every doc in the union of the cursor postings
-    /// is scored and offered to the top-K heap.
-    ///
-    /// **Not on the ranked path.** `dispatch_or_algo` routes to
-    /// MaxScore+BMM or the windowed union. This walk serves the exact-count
-    /// search (`run_prepared_with_count`), which has to visit every match,
-    /// and the bench selector `search_with_algo_for_bench(OrAlgo::Exhaustive)`,
-    /// kept because the supertable bench surfaced one shape where it
-    /// narrowly wins. A must-not `filter` drops a doc before it is scored
-    /// or counted.
-    ///
-    /// **When this can beat BMM (measured at 10M × 8 superfiles)**:
-    /// - **Prefix expansions over very-rare terms, in parallel mode.**
-    ///   E.g., `term0009*` expanding to 10 terms at Zipfian rank
-    ///   90–99 (df ≈ 0.1% each). On the supertable parallel bench,
-    ///   exhaustive ran at 40.2 ms vs BMM's 54.0 ms — a 26% win. The
-    ///   per-superfile work is tiny (∼12 K matching docs across 10
-    ///   short cursors) so BMM's per-block bookkeeping
-    ///   (`f_essential` recomputation, `shallow_advance_block_to`,
-    ///   `inspect_block_max_bm25`) dominates over actual scoring
-    ///   work.
-    ///
-    /// **When BMM is strictly better — measured regressions if we
-    /// route to exhaustive**:
-    /// - **Mid-rank uniform-UB queries.** Five terms at rank 50–54
-    ///   (df ≈ 0.4% each): exhaustive serial 174 ms vs BMM 99 ms —
-    ///   a **76% regression**. Three terms at rank 50–52: exhaustive
-    ///   serial 93 ms vs BMM 61 ms — a **52% regression**. Enough
-    ///   matching docs exist that BMM's skip-pruning actually fires
-    ///   and amortizes its bookkeeping.
-    /// - **Any dominant-term query.** BMM's `f_essential == 1` fast
-    ///   path collapses to a block-batch loop on the dominant
-    ///   cursor's postings — about as tight as exhaustive could be,
-    ///   and with skip on top.
-    /// - **Single-term queries.** Don't go through OR dispatch
-    ///   anyway; `search_single_term_bmw` handles them.
-    ///
-    /// **Routing heuristic if revisited**: the obvious-looking
-    /// `max(term_max_bm25) / sum(term_max_bm25) < 1.5/n_cursors`
-    /// (uniform UB) **over-routes** because it admits mid-rank
-    /// queries where BMM wins. A better rule would gate on
-    /// *absolute* low total df **and** uniform UB — e.g.,
-    /// `σdf < n_docs / 100 AND max_ub/sum_ub < 1.5/n_cursors`.
-    /// Empirically that admits the prefix-of-rare-terms shape and
-    /// excludes the mid-rank multi-term shapes. Not yet wired up:
-    /// the single-query parallel win (26% on prefix) hasn't
-    /// justified the routing-heuristic maintenance cost yet.
-    ///
-    /// Algorithm: classic k-way merge over `TermCursor`s. Each
-    /// iteration finds the smallest current `doc_id` among live
-    /// cursors, sums BM25 contributions from all cursors at that
-    /// doc, advances those cursors, pushes into the top-K min-heap.
+    /// Exhaustive union walk for multi-term OR: a k-way merge over the
+    /// cursors that scores every doc in the union and offers it to the top-k
+    /// heap, with no threshold-driven skipping. Not on any query path; the
+    /// bench selector (`OrAlgo::Exhaustive`) keeps it as the unpruned
+    /// baseline the pruned kernels are measured against.
     ///
     /// Result invariants match [`Self::run_max_score_bmm`]: top-k by
     /// descending BM25 score, ties broken by ascending doc_id.
@@ -3606,15 +3526,13 @@ impl FtsReader {
         column_id: u32,
         mut cursors: Vec<TermCursor>,
         k: usize,
-        mut filter: Option<&mut ExcludeFilter>,
-    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         let col_meta = &self.columns[column_id as usize];
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
         let initial_cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
         let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::with_capacity(initial_cap);
         let mut threshold: f32 = 0.0;
-        let mut count = 0u64;
 
         loop {
             // The smallest current doc_id across the live cursors is the
@@ -3630,14 +3548,8 @@ impl FtsReader {
             if candidate == u32::MAX {
                 break;
             }
-            let admitted = match filter.as_deref_mut() {
-                Some(f) => f.admits(candidate),
-                None => true,
-            };
-
             // Score: sum BM25 from every cursor at the candidate, four
-            // cursors per SIMD call. Every cursor at the candidate advances,
-            // admitted or not.
+            // cursors per SIMD call, advancing each.
             let norm = dl_norm_k1.get(candidate);
             let mut score: f32 = 0.0;
             let mut idfs = [0.0_f32; 4];
@@ -3647,28 +3559,19 @@ impl FtsReader {
                 if cursor.current_doc_id() != candidate {
                     continue;
                 }
-                if admitted {
-                    idfs[packed] = cursor.idf_weight;
-                    tfs[packed] = cursor.current_tf() as f32;
-                    packed += 1;
-                    if packed == 4 {
-                        score += bm25::score_simd_x4(idfs, tfs, norm);
-                        idfs = [0.0; 4];
-                        tfs = [0.0; 4];
-                        packed = 0;
-                    }
+                idfs[packed] = cursor.idf_weight;
+                tfs[packed] = cursor.current_tf() as f32;
+                packed += 1;
+                if packed == 4 {
+                    score += bm25::score_simd_x4(idfs, tfs, norm);
+                    idfs = [0.0; 4];
+                    tfs = [0.0; 4];
+                    packed = 0;
                 }
                 cursor.next();
             }
-            if !admitted {
-                continue;
-            }
             if packed > 0 {
                 score += bm25::score_simd_x4(idfs, tfs, norm);
-            }
-            count += 1;
-            if k == 0 {
-                continue;
             }
 
             // Top-K update. `threshold` mirrors `heap.peek().0` so the
@@ -3676,22 +3579,23 @@ impl FtsReader {
             offer_top_k(&mut heap, k, &mut threshold, score, candidate);
         }
 
-        Ok((drain_top_k_desc(heap), count))
+        Ok(drain_top_k_desc(heap))
     }
 
-    /// Multi-term OR dispatch. Routes every union to the one windowed MaxScore
-    /// kernel ([`Self::run_windowed_maxscore`]), except a 2-term rare+common OR,
-    /// which goes to WAND+BMW ([`Self::run_wand_bmw`]) — it pivots on the rare
-    /// term to skip the common term's long posting list, the one shape the
-    /// windowed kernel can't beat. The rationale for that cutoff is inline below.
+    /// Multi-term OR dispatch. At a small `k`, with no negation and no floor,
+    /// a union with a rare term first tries the rare-led walks
+    /// ([`Self::rare_led_pair`] for two terms, [`Self::rare_led`] for more):
+    /// they rank the rare term's documents directly and either finish, hand
+    /// back a seed for the bar, or hand the rest to [`Self::rare_split`]. A
+    /// 2-term pair the rare-led walk declines goes to WAND+BMW
+    /// ([`Self::run_wand_bmw`]). Everything else runs the windowed MaxScore
+    /// kernel ([`Self::run_windowed_maxscore`]).
     ///
     /// The per-candidate MaxScore+BMM ([`Self::run_max_score_bmm`]), the plain
     /// windowed OR-sum ([`Self::run_windowed_union`]), and the exhaustive walk
     /// ([`Self::run_exhaustive_union`]) remain in the tree only as bench
     /// baselines and the correctness oracle, reachable via
     /// `search_with_algo_for_bench`; the dispatcher routes to none of them.
-    /// The exact-count search (`run_prepared_with_count`) takes the
-    /// exhaustive walk directly, since a count has to visit every match.
     pub(super) fn dispatch_or_algo(
         &self,
         column_id: u32,
@@ -3848,7 +3752,8 @@ impl FtsReader {
     /// maximum, an upper bound strictly above any score it stands for, so
     /// once the k-th best reaches it no such document can enter the top k,
     /// not even on a tie, and the ranked rare-term documents are the answer.
-    /// Otherwise `None`, and the caller runs the general walk from the start.
+    /// Otherwise an `Err` saying how the caller goes on: from a seed for the
+    /// bar, by splitting off the rare term, or with the general walk.
     /// This skips the general walk's opening stretch, where the threshold is
     /// still below the common term's maximum and its documents are scored
     /// one by one until `k` rare-term documents have been seen.
@@ -3922,9 +3827,7 @@ impl FtsReader {
         match algo {
             OrAlgo::Bmm => self.run_max_score_bmm(column_id, cursors, k, None, f32::NEG_INFINITY),
             OrAlgo::WandBmw => self.run_wand_bmw(column_id, cursors, k),
-            OrAlgo::Exhaustive => self
-                .run_exhaustive_union(column_id, cursors, k, None)
-                .map(|(hits, _)| hits),
+            OrAlgo::Exhaustive => self.run_exhaustive_union(column_id, cursors, k),
             OrAlgo::Windowed => {
                 self.run_windowed_union(column_id, cursors, k, None, f32::NEG_INFINITY, 0, u32::MAX)
             }

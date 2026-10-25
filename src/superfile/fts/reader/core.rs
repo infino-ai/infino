@@ -367,8 +367,8 @@ impl PreparedClauses {
 /// Multi-term OR algorithm selector for the bench harness's
 /// `search_with_algo_for_bench` entry point, so head-to-head bench runs can
 /// compare the kernels under identical inputs. Production code routes through
-/// `FtsReader::dispatch_or_algo`, which sends every multi-term union to
-/// `WindowedMaxscore` and a 2-term rare+common OR to WAND+BMW.
+/// `FtsReader::dispatch_or_algo`: the rare-led walks for a union with a rare
+/// term at small `k`, else `WindowedMaxscore`.
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrAlgo {
@@ -376,13 +376,12 @@ pub enum OrAlgo {
     /// `WindowedMaxscore`; retained as a bench baseline and the correctness
     /// oracle the windowed kernels are checked against.
     Bmm,
-    /// WAND + Block-Max-WAND. The production path for a 2-term rare+common OR
-    /// (it pivots on the rare term to skip the common term's long list); a
-    /// bench baseline otherwise.
+    /// WAND + Block-Max-WAND. In production, the fallback for a 2-term
+    /// rare+common OR the rare-led walk declines (it pivots on the rare term to
+    /// skip the common term's long list); a bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. The OR
-    /// dispatcher never routes here; the exact-count search does (see
-    /// `run_exhaustive_union`), and the benches keep it as a baseline.
+    /// Exhaustive union walk with SIMD scoring + top-K heap: the unpruned
+    /// baseline. Nothing on a query path routes here.
     Exhaustive,
     /// Windowed union: accumulate each term's contribution into a fixed doc-id
     /// window (presence bitset + score array), then drain in doc order into the

@@ -1343,14 +1343,13 @@ impl FtsReader {
             } => bytes,
         };
         let postings = term_bytes.as_ref();
-        let metadata_offset = 0usize;
 
         // Everything below is the synchronous scoring walk (no awaits):
         // bracket it on this thread for the per-query kernel CPU stat.
         // Gated: an unmetered process must not pay the procfs reads on
         // the most common query shape.
         let kernel_start = metering_active().then(thread_cpu_ns).flatten();
-        let term_meta = TermMeta::parse(postings, metadata_offset, col_meta.positions)?;
+        let term_meta = TermMeta::parse(postings, 0, col_meta.positions)?;
 
         let local_idf = bm25::idf(col_meta.scored_doc_count(), term_meta.df);
         let idf_t = idf.resolve(col_meta, term_meta.df)?;
@@ -1361,10 +1360,9 @@ impl FtsReader {
         let bounds = BoundDecoder::new(col_meta, idf_t, local_idf);
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
-        // Stack-resident decode scratch: `BLOCK_LEN` is a compile-time
-        // const and these never cross an await (the whole scoring walk
-        // below is synchronous), so they stay off the heap — no per-query
-        // malloc/free on the most common query shape.
+        // Stack-resident decode scratch for the seed below: `BLOCK_LEN` is a
+        // compile-time const and these never cross an await, so they stay off
+        // the heap.
         let mut buf_d = [0u32; BLOCK_LEN];
         let mut buf_t = [0u32; BLOCK_LEN];
 
@@ -1372,11 +1370,10 @@ impl FtsReader {
         // Every long-form term carries a coarse block-max table.
         let coarse_enabled = term_meta.has_coarse;
 
-        // Threshold-first seed. The doc-id-order walk below fills `heap_min`
-        // slowly, so on a common term it decodes ~2/3 of its blocks before
-        // the k-th threshold has risen enough to skip them (measured: `the`
-        // TOP_10 decodes ~1,209 blocks, only ~368 of them irreducible). To
-        // raise the bar first, decode the highest-block-max blocks up front
+        // Threshold-first seed. The doc-id-order walk below raises its k-th
+        // best slowly, so on a common term it decodes most of its blocks
+        // before the bar has risen enough to skip them. To raise the bar
+        // first, decode the highest-block-max blocks up front
         // — found cheaply via the coarse level — and take the k-th score of
         // those as a floor for the main walk's skip bar.
         //
@@ -1427,7 +1424,7 @@ impl FtsReader {
                 BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
             for &(_, bi) in &cand[..m] {
                 let range = term_meta.block_range_in_term(postings, bi, None);
-                let bytes = &postings[metadata_offset + range.start..metadata_offset + range.end];
+                let bytes = &postings[range.start..range.end];
                 let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
                 let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
                 for j in 0..n {
