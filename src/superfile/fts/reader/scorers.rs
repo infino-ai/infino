@@ -4951,6 +4951,73 @@ mod tests {
         assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
     }
 
+    /// The AVX-512 window accumulate leaves the same bits in the window as the
+    /// scalar one over the postings it consumes: dense runs (expanded into a
+    /// 16-slot read-modify-write) and sparse ones, onto a window that already
+    /// holds scores, at norms spread across the table's buckets.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn accumulate_run_avx512_matches_scalar() {
+        if !std::arch::is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..2_000u32 {
+            b.add_doc(0, i, &"w ".repeat(1 + (i as usize * 7919) % 300))
+                .expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let norms = r.columns[0].dl_norm_k1();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for trial in 0..200 {
+            let base = 64 * (next() % 8) as u32;
+            let n = 8 + (next() % 120) as usize;
+            let max_gap = [1u64, 2, 3, 40][trial % 4];
+            let mut ids = Vec::with_capacity(n);
+            let mut d = base + (next() % 16) as u32;
+            for _ in 0..n {
+                if d >= base + OR_WINDOW || d >= 2_000 {
+                    break;
+                }
+                ids.push(d);
+                d += 1 + (next() % max_gap) as u32;
+            }
+            let tfs: Vec<u32> = ids.iter().map(|_| 1 + (next() % 20) as u32).collect();
+            let start: Vec<f32> = (0..OR_WINDOW)
+                .map(|_| (next() % 1000) as f32 / 97.0)
+                .collect();
+            let (mut simd, mut scalar) = (start.clone(), start);
+            let mut simd_present = [0u64; OR_WINDOW_WORDS];
+            let mut scalar_present = [0u64; OR_WINDOW_WORDS];
+            let idf = 1.7f32;
+            // SAFETY: avx512f is present (checked above).
+            let used = unsafe {
+                accumulate_run_avx512(idf, &ids, &tfs, base, &mut simd, &mut simd_present, norms)
+            };
+            assert!(
+                used <= ids.len() && used.is_multiple_of(8),
+                "trial {trial}: used {used}"
+            );
+            for (&d, &tf) in ids[..used].iter().zip(&tfs[..used]) {
+                let local = (d - base) as usize;
+                scalar[local] += bm25::score_with_dl_norm_k1(idf, tf, norms.get(d));
+                scalar_present[local >> 6] |= 1u64 << (local & 63);
+            }
+            assert_eq!(simd_present, scalar_present, "trial {trial}: presence");
+            for (slot, (a, b)) in simd.iter().zip(&scalar).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "trial {trial}: slot {slot}");
+            }
+        }
+    }
+
     /// The must-led walk prunes on a bound summed in one order and admits on a
     /// score summed in another; its bar's slack must cover the gap. Sums of the
     /// same non-negative terms in two orders stay within that slack of each other.
