@@ -142,6 +142,11 @@ fn field_bytes(v: u32) -> usize {
     }
 }
 
+/// The exception tables' leading byte: the lane field's byte width in the
+/// low nibble, the high-bits field's in the high one.
+const EXC_LANE_BYTES_MASK: u8 = 0xF;
+const EXC_HI_BYTES_SHIFT: u32 = 4;
+
 /// Field `i` of a table of `W`-byte little-endian fields.
 #[inline(always)]
 fn field<const W: usize>(table: &[u8], i: usize) -> u32 {
@@ -310,7 +315,7 @@ fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: b
             .map(|&(_, hi)| field_bytes(hi))
             .max()
             .unwrap_or(1);
-        out.push((lane_bytes as u8) | ((hi_bytes as u8) << 4));
+        out.push((lane_bytes as u8) | ((hi_bytes as u8) << EXC_HI_BYTES_SHIFT));
         for &(lane, _) in &plan.exceptions {
             out.extend_from_slice(&lane.to_le_bytes()[..lane_bytes]);
         }
@@ -326,11 +331,12 @@ fn write_stream(out: &mut Vec<u8>, lanes: &[u32], plan: &ExceptionPlan, fixed: b
 }
 
 /// One stream of a packed group located for random access: its lane
-/// width, where its payload lies in the positions bytes, and its
-/// exceptions in ascending lane order.
+/// width and count, where its payload lies in the positions bytes, and
+/// its exceptions in ascending lane order.
 #[derive(Default)]
 struct StreamIndex {
     width: u8,
+    lanes: usize,
     payload: Range<usize>,
     exceptions: Vec<(u32, u32)>,
 }
@@ -361,22 +367,13 @@ impl StreamIndex {
         bytes.get(payload.clone())?;
         *at = payload.end;
         self.exceptions.clear();
-        let mut prev_lane: Option<u32> = None;
-        let mut push = |lane: u32, hi: u32| -> Option<()> {
-            if lane as usize >= n || prev_lane.is_some_and(|p| lane <= p) {
-                return None;
-            }
-            self.exceptions.push((lane, hi));
-            prev_lane = Some(lane);
-            Some(())
-        };
+        let tables = &mut self.exceptions;
         if fixed && n_exc > 0 {
             // Both tables in place: lanes, then high bits, each `n_exc`
             // little-endian fields of the width the leading byte gives.
             let widths = *bytes.get(*at)?;
             *at += 1;
-            let tables = &mut self.exceptions;
-            *at = match (widths & 0xF, widths >> 4) {
+            *at = match (widths & EXC_LANE_BYTES_MASK, widths >> EXC_HI_BYTES_SHIFT) {
                 (1, 1) => read_tables::<1, 1>(bytes, *at, n_exc, tables),
                 (1, 2) => read_tables::<1, 2>(bytes, *at, n_exc, tables),
                 (1, 4) => read_tables::<1, 4>(bytes, *at, n_exc, tables),
@@ -388,27 +385,27 @@ impl StreamIndex {
                 (4, 4) => read_tables::<4, 4>(bytes, *at, n_exc, tables),
                 _ => None,
             }?;
-            // Lanes must ascend and fall inside the stream.
-            let mut prev: Option<u32> = None;
-            for &(lane, _) in tables.iter() {
-                if lane as usize >= n || prev.is_some_and(|p| lane <= p) {
-                    return None;
-                }
-                prev = Some(lane);
-            }
         } else if !fixed {
             for _ in 0..n_exc {
                 let lane = read_varint(bytes, at)?;
                 let hi = read_varint(bytes, at)?;
-                push(lane, hi)?;
+                tables.push((lane, hi));
             }
         }
+        // Lanes must ascend and fall inside the stream.
+        let mut prev: Option<u32> = None;
+        for &(lane, _) in tables.iter() {
+            if lane as usize >= n || prev.is_some_and(|p| lane <= p) {
+                return None;
+            }
+            prev = Some(lane);
+        }
         self.width = width;
+        self.lanes = n;
         self.payload = payload;
         Some(())
     }
 
-    /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
     /// One lane of the stream, exception applied.
     #[inline]
     fn lane(&self, bytes: &[u8], i: usize) -> Option<u32> {
@@ -432,7 +429,14 @@ impl StreamIndex {
         hi.checked_shl(u32::from(self.width)).unwrap_or(0)
     }
 
+    /// Lanes `from..from + n`, exceptions patched in, appended to `out`.
+    /// `None`, with nothing appended, when they run past the stream.
     fn read_lanes(&self, bytes: &[u8], from: usize, n: usize, out: &mut Vec<u32>) -> Option<()> {
+        // Checked before `out` grows: `n` comes from a posting's tf, which
+        // a corrupt block can make arbitrarily large.
+        if from + n > self.lanes {
+            return None;
+        }
         let base = out.len();
         out.resize(base + n, 0);
         let read = self.read_lanes_into(bytes, from, &mut out[base..]);
@@ -520,8 +524,6 @@ pub(crate) struct GroupIndex {
     /// the pairs before it) for a packed group, in the values (`Σ tf`)
     /// for a LEB128 one. `tfs.len() + 1` entries.
     starts: Vec<u32>,
-    /// A run's raw values before the gaps are summed into positions.
-    run: Vec<u32>,
 }
 
 impl GroupIndex {
@@ -537,6 +539,12 @@ impl GroupIndex {
         match header {
             GROUP_LEB128 => {
                 self.kind = GroupKind::Leb128;
+                // Each value takes at least a byte: a count the rest of the
+                // bytes cannot hold is corrupt, and is refused before it
+                // sizes the buffer.
+                if n > bytes.len() - *at {
+                    return None;
+                }
                 self.values.clear();
                 self.values.reserve(n);
                 for _ in 0..n {
@@ -546,8 +554,17 @@ impl GroupIndex {
             GROUP_PACKED | GROUP_PACKED_FIXED => {
                 let fixed = header == GROUP_PACKED_FIXED;
                 self.kind = GroupKind::Packed;
+                let n_gaps = n.checked_sub(tfs.len())?;
                 self.first.parse_into(bytes, at, tfs.len(), fixed)?;
-                self.gap.parse_into(bytes, at, n - tfs.len(), fixed)?;
+                self.gap.parse_into(bytes, at, n_gaps, fixed)?;
+                // Every gap is at least one (a doc's positions strictly
+                // increase), so a zero-width gap stream carries each gap as
+                // an exception. One that does not is corrupt; refusing it
+                // bounds the gap count by the bytes holding the exceptions,
+                // as a payload bounds it at any other width.
+                if self.gap.width == 0 && self.gap.exceptions.len() != n_gaps {
+                    return None;
+                }
             }
             _ => return None,
         }
@@ -596,12 +613,9 @@ impl GroupIndex {
             self.kind = GroupKind::Bulk;
         }
         self.served += 1;
-        self.run.clear();
         match self.kind {
             GroupKind::Leb128 => {
-                self.run
-                    .extend_from_slice(self.values.get(start..start + tf as usize)?);
-                positions_from_run_values(&self.run, out)
+                positions_from_run_values(self.values.get(start..start + tf as usize)?, out)
             }
             GroupKind::Packed => {
                 if tf as usize <= SMALL_TF {
@@ -824,6 +838,121 @@ mod tests {
                 .is_none(),
             "width past 32, fixed tables"
         );
+    }
+
+    #[test]
+    fn every_exception_field_width_reads_back() {
+        // One doc whose gaps are all one (width 1) but for three outliers in
+        // its last lanes. The lane count sets the lane field's bytes (lanes
+        // past 255 need two, past 65535 four) and the outliers' size the
+        // high-bits field's, so each pair of widths is written and read.
+        for (n_gaps, lane_bytes) in [(200usize, 1u8), (1_000, 2), (70_000, 4)] {
+            for (outlier, hi_bytes) in [(200u32, 1u8), (1 << 12, 2), (1 << 20, 4)] {
+                let mut vals = vec![1u32; n_gaps + 1];
+                vals[0] = 0;
+                for k in 1..=3 {
+                    vals[n_gaps + 1 - k] = outlier + k as u32;
+                }
+                let tfs = [vals.len() as u32];
+                let mut out = Vec::new();
+                group(&mut out, &tfs, &vals, false);
+                // Header, an empty first stream (width 0, no exceptions),
+                // then the gap stream's width, count and packed lanes.
+                let widths_at = 1 + 2 + 2 + payload_bytes(n_gaps, 1);
+                assert_eq!(out[1 + 2], 1, "gap width");
+                assert_eq!(out[1 + 2 + 1], 3, "three exceptions");
+                assert_eq!(
+                    out[widths_at],
+                    lane_bytes | (hi_bytes << EXC_HI_BYTES_SHIFT),
+                    "{n_gaps} gaps, outlier {outlier}"
+                );
+                assert_eq!(
+                    decode_all(&out, 0, &tfs),
+                    Some(positions_of(&tfs, &vals)),
+                    "{n_gaps} gaps, outlier {outlier}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exception_lanes_out_of_order_or_range_are_refused() {
+        // A first stream of two lanes at width 0 whose exceptions name the
+        // lanes given, in both table forms. Ascending in-range lanes parse;
+        // a repeat, a descent, or a lane past the stream is corrupt.
+        for (lanes, ok) in [
+            ([0u8, 1], true),
+            ([1, 1], false),
+            ([1, 0], false),
+            ([0, 2], false),
+        ] {
+            let fixed = [
+                GROUP_PACKED_FIXED,
+                0,
+                2,
+                1 | (1 << EXC_HI_BYTES_SHIFT),
+                lanes[0],
+                lanes[1],
+                5,
+                6,
+                0,
+                0,
+            ];
+            let varint = [GROUP_PACKED, 0, 2, lanes[0], 5, lanes[1], 6, 0, 0];
+            for bytes in [&fixed[..], &varint[..]] {
+                let mut index = GroupIndex::default();
+                assert_eq!(
+                    index.locate(bytes, &mut 0, &[1, 1]).is_some(),
+                    ok,
+                    "lanes {lanes:?}, header {}",
+                    bytes[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn corrupt_counts_are_refused_before_they_size_a_buffer() {
+        // A LEB128 group claiming more values than its bytes could hold:
+        // refused before reserving room for them.
+        let huge = [u32::MAX; 128];
+        assert!(
+            GroupIndex::default()
+                .locate(&[GROUP_LEB128, 1, 2, 3], &mut 0, &huge)
+                .is_none(),
+            "LEB128 count past the bytes"
+        );
+        // A zero-width gap stream with no exceptions: every gap would be
+        // zero, which no doc's strictly increasing positions give, and its
+        // lane count would be bounded by nothing in the bytes.
+        for header in [GROUP_PACKED, GROUP_PACKED_FIXED] {
+            let bytes = [header, 0, 0, 0, 0];
+            assert!(
+                GroupIndex::default()
+                    .locate(&bytes, &mut 0, &[u32::MAX])
+                    .is_none(),
+                "zero-width gaps without exceptions, header {header}"
+            );
+            // A zero tf leaves fewer values than docs: refused, not an
+            // underflow.
+            assert!(
+                GroupIndex::default()
+                    .locate(&bytes, &mut 0, &[0, 0])
+                    .is_none(),
+                "zero tfs, header {header}"
+            );
+        }
+        // A run asked for past its group: refused before its gap lanes
+        // are appended (its first position may already be).
+        let tfs = [6u32, 6];
+        let vals: Vec<u32> = (0..12).map(|i| 3 + i % 5).collect();
+        let mut out = Vec::new();
+        group(&mut out, &tfs, &vals, false);
+        let mut index = GroupIndex::default();
+        index.locate(&out, &mut 0, &tfs).expect("parses");
+        let mut got = vec![9u32];
+        assert!(index.run_positions(&out, 1, 1 << 30, &mut got).is_none());
+        assert!(got.len() <= 2, "no gap lanes appended: {}", got.len());
     }
 
     #[test]
@@ -1083,9 +1212,9 @@ mod tests {
             group(&mut out, &tfs, &vals, allow);
             let mut index = GroupIndex::default();
             index.locate(&out, &mut 0, &tfs).expect("parses");
-            for pair in 0..tfs.len() {
+            for (pair, &tf) in tfs.iter().enumerate() {
                 let mut got = Vec::new();
-                let read = index.run_positions(&out, pair, tfs[pair], &mut got);
+                let read = index.run_positions(&out, pair, tf, &mut got);
                 match pair {
                     2 | 4 => assert!(read.is_none(), "pair {pair} allow {allow}"),
                     _ => {
