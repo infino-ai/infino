@@ -3135,10 +3135,7 @@ impl FtsReader {
                         c0.next();
                         continue;
                     }
-                    let mut raised = false;
-                    if heap.offer(k, &mut threshold, score, candidate) {
-                        raised = true;
-                    }
+                    let raised = heap.offer(k, &mut threshold, score, candidate);
                     c0.next();
                     // Only when the threshold actually rose: if even this term
                     // plus every other term at its max can't beat it, no further
