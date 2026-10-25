@@ -1203,7 +1203,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
         },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use async_trait::async_trait;
@@ -5127,6 +5127,45 @@ mod tests {
                 "a term of one commit routes to that superfile alone"
             );
         }
+    }
+
+    /// Where a stream of commits spends its time: each commit of
+    /// `COMMIT_ROWS` unique-term titles, timed, and then the maintenance
+    /// passes alone (the term-index rebuild among them). Prints the
+    /// per-commit mean over tens, the slowest commit, and the optimize
+    /// time. Run with `--release`; it builds a million rows.
+    #[test]
+    #[ignore = "timing report, not a check"]
+    fn where_many_commits_spend_their_time() {
+        const COMMITS: usize = 200;
+        const COMMIT_ROWS: usize = 5000;
+        let (_dir, _storage, st) = fresh_table();
+        let mut per_commit = Vec::with_capacity(COMMITS);
+        for c in 0..COMMITS {
+            let titles: Vec<String> = (0..COMMIT_ROWS)
+                .map(|i| format!("id{} shared", c * COMMIT_ROWS + i))
+                .collect();
+            let t = Instant::now();
+            commit_titles(&st, &titles);
+            per_commit.push(t.elapsed());
+        }
+        for (k, chunk) in per_commit.chunks(10).enumerate() {
+            let mean = chunk.iter().sum::<Duration>() / chunk.len() as u32;
+            let max = chunk.iter().max().expect("non-empty chunk");
+            eprintln!(
+                "commits {:3}-{:3}: mean {:7.1} ms, slowest {:7.1} ms",
+                k * 10 + 1,
+                k * 10 + chunk.len(),
+                mean.as_secs_f64() * 1000.0,
+                max.as_secs_f64() * 1000.0
+            );
+        }
+        let t = Instant::now();
+        maintenance_only_optimize(&st);
+        eprintln!(
+            "maintenance-only optimize after {COMMITS} commits: {:.1} ms",
+            t.elapsed().as_secs_f64() * 1000.0
+        );
     }
 
     /// A retry appends the segment it already built onto the winner's root:
