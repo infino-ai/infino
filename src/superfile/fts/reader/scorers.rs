@@ -561,6 +561,11 @@ fn must_lead_should_count(
     count
 }
 
+/// Relative error, in units of `f32::EPSILON` per summed term, by which two
+/// sums of the same non-negative terms in different orders can differ: each
+/// addition rounds by at most half an ulp, on either sum.
+const REASSOCIATION_ULPS_PER_TERM: f32 = 2.0;
+
 /// How many times fewer postings the optional terms must have over a
 /// required block's range than the block itself, for the must-led walk to
 /// collect theirs and score only the required docs among them.
@@ -644,13 +649,18 @@ fn must_lead_should_walk<C: Collector>(
     // The bar a doc must beat: the collector's k-th best once it is full (a
     // heap keeps it exact, a buffer at its last cut, never above the true
     // one), else the floor (`NEG_INFINITY` when there is none, which prunes
-    // nothing).
+    // nothing). Pruning sums a doc's bounds strongest term first while its
+    // score is summed in query order, so a bound can round a few ulps below
+    // the score it covers: prune against the bar lowered by that much, and
+    // leave admission to the collector's own test on the real score.
     let mut kth = f32::NEG_INFINITY;
+    let slack = REASSOCIATION_ULPS_PER_TERM * (m + 1) as f32 * f32::EPSILON;
     let bar = |heap: &C, kth: f32| -> f32 {
-        match heap.is_full(k) {
+        let bar = match heap.is_full(k) {
             true => kth.max(floor_eff),
             false => floor_eff,
-        }
+        };
+        bar - bar.abs() * slack
     };
     let mut threshold = bar(heap, kth);
     // The block batch's scratch: the block's candidates, their required
@@ -5112,6 +5122,37 @@ mod tests {
         let mut s3 = scores0.clone();
         assert_eq!(filter_survivors(&mut d3, &mut s3, f32::NEG_INFINITY), 40);
         assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
+    }
+
+    /// The must-led walk prunes on a bound summed in one order and admits on a
+    /// score summed in another; its bar's slack must cover the gap. Sums of the
+    /// same non-negative terms in two orders stay within that slack of each other.
+    #[test]
+    fn reassociation_slack_covers_summing_in_another_order() {
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..20_000 {
+            let n = 2 + (next() % (MAX_SHOULDS_LED as u64)) as usize;
+            let terms: Vec<f32> = (0..n)
+                .map(|_| (next() % 1_000_000) as f32 / 37_000.0 * (1 + next() % 3) as f32)
+                .collect();
+            let mut shuffled = terms.clone();
+            for i in (1..n).rev() {
+                shuffled.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let a: f32 = terms.iter().sum();
+            let b: f32 = shuffled.iter().fold(0.0, |acc, &t| acc + t);
+            let slack = REASSOCIATION_ULPS_PER_TERM * n as f32 * f32::EPSILON;
+            assert!(
+                a <= b + b * slack && b <= a + a * slack,
+                "{terms:?}: {a} vs {b}"
+            );
+        }
     }
 
     /// The dispatched filter (AVX2 where present) and the scalar one keep the
