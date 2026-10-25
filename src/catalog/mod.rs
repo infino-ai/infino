@@ -817,9 +817,13 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        // A hosted connection reads the document the endpoint serves; the
+        // local handle below is the engine's own.
         #[cfg(feature = "remote")]
-        if let CatalogStore::Remote(_) = &self.inner.store {
-            return Err(remote_schema_unsupported("schema", name));
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c
+                .schema_document(name)
+                .map_err(|e| e.with_context("schema", Some(name)));
         }
         let handle = self.open_table_handle(name)?;
         Ok((*handle.table_schema()).clone())
@@ -857,9 +861,13 @@ impl Connection {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
+        // The endpoint creates the table from the patch when there is none,
+        // as the local path below does, so a hosted write forwards whole.
         #[cfg(feature = "remote")]
-        if let CatalogStore::Remote(_) = &self.inner.store {
-            return Err(remote_schema_unsupported("apply_schema", name));
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c
+                .apply_schema(name, patch, expected)
+                .map_err(|e| e.with_context("apply_schema", Some(name)));
         }
         let handle = match self.open_table_handle(name) {
             Ok(handle) => handle,
@@ -1831,16 +1839,6 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
         ));
     }
     Ok((Arc::new(Schema::new(fields)), indexes))
-}
-
-/// The schema document is served by the engine; a hosted connection does
-/// not carry it over the wire yet.
-#[cfg(feature = "remote")]
-fn remote_schema_unsupported(operation: &'static str, name: &str) -> InfinoError {
-    InfinoError::Backend(
-        "the schema document is not available over a hosted connection yet".to_string(),
-    )
-    .with_context(operation, Some(name))
 }
 
 fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {

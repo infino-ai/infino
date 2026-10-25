@@ -193,9 +193,14 @@ pub(crate) fn status_to_error(op: &str, code: u16, body: &str) -> InfinoError {
         404 => InfinoError::NotFound(format!("{op}: {body}")),
         409 => InfinoError::AlreadyExists(format!("{op}: {body}")),
         412 => InfinoError::Conflict(format!("{op}: {body}")),
-        401 | 403 => {
-            InfinoError::Backend(format!("{op}: unauthorized (check the API key): {body}"))
-        }
+        // Both say the key was not accepted for this call: 401 that it is not
+        // a key the service knows, 403 that it is one and may not do this — a
+        // capability it lacks, or a limit of the account behind it that the
+        // body names. The code stays in the message, as on every other
+        // status, so a caller can tell the two apart.
+        401 | 403 => InfinoError::Backend(format!(
+            "{op}: server returned {code} (the key was refused for this call): {body}"
+        )),
         _ => InfinoError::Backend(format!("{op}: server returned {code}: {body}")),
     }
 }
@@ -384,5 +389,16 @@ mod tests {
             status_to_error("query_sql", 500, "boom"),
             InfinoError::Backend(_)
         ));
+    }
+
+    /// A refused key and a refused call differ only by status, and the
+    /// message is all a caller gets: the code is in it for every status.
+    #[test]
+    fn refused_statuses_keep_their_code_in_the_message() {
+        let unknown = status_to_error("append", 401, "bad key").to_string();
+        assert!(unknown.contains("server returned 401"), "{unknown}");
+        let limited = status_to_error("append", 403, "row limit reached").to_string();
+        assert!(limited.contains("server returned 403"), "{limited}");
+        assert!(limited.contains("row limit reached"), "{limited}");
     }
 }

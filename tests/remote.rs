@@ -19,8 +19,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use datafusion::prelude::{col, lit};
 use infino::{
-    Bm25SearchOptions, BoolMode, ConnectOptions, FtsField, IndexSpec, InfinoError, Metric,
-    OptimizeError, OptimizeOptions, Stemmer, Stopwords, VectorFilter, VectorSearchOptions,
+    Bm25SearchOptions, BoolMode, ConnectOptions, FieldPatch, FtsField, IndexSpec, InfinoError,
+    Metric, OptimizeError, OptimizeOptions, SchemaPatch, Stemmer, Stopwords, VectorFilter,
+    VectorSearchOptions,
 };
 use serde_json::json;
 use wiremock::{
@@ -251,6 +252,187 @@ async fn open_table_missing_maps_to_not_found() {
     let err = with_connection(server.uri(), |db| {
         db.open_table("ghost")
             .expect_err("missing table must error")
+    })
+    .await;
+    assert!(matches!(err, InfinoError::NotFound(_)), "got {err:?}");
+}
+
+/// A schema document as the endpoint serves it: the one a local table writes
+/// for the same declaration, so these tests pin the codec the hosted side and
+/// this client share rather than a hand-written sample of it.
+///
+/// Built on a plain thread: the local engine drives its own async work from
+/// a sync call, which it may not do from inside the test's `current_thread`
+/// runtime (and a `spawn_blocking` thread still carries that runtime).
+fn posts_document() -> serde_json::Value {
+    std::thread::spawn(|| {
+        let db = infino::connect("memory://").expect("local connection");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("title", DataType::LargeUtf8, true),
+        ]));
+        db.create_table("posts", schema, IndexSpec::new().fts("title"))
+            .expect("create_table");
+        db.schema("posts").expect("schema").to_json()
+    })
+    .join()
+    .expect("document thread")
+}
+
+/// The patch every schema-write test sends: one nullable text column.
+fn body_patch() -> SchemaPatch {
+    SchemaPatch::new(vec![
+        FieldPatch::named("body")
+            .with_type(DataType::LargeUtf8)
+            .with_nullable(true),
+    ])
+}
+
+#[tokio::test]
+async fn schema_document_is_read_over_the_wire() {
+    let server = MockServer::start().await;
+    let document = posts_document();
+    Mock::given(method("POST"))
+        .and(path("/v1/schema/mydb"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(body_partial_json(json!({
+            "table_name": "posts",
+            "encoding": "document",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(document.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let read = with_connection(server.uri(), |db| {
+        db.schema("posts").expect("schema").to_json()
+    })
+    .await;
+    assert_eq!(
+        read, document,
+        "the document reads back as the endpoint served it"
+    );
+    assert_eq!(
+        read["fields"][1]["index"]["kind"], "fts",
+        "the column's index role crosses the wire"
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_posts_the_patch_and_reads_the_document_back() {
+    let server = MockServer::start().await;
+    let document = posts_document();
+    Mock::given(method("POST"))
+        .and(path("/v1/schema/mydb"))
+        .and(header("authorization", format!("Bearer {KEY}").as_str()))
+        .and(body_partial_json(json!({
+            "table_name": "posts",
+            "expected_schema_id": 1,
+            "patch": {
+                "fields": [{"name": "body", "type": "large_utf8", "nullable": true}],
+            },
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(document.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let read = with_connection(server.uri(), |db| {
+        db.apply_schema("posts", &body_patch(), Some(1))
+            .expect("apply_schema")
+            .to_json()
+    })
+    .await;
+    assert_eq!(read, document);
+
+    // A write without a comparison sends no `expected_schema_id` at all: the
+    // endpoint reads an absent key as "no precondition", and a null would be
+    // a field the request schema does not define.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests[0].body).expect("json request body");
+    assert!(
+        body.get("encoding").is_none(),
+        "a write never names an encoding; the endpoint refuses the pair"
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_through_the_table_handle_omits_the_precondition() {
+    let server = MockServer::start().await;
+    let document = posts_document();
+    // The write's mock first: wiremock answers with the first mounted mock
+    // that matches, and the catch-all below would otherwise serve the patch
+    // an Arrow schema.
+    Mock::given(method("POST"))
+        .and(path("/v1/schema/mydb"))
+        .and(body_partial_json(
+            json!({ "patch": { "fields": [{"name": "body"}] } }),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(document.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_schema(&server).await;
+
+    let read = with_connection(server.uri(), |db| {
+        let table = db.open_table("posts").expect("open_table");
+        table
+            .apply_schema(&body_patch(), None)
+            .expect("apply_schema")
+            .to_json()
+    })
+    .await;
+    assert_eq!(read, document);
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("request recording is enabled");
+    let write = requests
+        .iter()
+        .find(|r| r.body.windows(7).any(|w| w == b"\"patch\""))
+        .expect("the write was sent");
+    let body: serde_json::Value = serde_json::from_slice(&write.body).expect("json request body");
+    assert!(
+        body.get("expected_schema_id").is_none(),
+        "no comparison asked for, none sent"
+    );
+}
+
+#[tokio::test]
+async fn apply_schema_lost_compare_and_set_maps_to_conflict() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/schema/mydb"))
+        .respond_with(
+            ResponseTemplate::new(409).set_body_string("schema moved: expected 1, current 2"),
+        )
+        .mount(&server)
+        .await;
+
+    let err = with_connection(server.uri(), |db| {
+        db.apply_schema("posts", &body_patch(), Some(1))
+            .expect_err("a lost compare-and-set must error")
+    })
+    .await;
+    assert!(matches!(err, InfinoError::Conflict(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn schema_document_of_missing_table_maps_to_not_found() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/schema/mydb"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no such table"))
+        .mount(&server)
+        .await;
+
+    let err = with_connection(server.uri(), |db| {
+        db.schema("ghost").expect_err("missing table must error")
     })
     .await;
     assert!(matches!(err, InfinoError::NotFound(_)), "got {err:?}");
@@ -780,6 +962,8 @@ async fn remote_client_matches_the_published_api_spec() {
         let _ = db.list_tables();
         let _ = db.drop_table("posts", false);
         let _ = db.query_sql("SELECT id FROM posts");
+        let _ = db.schema("posts");
+        let _ = db.apply_schema("posts", &body_patch(), Some(1));
         if let Ok(table) = db.open_table("posts") {
             let _ = table.append(&id_batch(vec![1]));
             let _ = table.update(col("id").gt(lit(0_i32)), &id_batch(vec![1]));

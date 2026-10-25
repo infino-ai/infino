@@ -4,9 +4,10 @@
 //! [`RemoteTable`] — a table handle backed by the hosted service.
 //!
 //! Implements the internal [`Table`] trait by forwarding each operation over
-//! the wire through its [`RemoteCatalog`]. Every query/mutation is supported;
-//! `optimize` and `gc` are deliberately not — on a hosted table those are the
-//! platform's (server-side) concern, so they report that rather than forwarding.
+//! the wire through its [`RemoteCatalog`]. Every query, mutation and schema
+//! change is supported; `optimize` and `gc` are deliberately not — on a hosted
+//! table those are the platform's (server-side) concern, so they report that
+//! rather than forwarding.
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::any::Any;
@@ -21,7 +22,7 @@ use super::{RemoteCatalog, read_arrow, read_json, wire};
 use crate::{
     Bm25SearchOptions, BoolMode, GcError, GcReport, InfinoError, MutationStats, OptimizeError,
     OptimizeOptions, ReindexError, ReindexOptions, Supertable, VectorFilter,
-    catalog::{remote_schema_unsupported, table::Table},
+    catalog::table::Table,
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
@@ -365,10 +366,10 @@ impl Table for RemoteTable {
 
     fn apply_schema(
         &self,
-        _patch: &SchemaPatch,
-        _expected: Option<u32>,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
-        Err(remote_schema_unsupported("apply_schema", &self.table_name))
+        self.catalog.apply_schema(&self.table_name, patch, expected)
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
