@@ -51,7 +51,7 @@
 use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BinaryHeap, HashMap, HashSet},
-    slice,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU32, AtomicU64, Ordering},
@@ -97,6 +97,13 @@ const EXACT_SUM_TERMS: usize = 2;
 /// ceiling — which is rounded once more than the kernel rounds a score.
 /// Mirrors the term index's ceiling slack.
 const BOUND_SLACK: f32 = 1.0 + 8.0 * f32::EPSILON;
+/// A term's tier up to this size is read whole in the merge's first wave: it
+/// costs what its first block costs, one ranged read, and the rounds after
+/// the first then need no storage round trip. A larger tier — a common
+/// term's, tens of blocks for every superfile — reads its first block alone,
+/// and the rest in one wave only if the merge goes on past it, which at a
+/// small k it rarely does.
+const TIER_FIRST_WAVE_MAX_BYTES: u64 = 4 << 20;
 /// Most distinct terms, phrase members included, the merge serves: a
 /// document's terms are a bit mask. Past two bare terms a candidate's sum
 /// carries slack (see [`EXACT_SUM_TERMS`]); the bounds hold for any
@@ -807,14 +814,14 @@ impl PreparedMerge<'_> {
             exact_scores,
             ..
         } = self;
-        // A round reads the next block of every live head. The blocks of one
-        // depth lie together, one chunk per term and segment, so a round is a
-        // ranged read per term, and every term's is issued at once. The first
-        // round's chunks are read before any merging; each later round's only
-        // once the merge has decided to go on. At a small k most merges stop
-        // after a block, and have then read a block of each head rather than
-        // the head. A read the merge no longer waits for still lands in the
-        // chunk cache, for the next query of the term.
+        // A round merges the next block of every live head. The blocks of one
+        // depth lie together, one chunk per term and segment. The first wave
+        // reads a small tier whole and a large tier's first block, every
+        // term's at once; a second wave, issued only if the merge goes on,
+        // reads what a large tier has left, so the merge costs one storage
+        // round trip at a small k and two at most. A read the merge no longer
+        // waits for still lands in the chunk cache, for the next query of the
+        // term.
         let max_rounds = match crate::config::global().diagnostics.tier_rounds {
             0 => usize::MAX,
             n => n as usize,
@@ -828,26 +835,41 @@ impl PreparedMerge<'_> {
         let mut merge = merge;
         let mut sources = sources;
         for round in 0..max_rounds {
-            // This round's chunk of every source that has one.
-            let reads: Vec<(usize, usize)> = sources
+            // What this round still has to read, per source: a small tier
+            // whole in the first wave; a large one's first block in the first
+            // wave and every block after it in the second, so no round past
+            // the first costs a round trip of its own.
+            let reads: Vec<(usize, usize, Range<usize>)> = sources
                 .iter()
                 .enumerate()
                 .flat_map(|(ti, term_sources)| {
-                    (0..term_sources.len())
-                        .filter(move |&si| term_sources[si].chunks.len() > round)
-                        .map(move |si| (ti, si))
+                    term_sources
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(si, source)| {
+                            let have = source.data.len();
+                            if have > round || have >= source.chunks.len() {
+                                return None;
+                            }
+                            let whole: u64 = source.chunks.iter().map(|c| c.len).sum();
+                            let upto = match round == 0 && whole > TIER_FIRST_WAVE_MAX_BYTES {
+                                true => 1,
+                                false => source.chunks.len(),
+                            };
+                            Some((ti, si, have..upto))
+                        })
                 })
                 .collect();
             let fetches: Vec<_> = reads
                 .iter()
-                .map(|&(ti, si)| {
-                    let source = &sources[ti][si];
-                    index.tier_chunks(&source.object, slice::from_ref(&source.chunks[round]))
+                .map(|(ti, si, span)| {
+                    let source = &sources[*ti][*si];
+                    index.tier_chunks(&source.object, &source.chunks[span.clone()])
                 })
                 .collect();
             let fetched: Vec<(Vec<Arc<TierChunkData>>, u64)> = try_join_all(fetches).await?;
-            for (&(ti, si), (data, bytes)) in reads.iter().zip(fetched) {
-                sources[ti][si].data.extend(data);
+            for ((ti, si, _), (data, bytes)) in reads.iter().zip(fetched) {
+                sources[*ti][*si].data.extend(data);
                 tier_bytes += bytes;
             }
             // Decode, score, join and bound the round as one job on the reader

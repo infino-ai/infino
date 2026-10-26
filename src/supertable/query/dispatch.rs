@@ -752,13 +752,14 @@ where
 /// never opened, so it is not counted.
 /// The units of a fan-out: each superfile (or a slice of one) with the
 /// parameters its kernel runs under.
-/// Opens issued ahead of a plan that is still resolving. Enough to overlap
-/// the plan's round trip with real work; few enough that a plan which keeps
-/// a dozen superfiles out of a thousand has wasted little. The full window
-/// applies once the plan is in, or where there is none. Measured at a
-/// billion documents against object storage: a full window issued ahead
-/// of the plan opened sixty-four superfiles a merge then ruled out, more
-/// bytes than the whole pruned query.
+/// Opens issued in all ahead of a plan that is still resolving. Enough to
+/// overlap the plan's round trip with real work; few enough that a plan
+/// which keeps a dozen superfiles out of a thousand has wasted little. The
+/// full window applies once the plan is in, or where there is none.
+/// Measured at a billion documents against object storage: a full window
+/// issued ahead of the plan opened sixty-four superfiles a merge then ruled
+/// out, more bytes than the whole pruned query; a window of eight that
+/// refilled as opens finished issued fifty.
 const PENDING_PLAN_WINDOW: usize = 8;
 
 pub(crate) type Units<P> = Vec<(Arc<SuperfileEntry>, P)>;
@@ -836,7 +837,9 @@ where
     let window = window.max(1);
     loop {
         let issue = match replan.is_some() {
-            true => PENDING_PLAN_WINDOW.min(window),
+            true => PENDING_PLAN_WINDOW
+                .saturating_sub(opened as usize)
+                .min(window),
             false => window,
         };
         while in_flight.len() < issue {
