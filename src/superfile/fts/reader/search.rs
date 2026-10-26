@@ -635,7 +635,9 @@ impl FtsReader {
         }
 
         // Negatives are a hard exclusion filter that only seeks doc ids, so
-        // they are built to count: no tfs, idf or bounds.
+        // they are built to count: no tfs, idf or bounds. They come from the
+        // memo like the scored terms where the index located them; a lazy
+        // reader otherwise fetches the dictionary whole to find them.
         let neg_cursors = match lists.negatives {
             [] => Vec::new(),
             negatives => {
@@ -645,15 +647,19 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    lists.prefetched,
                 )
                 .await?
             }
         };
         // term-dictionary ranges the builds below request — one per
-        // `build_term_cursors` call (the dictionary fetch is a real
-        // byte-source range on every query, warm or cold).
-        let mut dict_ranges = u64::from(!lists.negatives.is_empty());
+        // `build_term_cursors` call that the memo does not cover (the
+        // dictionary fetch is a real byte-source range on every query,
+        // warm or cold).
+        let negatives_from_memo = lists
+            .prefetched
+            .is_some_and(|m| lists.negatives.iter().all(|t| m.contains(t)));
+        let mut dict_ranges = u64::from(!lists.negatives.is_empty() && !negatives_from_memo);
         // The gate exists when there is anything to gate on: a negated
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
