@@ -1310,12 +1310,23 @@ impl SupertableReader {
         }
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
-        // locations and the superfile's dictionary never read.
+        // locations and the superfile's dictionary never read. That holds
+        // for every term the walk looks up, the negated ones included: they
+        // score nothing, but a superfile that had to find one in its
+        // dictionary would read the dictionary whole — tens of megabytes on
+        // a large superfile, for every superfile the query opens.
+        let mut located: Vec<&str> = all_terms.clone();
+        located.extend(negatives.iter().map(String::as_str));
+        for p in &negative_phrases {
+            located.extend(p.iter().map(String::as_str));
+        }
+        located.sort_unstable();
+        located.dedup();
         let index_locations = self
-            .index_locations(column, &all_terms, &kept)
+            .index_locations(column, &located, &kept)
             .instrument(term_span.clone())
             .await?;
-        term_span.record("terms", all_terms.len());
+        term_span.record("terms", located.len());
         trace::end(term_span);
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
