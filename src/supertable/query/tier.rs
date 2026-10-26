@@ -66,6 +66,7 @@ use rayon::{
     slice::{ParallelSlice, ParallelSliceMut},
 };
 use roaring::RoaringBitmap;
+use tokio::task;
 use uuid::Uuid;
 
 use super::fts::baked_avgdl;
@@ -814,6 +815,26 @@ pub(crate) async fn prepare_merge<'a>(
 }
 
 impl PreparedMerge<'_> {
+    /// Start the first wave's reads and return, for a query that cannot use
+    /// the plan in time — its opens all issue at once — but whose next query
+    /// of these terms can: the reads land in the chunk cache, and that query
+    /// finds them resident and merges before it opens.
+    pub(crate) fn prefetch(self, index: Arc<TermIndex>) {
+        for source in self.sources.iter().flatten() {
+            let whole: u64 = source.chunks.iter().map(|c| c.len).sum();
+            let upto = match whole > TIER_FIRST_WAVE_MAX_BYTES {
+                true => 1,
+                false => source.chunks.len(),
+            };
+            let chunks = source.chunks[..upto].to_vec();
+            let object = source.object;
+            let index = Arc::clone(&index);
+            task::spawn(async move {
+                let _ = index.tier_chunks(&object, &chunks).await;
+            });
+        }
+    }
+
     /// Read the chunked heads and merge, round by round.
     pub(crate) async fn run(self) -> Result<Option<TierSelection>, TermIndexError> {
         let PreparedMerge {

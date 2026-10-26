@@ -1936,6 +1936,7 @@ impl SupertableReader {
             if prepared.is_none() {
                 declined.store(true, AtomicOrdering::Relaxed);
             }
+            let window = manifest.options.bound_ordered_open_window.max(1);
             match prepared {
                 Some(prepared) if prepared.resident => {
                     let selection = prepared.run().await.unwrap_or_else(|e| {
@@ -1947,6 +1948,15 @@ impl SupertableReader {
                         units = keep;
                         settled_before = settled;
                     }
+                }
+                // On a table whose kept units all issue at once, a merge that
+                // must read its tiers would report after every open is under
+                // way and change none; its reads would only compete with the
+                // opens, and the gate would spend samples on a plan that
+                // cannot act. Its first wave is read without waiting, for the
+                // next query of these terms, and nothing is reported.
+                Some(prepared) if units.len() <= window => {
+                    prepared.prefetch(Arc::clone(index));
                 }
                 Some(prepared) => {
                     replan = Some(Box::pin(async move {
