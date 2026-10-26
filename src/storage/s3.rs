@@ -593,22 +593,29 @@ impl StorageProvider for S3StorageProvider {
         let path = self.path(uri)?;
         let n = bytes.len() as u64;
         // Re-issue transient failures like the read paths. Only
-        // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` still
-        // surfaces immediately; a create-only PUT that never landed is safe to retry.
-        let out = retry::with_reissue(|| {
-            let bytes = bytes.clone();
-            async {
-                let opts = PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                };
-                self.store
-                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
-                    .await
-                    .map(|r| r.e_tag)
-                    .map_err(|e| translate(uri, e))
-            }
-        })
+        // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` on
+        // the first issue still surfaces immediately. A create that timed out
+        // may have landed, so a re-issue that meets it reads it back and
+        // reports it created (see `create_with_reissue`).
+        let out = retry::create_with_reissue(
+            uri,
+            &bytes,
+            || {
+                let bytes = bytes.clone();
+                async {
+                    let opts = PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    };
+                    self.store
+                        .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                        .await
+                        .map(|r| r.e_tag)
+                        .map_err(|e| translate(uri, e))
+                }
+            },
+            || self.get(uri),
+        )
         .await;
         if out.is_ok() {
             self.meter.record_put(n);

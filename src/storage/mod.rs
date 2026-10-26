@@ -492,6 +492,12 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// `x-goog-if-generation-match: 0` on GCS, `O_EXCL` on
     /// LocalFS.
     ///
+    /// A provider that re-issues a create after a transient failure
+    /// (the first issue may have landed) reports success when the
+    /// re-issue finds the target holding exactly `bytes`, with that
+    /// object's etag; a `PreconditionFailed` on the first issue always
+    /// surfaces.
+    ///
     /// Returns the new object's etag when the backend surfaces
     /// one (S3 always, LocalFs via mtime). `Ok(None)` is legal
     /// and means the write succeeded but no etag was reported;

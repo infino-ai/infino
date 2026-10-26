@@ -19,6 +19,7 @@
 
 use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
+    future::Future,
     io::Error as IoError,
     ops::Range,
     sync::{
@@ -69,6 +70,23 @@ pub enum FaultKind {
     /// or a timeout: a conditional write meets itself and fails its
     /// precondition.
     ResponseLost,
+    /// The call lands, but the caller gets
+    /// [`StorageError::TransientExhausted`]: a request that timed out after
+    /// the store accepted it, with the storage client's own retries spent.
+    /// Unlike [`Self::ResponseLost`], nothing re-issues the call; a caller
+    /// that does re-issue a create-only write meets its own object.
+    TimedOutAfterLanding,
+}
+
+/// What an operation does once [`FaultStorage::check`] has matched it
+/// against the armed rules.
+enum Injection {
+    /// No rule matched: issue the call once.
+    Pass,
+    /// Issue the call, drop its result, and issue it again.
+    Reissue,
+    /// Issue the call, drop its result, and fail with this error.
+    FailAfterLanding(StorageError),
 }
 
 /// One armed fault: the next `remaining` calls of `op` whose URI
@@ -161,11 +179,9 @@ impl FaultStorage {
         self.fired.load(Ordering::SeqCst)
     }
 
-    /// `Err` for a rule that fails the call, `Ok(true)` for a
-    /// [`FaultKind::ResponseLost`] rule (the caller issues the call once and
-    /// drops its result before issuing it again), `Ok(false)` when no rule
-    /// matches.
-    fn check(&self, op: FaultOp, uri: &str) -> Result<bool, StorageError> {
+    /// `Err` for a rule that fails the call before it lands, otherwise what
+    /// the operation does with its call — see [`Injection`].
+    fn check(&self, op: FaultOp, uri: &str) -> Result<Injection, StorageError> {
         let hook = {
             let mut hooks = guard(&self.hooks);
             hooks
@@ -183,11 +199,11 @@ impl FaultStorage {
                 rule.remaining -= 1;
                 self.fired.fetch_add(1, Ordering::SeqCst);
                 return match rule.kind {
-                    FaultKind::ResponseLost => Ok(true),
-                    FaultKind::Transient => Err(StorageError::TransientExhausted {
-                        uri: uri.to_string(),
-                        source: Box::new(IoError::other("injected fault")),
-                    }),
+                    FaultKind::ResponseLost => Ok(Injection::Reissue),
+                    FaultKind::TimedOutAfterLanding => {
+                        Ok(Injection::FailAfterLanding(injected_transient(uri)))
+                    }
+                    FaultKind::Transient => Err(injected_transient(uri)),
                     FaultKind::Precondition => Err(StorageError::PreconditionFailed {
                         uri: uri.to_string(),
                     }),
@@ -197,7 +213,35 @@ impl FaultStorage {
                 };
             }
         }
-        Ok(false)
+        Ok(Injection::Pass)
+    }
+
+    /// Run `call` for `op` on `uri` under the armed rules, as the matched
+    /// [`Injection`] says.
+    async fn run<T, F, Fut>(&self, op: FaultOp, uri: &str, call: F) -> Result<T, StorageError>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, StorageError>>,
+    {
+        match self.check(op, uri)? {
+            Injection::Pass => {}
+            Injection::Reissue => {
+                let _ = call().await;
+            }
+            Injection::FailAfterLanding(e) => {
+                let _ = call().await;
+                return Err(e);
+            }
+        }
+        call().await
+    }
+}
+
+/// The [`StorageError::TransientExhausted`] an armed rule injects.
+fn injected_transient(uri: &str) -> StorageError {
+    StorageError::TransientExhausted {
+        uri: uri.to_string(),
+        source: Box::new(IoError::other("injected fault")),
     }
 }
 
@@ -212,36 +256,30 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[async_trait]
 impl StorageProvider for FaultStorage {
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-        if self.check(FaultOp::Head, uri)? {
-            let _ = self.inner.head(uri).await;
-        }
-        self.inner.head(uri).await
+        self.run(FaultOp::Head, uri, || self.inner.head(uri)).await
     }
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-        if self.check(FaultOp::Get, uri)? {
-            let _ = self.inner.get(uri).await;
-        }
-        self.inner.get(uri).await
+        self.run(FaultOp::Get, uri, || self.inner.get(uri)).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-        if self.check(FaultOp::GetRange, uri)? {
-            let _ = self.inner.get_range(uri, range.clone()).await;
-        }
-        self.inner.get_range(uri, range).await
+        self.run(FaultOp::GetRange, uri, || {
+            self.inner.get_range(uri, range.clone())
+        })
+        .await
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
-        if self.check(FaultOp::PutAtomic, uri)? {
-            let _ = self.inner.put_atomic(uri, bytes.clone()).await;
-        }
-        self.inner.put_atomic(uri, bytes).await
+        self.run(FaultOp::PutAtomic, uri, || {
+            self.inner.put_atomic(uri, bytes.clone())
+        })
+        .await
     }
     async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
         // Shares `PutAtomic`'s fault point: both are "write these bytes at
         // this key", and a test injecting a write fault wants both.
-        if self.check(FaultOp::PutAtomic, uri)? {
-            let _ = self.inner.put_overwrite(uri, bytes.clone()).await;
-        }
-        self.inner.put_overwrite(uri, bytes).await
+        self.run(FaultOp::PutAtomic, uri, || {
+            self.inner.put_overwrite(uri, bytes.clone())
+        })
+        .await
     }
     async fn put_if_match(
         &self,
@@ -249,13 +287,10 @@ impl StorageProvider for FaultStorage {
         bytes: Bytes,
         expected_etag: Option<&str>,
     ) -> Result<Option<String>, StorageError> {
-        if self.check(FaultOp::PutIfMatch, uri)? {
-            let _ = self
-                .inner
-                .put_if_match(uri, bytes.clone(), expected_etag)
-                .await;
-        }
-        self.inner.put_if_match(uri, bytes, expected_etag).await
+        self.run(FaultOp::PutIfMatch, uri, || {
+            self.inner.put_if_match(uri, bytes.clone(), expected_etag)
+        })
+        .await
     }
     async fn put_multipart(
         &self,
@@ -264,10 +299,8 @@ impl StorageProvider for FaultStorage {
         self.inner.put_multipart(uri).await
     }
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-        if self.check(FaultOp::Delete, uri)? {
-            let _ = self.inner.delete(uri).await;
-        }
-        self.inner.delete(uri).await
+        self.run(FaultOp::Delete, uri, || self.inner.delete(uri))
+            .await
     }
     async fn list_with_prefix_metadata(
         &self,
@@ -379,6 +412,34 @@ mod tests {
             .get("data/a.bin")
             .await
             .expect("the first write landed");
+        assert_eq!(bytes.as_ref(), b"abc");
+    }
+
+    /// A timeout after landing lands the call and fails it transiently,
+    /// without re-issuing it.
+    #[tokio::test]
+    async fn a_timeout_after_landing_lands_the_call_and_fails_it() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local"));
+        let faults = FaultStorage::wrap(local);
+
+        faults.fail_with(
+            FaultKind::TimedOutAfterLanding,
+            FaultOp::PutAtomic,
+            "data/",
+            1,
+        );
+        let err = faults
+            .put_atomic("data/a.bin", Bytes::from_static(b"abc"))
+            .await
+            .expect_err("the caller sees the timeout");
+        assert!(
+            matches!(err, StorageError::TransientExhausted { .. }),
+            "expected TransientExhausted, got {err:?}"
+        );
+        assert_eq!(faults.fired(), 1);
+        let (bytes, _) = faults.get("data/a.bin").await.expect("the write landed");
         assert_eq!(bytes.as_ref(), b"abc");
     }
 }

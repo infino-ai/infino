@@ -107,6 +107,57 @@ where
     }
 }
 
+/// Re-issue a create-only PUT through the app-level transient budget,
+/// recognising an earlier issue of its own that landed.
+///
+/// A create is not idempotent: a request that timed out after the store
+/// accepted it has landed, and its re-issue then fails the precondition
+/// against its own object. (`object_store` declines to retry a create on a
+/// timeout for exactly this reason; this layer re-issues it anyway.) So once
+/// an issue has failed transiently, a `PreconditionFailed` on a later issue
+/// is ambiguous, and `read_back` settles it: an object holding exactly
+/// `bytes` is the landed write, reported as created with its own CAS token;
+/// anything else is a real lost race and surfaces as `PreconditionFailed`.
+///
+/// A `PreconditionFailed` on the first issue surfaces without a read-back:
+/// nothing of ours can be there yet, so the key belongs to someone else even
+/// when they wrote the same bytes, and the contention path costs no GET.
+/// `create` performs one create-only PUT and `read_back` one whole-object
+/// GET, both already translated to `StorageError`.
+pub(crate) async fn create_with_reissue<C, CFut, R, RFut>(
+    uri: &str,
+    bytes: &Bytes,
+    mut create: C,
+    read_back: R,
+) -> Result<Option<String>, StorageError>
+where
+    C: FnMut() -> CFut,
+    CFut: Future<Output = Result<Option<String>, StorageError>>,
+    R: FnOnce() -> RFut,
+    RFut: Future<Output = Result<(Bytes, ObjectMeta), StorageError>>,
+{
+    let mut issued = 0u32;
+    let created = with_reissue(|| {
+        issued += 1;
+        create()
+    })
+    .await;
+    let lost = match created {
+        Err(lost @ StorageError::PreconditionFailed { .. }) if issued > 1 => lost,
+        other => return other,
+    };
+    match read_back().await {
+        Ok((existing, meta)) if existing == *bytes => Ok(meta.etag),
+        Ok(_) => Err(lost),
+        Err(e) => {
+            // Without the object we cannot tell our write from a peer's, so
+            // report what the store said rather than claim a create.
+            warn!(uri, error = %e, "could not read back a re-issued create; reporting the precondition");
+            Err(lost)
+        }
+    }
+}
+
 /// Whole-object GET with truncated-body detection + transient re-issue.
 ///
 /// `object_store`'s streamed body can come back short: a socket dropped
@@ -226,9 +277,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::{cell::Cell, sync::Arc};
+
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        test_helpers::fault_storage::{FaultKind, FaultOp, FaultStorage},
+    };
 
     fn transient() -> StorageError {
         StorageError::TransientExhausted {
@@ -321,6 +378,166 @@ mod tests {
         .await;
         assert!(matches!(r, Err(StorageError::NotFound { .. })));
         assert_eq!(calls.get(), 1);
+    }
+
+    // ---- create_with_reissue ---------------------------------------------
+
+    /// The key every create below targets.
+    const CREATE_URI: &str = "data/seg-00000001.sf.parquet";
+    /// The bytes the create writes.
+    const OURS: &[u8] = b"the bytes this create writes";
+    /// A peer's different bytes at the same key.
+    const PEERS: &[u8] = b"a peer's bytes";
+
+    /// Fault storage over a fresh local directory.
+    fn fault_store(dir: &TempDir) -> Arc<FaultStorage> {
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local provider"));
+        FaultStorage::wrap(local)
+    }
+
+    /// Create [`OURS`] at [`CREATE_URI`] the way the object-store providers
+    /// do, counting read-backs in `read_backs`.
+    async fn create_ours(
+        faults: &FaultStorage,
+        read_backs: &Cell<u32>,
+    ) -> Result<Option<String>, StorageError> {
+        let bytes = Bytes::from_static(OURS);
+        create_with_reissue(
+            CREATE_URI,
+            &bytes,
+            || faults.put_atomic(CREATE_URI, bytes.clone()),
+            || {
+                read_backs.set(read_backs.get() + 1);
+                faults.get(CREATE_URI)
+            },
+        )
+        .await
+    }
+
+    /// The hazard `create_with_reissue` exists for: a create that timed out
+    /// after landing, re-issued as a plain transient retry, meets its own
+    /// object and reports a lost race.
+    #[tokio::test]
+    async fn a_bare_reissue_of_a_landed_create_meets_its_own_object() {
+        let dir = TempDir::new().expect("tempdir");
+        let faults = fault_store(&dir);
+        faults.fail_with(
+            FaultKind::TimedOutAfterLanding,
+            FaultOp::PutAtomic,
+            CREATE_URI,
+            1,
+        );
+        let err = with_reissue(|| faults.put_atomic(CREATE_URI, Bytes::from_static(OURS)))
+            .await
+            .expect_err("the re-issue meets the first write");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+    }
+
+    /// A create that timed out after landing is reported created, with the
+    /// landed object's token, so a caller can chain it into a CAS.
+    #[tokio::test]
+    async fn create_that_timed_out_after_landing_reports_its_own_write() {
+        let dir = TempDir::new().expect("tempdir");
+        let faults = fault_store(&dir);
+        faults.fail_with(
+            FaultKind::TimedOutAfterLanding,
+            FaultOp::PutAtomic,
+            CREATE_URI,
+            1,
+        );
+        let read_backs = Cell::new(0);
+        let token = create_ours(&faults, &read_backs)
+            .await
+            .expect("the landed write is ours");
+        assert_eq!(faults.fired(), 1, "the first issue timed out after landing");
+        assert_eq!(
+            read_backs.get(),
+            1,
+            "the ambiguous precondition was read back"
+        );
+        let (bytes, meta) = faults.get(CREATE_URI).await.expect("get");
+        assert_eq!(bytes.as_ref(), OURS);
+        assert_eq!(token, meta.etag, "the token is the landed object's");
+    }
+
+    /// After a transient failure, a key holding a peer's bytes is a lost race.
+    #[tokio::test]
+    async fn create_that_timed_out_surfaces_a_peers_object() {
+        let dir = TempDir::new().expect("tempdir");
+        let faults = fault_store(&dir);
+        faults
+            .put_atomic(CREATE_URI, Bytes::from_static(PEERS))
+            .await
+            .expect("peer create");
+        faults.fail(FaultOp::PutAtomic, CREATE_URI, 1);
+        let read_backs = Cell::new(0);
+        let err = create_ours(&faults, &read_backs)
+            .await
+            .expect_err("a peer's object is a lost race");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+        assert_eq!(
+            read_backs.get(),
+            1,
+            "the ambiguous precondition was read back"
+        );
+        let (bytes, _) = faults.get(CREATE_URI).await.expect("get");
+        assert_eq!(bytes.as_ref(), PEERS, "the peer's object is untouched");
+    }
+
+    /// A first issue that finds the key taken never landed anything, so it
+    /// is a lost race even against identical bytes, and costs no read-back.
+    #[tokio::test]
+    async fn create_whose_first_issue_finds_the_key_taken_never_reads_back() {
+        let dir = TempDir::new().expect("tempdir");
+        let faults = fault_store(&dir);
+        faults
+            .put_atomic(CREATE_URI, Bytes::from_static(OURS))
+            .await
+            .expect("earlier create");
+        let read_backs = Cell::new(0);
+        let err = create_ours(&faults, &read_backs)
+            .await
+            .expect_err("create-only on an existing key");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+        assert_eq!(read_backs.get(), 0, "no read-back on the first issue");
+    }
+
+    /// A read-back that fails cannot prove the write ours, so the
+    /// precondition stands.
+    #[tokio::test]
+    async fn create_whose_read_back_fails_reports_the_precondition() {
+        let dir = TempDir::new().expect("tempdir");
+        let faults = fault_store(&dir);
+        faults.fail_with(
+            FaultKind::TimedOutAfterLanding,
+            FaultOp::PutAtomic,
+            CREATE_URI,
+            1,
+        );
+        faults.fail(FaultOp::Get, CREATE_URI, 1);
+        let read_backs = Cell::new(0);
+        let err = create_ours(&faults, &read_backs)
+            .await
+            .expect_err("an unread object is not claimed");
+        assert!(
+            matches!(err, StorageError::PreconditionFailed { .. }),
+            "expected PreconditionFailed, got {err:?}"
+        );
+        assert_eq!(
+            faults.fired(),
+            2,
+            "the landing timeout and the failed read-back"
+        );
     }
 
     #[tokio::test(start_paused = true)]

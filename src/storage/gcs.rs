@@ -381,23 +381,30 @@ impl StorageProvider for GcsStorageProvider {
         let path = self.path(uri)?;
         let n = bytes.len() as u64;
         // PutMode::Create maps to `x-goog-if-generation-match: 0` (native
-        // create-if-absent). Re-issue only transient failures. Return the
-        // new *generation* (r.version) — the CAS token callers chain forward
-        // — not the HTTP etag (r.e_tag).
-        let out = retry::with_reissue(|| {
-            let bytes = bytes.clone();
-            async {
-                let opts = PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                };
-                self.store
-                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
-                    .await
-                    .map(|r| r.version)
-                    .map_err(|e| translate(uri, e))
-            }
-        })
+        // create-if-absent). Re-issue only transient failures; a re-issue
+        // that meets our own landed write reads it back and reports it
+        // created (see `create_with_reissue`). Return the new *generation*
+        // (r.version) — the CAS token callers chain forward — not the HTTP
+        // etag (r.e_tag); the read-back's token is the generation too.
+        let out = retry::create_with_reissue(
+            uri,
+            &bytes,
+            || {
+                let bytes = bytes.clone();
+                async {
+                    let opts = PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    };
+                    self.store
+                        .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                        .await
+                        .map(|r| r.version)
+                        .map_err(|e| translate(uri, e))
+                }
+            },
+            || self.get(uri),
+        )
         .await;
         if out.is_ok() {
             self.meter.record_put(n);
