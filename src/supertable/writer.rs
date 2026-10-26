@@ -12328,13 +12328,25 @@ pub(crate) async fn try_commit_attempt(
             };
         let policy = term_index::BuildPolicy::default();
         let store = storage.as_ref();
+        // A fold the root calls for is CPU work, merged on the reader pool as
+        // optimize's rebuild and fold merge theirs.
+        let pool = Some(&*current_manifest.options.reader_pool);
         let reference = async move {
             match reserved_segment {
                 Some(reserved) => {
-                    term_index::append_reserved(store, prior, term_contributions, &policy, reserved)
-                        .await
+                    term_index::append_reserved(
+                        store,
+                        prior,
+                        term_contributions,
+                        &policy,
+                        reserved,
+                        pool,
+                    )
+                    .await
                 }
-                None => term_index::append_delta(store, prior, term_contributions, &policy).await,
+                None => {
+                    term_index::append_delta(store, prior, term_contributions, &policy, pool).await
+                }
             }
         }
         .instrument(detail_span!(
