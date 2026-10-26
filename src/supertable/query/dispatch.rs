@@ -752,6 +752,15 @@ where
 /// never opened, so it is not counted.
 /// The units of a fan-out: each superfile (or a slice of one) with the
 /// parameters its kernel runs under.
+/// Opens issued ahead of a plan that is still resolving. Enough to overlap
+/// the plan's round trip with real work; few enough that a plan which keeps
+/// a dozen superfiles out of a thousand has wasted little. The full window
+/// applies once the plan is in, or where there is none. Measured at a
+/// billion documents against object storage: a full window issued ahead
+/// of the plan opened sixty-four superfiles a merge then ruled out, more
+/// bytes than the whole pruned query.
+const PENDING_PLAN_WINDOW: usize = 8;
+
 pub(crate) type Units<P> = Vec<(Arc<SuperfileEntry>, P)>;
 /// What a plan that arrives while a fan-out runs does to the units not yet
 /// issued: given them, it returns the ones to go on with in the order to
@@ -826,7 +835,11 @@ where
     let mut replan = replan;
     let window = window.max(1);
     loop {
-        while in_flight.len() < window {
+        let issue = match replan.is_some() {
+            true => PENDING_PLAN_WINDOW.min(window),
+            false => window,
+        };
+        while in_flight.len() < issue {
             let Some((entry, params)) = pending.pop_front() else {
                 break;
             };
@@ -839,8 +852,9 @@ where
         // The plan is polled beside the opens for as long as any run: one
         // that reports once every unit is issued changes no open, but what
         // it read is in memory for the next query of its terms. Once the
-        // opens are done it is dropped unawaited.
-        if in_flight.is_empty() {
+        // opens are done it is dropped unawaited — unless units still wait
+        // on it, which the select below then awaits alone.
+        if in_flight.is_empty() && (pending.is_empty() || replan.is_none()) {
             break;
         }
         // A finished unit is seen here, on the one task that drives the
@@ -1037,7 +1051,13 @@ mod codec_verify_tests {
 
 #[cfg(test)]
 mod fanout_tier_tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     use super::*;
     use crate::{
@@ -1096,6 +1116,89 @@ mod fanout_tier_tests {
 
         let reopened = Supertable::open(options()).expect("reopen");
         assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
+    }
+
+    /// Superfiles in the plan fixture: more than are issued ahead of a plan.
+    const PLANNED_COMMITS: usize = 12;
+    /// How long the fixture's plan takes to arrive: long after the opens
+    /// issued ahead of it, which do nothing, have finished.
+    const PLAN_DELAY: Duration = Duration::from_millis(100);
+    /// A window wider than the fixture, so the pending-plan cap is what holds.
+    const WIDE_WINDOW: usize = 64;
+
+    /// While a plan is still to come only a few opens run ahead of it, and
+    /// the fan-out waits for the plan rather than ending when those finish:
+    /// every unit the plan keeps is answered. The opens hold until the plan
+    /// is in, as a cold open outlasts the plan's round trip, so what ran
+    /// ahead of the plan is exactly what the window let through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_plan_holds_the_fanout_to_a_few_opens_until_it_arrives() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        for i in 0..PLANNED_COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&[&format!("title {i}")]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let reader = table.reader().expect("reader");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| (Arc::clone(entry), ()))
+            .collect();
+        assert_eq!(units.len(), PLANNED_COMMITS);
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_before_plan = Arc::new(AtomicUsize::new(0));
+        // Opens wait on this until the plan is in; the plan then lets every
+        // unit through.
+        let gate = Arc::new(Semaphore::new(0));
+        let plan: ReplanFuture<'_, (), ()> = {
+            let opened = Arc::clone(&opened);
+            let opened_before_plan = Arc::clone(&opened_before_plan);
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                tokio::time::sleep(PLAN_DELAY).await;
+                opened_before_plan.store(opened.load(Ordering::Acquire), Ordering::Release);
+                gate.add_permits(PLANNED_COMMITS);
+                let keep_all: Replan<'_, (), ()> = Box::new(|units| (units, Vec::new()));
+                Some(keep_all)
+            })
+        };
+        let body = {
+            let opened = Arc::clone(&opened);
+            let gate = Arc::clone(&gate);
+            move |_, _, _, _, ()| {
+                opened.fetch_add(1, Ordering::AcqRel);
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.acquire().await.expect("gate open").forget();
+                    Ok::<(), QueryError>(())
+                }
+            }
+        };
+        let out = fanout_with_ordered(
+            &reader,
+            units,
+            WIDE_WINDOW,
+            |_: &()| false,
+            body,
+            |_: &()| {},
+            Some(plan),
+        )
+        .await
+        .expect("fan-out");
+        assert_eq!(out.len(), PLANNED_COMMITS, "every unit the plan kept ran");
+        assert_eq!(
+            opened_before_plan.load(Ordering::Acquire),
+            PENDING_PLAN_WINDOW,
+            "only the pending-plan window ran ahead of the plan"
+        );
     }
 }
 
