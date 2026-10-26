@@ -1589,7 +1589,10 @@ impl SuperfileReader {
         let Some(loc) = self.id_sidecar else {
             return;
         };
-        if !loc.packed {
+        // A resident reader resolves ids from its own bytes; the blocks are
+        // for a lazy one, and building a byte source here per superfile and
+        // query is measurable on a warm table.
+        if !loc.packed || self.bytes.is_some() {
             return;
         }
         let dir_len = (ids::directory_len(self.n_docs as usize) as u64).min(loc.len);
