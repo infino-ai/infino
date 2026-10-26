@@ -1146,7 +1146,12 @@ impl SupertableReader {
         // Such a search keeps its ceilings; a scope that only chooses
         // superfiles leaves the merge sound, since it works over the kept
         // set.
+        // A table of one superfile has nothing for a merge to rule out or
+        // order, and its kernel seeds its own floor from its own blocks; the
+        // merge would only cost its reads and rounds on every query, and the
+        // gate its samples learning so.
         let tiers_serve = index_column.is_some()
+            && kept.len() > 1
             && scope.is_none_or(|s| !s.bounds_rows(&kept))
             && all_terms.len() <= tier::MAX_TIER_TERMS
             && manifest.term_index_complete()
