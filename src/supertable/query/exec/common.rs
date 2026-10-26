@@ -791,17 +791,16 @@ pub(crate) async fn resolve_hits(
 
     // Assemble output columns in the projection's emit order, each
     // drawn from the decoded scalar batch or the synthesized score. The
-    // score array is one float per hit, built only when a projection
-    // asks for it.
-    let score: Option<ArrayRef> = requested.contains(&score_idx).then(|| {
-        Arc::new(Float32Array::from_iter_values(hits.iter().map(|h| h.score))) as ArrayRef
-    });
+    // score array is one float per hit, built the first time a
+    // projection asks for it.
+    let mut score: Option<ArrayRef> = None;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(requested.len());
     for &p in &requested {
         if p == score_idx {
-            columns.push(Arc::clone(
-                score.as_ref().expect("score built when projected"),
-            ));
+            let built = score.get_or_insert_with(|| {
+                Arc::new(Float32Array::from_iter_values(hits.iter().map(|h| h.score))) as ArrayRef
+            });
+            columns.push(Arc::clone(built));
         } else {
             let name = scalar_schema.field(p).name();
             let rb = resolved

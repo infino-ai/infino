@@ -1928,10 +1928,13 @@ impl SupertableReader {
     /// [`Self::token_match_async`] with a say over whether every hit
     /// leaves carrying its stable `_id`. A caller that never reads the
     /// ids, an aggregate over the match that projects only scalar
-    /// columns, passes `false` and skips the per-hit stamping, which on a
-    /// match of a few hundred thousand rows is most of what producing the
-    /// hits costs. Hits then carry a stable id only where the fan-out
-    /// tagged one for free, and must not be asked for `_id`.
+    /// columns, passes `false` and skips the stamping. A file whose ids
+    /// follow from span arithmetic is stamped as the fan-out tags its
+    /// hits, so there the skip saves one pass over the hits; on a
+    /// cell-packed or gapped-span file stamping reads the file's `_id`
+    /// column, and that read is what the skip saves. Hits then carry a
+    /// stable id only where the fan-out tagged one, and must not be asked
+    /// for `_id`.
     pub(crate) async fn token_match_hits_async(
         &self,
         column: &str,
