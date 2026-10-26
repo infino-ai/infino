@@ -370,6 +370,28 @@ const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFIL
 /// Scale this up if target_superfile_size_mb is raised well past the default
 pub const DEFAULT_STALE_SEAL_TIMEOUT_MS: u64 = 2 * 60 * 1000;
 
+/// Which parts of a compaction pass run. All on by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CompactionSteps {
+    /// Split vector cells that grew too big.
+    pub split: bool,
+    /// Merge small superfiles into bigger ones.
+    pub merge_superfiles: bool,
+    /// When to re-measure vector search settings.
+    pub recalibrate: RecalibratePolicy,
+}
+
+impl Default for CompactionSteps {
+    fn default() -> Self {
+        Self {
+            split: true,
+            merge_superfiles: true,
+            recalibrate: RecalibratePolicy::Auto,
+        }
+    }
+}
+
 /// Compaction settings: target size, fill floor, and memory budget.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -412,6 +434,9 @@ pub struct CompactionSettings {
     /// How old a sealed tombstone sidecar has to be, in milliseconds,
     /// before it's treated as abandoned
     pub stale_seal_timeout_ms: u64,
+    /// Which parts of the pass run. Set by the caller.
+    #[serde(skip)]
+    pub steps: CompactionSteps,
 }
 
 impl Default for CompactionSettings {
@@ -423,6 +448,7 @@ impl Default for CompactionSettings {
             max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
             max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
+            steps: CompactionSteps::default(),
         }
     }
 }
@@ -1179,6 +1205,47 @@ pub(crate) struct AdjacencySpec {
     pub(crate) dst_id: String,
 }
 
+/// Which parts of `optimize()` run. All on by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OptimizeSteps {
+    /// Check the graph edge columns before changing anything.
+    #[cfg(feature = "graph-index")]
+    pub check_adjacency_spec: bool,
+    /// Move pending vectors into their cells.
+    pub drain_hidden_cells: bool,
+    /// Run compaction (its own parts are picked by [`CompactionSteps`]).
+    pub compact: bool,
+    /// Pre-build the vector router so the next query doesn't have to.
+    pub router_cache_warmup: bool,
+    /// Rebuild the term index.
+    pub refresh_term_index: bool,
+    /// Rebuild the graph adjacency index.
+    #[cfg(feature = "graph-index")]
+    pub refresh_adjacency_spec: bool,
+    /// Delete superfiles no longer in use.
+    pub gc: bool,
+    /// Clean up finished update/delete logs.
+    pub gc_sweep_once: bool,
+}
+
+impl Default for OptimizeSteps {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "graph-index")]
+            check_adjacency_spec: true,
+            drain_hidden_cells: true,
+            compact: true,
+            router_cache_warmup: true,
+            refresh_term_index: true,
+            #[cfg(feature = "graph-index")]
+            refresh_adjacency_spec: true,
+            gc: true,
+            gc_sweep_once: true,
+        }
+    }
+}
+
 /// Options for [`crate::Supertable::optimize`].
 ///
 /// Additional operation kinds (e.g. vector-index maintenance) will be
@@ -1187,8 +1254,7 @@ pub(crate) struct AdjacencySpec {
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
-    pub(crate) recalibrate: RecalibratePolicy,
-    pub(crate) skip_router_cache_warmup: bool,
+    pub(crate) steps: OptimizeSteps,
     /// The edge columns of a table whose rows are a graph; set, `optimize()`
     /// builds and publishes the resident adjacency index the graph walks
     /// read, as it builds the `hnsw` graph over a vector column.
@@ -1242,25 +1308,16 @@ impl OptimizeOptions {
         self
     }
 
-    /// Override how `optimize()` handles probe-law recalibration (default
-    /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
-    pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
-        self.recalibrate = recalibrate;
-        self
-    }
-
-    /// Skip pre-building the in-process centroid-router cache after
-    /// compaction. For a process that optimizes but serves no queries;
-    /// queries still load or build the router lazily.
-    pub fn with_skip_router_cache_warmup(mut self, skip: bool) -> Self {
-        self.skip_router_cache_warmup = skip;
+    /// Pick which parts of `optimize()` run.
+    pub fn with_steps(mut self, steps: OptimizeSteps) -> Self {
+        self.steps = steps;
         self
     }
 }
 
-/// How `optimize()` treats the probe-law recalibration — the O(N) query-serving
-/// calibration, separable from the storage-necessary drain/split/merge which
-/// always run. Storage work is unaffected by this; only recalibration is gated.
+/// How compaction treats the probe-law recalibration — the O(N) query-serving
+/// calibration, separate from the drain/split/merge storage work. Only
+/// recalibration is gated by this; the storage work follows its own steps.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum RecalibratePolicy {
@@ -1271,8 +1328,8 @@ pub enum RecalibratePolicy {
     /// Always recalibrate this optimize, regardless of the Auto condition — for a
     /// final optimize before serving, when the laws must reflect the full corpus.
     Force,
-    /// Skip recalibration this optimize; the storage-necessary drain/split/merge
-    /// still run. For a repeated-optimize ingest loop where no query is served
+    /// Skip recalibration this optimize; drain/split/merge still run if their
+    /// steps are on. For a repeated-optimize ingest loop where no query is served
     /// until a later, deliberately recalibrated optimize.
     Skip,
 }
