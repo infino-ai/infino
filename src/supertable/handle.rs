@@ -2520,6 +2520,36 @@ impl WeakReader {
 }
 
 impl SupertableReader {
+    /// How a query opens the superfiles it reads. Toward a whole local copy
+    /// when the disk cache can hold the table, so a superfile read once is
+    /// served from disk from then on; by ranges alone when it cannot. A cache
+    /// smaller than its table would otherwise fill as many whole files as fit
+    /// and evict the rest, spending the budget on the fraction of the table
+    /// it holds and the bandwidth on bytes no query asked for, while the
+    /// blocks every query does touch — a superfile's length and id arrays —
+    /// are evicted between queries and read again.
+    pub(crate) fn open_intent(&self) -> ReadIntent {
+        let manifest = self.manifest();
+        let Some(cache) = manifest.options.disk_cache.as_ref() else {
+            return ReadIntent::Warm;
+        };
+        let table_bytes: u64 = manifest
+            .superfiles
+            .iter()
+            .map(|entry| {
+                entry
+                    .subsection_offsets
+                    .as_ref()
+                    .map_or(0, |offsets| offsets.total_size)
+            })
+            .sum();
+        if table_bytes <= cache.disk_budget_bytes() {
+            ReadIntent::Warm
+        } else {
+            ReadIntent::Stream
+        }
+    }
+
     /// The running cost of one superfile open on this table (see
     /// `SupertableInner::open_cost_ns`); zero until a fan-out has run.
     pub(crate) fn open_cost_ns(&self) -> u64 {
@@ -4288,6 +4318,75 @@ mod tests {
             "explicit budgets are warned about, never changed"
         );
         drop(st);
+    }
+
+    /// A query opens toward a whole local copy only when the cache can hold
+    /// the table; a cache smaller than its table reads by ranges and keeps
+    /// the blocks it touched, rather than filling the files that fit.
+    #[test]
+    fn a_cache_smaller_than_the_table_opens_by_ranges() {
+        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore};
+
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        {
+            let st = Supertable::create(opts().with_storage(Arc::clone(&storage))).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.append(&title_batch(&["alpha beta", "gamma delta"]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let cache_for = |budget: u64| {
+            let dir = TempDir::new().expect("cache tempdir");
+            let cache = DiskCacheStore::new_unpinned(
+                Arc::clone(&storage),
+                DiskCacheConfig {
+                    cache_root: dir.path().to_path_buf(),
+                    disk_budget_bytes: budget,
+                    mmap_cold_threshold_secs: 0,
+                    mmap_sweep_interval_secs: 0,
+                    ..Default::default()
+                },
+            )
+            .expect("cache");
+            (dir, cache)
+        };
+
+        let (_small_dir, small) = cache_for(1);
+        let st = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(small),
+        )
+        .expect("open");
+        let table_bytes = st.on_storage_footprint_bytes();
+        assert!(table_bytes > 1, "a committed table has a footprint");
+        assert!(
+            matches!(
+                st.reader().expect("reader").open_intent(),
+                ReadIntent::Stream
+            ),
+            "a one-byte cache cannot hold the table"
+        );
+
+        let (_large_dir, large) = cache_for(table_bytes * 4);
+        let st = Supertable::open(
+            opts()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(large),
+        )
+        .expect("open");
+        assert!(
+            matches!(st.reader().expect("reader").open_intent(), ReadIntent::Warm),
+            "a cache four times the table holds it"
+        );
+
+        let st = Supertable::open(opts().with_storage(storage)).expect("open");
+        assert!(
+            matches!(st.reader().expect("reader").open_intent(), ReadIntent::Warm),
+            "without a cache there is nothing to hold"
+        );
     }
 
     /// Cold reopen with lazy manifest parts must not under-report the

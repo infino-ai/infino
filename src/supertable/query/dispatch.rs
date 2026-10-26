@@ -800,7 +800,7 @@ where
         units = units.len(),
         window, "fanning query out across superfiles in ceiling order"
     );
-    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm, tiers.clone()).await;
+    let ctx = FanoutContext::new(reader, &units, true, reader.open_intent(), tiers.clone()).await;
     let started = Instant::now();
     // One unit and no plan to wait for: inline, as in [`fanout_with`];
     // nothing to overlap against.
@@ -903,7 +903,7 @@ where
         reader,
         units,
         true,
-        ReadIntent::Warm, // FTS/local-hit path: warm toward a full mmap
+        reader.open_intent(),
         local_hits_body(kernel),
     )
     .await

@@ -145,7 +145,7 @@ use crate::{
             prune::{PruneLeaf, select_superfiles},
             tier,
         },
-        reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
+        reader_cache::disk::ForegroundQueryGuard,
         schema::FieldId,
         tombstones::SidecarCache,
     },
@@ -2131,7 +2131,7 @@ impl SupertableReader {
             self,
             units,
             false,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, _entry, _sidecars, _now, (suid, full): (Uuid, bool)| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
@@ -2270,7 +2270,7 @@ impl SupertableReader {
             self,
             units,
             false,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, _entry, _sidecars, _now, ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let prefix_arc = Arc::clone(&prefix_arc);
@@ -2710,7 +2710,7 @@ impl SupertableReader {
             self,
             units,
             true,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
@@ -3017,7 +3017,7 @@ impl SupertableReader {
             }
         };
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_with(self, units, true, ReadIntent::Warm, body)
+        let per_unit = dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(fanout_span)
             .await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
