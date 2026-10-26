@@ -222,11 +222,15 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// triggered them. Lazy load stays available as an explicit opt-in
 /// (`with_eager_load_threshold(0)`).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
-/// Default for [`SupertableOptions::bound_ordered_open_window`]. Sixty-four
-/// covers any compacted table up to a few hundred million rows outright, so
-/// the ceiling order changes nothing there; pruning begins where tables have
-/// more superfiles than that, which is where it pays.
-const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
+/// Default for [`SupertableOptions::bound_ordered_open_window`]. Two hundred
+/// and fifty-six covers any compacted table up to a billion rows or so
+/// outright, so the ceiling order changes nothing there; pruning by the
+/// running floor begins where tables have more superfiles than that. A
+/// query a term index's merge cannot prune opens every superfile, and a
+/// window this wide opens a thousand in four rounds of requests rather than
+/// seventeen; what each open fetches is a few hundred kilobytes at most once
+/// a superfile's arrays are cached, and a few megabytes on first touch.
+const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
