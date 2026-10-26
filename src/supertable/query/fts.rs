@@ -2693,7 +2693,7 @@ impl SupertableReader {
                 Ok(batch)
             }
         };
-        dispatch::fanout_with(self, units, true, ReadIntent::Warm, body)
+        dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(fanout_span)
             .await
     }
