@@ -106,6 +106,25 @@ where
     .instrument(span)
 }
 
+/// [`traced_tvf`] for a search that comes out as several batches, one per
+/// superfile: the `rows_out` recorded is their sum.
+pub(crate) fn traced_tvf_batches<F>(span: Span, search: F) -> impl Future<Output = F::Output>
+where
+    F: Future<Output = DfResult<Vec<RecordBatch>>>,
+{
+    async move {
+        let out = search.await;
+        if let Ok(batches) = &out {
+            record(
+                "rows_out",
+                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+            );
+        }
+        out
+    }
+    .instrument(span)
+}
+
 /// Catalog the per-call scans of [`scope_to_call`] are named under. No
 /// user table lives in it, so a call's scan can never share a name — and
 /// with it plan equality — with a scan of a real table.
@@ -998,8 +1017,6 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
-    let table = manifest.table_schema();
-    let legacy = manifest.options.legacy_names();
     let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
     let schema_id = manifest.table_schema().schema_id();
@@ -1057,21 +1074,13 @@ async fn resolve_columns(
     // A file whose columns match the table's reads by name as it always
     // has; any other file reads through its map: the table's columns are
     // projected under the file's names and reshaped to the table's.
-    let adapter_for = |rd: &SuperfileReader| -> Option<FileSchemaMap> {
-        let map = FileSchemaMap::new(
-            &table,
-            &manifest.options.id_column,
-            &PhysicalSchema::of_reader(rd, &legacy),
-        );
-        (!map.is_identity()).then_some(map)
-    };
     let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
         Vec::new();
     let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32], Option<FileSchemaMap>)> =
         Vec::new();
     for (i, rd) in &opened {
         let locals = &seg_locals[*i];
-        let adapter = adapter_for(rd);
+        let adapter = file_adapter(manifest, rd);
         if rd.can_take_by_local_doc_ids() {
             warm_inputs.push((*i, Arc::clone(rd), locals.clone(), adapter));
         } else {
@@ -1098,14 +1107,8 @@ async fn resolve_columns(
                     .map(|(i, sf, locals, adapter)| {
                         // Per-superfile bracket: the resident decode is
                         // this wave's kernel section, one chunk per file.
-                        let (batch, ns) = timed_section(|| match &adapter {
-                            None => sf.take_by_local_doc_ids(&locals, &name_refs),
-                            Some(map) => {
-                                let physical = map.stored_names(&name_refs);
-                                let read = sf.take_by_local_doc_ids(&locals, &physical)?;
-                                map.adapt(&read, &out_schema)
-                                    .map_err(|e| ReadError::Columnar(e.to_string()))
-                            }
+                        let (batch, ns) = timed_section(|| {
+                            take_resident_file(&sf, &locals, &name_refs, &adapter, &out_schema)
                         });
                         batch.map(|batch| ((i, batch), ns))
                     })
@@ -1121,15 +1124,7 @@ async fn resolve_columns(
     let out_schema_ref = &out_schema;
     let cold_wave = try_join_all(cold_units.into_iter().map(
         |(i, rd, locals, adapter)| async move {
-            let batch = match &adapter {
-                None => take_rows_byte_source(rd, locals, names).await?,
-                Some(map) => {
-                    let physical = map.stored_names(names);
-                    let read = take_rows_byte_source(rd, locals, &physical).await?;
-                    map.adapt(&read, out_schema_ref)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
-                }
-            };
+            let batch = take_lazy_file(rd, locals, names, &adapter, out_schema_ref).await?;
             Ok::<_, DataFusionError>((i, batch))
         },
     ));
@@ -1172,12 +1167,101 @@ async fn resolve_columns(
         .map_err(|error| QueryError::internal(error).into())
 }
 
+/// The map from a file's own column names to the table's, when the file
+/// was written under different ones (before a rename); `None` when the
+/// file's columns are the table's and reads need no translation.
+fn file_adapter(manifest: &ManifestSnapshot, rd: &SuperfileReader) -> Option<FileSchemaMap> {
+    let map = FileSchemaMap::new(
+        &manifest.table_schema(),
+        &manifest.options.id_column,
+        &PhysicalSchema::of_reader(rd, &manifest.options.legacy_names()),
+    );
+    (!map.is_identity()).then_some(map)
+}
+
+/// `names` at `locals` of one resident superfile, under the table's
+/// column names: a CPU-bound Parquet page decode over resident bytes, so
+/// callers run it on the reader pool.
+fn take_resident_file(
+    rd: &SuperfileReader,
+    locals: &[u32],
+    names: &[&str],
+    adapter: &Option<FileSchemaMap>,
+    out_schema: &SchemaRef,
+) -> Result<RecordBatch, ReadError> {
+    match adapter {
+        None => rd.take_by_local_doc_ids(locals, names),
+        Some(map) => {
+            let physical = map.stored_names(names);
+            let read = rd.take_by_local_doc_ids(locals, &physical)?;
+            map.adapt(&read, out_schema)
+                .map_err(|e| ReadError::Columnar(e.to_string()))
+        }
+    }
+}
+
+/// `names` at `locals` of one lazily opened superfile, streamed through
+/// its byte source so the disk cache's block layer serves repeated reads.
+async fn take_lazy_file(
+    rd: &SuperfileReader,
+    locals: &[u32],
+    names: &[&str],
+    adapter: &Option<FileSchemaMap>,
+    out_schema: &SchemaRef,
+) -> DfResult<RecordBatch> {
+    match adapter {
+        None => take_rows_byte_source(rd, locals, names).await,
+        Some(map) => {
+            let physical = map.stored_names(names);
+            let read = take_rows_byte_source(rd, locals, &physical).await?;
+            map.adapt(&read, out_schema)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))
+        }
+    }
+}
+
+/// `names` at `locals` of one superfile, for a caller that wants the rows
+/// of each superfile as its own batch rather than a global hit set: the
+/// resident decode goes to the reader pool, a lazy reader streams, and the
+/// decode is counted as kernel CPU like [`resolve_hits`]'s. The batch
+/// carries `out_schema`, [`hit_output_schema`] for `names`.
+pub(crate) async fn take_file_columns(
+    manifest: &ManifestSnapshot,
+    rd: &Arc<SuperfileReader>,
+    locals: Vec<u32>,
+    names: &[&str],
+    out_schema: &SchemaRef,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> DfResult<RecordBatch> {
+    let adapter = file_adapter(manifest, rd);
+    if !rd.can_take_by_local_doc_ids() {
+        return take_lazy_file(rd, &locals, names, &adapter, out_schema).await;
+    }
+    let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    let out_schema = Arc::clone(out_schema);
+    let rd = Arc::clone(rd);
+    let (batch, ns) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "file columns decode: reader pool dropped result",
+        move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            timed_section(|| take_resident_file(&rd, &locals, &name_refs, &adapter, &out_schema))
+        },
+    )
+    .await
+    .map_err(QueryError::internal)?;
+    if let Some(stats) = op_stats {
+        stats.add_kernel_cpu_ns(ns);
+    }
+    batch.map_err(|e| QueryError::from(e).into())
+}
+
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
 /// For disk-cache readers this preserves the block-cache layer instead of
 /// bypassing it with a new object-store handle on every scalar projection.
 /// The fields a hit batch carries for `names`, in that order: the table's
 /// stored columns, which is the shape every adapted file reads into.
-fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
+pub(crate) fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
     let fields = names
         .iter()
         .map(|name| {

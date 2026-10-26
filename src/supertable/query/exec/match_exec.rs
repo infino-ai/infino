@@ -45,7 +45,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use futures::stream;
+use futures::{TryStreamExt, stream};
 
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -55,7 +55,7 @@ use crate::{
         query::exec::{
             common::{
                 arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
-                traced_tvf,
+                traced_tvf, traced_tvf_batches,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -366,6 +366,77 @@ impl ExecutionPlan for MatchExec {
             (Some(_), None) => false,
         };
         let counts_only = matches!(&projection, Some(indices) if indices.is_empty());
+        let score_idx = scalar_schema.fields().len();
+        let needs_score = match &projection {
+            None => true,
+            Some(indices) => indices.contains(&score_idx),
+        };
+        let span = match &self.query {
+            MatchQuery::Token { .. } => {
+                detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
+            }
+            MatchQuery::Exact { .. } => {
+                detail_span!("tvf.exact_match", rows_out = tracing::field::Empty)
+            }
+        };
+
+        // Scalar columns only, neither `_id` nor the score: each
+        // superfile's matching rows come out as their own batch, straight
+        // from the walk to a column take, and the consumer (an aggregate,
+        // a filter) takes them in any order. The projection may name a
+        // column twice; the batches carry each distinct column once and
+        // are laid out to the projection here.
+        if !counts_only
+            && !needs_ids
+            && !needs_score
+            && let (Some(indices), MatchQuery::Token { query, mode }) =
+                (projection.clone(), query.clone())
+        {
+            let columns_schema = Arc::clone(&projected_schema);
+            let fut = async move {
+                let mut names: Vec<&str> = Vec::new();
+                for &p in &indices {
+                    let name = scalar_schema.field(p).name().as_str();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                let per_file = reader
+                    .token_match_columns_async(&column, &query, mode, &names)
+                    .await?;
+                let mut out = Vec::with_capacity(per_file.len());
+                for batch in per_file {
+                    let columns: Vec<_> = indices
+                        .iter()
+                        .map(|&p| {
+                            let name = scalar_schema.field(p).name();
+                            let idx = batch
+                                .schema()
+                                .index_of(name)
+                                .map_err(QueryError::internal)?;
+                            Ok::<_, QueryError>(Arc::clone(batch.column(idx)))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    out.push(
+                        RecordBatch::try_new_with_options(
+                            Arc::clone(&columns_schema),
+                            columns,
+                            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                        )
+                        .map_err(QueryError::internal)?,
+                    );
+                }
+                Ok::<Vec<RecordBatch>, DataFusionError>(out)
+            };
+            let fut = traced_tvf_batches(span, fut);
+            let stream = stream::once(fut)
+                .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                projected_schema,
+                stream,
+            )));
+        }
         let count_schema = Arc::clone(&projected_schema);
 
         let fut = async move {
@@ -397,15 +468,6 @@ impl ExecutionPlan for MatchExec {
                 projection.as_deref(),
             )
             .await
-        };
-
-        let span = match &self.query {
-            MatchQuery::Token { .. } => {
-                detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
-            }
-            MatchQuery::Exact { .. } => {
-                detail_span!("tvf.exact_match", rows_out = tracing::field::Empty)
-            }
         };
         let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
@@ -548,6 +610,32 @@ mod tests {
                 format!("{:?}", via_rows[0].column(0)),
                 "max over {tvf}"
             );
+            // A grouped aggregate and a projection naming a column twice go
+            // the same per-superfile way; the rows must still be the matched
+            // ones under every grouping.
+            let grouped = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT length(title) AS l, count(*) AS n, min(title) AS t FROM {tvf} \
+                     GROUP BY length(title) ORDER BY l"
+                ))
+                .expect("grouped over the match");
+            let grouped_via_rows = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT length(title) AS l, count(*) AS n, min(title) AS t \
+                     FROM (SELECT title FROM {tvf} ORDER BY _id) GROUP BY length(title) ORDER BY l"
+                ))
+                .expect("grouped over the rows");
+            assert_eq!(
+                format!("{grouped:?}"),
+                format!("{grouped_via_rows:?}"),
+                "grouped aggregate over {tvf}"
+            );
+            let twice = rows(&st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
+            assert_eq!(twice, counted, "a column named twice over {tvf}");
         }
     }
 

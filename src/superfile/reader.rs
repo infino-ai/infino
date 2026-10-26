@@ -97,6 +97,18 @@ const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 /// reads less.
 const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
+/// A take of at least one row in this many of the file reads each
+/// projected column whole and gathers the rows from it, instead of
+/// decoding through a row selection. A selection skips the pages that
+/// hold none of its rows, which a take this dense never does, so it pays
+/// the full decode anyway plus the selection's bookkeeping per row: on a
+/// million-row file, a take of a fifth of the rows of one float column
+/// through a selection measured 13 ms against 1.7 ms for the
+/// whole-column read and gather, the aggregate around them included.
+/// Below this share the pages a selection skips are worth more than the
+/// bookkeeping costs.
+const WHOLE_COLUMN_TAKE_DIVISOR: u64 = 16;
+
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map
         .get(kv::VEC_LAYOUT)
@@ -1391,36 +1403,56 @@ impl SuperfileReader {
                     .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
                 col_indices.push(idx);
             }
-            let (sorted_ids, selection) = row_selection_for_ids(local_doc_ids);
             // Metadata-cached read: reuse the `ArrowReaderMetadata` parsed at
             // open (no per-call footer parse), so this targeted read only pays
-            // the projected-column page decode. The page index (when present)
-            // lets `RowSelection` seek to the relevant pages. CPU-bound over
-            // in-memory bytes — callers fan these across `options.reader_pool`.
+            // the projected-column page decode. CPU-bound over in-memory
+            // bytes — callers fan these across `options.reader_pool`.
             let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
             let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
-            let reader = builder
-                .with_projection(mask)
-                .with_row_selection(selection)
-                .build()
-                .map_err(|e| ReadError::Columnar(e.to_string()))?;
-            let read_schema = reader.schema();
-            let batches = reader
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| ReadError::Columnar(e.to_string()))?;
-            // `selected` has exactly sorted_ids.len() rows in sorted_ids order
-            // (parquet honors the selection).
-            let selected = concat_batches(&read_schema, &batches)
-                .map_err(|e| ReadError::Columnar(e.to_string()))?;
-            debug_assert_eq!(
-                selected.num_rows(),
-                sorted_ids.len(),
-                "RowSelection rows ≠ requested distinct doc ids"
-            );
-            // Rank back into the caller's order via take. Cheap: typical k is
-            // 10..1000.
-            let indices = rank_back_indices(local_doc_ids, &sorted_ids);
-            Some((selected, indices))
+            let builder = builder.with_projection(mask);
+            let dense = (local_doc_ids.len() as u64).saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR)
+                >= self.n_docs;
+            if dense {
+                // A take this dense touches every page: read the columns
+                // whole, in row order, and gather the rows in the caller's
+                // order straight from them (see WHOLE_COLUMN_TAKE_DIVISOR).
+                let reader = builder
+                    .build()
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                let read_schema = reader.schema();
+                let batches = reader
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                let whole = concat_batches(&read_schema, &batches)
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                let indices = UInt32Array::from(local_doc_ids.to_vec());
+                Some((whole, indices))
+            } else {
+                // The page index (when present) lets `RowSelection` seek to
+                // the relevant pages.
+                let (sorted_ids, selection) = row_selection_for_ids(local_doc_ids);
+                let reader = builder
+                    .with_row_selection(selection)
+                    .build()
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                let read_schema = reader.schema();
+                let batches = reader
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                // `selected` has exactly sorted_ids.len() rows in sorted_ids
+                // order (parquet honors the selection).
+                let selected = concat_batches(&read_schema, &batches)
+                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
+                debug_assert_eq!(
+                    selected.num_rows(),
+                    sorted_ids.len(),
+                    "RowSelection rows ≠ requested distinct doc ids"
+                );
+                // Rank back into the caller's order via take. Cheap: typical k
+                // is 10..1000.
+                let indices = rank_back_indices(local_doc_ids, &sorted_ids);
+                Some((selected, indices))
+            }
         };
 
         // 7. Gather columns in caller's projection order: `_id` from the
