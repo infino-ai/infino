@@ -103,6 +103,8 @@ class Connection:
     # field cap; `schema_id`). With `patch`, a dict in the same shape, merge it
     # into the schema — creating the table when there is none — and return
     # the document afterwards; `expected_schema_id` is a compare-and-set.
+    # Not yet available on a hosted (https://) connection; it raises an error
+    # there.
     def schema(
         self,
         name: str,
