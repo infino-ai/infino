@@ -47,7 +47,7 @@ use super::{
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    config,
+    config::{self, CompactionSteps},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     storage::{PrefixedStorageProvider, StorageError, StorageProvider},
@@ -1829,6 +1829,7 @@ const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 /// small delta files.
 pub(crate) fn hidden_vector_index_compaction_settings(
     max_concurrent_jobs: Option<usize>,
+    steps: CompactionSteps,
 ) -> crate::config::CompactionSettings {
     let cfg = crate::config::global();
     let vector = &cfg.vector;
@@ -1854,6 +1855,7 @@ pub(crate) fn hidden_vector_index_compaction_settings(
         // selection begins — no merge can race a split that would remove a
         // superfile it planned to use.
         max_concurrent_jobs,
+        steps,
         ..Default::default()
     }
 }
@@ -2917,16 +2919,19 @@ mod tests {
     #[test]
     fn the_hidden_index_follows_the_width_it_was_given() {
         assert_eq!(
-            hidden_vector_index_compaction_settings(Some(1)).max_concurrent_jobs,
+            hidden_vector_index_compaction_settings(Some(1), CompactionSteps::default())
+                .max_concurrent_jobs,
             Some(1),
             "a serial pass must be serial on both tables"
         );
         assert_eq!(
-            hidden_vector_index_compaction_settings(Some(4)).max_concurrent_jobs,
+            hidden_vector_index_compaction_settings(Some(4), CompactionSteps::default())
+                .max_concurrent_jobs,
             Some(4)
         );
         assert_eq!(
-            hidden_vector_index_compaction_settings(None).max_concurrent_jobs,
+            hidden_vector_index_compaction_settings(None, CompactionSteps::default())
+                .max_concurrent_jobs,
             None,
             "unset still derives, as the user table does"
         );
@@ -4789,15 +4794,16 @@ mod tests {
         (storage_dir, cache_dir, consumer)
     }
 
-    const COMPACTION_TEST_SETTINGS: crate::config::CompactionSettings =
+    fn compaction_test_settings() -> crate::config::CompactionSettings {
         crate::config::CompactionSettings {
             target_superfile_size_mb: 1,
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             max_memory_mb: 64,
             max_concurrent_jobs: Some(1),
-            stale_seal_timeout_ms: crate::config::DEFAULT_STALE_SEAL_TIMEOUT_MS,
-        };
+            ..Default::default()
+        }
+    }
 
     /// Regression guard for optimize/compaction on the hidden vector index:
     /// after lazy hidden-index reads, hidden compaction must still open every
@@ -4835,7 +4841,7 @@ mod tests {
         assert!(!hits.is_empty(), "hidden index should return vector hits");
 
         hidden
-            .compact(&COMPACTION_TEST_SETTINGS)
+            .compact(&compaction_test_settings())
             .expect("hidden compaction should succeed after lazy reads");
     }
 
@@ -4860,7 +4866,7 @@ mod tests {
         assert!(!hits.is_empty(), "pre-drain user search should return hits");
 
         consumer
-            .compact(&COMPACTION_TEST_SETTINGS)
+            .compact(&compaction_test_settings())
             .expect("user compaction should succeed after lazy pre-drain reads");
     }
 
@@ -5008,7 +5014,7 @@ mod tests {
         assert!(!hits.is_empty(), "pre-optimize FTS should return hits");
 
         consumer
-            .optimize(&OptimizeOptions::compact(COMPACTION_TEST_SETTINGS))
+            .optimize(&OptimizeOptions::compact(compaction_test_settings()))
             .expect("sql-shaped optimize after lazy reads");
 
         let hits_after = consumer
@@ -7423,8 +7429,18 @@ mod tests {
             "the planted state must read as lagging"
         );
 
+        let with_policy = |recalibrate| {
+            OptimizeOptions::compact(config::CompactionSettings {
+                steps: CompactionSteps {
+                    recalibrate,
+                    ..CompactionSteps::default()
+                },
+                ..config::CompactionSettings::default()
+            })
+        };
+
         // Skip: the law-repairing recalibration must NOT run — the lag stands.
-        st.optimize(&OptimizeOptions::default().with_recalibrate(RecalibratePolicy::Skip))
+        st.optimize(&with_policy(RecalibratePolicy::Skip))
             .expect("optimize (skip)");
         assert!(
             read_routing(&hidden).rerank_law_lags_pool(achievable(&hidden)),
@@ -7433,7 +7449,7 @@ mod tests {
         );
 
         // Force: recalibration runs and repairs the law.
-        st.optimize(&OptimizeOptions::default().with_recalibrate(RecalibratePolicy::Force))
+        st.optimize(&with_policy(RecalibratePolicy::Force))
             .expect("optimize (force)");
         let repaired = read_routing(&hidden);
         assert!(
@@ -7595,7 +7611,10 @@ mod tests {
         // Merge the hidden index: the superseded parent blocks are dropped and
         // the parent superfile is reclaimed.
         hidden
-            .compact(&hidden_vector_index_compaction_settings(None))
+            .compact(&hidden_vector_index_compaction_settings(
+                None,
+                CompactionSteps::default(),
+            ))
             .expect("hidden merge");
 
         let reader = hidden.reader().expect("reader");
@@ -7622,16 +7641,9 @@ mod tests {
         );
     }
 
-    /// Regression: `optimize` must run the hidden cell-split phase on a handle
-    /// built at table CREATE time, in the same process, with no reopen. The
-    /// split gate in `compact_one_table` once keyed on the handle's options —
-    /// but a create-era hidden handle has no user manifest to train a grid
-    /// from, so its options never carry a VectorCell strategy (only the first
-    /// drain locks it into the manifest), and the options-keyed gate silently
-    /// skipped every split until the table was reopened elsewhere. This pins
-    /// the manifest-keyed gate through the public `optimize()` entry.
-    #[test]
-    fn optimize_runs_split_phase_on_create_era_handle() {
+    /// A table whose one hidden cell holds many separated modes, so
+    /// `optimize` wants to split it. Returns the table and its hidden index.
+    fn single_multimodal_cell_table() -> (TempDir, Supertable, Arc<Supertable>) {
         // The 500k `cell_split_doc_cap` is out of unit-test reach and config is
         // process-global, so the fixture leans on the default modality trigger
         // instead: a cell holding >= MODALITY_MIN_CELL_DOCS rows in MORE than
@@ -7738,23 +7750,58 @@ mod tests {
             other => panic!("hidden must be VectorCell after drain, got {other:?}"),
         }
 
+        (dir, st, hidden)
+    }
+
+    fn hidden_cell_count(hidden: &Supertable) -> u32 {
+        match hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .get_partition_strategy()
+        {
+            PartitionStrategy::VectorCell { clusters, .. } => clusters.n_cent,
+            other => panic!("hidden stays VectorCell, got {other:?}"),
+        }
+    }
+
+    /// Regression: `optimize` must run the hidden cell-split phase on a handle
+    /// built at table CREATE time, in the same process, with no reopen. The
+    /// split gate in `compact_one_table` once keyed on the handle's options —
+    /// but a create-era hidden handle has no user manifest to train a grid
+    /// from, so its options never carry a VectorCell strategy (only the first
+    /// drain locks it into the manifest), and the options-keyed gate silently
+    /// skipped every split until the table was reopened elsewhere. This pins
+    /// the manifest-keyed gate through the public `optimize()` entry.
+    #[test]
+    fn optimize_runs_split_phase_on_create_era_handle() {
+        let (_dir, st, hidden) = single_multimodal_cell_table();
         st.optimize(&OptimizeOptions::default()).expect("optimize");
 
         // No reopen: the same create-era handles observe the split. The grid
         // must have grown past one cell (doc preservation across a split is
         // pinned by the dedicated `split_overflow_cell_*` tests).
-        let reader = hidden.reader().expect("reader");
-        match reader.manifest().get_partition_strategy() {
-            PartitionStrategy::VectorCell { clusters, .. } => {
-                assert!(
-                    clusters.n_cent > 1,
-                    "optimize on a create-era handle must run the split phase; \
-                     grid stayed at {} cell(s)",
-                    clusters.n_cent
-                );
-            }
-            other => panic!("hidden stays VectorCell after optimize, got {other:?}"),
-        }
+        let cells = hidden_cell_count(&hidden);
+        assert!(
+            cells > 1,
+            "optimize on a create-era handle must run the split phase; \
+             grid stayed at {cells} cell(s)"
+        );
+    }
+
+    #[test]
+    fn optimize_skips_split_when_the_step_is_off() {
+        let (_dir, st, hidden) = single_multimodal_cell_table();
+        let cfg = config::CompactionSettings {
+            steps: CompactionSteps {
+                split: false,
+                ..CompactionSteps::default()
+            },
+            ..config::CompactionSettings::default()
+        };
+        st.optimize(&OptimizeOptions::compact(cfg))
+            .expect("optimize");
+        assert_eq!(hidden_cell_count(&hidden), 1, "the cell must not split");
     }
 
     #[test]
@@ -9181,6 +9228,21 @@ mod tests {
         assert!(
             before >= 2,
             "need multiple drained packed shards before compaction, got {before}"
+        );
+
+        // Merge off on the user table's pass must reach the hidden index too.
+        let no_merge = CompactionSettings {
+            steps: CompactionSteps {
+                merge_superfiles: false,
+                ..CompactionSteps::default()
+            },
+            ..CompactionSettings::default()
+        };
+        st.compact(&no_merge).expect("compact with merge off");
+        assert_eq!(
+            count_by_shard(hidden.reader().expect("reader").manifest()),
+            before,
+            "merge step off must leave the hidden shards alone"
         );
 
         let cfg = CompactionSettings {

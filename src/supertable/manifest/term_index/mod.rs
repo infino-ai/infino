@@ -1459,7 +1459,7 @@ mod tests {
         *,
     };
     use crate::{
-        Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions,
+        Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions, OptimizeSteps,
         storage::{LocalFsStorageProvider, ObjectMeta},
         superfile::fts::bm25,
         supertable::{
@@ -3383,6 +3383,21 @@ mod tests {
         let (_, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(root.segments.len(), 2, "the append added a delta");
         assert!(optimize_rebuilds_term_index(&st, &faults));
+    }
+
+    #[test]
+    fn optimize_keeps_the_delta_segment_when_the_refresh_step_is_off() {
+        let (_dir, _faults, storage, st) = optimized_fault_table();
+        commit_segment(&st, SEGMENTS);
+        let steps = OptimizeSteps {
+            refresh_term_index: false,
+            ..OptimizeSteps::default()
+        };
+        st.optimize(&maintenance_only_options().with_steps(steps))
+            .expect("optimize");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.segments.len(), 2, "the delta must not be folded in");
     }
 
     /// A one-slice segment, told apart by `tag`.

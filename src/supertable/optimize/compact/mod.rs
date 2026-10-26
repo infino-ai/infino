@@ -283,33 +283,10 @@ impl Supertable {
     /// selects compaction jobs, then for each job seals every input
     /// superfile's tombstone sidecar so no concurrent deletes can land
     /// during the merge window.
-    /// Compaction with the historical `Auto` recalibration behavior. Used by
-    /// tests; production goes through [`compact_with`] from the optimize entry
-    /// point so the caller's [`RecalibratePolicy`] is honored.
-    #[cfg(test)]
     pub(crate) fn compact(&self, cfg: &CompactionSettings) -> Result<(), CompactionError> {
-        self.compact_with(cfg, RecalibratePolicy::Auto)
+        bridge_on_runtime(self.compact_async(cfg), &self.inner().query_runtime())
     }
 
-    /// Like [`compact`], but with an explicit recalibration policy. `compact`
-    /// keeps the historical `Auto` behavior for its many call sites; the
-    /// optimize entry point threads the caller's `OptimizeOptions.recalibrate`
-    /// through here so a repeated-optimize ingest loop can skip the O(N)
-    /// recalibration.
-    pub(crate) fn compact_with(
-        &self,
-        cfg: &CompactionSettings,
-        recalibrate: RecalibratePolicy,
-    ) -> Result<(), CompactionError> {
-        bridge_on_runtime(
-            self.compact_async_with(cfg, recalibrate),
-            &self.inner().query_runtime(),
-        )
-    }
-
-    /// Async compaction with the historical `Auto` recalibration behavior.
-    /// Used by tests; production goes through [`compact_async_with`].
-    #[cfg(test)]
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
@@ -318,39 +295,24 @@ impl Supertable {
         &self,
         cfg: &CompactionSettings,
     ) -> Result<(), CompactionError> {
-        self.compact_async_with(cfg, RecalibratePolicy::Auto).await
-    }
-
-    #[cfg_attr(
-        feature = "detailed-tracing",
-        tracing::instrument(name = "compact", skip_all, fields(role = self.role().as_str()))
-    )]
-    pub(crate) async fn compact_async_with(
-        &self,
-        cfg: &CompactionSettings,
-        recalibrate: RecalibratePolicy,
-    ) -> Result<(), CompactionError> {
         let phase_timers = global().diagnostics.optimize_phase_timers;
-        Self::compact_one_table(self, cfg, recalibrate).await?;
+        let calibrate_fanout = !matches!(cfg.steps.recalibrate, RecalibratePolicy::Skip);
+        Self::compact_one_table(self, cfg).await?;
         if matches!(
             self.inner().manifest.load().get_partition_strategy(),
             PartitionStrategy::VectorCell { .. }
         ) {
             let __st = Instant::now();
-            refresh_slow_vector_state(
-                self.inner(),
-                !matches!(recalibrate, RecalibratePolicy::Skip),
-            )
-            .await
-            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            refresh_slow_vector_state(self.inner(), calibrate_fanout)
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
             if phase_timers {
                 info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
             }
         } else if let Some(hidden) = self.inner().vector_index_table.as_ref() {
             Self::compact_one_table(
                 hidden,
-                &hidden_vector_index_compaction_settings(cfg.max_concurrent_jobs),
-                recalibrate,
+                &hidden_vector_index_compaction_settings(cfg.max_concurrent_jobs, cfg.steps),
             )
             .await?;
             // The hidden pass settled vector membership (merges + finalize +
@@ -359,12 +321,9 @@ impl Supertable {
             // manifest parts, so publication is required for reopen and a
             // failure must be visible to the caller.
             let __st = Instant::now();
-            refresh_slow_vector_state(
-                hidden.inner(),
-                !matches!(recalibrate, RecalibratePolicy::Skip),
-            )
-            .await
-            .map_err(|error| CompactionError::Refresh(error.to_string()))?;
+            refresh_slow_vector_state(hidden.inner(), calibrate_fanout)
+                .await
+                .map_err(|error| CompactionError::Refresh(error.to_string()))?;
             if phase_timers {
                 info!(secs = __st.elapsed().as_secs_f64(), "[optphase]   settle");
             }
@@ -379,7 +338,6 @@ impl Supertable {
     pub(crate) async fn compact_one_table(
         table: &Supertable,
         cfg: &CompactionSettings,
-        recalibrate: RecalibratePolicy,
     ) -> Result<(), CompactionError> {
         let inner = table.inner();
 
@@ -441,121 +399,128 @@ impl Supertable {
         // are planned from one snapshot, so the width must not drift mid-pass.
         let concurrency = global().compaction_concurrency(cfg);
         let mut __pt = Instant::now();
-        if hidden_ivf && !graph_served {
+
+        if hidden_ivf && !graph_served && cfg.steps.split {
             split_overflow_cells(Arc::clone(inner))
                 .await
                 .map_err(|e| CompactionError::Build(e.to_string()))?;
+            if phase_timers {
+                info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   split");
+            }
         }
-        if phase_timers {
-            info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   split");
-        }
 
-        let manifest = inner.manifest.load_full();
+        if cfg.steps.merge_superfiles {
+            let manifest = inner.manifest.load_full();
 
-        // Prefetch sidecars using the cache to batch storage GETs.
-        // This populates both bitmap and seal information for all superfiles.
-        // The cache returns empty bitmaps for superfiles without tombstones.
-        let superfile_ids: Vec<Uuid> = manifest
-            .get_all_superfiles()
-            .iter()
-            .map(|e| e.superfile_id)
-            .collect();
+            // Prefetch sidecars using the cache to batch storage GETs.
+            // This populates both bitmap and seal information for all superfiles.
+            // The cache returns empty bitmaps for superfiles without tombstones.
+            let superfile_ids: Vec<Uuid> = manifest
+                .get_all_superfiles()
+                .iter()
+                .map(|e| e.superfile_id)
+                .collect();
 
-        let sidecar_map: HashMap<Uuid, (Arc<RoaringBitmap>, Option<SealRecord>)> =
-            if let Some(cache) = &inner.tombstone_cache {
-                let now = Instant::now();
-                cache.prefetch(&superfile_ids, now).await;
+            let sidecar_map: HashMap<Uuid, (Arc<RoaringBitmap>, Option<SealRecord>)> =
+                if let Some(cache) = &inner.tombstone_cache {
+                    let now = Instant::now();
+                    cache.prefetch(&superfile_ids, now).await;
 
-                // Build a map of superfile_id → (bitmap, seal) by checking the cache.
-                // Cache hits are O(1); any misses are already prefetched above.
-                superfile_ids
-                    .iter()
-                    .filter_map(|id| match cache.sidecar_for(*id, now) {
-                        Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
-                        Err(_) => None,
-                    })
-                    .collect()
-            } else {
-                // Fallback for in-memory-only tables (no storage, no tombstone cache).
-                HashMap::new()
-            };
+                    // Build a map of superfile_id → (bitmap, seal) by checking the cache.
+                    // Cache hits are O(1); any misses are already prefetched above.
+                    superfile_ids
+                        .iter()
+                        .filter_map(|id| match cache.sidecar_for(*id, now) {
+                            Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
+                            Err(_) => None,
+                        })
+                        .collect()
+                } else {
+                    // Fallback for in-memory-only tables (no storage, no tombstone cache).
+                    HashMap::new()
+                };
 
-        // Build SuperfileStats for every superfile in the snapshot, once per
-        // id. Deduped here, not in `select`: the drain-watermark split below
-        // could otherwise put two copies of one superfile in different jobs.
-        let now = Utc::now();
-        let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
-        let listed = manifest.get_all_superfiles();
-        let schema = manifest.table_schema();
-        let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
-            .map(|entry| {
-                let (bitmap, seal) = sidecar_map
-                    .get(&entry.superfile_id)
-                    .cloned()
-                    .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
-                let tombstoned_docs = bitmap.len();
-                let sealed_by_other = seal.as_ref().is_some_and(|s| {
-                    !tombstones_admin::is_seal_stale(s.sealed_at, now, stale_seal_timeout)
-                });
-                SuperfileStats {
-                    superfile_id: entry.superfile_id,
-                    partition_key: entry.partition_key.clone(),
-                    size_bytes: entry
-                        .subsection_offsets
-                        .as_ref()
-                        .map(|o| o.total_size)
-                        .unwrap_or(0),
-                    n_docs: entry.n_docs,
-                    tombstoned_docs,
-                    id_min: entry.id_min,
-                    sealed_by_other,
-                    birth_version: entry.birth_version,
-                    stale_type: !unconverted_columns(entry, &schema, &manifest.options.id_column)
+            // Build SuperfileStats for every superfile in the snapshot, once per
+            // id. Deduped here, not in `select`: the drain-watermark split below
+            // could otherwise put two copies of one superfile in different jobs.
+            let now = Utc::now();
+            let stale_seal_timeout = Duration::from_millis(cfg.stale_seal_timeout_ms);
+            let listed = manifest.get_all_superfiles();
+            let schema = manifest.table_schema();
+            let stats: Vec<SuperfileStats> = listed_once(listed, |entry| entry.superfile_id)
+                .map(|entry| {
+                    let (bitmap, seal) = sidecar_map
+                        .get(&entry.superfile_id)
+                        .cloned()
+                        .unwrap_or_else(|| (Arc::new(RoaringBitmap::new()), None));
+                    let tombstoned_docs = bitmap.len();
+                    let sealed_by_other = seal.as_ref().is_some_and(|s| {
+                        !tombstones_admin::is_seal_stale(s.sealed_at, now, stale_seal_timeout)
+                    });
+                    SuperfileStats {
+                        superfile_id: entry.superfile_id,
+                        partition_key: entry.partition_key.clone(),
+                        size_bytes: entry
+                            .subsection_offsets
+                            .as_ref()
+                            .map(|o| o.total_size)
+                            .unwrap_or(0),
+                        n_docs: entry.n_docs,
+                        tombstoned_docs,
+                        id_min: entry.id_min,
+                        sealed_by_other,
+                        birth_version: entry.birth_version,
+                        stale_type: !unconverted_columns(
+                            entry,
+                            &schema,
+                            &manifest.options.id_column,
+                        )
                         .is_empty(),
+                    }
+                })
+                .collect();
+
+            if stats.len() < listed.len() {
+                warn!(
+                    role = table.role().as_str(),
+                    repeats = listed.len() - stats.len(),
+                    "manifest lists some superfiles more than once; compacting each once"
+                );
+            }
+
+            // A user table with a hidden vector index selects jobs per side of
+            // the drain watermark, never across it (see
+            // [`split_stats_at_drain_watermark`] for why a mixed merge loses
+            // vectors). Tables without a hidden sibling select over everything.
+            let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
+                Some(hidden) => {
+                    let drained = hidden.inner().manifest.load_full().get_drained_ranges();
+                    let (drained_stats, undrained_stats) =
+                        split_stats_at_drain_watermark(stats, &drained);
+                    vec![drained_stats, undrained_stats]
                 }
-            })
-            .collect();
-
-        if stats.len() < listed.len() {
-            warn!(
-                role = table.role().as_str(),
-                repeats = listed.len() - stats.len(),
-                "manifest lists some superfiles more than once; compacting each once"
-            );
+                None => vec![stats],
+            };
+            for stats in &stat_groups {
+                let jobs = select(stats, cfg);
+                info!(
+                    role = table.role().as_str(),
+                    jobs = jobs.len(),
+                    concurrency,
+                    "compaction jobs planned"
+                );
+                if phase_timers {
+                    __pt = Instant::now();
+                }
+                table
+                    .run_compaction_jobs(jobs, stale_seal_timeout, concurrency)
+                    .await?;
+                if phase_timers {
+                    info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
+                }
+            }
+            clear_completed_conversions(inner).await?;
         }
-
-        // A user table with a hidden vector index selects jobs per side of
-        // the drain watermark, never across it (see
-        // [`split_stats_at_drain_watermark`] for why a mixed merge loses
-        // vectors). Tables without a hidden sibling select over everything.
-        let stat_groups: Vec<Vec<SuperfileStats>> = match inner.vector_index_table.as_ref() {
-            Some(hidden) => {
-                let drained = hidden.inner().manifest.load_full().get_drained_ranges();
-                let (drained_stats, undrained_stats) =
-                    split_stats_at_drain_watermark(stats, &drained);
-                vec![drained_stats, undrained_stats]
-            }
-            None => vec![stats],
-        };
-        for stats in &stat_groups {
-            let jobs = select(stats, cfg);
-            info!(
-                role = table.role().as_str(),
-                jobs = jobs.len(),
-                concurrency,
-                "compaction jobs planned"
-            );
-            if phase_timers {
-                __pt = Instant::now();
-            }
-            table
-                .run_compaction_jobs(jobs, stale_seal_timeout, concurrency)
-                .await?;
-            if phase_timers {
-                info!(secs = __pt.elapsed().as_secs_f64(), "[optphase]   merge");
-            }
-        }
-        clear_completed_conversions(inner).await?;
 
         // The pass reshaped the hidden index (split children and/or merge
         // outputs committed): the probe laws were measured against the old
@@ -602,10 +567,10 @@ impl Supertable {
         // Recalibration is the O(N) query-serving calibration — gate it by the
         // caller's policy (default Auto). Skip runs none; Force always runs it;
         // Auto runs it only on a grid or growth change, or a lagging rerank
-        // law. Storage work above already ran regardless of the policy.
+        // law. The policy never gates the split/merge steps above.
         let run_recalibrate = hidden_ivf
             && !graph_served
-            && match recalibrate {
+            && match cfg.steps.recalibrate {
                 RecalibratePolicy::Skip => false,
                 RecalibratePolicy::Force => true,
                 RecalibratePolicy::Auto => grid_or_growth() || rerank_lags(),
@@ -2565,7 +2530,10 @@ mod tests {
     };
     use crate::{
         BoolMode, Stemmer, Stopwords, VectorSearchOptions,
-        config::{DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions},
+        config::{
+            CompactionSteps, DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions,
+            OptimizeSteps,
+        },
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
         superfile::{
@@ -4137,6 +4105,61 @@ mod tests {
         let mut w = st.writer().expect("writer");
         w.append(&build_title_batch(titles)).expect("append");
         w.commit().expect("commit");
+    }
+
+    /// Ten small commits: enough for `small_compact_cfg` to plan a merge.
+    fn commit_ten_small_files(st: &Supertable) {
+        for i in 0..10 {
+            commit_titles(st, &[&format!("doc {i} first"), &format!("doc {i} second")]);
+        }
+    }
+
+    fn superfile_count(st: &Supertable) -> usize {
+        st.inner().manifest.load().get_all_superfiles().len()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_skips_merging_when_the_step_is_off() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_ten_small_files(&st);
+        let before = superfile_count(&st);
+
+        let cfg = CompactionSettings {
+            steps: CompactionSteps {
+                merge_superfiles: false,
+                ..CompactionSteps::default()
+            },
+            ..small_compact_cfg()
+        };
+        st.compact_async(&cfg).await.expect("compact");
+        assert_eq!(superfile_count(&st), before, "nothing should merge");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(superfile_count(&st) < before, "default steps should merge");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn optimize_skips_compaction_when_the_step_is_off() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_ten_small_files(&st);
+        let before = superfile_count(&st);
+
+        let steps = OptimizeSteps {
+            compact: false,
+            ..OptimizeSteps::default()
+        };
+        let opts = OptimizeOptions::compact(small_compact_cfg()).with_steps(steps);
+        let st = task::spawn_blocking(move || {
+            st.optimize(&opts).expect("optimize");
+            st
+        })
+        .await
+        .expect("join");
+        assert_eq!(superfile_count(&st), before, "nothing should merge");
     }
 
     #[tokio::test(flavor = "multi_thread")]

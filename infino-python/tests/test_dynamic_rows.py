@@ -149,7 +149,7 @@ def test_a_frames_missing_value_is_stored_as_null():
     """A pandas frame marks a missing number with NaN, which JSON cannot
     spell. It means the row carries nothing there, so it is written as null —
     the same as a key a dict leaves out."""
-    import pandas as pd
+    pd = pytest.importorskip("pandas")
 
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
@@ -165,7 +165,7 @@ def test_only_a_frames_nan_is_read_as_missing():
     they left out. Neither is rewritten; both reach the column as sent."""
     import math
 
-    import pandas as pd
+    pd = pytest.importorskip("pandas")
     import pyarrow as pa
 
     scored = pa.schema(
@@ -217,7 +217,7 @@ def test_a_frame_with_a_nan_is_serialized_twice_not_three_times():
         calls.append(kwargs.get("allow_nan"))
         return original(*args, **kwargs)
 
-    import pandas as pd
+    pd = pytest.importorskip("pandas")
 
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
@@ -247,7 +247,7 @@ def test_a_frame_without_a_nan_is_serialized_once():
         calls.append(kwargs.get("allow_nan"))
         return original(*args, **kwargs)
 
-    import pandas as pd
+    pd = pytest.importorskip("pandas")
 
     db = infino.connect("memory://")
     docs = db.create_table("docs", _title_schema(), infino.IndexSpec())
