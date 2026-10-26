@@ -27,8 +27,8 @@ use crate::{
         fts::{
             builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
             posting::{
-                BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, decode_block,
-                patched_exception_ranges,
+                BLOCK_LEN, BlockHeader, ENCODING_PACKED, ENCODING_PATCHED, ENCODING_RUN,
+                decode_block, patched_exception_ranges,
             },
             short::{decode_short, short_df},
         },
@@ -74,8 +74,9 @@ pub struct DfBucket {
     pub skip_bytes: u64,
     pub coarse_bytes: u64,
     pub block_header_bytes: u64,
-    /// Long-form payload: packed doc-id lanes, packed tf lanes, bitset
-    /// blocks (presence words + tfs).
+    /// Long-form payload: packed doc-id lanes, packed tf lanes (every
+    /// block's, a bitset or run block's included) and bitset presence
+    /// words. A run block stores no doc ids past its header's origin.
     pub docid_bytes: u64,
     pub tf_bytes: u64,
     pub bitset_bytes: u64,
@@ -87,6 +88,8 @@ pub struct DfBucket {
     pub partial_blocks: u64,
     /// Blocks in the patched encoding (narrow width plus exceptions).
     pub patched_blocks: u64,
+    /// Blocks in the run encoding (consecutive doc ids, none stored).
+    pub run_blocks: u64,
     /// Patched blocks by their delta-exception count (`PATCH_HIST_EDGES`
     /// bands) and the bytes each band saves over plain packing.
     pub patched_by_exceptions: [u64; PATCH_HIST_BANDS],
@@ -125,6 +128,7 @@ impl DfBucket {
         self.blocks += o.blocks;
         self.partial_blocks += o.partial_blocks;
         self.patched_blocks += o.patched_blocks;
+        self.run_blocks += o.run_blocks;
         for i in 0..PATCH_HIST_BANDS {
             self.patched_by_exceptions[i] += o.patched_by_exceptions[i];
             self.patched_saved_by_exceptions[i] += o.patched_saved_by_exceptions[i];
@@ -334,6 +338,10 @@ impl FtsReader {
                                     b.padding_bytes +=
                                         (LANES - doc_count) * (delta_bits + tf_bits) / 8;
                                 }
+                                ENCODING_RUN => {
+                                    b.run_blocks += 1;
+                                    b.tf_bytes += LANES * tf_bits / 8;
+                                }
                                 _ => {
                                     b.bitset_bytes +=
                                         (block.len() - hdr.payload()) as u64 - LANES * tf_bits / 8;
@@ -454,12 +462,13 @@ impl fmt::Display for FtsSizeBreakdown {
             }
             writeln!(
                 f,
-                "  long-form fixed overhead {:.2} MiB, lane padding {:.2} MiB, {} blocks ({} partial, {} patched)",
+                "  long-form fixed overhead {:.2} MiB, lane padding {:.2} MiB, {} blocks ({} partial, {} patched, {} run)",
                 mib(c.total.fixed_overhead_bytes()),
                 mib(c.total.padding_bytes),
                 c.total.blocks,
                 c.total.partial_blocks,
-                c.total.patched_blocks
+                c.total.patched_blocks,
+                c.total.run_blocks
             )?;
             let bands = |edges: &[u64; PATCH_HIST_BANDS - 1], counts: &[u64], saved: &[u64]| {
                 let mut lo = 0u64;
@@ -592,7 +601,7 @@ mod tests {
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), true).expect("register");
         // `only` inlines (df=1, tf=1); `pair` is short (df=2); `every`
-        // spans two blocks (long form).
+        // spans two blocks (long form), both runs of consecutive docs.
         for i in 0..(BLOCK_LEN as u32 + 5) {
             let text = match i {
                 0 => "only pair every",
@@ -612,6 +621,10 @@ mod tests {
         assert_eq!(c.total.long_terms, 1);
         assert_eq!(c.total.blocks, 2);
         assert_eq!(c.total.partial_blocks, 1);
+        // Run blocks are reported as runs: no presence words, only tfs.
+        assert_eq!(c.total.run_blocks, 2);
+        assert_eq!(c.total.bitset_bytes, 0);
+        assert!(s.to_string().contains("2 run)"));
         // The whole postings region (the reader's range already excludes
         // the trailing CRC) is accounted for.
         assert_eq!(c.total.postings_region_bytes(), s.postings_region_bytes);

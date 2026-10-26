@@ -61,9 +61,16 @@ pub(crate) fn read_u64_varint(bytes: &[u8], at: &mut usize) -> Option<u64> {
 }
 
 /// Decode one LEB128 `u32`, as [`read_u64_varint`] but refusing a value
-/// past `u32::MAX`.
-#[inline]
+/// past `u32::MAX`. A one-byte value, the common case, is read inline;
+/// longer ones take the general decoder.
+#[inline(always)]
 pub(crate) fn read_varint(bytes: &[u8], at: &mut usize) -> Option<u32> {
+    if let Some(&b) = bytes.get(*at)
+        && b & CONTINUATION_BIT == 0
+    {
+        *at += 1;
+        return Some(u32::from(b));
+    }
     u32::try_from(read_u64_varint(bytes, at)?).ok()
 }
 
