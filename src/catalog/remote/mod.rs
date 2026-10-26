@@ -208,6 +208,10 @@ impl RemoteCatalog {
         }
         let response = match self.post_json("schema", body) {
             Ok(response) => response,
+            // `status_to_error` reads every 409 as AlreadyExists, which is
+            // what it means on the create routes. This route merges into the
+            // table or creates it, so it never refuses a table for existing:
+            // its 409 is only ever a lost compare-and-set, the schema moved.
             Err(InfinoError::AlreadyExists(message)) => {
                 return Err(InfinoError::Conflict(message));
             }
