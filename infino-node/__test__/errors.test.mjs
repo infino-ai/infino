@@ -80,11 +80,20 @@ test("hosted 500 carries status 500", async () => {
   });
 });
 
-test("hosted 401 keeps the unauthorized message (transport carries no number)", async () => {
+test("hosted 401 carries status 401 and says the key was refused", async () => {
   await withStubApi(401, '{"error":"invalid api key"}', (db) => {
     const e = throws(() => db.listTables());
-    assert.equal(e.status, undefined);
-    assert.match(e.message, /unauthorized \(check the API key\)/);
+    assert.equal(e.status, 401);
+    assert.match(e.message, /the key was refused for this call/);
+    assert.match(e.message, /invalid api key/);
+  });
+});
+
+test("hosted 403 carries status 403 and the API's own reason", async () => {
+  await withStubApi(403, '{"error":"free plan row limit reached: 1000 of 1000 rows stored"}', (db) => {
+    const e = throws(() => db.listTables());
+    assert.equal(e.status, 403);
+    assert.match(e.message, /row limit reached/);
   });
 });
 

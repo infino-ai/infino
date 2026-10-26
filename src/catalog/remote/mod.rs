@@ -18,11 +18,18 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::{Value, json};
 
-use crate::{IndexSpec, InfinoError, Supertable};
+use crate::{
+    IndexSpec, InfinoError, Supertable,
+    supertable::schema::{TableSchema, change::SchemaPatch},
+};
 
 /// Environment variable consulted for the API key when `ConnectOptions` does
 /// not carry one.
 const API_KEY_ENV: &str = "INFINO_API_KEY";
+
+/// The `encoding` a describe names to get the schema document rather than
+/// the column-descriptor array the endpoint answers by default.
+const DOCUMENT_ENCODING: &str = "document";
 
 /// A connection to a hosted endpoint. Holds the sync HTTP client, the base URL
 /// (scheme + host), the target database, and the bearer credential.
@@ -170,6 +177,55 @@ impl RemoteCatalog {
         let response = self.post_json("query_sql", json!({ "query": sql }))?;
         read_arrow("query_sql", response)
     }
+
+    /// The schema document of `name`: `POST /v1/schema` with
+    /// `encoding: "document"`. The endpoint serves the document in the
+    /// engine's own JSON (what [`TableSchema::to_json`] writes), so it reads
+    /// back with the same codec and nothing is translated.
+    pub(crate) fn schema_document(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        let response = self.post_json(
+            "schema",
+            json!({ "table_name": name, "encoding": DOCUMENT_ENCODING }),
+        )?;
+        read_schema_document("schema", response)
+    }
+
+    /// Merge `patch` into the schema of `name` (creating the table when
+    /// there is none) and read back the document that resulted: `POST
+    /// /v1/schema` with `patch`, and `expected_schema_id` when the caller
+    /// compares. The endpoint answers a compare-and-set that lost with 409,
+    /// which on this one route means the schema moved — the local handle's
+    /// [`InfinoError::Conflict`] — and never "already exists".
+    pub(crate) fn apply_schema(
+        &self,
+        name: &str,
+        patch: &SchemaPatch,
+        expected: Option<u32>,
+    ) -> Result<TableSchema, InfinoError> {
+        let mut body = json!({ "table_name": name, "patch": patch.to_json() });
+        if let Some(expected) = expected {
+            body["expected_schema_id"] = json!(expected);
+        }
+        let response = match self.post_json("schema", body) {
+            Ok(response) => response,
+            // `status_to_error` reads every 409 as AlreadyExists, which is
+            // what it means on the create routes. This route merges into the
+            // table or creates it, so it never refuses a table for existing:
+            // its 409 is only ever a lost compare-and-set, the schema moved.
+            Err(InfinoError::AlreadyExists(message)) => {
+                return Err(InfinoError::Conflict(message));
+            }
+            Err(e) => return Err(e),
+        };
+        read_schema_document("apply_schema", response)
+    }
+}
+
+/// Read a schema document off a JSON response body.
+fn read_schema_document(op: &str, response: ureq::Response) -> Result<TableSchema, InfinoError> {
+    let value = read_json(op, response)?;
+    TableSchema::from_json(&value)
+        .map_err(|e| InfinoError::Backend(format!("{op}: parsing the schema document: {e}")))
 }
 
 /// Turn a `ureq` send result into an [`InfinoError`]: an HTTP error status maps
