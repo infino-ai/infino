@@ -83,7 +83,6 @@ use crate::{
             SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
             superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
-        reader_cache::ReadIntent,
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
     },
     utils::trace::record,
@@ -1008,6 +1007,10 @@ async fn resolve_columns(
         }
     }
 
+    // Opened as the search that found the hits opened: by ranges alone on a
+    // table the cache cannot hold, so resolving a hit's columns never starts
+    // a whole-file download the search itself declined.
+    let intent = reader.open_intent();
     let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
         let entry = manifest
             .lookup_superfile_entry(uri)
@@ -1025,7 +1028,7 @@ async fn resolve_columns(
             &entry.uri,
             &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
-            ReadIntent::Warm,
+            intent,
         )
         .await
         .map(|reader| (index, reader))
