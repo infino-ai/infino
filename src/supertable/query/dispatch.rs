@@ -762,6 +762,14 @@ where
 /// refilled as opens finished issued fifty.
 const PENDING_PLAN_WINDOW: usize = 8;
 
+/// Windows of units a fan-out must have for the cap above to apply. A plan
+/// is worth waiting for where it can rule out more than a window or two of
+/// opens; on a table of a few windows the opens that would run ahead of it
+/// are most of the query, and holding them costs the plan's round trip for
+/// nothing. Measured at a hundred million documents, 112 superfiles: the
+/// cap cost 13% at k=100, where the merge rarely prunes.
+const PENDING_PLAN_MIN_WINDOWS: usize = 4;
+
 /// Opens in flight until the first of them have answered. The running floor
 /// is what lets a kernel skip posting blocks and the fan-out skip whole
 /// superfiles, and it forms from the first answers; a window opened wide
@@ -845,8 +853,12 @@ where
     let mut pending: VecDeque<(Arc<SuperfileEntry>, P)> = units.into();
     let mut replan = replan;
     let window = window.max(1);
+    let cap_ahead_of_plan = pending.len() > PENDING_PLAN_MIN_WINDOWS * window;
     loop {
-        let issue = match (replan.is_some(), out.len() < FLOOR_WINDOW) {
+        let issue = match (
+            replan.is_some() && cap_ahead_of_plan,
+            out.len() < FLOOR_WINDOW,
+        ) {
             (true, _) => PENDING_PLAN_WINDOW
                 .saturating_sub(opened as usize)
                 .min(window),
@@ -1132,13 +1144,15 @@ mod fanout_tier_tests {
         assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
     }
 
-    /// Superfiles in the plan fixture: more than are issued ahead of a plan.
-    const PLANNED_COMMITS: usize = 12;
+    /// Superfiles in the plan fixture: more than four windows of them, so the
+    /// cap ahead of a plan applies, and more than the cap lets through.
+    const PLANNED_COMMITS: usize = 40;
     /// How long the fixture's plan takes to arrive: long after the opens
     /// issued ahead of it, which do nothing, have finished.
     const PLAN_DELAY: Duration = Duration::from_millis(100);
-    /// A window wider than the fixture, so the pending-plan cap is what holds.
-    const WIDE_WINDOW: usize = 64;
+    /// A window the fixture exceeds four times over, no narrower than the
+    /// cap, so the cap is what holds.
+    const WIDE_WINDOW: usize = PENDING_PLAN_WINDOW;
 
     /// While a plan is still to come only a few opens run ahead of it, and
     /// the fan-out waits for the plan rather than ending when those finish:
