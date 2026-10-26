@@ -606,7 +606,7 @@ impl FtsReader {
                 (_, allow) => Some(AtomExcludeFilter::with_allow(
                     negative_atoms,
                     allow.map(RowSet::new),
-                    self.doc_map.clone(),
+                    self.doc_map().clone(),
                 )),
             };
             // The atom walk is the whole kernel for phrase shapes —
@@ -661,7 +661,7 @@ impl FtsReader {
             (_, allow) => Some(ExcludeFilter::with_allow(
                 neg_cursors,
                 allow.map(RowSet::new),
-                self.doc_map.clone(),
+                self.doc_map().clone(),
             )),
         };
 
@@ -1254,6 +1254,7 @@ impl FtsReader {
         // column could park every core with nothing left to drive the read
         // that would release them.
         self.ensure_norms(column_id).await?;
+        self.ensure_doc_map().await?;
         let term_bytes = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
@@ -1631,6 +1632,7 @@ impl FtsReader {
         if purpose.scores() {
             self.ensure_norms(column_id).await?;
         }
+        self.ensure_doc_map().await?;
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
         // offset, or a miss — preserving query order and arity (a miss is a

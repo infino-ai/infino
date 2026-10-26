@@ -22,6 +22,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::future::join;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
@@ -545,7 +546,16 @@ pub struct FtsReader {
     /// blob's own id space from end to end, and the ids they return are
     /// translated once here. That is what lets the writer group
     /// documents by the terms they share without a Parquet row moving.
-    pub(super) doc_map: DocMap,
+    ///
+    /// Read whole, once: at open from a blob in memory, and on a lazy source
+    /// by the first query that needs it ([`Self::ensure_doc_map`]), in that
+    /// query's wave of reads rather than a round trip before it.
+    doc_map: OnceLock<DocMap>,
+    /// Where the map lies when the blob has one: its body, the CRC after it.
+    /// `None` on a blob in row order.
+    doc_map_region: Option<Range<usize>>,
+    /// Whether a read after open checks its CRC, as the open's reads did.
+    verify_crc: bool,
 }
 
 impl FtsReader {
@@ -1030,10 +1040,13 @@ impl FtsReader {
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
 
-        // The map is read whole at open, beside the doc-lengths tail it
-        // sits next to, because every query that returns a hit needs it.
-        let doc_map: DocMap = match doc_map_offset {
-            None => DocMap::Identity,
+        // From memory the map is a slice of the blob, taken now. A lazy source
+        // that does not hold it yet reads it with the first query that needs
+        // it, beside that query's other reads, so an open costs no round trip
+        // for it and a superfile that returns no hit never reads it.
+        let doc_map = OnceLock::new();
+        let doc_map_region = match doc_map_offset {
+            None => None,
             Some(mo) => {
                 let body_end = doc_lengths_table_offset
                     .saturating_sub(format::fts::doc_map_len_trailer(version))
@@ -1050,34 +1063,19 @@ impl FtsReader {
                          below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
                 }
-                let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
-                if opts.verify_crc {
-                    let crc_bytes = fetch_source_range(
-                        &source,
-                        body_end..body_end + format::CRC_BYTES,
-                        "fts/doc-map crc",
-                    )?;
-                    if read_u32_le(&crc_bytes) != crc32c(&body) {
-                        return Err(FtsError::Read(ReadError::ChecksumMismatch {
-                            section: "fts/doc-map",
-                            column: String::new(),
-                        }));
+                let region = mo..body_end;
+                if let Some(body) = source.try_get_range_sync(region.clone()) {
+                    if opts.verify_crc {
+                        let crc_bytes = fetch_source_range(
+                            &source,
+                            body_end..body_end + format::CRC_BYTES,
+                            "fts/doc-map crc",
+                        )?;
+                        verify_doc_map(&body, &crc_bytes)?;
                     }
+                    let _ = doc_map.set(DocMap::permuted(own_map_bytes(&source, body)));
                 }
-                // Held as bytes rather than decoded. On a blob opened from a
-                // memory mapping the region is the mapping itself, so the map
-                // costs no heap at open and its pages stay evictable, where a
-                // decoded copy would sit on the heap for the life of the
-                // reader. A lazy source may answer a read this large with a
-                // window onto a bigger fetch, and keeping the window would keep
-                // that whole fetch alive for as long; the map is the one read
-                // of the open the reader holds on to, so over such a source it
-                // takes a copy of the map alone.
-                let region = match &source {
-                    Source::InMemory(_) => body,
-                    Source::Lazy(_) => Bytes::copy_from_slice(&body),
-                };
-                DocMap::permuted(region)
+                Some(region)
             }
         };
 
@@ -1093,7 +1091,90 @@ impl FtsReader {
             columns,
             column_id_by_name,
             doc_map,
+            doc_map_region,
+            verify_crc: opts.verify_crc,
         })
+    }
+
+    /// The doc-id map, read now if no query has read it yet. Every query
+    /// entry point reads it on its own runtime first
+    /// ([`Self::ensure_doc_map`]), so this fallback is for a read that lost
+    /// that race; a read that fails here logs and translates rows as blob
+    /// ids, as the norms fallback scores against an empty table, rather
+    /// than abort mid-kernel.
+    pub(super) fn doc_map(&self) -> &DocMap {
+        if let Some(map) = self.doc_map.get() {
+            return map;
+        }
+        // Read outside the cell: an initializer that fetches would hold the
+        // cell's lock across the fetch and park every other reader on it.
+        let map = match self.read_doc_map_sync() {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::error!(%error, "fts doc-id map unreadable; rows taken as blob ids");
+                DocMap::Identity
+            }
+        };
+        self.doc_map.get_or_init(|| map)
+    }
+
+    fn read_doc_map_sync(&self) -> Result<DocMap, FtsError> {
+        let Some(region) = &self.doc_map_region else {
+            return Ok(DocMap::Identity);
+        };
+        let body = fetch_source_range(&self.source, region.clone(), "fts/doc-map")?;
+        if self.verify_crc {
+            let crc_bytes = fetch_source_range(
+                &self.source,
+                region.end..region.end + format::CRC_BYTES,
+                "fts/doc-map crc",
+            )?;
+            verify_doc_map(&body, &crc_bytes)?;
+        }
+        Ok(DocMap::permuted(own_map_bytes(&self.source, body)))
+    }
+
+    /// Read the doc-id map on the caller's runtime if a query has not yet,
+    /// so no translation of a hit reads through the sync bridge. Nothing to
+    /// read on a blob in row order.
+    pub(super) async fn ensure_doc_map(&self) -> Result<(), FtsError> {
+        if self.doc_map.get().is_some() {
+            return Ok(());
+        }
+        let Some(region) = &self.doc_map_region else {
+            return Ok(());
+        };
+        let span = match self.verify_crc {
+            true => region.start..region.end + format::CRC_BYTES,
+            false => region.clone(),
+        };
+        let bytes = self
+            .source
+            .range_async(span)
+            .await
+            .map_err(|e| FtsError::RangeFetch {
+                what: "fts/doc-map",
+                source: e,
+            })?;
+        let body = bytes.slice(..region.len());
+        if self.verify_crc {
+            verify_doc_map(&body, &bytes[region.len()..])?;
+        }
+        let _ = self
+            .doc_map
+            .set(DocMap::permuted(own_map_bytes(&self.source, body)));
+        Ok(())
+    }
+
+    /// Everything scoring `column` reads besides the postings — the length
+    /// buckets and the doc-id map — fetched together, so a cold superfile's
+    /// query issues them in one wave with its postings rather than one after
+    /// another. Each is a no-op once read.
+    pub(crate) async fn prewarm_scoring(&self, column: &str) -> Result<(), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let (norms, map) = join(self.ensure_norms(column_id), self.ensure_doc_map()).await;
+        norms?;
+        map
     }
 
     /// The Parquet row a doc id of this blob stands for.
@@ -1109,13 +1190,13 @@ impl FtsReader {
     /// should not take down a query.
     #[inline]
     pub(crate) fn row_of(&self, doc_id: FtsDocId) -> RowId {
-        self.doc_map.row_of(doc_id)
+        self.doc_map().row_of(doc_id)
     }
 
     /// Whether this blob stores its documents under an ordering of its
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {
-        self.doc_map.is_permuted()
+        self.doc_map_region.is_some()
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -1373,6 +1454,7 @@ impl FtsReader {
         if purpose.scores() {
             self.ensure_norms(column_id).await?;
         }
+        self.ensure_doc_map().await?;
         if !phrases.is_empty() && !col_meta.positions {
             return Err(FtsError::PositionsUnavailable {
                 column: col_meta.name.clone(),
@@ -1955,6 +2037,29 @@ pub(super) fn top_k(scores: FxHashMap<RowId, f32>, k: usize) -> Vec<(RowId, f32)
         }
     }
     drain_top_k_desc(heap)
+}
+
+/// The map's bytes as the reader keeps them. From memory the region is the
+/// blob itself, so the map costs no heap and its pages stay evictable. A lazy
+/// source may answer a read this large with a window onto a bigger fetch,
+/// and keeping the window would keep that whole fetch alive; the map is the
+/// one read the reader holds on to, so over such a source it takes a copy.
+fn own_map_bytes(source: &Source, body: Bytes) -> Bytes {
+    match source {
+        Source::InMemory(_) => body,
+        Source::Lazy(_) => Bytes::copy_from_slice(&body),
+    }
+}
+
+/// Check the map's body against the CRC stored after it.
+fn verify_doc_map(body: &[u8], crc_bytes: &[u8]) -> Result<(), FtsError> {
+    if crc_bytes.len() < format::CRC_BYTES || read_u32_le(crc_bytes) != crc32c(body) {
+        return Err(FtsError::Read(ReadError::ChecksumMismatch {
+            section: "fts/doc-map",
+            column: String::new(),
+        }));
+    }
+    Ok(())
 }
 
 pub(super) fn fetch_source_range(

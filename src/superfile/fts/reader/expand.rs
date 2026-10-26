@@ -709,7 +709,7 @@ impl FtsReader {
             work.kernel_cpu_ns += ns;
             bits = ored?;
         }
-        let doc_map = self.doc_map.clone();
+        let doc_map = self.doc_map().clone();
         let (rows, ns) = run_on_pool(pool, "contains rows", move || {
             timed_section(|| rows_of(bits, &inline, n_docs, &doc_map))
         })

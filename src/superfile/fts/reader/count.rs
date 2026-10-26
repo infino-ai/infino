@@ -598,6 +598,7 @@ impl FtsReader {
         }
         entries.truncate(limit);
         self.ensure_norms(column_id).await?;
+        self.ensure_doc_map().await?;
         let col_meta = &self.columns[column_id as usize];
         let mut out = Vec::with_capacity(entries.len());
         let mut with_postings: Vec<usize> = Vec::new();

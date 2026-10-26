@@ -85,6 +85,7 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
+use futures::future::join;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
 use tracing::{Instrument, debug, warn};
@@ -1471,14 +1472,28 @@ impl SupertableReader {
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
                 // instead of re-reading what the df wave already fetched.
-                let memo: Option<Arc<FetchedTermMemo>> =
+                let memo = async {
                     match prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned() {
                         Some(memo) => Some(memo),
                         // No open-wave memo: build one from the term index's
                         // locations, fetching postings only. A failure here
                         // costs the dictionary read, never the answer.
                         None => memo_from_locations(&r, &index_locations, suid).await,
-                    };
+                    }
+                };
+                // What scoring reads besides the postings — the length buckets
+                // and the doc-id map — goes in the same wave as the postings,
+                // so a cold superfile costs one round trip before its kernel
+                // rather than three. A read that fails here is read again by
+                // the kernel's own entry, which reports it.
+                let prewarm = async {
+                    if let Some(fts) = r.fts()
+                        && let Err(error) = fts.prewarm_scoring(&column_arc).await
+                    {
+                        debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
+                    }
+                };
+                let (memo, ()): (Option<Arc<FetchedTermMemo>>, ()) = join(memo, prewarm).await;
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full
