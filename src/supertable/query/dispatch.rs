@@ -846,11 +846,12 @@ where
     let mut replan = replan;
     let window = window.max(1);
     loop {
-        let issue = match replan.is_some() {
-            true => PENDING_PLAN_WINDOW
+        let issue = match (replan.is_some(), out.len() < FLOOR_WINDOW) {
+            (true, _) => PENDING_PLAN_WINDOW
                 .saturating_sub(opened as usize)
                 .min(window),
-            false => window,
+            (false, true) => FLOOR_WINDOW.min(window),
+            (false, false) => window,
         };
         while in_flight.len() < issue {
             let Some((entry, params)) = pending.pop_front() else {
