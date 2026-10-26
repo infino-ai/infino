@@ -762,6 +762,16 @@ where
 /// refilled as opens finished issued fifty.
 const PENDING_PLAN_WINDOW: usize = 8;
 
+/// Opens in flight until the first of them have answered. The running floor
+/// is what lets a kernel skip posting blocks and the fan-out skip whole
+/// superfiles, and it forms from the first answers; a window opened wide
+/// before any answer scores every superfile against no floor at all. A
+/// billion documents measured: the full window from the start read three
+/// to four times the postings of a query the merge does not serve, for no
+/// gain in its wall. The configured window applies once this many have
+/// answered.
+const FLOOR_WINDOW: usize = 64;
+
 pub(crate) type Units<P> = Vec<(Arc<SuperfileEntry>, P)>;
 /// What a plan that arrives while a fan-out runs does to the units not yet
 /// issued: given them, it returns the ones to go on with in the order to
