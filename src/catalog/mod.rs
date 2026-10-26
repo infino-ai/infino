@@ -1109,8 +1109,10 @@ impl Connection {
     /// already fired returns at once, without reading anything.
     ///
     /// What a cancel does not cut short:
-    /// - A table's manifest load already under way: the call waits for it,
-    ///   since the handle is checked between tables.
+    /// - A `FROM` table's manifest load already under way: the call waits for
+    ///   it, since the handle is checked between tables. A table named only
+    ///   inside a search function is opened while planning, so the call does
+    ///   not wait for its load, which finishes after the call returns.
     /// - Work already handed off, which finishes after the call returns: an
     ///   object-store read a search function is waiting on, CPU work on the
     ///   reader pool, a manifest part being loaded (it lands in the cache for
@@ -1274,9 +1276,10 @@ impl Connection {
             let planner_ctx = ctx.clone();
             // The planning task runs on another thread, which inherits no
             // span on its own. `sql.plan` is made here, under this call's
-            // span, and `SpawnedTask` runs the task in the span that spawned
-            // it (see `trace::follow_spans_into_datafusion_tasks`), so the
-            // plan phase stays in this trace.
+            // span, and the task carries it along. The task tracer
+            // (`trace::follow_spans_into_datafusion_tasks`) is installed only
+            // with `detailed-tracing`, so the span is attached here too, or
+            // planning's log lines lose this call's span in every other build.
             let planning = async move {
                 // Plan the statement already parsed and checked, check the plan, execute.
                 // `SessionContext::sql` would run a DDL or session statement while producing
@@ -1310,7 +1313,8 @@ impl Connection {
                     .map_err(|e| datafusion_error(&e))?;
                 Ok::<_, InfinoError>((task_ctx, plan))
             }
-            .instrument(detail_span!("sql.plan"));
+            .instrument(detail_span!("sql.plan"))
+            .in_current_span();
             // A `SpawnedTask` aborts the task when dropped, so a cancel stops
             // the file opens planning is making instead of leaving them to
             // run on, detached.
@@ -2006,7 +2010,11 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc},
+        sync::{
+            Arc, Mutex, MutexGuard, PoisonError,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
         time::{Duration, Instant},
     };
@@ -5988,17 +5996,35 @@ mod tests {
     /// The slowed stores a connection built, one per provider in the order it
     /// built them: the catalog root, then each table as it was opened.
     #[derive(Default)]
-    struct SlowStores(Mutex<Vec<Arc<SlowStorage>>>);
+    struct SlowStores {
+        stores: Mutex<Vec<Arc<SlowStorage>>>,
+        /// Whether stores built from now on start with their reads held.
+        hold_new: AtomicBool,
+    }
 
     impl SlowStores {
         fn wrap(&self, inner: Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> {
             let slow = SlowStorage::wrap(inner, SLOW_READ);
+            if self.hold_new.load(Ordering::SeqCst) {
+                slow.hold_reads();
+            }
             self.lock().push(Arc::clone(&slow));
             slow
         }
 
         fn lock(&self) -> MutexGuard<'_, Vec<Arc<SlowStorage>>> {
-            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+            self.stores.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Hold the reads of every store built from now on, until
+        /// [`Self::release_reads`].
+        fn hold_new_stores(&self) {
+            self.hold_new.store(true, Ordering::SeqCst);
+        }
+
+        fn release_reads(&self) {
+            self.hold_new.store(false, Ordering::SeqCst);
+            self.lock().iter().for_each(|s| s.release_reads());
         }
 
         /// Providers built so far.
@@ -6269,9 +6295,14 @@ mod tests {
         let cancel = QueryCancel::new();
 
         // Providers are built in order: the catalog root, then `docs` when
-        // the query opens it.
+        // the query opens it. The open of `docs` is held until the cancel has
+        // fired, so the cancel lands while it is under way however slow the
+        // runner.
+        stores.hold_new_stores();
         let running = query_in_background(&conn, "SELECT count(*) FROM docs, more", &cancel);
         wait_until("the query opens docs", || stores.reads_on(1) > 0);
+        cancel.cancel();
+        stores.release_reads();
         cancel_and_expect_cancelled(&cancel, &running);
         assert_eq!(stores.built(), 2, "more was never opened");
     }
@@ -6291,6 +6322,27 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         let cancel = QueryCancel::new();
         let sql = format!("SELECT count(*) FROM range({COUNTED_ROWS})");
+        let running = query_in_background(&conn, &sql, &cancel);
+        thread::sleep(EXECUTE_BEFORE_CANCEL);
+        cancel_and_expect_cancelled(&cancel, &running);
+    }
+
+    /// Copies of a title the one-poll cancel test scans: seconds of regex
+    /// work in a debug build.
+    const SCANNED_COPIES: u64 = 500_000;
+
+    /// A query that does all its work in one poll still returns promptly when
+    /// cancelled. Over a warm table there is no read to wait on, and the
+    /// regex runs over a single row, so nothing yields until it is done.
+    #[test]
+    fn a_query_cancelled_inside_one_long_poll_returns() {
+        let (conn, _dir) = storage_conn();
+        write_fox_table(&conn, "docs", 1, 1);
+        conn.query_sql(READ_EVERY_FILE).expect("warm the table");
+        let cancel = QueryCancel::new();
+        let sql = format!(
+            "SELECT regexp_count(repeat(title, {SCANNED_COPIES}), '[0-9a-f]{{4}}') FROM docs"
+        );
         let running = query_in_background(&conn, &sql, &cancel);
         thread::sleep(EXECUTE_BEFORE_CANCEL);
         cancel_and_expect_cancelled(&cancel, &running);

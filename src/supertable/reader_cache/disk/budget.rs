@@ -162,7 +162,9 @@ impl DiskCacheStore {
                 .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
             {
                 self.release_entry_accounting(&removed);
-                self.retain_block_file(&uri, &removed, now_us);
+                if let Some(source) = removed.block_source() {
+                    self.retain_block_file(&uri, source, now_us);
+                }
             }
         }
     }

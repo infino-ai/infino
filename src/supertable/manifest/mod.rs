@@ -2217,7 +2217,10 @@ impl ManifestSnapshot {
     /// part claims bytes from the loader's open-blob budget that are never
     /// given back, so a load abandoned after its decode started and run
     /// again would claim them twice, and repeated cancels would drain the
-    /// budget until opens stop getting their inline open blobs.
+    /// budget until opens stop getting their inline open blobs. Only loads
+    /// through here: [`Self::derive_length_totals`] decodes parts without
+    /// keeping them, so a BM25 query cancelled there, over a manifest that
+    /// records no length totals, decodes them again on its rerun.
     pub async fn get_part_by_id(
         &self,
         part_id: PartId,

@@ -7,7 +7,9 @@
 //! Each `get` and `get_range` sleeps before reaching the inner provider, so a
 //! test sees reads issued together overlap, and can act while a read is in
 //! flight: cancel a query mid-open, say, then check that no read starts after
-//! it returned. `tail` and `get_if_none_match` are the trait's defaults built
+//! it returned. [`SlowStorage::hold_reads`] parks every read until
+//! [`SlowStorage::release_reads`], for a test that must act before a read
+//! finishes, however slow the runner. `tail` and `get_if_none_match` are the trait's defaults built
 //! from those, so a `tail` here is a HEAD plus a range read, whatever the
 //! inner provider does natively. Writes, listing and deletes pass through
 //! untouched.
@@ -25,7 +27,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::MultipartUpload;
-use tokio::time::sleep;
+use tokio::{sync::watch, time::sleep};
 
 use crate::{
     runtime_metrics::io::UsageMeter,
@@ -41,6 +43,8 @@ pub struct SlowStorage {
     max_in_flight: AtomicUsize,
     /// The object each read started on, in order.
     read_uris: Mutex<Vec<String>>,
+    /// Whether reads are parked before they reach the inner provider.
+    held: watch::Sender<bool>,
 }
 
 impl SlowStorage {
@@ -53,7 +57,19 @@ impl SlowStorage {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             read_uris: Mutex::new(Vec::new()),
+            held: watch::Sender::new(false),
         })
+    }
+
+    /// Park reads, those in flight and those to come, until
+    /// [`Self::release_reads`]. A parked read still counts as started.
+    pub fn hold_reads(&self) {
+        self.held.send_replace(true);
+    }
+
+    /// Let parked reads go on.
+    pub fn release_reads(&self) {
+        self.held.send_replace(false);
     }
 
     /// Reads started so far, finished or not.
@@ -79,6 +95,12 @@ impl SlowStorage {
     /// The most reads ever in flight at once.
     pub fn max_in_flight(&self) -> usize {
         self.max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// What a read waits for: the delay, then any hold.
+    async fn wait(&self) {
+        sleep(self.delay).await;
+        let _ = self.held.subscribe().wait_for(|held| !held).await;
     }
 
     /// Count a read in for as long as the returned guard lives, so a read
@@ -121,13 +143,13 @@ impl StorageProvider for SlowStorage {
 
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
         let _read = self.start_read(uri);
-        sleep(self.delay).await;
+        self.wait().await;
         self.inner.get(uri).await
     }
 
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
         let _read = self.start_read(uri);
-        sleep(self.delay).await;
+        self.wait().await;
         self.inner.get_range(uri, range).await
     }
 

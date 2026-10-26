@@ -74,6 +74,31 @@ impl Drop for UnclaimedTmp {
     }
 }
 
+/// A lazy open's block sources, until its entry is admitted ([`Self::admitted`]). A source that
+/// adopts a `.blocks` file left on disk takes over the charge of the file's record, and gives it
+/// back when it drops. Dropped unadmitted (an open that fails, is cancelled, or loses its slot to a
+/// whole file), a source hands the file back to a record instead, so the file stays charged and
+/// eviction can still reach it.
+struct UnadmittedBlockSources<'a> {
+    store: &'a DiskCacheStore,
+    uri: SuperfileUri,
+    sources: Vec<Arc<BlockCachedSource>>,
+}
+
+impl UnadmittedBlockSources<'_> {
+    fn admitted(mut self) {
+        self.sources.clear();
+    }
+}
+
+impl Drop for UnadmittedBlockSources<'_> {
+    fn drop(&mut self) {
+        for source in &self.sources {
+            self.store.retain_unadmitted_block_file(&self.uri, source);
+        }
+    }
+}
+
 impl DiskCacheStore {
     /// Mmap a cache file and open it as a [`Residency::Mapped`] entry. The caller owns the budget
     /// and the map insert. The reader and the entry share one `Arc<Mmap>`, so the idle-page sweep's
@@ -662,7 +687,12 @@ impl DiskCacheStore {
         // size up front; without it the block source charges what it fills. A guard, committed
         // only once the entry is admitted: an open that errors or is dropped midway (a cancelled
         // query) gives the bytes back instead of charging the budget for an entry nobody holds.
-        // The block source needs no such care: it writes blocks only once its entry is admitted.
+        // The block sources are guarded until then too, for a `.blocks` file they adopt.
+        let mut unadmitted = UnadmittedBlockSources {
+            store: self,
+            uri: *uri,
+            sources: Vec::new(),
+        };
         let (lazy_reader, size, whole_file, block_source) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
 
@@ -719,6 +749,7 @@ impl DiskCacheStore {
                     aligned_region: offsets.vec,
                 },
             );
+            unadmitted.sources.push(Arc::clone(&block_source));
             let block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
 
@@ -798,7 +829,13 @@ impl DiskCacheStore {
             // blocks the first open wrote are adopted when their index has
             // landed, fetched again otherwise).
             let opened = self
-                .open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, !allow_background_fill)
+                .open_lazy_unknown_size(
+                    uri,
+                    &storage_uri,
+                    &fetch_storage,
+                    !allow_background_fill,
+                    &mut unadmitted,
+                )
                 .await?;
             let whole_file = self
                 .reserve_whole_file(allow_background_fill, opened.1)
@@ -807,8 +844,14 @@ impl DiskCacheStore {
             let (lazy_reader, size, block_source) = if allow_background_fill && whole_file.is_none()
             {
                 drop(opened);
-                self.open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, true)
-                    .await?
+                self.open_lazy_unknown_size(
+                    uri,
+                    &storage_uri,
+                    &fetch_storage,
+                    true,
+                    &mut unadmitted,
+                )
+                .await?
             } else {
                 opened
             };
@@ -846,9 +889,12 @@ impl DiskCacheStore {
         // Admission may return an existing whole file instead; serve what it returns. Either way
         // admission takes the reserved bytes over: the new entry holds them, or admission
         // releases them when a whole file already holds the slot.
-        let admitted = self.admit_entry(*uri, entry);
+        let admitted = self.admit_entry(*uri, Arc::clone(&entry));
         if let Some(reservation) = whole_file {
             reservation.commit();
+        }
+        if Arc::ptr_eq(&admitted, &entry) {
+            unadmitted.admitted();
         }
 
         Ok(admitted)
@@ -856,14 +902,16 @@ impl DiskCacheStore {
 
     /// A lazy open of `storage_uri` whose size is not known up front: the first `tail()` inside
     /// `open_lazy_with` is a suffix-range GET that returns the footer bytes and the object's size.
-    /// `owns_accounting` is the block source's (see [`BlockCachedSource::new_with_accounting`]).
-    /// Returns the reader, the size the open discovered and the block source it reads through.
+    /// `owns_accounting` is the block source's (see [`BlockCachedSource::new_with_accounting`]),
+    /// and the source joins `unadmitted`. Returns the reader, the size the open discovered and the
+    /// block source it reads through.
     async fn open_lazy_unknown_size(
         self: &Arc<Self>,
         uri: &SuperfileUri,
         storage_uri: &str,
         fetch_storage: &Arc<dyn StorageProvider>,
         owns_accounting: bool,
+        unadmitted: &mut UnadmittedBlockSources<'_>,
     ) -> Result<(SuperfileReader, u64, Arc<BlockCachedSource>), DiskCacheError> {
         let range_src: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_unknown_size(
             Arc::clone(fetch_storage),
@@ -878,6 +926,7 @@ impl DiskCacheStore {
             // No manifest hints here, so the layout is unknown.
             SourceLayout::ALL_ALIGNED,
         );
+        unadmitted.sources.push(Arc::clone(&block_source));
         let source: Arc<dyn LazyByteSource> = Arc::clone(&block_source) as Arc<dyn LazyByteSource>;
         let lazy_reader =
             SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
@@ -3735,6 +3784,66 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 0, "the reservation came back");
         assert!(!store.is_cached(&uri), "nothing was admitted");
         store.assert_budget_consistent();
+    }
+
+    /// A lazy open that adopts a `.blocks` file left on disk takes over the charge the file's
+    /// record carried. Dropped before its entry is admitted (a cancelled query), it hands the file
+    /// back to a record, so the file stays charged and eviction can still reach it.
+    #[tokio::test]
+    async fn a_lazy_open_dropped_after_adopting_a_block_file_keeps_the_file_charged() {
+        let (_dir, store, recording) = store_over_recording();
+        let uri = SuperfileUri::new_v4();
+        let bytes = multi_block_vector_superfile_bytes();
+        let total = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+        // The open reads only the tail and the vector header, neither of them in the last block.
+        let last = ((total - 1) / CACHE_BLOCK_BYTES) as u32;
+        let seeded = seed_valid_block_file(&store, &uri, total, &[last]);
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        drop(store);
+        assert_eq!(
+            restarted.stats().current_bytes,
+            seeded,
+            "the restart counted the file"
+        );
+
+        // With no size hints the open reads the tail first, then the vector header through its
+        // block source, which adopts the file before it reads.
+        recording.pause_read_after(1);
+        let opening = spawn({
+            let restarted = Arc::clone(&restarted);
+            async move {
+                restarted
+                    .cold_fetch_lazy(
+                        &uri,
+                        &uri.storage_path(),
+                        None,
+                        restarted.resolve_storage(None),
+                        false,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        });
+        until_a_read_is_paused(&recording).await;
+        opening.abort();
+        assert!(opening.await.expect_err("aborted").is_cancelled());
+
+        assert!(!restarted.is_cached(&uri), "nothing was admitted");
+        assert_eq!(
+            restarted.stats().current_bytes,
+            seeded,
+            "the file is still charged"
+        );
+        restarted.assert_budget_consistent();
+        restarted.evict_at_least(seeded).await.expect("evict");
+        assert!(
+            !restarted.blocks_path(&uri).exists(),
+            "eviction reaches the file"
+        );
+        assert_eq!(restarted.stats().current_bytes, 0);
     }
 
     /// The same reservation comes back when a read of the open batch fails, not only when the open

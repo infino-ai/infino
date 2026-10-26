@@ -34,6 +34,7 @@
 use std::{
     fs,
     path::PathBuf,
+    process,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -98,11 +99,14 @@ pub struct ManifestDiskCache {
     n_hits: AtomicU64,
     n_misses: AtomicU64,
     n_evictions: AtomicU64,
-    /// Numbers each write's temp file, so two writes of the same part (a
-    /// cancelled query's still landing while its rerun writes again) never
-    /// share one.
-    next_tmp: AtomicU64,
 }
+
+/// Numbers each manifest-part write's temp file in this process. Process
+/// wide, as each table open builds its own cache over the same directory, so
+/// two writes of the same part (a cancelled query's still landing while its
+/// rerun writes again, or two opens of one table) never share one; the temp
+/// name also carries the pid, for writes from another process.
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 impl ManifestDiskCache {
     /// Construct a cache rooted at `cache_root` (created if absent)
@@ -121,7 +125,6 @@ impl ManifestDiskCache {
             n_hits: AtomicU64::new(0),
             n_misses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
-            next_tmp: AtomicU64::new(0),
         };
         cache.scan_existing();
         Ok(Arc::new(cache))
@@ -386,9 +389,12 @@ impl ManifestDiskCache {
 
     /// A temp file for one write of `hash`, distinct from every other write's.
     fn tmp_path(&self, hash: &ContentHash) -> PathBuf {
-        let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
-        self.cache_root
-            .join(format!("{}.{n:x}{CACHE_TMP_SUFFIX}", cache_filename(hash)))
+        let n = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        self.cache_root.join(format!(
+            "{}.{}.{n:x}{CACHE_TMP_SUFFIX}",
+            cache_filename(hash),
+            process::id()
+        ))
     }
 }
 
@@ -572,14 +578,17 @@ mod tests {
 
     /// Two writes of one part never share a temp file, so a cancelled query's
     /// write still landing cannot interleave with its rerun's and leave torn
-    /// bytes under the part's name.
+    /// bytes under the part's name. That holds across the caches two opens of
+    /// one table build over the same directory too.
     #[test]
     fn writes_of_one_part_use_distinct_temp_files() {
         let root = tmp_root("distinct-tmp");
         let _ = fs::remove_dir_all(&root);
         let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let other = ManifestDiskCache::new(root.clone(), 1 << 20).expect("other cache");
         let h = hash_of(b"part");
         assert_ne!(cache.tmp_path(&h), cache.tmp_path(&h));
+        assert_ne!(cache.tmp_path(&h), other.tmp_path(&h));
         let _ = fs::remove_dir_all(&root);
     }
 

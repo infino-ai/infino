@@ -670,16 +670,10 @@ impl BlockCachedSource {
     /// `Required field null_pages is missing`. Comparing inodes keeps the
     /// persisted index faithful to whatever data file the path currently names.
     fn persist_idx(&self, bf: &BlockFile, snapshot: &[u8]) {
-        use std::os::unix::fs::MetadataExt;
-        let own = match bf.file.metadata() {
-            Ok(meta) => meta.ino(),
-            Err(_) => return,
-        };
-        match fs::metadata(&self.path) {
-            Ok(meta) if meta.ino() == own => {}
-            // Path is gone or now names another generation's inode — never
-            // stamp our bitmap onto it.
-            _ => return,
+        // Path is gone or now names another generation's inode — never
+        // stamp our bitmap onto it.
+        if !self.path_names(bf) {
+            return;
         }
         let idx = self.idx_path();
         let seq = PERSIST_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -689,6 +683,22 @@ impl BlockCachedSource {
         if fs::write(&tmp, snapshot).is_ok() {
             let _ = fs::rename(&tmp, &idx);
         }
+    }
+
+    /// Whether `self.path` still names `bf`'s inode, rather than being gone or
+    /// naming a later generation's file.
+    fn path_names(&self, bf: &BlockFile) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (bf.file.metadata(), fs::metadata(&self.path)) {
+            (Ok(own), Ok(named)) => own.ino() == named.ino(),
+            _ => false,
+        }
+    }
+
+    /// Whether this source has a block file and its path still names it.
+    pub(crate) fn path_names_its_file(&self) -> bool {
+        self.created_block_file()
+            .is_some_and(|bf| self.path_names(bf))
     }
 
     /// Byte length of block `b` (the trailing block may be partial).

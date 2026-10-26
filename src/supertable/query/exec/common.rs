@@ -255,6 +255,13 @@ impl TableProvider for CallScopedTable {
 /// through here; error mapping stays with the caller, whose surface it
 /// belongs to.
 ///
+/// The collect runs as its own task, so the caller sees a cancel or the
+/// process memory limit while it runs: a plan over cached data can finish all
+/// its work in one poll, and a check in the same task would only run once the
+/// result is ready. Dropping the returned future drops the task, which stops
+/// DataFusion's partition tasks and the search functions' fan-out; a batch
+/// already being processed still finishes first.
+///
 /// When the process has a memory limit (see `memory::resident`), the collect
 /// races it, and a process past the limit ends the statement with a
 /// `ResourcesExhausted` refusal.
@@ -263,39 +270,30 @@ pub(crate) async fn collect_plan_metered(
     task_ctx: Arc<TaskContext>,
     op_stats: &Option<Arc<OpStatsCollector>>,
 ) -> DfResult<Vec<RecordBatch>> {
+    let limit = process_limit();
+    // Over the limit before we start: refuse without spawning anything.
+    if let Some(limit) = limit
+        && let Some(anon) = process_over_limit(limit)
+    {
+        return Err(over_process_limit(anon, limit));
+    }
     let metered: Arc<dyn ExecutionPlan> =
         Arc::new(MeteredExec::new(Arc::clone(plan), op_stats.clone()));
-    let collected = collect(metered, task_ctx);
-    let batches = match process_limit() {
-        None => collected.await?,
-        // With a process limit, run the collect as its own task and race it
-        // against the sampler. The streamed batches are never reserved, so
-        // this is the only bound on them.
-        //  - over the limit before we start: refuse without spawning anything.
-        //  - own task, because a plan over cached data can finish all its work
-        //    in one poll, so a check in the same task would only run once the
-        //    result is ready.
-        //  - limit wins: dropping the task stops DataFusion's partition tasks
-        //    and the search functions' fan-out. A batch already being
-        //    processed still finishes first.
-        //  - `biased` checks the limit first, so a reading over it wins even if
-        //    the result lands in the same wakeup.
-        Some(limit) => {
-            if let Some(anon) = process_over_limit(limit) {
+    let collecting = SpawnedTask::spawn(collect(metered, task_ctx).in_current_span());
+    let joined = match limit {
+        None => collecting.await,
+        // The streamed batches are never reserved, so the limit is the only
+        // bound on them. `biased` checks it first, so a reading over it wins
+        // even if the result lands in the same wakeup.
+        Some(limit) => tokio::select! {
+            biased;
+            anon = process_limit_exceeded(limit) => {
                 return Err(over_process_limit(anon, limit));
             }
-            let collecting = SpawnedTask::spawn(collected);
-            tokio::select! {
-                biased;
-                anon = process_limit_exceeded(limit) => {
-                    return Err(over_process_limit(anon, limit));
-                }
-                joined = collecting => {
-                    joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??
-                }
-            }
-        }
+            joined = collecting => joined,
+        },
     };
+    let batches = joined.map_err(|join| DataFusionError::ExecutionJoin(Box::new(join)))??;
     // Harvesting the unwrapped plan and the wrapped one reach the same
     // leaves — the walk dedupes by node identity and sums childless nodes
     // only, and the meter delegates `execute` to this same tree.
