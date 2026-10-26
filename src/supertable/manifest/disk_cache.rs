@@ -41,7 +41,9 @@ use std::{
     time::Instant,
 };
 
+use bytes::Bytes;
 use dashmap::{DashMap, Entry};
+use tokio::task::spawn_blocking;
 
 use crate::{supertable::manifest::part::ContentHash, utils::trace::record};
 
@@ -80,8 +82,9 @@ pub struct ManifestCacheStats {
 /// Content-addressed disk cache for manifest-part bytes.
 ///
 /// Construction is sync (a directory scan); `get` / `put` are async
-/// because file I/O is handed to `tokio::fs` so tokio workers aren't
-/// blocked on the syscall. Verification (blake3 over the cached bytes)
+/// because their file I/O runs off the tokio workers (a `get` through
+/// `tokio::fs`, a `put` as one blocking task) so they aren't blocked on
+/// the syscall. Verification (blake3 over the cached bytes)
 /// runs inline, matching the loader's existing hash check.
 pub struct ManifestDiskCache {
     cache_root: PathBuf,
@@ -95,6 +98,10 @@ pub struct ManifestDiskCache {
     n_hits: AtomicU64,
     n_misses: AtomicU64,
     n_evictions: AtomicU64,
+    /// Numbers each write's temp file, so two writes of the same part (a
+    /// cancelled query's still landing while its rerun writes again) never
+    /// share one.
+    next_tmp: AtomicU64,
 }
 
 impl ManifestDiskCache {
@@ -114,6 +121,7 @@ impl ManifestDiskCache {
             n_hits: AtomicU64::new(0),
             n_misses: AtomicU64::new(0),
             n_evictions: AtomicU64::new(0),
+            next_tmp: AtomicU64::new(0),
         };
         cache.scan_existing();
         Ok(Arc::new(cache))
@@ -217,7 +225,13 @@ impl ManifestDiskCache {
     /// Idempotent: an already-cached hash is a no-op. `hash` must be
     /// the blake3 of `bytes`; the caller (the loader) has already
     /// verified this.
-    pub async fn put(&self, hash: ContentHash, bytes: &[u8]) {
+    ///
+    /// The write, the rename and the index insert run as one blocking task,
+    /// which settles the budget on every outcome. A caller dropped while it
+    /// runs (a cancelled query) therefore leaves the cache as if it had
+    /// waited: the part lands indexed and charged, never as a file the
+    /// budget and eviction cannot see.
+    pub async fn put(self: &Arc<Self>, hash: ContentHash, bytes: Bytes) {
         if self.entries.contains_key(&hash) {
             return;
         }
@@ -230,25 +244,32 @@ impl ManifestDiskCache {
         if !self.reserve(size) {
             return;
         }
+        let cache = Arc::clone(self);
+        // A join error is a panic or a runtime shutting down. The cache is
+        // best-effort either way, so the caller carries on.
+        let _ = spawn_blocking(move || cache.write_reserved(hash, &bytes)).await;
+    }
 
+    /// Write `bytes` under `hash` and index it, with `bytes.len()` already
+    /// reserved. The reservation is given back when the write fails, or when
+    /// a concurrent put of the same hash indexed it first.
+    fn write_reserved(&self, hash: ContentHash, bytes: &[u8]) {
+        let size = bytes.len() as u64;
         let final_path = self.cache_path(&hash);
         let tmp_path = self.tmp_path(&hash);
-        let write_result = async {
-            tokio::fs::write(&tmp_path, bytes).await?;
-            tokio::fs::rename(&tmp_path, &final_path).await
-        }
-        .await;
-
-        if write_result.is_err() {
+        if fs::write(&tmp_path, bytes)
+            .and_then(|()| fs::rename(&tmp_path, &final_path))
+            .is_err()
+        {
             // Roll back the reservation; leave no partial tmp behind.
             self.current_bytes.fetch_sub(size, Ordering::Release);
-            let _ = tokio::fs::remove_file(&tmp_path).await;
+            let _ = fs::remove_file(&tmp_path);
             return;
         }
 
-        // Commit into the accounting index. If a concurrent put raced
-        // us to the same hash, release our reservation — the file on
-        // disk is byte-identical either way (content addressing).
+        // Commit into the accounting index. If a concurrent put raced us to
+        // the same hash, release our reservation: the file on disk is
+        // byte-identical either way (content addressing).
         match self.entries.entry(hash) {
             Entry::Vacant(v) => {
                 v.insert(CacheEntry {
@@ -363,9 +384,11 @@ impl ManifestDiskCache {
         self.cache_root.join(cache_filename(hash))
     }
 
+    /// A temp file for one write of `hash`, distinct from every other write's.
     fn tmp_path(&self, hash: &ContentHash) -> PathBuf {
+        let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
         self.cache_root
-            .join(format!("{}{CACHE_TMP_SUFFIX}", cache_filename(hash)))
+            .join(format!("{}.{n:x}{CACHE_TMP_SUFFIX}", cache_filename(hash)))
     }
 }
 
@@ -397,6 +420,11 @@ fn parse_cache_filename(name: &str) -> Option<ContentHash> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures::FutureExt;
+    use tokio::time::{sleep, timeout};
+
     use super::*;
 
     /// Deterministic content hash for a payload (mirrors the loader's
@@ -420,7 +448,7 @@ mod tests {
 
         let bytes = b"compressed-part-bytes".to_vec();
         let h = hash_of(&bytes);
-        cache.put(h, &bytes).await;
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
 
         let got = cache.get(&h).await.expect("hit");
         assert_eq!(got, bytes);
@@ -449,8 +477,8 @@ mod tests {
         let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"abc".to_vec();
         let h = hash_of(&bytes);
-        cache.put(h, &bytes).await;
-        cache.put(h, &bytes).await;
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         assert_eq!(cache.stats().n_entries, 1);
         assert_eq!(cache.stats().current_bytes, bytes.len() as u64);
         let _ = fs::remove_dir_all(&root);
@@ -463,7 +491,7 @@ mod tests {
         let cache = ManifestDiskCache::new(root.clone(), 4).expect("cache");
         let bytes = b"way too big for a 4 byte budget".to_vec();
         let h = hash_of(&bytes);
-        cache.put(h, &bytes).await;
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         assert_eq!(cache.stats().n_entries, 0);
         assert!(cache.get(&h).await.is_none());
         let _ = fs::remove_dir_all(&root);
@@ -479,11 +507,11 @@ mod tests {
         let b = vec![2u8; 10];
         let c = vec![3u8; 10];
         let (ha, hb, hc) = (hash_of(&a), hash_of(&b), hash_of(&c));
-        cache.put(ha, &a).await;
-        cache.put(hb, &b).await;
+        cache.put(ha, Bytes::copy_from_slice(&a)).await;
+        cache.put(hb, Bytes::copy_from_slice(&b)).await;
         // Touch `a` so `b` becomes the LRU victim.
         assert!(cache.get(&ha).await.is_some());
-        cache.put(hc, &c).await;
+        cache.put(hc, Bytes::copy_from_slice(&c)).await;
 
         assert!(cache.get(&ha).await.is_some(), "a kept (recently used)");
         assert!(cache.get(&hc).await.is_some(), "c kept (just inserted)");
@@ -499,7 +527,7 @@ mod tests {
         let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
         let bytes = b"genuine-bytes".to_vec();
         let h = hash_of(&bytes);
-        cache.put(h, &bytes).await;
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         // Overwrite the on-disk file with garbage that won't hash to h.
         let path = cache.cache_path(&h);
         tokio::fs::write(&path, b"tampered")
@@ -520,7 +548,7 @@ mod tests {
         let h = hash_of(&bytes);
         {
             let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
-            cache.put(h, &bytes).await;
+            cache.put(h, Bytes::copy_from_slice(&bytes)).await;
         }
         // New cache over the same root: index rebuilt from disk.
         let reopened = ManifestDiskCache::new(root.clone(), 1 << 20).expect("reopen");
@@ -540,5 +568,58 @@ mod tests {
         // Unrelated names are rejected.
         assert_eq!(parse_cache_filename("not-a-part.txt"), None);
         assert_eq!(parse_cache_filename("part-xyz.avro.zst"), None);
+    }
+
+    /// Two writes of one part never share a temp file, so a cancelled query's
+    /// write still landing cannot interleave with its rerun's and leave torn
+    /// bytes under the part's name.
+    #[test]
+    fn writes_of_one_part_use_distinct_temp_files() {
+        let root = tmp_root("distinct-tmp");
+        let _ = fs::remove_dir_all(&root);
+        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let h = hash_of(b"part");
+        assert_ne!(cache.tmp_path(&h), cache.tmp_path(&h));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// How long the dropped-put test waits for the write it handed off to land.
+    const ORPHANED_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+    /// Poll cadence while it waits.
+    const ORPHANED_WRITE_POLL: Duration = Duration::from_millis(5);
+
+    /// A put dropped after it reserved budget, as a cancelled query drops it,
+    /// still lands the part indexed and charged, with no temp file left, as
+    /// if the caller had waited. A part on disk outside the index would sit
+    /// past the budget where eviction cannot see it.
+    #[tokio::test]
+    async fn a_put_dropped_midway_still_lands_indexed_and_charged() {
+        let root = tmp_root("dropped-put");
+        let _ = fs::remove_dir_all(&root);
+        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let bytes = b"compressed-part-bytes".to_vec();
+        let h = hash_of(&bytes);
+
+        // One poll reserves and hands the write off; dropping it is the cancel.
+        let _ = cache.put(h, Bytes::copy_from_slice(&bytes)).now_or_never();
+        let landed = timeout(ORPHANED_WRITE_DEADLINE, async {
+            while cache.stats().n_entries == 0 {
+                sleep(ORPHANED_WRITE_POLL).await;
+            }
+        })
+        .await;
+        assert!(landed.is_ok(), "the dropped put lands in the index");
+        assert_eq!(
+            cache.stats().current_bytes,
+            bytes.len() as u64,
+            "charged once"
+        );
+        let leftover_tmp = fs::read_dir(&root)
+            .expect("cache dir")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().ends_with(CACHE_TMP_SUFFIX));
+        assert!(!leftover_tmp, "no temp file is left behind");
+        assert_eq!(cache.get(&h).await.expect("hit"), bytes);
+        let _ = fs::remove_dir_all(&root);
     }
 }

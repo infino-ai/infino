@@ -329,13 +329,16 @@ impl DiskCacheStore {
             return Ok(None);
         }
 
-        // The scan already counted this file's bytes. A file it never saw (written later by another
-        // process) is charged like a fetch.
-        let counted = self.unindexed.remove(uri).is_some();
-        let reservation = if counted {
-            None
-        } else {
-            Some(self.reserve(size).await?)
+        // The scan already counted this file's bytes, and the open takes that charge over; a file
+        // it never saw (written later by another process) is charged like a fetch. Either way the
+        // charge is given back unless an entry is admitted. An open that fails, or is dropped
+        // midway (a cancelled query, while a holed copy reads its vector header), leaves the file
+        // on disk uncounted until its next open or a restart's scan counts it again. Putting the
+        // scan's record back instead could count it twice, were a concurrent open admitting the
+        // same file meanwhile.
+        let reservation = match self.unindexed.remove(uri) {
+            Some(_) => self.adopt_charge(size),
+            None => self.reserve(size).await?,
         };
 
         let opened = if holed {
@@ -354,9 +357,7 @@ impl DiskCacheStore {
                 // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
                 let entry = self.admit_entry(*uri, entry);
 
-                if let Some(r) = reservation {
-                    r.commit();
-                }
+                reservation.commit();
 
                 self.current_bytes.fetch_sub(uncharged, Ordering::Release);
 
@@ -365,10 +366,8 @@ impl DiskCacheStore {
                 Ok(Some(entry))
             }
             Err(e) => {
-                // A dropped reservation frees itself; scan-counted bytes are given back by hand.
-                if counted {
-                    self.current_bytes.fetch_sub(size, Ordering::Release);
-                }
+                // The reservation, dropped here, gives the charge back.
+                drop(reservation);
 
                 tracing::warn!(target: "infino::cache", uri = %uri.0, err = ?e, "evict: cache file failed to open, discarding + re-fetching");
 

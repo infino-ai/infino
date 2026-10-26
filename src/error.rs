@@ -129,6 +129,14 @@ pub enum InfinoError {
     /// either forward). Retrying cannot help.
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    /// The caller cancelled the operation through its [`QueryCancel`]
+    /// handle, and the call returned early. A query writes no table data, so
+    /// running it again with a fresh handle is safe.
+    ///
+    /// [`QueryCancel`]: crate::QueryCancel
+    #[error("cancelled: {0}")]
+    Cancelled(String),
 }
 
 impl InfinoError {
@@ -162,6 +170,7 @@ impl InfinoError {
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
             Self::Unsupported(m) => Self::Unsupported(format!("{prefix}: {m}")),
+            Self::Cancelled(m) => Self::Cancelled(format!("{prefix}: {m}")),
         }
     }
 
@@ -625,6 +634,10 @@ mod tests {
         assert_eq!(InfinoError::Conflict("t".into()).to_string(), "conflict: t");
         assert_eq!(InfinoError::Backend("t".into()).to_string(), "backend: t");
         assert_eq!(InfinoError::Config("t".into()).to_string(), "config: t");
+        assert_eq!(
+            InfinoError::Cancelled("t".into()).to_string(),
+            "cancelled: t"
+        );
     }
 
     #[test]
@@ -637,6 +650,17 @@ mod tests {
 
         let err = InfinoError::Conflict("lost the CAS".into()).with_context("delete", None);
         assert_eq!(err.to_string(), "conflict: delete: lost the CAS");
+
+        let err = InfinoError::Cancelled("the query was cancelled".into())
+            .with_context("query_sql", None);
+        assert!(
+            matches!(err, InfinoError::Cancelled(_)),
+            "keeps its variant"
+        );
+        assert_eq!(
+            err.to_string(),
+            "cancelled: query_sql: the query was cancelled"
+        );
     }
 
     #[test]

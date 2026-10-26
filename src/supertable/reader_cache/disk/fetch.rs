@@ -29,7 +29,7 @@ use memmap2::Mmap;
 use tokio::{
     io::{AsyncSeekExt, AsyncWriteExt},
     sync::oneshot,
-    task::{JoinHandle, spawn_blocking},
+    task::{JoinHandle, JoinSet, spawn_blocking},
 };
 use tracing::{Instrument, debug_span};
 
@@ -54,6 +54,25 @@ use crate::{
     },
     utils::trace::{OpOrigin, detached},
 };
+
+/// A hybrid fill's temp file, deleted on drop until the finalizer takes it over
+/// ([`Self::claim`]). Pwrites still in flight write into the unlinked file and free it as they
+/// finish.
+struct UnclaimedTmp(Option<PathBuf>);
+
+impl UnclaimedTmp {
+    fn claim(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for UnclaimedTmp {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 impl DiskCacheStore {
     /// Mmap a cache file and open it as a [`Residency::Mapped`] entry. The caller owns the budget
@@ -285,15 +304,22 @@ impl DiskCacheStore {
             size.div_ceil(chunk_size)
         };
 
-        let file = tokio::fs::File::create(&tmp).await?;
-        file.set_len(size).await?;
-        let file = Arc::new(tokio::sync::Mutex::new(file));
+        // Deleted unless the entry is admitted, when the finalizer takes the file over: an open that
+        // errors or is dropped midway (a cancelled query) leaves no full-size download on disk
+        // that nothing charges. Created here rather than on the blocking pool, so no await falls
+        // between the file appearing and its guard: a cancel there would leave the file unguarded.
+        let file = fs::File::create(&tmp)?;
+        let unclaimed_tmp = UnclaimedTmp(Some(tmp.clone()));
+        file.set_len(size)?;
+        let file = Arc::new(tokio::sync::Mutex::new(tokio::fs::File::from_std(file)));
 
         // Per-chunk slot for the foreground buffer assembly.
         let chunks: Arc<tokio::sync::Mutex<Vec<Option<(u64, Bytes)>>>> =
             Arc::new(tokio::sync::Mutex::new(vec![None; n_chunks as usize]));
 
-        let mut fetch_handles = Vec::with_capacity(n_chunks as usize);
+        // A `JoinSet`, so dropping this open (an error, or a cancelled query) aborts the GETs still
+        // in flight rather than leaving them to download the rest of the file.
+        let mut fetches = JoinSet::new();
         let mut write_handles = Vec::with_capacity(n_chunks as usize);
 
         for i in 0..n_chunks {
@@ -310,7 +336,7 @@ impl DiskCacheStore {
             let (write_tx, write_rx) = oneshot::channel::<JoinHandle<Result<(), DiskCacheError>>>();
             write_handles.push(write_rx);
 
-            fetch_handles.push(tokio::spawn(
+            fetches.spawn(
                 async move {
                     let bytes = storage.get_range(&uri_s, start..end).await?;
                     // Save Bytes for the foreground.
@@ -335,14 +361,13 @@ impl DiskCacheStore {
                     Ok::<(), DiskCacheError>(())
                 }
                 .in_current_span(),
-            ));
+            );
         }
 
         // 2. Await all fetches (NOT pwrites). Foreground bytes
         //    are now complete.
-        for h in fetch_handles {
-            h.await
-                .map_err(|e| DiskCacheError::SuperfileOpen(format!("fetch join: {e}")))??;
+        while let Some(fetched) = fetches.join_next().await {
+            fetched.map_err(|e| DiskCacheError::SuperfileOpen(format!("fetch join: {e}")))??;
         }
 
         // 3. Assemble the in-memory buffer for the foreground.
@@ -389,6 +414,7 @@ impl DiskCacheStore {
         // Admit the entry so later readers hit tier 1 instead of re-entering the coordinator.
         let entry = self.admit_entry(*uri, entry);
         reservation.commit();
+        unclaimed_tmp.claim();
 
         // 5. Spawn the background finalizer: wait for pwrites,
         //    fsync, rename, mmap, and atomically replace the
@@ -631,12 +657,19 @@ impl DiskCacheStore {
         allow_background_fill: bool,
     ) -> Result<Arc<CachedEntry>, DiskCacheError> {
         let storage_uri = storage_key.to_owned();
-        let block_source_arc: Arc<BlockCachedSource>;
-        // Whether the whole file is reserved for a background download, so the entry is charged
-        // its full size up front; otherwise the block source charges what it fills.
-        let (lazy_reader, size, eager) = if let Some(offsets) = offsets {
+
+        // The whole file reserved for a background download, so the entry is charged its full
+        // size up front; without it the block source charges what it fills. A guard, committed
+        // only once the entry is admitted: an open that errors or is dropped midway (a cancelled
+        // query) gives the bytes back instead of charging the budget for an entry nobody holds.
+        // The block source needs no such care: it writes blocks only once its entry is admitted.
+        let (lazy_reader, size, whole_file, block_source) = if let Some(offsets) = offsets {
             let total_size = offsets.total_size;
-            let eager = allow_background_fill && self.reserve_whole_file(total_size).await;
+
+            let whole_file = self
+                .reserve_whole_file(allow_background_fill, total_size)
+                .await;
+            let eager = whole_file.is_some();
 
             // Match `SuperfileReader::open_lazy_with`'s parquet tail
             // speculation length so the overlay covers the entire
@@ -686,7 +719,7 @@ impl DiskCacheStore {
                     aligned_region: offsets.vec,
                 },
             );
-            block_source_arc = Arc::clone(&block_source);
+            let block_source_arc = Arc::clone(&block_source);
             let mut overlay = PrefetchedSource::new(block_source);
 
             // Whatever the manifest part carried rides straight into the
@@ -747,22 +780,12 @@ impl DiskCacheStore {
             // whole-superfile range reads, defeating the lazy/open-batch
             // path. Eager cache promotion can still verify when it
             // materializes the full superfile.
-            let lazy_reader = match SuperfileReader::open_lazy_with(
+            let lazy_reader = SuperfileReader::open_lazy_with(
                 Arc::clone(&source),
                 OpenOptions { verify_crc: false },
             )
-            .await
-            {
-                Ok(reader) => reader,
-                Err(e) => {
-                    // Nothing holds the reservation now; give it back.
-                    if eager {
-                        self.release_block_bytes(total_size);
-                    }
-                    return Err(e.into());
-                }
-            };
-            (lazy_reader, total_size, eager)
+            .await?;
+            (lazy_reader, total_size, whole_file, block_source_arc)
         } else {
             // Unknown-size path: avoid the cold-open HEAD round-trip.
             // The first `tail()` inside `open_lazy_with` is a native
@@ -777,17 +800,22 @@ impl DiskCacheStore {
             let opened = self
                 .open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, !allow_background_fill)
                 .await?;
-            let eager = allow_background_fill && self.reserve_whole_file(opened.1).await;
-            let (lazy_reader, size, block_source) = if allow_background_fill && !eager {
+            let whole_file = self
+                .reserve_whole_file(allow_background_fill, opened.1)
+                .await;
+
+            let (lazy_reader, size, block_source) = if allow_background_fill && whole_file.is_none()
+            {
                 drop(opened);
                 self.open_lazy_unknown_size(uri, &storage_uri, &fetch_storage, true)
                     .await?
             } else {
                 opened
             };
-            block_source_arc = block_source;
-            (lazy_reader, size, eager)
+            (lazy_reader, size, whole_file, block_source)
         };
+
+        let eager = whole_file.is_some();
 
         // A Stream open, or a Warm open the budget could not hold whole, charges only the blocks
         // it fills (SourceOwned), so a fanout over many superfiles does not reserve them all in
@@ -798,7 +826,7 @@ impl DiskCacheStore {
             (Arc::new(AtomicU64::new(size)), EntryAccounting::Eager)
         } else {
             (
-                block_source_arc.filled_bytes_handle(),
+                block_source.filled_bytes_handle(),
                 EntryAccounting::SourceOwned,
             )
         };
@@ -806,7 +834,7 @@ impl DiskCacheStore {
             reader: Arc::clone(&lazy_reader),
             // Unlatched: a later Warm read starts the fill, see `maybe_spawn_background_fill`.
             residency: Residency::Paged {
-                block_source: block_source_arc,
+                block_source: Arc::clone(&block_source),
                 fill_spawned: AtomicBool::new(false),
             },
             size_bytes,
@@ -814,8 +842,16 @@ impl DiskCacheStore {
             last_access_us: AtomicU64::new(self.now_us()),
         });
         self.n_cold_fetches.fetch_add(1, Ordering::AcqRel);
-        // Admission may return an existing whole file instead; serve what it returns.
-        Ok(self.admit_entry(*uri, entry))
+
+        // Admission may return an existing whole file instead; serve what it returns. Either way
+        // admission takes the reserved bytes over: the new entry holds them, or admission
+        // releases them when a whole file already holds the slot.
+        let admitted = self.admit_entry(*uri, entry);
+        if let Some(reservation) = whole_file {
+            reservation.commit();
+        }
+
+        Ok(admitted)
     }
 
     /// A lazy open of `storage_uri` whose size is not known up front: the first `tail()` inside
@@ -842,8 +878,7 @@ impl DiskCacheStore {
             // No manifest hints here, so the layout is unknown.
             SourceLayout::ALL_ALIGNED,
         );
-        let shared = Arc::clone(&block_source);
-        let source: Arc<dyn LazyByteSource> = shared;
+        let source: Arc<dyn LazyByteSource> = Arc::clone(&block_source) as Arc<dyn LazyByteSource>;
         let lazy_reader =
             SuperfileReader::open_lazy_with(Arc::clone(&source), OpenOptions { verify_crc: false })
                 .await?;
@@ -1693,7 +1728,11 @@ mod tests {
 
     use bytes::Bytes;
     use tempfile::TempDir;
-    use tokio::{spawn, task::yield_now, time::timeout};
+    use tokio::{
+        spawn,
+        task::yield_now,
+        time::{sleep, timeout},
+    };
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -1715,6 +1754,7 @@ mod tests {
                 },
             },
         },
+        test_helpers::fault_storage::{FaultOp, FaultStorage},
     };
 
     /// Poll cadence while a test waits for a background fill to finish.
@@ -1772,7 +1812,7 @@ mod tests {
         // Parked at the permit, the fill task holds the store alive.
         timeout(PROMOTE_TIMEOUT, async {
             while Arc::strong_count(&store) == 1 {
-                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+                sleep(FILL_POLL_INTERVAL).await;
             }
         })
         .await
@@ -1784,7 +1824,7 @@ mod tests {
     async fn wait_for_the_fill_to_exit(store: &Arc<DiskCacheStore>) {
         timeout(PROMOTE_TIMEOUT, async {
             while Arc::strong_count(store) > 1 {
-                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+                sleep(FILL_POLL_INTERVAL).await;
             }
         })
         .await
@@ -1853,7 +1893,7 @@ mod tests {
         drop(permit);
         timeout(PROMOTE_TIMEOUT, async {
             while !recording.is_paused() {
-                tokio::time::sleep(FILL_POLL_INTERVAL).await;
+                sleep(FILL_POLL_INTERVAL).await;
             }
         })
         .await
@@ -2968,7 +3008,7 @@ mod tests {
             .await
             .expect("vector lazy open");
         drop(vector_reader);
-        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        sleep(FOREGROUND_GUARD_HOLD).await;
         assert!(
             !store.is_mmap_promoted(&uri),
             "vector open must not spawn background fill"
@@ -3401,7 +3441,7 @@ mod tests {
 
         let reader = store.reader(&uri).await.expect("lazy cold");
         let _foreground = ForegroundQueryGuard::enter();
-        tokio::time::sleep(FOREGROUND_GUARD_HOLD).await;
+        sleep(FOREGROUND_GUARD_HOLD).await;
         assert!(
             !store.is_mmap_promoted(&uri),
             "background promotion must yield while this URI's lazy reader is held"
@@ -3609,4 +3649,238 @@ mod tests {
     }
 
     // ----- wait_until_mmap_promoted timeout path -----
+
+    // ----- an open dropped midway, as a cancelled query drops it -----
+
+    /// Offsets for a file of `total_size` with no open blob, so a known-size open fetches its open
+    /// batch over the wire and has a read to be stopped in.
+    fn offsets_without_open_blob(total_size: u64) -> SubsectionOffsets {
+        SubsectionOffsets {
+            total_size,
+            vec: None,
+            fts: None,
+            vec_open_ranges: Vec::new(),
+            fts_open_ranges: Vec::new(),
+            open_blob: Vec::new(),
+        }
+    }
+
+    /// A store over recording storage with background fill on, and the recording.
+    fn store_over_recording() -> (TempDir, Arc<DiskCacheStore>, Arc<RecordingStorage>) {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let recording = RecordingStorage::over(local);
+        let store = DiskCacheStore::new_unpinned(
+            Arc::clone(&recording) as Arc<dyn StorageProvider>,
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+        (dir, store, recording)
+    }
+
+    /// Wait until `recording` holds a read paused.
+    async fn until_a_read_is_paused(recording: &RecordingStorage) {
+        timeout(READ_DEADLINE, async {
+            while !recording.is_paused() {
+                sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("a read starts");
+    }
+
+    /// A known-size Warm open reserves the whole file for its background download before it
+    /// fetches the open batch. Dropped during that fetch, the reservation comes back: nothing was
+    /// admitted to own it, and a charge left behind would hold budget for no file until restart.
+    #[tokio::test]
+    async fn a_lazy_open_dropped_mid_read_gives_back_its_whole_file_reservation() {
+        let (_dir, store, recording) = store_over_recording();
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let total = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+
+        recording.pause_next_read();
+        let opening = spawn({
+            let store = Arc::clone(&store);
+            async move {
+                let offsets = offsets_without_open_blob(total);
+                store
+                    .cold_fetch_lazy(
+                        &uri,
+                        &uri.storage_path(),
+                        Some(&offsets),
+                        store.resolve_storage(None),
+                        true,
+                    )
+                    .await
+                    .map(|_| ())
+            }
+        });
+        until_a_read_is_paused(&recording).await;
+        assert_eq!(
+            store.stats().current_bytes,
+            total,
+            "the open holds the whole file reserved while it reads"
+        );
+
+        opening.abort();
+        assert!(opening.await.expect_err("aborted").is_cancelled());
+        assert_eq!(store.stats().current_bytes, 0, "the reservation came back");
+        assert!(!store.is_cached(&uri), "nothing was admitted");
+        store.assert_budget_consistent();
+    }
+
+    /// The same reservation comes back when a read of the open batch fails, not only when the open
+    /// is dropped.
+    #[tokio::test]
+    async fn a_lazy_open_whose_open_batch_read_fails_gives_back_its_reservation() {
+        let (dir, store) = test_store_with(|cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        let uri = SuperfileUri::new_v4();
+        let bytes = tiny_superfile_bytes();
+        let total = bytes.len() as u64;
+        put_superfile(&store, &uri, bytes).await;
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let faults = FaultStorage::wrap(local);
+        faults.fail(FaultOp::GetRange, &uri.0.to_string(), 1);
+
+        let offsets = offsets_without_open_blob(total);
+        let opened = store
+            .cold_fetch_lazy(
+                &uri,
+                &uri.storage_path(),
+                Some(&offsets),
+                Arc::clone(&faults) as Arc<dyn StorageProvider>,
+                true,
+            )
+            .await;
+        assert!(opened.is_err(), "the failed read fails the open");
+        assert_eq!(faults.fired(), 1, "the armed read is the one that failed");
+        assert_eq!(store.stats().current_bytes, 0, "the reservation came back");
+        store.assert_budget_consistent();
+    }
+
+    /// A restart counts a holed copy found on disk and reuses it on the next open, which reads the
+    /// copy's vector header through the block cache. Dropped during that read, the reuse gives the
+    /// restart's charge back and leaves no record, so nothing can count the copy twice; the next
+    /// open still finds the copy and reuses it, charged once.
+    #[tokio::test]
+    async fn a_holed_copy_reuse_dropped_mid_read_gives_back_its_charge() {
+        let (_dir, store, recording) = store_over_recording();
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_vector_superfile_bytes()).await;
+        drop(
+            store
+                .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Warm)
+                .await
+                .expect("warm open"),
+        );
+        store
+            .wait_until_mmap_promoted(&uri, PROMOTE_TIMEOUT)
+            .await
+            .expect("promote");
+        store.block_writes_settled().await;
+        let restarted = reopen_store(&store, |cfg| {
+            cfg.cold_fetch_mode = ColdFetchMode::LazyForegroundWithBackgroundFill;
+        });
+        drop(store);
+        // Without its blocks the copy's vector header is fetched by range.
+        restarted.drop_block_file(&uri);
+        let counted = restarted.stats().current_bytes;
+        assert!(counted > 0, "the restart counted the copy");
+
+        recording.pause_next_read();
+        let reusing = spawn({
+            let restarted = Arc::clone(&restarted);
+            async move {
+                restarted
+                    .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+                    .await
+                    .map(|_| ())
+            }
+        });
+        until_a_read_is_paused(&recording).await;
+        reusing.abort();
+        assert!(reusing.await.expect_err("aborted").is_cancelled());
+        assert_eq!(restarted.stats().current_bytes, 0, "the charge came back");
+        assert!(!restarted.unindexed.contains_key(&uri), "no record left");
+        restarted.assert_budget_consistent();
+
+        let before = restarted.stats();
+        restarted
+            .open_for_query(&uri, &uri.storage_path(), None, None, ReadIntent::Stream)
+            .await
+            .expect("read after the dropped one");
+        let after = restarted.stats();
+        assert_eq!(after.n_cold_fetches, before.n_cold_fetches, "no refetch");
+        assert_eq!(after.n_disk_reuses - before.n_disk_reuses, 1, "copy reused");
+        restarted.assert_budget_consistent();
+    }
+
+    /// Download streams and chunk size for the dropped hybrid-fill test: small chunks, so the
+    /// file is split across several downloads and some land while one is held.
+    const HYBRID_TEST_STREAMS: usize = 4;
+    const HYBRID_TEST_CHUNK_BYTES: u64 = 256;
+
+    /// A hybrid open dropped while its chunk downloads run, as a cancelled query drops it, leaves
+    /// nothing behind: its reservation comes back, and the temp file the downloads were filling is
+    /// deleted rather than left on disk at full size where nothing charges it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hybrid_open_dropped_mid_download_leaves_no_temp_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("localfs"));
+        let recording = RecordingStorage::over(local);
+        let store = DiskCacheStore::new_unpinned(
+            Arc::clone(&recording) as Arc<dyn StorageProvider>,
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+                cold_fetch_streams: HYBRID_TEST_STREAMS,
+                cold_fetch_chunk_bytes: HYBRID_TEST_CHUNK_BYTES,
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("store");
+        let uri = SuperfileUri::new_v4();
+        put_superfile(&store, &uri, tiny_superfile_bytes()).await;
+
+        // Every chunk download holds the storage; once they are all gone the count is back here.
+        let holders_at_rest = Arc::strong_count(&recording);
+        recording.pause_next_read();
+        let opening = spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .cold_fetch_hybrid(&uri, &uri.storage_path(), store.resolve_storage(None))
+                    .await
+                    .map(|_| ())
+            }
+        });
+        until_a_read_is_paused(&recording).await;
+        assert_eq!(leftover_tempfiles(&store), 1, "the download is under way");
+
+        opening.abort();
+        assert!(opening.await.expect_err("aborted").is_cancelled());
+        timeout(READ_DEADLINE, async {
+            while Arc::strong_count(&recording) > holders_at_rest {
+                sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the held download is aborted, not left running");
+        assert_eq!(leftover_tempfiles(&store), 0, "the temp file is deleted");
+        assert_eq!(store.stats().current_bytes, 0, "the reservation came back");
+        store.assert_budget_consistent();
+    }
 }
