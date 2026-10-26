@@ -146,8 +146,16 @@ impl TierPolicy {
     const RARITY_BUCKETS: usize = 4;
     const CLASSES: usize =
         Self::SHAPES * Self::K_BUCKETS * Self::TERM_BUCKETS * Self::RARITY_BUCKETS;
-    /// One query in this many takes the way the averages do not favour.
+    /// One query in this many takes the way the averages do not favour,
+    /// while the two averages are within [`Self::CLEAR_GAP`] of each other.
     const EXPLORE_EVERY: u32 = 16;
+    /// One query in this many looks again once the averages differ by
+    /// [`Self::CLEAR_GAP`] or more: a decision that clear is rarely wrong,
+    /// and every look costs a query the slower way — at a billion
+    /// documents, seconds against a tenth of one.
+    const EXPLORE_EVERY_CLEAR: u32 = 64;
+    /// The ratio of the two averages past which the decision is clear.
+    const CLEAR_GAP: u64 = 4;
     /// Queries each way is measured over, alternating, before the averages
     /// are compared: queries of a class differ in cost several-fold, so an
     /// average over one query does not compare with one over the mix.
@@ -238,6 +246,11 @@ impl TierPolicy {
         let without = self.walls[class][0].load(Ordering::Relaxed);
         let with = self.walls[class][1].load(Ordering::Relaxed);
         let favoured = with <= without;
+        let clear = without.max(with) >= Self::CLEAR_GAP.saturating_mul(without.min(with));
+        let explore = match clear {
+            true => trial.is_multiple_of(Self::EXPLORE_EVERY_CLEAR),
+            false => explore,
+        };
         if explore { !favoured } else { favoured }
     }
 
@@ -1466,7 +1479,8 @@ mod tests {
     }
 
     /// The policy alternates until each way has its samples, then takes
-    /// the cheaper way and tries the other one query in sixteen.
+    /// the cheaper way and tries the other one query in sixteen while the
+    /// two are within a few times of each other.
     #[test]
     fn the_policy_measures_both_ways_before_it_chooses() {
         let policy = TierPolicy::new();
@@ -1475,12 +1489,12 @@ mod tests {
         for _ in 0..(2 * TierPolicy::MIN_SAMPLES) {
             let with = policy.merge(class);
             ways.push(with);
-            // Merging costs ten times what not merging costs, and prunes.
+            // Merging costs twice what not merging costs, and prunes.
             policy.note(
                 class,
                 with,
                 with.then_some(true),
-                if with { 10_000 } else { 1_000 },
+                if with { 2_000 } else { 1_000 },
             );
         }
         assert_eq!(
@@ -1545,6 +1559,52 @@ mod tests {
         assert!(
             policy.merge(class),
             "an unreported merge is neutral, and one fruitless merge does not stop the class"
+        );
+    }
+
+    /// Once the two ways' averages differ by [`TierPolicy::CLEAR_GAP`] or
+    /// more, the class looks at the slower way one query in
+    /// [`TierPolicy::EXPLORE_EVERY_CLEAR`] rather than one in
+    /// [`TierPolicy::EXPLORE_EVERY`]; a narrower gap keeps the closer look.
+    #[test]
+    fn a_clear_decision_is_explored_less_often() {
+        /// Trials counted after the samples are in: two clear-explore ticks.
+        const TRIALS: u32 = 2 * TierPolicy::EXPLORE_EVERY_CLEAR;
+        let settled = |with_ns: u64, without_ns: u64| {
+            let policy = TierPolicy::new();
+            let class = TierPolicy::class(true, false, 10, 2, 9.0);
+            for _ in 0..TierPolicy::MIN_SAMPLES {
+                let m = policy.merge(class);
+                policy.note(class, m, Some(true), if m { with_ns } else { without_ns });
+                let m = policy.merge(class);
+                policy.note(class, m, Some(true), if m { with_ns } else { without_ns });
+            }
+            let trials_so_far = 2 * TierPolicy::MIN_SAMPLES;
+            // Count from the next multiple of the wider period, so each
+            // arm sees whole periods.
+            let skip =
+                TierPolicy::EXPLORE_EVERY_CLEAR - trials_so_far % TierPolicy::EXPLORE_EVERY_CLEAR;
+            for _ in 0..skip {
+                let m = policy.merge(class);
+                policy.note(class, m, Some(true), if m { with_ns } else { without_ns });
+            }
+            (0..TRIALS)
+                .filter(|_| {
+                    let m = policy.merge(class);
+                    policy.note(class, m, Some(true), if m { with_ns } else { without_ns });
+                    !m
+                })
+                .count() as u32
+        };
+        assert_eq!(
+            settled(1_000, 10_000),
+            TRIALS / TierPolicy::EXPLORE_EVERY_CLEAR,
+            "ten times faster with the merge: the slower way one query in sixty-four"
+        );
+        assert_eq!(
+            settled(1_000, 2_000),
+            TRIALS / TierPolicy::EXPLORE_EVERY,
+            "twice as fast: still one query in sixteen"
         );
     }
 
