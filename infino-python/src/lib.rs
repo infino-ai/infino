@@ -1314,7 +1314,6 @@ impl Table {
     #[pyo3(signature = (settings=None))]
     fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
-        let mut recalibrate = RecalibratePolicy::default();
         if let Some(o) = settings {
             if let Some(v) = o.max_memory_mb {
                 s.max_memory_mb = v;
@@ -1329,7 +1328,7 @@ impl Table {
                 s.stale_seal_timeout_ms = v;
             }
             if let Some(v) = o.recalibrate.as_deref() {
-                recalibrate = match v.to_ascii_lowercase().as_str() {
+                s.steps.recalibrate = match v.to_ascii_lowercase().as_str() {
                     "auto" => RecalibratePolicy::Auto,
                     "force" => RecalibratePolicy::Force,
                     "skip" => RecalibratePolicy::Skip,
@@ -1341,7 +1340,7 @@ impl Table {
                 };
             }
         }
-        let opts = OptimizeOptions::compact(s).with_recalibrate(recalibrate);
+        let opts = OptimizeOptions::compact(s);
         py.detach(|| self.inner.optimize(&opts))
             .map_err(optimize_err)
     }

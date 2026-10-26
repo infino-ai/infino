@@ -174,8 +174,8 @@ pub use catalog::{
     ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
 };
 pub use config::{
-    CompactionSettings, GcSettings, OptimizeOptions, RecalibratePolicy, ReindexMode,
-    ReindexOptions, ReindexTarget, SuperfileIndex,
+    CompactionSettings, CompactionSteps, GcSettings, OptimizeOptions, OptimizeSteps,
+    RecalibratePolicy, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex,
 };
 /// Rows as JSON documents, mapped to one Arrow batch under a table's schema
 /// — what [`Supertable::append_rows`] does before it appends. For a server
