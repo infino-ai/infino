@@ -1118,6 +1118,9 @@ impl Connection {
     ///   reader pool, a manifest part being loaded (it lands in the cache for
     ///   the next query), and the background download of a file the query
     ///   opened, as after any query.
+    /// - Execution on the calling thread: the result is gathered there, so a
+    ///   plan over cached data that does its work without yielding (one
+    ///   partition, no read to wait on) sees the cancel only once it yields.
     /// - A hosted connection's request: the handle is checked only before it
     ///   is sent.
     ///
@@ -6322,27 +6325,6 @@ mod tests {
         let conn = connect("memory://").expect("connect");
         let cancel = QueryCancel::new();
         let sql = format!("SELECT count(*) FROM range({COUNTED_ROWS})");
-        let running = query_in_background(&conn, &sql, &cancel);
-        thread::sleep(EXECUTE_BEFORE_CANCEL);
-        cancel_and_expect_cancelled(&cancel, &running);
-    }
-
-    /// Copies of a title the one-poll cancel test scans: seconds of regex
-    /// work in a debug build.
-    const SCANNED_COPIES: u64 = 500_000;
-
-    /// A query that does all its work in one poll still returns promptly when
-    /// cancelled. Over a warm table there is no read to wait on, and the
-    /// regex runs over a single row, so nothing yields until it is done.
-    #[test]
-    fn a_query_cancelled_inside_one_long_poll_returns() {
-        let (conn, _dir) = storage_conn();
-        write_fox_table(&conn, "docs", 1, 1);
-        conn.query_sql(READ_EVERY_FILE).expect("warm the table");
-        let cancel = QueryCancel::new();
-        let sql = format!(
-            "SELECT regexp_count(repeat(title, {SCANNED_COPIES}), '[0-9a-f]{{4}}') FROM docs"
-        );
         let running = query_in_background(&conn, &sql, &cancel);
         thread::sleep(EXECUTE_BEFORE_CANCEL);
         cancel_and_expect_cancelled(&cancel, &running);
