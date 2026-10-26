@@ -26,12 +26,13 @@ use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 
 use super::{
-    cursor::{CursorUse, TermCursor, TermMeta},
+    cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
     filter::ExcludeFilter,
     metadata::{
         ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
     },
     phrase::{AnyCursor, PhraseCursor},
+    scorers::{count_and_planned, df_total},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
     work::{term_cursor_bytes, term_cursor_ranges},
@@ -50,7 +51,7 @@ use crate::{
             bm25,
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
-            posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
+            posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
             short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
         },
@@ -280,7 +281,7 @@ impl PreparedClauses {
             PreparedClauses::MustShould { must_cursors, .. } => {
                 must_cursors.iter().map(|c| c.df).min().unwrap_or(0)
             }
-            PreparedClauses::Or { cursors, .. } => cursors.iter().map(|c| c.df).sum(),
+            PreparedClauses::Or { cursors, .. } => df_total(cursors),
         }
     }
 
@@ -366,8 +367,8 @@ impl PreparedClauses {
 /// Multi-term OR algorithm selector for the bench harness's
 /// `search_with_algo_for_bench` entry point, so head-to-head bench runs can
 /// compare the kernels under identical inputs. Production code routes through
-/// `FtsReader::dispatch_or_algo`, which sends every multi-term union to
-/// `WindowedMaxscore` and a 2-term rare+common OR to WAND+BMW.
+/// `FtsReader::dispatch_or_algo`: the rare-led walks for a union with a rare
+/// term at small `k`, else `WindowedMaxscore`.
 #[doc(hidden)]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum OrAlgo {
@@ -375,13 +376,12 @@ pub enum OrAlgo {
     /// `WindowedMaxscore`; retained as a bench baseline and the correctness
     /// oracle the windowed kernels are checked against.
     Bmm,
-    /// WAND + Block-Max-WAND. The production path for a 2-term rare+common OR
-    /// (it pivots on the rare term to skip the common term's long list); a
-    /// bench baseline otherwise.
+    /// WAND + Block-Max-WAND. In production, the fallback for a 2-term
+    /// rare+common OR the rare-led walk declines (it pivots on the rare term to
+    /// skip the common term's long list); a bench baseline otherwise.
     WandBmw,
-    /// Exhaustive union walk with SIMD scoring + top-K heap. The OR
-    /// dispatcher never routes here; the exact-count search does (see
-    /// `run_exhaustive_union`), and the benches keep it as a baseline.
+    /// Exhaustive union walk with SIMD scoring + top-K heap: the unpruned
+    /// baseline. Nothing on a query path routes here.
     Exhaustive,
     /// Windowed union: accumulate each term's contribution into a fixed doc-id
     /// window (presence bitset + score array), then drain in doc order into the
@@ -434,54 +434,6 @@ pub(super) const OR_COUNT_ANCHOR_DOMINANCE: u64 = 8;
 /// `total_df >= max_doc / N`.
 pub(super) const OR_COUNT_BITSET_DENSITY_DIVISOR: u64 = 16;
 
-/// Ranked-AND membership-walk routing (`FtsReader::and_membership_scored`) uses
-/// two sparsity tiers for the rarest term, plus a density check on the middle
-/// tier. All thresholds are `1/N` fractions of the doc-id space.
-///
-/// - **Rarest < `1/AND_MEMBERSHIP_ALWAYS_DIVISOR`** (very sparse): always route
-///   to the walk. Driving so short a list, bit-testing the others, is cheaper
-///   than the flat-merge regardless of the others' density — this is the tier
-///   the walk always served.
-/// - **Rarest in `[1/ALWAYS, 1/AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR)`**
-///   (moderately sparse): route only when the others are collectively dense
-///   enough (see [`AND_MEMBERSHIP_OTHERS_DENSITY_MULT`]). This is the band the
-///   walk newly reaches — a discriminating term plus common ones — and the one
-///   that needs the density guard, because a moderately-sparse rarest with only
-///   moderately-common companions is handled better by the flat-merge's block
-///   decode + block-max skip.
-/// - **Rarest ≥ `1/RAREST_SPARSE_DIVISOR`**: never; the all-dense case (every
-///   term common) keeps the flat-merge.
-///
-/// The walk now carries the flat-merge's own Block-Max-AND heap-bar skip, so the
-/// middle tier no longer regresses the ranked tail (p99) the way a skip-less
-/// walk did when this was a flat `1/16` gate.
-pub(super) const AND_MEMBERSHIP_ALWAYS_DIVISOR: u64 = 64;
-
-/// Upper sparsity bound for the density-gated middle routing tier — see
-/// [`AND_MEMBERSHIP_ALWAYS_DIVISOR`]. A rarest term denser than this fraction of
-/// the corpus never routes to the membership walk: past it the driver list is
-/// long enough that iterating it costs more than the block decode the walk
-/// avoids, screen or no screen.
-pub(super) const AND_MEMBERSHIP_RAREST_SPARSE_DIVISOR: u64 = 8;
-
-/// Density guard for the middle routing tier: the *other* terms must be
-/// collectively at least this many times denser than the driver (their combined
-/// df ≥ `MULT` × the rarest df). The walk's win is skipping the flat-merge's
-/// decode of the common terms' blocks; that only outweighs iterating the whole
-/// driver list when those others are much denser than the driver. When they are
-/// only moderately denser (e.g. three mid-frequency terms), the flat-merge's
-/// block decode is already cheap and its block-max skip prunes the driver, so it
-/// wins — routing such a query to the walk regressed it. Sparsity alone can't
-/// tell the two apart (same rarest term, different companions), so this ratio is
-/// the discriminator. It was first calibrated on the ranked-AND intersection set
-/// against a walk that probed every driver doc: wins sat at ≥ ~38× and the one
-/// regression at ~4.5×, so `8` separated them with margin. The walk now screens
-/// each driver doc on its own score and probes only the survivors, which roughly
-/// halved its cost on the shapes it already served, so the break-even against
-/// the flat-merge moved down with it and the guard follows. (The very-sparse
-/// tier skips this check.)
-pub(super) const AND_MEMBERSHIP_OTHERS_DENSITY_MULT: u64 = 4;
-
 /// Multi-term OR dispatch floor. A 2-term OR is already sub-millisecond
 /// on MaxScore, so the window's per-window bookkeeping isn't worth it
 /// below this many terms. `pub(crate)`: the supertable fan-out reuses
@@ -508,6 +460,18 @@ pub(super) const WAND_BMW_2TERM_MAX_K: usize = 128;
 /// term can dominate the BM25 UB (higher idf) while still being common
 /// (long list), which WAND can't skip — only df separates the cases.
 pub(super) const WAND_BMW_2TERM_DF_RATIO: u64 = 16;
+
+/// Largest rare-term document frequency the rare-led pair pass ranks in
+/// full before falling back. Ranking those documents is the walk the
+/// two-term WAND ends in anyway, so the pass costs extra only when it has to
+/// fall back; the cap bounds that waste for a "rare" term that is merely
+/// less common.
+pub(super) const RARE_LED_MAX_DF: u64 = 1 << 17;
+
+/// Postings-equivalent cost of testing one document against one term in a
+/// count: a block locate and, on a packed block, a decode. Weighs probing a
+/// rare term's documents against folding every term into a bitset.
+pub(super) const COUNT_PROBE_POSTINGS: u64 = 40;
 
 /// Initial capacity for a scan's top-k heap, in [`TopKEntry`] slots.
 ///
@@ -569,6 +533,9 @@ pub struct FtsReader {
     /// decode alike, but a migration reports and plans on which one a file
     /// actually is.
     pub(super) version: u32,
+    /// Long terms' decoded block tables, shared by every clone of this
+    /// reader (see [`BlockTableCache`]).
+    pub(super) block_tables: Arc<BlockTableCache>,
     pub(super) columns: Vec<ColumnMeta>,
     pub(super) column_id_by_name: HashMap<String, u32>,
     /// The Parquet row each doc id in this blob stands for. The
@@ -1115,6 +1082,7 @@ impl FtsReader {
         };
 
         Ok(FtsReader {
+            block_tables: Arc::default(),
             source,
             n_docs,
             n_terms_total,
@@ -1712,6 +1680,7 @@ impl FtsReader {
                         TermIdf::Absent,
                         1,
                         CursorUse::Match,
+                        None,
                     )?;
                     // Each block's runs are one group, decoded whole at the
                     // block's start and sliced per pair.
@@ -1824,6 +1793,7 @@ impl FtsReader {
                                 TermIdf::Absent,
                                 1,
                                 CursorUse::Count,
+                                None,
                             )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
@@ -2067,6 +2037,15 @@ pub(super) fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
 /// drops scoring and the top-k heap, since a count needs neither order
 /// nor scores. No doc-id list is materialized.
 pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
+    // Two terms: `|a ∪ b| = df(a) + df(b) − |a ∩ b|`, and the intersection
+    // runs whichever of probing and folding reads less, so the union never
+    // pays for a walk of its own.
+    if cursors.len() == 2 {
+        // Saturating: a df comes from the term's stored metadata, and a
+        // corrupt one must not wrap the count.
+        let both = cursors[0].df.saturating_add(cursors[1].df);
+        return both.saturating_sub(count_and_planned(cursors));
+    }
     // Fast path: when one term's list dwarfs the rest, count it as
     // `df(dominant) + |others \ dominant|` instead of walking the
     // dominant term's whole posting list. See `or_count_anchored`.
@@ -2077,7 +2056,7 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
     // ids into one doc-space bitset and popcount. Avoids the per-window
     // bookkeeping the walk below pays per doc.
-    let total_df: u64 = cursors.iter().map(|c| c.df).sum();
+    let total_df = df_total(&cursors);
     let max_doc = cursors
         .iter()
         .filter_map(|c| c.blocks.last())
@@ -2109,15 +2088,7 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         // Mark each cursor's docs in [base, window_end). `d - base` is in
         // range because every live cursor sits at >= min_doc >= base.
         for c in &mut cursors {
-            while !c.is_exhausted() {
-                let d = c.current_doc_id();
-                if d >= window_end {
-                    break;
-                }
-                let local = (d - base) as usize;
-                present[local >> 6] |= 1u64 << (local & 63);
-                c.next();
-            }
+            mark_window(c, base, window_end, &mut present);
         }
         // Count distinct docs in this window and clear for reuse.
         for word in present.iter_mut() {
@@ -2126,6 +2097,31 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         }
     }
     n
+}
+
+/// Mark `c`'s docs below `window_end` into `present`, a window bitmap whose
+/// bit 0 is doc `base`, and leave the cursor on its first doc at or past
+/// `window_end`. Reads each decoded block as a slice, so a dense term costs
+/// a store per doc and a cursor move per block, not a cursor step per doc.
+/// Every doc the cursor sits on must be at or past `base`.
+#[inline]
+pub(super) fn mark_window(c: &mut TermCursor, base: u32, window_end: u32, present: &mut [u64]) {
+    while !c.is_exhausted() {
+        let docs = &c.block_doc_ids[c.pos..c.block_n];
+        let take = docs.partition_point(|&d| d < window_end);
+        for &d in &docs[..take] {
+            let local = d - base;
+            present[(local >> 6) as usize] |= 1u64 << (local & 63);
+        }
+        if take == 0 {
+            break;
+        }
+        let rest = docs.len() - take;
+        c.advance_by(take);
+        if rest > 0 {
+            break;
+        }
+    }
 }
 
 /// Disjunction cardinality via a full doc-space bitset: OR every term's
@@ -2152,7 +2148,7 @@ fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
 /// doc ids; a **PACKED** block is decoded doc-ids-only (no tf) and scattered; an
 /// inline (df=1) cursor scatters its single pre-decoded doc. `scratch` is a
 /// reused `BLOCK_LEN` decode buffer. Shared by the union count
-/// ([`or_count_bitset`]) and the intersection count (`count_and_intersect_bitset`)
+/// ([`or_count_bitset`]) and the counts with exclusions (`count_excluding`)
 /// so a common term's dense blocks are merged at memory bandwidth either way.
 pub(super) fn or_cursor_into_bitset(
     dest: &mut [u64],
@@ -2163,32 +2159,88 @@ pub(super) fn or_cursor_into_bitset(
     // pre-decoded and have no block bytes to slice.
     if c.predecoded {
         for &d in &c.block_doc_ids[..c.block_n] {
-            dest[(d >> 6) as usize] |= 1u64 << (d & 63);
+            mark_in(dest, 0, d);
         }
         return;
     }
-    for (b, block) in c.blocks.iter().enumerate() {
-        // Borrow the block bytes in place rather than `.slice()` them: a
-        // per-block `.slice()` bumps and drops an atomic refcount on `c.bytes`
-        // for every block of the union, while a borrowed subslice needs none —
-        // the same fix already applied to the membership `contains` path.
-        let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
-        let hdr = c.block_header(b);
-        if hdr.encoding == ENCODING_BITSET {
-            // Word-OR the presence bitset in at its aligned base word.
-            // Tfs trail; the bitset is everything between them.
-            let base_word = hdr.base as usize / 64;
-            let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
-            for (i, chunk) in presence.chunks_exact(8).enumerate() {
-                dest[base_word + i] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+    for b in 0..c.blocks.len() {
+        or_block_into(dest, c, b, 0, scratch);
+    }
+}
+
+/// OR block `b` of `c` into `dest`, a bitset whose bit 0 is doc `base` (a
+/// multiple of 64), dropping docs past its span: a **bitset** block's
+/// presence words are copied at their aligned word, a **run** block is set
+/// as a range, a **packed** block is decoded doc-ids-only and scattered. The
+/// block bytes are borrowed in place rather than `.slice()`d, so the walk
+/// over a long list takes no refcount per block.
+fn or_block_into(
+    dest: &mut [u64],
+    c: &TermCursor,
+    b: usize,
+    base: u32,
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    debug_assert_eq!(base % 64, 0, "a bitset's origin is word-aligned");
+    let block = c.blocks[b];
+    let bytes = &c.bytes[block.block_byte_offset..block.block_byte_end];
+    let hdr = c.block_header(b);
+    if hdr.encoding == ENCODING_BITSET {
+        debug_assert_eq!(hdr.base % 64, 0, "a bitset block starts on a word");
+        // Tfs trail; the presence words are everything between them.
+        let presence = &bytes[hdr.payload()..bytes.len() - hdr.tfs_size()];
+        let (block_word, base_word) = ((hdr.base / 64) as usize, (base / 64) as usize);
+        for (i, chunk) in presence.chunks_exact(8).enumerate() {
+            let Some(wi) = (block_word + i).checked_sub(base_word) else {
+                continue;
+            };
+            if wi >= dest.len() {
+                break;
             }
-        } else {
-            let n = decode_block_doc_ids(bytes, &hdr, scratch);
-            for &d in &scratch[..n] {
-                dest[(d >> 6) as usize] |= 1u64 << (d & 63);
-            }
+            dest[wi] |= u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        }
+    } else if hdr.encoding == ENCODING_RUN {
+        let span_end = u64::from(base) + dest.len() as u64 * 64;
+        let lo = hdr.base.max(base);
+        let hi = (u64::from(hdr.base) + hdr.count() as u64).min(span_end) as u32;
+        if lo < hi {
+            set_bit_range(dest, lo - base, hi - base);
+        }
+    } else {
+        let n = decode_block_doc_ids(bytes, &hdr, scratch);
+        for &d in &scratch[..n] {
+            mark_in(dest, base, d);
         }
     }
+}
+
+/// Set doc `d`'s bit in `dest`, a bitset whose bit 0 is doc `base`, if `d`
+/// falls inside its span.
+#[inline(always)]
+fn mark_in(dest: &mut [u64], base: u32, d: u32) {
+    if let Some(local) = d.checked_sub(base)
+        && let Some(word) = dest.get_mut((local >> 6) as usize)
+    {
+        *word |= 1u64 << (local & 63);
+    }
+}
+
+/// Set bits `[from, to)` of a doc-space bitset: the edge words masked, the
+/// words between filled whole.
+pub(super) fn set_bit_range(dest: &mut [u64], from: u32, to: u32) {
+    if from >= to {
+        return;
+    }
+    let (first, last) = ((from / 64) as usize, ((to - 1) / 64) as usize);
+    let lo = u64::MAX << (from % 64);
+    let hi = u64::MAX >> (63 - (to - 1) % 64);
+    if first == last {
+        dest[first] |= lo & hi;
+        return;
+    }
+    dest[first] |= lo;
+    dest[first + 1..last].fill(u64::MAX);
+    dest[last] |= hi;
 }
 
 /// Pick the cursor whose df dominates the union, or `None` if no term is
@@ -2238,9 +2290,14 @@ fn dominant_anchor_of_dfs(dfs: impl IntoIterator<Item = u64>) -> Option<usize> {
 fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
     let mut anchor = cursors.swap_remove(anchor_idx);
     let mut n = anchor.df;
-    // Frontier merge over the remaining (rarer) cursors: smallest current
-    // doc, membership-test the anchor, then advance every other cursor
-    // sitting on that doc so each distinct doc is visited once.
+    // The rarer cursors' docs, one window at a time, deduplicated by the
+    // window bitmap. A window holding few of them tests each against the
+    // anchor; a window holding many reads the anchor's own window from its
+    // blocks and counts the rarer docs it lacks a word at a time.
+    let mut present = [0u64; OR_WINDOW_WORDS];
+    let mut anchor_win = [0u64; OR_WINDOW_WORDS];
+    let mut anchor_block = 0usize;
+    let mut scratch = [0u32; BLOCK_LEN];
     loop {
         let mut min_doc = u32::MAX;
         for c in &cursors {
@@ -2251,20 +2308,83 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         if min_doc == u32::MAX {
             break;
         }
+        let base = min_doc & !(OR_WINDOW - 1);
+        let window_end = base.saturating_add(OR_WINDOW);
+        for c in &mut cursors {
+            mark_window(c, base, window_end, &mut present);
+        }
+        let marked: u32 = present.iter().map(|w| w.count_ones()).sum();
+        if marked >= ANCHOR_WINDOW_MIN_DOCS {
+            anchor_win.fill(0);
+            or_blocks_into_window(
+                &anchor,
+                &mut anchor_block,
+                base,
+                &mut anchor_win,
+                &mut scratch,
+            );
+            for (w, a) in present.iter_mut().zip(&anchor_win) {
+                n += u64::from((std::mem::take(w) & !a).count_ones());
+            }
+            continue;
+        }
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
         // in one word-load; `skip_to` would decode each block — expanding its
         // ~128 doc ids — as the frontier drags the anchor across its whole list.
-        if !anchor.contains(min_doc) {
-            n += 1;
-        }
-        for c in cursors.iter_mut() {
-            if !c.is_exhausted() && c.current_doc_id() == min_doc {
-                c.next();
+        for (word_idx, word) in present.iter_mut().enumerate() {
+            let mut bits = std::mem::take(word);
+            while bits != 0 {
+                let doc = base + ((word_idx as u32) << 6) + bits.trailing_zeros();
+                bits &= bits - 1;
+                if !anchor.contains(doc) {
+                    n += 1;
+                }
             }
         }
     }
     n
+}
+
+/// Rarer-term docs in a window at which the anchored count reads the
+/// anchor's window from its blocks rather than testing each doc: a dense
+/// anchor covers a window in a few dozen blocks, whose presence words cost
+/// less than this many membership tests.
+const ANCHOR_WINDOW_MIN_DOCS: u32 = 64;
+
+/// OR `c`'s docs in the window `[base, base + OR_WINDOW)` into `dest` (bit 0
+/// is doc `base`), from its blocks rather than by walking it: a bitset block's
+/// presence words are copied, a run block is set as a range, a packed block is
+/// decoded and scattered. `from_block` is the first block that may reach the
+/// window; it advances past blocks that end before it, so windows must come
+/// in ascending order.
+fn or_blocks_into_window(
+    c: &TermCursor,
+    from_block: &mut usize,
+    base: u32,
+    dest: &mut [u64; OR_WINDOW_WORDS],
+    scratch: &mut [u32; BLOCK_LEN],
+) {
+    if c.predecoded {
+        for &d in &c.block_doc_ids[..c.block_n] {
+            mark_in(dest, base, d);
+        }
+        return;
+    }
+    while *from_block < c.blocks.len() && c.blocks[*from_block].last_doc_id < base {
+        *from_block += 1;
+    }
+    let end = base.saturating_add(OR_WINDOW);
+    for b in *from_block..c.blocks.len() {
+        let first = match b {
+            0 => 0,
+            _ => c.blocks[b - 1].last_doc_id + 1,
+        };
+        if first >= end {
+            break;
+        }
+        or_block_into(dest, c, b, base, scratch);
+    }
 }
 
 /// Document `d`'s stored length from a doc-lengths array of `u16`
@@ -2280,7 +2400,10 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
 /// unknown as unsupported.
 fn check_version(version: u32) -> Result<(), FtsError> {
     match version {
-        format::fts::VERSION_V7 | format::fts::VERSION_V8 | format::fts::VERSION_V9 => Ok(()),
+        format::fts::VERSION_V7
+        | format::fts::VERSION_V8
+        | format::fts::VERSION_V9
+        | format::fts::VERSION_V10 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -2478,7 +2601,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V9 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V10 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"
@@ -4607,5 +4730,82 @@ mod tests {
         assert!(column.norms_loaded(), "the retry must fill the norms cell");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
+    }
+
+    /// The union count's helpers on inputs the corpora above do not reach.
+    mod union_count_edges {
+        use super::*;
+
+        /// `body` cursors for `terms` over `docs`, for a count.
+        async fn count_cursors(docs: &[&str], terms: &[&str]) -> Vec<TermCursor> {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for (i, text) in docs.iter().enumerate() {
+                b.add_doc(0, i as u32, text).expect("add doc");
+            }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            r.build_term_cursors(0, terms, QueryIdf::ThisFile, CursorUse::Count, None, None)
+                .await
+                .expect("cursors")
+        }
+
+        /// A two-term union counts `df(a) + df(b) - |a ∩ b|` from the stored
+        /// dfs; a corrupt df must saturate the count, not wrap it.
+        #[tokio::test]
+        async fn a_two_term_union_count_saturates_on_corrupt_dfs() {
+            let docs: Vec<&str> = (0..300)
+                .map(|i| if i % 3 == 0 { "a b" } else { "a" })
+                .collect();
+            let cursors = count_cursors(&docs, &["a", "b"]).await;
+            assert_eq!(
+                or_count_unranked(cursors.clone()),
+                300,
+                "premise: sound dfs"
+            );
+            let mut huge = cursors.clone();
+            huge[0].df = u64::MAX;
+            assert_eq!(or_count_unranked(huge), u64::MAX - 100);
+            let mut zero = cursors;
+            zero[0].df = 0;
+            zero[1].df = 0;
+            assert_eq!(or_count_unranked(zero), 0);
+        }
+
+        /// An empty or inverted range sets nothing; a range across words
+        /// sets exactly its bits.
+        #[test]
+        fn set_bit_range_sets_exactly_the_range() {
+            let mut dest = [0u64; 4];
+            for (from, to) in [(0, 0), (64, 64), (70, 5), (200, 1)] {
+                set_bit_range(&mut dest, from, to);
+                assert_eq!(dest, [0; 4], "[{from}, {to})");
+            }
+            set_bit_range(&mut dest, 3, 130);
+            assert_eq!(dest, [u64::MAX << 3, u64::MAX, 0b11, 0]);
+        }
+
+        /// A short-form cursor has no blocks to read: its decoded docs inside
+        /// the window are marked, the rest left out.
+        #[tokio::test]
+        async fn or_blocks_into_window_marks_a_predecoded_cursor() {
+            let planted = [3usize, 70, OR_WINDOW as usize + 4, OR_WINDOW as usize + 904];
+            let docs: Vec<&str> = (0..2 * OR_WINDOW as usize)
+                .map(|i| if planted.contains(&i) { "rare" } else { "x" })
+                .collect();
+            let cursors = count_cursors(&docs, &["rare"]).await;
+            assert!(cursors[0].predecoded, "premise: a short-form term");
+            let mut scratch = [0u32; BLOCK_LEN];
+            for (base, want) in [(0u32, [3usize, 70]), (OR_WINDOW, [4, 904])] {
+                let mut dest = [0u64; OR_WINDOW_WORDS];
+                let mut from_block = 0usize;
+                or_blocks_into_window(&cursors[0], &mut from_block, base, &mut dest, &mut scratch);
+                let mut expect = [0u64; OR_WINDOW_WORDS];
+                for local in want {
+                    expect[local / 64] |= 1 << (local % 64);
+                }
+                assert_eq!(dest, expect, "window at {base}");
+            }
+        }
     }
 }

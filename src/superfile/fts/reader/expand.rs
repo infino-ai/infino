@@ -687,6 +687,7 @@ impl FtsReader {
                             TermIdf::Absent,
                             UNWEIGHTED,
                             CursorUse::Count,
+                            None,
                         )?;
                         // The bitset spans this blob's documents; a list
                         // reaching past them is a damaged blob, refused

@@ -174,13 +174,10 @@ impl ExcludeFilter {
         if !allows(&self.allow, &self.doc_map, doc) {
             return false;
         }
-        for c in &mut self.cursors {
-            c.skip_to(doc);
-            if !c.is_exhausted() && c.current_doc_id() == doc {
-                return false;
-            }
-        }
-        true
+        // Membership only: the negated cursors are never iterated, so a
+        // bitset block answers with a bit test and a packed block with one
+        // decode and a search, never decoding past the block that holds `doc`.
+        !self.cursors.iter_mut().any(|c| c.contains(doc))
     }
 }
 

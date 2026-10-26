@@ -13,6 +13,8 @@ mod expand;
 mod filter;
 mod metadata;
 mod options;
+#[cfg(test)]
+mod oracle_scale;
 mod phrase;
 mod scorers;
 mod search;

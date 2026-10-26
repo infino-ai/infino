@@ -646,8 +646,8 @@ async fn tiered_vocabulary_spans_the_posting_forms() {
 
         let dense = layout(TIER_DENSE).await;
         assert!(
-            dense.bitset_blocks > 0,
-            "sample {sample}: the densest drawn tier should store presence bits, got {dense:?}"
+            dense.bitset_blocks + dense.run_blocks > 0,
+            "sample {sample}: the densest drawn tier should store presence bits or runs, got {dense:?}"
         );
         let packed = layout(TIER_PACKED).await;
         assert!(

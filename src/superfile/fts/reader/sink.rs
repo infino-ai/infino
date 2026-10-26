@@ -12,8 +12,10 @@ use std::{
     sync::atomic::{AtomicU32, Ordering as AtomicOrdering},
 };
 
-use super::{cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable};
-use crate::superfile::{fts::bm25, id_space::FtsDocId};
+use super::{
+    cursor::TermCursor, filter::ExcludeFilter, metadata::NormTable, scorers::score_noness_batched,
+};
+use crate::superfile::id_space::FtsDocId;
 
 /// A monotonically rising score floor shared by every segment of one
 /// query's fan-out, readable and raisable lock-free mid-walk.
@@ -75,9 +77,45 @@ pub(in crate::superfile::fts) struct TopKEntry<I = FtsDocId>(
     pub(in crate::superfile::fts) f32,
     pub(in crate::superfile::fts) I,
 );
+/// An integer that orders as the score does: the sign bit flipped for a
+/// non-negative score, every bit for a negative one. The top-k heaps compare
+/// these rather than floats, a single integer compare per heap step; a
+/// score is never NaN.
+#[inline(always)]
+fn score_key(score: f32) -> u32 {
+    let bits = score.to_bits();
+    match bits >> 31 {
+        0 => bits | 0x8000_0000,
+        _ => !bits,
+    }
+}
+
+/// The score whose [`score_key`] is `key`.
+#[inline(always)]
+fn score_of_key(key: u32) -> f32 {
+    f32::from_bits(match key >> 31 {
+        1 => key & 0x7FFF_FFFF,
+        _ => !key,
+    })
+}
+
+/// `(score, doc)` packed so a larger integer is a better entry: the score's
+/// key above, the doc id inverted below so that on a tied score the smaller
+/// doc is the better one. Selecting on these is one integer compare a step.
+#[inline(always)]
+fn rank_key(score: f32, doc: u32) -> u64 {
+    (u64::from(score_key(score)) << 32) | u64::from(!doc)
+}
+
+/// The `(score, doc)` a [`rank_key`] packs.
+#[inline(always)]
+fn unrank_key(key: u64) -> (f32, u32) {
+    (score_of_key((key >> 32) as u32), !(key as u32))
+}
+
 impl<I: Eq> PartialEq for TopKEntry<I> {
     fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0 && self.1 == other.1
+        score_key(self.0) == score_key(other.0) && self.1 == other.1
     }
 }
 impl<I: Eq> Eq for TopKEntry<I> {}
@@ -93,10 +131,8 @@ impl<I: Ord> Ord for TopKEntry<I> {
         // inverted, so that among score-tied entries the LARGER doc id
         // is greater — i.e. peek — and is the one evicted when a
         // better doc arrives, keeping the smaller id.
-        other
-            .0
-            .partial_cmp(&self.0)
-            .unwrap_or(Ordering::Equal)
+        score_key(other.0)
+            .cmp(&score_key(self.0))
             .then_with(|| self.1.cmp(&other.1))
     }
 }
@@ -133,11 +169,9 @@ pub(in crate::superfile::fts) fn finish_head<I: Ord + Copy>(
 /// sort has no observable reorderings.
 pub(super) fn drain_top_k_desc<I: Ord + Copy>(heap: BinaryHeap<TopKEntry<I>>) -> Vec<(I, f32)> {
     let mut out: Vec<(I, f32)> = heap.into_iter().map(|TopKEntry(s, d)| (d, s)).collect();
-    out.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    });
+    // `total_cmp` orders a score that is never NaN exactly as `partial_cmp`
+    // does, with an integer compare instead of an `Option` per step.
+    out.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     out
 }
 
@@ -171,16 +205,11 @@ pub(super) trait AndSink {
     /// unranked count over a large intersection cheaper than ranking it.
     fn needs_score(&self) -> bool;
 
-    /// Whether a leader doc's own score, tested against [`bar`](AndSink::bar),
-    /// is worth computing to reject the doc before the walk touches any other
-    /// term. True for a sink whose bar is the score a hit must actually beat.
-    ///
-    /// False for a sink that deliberately reports a bar *below* that, which no
-    /// leader-side screen can make up for: the gap between the two is exactly
-    /// the room the screen would have needed to reject anything, so it pays a
-    /// norm lookup and a divide per leader doc and rejects almost nothing.
-    fn screenable(&self) -> bool {
-        true
+    /// How many terms the sink adds to a doc's score beyond the walk's own,
+    /// so the walk's pruning bar allows for summing them in another order
+    /// (see `pruning_bar`).
+    fn added_terms(&self) -> usize {
+        0
     }
 
     /// Record one doc in the intersection. `score` is meaningful only
@@ -230,12 +259,15 @@ impl AndSink for ScoreSink<'_> {
 /// the sink — the AND walk emits docs in ascending order, so each
 /// should list is `skip_to`-streamed forward at most once per query,
 /// exactly like [`ExcludeFilter`]'s negated cursors.
-pub(super) struct MustShouldSink<'a> {
-    pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
+pub(super) struct MustShouldSink<'a, C: Collector> {
+    pub(super) heap: &'a mut C,
+    /// The collector's k-th best: exact in a heap, at its last cut in a
+    /// buffer (never above the true one).
+    pub(super) kth: f32,
     pub(super) k: usize,
     pub(super) filter: Option<&'a mut ExcludeFilter>,
     pub(super) floor_eff: f32,
-    pub(super) shoulds: Vec<TermCursor>,
+    pub(super) shoulds: ShouldBatch,
     /// Σ `term_max_bm25` over the should cursors — the most the
     /// shoulds can add to any single doc's score.
     pub(super) should_ub: f32,
@@ -244,21 +276,20 @@ pub(super) struct MustShouldSink<'a> {
     pub(super) dl_norm_k1: &'a NormTable,
 }
 
-impl AndSink for MustShouldSink<'_> {
+impl<C: Collector> AndSink for MustShouldSink<'_, C> {
+    fn added_terms(&self) -> usize {
+        self.shoulds.len()
+    }
+
     fn bar(&self) -> f32 {
         // The AND walk's block-max arithmetic bounds the MUST portion
         // of a doc's score only, so the pruning bar is lowered by the
         // most the shoulds could add: a must block that can't reach
         // (kth-best − should_ub) can't produce a top-k doc even with
         // every should matching at its maximum.
-        let full_bar = if self.heap.len() >= self.k {
-            self.heap
-                .peek()
-                .expect("heap len == k")
-                .0
-                .max(self.floor_eff)
-        } else {
-            self.floor_eff
+        let full_bar = match self.heap.is_full(self.k) {
+            true => self.kth.max(self.floor_eff),
+            false => self.floor_eff,
         };
         full_bar - self.should_ub
     }
@@ -267,35 +298,87 @@ impl AndSink for MustShouldSink<'_> {
         true
     }
 
-    /// The bar above is the k-th best lowered by every should term's maximum,
-    /// so that a doc carrying all the musts and no should is still reachable.
-    /// A must-only leader score tested against it is short by that same
-    /// discount, which is why the screen cannot pay here.
-    fn screenable(&self) -> bool {
-        false
-    }
-
     fn emit(&mut self, doc: u32, must_score: f32) {
-        let mut score = must_score;
-        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
-        // Floor gate on the FULL score — a must-only score below the
-        // floor can still survive once its shoulds are added.
-        if score > self.floor_eff {
-            and_heap_push(self.heap, self.k, self.filter.as_deref_mut(), score, doc);
+        if self.shoulds.push(doc, must_score) {
+            self.flush();
         }
     }
 }
 
-/// Add each should term's BM25 at `doc` to `score`, streaming the
-/// cursors forward to it. Accumulates in cursor order so the ranked and
-/// the counted must+should sinks produce the same bits.
-#[inline]
-fn add_should_scores(shoulds: &mut [TermCursor], doc: u32, norm: f32, score: &mut f32) {
-    for c in shoulds {
-        c.skip_to(doc);
-        if !c.is_exhausted() && c.current_doc_id() == doc {
-            *score += bm25::score_with_dl_norm_k1(c.idf_weight, c.current_tf(), norm);
+impl<C: Collector> MustShouldSink<'_, C> {
+    /// Score the held docs' shoulds and offer them to the heap. The walk
+    /// calls this once more after its last doc.
+    pub(super) fn flush(&mut self) {
+        let (docs, scores) = self.shoulds.score(self.dl_norm_k1);
+        for (&doc, &score) in docs.iter().zip(scores) {
+            // Floor gate on the FULL score — a must-only score below the
+            // floor can still survive once its shoulds are added.
+            if score <= self.floor_eff || (self.heap.is_full(self.k) && score <= self.kth) {
+                continue;
+            }
+            // The negation is asked only of a doc that would be admitted, in
+            // ascending doc order.
+            if let Some(f) = self.filter.as_deref_mut()
+                && !f.admits(doc)
+            {
+                continue;
+            }
+            self.heap.offer(self.k, &mut self.kth, score, doc);
         }
+        self.shoulds.clear();
+    }
+}
+
+/// How many must-intersection docs wait for their should scores.
+const SHOULD_BATCH: usize = 128;
+
+/// Must-intersection docs held until a batch is full, so each should term
+/// is probed once for the batch ([`TermCursor::probe_tfs`]) rather than
+/// stepped to every doc. Each doc adds its should scores in cursor order,
+/// so the ranked and the counted must+should sinks produce the same bits.
+/// The should cursors are only probed, never iterated.
+pub(super) struct ShouldBatch {
+    shoulds: Vec<TermCursor>,
+    docs: Vec<u32>,
+    scores: Vec<f32>,
+    tfs: Vec<u32>,
+}
+
+impl ShouldBatch {
+    /// The number of should terms.
+    pub(super) fn len(&self) -> usize {
+        self.shoulds.len()
+    }
+
+    pub(super) fn new(shoulds: Vec<TermCursor>) -> Self {
+        Self {
+            shoulds,
+            docs: Vec::with_capacity(SHOULD_BATCH),
+            scores: Vec::with_capacity(SHOULD_BATCH),
+            tfs: Vec::with_capacity(SHOULD_BATCH),
+        }
+    }
+
+    /// Hold `doc` with its must score; `true` once the batch is full.
+    #[inline]
+    fn push(&mut self, doc: u32, must_score: f32) -> bool {
+        self.docs.push(doc);
+        self.scores.push(must_score);
+        self.docs.len() == SHOULD_BATCH
+    }
+
+    /// Add every should term's BM25 to each held doc's score; the held
+    /// docs with their full scores, in ascending doc order.
+    fn score(&mut self, dl_norm_k1: &NormTable) -> (&[u32], &[f32]) {
+        for c in &mut self.shoulds {
+            score_noness_batched(c, &self.docs, &mut self.scores, dl_norm_k1, &mut self.tfs);
+        }
+        (&self.docs, &self.scores)
+    }
+
+    fn clear(&mut self) {
+        self.docs.clear();
+        self.scores.clear();
     }
 }
 
@@ -314,10 +397,6 @@ impl AndSink for ScoreCountSink<'_> {
         true
     }
 
-    fn screenable(&self) -> bool {
-        false
-    }
-
     fn emit(&mut self, doc: u32, score: f32) {
         if let Some(f) = self.filter.as_deref_mut()
             && !f.admits(doc)
@@ -329,13 +408,50 @@ impl AndSink for ScoreCountSink<'_> {
     }
 }
 
+/// [`ScoreSink`] collecting into a [`TopKBuffer`]: the same floor gate and
+/// filter, an append per admitted hit instead of a sift, and a bar that rises
+/// at each cut. For a large `k`, where most hits are admitted.
+pub(super) struct BufferedScoreSink<'a> {
+    pub(super) top: TopKBuffer,
+    pub(super) k: usize,
+    pub(super) filter: Option<&'a mut ExcludeFilter>,
+    pub(super) floor_eff: f32,
+    /// The k-th best at the last cut, never below the floor.
+    pub(super) kth: f32,
+}
+
+impl AndSink for BufferedScoreSink<'_> {
+    fn bar(&self) -> f32 {
+        match self.top.is_full(self.k) {
+            true => self.kth.max(self.floor_eff),
+            false => self.floor_eff,
+        }
+    }
+
+    fn needs_score(&self) -> bool {
+        true
+    }
+
+    fn emit(&mut self, doc: u32, score: f32) {
+        if score <= self.floor_eff {
+            return;
+        }
+        if let Some(f) = self.filter.as_deref_mut()
+            && !f.admits(doc)
+        {
+            return;
+        }
+        self.top.offer(self.k, &mut self.kth, score, doc);
+    }
+}
+
 /// [`MustShouldSink`] without pruning: every must-intersection doc is
 /// scored and counted, and the shoulds only add to its score.
 pub(super) struct MustShouldCountSink<'a> {
     pub(super) heap: &'a mut BinaryHeap<TopKEntry>,
     pub(super) k: usize,
     pub(super) filter: Option<&'a mut ExcludeFilter>,
-    pub(super) shoulds: Vec<TermCursor>,
+    pub(super) shoulds: ShouldBatch,
     pub(super) dl_norm_k1: &'a NormTable,
     pub(super) count: u64,
 }
@@ -345,10 +461,6 @@ impl AndSink for MustShouldCountSink<'_> {
         true
     }
 
-    fn screenable(&self) -> bool {
-        false
-    }
-
     fn emit(&mut self, doc: u32, must_score: f32) {
         if let Some(f) = self.filter.as_deref_mut()
             && !f.admits(doc)
@@ -356,9 +468,21 @@ impl AndSink for MustShouldCountSink<'_> {
             return;
         }
         self.count += 1;
-        let mut score = must_score;
-        add_should_scores(&mut self.shoulds, doc, self.dl_norm_k1.get(doc), &mut score);
-        and_heap_push(self.heap, self.k, None, score, doc);
+        if self.shoulds.push(doc, must_score) {
+            self.flush();
+        }
+    }
+}
+
+impl MustShouldCountSink<'_> {
+    /// Score the held docs' shoulds and offer them to the heap. The walk
+    /// calls this once more after its last doc.
+    pub(super) fn flush(&mut self) {
+        let (docs, scores) = self.shoulds.score(self.dl_norm_k1);
+        for (&doc, &score) in docs.iter().zip(scores) {
+            and_heap_push(self.heap, self.k, None, score, doc);
+        }
+        self.shoulds.clear();
     }
 }
 
@@ -393,16 +517,24 @@ pub(super) fn and_heap_push(
     score: f32,
     doc_id: u32,
 ) {
+    let full = heap.len() >= k;
+    if full
+        && heap
+            .peek()
+            .is_some_and(|w| !(score > w.0 || (score == w.0 && doc_id < w.1.get())))
+    {
+        return;
+    }
+    // The negation is asked only of a doc that would enter the heap: one that
+    // would not is dropped either way, and the docs asked still ascend.
     if let Some(f) = filter
         && !f.admits(doc_id)
     {
         return;
     }
-    if heap.len() < k {
+    if !full {
         heap.push(TopKEntry(score, FtsDocId::new(doc_id)));
-    } else if let Some(mut worst) = heap.peek_mut()
-        && (score > worst.0 || (score == worst.0 && doc_id < worst.1.get()))
-    {
+    } else if let Some(mut worst) = heap.peek_mut() {
         *worst = TopKEntry(score, FtsDocId::new(doc_id));
     }
 }
@@ -420,9 +552,184 @@ pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) 
     }
 }
 
+/// Offer `(score, doc)` to a top-`k` heap whose admission bar is
+/// `threshold`: pushed while the heap fills, and once it is full kept only
+/// when it beats the bar, in place of the worst entry. Whenever the heap is
+/// full after the offer the bar becomes its worst score, but never drops
+/// below where it was, so a floor the caller seeded is kept. Returns whether
+/// the bar was set or rose, for callers that re-plan on a higher bar. A
+/// `k` of zero admits nothing.
+#[inline]
+pub(super) fn offer_top_k(
+    heap: &mut BinaryHeap<TopKEntry>,
+    k: usize,
+    threshold: &mut f32,
+    score: f32,
+    doc: u32,
+) -> bool {
+    if k == 0 {
+        return false;
+    }
+    if heap.len() < k {
+        heap.push(TopKEntry(score, FtsDocId::new(doc)));
+        if heap.len() < k {
+            return false;
+        }
+    } else if score > *threshold {
+        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
+    } else {
+        return false;
+    }
+    *threshold = heap.peek().expect("a full heap").0.max(*threshold);
+    true
+}
+
+/// A top-`k` collector a ranked kernel is generic over: the heap, which
+/// raises the bar on every admission, or the buffer, which raises it in
+/// steps and costs no sift per admission.
+pub(super) trait Collector: Sized {
+    fn with_capacity(k: usize, capacity: usize) -> Self;
+    /// Whether `k` entries have been admitted, so the bar is a real k-th best.
+    fn is_full(&self, k: usize) -> bool;
+    /// Offer `(score, doc)`; see [`offer_top_k`] for the admission rule. Returns
+    /// whether the bar was set or rose.
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool;
+    /// The best `k`, by descending score and ascending doc on a tie.
+    fn into_sorted(self) -> Vec<(FtsDocId, f32)>;
+}
+
+impl Collector for BinaryHeap<TopKEntry> {
+    fn with_capacity(_k: usize, capacity: usize) -> Self {
+        BinaryHeap::with_capacity(capacity)
+    }
+    #[inline]
+    fn is_full(&self, k: usize) -> bool {
+        self.len() >= k
+    }
+    #[inline]
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool {
+        offer_top_k(self, k, threshold, score, doc)
+    }
+    fn into_sorted(self) -> Vec<(FtsDocId, f32)> {
+        drain_top_k_desc(self)
+    }
+}
+
+/// The best `k` entries offered, kept in an unordered buffer cut back to the
+/// best `k` by selection whenever it outgrows them by [`TopKBuffer::slack`].
+/// A heap pays a `log k`-step sift for every admission, which at a large `k`
+/// with a low bar is most of them; the buffer pays an append, and a linear
+/// selection per `slack` appends. Its bar is the k-th best at the last cut:
+/// never above the true k-th best, so pruning against it stays safe, and
+/// refreshed often enough (`slack` is `k / 2`) that it trails closely.
+/// Entries are held as [`rank_key`]s.
+pub(super) struct TopKBuffer {
+    k: usize,
+    buf: Vec<u64>,
+    full: bool,
+}
+
+impl TopKBuffer {
+    /// Appends between cuts once full.
+    fn slack(k: usize) -> usize {
+        (k / TOPK_BUFFER_SLACK_DIVISOR).max(1)
+    }
+
+    /// Keep the best `k` and return the k-th best's score.
+    fn cut(&mut self, k: usize) -> f32 {
+        if self.buf.len() > k {
+            self.buf.select_nth_unstable_by(k - 1, |a, b| b.cmp(a));
+            self.buf.truncate(k);
+        }
+        unrank_key(*self.buf.iter().min().expect("k > 0 entries")).0
+    }
+}
+
+/// [`TopKBuffer`] cuts once it holds `k + k / this` entries.
+const TOPK_BUFFER_SLACK_DIVISOR: usize = 2;
+
+impl Collector for TopKBuffer {
+    fn with_capacity(k: usize, capacity: usize) -> Self {
+        Self {
+            k,
+            // `k` may stand for "every hit" (`usize::MAX`): size from the
+            // caller's bounded estimate, never from `k` itself.
+            buf: Vec::with_capacity(capacity),
+            full: false,
+        }
+    }
+    #[inline]
+    fn is_full(&self, _k: usize) -> bool {
+        self.full
+    }
+    #[inline]
+    fn offer(&mut self, k: usize, threshold: &mut f32, score: f32, doc: u32) -> bool {
+        // A score equal to the bar is kept: the bar may trail the true k-th
+        // best, and a tie there with a smaller doc wins on the doc-id leg,
+        // which the final selection decides.
+        if k == 0 || (self.full && score < *threshold) {
+            return false;
+        }
+        self.buf.push(rank_key(score, doc));
+        let due = match self.full {
+            false => self.buf.len() == k,
+            true => self.buf.len() >= k.saturating_add(Self::slack(k)),
+        };
+        if !due {
+            return false;
+        }
+        self.full = true;
+        *threshold = self.cut(k).max(*threshold);
+        true
+    }
+    fn into_sorted(mut self) -> Vec<(FtsDocId, f32)> {
+        self.buf.sort_unstable_by(|a, b| b.cmp(a));
+        self.buf.truncate(self.k);
+        self.buf
+            .into_iter()
+            .map(|key| {
+                let (score, doc) = unrank_key(key);
+                (FtsDocId::new(doc), score)
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rank_keys_round_trip_and_order_as_the_entries_do() {
+        let scores = [
+            0.0f32,
+            -0.0,
+            1e-30,
+            0.5,
+            1.0,
+            7.25,
+            1e30,
+            -1.0,
+            -1e-30,
+            f32::INFINITY,
+        ];
+        let docs = [0u32, 1, 7, u32::MAX - 1, u32::MAX];
+        for &s in &scores {
+            for &d in &docs {
+                let (s2, d2) = unrank_key(rank_key(s, d));
+                assert_eq!((s2.to_bits(), d2), (s.to_bits(), d));
+                for &t in &scores {
+                    for &e in &docs {
+                        // A larger key is a better entry: the smaller in
+                        // `TopKEntry`'s reversed order.
+                        let by_key = rank_key(t, e).cmp(&rank_key(s, d));
+                        let by_entry = TopKEntry(s, d).cmp(&TopKEntry(t, e));
+                        assert_eq!(by_key, by_entry, "({s}, {d}) vs ({t}, {e})");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn and_heap_push_keeps_the_smaller_doc_on_a_tied_score() {
@@ -453,6 +760,116 @@ mod tests {
             drain_top_k_desc(heap),
             vec![(FtsDocId::new(30), 2.0), (FtsDocId::new(5), 1.0)]
         );
+    }
+
+    #[test]
+    fn offer_top_k_fills_then_keeps_the_best_and_never_lowers_a_seeded_bar() {
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        let mut bar = 0.0f32;
+        assert!(
+            !offer_top_k(&mut heap, 2, &mut bar, 1.0, 1),
+            "still filling"
+        );
+        assert!(
+            offer_top_k(&mut heap, 2, &mut bar, 3.0, 2),
+            "full: the bar is set"
+        );
+        assert_eq!(bar, 1.0);
+        assert!(
+            !offer_top_k(&mut heap, 2, &mut bar, 0.5, 3),
+            "under the bar"
+        );
+        assert!(offer_top_k(&mut heap, 2, &mut bar, 2.0, 4), "beats the bar");
+        assert_eq!(bar, 2.0);
+        let mut docs: Vec<u32> = heap.iter().map(|e| e.1.get()).collect();
+        docs.sort_unstable();
+        assert_eq!(docs, [2, 4]);
+        // A seeded floor above the heap's worst score is kept.
+        let mut heap: BinaryHeap<TopKEntry> = BinaryHeap::new();
+        let mut bar = 5.0f32;
+        assert!(offer_top_k(&mut heap, 1, &mut bar, 1.0, 1));
+        assert_eq!(bar, 5.0);
+        assert!(
+            !offer_top_k(&mut heap, 0, &mut bar, 9.0, 2),
+            "k = 0 admits nothing"
+        );
+    }
+
+    #[test]
+    fn score_key_orders_exactly_as_total_cmp() {
+        let values = [
+            0.0f32,
+            -0.0,
+            f32::MIN_POSITIVE,
+            1e-30,
+            0.25,
+            1.0,
+            1.0 + f32::EPSILON,
+            3.5,
+            7.25,
+            1e30,
+            f32::MAX,
+            -1.0,
+            -3.5,
+            f32::MIN,
+        ];
+        for &a in &values {
+            for &b in &values {
+                assert_eq!(
+                    score_key(a).cmp(&score_key(b)),
+                    a.total_cmp(&b),
+                    "score_key({a}) vs score_key({b})"
+                );
+            }
+        }
+        // Equal scores tie on the key, so the doc id decides: the heap keeps
+        // the smaller one.
+        let tied = |d: u32| TopKEntry(2.5f32, FtsDocId::new(d));
+        let mut heap: BinaryHeap<TopKEntry> = [tied(9), tied(3)].into_iter().collect();
+        assert_eq!(
+            heap.peek().map(|e| e.1.get()),
+            Some(9),
+            "the larger id is evicted first"
+        );
+        heap.pop();
+        assert_eq!(heap.peek().map(|e| e.1.get()), Some(3));
+    }
+
+    #[test]
+    fn the_buffered_collector_keeps_what_the_heap_keeps() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        // `usize::MAX` stands for "every hit" and must neither overflow nor cut.
+        for k in [1usize, 2, 7, 64, 512, 1000, usize::MAX] {
+            for floor in [0.0f32, 3.0] {
+                let mut heap: BinaryHeap<TopKEntry> = Collector::with_capacity(k, 0);
+                let mut buf = TopKBuffer::with_capacity(k, 0);
+                let (mut bar_h, mut bar_b) = (floor, floor);
+                // Ascending docs, as every kernel offers them, with heavy ties.
+                for doc in 0..5 * k.min(1000) as u32 + 37 {
+                    let score = rng(64) as f32 / 8.0;
+                    heap.offer(k, &mut bar_h, score, doc);
+                    buf.offer(k, &mut bar_b, score, doc);
+                    assert!(bar_b <= bar_h, "the buffer's bar never passes the heap's");
+                }
+                let want = heap.into_sorted();
+                let got = buf.into_sorted();
+                // Entries under a seeded floor may sit in either (a floor only
+                // prunes); the ones above it must agree exactly.
+                let above = |v: &[(FtsDocId, f32)]| -> Vec<(u32, f32)> {
+                    v.iter()
+                        .filter(|e| e.1 > floor)
+                        .map(|e| (e.0.get(), e.1))
+                        .collect()
+                };
+                assert_eq!(above(&got), above(&want), "k={k} floor={floor}");
+            }
+        }
     }
 
     #[test]
