@@ -16,6 +16,7 @@
 //! then it's a borrowed view).
 
 use std::{
+    cmp::Reverse,
     collections::{BinaryHeap, HashMap},
     ops::Range,
     sync::{Arc, OnceLock},
@@ -403,6 +404,19 @@ pub enum OrAlgo {
 pub(super) const OR_WINDOW: u32 = 4096;
 /// Number of 64-bit words in the window presence bitset.
 pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
+
+/// Terms from which an unranked union walks its cursors through a heap
+/// keyed by current doc rather than rescanning every cursor per emitted
+/// doc. A rescan costs the term count n per doc; the heap costs log n
+/// per posting, so a doc matched by m of the terms costs m·log n. The
+/// heap therefore loses only when the average doc matches more than
+/// n / log n of the terms, which a handful of overlapping terms can do
+/// and a long list cannot: at 8 terms that is 3 of the 8, at 5000 it is
+/// 400. Below this many terms the rescan is kept; a union of n sparse
+/// terms (an `IN` list of ids, say) costs n² under the rescan and
+/// n·log n under the heap. The count walk has its own window-based
+/// rescan and picks by comparing work (see [`or_count_unranked`]).
+pub(super) const OR_HEAP_MIN_TERMS: usize = 8;
 
 /// Dominance threshold for the df-anchored union count. When one term's
 /// document frequency is at least this multiple of *all the other terms'
@@ -1984,12 +1998,16 @@ pub(super) fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 /// Unranked multi-term OR walk: the union of the cursors' doc ids in
-/// ascending order. A k-way merge — each step finds the minimum current
-/// doc id across the live cursors, hands it to `emit`, and advances
-/// every cursor sitting on it (so the next minimum is strictly greater
-/// and `emit` is called exactly once per distinct doc). No scoring; the
-/// caller wants membership, not rank.
+/// ascending order, `emit` called exactly once per distinct doc. No
+/// scoring; the caller wants membership, not rank. A few cursors walk by
+/// rescanning for the minimum current doc each step; from
+/// [`OR_HEAP_MIN_TERMS`] on they walk through a heap keyed by current doc
+/// ([`or_walk_heap`]), since the rescan's cost per step is the term count.
 pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+    if cursors.len() >= OR_HEAP_MIN_TERMS {
+        or_walk_heap(cursors, emit);
+        return;
+    }
     loop {
         let min_doc = cursors
             .iter()
@@ -2002,6 +2020,32 @@ pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMu
             if !c.is_exhausted() && c.current_doc_id() == min_doc {
                 c.next();
             }
+        }
+    }
+}
+
+/// [`or_walk_unranked`] through a min-heap of (current doc, cursor): each
+/// step pops the smallest current doc, emits it once however many cursors
+/// sit on it (equal docs pop consecutively), and advances only the
+/// cursor popped. Cost is the union size times the log of the term
+/// count, independent of how many terms there are per step.
+fn or_walk_heap(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = cursors
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.is_exhausted())
+        .map(|(i, c)| Reverse((c.current_doc_id(), i)))
+        .collect();
+    let mut last: Option<u32> = None;
+    while let Some(Reverse((doc, i))) = heap.pop() {
+        if last != Some(doc) {
+            emit(doc);
+            last = Some(doc);
+        }
+        let c = &mut cursors[i];
+        c.next();
+        if !c.is_exhausted() {
+            heap.push(Reverse((c.current_doc_id(), i)));
         }
     }
 }
@@ -2059,6 +2103,11 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     if total_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
         return or_count_bitset(cursors, max_doc);
     }
+    if or_count_prefers_heap(cursors.len(), total_df, max_doc) {
+        let mut n = 0u64;
+        or_walk_heap(cursors, |_| n += 1);
+        return n;
+    }
     let mut present = [0u64; OR_WINDOW_WORDS];
     let mut n = 0u64;
     loop {
@@ -2115,6 +2164,31 @@ pub(super) fn mark_window(c: &mut TermCursor, base: u32, window_end: u32, presen
             break;
         }
     }
+}
+
+/// Whether a union count over `terms` cursors holding `total_df` postings
+/// in a doc space up to `max_doc` is cheaper through the heap walk than
+/// through the windowed walk. Over raw numbers so the boundary is
+/// unit-testable without building cursors.
+///
+/// The windowed walk rescans the whole cursor set once per touched
+/// window and then pays one bit op per posting; the heap walk pays a
+/// log-of-term-count step per posting and no rescans. A sparse union
+/// over many terms (an `IN` list of ids, say) touches a window per few
+/// postings, so the rescans dominate and the heap wins; a dense union
+/// over a few dozen common terms packs thousands of postings per window,
+/// so the rescans are noise and the windowed walk wins. Touched windows
+/// are bounded by both the window count and the posting count. Below
+/// [`OR_HEAP_MIN_TERMS`] the windowed walk is kept outright.
+fn or_count_prefers_heap(terms: usize, total_df: u64, max_doc: u32) -> bool {
+    if terms < OR_HEAP_MIN_TERMS {
+        return false;
+    }
+    let terms = terms as u64;
+    let n_windows = u64::from(max_doc / OR_WINDOW) + 1;
+    let rescan_steps = terms.saturating_mul(n_windows.min(total_df));
+    let heap_steps = total_df.saturating_mul(u64::from(terms.ilog2()) + 1);
+    heap_steps < rescan_steps
 }
 
 /// Disjunction cardinality via a full doc-space bitset: OR every term's
@@ -3972,6 +4046,22 @@ mod tests {
         assert_eq!(read_u32_le(&b32), 0x1234_5678);
         let b64 = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(read_u64_le(&b64), 1);
+    }
+
+    #[test]
+    fn the_count_walk_takes_the_heap_only_when_rescans_outnumber_heap_steps() {
+        // 1M docs is 245 windows. 5000 single-doc terms: 5000 rescans of
+        // 245 windows against 5000 heap steps of 13 → heap.
+        assert!(or_count_prefers_heap(5000, 5000, 1_000_000));
+        // Ten terms of 10k postings each: 10 rescans of 245 windows
+        // against 100k heap steps of 4 → windowed.
+        assert!(!or_count_prefers_heap(10, 100_000, 1_000_000));
+        // Below the term threshold the windowed walk is kept however
+        // sparse the union.
+        assert!(!or_count_prefers_heap(OR_HEAP_MIN_TERMS - 1, 7, 1_000_000));
+        // One window: 1000 single-doc terms in 3000 docs are rescanned
+        // once, against 1000 heap steps of 10 → windowed.
+        assert!(!or_count_prefers_heap(1000, 1000, 3_000));
     }
 
     #[test]
