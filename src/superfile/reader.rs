@@ -32,12 +32,12 @@ use std::{
     },
 };
 
-use arrow::compute::{concat_batches, take};
+use arrow::compute::{concat_batches, interleave, take_record_batch};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
     RecordBatchReader, UInt32Array,
 };
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
 use parquet::{
@@ -97,16 +97,22 @@ const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 /// reads less.
 const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
-/// A take of at least one row in this many of the file reads each
-/// projected column whole and gathers the rows from it, instead of
-/// decoding through a row selection. A selection skips the pages that
-/// hold none of its rows, which a take this dense never does, so it pays
-/// the full decode anyway plus the selection's bookkeeping per row: on a
-/// million-row file, a take of a fifth of the rows of one float column
-/// through a selection measured 13 ms against 1.7 ms for the
-/// whole-column read and gather, the aggregate around them included.
-/// Below this share the pages a selection skips are worth more than the
-/// bookkeeping costs.
+/// A take of at least one row in this many of the file, over fixed-width
+/// columns only, reads each projected column whole and gathers the rows
+/// from it, instead of decoding through a row selection. A selection skips
+/// the pages that hold none of its rows, which a take this dense rarely
+/// can, so it pays nearly the full decode anyway plus the selection's
+/// bookkeeping per row: on a million-row file, a take of a fifth of the
+/// rows of one float column through a selection measured 13 ms against
+/// 1.7 ms for the whole-column read and gather, the aggregate around them
+/// included. Below this share the pages a selection skips are worth more
+/// than the bookkeeping costs.
+///
+/// A variable-width column keeps the selection at any density: its decode
+/// is its values' bytes rather than a slot per row, so the pages a
+/// selection skips cost more than its bookkeeping saves, most of all when
+/// the rows cluster (matches close in time, as a log's are) and whole
+/// pages hold none of them.
 const WHOLE_COLUMN_TAKE_DIVISOR: u64 = 16;
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
@@ -1392,7 +1398,8 @@ impl SuperfileReader {
         //    invariant of the superfile body), so the selection lines up
         //    directly with parquet row offsets; the caller's original order
         //    (including duplicates) is restored via the rank-back step.
-        let parquet_selected = if parquet_names.is_empty() {
+        //    Either way the rows come out in the caller's order.
+        let parquet_rows = if parquet_names.is_empty() {
             None
         } else {
             let mut col_indices = Vec::with_capacity(parquet_names.len());
@@ -1410,12 +1417,18 @@ impl SuperfileReader {
             let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
             let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
             let builder = builder.with_projection(mask);
-            let dense = (local_doc_ids.len() as u64).saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR)
-                >= self.n_docs;
+            let fixed_width = col_indices
+                .iter()
+                .all(|&i| self.schema.field(i).data_type().primitive_width().is_some());
+            let dense = fixed_width
+                && (local_doc_ids.len() as u64).saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR)
+                    >= self.n_docs;
             if dense {
-                // A take this dense touches every page: read the columns
-                // whole, in row order, and gather the rows in the caller's
-                // order straight from them (see WHOLE_COLUMN_TAKE_DIVISOR).
+                // A take this dense touches nearly every page: read the
+                // columns whole, in row order, and gather the rows in the
+                // caller's order straight from the decoded batches, with no
+                // copy of the whole column made first (see
+                // WHOLE_COLUMN_TAKE_DIVISOR).
                 let reader = builder
                     .build()
                     .map_err(|e| ReadError::Columnar(e.to_string()))?;
@@ -1423,10 +1436,7 @@ impl SuperfileReader {
                 let batches = reader
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|e| ReadError::Columnar(e.to_string()))?;
-                let whole = concat_batches(&read_schema, &batches)
-                    .map_err(|e| ReadError::Columnar(e.to_string()))?;
-                let indices = UInt32Array::from(local_doc_ids.to_vec());
-                Some((whole, indices))
+                Some(gather_rows(&read_schema, &batches, local_doc_ids)?)
             } else {
                 // The page index (when present) lets `RowSelection` seek to
                 // the relevant pages.
@@ -1451,28 +1461,29 @@ impl SuperfileReader {
                 // Rank back into the caller's order via take. Cheap: typical k
                 // is 10..1000.
                 let indices = rank_back_indices(local_doc_ids, &sorted_ids);
-                Some((selected, indices))
+                Some(
+                    take_record_batch(&selected, &indices)
+                        .map_err(|e| ReadError::Columnar(e.to_string()))?,
+                )
             }
         };
 
         // 7. Gather columns in caller's projection order: `_id` from the
-        //    sidecar, everything else rank-backed from the Parquet read.
+        //    sidecar, everything else from the Parquet read's rows.
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
         for &name in projection {
             if use_sidecar_for_id && name == self.id_column {
                 columns.push(Arc::clone(sidecar_id.as_ref().expect("built above")));
                 continue;
             }
-            let (selected, indices) = parquet_selected
+            let rows = parquet_rows
                 .as_ref()
                 .expect("non-id projection implies a parquet read");
-            let idx = selected
+            let idx = rows
                 .schema()
                 .index_of(name)
                 .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
-            let taken = take(selected.column(idx), indices, None)
-                .map_err(|e| ReadError::Columnar(e.to_string()))?;
-            columns.push(taken);
+            columns.push(Arc::clone(rows.column(idx)));
         }
         // The row count is carried explicitly rather than inferred from the
         // columns: a projection can legitimately resolve to no columns at
@@ -2617,6 +2628,54 @@ pub(crate) fn row_selection_for_ids(ids: &[u32]) -> (Vec<u32>, RowSelection) {
     (sorted, RowSelection::from(selectors))
 }
 
+/// The rows at `ids` (row numbers in the file, in the caller's order,
+/// repeats honored) of `batches`, which hold the file's rows whole and in
+/// order, as one batch of `schema`. Each column is gathered straight from
+/// the decoded batches, so no copy of the whole column is made on the way.
+fn gather_rows(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    ids: &[u32],
+) -> Result<RecordBatch, ReadError> {
+    // Each batch's first row, to find the batch an id falls in.
+    let mut starts = Vec::with_capacity(batches.len());
+    let mut rows = 0usize;
+    for batch in batches {
+        starts.push(rows);
+        rows += batch.num_rows();
+    }
+    let at = ids
+        .iter()
+        .map(|&id| {
+            let row = id as usize;
+            if row >= rows {
+                return Err(ReadError::DocIdOutOfRange {
+                    doc_id: id,
+                    n_docs: rows as u64,
+                });
+            }
+            // `starts[0]` is 0, so some batch starts at or before `row`.
+            let batch = starts.partition_point(|&start| start <= row) - 1;
+            Ok((batch, row - starts[batch]))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let columns = (0..schema.fields().len())
+        .map(|column| {
+            let arrays: Vec<&dyn Array> = batches
+                .iter()
+                .map(|batch| batch.column(column).as_ref())
+                .collect();
+            interleave(&arrays, &at).map_err(|e| ReadError::Columnar(e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(ids.len())),
+    )
+    .map_err(|e| ReadError::Columnar(e.to_string()))
+}
+
 /// Rank-back `take` indices restoring the caller's id order (duplicates
 /// honored) over rows selected via [`row_selection_for_ids`]: for each
 /// requested id, its row position in `sorted` is its row position in
@@ -2730,7 +2789,7 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
 mod tests {
     use std::collections::HashSet;
 
-    use arrow_array::{Decimal128Array, LargeStringArray, RecordBatch};
+    use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
     use async_trait::async_trait;
     use tracing::Level;
@@ -3175,6 +3234,45 @@ mod tests {
         // Positions in `sorted`: 7→2, 2→1, 7→2, 0→0.
         let got: Vec<u32> = (0..indices.len()).map(|i| indices.value(i)).collect();
         assert_eq!(got, vec![2, 1, 2, 0]);
+    }
+
+    /// The whole-column gather takes rows from across the decoded batches,
+    /// in the caller's order, repeats and the rows either side of a batch
+    /// boundary included, and refuses a row past the file.
+    #[test]
+    fn gather_rows_crosses_batches_in_the_callers_order() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        // Rows 0..9 as three batches of uneven length; each value is its row.
+        let batches: Vec<RecordBatch> = [0..3i64, 3..5, 5..9]
+            .into_iter()
+            .map(|rows| {
+                RecordBatch::try_new(
+                    Arc::clone(&schema),
+                    vec![Arc::new(Int64Array::from_iter_values(rows)) as ArrayRef],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let ids = [8u32, 0, 3, 2, 8, 5, 4];
+        let gathered = gather_rows(&schema, &batches, &ids).expect("gather");
+        let got = gathered
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64")
+            .values()
+            .to_vec();
+        assert_eq!(got, ids.map(i64::from).to_vec());
+
+        let err = gather_rows(&schema, &batches, &[9]).expect_err("past the file");
+        assert!(matches!(
+            err,
+            ReadError::DocIdOutOfRange {
+                doc_id: 9,
+                n_docs: 9
+            }
+        ));
     }
 
     #[test]

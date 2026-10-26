@@ -273,22 +273,6 @@ impl UnrankedMatchSet {
     }
 }
 
-/// The presence leaf a match set prunes with: its bare terms plus every
-/// phrase's members, under the strongest mode those atoms allow.
-///
-/// A phrase's members are conjunctive — a match contains all of them, adjacent
-/// — but that only constrains the whole query when nothing else could satisfy
-/// it. So the mode is `And` when the caller already requires every atom (a
-/// must-side prune), and also for the single quoted phrase with no bare terms,
-/// where matching the query *is* matching the phrase. A disjunction of a phrase
-/// with anything else is `(a AND b) OR c`, which one presence leaf cannot
-/// express, so it falls back to the union over every atom — weaker, never
-/// wrong.
-///
-/// Flattening the members into the query's mode unconditionally is what makes a
-/// quoted phrase of common words prune nothing: `"wine beer"` asks only whether
-/// a superfile holds `wine` or `beer`, which at corpus scale every superfile
-/// does.
 /// One parsed unranked match, ready to run against any of its superfiles:
 /// the terms and phrases on each side of the negation, the index
 /// locations that let a superfile skip its dictionary, and the statistics
@@ -368,6 +352,22 @@ impl MatchKernel {
     }
 }
 
+/// The presence leaf a match set prunes with: its bare terms plus every
+/// phrase's members, under the strongest mode those atoms allow.
+///
+/// A phrase's members are conjunctive — a match contains all of them, adjacent
+/// — but that only constrains the whole query when nothing else could satisfy
+/// it. So the mode is `And` when the caller already requires every atom (a
+/// must-side prune), and also for the single quoted phrase with no bare terms,
+/// where matching the query *is* matching the phrase. A disjunction of a phrase
+/// with anything else is `(a AND b) OR c`, which one presence leaf cannot
+/// express, so it falls back to the union over every atom — weaker, never
+/// wrong.
+///
+/// Flattening the members into the query's mode unconditionally is what makes a
+/// quoted phrase of common words prune nothing: `"wine beer"` asks only whether
+/// a superfile holds `wine` or `beer`, which at corpus scale every superfile
+/// does.
 fn presence_leaf(
     column: &str,
     terms: &[String],
@@ -2103,8 +2103,9 @@ impl SupertableReader {
                 }
                 let refs: Vec<&str> = names.iter().map(String::as_str).collect();
                 // The same rows of the same superfile under the same columns
-                // are the same batch for the life of the process; the hit
-                // path memoises them per reader generation, and so does this.
+                // and schema are the same batch for as long as the immutable
+                // superfile lives; the hit path memoises them under that
+                // key, and so does this.
                 let decoded = &shared.decoded_scalar_cache;
                 if let Some(batch) = decoded.get(entry.uri, schema_id, &locals, &refs) {
                     return Ok(batch);

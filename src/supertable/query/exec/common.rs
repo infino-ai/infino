@@ -96,29 +96,24 @@ pub(crate) fn traced_tvf<F>(span: Span, search: F) -> impl Future<Output = F::Ou
 where
     F: Future<Output = DfResult<RecordBatch>>,
 {
-    async move {
-        let out = search.await;
-        if let Ok(batch) = &out {
-            record("rows_out", batch.num_rows());
-        }
-        out
-    }
-    .instrument(span)
+    traced_tvf_rows(span, search, RecordBatch::num_rows)
 }
 
-/// [`traced_tvf`] for a search that comes out as several batches, one per
-/// superfile: the `rows_out` recorded is their sum.
-pub(crate) fn traced_tvf_batches<F>(span: Span, search: F) -> impl Future<Output = F::Output>
+/// [`traced_tvf`] for a search whose output counts its rows through `rows`:
+/// one that comes out as several batches, one per superfile, records their
+/// sum.
+pub(crate) fn traced_tvf_rows<T, F>(
+    span: Span,
+    search: F,
+    rows: fn(&T) -> usize,
+) -> impl Future<Output = F::Output>
 where
-    F: Future<Output = DfResult<Vec<RecordBatch>>>,
+    F: Future<Output = DfResult<T>>,
 {
     async move {
         let out = search.await;
-        if let Ok(batches) = &out {
-            record(
-                "rows_out",
-                batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
-            );
+        if let Ok(output) = &out {
+            record("rows_out", rows(output));
         }
         out
     }
@@ -2497,6 +2492,55 @@ mod tests {
             "scalar resolution must cold-fetch lazy readers; got {}",
             cache.stats().n_cold_fetches,
         );
+    }
+
+    /// An aggregate over the match function that projects scalar columns
+    /// only reads each superfile's rows through the lazy take on a cold
+    /// reopen, and leaves a deleted row out as the hit path does: it equals
+    /// the same aggregate over the materialized rows.
+    #[test]
+    fn match_columns_cold_path_leaves_deleted_rows_out() {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        commit_titles_to(&storage);
+        let producer =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("open producer");
+        let stats = producer
+            .delete(col("title").eq(lit("rust systems")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+        drop(producer);
+
+        let (cache, consumer) = open_cold(Arc::clone(&storage), &cache_dir);
+        let reader = consumer.reader().expect("reader");
+        let scalar_only = reader
+            .query_sql(
+                "SELECT count(title) AS n, max(length(title)) AS m \
+                 FROM token_match('title', 'rust')",
+            )
+            .expect("aggregate over the match");
+        assert!(
+            cache.stats().n_cold_fetches >= 1,
+            "the scalar-only take must cold-fetch lazy readers; got {}",
+            cache.stats().n_cold_fetches,
+        );
+        let via_rows = reader
+            .query_sql(
+                "SELECT count(title) AS n, max(length(title)) AS m \
+                 FROM (SELECT title FROM token_match('title', 'rust') ORDER BY _id)",
+            )
+            .expect("aggregate over the rows");
+        assert_eq!(format!("{scalar_only:?}"), format!("{via_rows:?}"));
+        let n = scalar_only[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is Int64")
+            .value(0);
+        assert_eq!(n, 1, "only the live 'rust' row is counted");
     }
 
     #[test]

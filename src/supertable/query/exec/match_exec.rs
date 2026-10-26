@@ -55,7 +55,7 @@ use crate::{
         query::exec::{
             common::{
                 arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
-                traced_tvf, traced_tvf_batches,
+                traced_tvf, traced_tvf_rows,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -428,7 +428,9 @@ impl ExecutionPlan for MatchExec {
                 }
                 Ok::<Vec<RecordBatch>, DataFusionError>(out)
             };
-            let fut = traced_tvf_batches(span, fut);
+            let fut = traced_tvf_rows(span, fut, |batches: &Vec<RecordBatch>| {
+                batches.iter().map(RecordBatch::num_rows).sum()
+            });
             let stream = stream::once(fut)
                 .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
                 .try_flatten();
@@ -573,8 +575,9 @@ mod tests {
     /// `COUNT(*)` over the match function projects no column and is
     /// answered by the count primitive; it must equal the row count the
     /// materialized match gives, and an aggregate over a scalar column
-    /// (which projects no `_id`) must equal the same aggregate over the
-    /// materialized rows.
+    /// (which projects no `_id`), a grouped aggregate and a projection
+    /// naming a column twice must equal the same over the materialized
+    /// rows.
     fn assert_aggregates_equal_the_rows(st: &Supertable) {
         for query in AGGREGATED_QUERIES {
             let tvf = format!("token_match('title', '{query}')");
