@@ -1998,17 +1998,12 @@ pub(super) fn read_u64_le(b: &[u8]) -> u64 {
 }
 
 /// Unranked multi-term OR walk: the union of the cursors' doc ids in
-/// ascending order, `emit` called exactly once per distinct doc. No
-/// scoring; the caller wants membership, not rank. The cursors walk by
-/// rescanning for the minimum current doc each step, unless the union is
-/// sparse enough over many terms that a heap keyed by current doc takes
-/// fewer steps ([`or_walk_prefers_heap`], [`or_walk_heap`]).
+/// ascending order. A k-way merge — each step finds the minimum current
+/// doc id across the live cursors, hands it to `emit`, and advances
+/// every cursor sitting on it (so the next minimum is strictly greater
+/// and `emit` is called exactly once per distinct doc). No scoring; the
+/// caller wants membership, not rank.
 pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
-    let doc_space = u64::from(cursors_max_doc(&cursors)) + 1;
-    if or_walk_prefers_heap(cursors.len(), df_total(&cursors), doc_space) {
-        or_walk_heap(cursors, emit);
-        return;
-    }
     loop {
         let min_doc = cursors
             .iter()
@@ -2077,7 +2072,7 @@ fn heap_beats_rescan(terms: usize, total_df: u64, rescans: u64) -> bool {
     heap_steps < terms.saturating_mul(rescans)
 }
 
-/// Whether the per-doc union walks ([`or_walk_unranked`], the atom walk in
+/// Whether the per-doc union walks ([`or_merge_unranked`], the atom walk in
 /// `Or` mode) should take the heap over `terms` walkers holding `total_df`
 /// postings in `doc_space` docs. The rescan runs once per doc of the
 /// union, which holds at most every doc and at most every posting. So a
@@ -2089,10 +2084,29 @@ pub(super) fn or_walk_prefers_heap(terms: usize, total_df: u64, doc_space: u64) 
     heap_beats_rescan(terms, total_df, doc_space.min(total_df))
 }
 
-/// The union's doc ids ([`or_walk_unranked`] collected into a `Vec`).
+/// The union's doc ids in ascending order, collected into a `Vec`: through
+/// the rescan walk ([`or_walk_unranked`]), unless the union is sparse
+/// enough over many terms that the heap walk takes fewer steps
+/// ([`or_walk_prefers_heap`], [`or_merge_heap`]).
 pub(super) fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
+    let doc_space = u64::from(cursors_max_doc(&cursors)) + 1;
+    if or_walk_prefers_heap(cursors.len(), df_total(&cursors), doc_space) {
+        return or_merge_heap(cursors);
+    }
     let mut out = Vec::new();
     or_walk_unranked(cursors, |doc| out.push(doc));
+    out
+}
+
+/// The union's doc ids through [`or_walk_heap`], into a vector of its own
+/// and out of line. Collected into one vector with the rescan in one
+/// function, the heap path cost the dense unions the rescan keeps 3 to 7%
+/// in a release build (eight and ten common terms over a million docs);
+/// apart, they ran as they do without the heap.
+#[inline(never)]
+fn or_merge_heap(cursors: Vec<TermCursor>) -> Vec<u32> {
+    let mut out = Vec::new();
+    or_walk_heap(cursors, |doc| out.push(doc));
     out
 }
 
