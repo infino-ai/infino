@@ -29,6 +29,7 @@
 
 use std::{fmt, sync::Arc};
 
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -44,7 +45,7 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use futures::stream;
+use futures::{TryStreamExt, stream};
 
 use crate::{
     superfile::fts::reader::BoolMode,
@@ -54,7 +55,7 @@ use crate::{
         query::exec::{
             common::{
                 arg_to_string, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
-                traced_tvf,
+                traced_tvf, traced_tvf_rows,
             },
             fts_exec::arg_to_bool_mode,
         },
@@ -351,10 +352,113 @@ impl ExecutionPlan for MatchExec {
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
 
+        // What the consumer reads decides how much of a hit to build. A
+        // projection of no columns at all is `COUNT(*)`: the count
+        // primitive answers it without a hit per row. One that leaves out
+        // `_id` (an aggregate over scalar columns) skips stamping stable
+        // ids, which reads an `_id` column only on a cell-packed or
+        // gapped-span file; elsewhere the hits arrive already stamped.
+        let id_column = reader.options().id_column.clone();
+        let id_idx = scalar_schema.index_of(&id_column).ok();
+        let needs_ids = match (&projection, id_idx) {
+            (None, _) => true,
+            (Some(indices), Some(id_idx)) => indices.contains(&id_idx),
+            (Some(_), None) => false,
+        };
+        let counts_only = matches!(&projection, Some(indices) if indices.is_empty());
+        let score_idx = scalar_schema.fields().len();
+        let needs_score = match &projection {
+            None => true,
+            Some(indices) => indices.contains(&score_idx),
+        };
+        let span = match &self.query {
+            MatchQuery::Token { .. } => {
+                detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
+            }
+            MatchQuery::Exact { .. } => {
+                detail_span!("tvf.exact_match", rows_out = tracing::field::Empty)
+            }
+        };
+
+        // Scalar columns only, neither `_id` nor the score: each
+        // superfile's matching rows come out as their own batch, straight
+        // from the walk to a column take, and the consumer (an aggregate,
+        // a filter) takes them in any order. The projection may name a
+        // column twice; the batches carry each distinct column once and
+        // are laid out to the projection here.
+        if !counts_only
+            && !needs_ids
+            && !needs_score
+            && let (Some(indices), MatchQuery::Token { query, mode }) =
+                (projection.clone(), query.clone())
+        {
+            let columns_schema = Arc::clone(&projected_schema);
+            let fut = async move {
+                let mut names: Vec<&str> = Vec::new();
+                for &p in &indices {
+                    let name = scalar_schema.field(p).name().as_str();
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                }
+                let per_file = reader
+                    .token_match_columns_async(&column, &query, mode, &names)
+                    .await?;
+                let mut out = Vec::with_capacity(per_file.len());
+                for batch in per_file {
+                    let columns: Vec<_> = indices
+                        .iter()
+                        .map(|&p| {
+                            let name = scalar_schema.field(p).name();
+                            let idx = batch
+                                .schema()
+                                .index_of(name)
+                                .map_err(QueryError::internal)?;
+                            Ok::<_, QueryError>(Arc::clone(batch.column(idx)))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    out.push(
+                        RecordBatch::try_new_with_options(
+                            Arc::clone(&columns_schema),
+                            columns,
+                            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                        )
+                        .map_err(QueryError::internal)?,
+                    );
+                }
+                Ok::<Vec<RecordBatch>, DataFusionError>(out)
+            };
+            let fut = traced_tvf_rows(span, fut, |batches: &Vec<RecordBatch>| {
+                batches.iter().map(RecordBatch::num_rows).sum()
+            });
+            let stream = stream::once(fut)
+                .map_ok(|batches| stream::iter(batches.into_iter().map(Ok)))
+                .try_flatten();
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                projected_schema,
+                stream,
+            )));
+        }
+        let count_schema = Arc::clone(&projected_schema);
+
         let fut = async move {
+            if counts_only && let MatchQuery::Token { query, mode } = &query {
+                let n = reader
+                    .token_match_count_async(&column, query, *mode)
+                    .await?;
+                let n = usize::try_from(n).map_err(QueryError::internal)?;
+                return RecordBatch::try_new_with_options(
+                    count_schema,
+                    Vec::new(),
+                    &RecordBatchOptions::new().with_row_count(Some(n)),
+                )
+                .map_err(|e| QueryError::internal(e).into());
+            }
             let hits = match &query {
                 MatchQuery::Token { query, mode } => {
-                    reader.token_match_async(&column, query, *mode).await
+                    reader
+                        .token_match_hits_async(&column, query, *mode, needs_ids)
+                        .await
                 }
                 MatchQuery::Exact { value } => reader.exact_match_async(&column, value).await,
             }?;
@@ -366,15 +470,6 @@ impl ExecutionPlan for MatchExec {
                 projection.as_deref(),
             )
             .await
-        };
-
-        let span = match &self.query {
-            MatchQuery::Token { .. } => {
-                detail_span!("tvf.token_match", rows_out = tracing::field::Empty)
-            }
-            MatchQuery::Exact { .. } => {
-                detail_span!("tvf.exact_match", rows_out = tracing::field::Empty)
-            }
         };
         let fut = traced_tvf(span, fut);
         let stream = stream::once(fut);
@@ -389,17 +484,21 @@ impl ExecutionPlan for MatchExec {
 mod tests {
     use std::{fmt, sync::Arc};
 
-    use arrow_array::{Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
         error::DataFusionError,
         execution::TaskContext,
         physical_plan::{DisplayFormatType, ExecutionPlan},
+        prelude::{col, lit},
     };
     use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
+    use tokio::runtime::Runtime;
 
     use super::{ExactMatchFunc, MatchExec, MatchQuery, TokenMatchFunc};
     use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, fts::reader::BoolMode},
         supertable::{
             Supertable, SupertableOptions, error::QueryError, handle::SupertableReader,
@@ -427,12 +526,15 @@ mod tests {
             .with_writer_pool(pool)
     }
 
+    fn titles_batch(titles: &[&str]) -> RecordBatch {
+        let arr = LargeStringArray::from(titles.to_vec());
+        RecordBatch::try_new(title_schema(), vec![Arc::new(arr)]).expect("batch")
+    }
+
     fn supertable_with_titles(titles: &[&str]) -> Supertable {
         let st = Supertable::create(options_title_fts()).expect("create");
         let mut w = st.writer().expect("writer");
-        let arr = LargeStringArray::from(titles.to_vec());
-        let batch = RecordBatch::try_new(title_schema(), vec![Arc::new(arr)]).expect("batch");
-        w.append(&batch).expect("append");
+        w.append(&titles_batch(titles)).expect("append");
         w.commit().expect("commit");
         st
     }
@@ -454,6 +556,131 @@ mod tests {
             "rust systems programming", // 2
             "go routines",              // 3
         ])
+    }
+
+    /// Queries whose aggregates are held to the materialized rows: a bare
+    /// term (the one the term index can count alone), a union, a `+must`
+    /// clause, and a term no row holds.
+    const AGGREGATED_QUERIES: [&str; 4] = ["rust", "rust python", "+rust systems", "nothing_here"];
+    /// A table with storage written over several commits, and the row its
+    /// delete removes: one the bare term matches, so a count that kept it
+    /// would disagree with the rows.
+    const STORED_COMMITS: [&[&str]; 3] = [
+        &["rust async runtime", "python data science"],
+        &["rust systems programming", "go routines"],
+        &["rust rust rust", "python rust bindings"],
+    ];
+    const DELETED_TITLE: &str = "rust systems programming";
+
+    /// `COUNT(*)` over the match function projects no column and is
+    /// answered by the count primitive; it must equal the row count the
+    /// materialized match gives, and an aggregate over a scalar column
+    /// (which projects no `_id`), a grouped aggregate and a projection
+    /// naming a column twice must equal the same over the materialized
+    /// rows.
+    fn assert_aggregates_equal_the_rows(st: &Supertable) {
+        for query in AGGREGATED_QUERIES {
+            let tvf = format!("token_match('title', '{query}')");
+            let counted = rows(st, &format!("SELECT _id FROM {tvf}"));
+            let batches = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!("SELECT count(*) AS n FROM {tvf}"))
+                .expect("count(*)");
+            let n = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0);
+            assert_eq!(n as usize, counted, "count(*) over {tvf}");
+            // A scalar aggregate projects `title` and no `_id`: the hits
+            // leave unstamped and the rows must still be the matched ones.
+            let longest = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!("SELECT max(length(title)) AS m FROM {tvf}"))
+                .expect("max over the match");
+            let via_rows = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT max(length(title)) AS m FROM (SELECT title FROM {tvf} ORDER BY _id)"
+                ))
+                .expect("max over the rows");
+            assert_eq!(
+                format!("{:?}", longest[0].column(0)),
+                format!("{:?}", via_rows[0].column(0)),
+                "max over {tvf}"
+            );
+            // A grouped aggregate and a projection naming a column twice go
+            // the same per-superfile way; the rows must still be the matched
+            // ones under every grouping.
+            let grouped = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT length(title) AS l, count(*) AS n, min(title) AS t FROM {tvf} \
+                     GROUP BY length(title) ORDER BY l"
+                ))
+                .expect("grouped over the match");
+            let grouped_via_rows = st
+                .reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT length(title) AS l, count(*) AS n, min(title) AS t \
+                     FROM (SELECT title FROM {tvf} ORDER BY _id) GROUP BY length(title) ORDER BY l"
+                ))
+                .expect("grouped over the rows");
+            assert_eq!(
+                format!("{grouped:?}"),
+                format!("{grouped_via_rows:?}"),
+                "grouped aggregate over {tvf}"
+            );
+            let twice = rows(st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
+            assert_eq!(twice, counted, "a column named twice over {tvf}");
+        }
+    }
+
+    #[test]
+    fn aggregates_over_the_match_function_equal_the_materialized_rows() {
+        let st = supertable_with_titles(&[
+            "rust async runtime",
+            "python data science",
+            "rust systems programming",
+            "go routines",
+            "rust rust rust",
+        ]);
+        assert_aggregates_equal_the_rows(&st);
+    }
+
+    /// The same agreement on a table with storage, which keeps a term
+    /// index: over several commits a bare term is counted from the
+    /// document frequencies the index holds, and once a delete lands the
+    /// count falls back to the fan-out, which leaves the deleted row out.
+    #[test]
+    fn aggregates_over_the_match_function_on_stored_superfiles_equal_the_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_title_fts().with_storage(storage)).expect("create");
+        for titles in STORED_COMMITS {
+            let mut w = st.writer().expect("writer");
+            w.append(&titles_batch(titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        let index = Runtime::new()
+            .expect("runtime")
+            .block_on(st.reader().expect("reader").manifest().term_index())
+            .expect("term index readable");
+        assert!(index.is_some(), "a table with storage keeps a term index");
+        assert_aggregates_equal_the_rows(&st);
+
+        let stats = st
+            .delete(col("title").eq(lit(DELETED_TITLE)))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+        assert_aggregates_equal_the_rows(&st);
     }
 
     #[test]

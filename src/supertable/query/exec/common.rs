@@ -95,10 +95,24 @@ pub(crate) fn traced_tvf<F>(span: Span, search: F) -> impl Future<Output = F::Ou
 where
     F: Future<Output = DfResult<RecordBatch>>,
 {
+    traced_tvf_rows(span, search, RecordBatch::num_rows)
+}
+
+/// [`traced_tvf`] for a search whose output counts its rows through `rows`:
+/// one that comes out as several batches, one per superfile, records their
+/// sum.
+pub(crate) fn traced_tvf_rows<T, F>(
+    span: Span,
+    search: F,
+    rows: fn(&T) -> usize,
+) -> impl Future<Output = F::Output>
+where
+    F: Future<Output = DfResult<T>>,
+{
     async move {
         let out = search.await;
-        if let Ok(batch) = &out {
-            record("rows_out", batch.num_rows());
+        if let Ok(output) = &out {
+            record("rows_out", rows(output));
         }
         out
     }
@@ -789,12 +803,17 @@ pub(crate) async fn resolve_hits(
     };
 
     // Assemble output columns in the projection's emit order, each
-    // drawn from the decoded scalar batch or the synthesized score.
-    let score = Arc::new(Float32Array::from_iter_values(hits.iter().map(|h| h.score))) as ArrayRef;
+    // drawn from the decoded scalar batch or the synthesized score. The
+    // score array is one float per hit, built the first time a
+    // projection asks for it.
+    let mut score: Option<ArrayRef> = None;
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(requested.len());
     for &p in &requested {
         if p == score_idx {
-            columns.push(Arc::clone(&score));
+            let built = score.get_or_insert_with(|| {
+                Arc::new(Float32Array::from_iter_values(hits.iter().map(|h| h.score))) as ArrayRef
+            });
+            columns.push(Arc::clone(built));
         } else {
             let name = scalar_schema.field(p).name();
             let rb = resolved
@@ -992,8 +1011,6 @@ async fn resolve_columns(
     let store = &manifest.options.store;
     let disk_cache = manifest.options.disk_cache.as_ref();
     let storage = manifest.options.storage.as_ref();
-    let table = manifest.table_schema();
-    let legacy = manifest.options.legacy_names();
     let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
     let schema_id = manifest.table_schema().schema_id();
@@ -1055,21 +1072,13 @@ async fn resolve_columns(
     // A file whose columns match the table's reads by name as it always
     // has; any other file reads through its map: the table's columns are
     // projected under the file's names and reshaped to the table's.
-    let adapter_for = |rd: &SuperfileReader| -> Option<FileSchemaMap> {
-        let map = FileSchemaMap::new(
-            &table,
-            &manifest.options.id_column,
-            &PhysicalSchema::of_reader(rd, &legacy),
-        );
-        (!map.is_identity()).then_some(map)
-    };
     let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
         Vec::new();
     let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32], Option<FileSchemaMap>)> =
         Vec::new();
     for (i, rd) in &opened {
         let locals = &seg_locals[*i];
-        let adapter = adapter_for(rd);
+        let adapter = file_adapter(manifest, rd);
         if rd.can_take_by_local_doc_ids() {
             warm_inputs.push((*i, Arc::clone(rd), locals.clone(), adapter));
         } else {
@@ -1096,14 +1105,8 @@ async fn resolve_columns(
                     .map(|(i, sf, locals, adapter)| {
                         // Per-superfile bracket: the resident decode is
                         // this wave's kernel section, one chunk per file.
-                        let (batch, ns) = timed_section(|| match &adapter {
-                            None => sf.take_by_local_doc_ids(&locals, &name_refs),
-                            Some(map) => {
-                                let physical = map.stored_names(&name_refs);
-                                let read = sf.take_by_local_doc_ids(&locals, &physical)?;
-                                map.adapt(&read, &out_schema)
-                                    .map_err(|e| ReadError::Columnar(e.to_string()))
-                            }
+                        let (batch, ns) = timed_section(|| {
+                            take_resident_file(&sf, &locals, &name_refs, &adapter, &out_schema)
                         });
                         batch.map(|batch| ((i, batch), ns))
                     })
@@ -1119,15 +1122,7 @@ async fn resolve_columns(
     let out_schema_ref = &out_schema;
     let cold_wave = try_join_all(cold_units.into_iter().map(
         |(i, rd, locals, adapter)| async move {
-            let batch = match &adapter {
-                None => take_rows_byte_source(rd, locals, names).await?,
-                Some(map) => {
-                    let physical = map.stored_names(names);
-                    let read = take_rows_byte_source(rd, locals, &physical).await?;
-                    map.adapt(&read, out_schema_ref)
-                        .map_err(|e| DataFusionError::Execution(e.to_string()))?
-                }
-            };
+            let batch = take_lazy_file(rd, locals, names, &adapter, out_schema_ref).await?;
             Ok::<_, DataFusionError>((i, batch))
         },
     ));
@@ -1170,12 +1165,101 @@ async fn resolve_columns(
         .map_err(|error| QueryError::internal(error).into())
 }
 
+/// The map from a file's own column names to the table's, when the file
+/// was written under different ones (before a rename); `None` when the
+/// file's columns are the table's and reads need no translation.
+fn file_adapter(manifest: &ManifestSnapshot, rd: &SuperfileReader) -> Option<FileSchemaMap> {
+    let map = FileSchemaMap::new(
+        &manifest.table_schema(),
+        &manifest.options.id_column,
+        &PhysicalSchema::of_reader(rd, &manifest.options.legacy_names()),
+    );
+    (!map.is_identity()).then_some(map)
+}
+
+/// `names` at `locals` of one resident superfile, under the table's
+/// column names: a CPU-bound Parquet page decode over resident bytes, so
+/// callers run it on the reader pool.
+fn take_resident_file(
+    rd: &SuperfileReader,
+    locals: &[u32],
+    names: &[&str],
+    adapter: &Option<FileSchemaMap>,
+    out_schema: &SchemaRef,
+) -> Result<RecordBatch, ReadError> {
+    match adapter {
+        None => rd.take_by_local_doc_ids(locals, names),
+        Some(map) => {
+            let physical = map.stored_names(names);
+            let read = rd.take_by_local_doc_ids(locals, &physical)?;
+            map.adapt(&read, out_schema)
+                .map_err(|e| ReadError::Columnar(e.to_string()))
+        }
+    }
+}
+
+/// `names` at `locals` of one lazily opened superfile, streamed through
+/// its byte source so the disk cache's block layer serves repeated reads.
+async fn take_lazy_file(
+    rd: &SuperfileReader,
+    locals: &[u32],
+    names: &[&str],
+    adapter: &Option<FileSchemaMap>,
+    out_schema: &SchemaRef,
+) -> DfResult<RecordBatch> {
+    match adapter {
+        None => take_rows_byte_source(rd, locals, names).await,
+        Some(map) => {
+            let physical = map.stored_names(names);
+            let read = take_rows_byte_source(rd, locals, &physical).await?;
+            map.adapt(&read, out_schema)
+                .map_err(|e| DataFusionError::Execution(e.to_string()))
+        }
+    }
+}
+
+/// `names` at `locals` of one superfile, for a caller that wants the rows
+/// of each superfile as its own batch rather than a global hit set: the
+/// resident decode goes to the reader pool, a lazy reader streams, and the
+/// decode is counted as kernel CPU like [`resolve_hits`]'s. The batch
+/// carries `out_schema`, [`hit_output_schema`] for `names`.
+pub(crate) async fn take_file_columns(
+    manifest: &ManifestSnapshot,
+    rd: &Arc<SuperfileReader>,
+    locals: Vec<u32>,
+    names: &[&str],
+    out_schema: &SchemaRef,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> DfResult<RecordBatch> {
+    let adapter = file_adapter(manifest, rd);
+    if !rd.can_take_by_local_doc_ids() {
+        return take_lazy_file(rd, &locals, names, &adapter, out_schema).await;
+    }
+    let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+    let out_schema = Arc::clone(out_schema);
+    let rd = Arc::clone(rd);
+    let (batch, ns) = run_on_pool(
+        Some(&manifest.options.reader_pool),
+        "file columns decode: reader pool dropped result",
+        move || {
+            let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+            timed_section(|| take_resident_file(&rd, &locals, &name_refs, &adapter, &out_schema))
+        },
+    )
+    .await
+    .map_err(QueryError::internal)?;
+    if let Some(stats) = op_stats {
+        stats.add_kernel_cpu_ns(ns);
+    }
+    batch.map_err(|e| QueryError::from(e).into())
+}
+
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.
 /// For disk-cache readers this preserves the block-cache layer instead of
 /// bypassing it with a new object-store handle on every scalar projection.
 /// The fields a hit batch carries for `names`, in that order: the table's
 /// stored columns, which is the shape every adapted file reads into.
-fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
+pub(crate) fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<SchemaRef> {
     let fields = names
         .iter()
         .map(|name| {
@@ -2436,6 +2520,55 @@ mod tests {
             "scalar resolution must cold-fetch lazy readers; got {}",
             cache.stats().n_cold_fetches,
         );
+    }
+
+    /// An aggregate over the match function that projects scalar columns
+    /// only reads each superfile's rows through the lazy take on a cold
+    /// reopen, and leaves a deleted row out as the hit path does: it equals
+    /// the same aggregate over the materialized rows.
+    #[test]
+    fn match_columns_cold_path_leaves_deleted_rows_out() {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        commit_titles_to(&storage);
+        let producer =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("open producer");
+        let stats = producer
+            .delete(col("title").eq(lit("rust systems")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+        drop(producer);
+
+        let (cache, consumer) = open_cold(Arc::clone(&storage), &cache_dir);
+        let reader = consumer.reader().expect("reader");
+        let scalar_only = reader
+            .query_sql(
+                "SELECT count(title) AS n, max(length(title)) AS m \
+                 FROM token_match('title', 'rust')",
+            )
+            .expect("aggregate over the match");
+        assert!(
+            cache.stats().n_cold_fetches >= 1,
+            "the scalar-only take must cold-fetch lazy readers; got {}",
+            cache.stats().n_cold_fetches,
+        );
+        let via_rows = reader
+            .query_sql(
+                "SELECT count(title) AS n, max(length(title)) AS m \
+                 FROM (SELECT title FROM token_match('title', 'rust') ORDER BY _id)",
+            )
+            .expect("aggregate over the rows");
+        assert_eq!(format!("{scalar_only:?}"), format!("{via_rows:?}"));
+        let n = scalar_only[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is Int64")
+            .value(0);
+        assert_eq!(n, 1, "only the live 'rust' row is counted");
     }
 
     #[test]
