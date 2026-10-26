@@ -1487,11 +1487,16 @@ impl SupertableReader {
                 // rather than three. A read that fails here is read again by
                 // the kernel's own entry, which reports it.
                 let prewarm = async {
-                    if let Some(fts) = r.fts()
-                        && let Err(error) = fts.prewarm_scoring(&column_arc).await
-                    {
-                        debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
-                    }
+                    let scoring = async {
+                        if let Some(fts) = r.fts()
+                            && let Err(error) = fts.prewarm_scoring(&column_arc).await
+                        {
+                            debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
+                        }
+                    };
+                    // The id sidecar's directory too, so resolving this
+                    // superfile's hits costs one round trip for their blocks.
+                    join(scoring, r.prewarm_id_directory()).await;
                 };
                 let (memo, ()): (Option<Arc<FetchedTermMemo>>, ()) = join(memo, prewarm).await;
                 // Share the global kth-best floor with every superfile —

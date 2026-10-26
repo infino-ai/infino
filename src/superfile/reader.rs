@@ -39,7 +39,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use futures::{FutureExt, future::BoxFuture};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, try_join_all},
+};
 use parquet::{
     arrow::{
         ProjectionMask,
@@ -75,7 +78,7 @@ use crate::{
             tokenize::{Phrase, Tokenizer},
         },
         id_space::RowId,
-        ids::PackedIds,
+        ids::{self, PackedIds},
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -1484,7 +1487,117 @@ impl SuperfileReader {
         sidecar: &IdSidecar,
         local_doc_ids: &[u32],
     ) -> Result<ArrayRef, ReadError> {
-        let ids = sidecar.ids(local_doc_ids)?;
+        self.id_array(sidecar.ids(local_doc_ids)?)
+    }
+
+    /// The `_id` of a few rows from the packed stable-id sidecar of a lazily
+    /// opened superfile, reading its directory and only the blocks the rows
+    /// fall in — a couple of kilobytes each — rather than the Parquet page
+    /// index and the pages that hold them. `None` when the superfile has no
+    /// packed sidecar or its sidecar was found broken; a read that fails is
+    /// an error the caller answers from Parquet instead, and a block that
+    /// does not decode marks the sidecar broken, as a whole-sidecar read
+    /// would, so later reads skip it.
+    pub(crate) async fn ids_from_sidecar_blocks(
+        &self,
+        local_doc_ids: &[u32],
+    ) -> Result<Option<ArrayRef>, ReadError> {
+        let Some(loc) = self.id_sidecar else {
+            return Ok(None);
+        };
+        if !loc.packed || self.id_sidecar_broken.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if let Some(&doc_id) = local_doc_ids
+            .iter()
+            .find(|&&doc| u64::from(doc) >= self.n_docs)
+        {
+            return Err(ReadError::DocIdOutOfRange {
+                doc_id,
+                n_docs: self.n_docs,
+            });
+        }
+        let n_docs = self.n_docs as usize;
+        let source = self.byte_source();
+        let fetch = |what: &'static str| {
+            move |source: LazyByteSourceError| ReadError::RangeFetch { what, source }
+        };
+        let dir_len = (ids::directory_len(n_docs) as u64).min(loc.len);
+        let dir_bytes = source
+            .range(loc.offset, dir_len)
+            .await
+            .map_err(fetch("stable-id sidecar directory fetch"))?;
+        let malformed = |what: String| {
+            self.mark_id_sidecar_broken();
+            ReadError::MalformedKv(what)
+        };
+        let dir = ids::PackedDirectory::open(&dir_bytes, n_docs).map_err(malformed)?;
+        let mut sorted: Vec<u32> = local_doc_ids.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let mut blocks: Vec<usize> = sorted
+            .iter()
+            .map(|&d| d as usize / ids::BLOCK_DOCS)
+            .collect();
+        blocks.dedup();
+        let sidecar_len = loc.len as usize;
+        let ranges: Vec<Range<usize>> = blocks
+            .iter()
+            .map(|&b| {
+                dir.block_range(b, sidecar_len).ok_or_else(|| {
+                    malformed(format!("stable-id sidecar block {b} is out of place"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let bodies = try_join_all(
+            ranges
+                .iter()
+                .map(|r| source.range(loc.offset + r.start as u64, r.len() as u64)),
+        )
+        .await
+        .map_err(fetch("stable-id sidecar block fetch"))?;
+        let mut by_doc: Vec<i128> = Vec::with_capacity(sorted.len());
+        let mut at = 0usize;
+        for (&b, body) in blocks.iter().zip(&bodies) {
+            let end = sorted[at..]
+                .iter()
+                .position(|&d| d as usize / ids::BLOCK_DOCS != b)
+                .map_or(sorted.len(), |n| at + n);
+            ids::ids_in_block(
+                body,
+                b,
+                n_docs,
+                dir.n_blocks(),
+                &sorted[at..end],
+                &mut by_doc,
+            )
+            .ok_or_else(|| malformed(format!("stable-id sidecar block {b} is malformed")))?;
+            at = end;
+        }
+        let ids: Vec<i128> = local_doc_ids
+            .iter()
+            .map(|d| by_doc[sorted.binary_search(d).expect("every doc was sorted in")])
+            .collect();
+        self.id_array(ids).map(Some)
+    }
+
+    /// Read the packed sidecar's directory into the byte source's cache, so a
+    /// later [`Self::ids_from_sidecar_blocks`] costs one round trip for its
+    /// blocks. Nothing to do without a packed sidecar; a failed read is left
+    /// to that later read to report.
+    pub(crate) async fn prewarm_id_directory(&self) {
+        let Some(loc) = self.id_sidecar else {
+            return;
+        };
+        if !loc.packed {
+            return;
+        }
+        let dir_len = (ids::directory_len(self.n_docs as usize) as u64).min(loc.len);
+        let _ = self.byte_source().range(loc.offset, dir_len).await;
+    }
+
+    /// The `_id` column over `ids`, typed as the table declares it.
+    fn id_array(&self, ids: Vec<i128>) -> Result<ArrayRef, ReadError> {
         let id_idx = self
             .schema
             .index_of(&self.id_column)
@@ -3053,6 +3166,44 @@ mod tests {
             .expect("decimal ids");
         let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
         assert_eq!(got, expected, "resolved ids match the row-order oracle");
+    }
+
+    /// A lazily opened superfile resolves a few rows' `_id` from the packed
+    /// sidecar's blocks alone — the directory and the blocks the rows fall
+    /// in — and gets what the row-order oracle says; a damaged block is an
+    /// error, and marks the sidecar broken so later reads go to Parquet.
+    #[tokio::test]
+    async fn stable_id_sidecar_blocks_serve_a_few_rows_of_a_lazy_reader() {
+        let (bytes, ids) = build_shuffled_id_superfile();
+        let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
+        let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+        let lazy = lazy_shuffled_id_reader(bytes.clone()).await;
+        let got = lazy
+            .ids_from_sidecar_blocks(&locals)
+            .await
+            .expect("read")
+            .expect("a packed sidecar serves");
+        let got = got
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
+        assert_eq!(got, expected, "ids from the blocks match the oracle");
+
+        let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
+        let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));
+        let lazy = lazy_shuffled_id_reader(damaged).await;
+        assert!(
+            lazy.ids_from_sidecar_blocks(&[4999]).await.is_err(),
+            "a row in the damaged block is an error, for the Parquet fallback"
+        );
+        assert!(
+            lazy.ids_from_sidecar_blocks(&[0, 37])
+                .await
+                .expect("read")
+                .is_none(),
+            "a sidecar found broken is not read again"
+        );
     }
 
     /// With `_id` alongside a scalar column, the sidecar serves `_id` and the
