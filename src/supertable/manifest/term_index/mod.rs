@@ -727,7 +727,7 @@ pub(crate) fn spill_tiers(
 /// gets.
 async fn fetch_verified(
     storage: &dyn StorageProvider,
-    disk_cache: Option<&ManifestDiskCache>,
+    disk_cache: Option<&Arc<ManifestDiskCache>>,
     uri: &str,
     hash: &ContentHash,
 ) -> Result<Bytes, TermIndexError> {
@@ -749,7 +749,7 @@ async fn fetch_verified(
         return Err(TermIndexError::HashMismatch);
     }
     if let Some(cache) = disk_cache {
-        cache.put(*hash, bytes.as_ref()).await;
+        cache.put(*hash, bytes.clone()).await;
     }
     Ok(bytes)
 }
@@ -904,7 +904,7 @@ impl TermIndex {
     ) -> Result<Self, TermIndexError> {
         let bytes = fetch_verified(
             storage.as_ref(),
-            disk_cache.as_deref(),
+            disk_cache.as_ref(),
             &reference.uri,
             &reference.content_hash,
         )
@@ -1157,7 +1157,7 @@ impl TermIndex {
         }
         let bytes = fetch_verified(
             self.storage.as_ref(),
-            self.disk_cache.as_deref(),
+            self.disk_cache.as_ref(),
             &slice_uri(hash),
             hash,
         )
@@ -1448,10 +1448,7 @@ mod tests {
         time::Duration,
     };
 
-    use async_trait::async_trait;
-    use object_store::MultipartUpload;
     use tempfile::TempDir;
-    use tokio::time::sleep;
 
     use super::{
         build::TIER_INLINE_MAX,
@@ -1460,7 +1457,7 @@ mod tests {
     };
     use crate::{
         Bm25SearchOptions, CompactionSettings, InfinoError, OptimizeOptions, OptimizeSteps,
-        storage::{LocalFsStorageProvider, ObjectMeta},
+        storage::LocalFsStorageProvider,
         superfile::fts::bm25,
         supertable::{
             Supertable,
@@ -1477,6 +1474,7 @@ mod tests {
             copy_dir_recursive,
             fault_storage::{FaultOp, FaultStorage},
             fid, old_format_fts_fixture, open_old_format_fts_fixture,
+            slow_storage::SlowStorage,
         },
         utils::terms::DictEntry,
     };
@@ -6069,8 +6067,8 @@ mod tests {
         );
     }
 
-    /// How long [`SlowGets`] holds each whole-object read open, so reads
-    /// issued together are seen overlapping.
+    /// How long the slow store holds each read open, so reads issued
+    /// together are seen overlapping.
     const SLOW_GET_DELAY: Duration = Duration::from_millis(20);
     /// Terms in the batched-lookup test, enough to span many small slices.
     const BATCH_TERMS: usize = 400;
@@ -6088,70 +6086,6 @@ mod tests {
     /// Hex digits in a random key — a 32-byte digest, the shape of a
     /// content-hash record key.
     const RANDOM_KEY_HEX_DIGITS: usize = 64;
-
-    /// Counts whole-object reads and the most of them ever in flight at
-    /// once, holding each open briefly so overlapping reads are visible.
-    #[derive(Debug)]
-    struct SlowGets {
-        inner: Arc<dyn StorageProvider>,
-        gets: AtomicUsize,
-        in_flight: AtomicUsize,
-        max_in_flight: AtomicUsize,
-    }
-
-    impl SlowGets {
-        fn wrap(inner: Arc<dyn StorageProvider>) -> Arc<Self> {
-            Arc::new(Self {
-                inner,
-                gets: AtomicUsize::new(0),
-                in_flight: AtomicUsize::new(0),
-                max_in_flight: AtomicUsize::new(0),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl StorageProvider for SlowGets {
-        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
-            self.inner.head(uri).await
-        }
-        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-            sleep(SLOW_GET_DELAY).await;
-            let out = self.inner.get(uri).await;
-            self.in_flight.fetch_sub(1, Ordering::SeqCst);
-            out
-        }
-        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
-            self.inner.get_range(uri, range).await
-        }
-        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
-            self.inner.put_overwrite(uri, bytes).await
-        }
-        async fn put_atomic(
-            &self,
-            uri: &str,
-            bytes: Bytes,
-        ) -> Result<Option<String>, StorageError> {
-            self.inner.put_atomic(uri, bytes).await
-        }
-        async fn put_if_match(
-            &self,
-            uri: &str,
-            bytes: Bytes,
-            expected_etag: Option<&str>,
-        ) -> Result<Option<String>, StorageError> {
-            self.inner.put_if_match(uri, bytes, expected_etag).await
-        }
-        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
-            self.inner.put_multipart(uri).await
-        }
-        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
-            self.inner.delete(uri).await
-        }
-    }
 
     /// A batched lookup answers exactly what one-by-one lookups do — runs
     /// concatenated across segments in segment order, absent terms empty,
@@ -6200,7 +6134,7 @@ mod tests {
         asked.push("absent");
         asked.push(terms[0].as_str());
 
-        let slow = SlowGets::wrap(Arc::clone(&local));
+        let slow = SlowStorage::wrap(Arc::clone(&local), SLOW_GET_DELAY);
         let batched_index = TermIndex::new(root.clone(), String::new(), slow.clone(), None);
         let batched = batched_index
             .runs_many(fid("body"), &asked)
@@ -6241,16 +6175,12 @@ mod tests {
             needed.len() > SLICE_FETCH_CONCURRENCY,
             "test spans many slices"
         );
-        assert_eq!(
-            slow.gets.load(Ordering::SeqCst),
-            needed.len(),
-            "each needed slice fetched once"
-        );
+        assert_eq!(slow.reads(), needed.len(), "each needed slice fetched once");
         assert!(
-            slow.max_in_flight.load(Ordering::SeqCst) > 1,
+            slow.max_in_flight() > 1,
             "slices are fetched together, not one after another"
         );
-        assert!(slow.max_in_flight.load(Ordering::SeqCst) <= SLICE_FETCH_CONCURRENCY);
+        assert!(slow.max_in_flight() <= SLICE_FETCH_CONCURRENCY);
     }
 
     /// Random keys share almost no prefix, so front-coding keeps nearly all

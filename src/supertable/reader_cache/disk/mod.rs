@@ -753,12 +753,13 @@ pub(crate) mod test_support {
 
     /// Storage that records every ranged GET, so a test can check which bytes left object storage.
     /// [`Self::pause_next_read`] parks the next ranged GET until [`Self::resume`], so a test can act
-    /// in the middle of a download.
+    /// in the middle of a download; [`Self::pause_read_after`] lets some go by first.
     #[derive(Debug)]
     pub(crate) struct RecordingStorage {
         inner: Arc<dyn StorageProvider>,
         ranges: Mutex<Vec<Range<u64>>>,
-        pause_next: AtomicBool,
+        /// Ranged GETs to let through before parking one; `None` parks none.
+        pause_after: Mutex<Option<usize>>,
         paused: AtomicBool,
         resume: Notify,
     }
@@ -768,7 +769,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 inner,
                 ranges: Mutex::new(Vec::new()),
-                pause_next: AtomicBool::new(false),
+                pause_after: Mutex::new(None),
                 paused: AtomicBool::new(false),
                 resume: Notify::new(),
             })
@@ -783,7 +784,28 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn pause_next_read(&self) {
-            self.pause_next.store(true, Ordering::SeqCst);
+            self.pause_read_after(0);
+        }
+
+        /// Park the ranged GET that follows the next `reads`.
+        pub(crate) fn pause_read_after(&self, reads: usize) {
+            *self.pause_after.lock().expect("pause_after") = Some(reads);
+        }
+
+        /// Whether this ranged GET is the one to park, counting it off.
+        fn take_pause(&self) -> bool {
+            let mut pause_after = self.pause_after.lock().expect("pause_after");
+            match *pause_after {
+                Some(0) => {
+                    *pause_after = None;
+                    true
+                }
+                Some(reads) => {
+                    *pause_after = Some(reads - 1);
+                    false
+                }
+                None => false,
+            }
         }
 
         pub(crate) fn is_paused(&self) -> bool {
@@ -805,7 +827,7 @@ pub(crate) mod test_support {
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             self.ranges.lock().expect("ranges").push(range.clone());
-            if self.pause_next.swap(false, Ordering::SeqCst) {
+            if self.take_pause() {
                 self.paused.store(true, Ordering::SeqCst);
                 self.resume.notified().await;
             }
@@ -981,6 +1003,31 @@ pub(crate) mod test_support {
         )
         .expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Rows in [`multi_block_vector_superfile_bytes`]: enough that the vector section sits outside
+    /// the tail a lazy open reads first.
+    const MULTI_BLOCK_VECTOR_ROWS: u64 = 4_000;
+
+    /// A vector superfile several cache blocks long. A lazy open without size hints reads the tail,
+    /// then the vector section's header near the front of the file through its block source.
+    pub(crate) fn multi_block_vector_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids((1..=MULTI_BLOCK_VECTOR_ROWS).collect::<Vec<u64>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).expect("batch");
+        let embeddings: Vec<f32> = (0..MULTI_BLOCK_VECTOR_ROWS * 16)
+            .map(|i| (i.wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0)
+            .collect();
+        b.add_batch(&batch, &[embeddings.as_slice()])
+            .expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }
 

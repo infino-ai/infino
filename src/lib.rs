@@ -171,7 +171,8 @@ pub use catalog::Supertable;
 /// Catalog entry points and handle: open a `Connection`, then create /
 /// open / drop / list tables.
 pub use catalog::{
-    ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, connect, connect_with,
+    ColdFetchMode, ConnectOptions, Connection, FtsField, IndexSpec, QueryCancel, connect,
+    connect_with,
 };
 pub use config::{
     CompactionSettings, CompactionSteps, GcSettings, OptimizeOptions, OptimizeSteps,

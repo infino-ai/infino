@@ -329,13 +329,16 @@ impl DiskCacheStore {
             return Ok(None);
         }
 
-        // The scan already counted this file's bytes. A file it never saw (written later by another
-        // process) is charged like a fetch.
-        let counted = self.unindexed.remove(uri).is_some();
-        let reservation = if counted {
-            None
-        } else {
-            Some(self.reserve(size).await?)
+        // The scan already counted this file's bytes, and the open takes that charge over; a file
+        // it never saw (written later by another process) is charged like a fetch. Either way the
+        // charge is given back unless an entry is admitted. An open that fails, or is dropped
+        // midway (a cancelled query, while a holed copy reads its vector header), leaves the file
+        // on disk uncounted until its next open or a restart's scan counts it again. Putting the
+        // scan's record back instead could count it twice, were a concurrent open admitting the
+        // same file meanwhile.
+        let reservation = match self.unindexed.remove(uri) {
+            Some(_) => self.adopt_charge(size),
+            None => self.reserve(size).await?,
         };
 
         let opened = if holed {
@@ -354,9 +357,7 @@ impl DiskCacheStore {
                 // Two racing reuses of one URI can both admit; admission frees the loser's bytes.
                 let entry = self.admit_entry(*uri, entry);
 
-                if let Some(r) = reservation {
-                    r.commit();
-                }
+                reservation.commit();
 
                 self.current_bytes.fetch_sub(uncharged, Ordering::Release);
 
@@ -365,10 +366,8 @@ impl DiskCacheStore {
                 Ok(Some(entry))
             }
             Err(e) => {
-                // A dropped reservation frees itself; scan-counted bytes are given back by hand.
-                if counted {
-                    self.current_bytes.fetch_sub(size, Ordering::Release);
-                }
+                // The reservation, dropped here, gives the charge back.
+                drop(reservation);
 
                 tracing::warn!(target: "infino::cache", uri = %uri.0, err = ?e, "evict: cache file failed to open, discarding + re-fetching");
 
@@ -411,13 +410,15 @@ impl DiskCacheStore {
         let _ = fs::remove_file(self.blocks_idx_path(uri));
     }
 
-    /// Keep charging a dropped lazy entry's `.blocks` file. Its source releases its own bytes on
-    /// drop but leaves the file for a later open to adopt; untracked, the file would sit on disk
-    /// outside the budget, where eviction cannot reach it.
-    pub(crate) fn retain_block_file(&self, uri: &SuperfileUri, entry: &CachedEntry, now_us: u64) {
-        let Some(source) = entry.block_source() else {
-            return;
-        };
+    /// Keep charging the `.blocks` file of a dropped lazy entry's `source`. The source releases its
+    /// own bytes on drop but leaves the file for a later open to adopt; untracked, the file would
+    /// sit on disk outside the budget, where eviction cannot reach it.
+    pub(crate) fn retain_block_file(
+        &self,
+        uri: &SuperfileUri,
+        source: &BlockCachedSource,
+        now_us: u64,
+    ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
         if filled == 0 {
             return;
@@ -430,6 +431,25 @@ impl DiskCacheStore {
         if let Some(prior) = self.block_files.insert(*uri, file) {
             self.current_bytes
                 .fetch_sub(prior.size_bytes, Ordering::Release);
+        }
+    }
+
+    /// [`Self::retain_block_file`] for a block source dropped before its entry was admitted (an
+    /// open that failed, was cancelled, or lost its slot to a whole file). Such a source writes no
+    /// blocks, so what it holds is a file it adopted, whose record it took over. Skipped when a
+    /// lazy entry holds `uri`, whose own source owns the path, and when the path no longer names
+    /// the file this source adopted.
+    pub(crate) fn retain_unadmitted_block_file(
+        &self,
+        uri: &SuperfileUri,
+        source: &BlockCachedSource,
+    ) {
+        let lazy_entry_owns_path = self
+            .cached
+            .get(uri)
+            .is_some_and(|entry| entry.block_source().is_some());
+        if !lazy_entry_owns_path && source.path_names_its_file() {
+            self.retain_block_file(uri, source, self.now_us());
         }
     }
 
