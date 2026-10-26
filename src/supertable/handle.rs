@@ -2579,6 +2579,13 @@ impl SupertableReader {
         &self.inner.decoded_scalar_cache
     }
 
+    /// The table state this reader shares with every other reader and
+    /// writer of its handle, for a task that outlives the reader's borrow
+    /// and wants the decoded-scalar cache or the options from it.
+    pub(super) fn shared_inner(&self) -> Arc<SupertableInner> {
+        Arc::clone(&self.inner)
+    }
+
     /// Per-generation global BM25 idf cache shared across every reader
     /// minted from this supertable — see [`GlobalIdfCache`].
     pub(crate) fn global_idf_cache(&self) -> &GlobalIdfCache {

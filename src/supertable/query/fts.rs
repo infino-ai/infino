@@ -140,7 +140,9 @@ use crate::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
-            exec::common::{resolve_hits_named, take_rows_byte_source},
+            exec::common::{
+                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+            },
             prune::{PruneLeaf, select_superfiles},
         },
         reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
@@ -268,6 +270,85 @@ impl Default for UnrankedMatchSet {
 impl UnrankedMatchSet {
     fn has_phrases(&self) -> bool {
         !self.phrases.is_empty()
+    }
+}
+
+/// One parsed unranked match, ready to run against any of its superfiles:
+/// the terms and phrases on each side of the negation, the index
+/// locations that let a superfile skip its dictionary, and the statistics
+/// sink. Shared by the walks that produce hits and the one that produces
+/// columns, so the two cannot drift apart in what they match.
+struct MatchKernel {
+    /// The matched column's field id, which finds the column under the
+    /// name a file written before a rename labelled it with.
+    column_field_id: Option<FieldId>,
+    column: String,
+    mode: BoolMode,
+    /// Any phrase atom, matched or negated, takes the phrase-aware walk.
+    phrase_involved: bool,
+    has_negatives: bool,
+    terms: Vec<String>,
+    phrases: Vec<Phrase<String>>,
+    negatives: Vec<String>,
+    negative_phrases: Vec<Phrase<String>>,
+    locations: IndexLocations,
+    op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+}
+
+impl MatchKernel {
+    /// The rows of superfile `suid`, read through `r`, that the match
+    /// keeps: the positive walk minus any row a negated atom reaches.
+    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+        // A file written before a rename labels the column as it was then,
+        // and its dictionary is keyed by that label; the id is what finds
+        // the column in either file.
+        let column = r
+            .column_alias(self.column_field_id, &self.column)
+            .to_owned();
+        let memo = memo_from_locations(r, &self.locations, suid).await;
+        let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
+        // Any phrase atom (match or negated) takes the phrase-aware walk;
+        // plain-token queries keep the optimized token_match path.
+        let (docs, mut work) = match self.phrase_involved {
+            true => {
+                r.atoms_match_ids(&column, &refs, &self.phrases, self.mode)
+                    .await?
+            }
+            false => {
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                    .await?
+            }
+        };
+        // Drop any positive match that also carries a negated atom (union
+        // of the negatives). The df / count fast paths can't express
+        // exclusion, so negation forces a materialized walk over both sets.
+        let docs = if self.has_negatives {
+            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
+            let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
+                true => {
+                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
+                        .await?
+                }
+                false => {
+                    r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
+                        .await?
+                }
+            };
+            work.merge(neg_work);
+            let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
+            docs.into_iter()
+                .filter(|d| !excluded.contains(d.get()))
+                .collect::<Vec<_>>()
+        } else {
+            docs
+        };
+        // One flush per superfile: positive + negation walks.
+        if let Some(stats) = &self.op_stats {
+            stats.add_fts_postings_bytes(work.postings_bytes);
+            stats.add_planned_read_ranges(work.planned_ranges);
+            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+        }
+        Ok(docs)
     }
 }
 
@@ -1942,6 +2023,115 @@ impl SupertableReader {
         mode: BoolMode,
         stamp_stable_ids: bool,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(Vec::new());
+        };
+        let phases = self.phase_spans();
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let per_unit = dispatch::fanout_local_hits(self, units, move |r, suid| {
+            let kernel = Arc::clone(&kernel);
+            async move {
+                Ok(kernel
+                    .docs(&r, suid)
+                    .await?
+                    .into_iter()
+                    .map(|d| (d.get(), 0.0f32))
+                    .collect::<Vec<_>>())
+            }
+        })
+        .instrument(fanout_span)
+        .await?;
+        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
+        // reallocations copy the whole hit vec repeatedly at 1M hits.
+        let total: usize = per_unit.iter().map(Vec::len).sum();
+        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
+        for unit in per_unit {
+            hits.extend(unit);
+        }
+        if stamp_stable_ids {
+            dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        }
+        Ok(hits)
+    }
+
+    /// The matching rows' `names` columns, one batch per superfile in no
+    /// particular order, for a consumer that reads neither `_id` nor the
+    /// score: an aggregate over the match. Each superfile's rows go from
+    /// the kernel's walk to a column take and out as their own batch, with
+    /// no hit per row, no stable-id stamping and no global interleave in
+    /// between, which on a match of a few hundred thousand rows is most of
+    /// what producing a hit set costs. Tombstoned rows are left out, as
+    /// the hit path leaves them out.
+    pub(crate) async fn token_match_columns_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        names: &[&str],
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(Vec::new());
+        };
+        let manifest = Arc::clone(self.manifest());
+        let out_schema =
+            hit_output_schema(&manifest.stored_schema(), names).map_err(QueryError::DataFusion)?;
+        let names: Arc<Vec<String>> = Arc::new(names.iter().map(|s| (*s).to_string()).collect());
+        let op_stats = self.op_stats.clone();
+        let shared = self.shared_inner();
+        let schema_id = manifest.table_schema().schema_id();
+        let phases = self.phase_spans();
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         suid: Uuid| {
+            let kernel = Arc::clone(&kernel);
+            let manifest = Arc::clone(&manifest);
+            let out_schema = Arc::clone(&out_schema);
+            let names = Arc::clone(&names);
+            let op_stats = op_stats.clone();
+            let shared = Arc::clone(&shared);
+            async move {
+                let docs = kernel.docs(&r, suid).await?;
+                let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
+                if let Some(cache) = cache.as_ref()
+                    && let Some(deny) =
+                        dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                {
+                    locals.retain(|local| !deny.contains(*local));
+                }
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                // The same rows of the same superfile under the same columns
+                // and schema are the same batch for as long as the immutable
+                // superfile lives; the hit path memoises them under that
+                // key, and so does this.
+                let decoded = &shared.decoded_scalar_cache;
+                if let Some(batch) = decoded.get(entry.uri, schema_id, &locals, &refs) {
+                    return Ok(batch);
+                }
+                let batch =
+                    take_file_columns(&manifest, &r, locals.clone(), &refs, &out_schema, &op_stats)
+                        .await
+                        .map_err(QueryError::DataFusion)?;
+                decoded.insert(entry.uri, schema_id, &locals, &refs, batch.clone());
+                Ok(batch)
+            }
+        };
+        dispatch::fanout_with(self, units, true, ReadIntent::Warm, body)
+            .instrument(fanout_span)
+            .await
+    }
+
+    /// What every unranked match walk starts from: the superfiles the
+    /// query's terms can match (`None` when there are none) and the kernel
+    /// that finds the matching rows in any one of them.
+    async fn match_kernel(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Option<(Vec<(Arc<SuperfileEntry>, Uuid)>, Arc<MatchKernel>)>, QueryError> {
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -1957,11 +2147,8 @@ impl SupertableReader {
         select_span.record("survivors", kept.len());
         trace::end(select_span);
         if kept.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let match_mode = match_set.mode;
-        let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         // Every plain term the kernel resolves, positive and negated: the
         // index's locations for them let each superfile skip its dictionary.
         let all_terms: Vec<&str> = match_set
@@ -1983,98 +2170,20 @@ impl SupertableReader {
                 (e, id)
             })
             .collect();
-        let column_field_id = self.manifest().field_id(column);
-        let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negatives.phrases);
-        let op_stats = self.op_stats.clone();
-        let kernel = move |r: Arc<SuperfileReader>, suid: Uuid| {
-            let column_arc = Arc::clone(&column_arc);
-            let term_arc = Arc::clone(&term_arc);
-            let phrase_arc = Arc::clone(&phrase_arc);
-            let neg_arc = Arc::clone(&neg_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
-            let locations = Arc::clone(&locations);
-            let op_stats = op_stats.clone();
-            async move {
-                // A file written before a rename labels the column as it was
-                // then, and its dictionary is keyed by that label; the id is
-                // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
-
-                let memo = memo_from_locations(&r, &locations, suid).await;
-                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                // Any phrase atom (match or negated) takes the
-                // phrase-aware walk; plain-token queries keep the
-                // optimized token_match path unchanged.
-                let (docs, mut work) = match phrase_involved {
-                    true => {
-                        r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                            .await?
-                    }
-                    false => {
-                        r.token_match_prefetched(&column_arc, &refs, match_mode, memo.as_deref())
-                            .await?
-                    }
-                };
-                // Drop any positive match that also carries a negated
-                // atom (union of the negatives). The df / count fast
-                // paths can't express exclusion, so negation forces a
-                // materialized walk over both sets.
-                let docs = if has_negatives {
-                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                        true => {
-                            r.token_match_prefetched(
-                                &column_arc,
-                                &neg_refs,
-                                BoolMode::Or,
-                                memo.as_deref(),
-                            )
-                            .await?
-                        }
-                        false => {
-                            r.atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
-                                .await?
-                        }
-                    };
-                    work.merge(neg_work);
-                    let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
-                    docs.into_iter()
-                        .filter(|d| !excluded.contains(d.get()))
-                        .collect::<Vec<_>>()
-                } else {
-                    docs
-                };
-                // One flush per superfile: positive + negation walks.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
-                Ok(docs
-                    .into_iter()
-                    .map(|d| (d.get(), 0.0f32))
-                    .collect::<Vec<_>>())
-            }
+        let kernel = MatchKernel {
+            column_field_id: self.manifest().field_id(column),
+            column: column.to_owned(),
+            mode: match_set.mode,
+            phrase_involved: match_set.has_phrases() || !negatives.phrases.is_empty(),
+            has_negatives: !negatives.is_empty(),
+            terms: match_set.terms,
+            phrases: match_set.phrases,
+            negatives: negatives.terms,
+            negative_phrases: negatives.phrases,
+            locations,
+            op_stats: self.op_stats.clone(),
         };
-        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel)
-            .instrument(fanout_span)
-            .await?;
-        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
-        // reallocations copy the whole hit vec repeatedly at 1M hits.
-        let total: usize = per_unit.iter().map(Vec::len).sum();
-        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
-        for unit in per_unit {
-            hits.extend(unit);
-        }
-        if stamp_stable_ids {
-            dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        }
-        Ok(hits)
+        Ok(Some((units, Arc::new(kernel))))
     }
 
     /// A single term's count, straight from the term index, or `None` when
