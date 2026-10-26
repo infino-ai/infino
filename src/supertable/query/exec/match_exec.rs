@@ -637,7 +637,7 @@ mod tests {
                 format!("{grouped_via_rows:?}"),
                 "grouped aggregate over {tvf}"
             );
-            let twice = rows(&st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
+            let twice = rows(st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
             assert_eq!(twice, counted, "a column named twice over {tvf}");
         }
     }
