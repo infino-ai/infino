@@ -1497,7 +1497,13 @@ impl SupertableReader {
                 // so a cold superfile costs one round trip before its kernel
                 // rather than three. A read that fails here is read again by
                 // the kernel's own entry, which reports it.
+                // A resident superfile has every byte in memory: nothing to
+                // prewarm, and on a warm table a future per superfile is
+                // measurable against a query of a millisecond.
                 let prewarm = async {
+                    if r.parquet_bytes().is_some() {
+                        return;
+                    }
                     let scoring = async {
                         if let Some(fts) = r.fts()
                             && let Err(error) = fts.prewarm_scoring(&column_arc).await
