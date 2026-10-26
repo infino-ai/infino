@@ -2866,12 +2866,31 @@ async fn select_top_k_stable(
     dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
     // Total order: score desc, then stable `_id` asc — deterministic and
     // invariant across compaction (unlike physical superfile/offset keys).
-    cands.sort_unstable_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-            .then(a.stable_id.cmp(&b.stable_id))
-    });
+    // Hits from a single unit already arrive by descending score, so only
+    // the runs of tied scores need reordering by `_id`; anything else is
+    // sorted whole. `total_cmp` orders a never-NaN score as `partial_cmp`
+    // does, with an integer compare.
+    let by_score_desc = cands.windows(2).all(|w| w[0].score >= w[1].score);
+    match by_score_desc {
+        true => {
+            let mut i = 0;
+            while i < cands.len() {
+                let mut j = i + 1;
+                while j < cands.len() && cands[j].score == cands[i].score {
+                    j += 1;
+                }
+                if j - i > 1 {
+                    cands[i..j].sort_unstable_by_key(|c| c.stable_id);
+                }
+                i = j;
+            }
+        }
+        false => cands.sort_unstable_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then(a.stable_id.cmp(&b.stable_id))
+        }),
+    }
     cands.truncate(k);
     Ok(cands)
 }

@@ -529,6 +529,7 @@ pub infino::CompactionSettings::max_memory_mb: u64
 pub infino::CompactionSettings::min_fill_percent: u8
 pub infino::CompactionSettings::min_superfiles_for_merge: u64
 pub infino::CompactionSettings::stale_seal_timeout_ms: u64
+pub infino::CompactionSettings::steps: infino::CompactionSteps
 pub infino::CompactionSettings::target_superfile_size_mb: u64
 impl core::clone::Clone for infino::CompactionSettings
 pub fn infino::CompactionSettings::clone(&self) -> Self
@@ -551,6 +552,28 @@ impl core::marker::Unpin for infino::CompactionSettings
 impl core::marker::UnsafeUnpin for infino::CompactionSettings
 impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionSettings
 impl core::panic::unwind_safe::UnwindSafe for infino::CompactionSettings
+#[non_exhaustive] pub struct infino::CompactionSteps
+pub infino::CompactionSteps::merge_superfiles: bool
+pub infino::CompactionSteps::recalibrate: infino::RecalibratePolicy
+pub infino::CompactionSteps::split: bool
+impl core::clone::Clone for infino::CompactionSteps
+pub fn infino::CompactionSteps::clone(&self) -> Self
+impl core::cmp::Eq for infino::CompactionSteps
+impl core::cmp::PartialEq for infino::CompactionSteps
+pub fn infino::CompactionSteps::eq(&self, &Self) -> bool
+impl core::default::Default for infino::CompactionSteps
+pub fn infino::CompactionSteps::default() -> Self
+impl core::fmt::Debug for infino::CompactionSteps
+pub fn infino::CompactionSteps::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::CompactionSteps
+impl core::marker::StructuralPartialEq for infino::CompactionSteps
+impl core::marker::Freeze for infino::CompactionSteps
+impl core::marker::Send for infino::CompactionSteps
+impl core::marker::Sync for infino::CompactionSteps
+impl core::marker::Unpin for infino::CompactionSteps
+impl core::marker::UnsafeUnpin for infino::CompactionSteps
+impl core::panic::unwind_safe::RefUnwindSafe for infino::CompactionSteps
+impl core::panic::unwind_safe::UnwindSafe for infino::CompactionSteps
 pub struct infino::ConnectOptions
 impl infino::ConnectOptions
 pub fn infino::ConnectOptions::new() -> Self
@@ -782,8 +805,7 @@ pub struct infino::OptimizeOptions
 impl infino::OptimizeOptions
 pub fn infino::OptimizeOptions::compact(infino::CompactionSettings) -> Self
 pub fn infino::OptimizeOptions::with_gc(self, infino::GcSettings) -> Self
-pub fn infino::OptimizeOptions::with_recalibrate(self, infino::RecalibratePolicy) -> Self
-pub fn infino::OptimizeOptions::with_skip_router_cache_warmup(self, bool) -> Self
+pub fn infino::OptimizeOptions::with_steps(self, infino::OptimizeSteps) -> Self
 impl core::clone::Clone for infino::OptimizeOptions
 pub fn infino::OptimizeOptions::clone(&self) -> Self
 impl core::default::Default for infino::OptimizeOptions
@@ -797,6 +819,31 @@ impl core::marker::Unpin for infino::OptimizeOptions
 impl core::marker::UnsafeUnpin for infino::OptimizeOptions
 impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeOptions
 impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeOptions
+#[non_exhaustive] pub struct infino::OptimizeSteps
+pub infino::OptimizeSteps::compact: bool
+pub infino::OptimizeSteps::drain_hidden_cells: bool
+pub infino::OptimizeSteps::gc: bool
+pub infino::OptimizeSteps::gc_sweep_once: bool
+pub infino::OptimizeSteps::refresh_term_index: bool
+pub infino::OptimizeSteps::router_cache_warmup: bool
+impl core::clone::Clone for infino::OptimizeSteps
+pub fn infino::OptimizeSteps::clone(&self) -> Self
+impl core::cmp::Eq for infino::OptimizeSteps
+impl core::cmp::PartialEq for infino::OptimizeSteps
+pub fn infino::OptimizeSteps::eq(&self, &Self) -> bool
+impl core::default::Default for infino::OptimizeSteps
+pub fn infino::OptimizeSteps::default() -> Self
+impl core::fmt::Debug for infino::OptimizeSteps
+pub fn infino::OptimizeSteps::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for infino::OptimizeSteps
+impl core::marker::StructuralPartialEq for infino::OptimizeSteps
+impl core::marker::Freeze for infino::OptimizeSteps
+impl core::marker::Send for infino::OptimizeSteps
+impl core::marker::Sync for infino::OptimizeSteps
+impl core::marker::Unpin for infino::OptimizeSteps
+impl core::marker::UnsafeUnpin for infino::OptimizeSteps
+impl core::panic::unwind_safe::RefUnwindSafe for infino::OptimizeSteps
+impl core::panic::unwind_safe::UnwindSafe for infino::OptimizeSteps
 #[non_exhaustive] pub struct infino::PlannedRepair
 pub infino::PlannedRepair::live_bytes: u64
 pub infino::PlannedRepair::mode: infino::ReindexMode

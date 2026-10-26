@@ -10,6 +10,7 @@ pub mod fuzz_oracle;
 pub mod multi_column;
 pub mod must_should;
 pub mod negation;
+pub mod old_format_superfile;
 pub mod phrase;
 pub mod pipeline;
 pub mod score_floor;

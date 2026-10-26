@@ -31,7 +31,7 @@
 //! non-negative because we use the +0.5 / +0.5 form ("BM25+1") which keeps
 //! the log argument ≥ 1.
 
-use wide::f32x4;
+use wide::{f32x4, f32x8};
 
 use crate::superfile::format;
 
@@ -260,20 +260,20 @@ pub fn score_simd_x4(
     scores.reduce_add()
 }
 
-/// Score one cursor at four documents in one SIMD operation. Each
-/// document has its own term frequency and length normalization; the
-/// cursor's precomputed `idf` is shared across all lanes.
-/// Returns the four independent contributions without reducing them.
-/// Callers pass posting-list term frequencies (`tf > 0`); unlike
-/// [`score_simd_x4`], this path does not use zero-padded lanes.
+/// Score one term at eight documents in one SIMD operation, each with its
+/// own tf and length normalization: the same multiply, add and divide per
+/// lane as the scalar [`score_with_dl_norm_k1`], so each lane's result is
+/// bit-identical to it, and a tf of 0 scores exactly 0.
 #[inline(always)]
-pub(super) fn score_one_term_x4(
-    idf_weight: f32,
-    tfs: [u32; SCORE_SIMD_LANES],
-    dl_norm_k1: [f32; SCORE_SIMD_LANES],
-) -> [f32; SCORE_SIMD_LANES] {
-    let tf_v = f32x4::from([tfs[0] as f32, tfs[1] as f32, tfs[2] as f32, tfs[3] as f32]);
-    let scores = f32x4::splat(idf_weight) * tf_v / (tf_v + f32x4::from(dl_norm_k1));
+pub(super) fn score_one_term_x8(idf_weight: f32, tfs: [u32; 8], dl_norm_k1: [f32; 8]) -> [f32; 8] {
+    // An explicit loop, not `[u32; 8]::map`: the map is left out of line
+    // under code-size pressure, a call per eight postings.
+    let mut tf_f = [0.0f32; 8];
+    for (f, &t) in tf_f.iter_mut().zip(&tfs) {
+        *f = t as f32;
+    }
+    let tf_v = f32x8::from(tf_f);
+    let scores = f32x8::splat(idf_weight) * tf_v / (tf_v + f32x8::from(dl_norm_k1));
     scores.to_array()
 }
 
@@ -487,19 +487,39 @@ mod tests {
     }
 
     #[test]
-    fn one_term_simd_x4_equals_scalar_lanes() {
-        let idf_weight = idf(1_000_000, 10_000);
-        let tfs = [1, 2, 5, 9];
-        let dl_norm_k1 = [0.4, 0.9, 1.2, 3.5];
-        let simd = score_one_term_x4(idf_weight, tfs, dl_norm_k1);
-
-        for lane in 0..SCORE_SIMD_LANES {
-            let scalar = score_with_dl_norm_k1(idf_weight, tfs[lane], dl_norm_k1[lane]);
-            assert!(
-                approx(simd[lane], scalar, 1e-6),
-                "lane {lane}: simd={} scalar={scalar}",
-                simd[lane]
-            );
+    fn one_term_x8_is_bit_identical_to_scalar_lanes() {
+        // Every multi-posting path relies on this: a doc's score must not
+        // depend on whether it was scored in a batch of eight or alone.
+        let mut x: u32 = 0x2545_F491;
+        for &idf_weight in &[idf(1_000_000, 10_000), idf(1_000_000, 900_000), 0.0, 7.5] {
+            for _ in 0..64 {
+                let mut tfs = [0u32; 8];
+                let mut norms = [0.0f32; 8];
+                for (t, n) in tfs.iter_mut().zip(norms.iter_mut()) {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    *t = x % 40;
+                    *n = 0.05 + (x >> 8) as f32 / (1u32 << 22) as f32;
+                }
+                let simd = score_one_term_x8(idf_weight, tfs, norms);
+                for lane in 0..8 {
+                    let scalar = score_with_dl_norm_k1(idf_weight, tfs[lane], norms[lane]);
+                    assert_eq!(
+                        simd[lane].to_bits(),
+                        scalar.to_bits(),
+                        "lane {lane} tf {}",
+                        tfs[lane]
+                    );
+                    if tfs[lane] == 0 {
+                        assert_eq!(
+                            simd[lane].to_bits(),
+                            0.0f32.to_bits(),
+                            "a tf of 0 scores +0"
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -18,6 +18,17 @@ pub(crate) fn width_of(v: u64) -> u8 {
     (u64::BITS - v.leading_zeros()) as u8
 }
 
+/// The low `width` bits set (`width <= 64`): the mask a `width`-bit value
+/// is read out of a wider load with.
+#[inline(always)]
+pub(crate) const fn low_mask(width: u8) -> u64 {
+    if width == MAX_WIDTH {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
+}
+
 /// Bytes a stream of `n` values at `width` bits occupies.
 #[inline]
 pub(crate) fn payload_bytes(n: usize, width: u8) -> usize {
@@ -57,12 +68,7 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
         && let Some(chunk) = payload.get(byte..byte + 8)
     {
         let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-        let mask: u64 = if width == MAX_WIDTH {
-            u64::MAX
-        } else {
-            (1u64 << width) - 1
-        };
-        return Some((word >> shift) & mask);
+        return Some((word >> shift) & low_mask(width));
     }
     let n_bytes = (shift as usize + width as usize).div_ceil(8);
     let slice = payload.get(byte..byte + n_bytes)?;
@@ -70,12 +76,7 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
     for (k, &b) in slice.iter().enumerate() {
         acc |= (b as u128) << (8 * k);
     }
-    let mask: u128 = if width == MAX_WIDTH {
-        u64::MAX as u128
-    } else {
-        (1u128 << width) - 1
-    };
-    Some(((acc >> shift) & mask) as u64)
+    Some(((acc >> shift) & u128::from(low_mask(width))) as u64)
 }
 
 /// A patched packing: the width most lanes fit, the lanes that do not
@@ -147,8 +148,8 @@ pub(crate) fn plan_exceptions(
 
 /// Lanes `from..from + n` of a `width`-bit stream, one 64-bit load per
 /// lane after a single bounds check for the run, to `sink`. `None` when
-/// the run ends past the payload. Shared by the position streams and
-/// the id sidecar's block decode.
+/// the run ends past the payload. The id sidecar's block decode reads its
+/// streams this way; the position streams take [`unpack_lanes_u32`].
 #[inline]
 pub(crate) fn for_each_lane(
     payload: &[u8],
@@ -163,16 +164,12 @@ pub(crate) fn for_each_lane(
         }
         return Some(());
     }
+    let mask = low_mask(width);
     let width = width as usize;
     let end_bit = (from + n) * width;
     if end_bit.div_ceil(8) > payload.len() {
         return None;
     }
-    let mask: u64 = if width == MAX_WIDTH as usize {
-        u64::MAX
-    } else {
-        (1u64 << width) - 1
-    };
     let mut bit = from * width;
     for _ in 0..n {
         let byte = bit / 8;
@@ -190,6 +187,205 @@ pub(crate) fn for_each_lane(
         bit += width;
     }
     Some(())
+}
+
+/// Lanes `from..from + out.len()` of a `width`-bit stream (`width <= 32`)
+/// written into `out`: the values [`for_each_lane`] yields, without its
+/// per-lane sink call or tail test. Every lane whose 8-byte load lies inside
+/// the payload is read in one straight loop; only the stream's last few
+/// take the padded load. `None` when the run ends past the payload.
+#[inline]
+pub(crate) fn unpack_lanes_u32(
+    payload: &[u8],
+    from: usize,
+    width: u8,
+    out: &mut [u32],
+) -> Option<()> {
+    let n = out.len();
+    if width == 0 {
+        out.fill(0);
+        return Some(());
+    }
+    debug_assert!(width <= 32, "a u32 lane is at most 32 bits wide");
+    let w = width as usize;
+    if ((from + n) * w).div_ceil(8) > payload.len() {
+        return None;
+    }
+    let mask = low_mask(width);
+    // Lane `l` loads bytes `l·w/8 .. +8`, inside the payload while
+    // `l ≤ ((len − 8)·8 + 7) / w`.
+    let fast = match payload.len().checked_sub(8) {
+        Some(room) => ((room * 8 + 7) / w + 1).saturating_sub(from).min(n),
+        None => 0,
+    };
+    let mut bit = from * w;
+    let (head, tail) = out.split_at_mut(fast);
+    // Whole groups of eight lanes first: eight lanes of `w` bits span
+    // exactly `w` bytes, so each lane's byte offset and shift within its
+    // group are the same in every group and are worked out once per run.
+    let (grouped, head) = head.split_at_mut(head.len() / LANE_GROUP * LANE_GROUP);
+    unpack_groups(payload, bit, width, grouped);
+    bit += grouped.len() * w;
+    for slot in head {
+        let byte = bit / 8;
+        let word = u64::from_le_bytes(
+            payload[byte..byte + 8]
+                .try_into()
+                .expect("invariant: a fast lane's load is in bounds"),
+        );
+        *slot = ((word >> (bit % 8)) & mask) as u32;
+        bit += w;
+    }
+    for slot in tail {
+        let byte = bit / 8;
+        let mut padded = [0u8; 8];
+        let rest = &payload[byte..payload.len().min(byte + 8)];
+        padded[..rest.len()].copy_from_slice(rest);
+        *slot = ((u64::from_le_bytes(padded) >> (bit % 8)) & mask) as u32;
+        bit += w;
+    }
+    Some(())
+}
+
+/// Lanes a width-specialized group unpacks together; eight lanes of any
+/// width end on a byte boundary.
+const LANE_GROUP: usize = 8;
+
+/// [`unpack_lanes_u32`]'s whole groups, dispatched once to the copy built
+/// for `width`, so the inner loop's shifts and masks are constants.
+/// `start_bit` is the first lane's bit position; every lane's 8-byte load
+/// must lie inside `payload`.
+fn unpack_groups(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
+    #[cfg(target_arch = "x86_64")]
+    let (start_bit, out) =
+        if width <= SIMD_UNPACK_MAX_WIDTH && std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 is present (checked above); see the function's notes
+            // for the bounds every load and store keeps to.
+            let done = unsafe { unpack_groups_avx2(payload, start_bit, width, out) };
+            (start_bit + done * usize::from(width), &mut out[done..])
+        } else {
+            (start_bit, out)
+        };
+    unpack_groups_scalar(payload, start_bit, width, out);
+}
+
+/// [`unpack_groups`] without the vector kernel: every whole group by the
+/// copy of [`unpack_groups_w`] built for `width`. The whole run on a target
+/// without AVX2, the groups the vector kernel leaves on one with it.
+#[inline]
+fn unpack_groups_scalar(payload: &[u8], start_bit: usize, width: u8, out: &mut [u32]) {
+    macro_rules! dispatch {
+        ($($w:literal)*) => {
+            match width {
+                $($w => unpack_groups_w::<$w>(payload, start_bit, out),)*
+                _ => unreachable!("a u32 lane is 1 to 32 bits wide"),
+            }
+        };
+    }
+    dispatch!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32);
+}
+
+/// Widest lane [`unpack_groups_avx2`] reads: a lane's bits, shifted by up to
+/// 7 within its first byte, fit the 32-bit load it is gathered into.
+#[cfg(target_arch = "x86_64")]
+const SIMD_UNPACK_MAX_WIDTH: u8 = 25;
+
+/// [`unpack_groups`] eight lanes per step: two 16-byte loads (lanes 0–3 and
+/// 4–7 each span at most 13 bytes at this width), one byte shuffle that
+/// gathers each lane's four bytes into its 32-bit slot, a per-lane shift and
+/// a mask. The run's bit phase fixes the shuffle and the shifts, so both are
+/// built once. Returns how many lanes it wrote (whole groups, from the
+/// front); it stops where a load would pass the payload's end and the
+/// scalar copy finishes the rest.
+///
+/// # Safety
+///
+/// The caller must have detected AVX2 at runtime. Given that, the function
+/// reads and writes only in bounds for any input: each step's two 16-byte
+/// loads lie inside `payload` (the loop runs while `byte + half + 16` fits),
+/// each store lies inside `out` (while `done + 8` fits), and `width` is at
+/// most [`SIMD_UNPACK_MAX_WIDTH`], so every shuffle index stays inside its
+/// 16-byte lane and every shift plus width inside 32 bits.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn unpack_groups_avx2(
+    payload: &[u8],
+    start_bit: usize,
+    width: u8,
+    out: &mut [u32],
+) -> usize {
+    use std::arch::x86_64::*;
+    debug_assert!((1..=SIMD_UNPACK_MAX_WIDTH).contains(&width));
+    let w = usize::from(width);
+    let phase = start_bit % 8;
+    let offs: [usize; LANE_GROUP] = std::array::from_fn(|l| (phase + l * w) / 8);
+    let half = offs[4];
+    let mut shuffle = [0u8; 32];
+    let mut shifts = [0u32; LANE_GROUP];
+    for l in 0..LANE_GROUP {
+        let (slot, from) = match l < 4 {
+            true => (4 * l, offs[l]),
+            false => (16 + 4 * (l - 4), offs[l] - half),
+        };
+        for b in 0..4 {
+            shuffle[slot + b] = (from + b) as u8;
+        }
+        shifts[l] = ((phase + l * w) % 8) as u32;
+    }
+    let mut byte = start_bit / 8;
+    let mut done = 0usize;
+    // SAFETY, per obligation:
+    // - AVX2 intrinsics: reachable only through the dispatcher's
+    //   `is_x86_feature_detected!("avx2")` guard.
+    // - Loads: both 16-byte loads start at `byte` and `byte + half` and the
+    //   loop runs only while `byte + half + 16 <= payload.len()`, `half >= 0`.
+    //   Unaligned variants, so no alignment precondition.
+    // - Store: eight `u32`s at `out[done..done + 8]`, inside `out` while
+    //   `done + 8 <= out.len()`.
+    // - Shuffle indices are below 16 within each 128-bit half: a lane's
+    //   offset from its half's start is at most `(7 + 3·25) / 8 = 10`, plus 3.
+    unsafe {
+        let shuffle_v = _mm256_loadu_si256(shuffle.as_ptr().cast());
+        let shift_v = _mm256_loadu_si256(shifts.as_ptr().cast());
+        let mask_v = _mm256_set1_epi32(low_mask(width) as i32);
+        let src = payload.as_ptr();
+        let dst = out.as_mut_ptr();
+        while done + LANE_GROUP <= out.len() && byte + half + 16 <= payload.len() {
+            let lo = _mm_loadu_si128(src.add(byte).cast());
+            let hi = _mm_loadu_si128(src.add(byte + half).cast());
+            let lanes = _mm256_shuffle_epi8(_mm256_set_m128i(hi, lo), shuffle_v);
+            let values = _mm256_and_si256(_mm256_srlv_epi32(lanes, shift_v), mask_v);
+            _mm256_storeu_si256(dst.add(done).cast(), values);
+            done += LANE_GROUP;
+            byte += w;
+        }
+    }
+    done
+}
+
+/// Unpack `out.len() / 8` groups of eight `W`-bit lanes starting at
+/// `start_bit`. The run's bit phase fixes each lane's byte offset and shift
+/// within its group for the whole run; each group then advances `W` bytes.
+#[inline(always)]
+fn unpack_groups_w<const W: usize>(payload: &[u8], start_bit: usize, out: &mut [u32]) {
+    let mask = const { low_mask(W as u8) };
+    let phase = start_bit % 8;
+    let offs: [usize; LANE_GROUP] = std::array::from_fn(|l| (phase + l * W) / 8);
+    let shifts: [u32; LANE_GROUP] = std::array::from_fn(|l| ((phase + l * W) % 8) as u32);
+    let span = offs[LANE_GROUP - 1] + 8;
+    let mut byte = start_bit / 8;
+    for group in out.chunks_exact_mut(LANE_GROUP) {
+        let chunk = &payload[byte..byte + span];
+        for (l, slot) in group.iter_mut().enumerate() {
+            let word = u64::from_le_bytes(
+                chunk[offs[l]..offs[l] + 8]
+                    .try_into()
+                    .expect("invariant: eight bytes"),
+            );
+            *slot = ((word >> shifts[l]) & mask) as u32;
+        }
+        byte += W;
+    }
 }
 
 #[cfg(test)]
@@ -217,11 +413,133 @@ mod tests {
     }
 
     #[test]
+    fn unpack_lanes_agrees_with_for_each_lane_at_every_width_and_offset() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for width in 0..=32u8 {
+            for n_vals in [1usize, 2, 7, 8, 9, 31, 64, 129] {
+                let vals: Vec<u64> = (0..n_vals)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x & low_mask(width)
+                    })
+                    .collect();
+                let mut buf = vec![0u8; payload_bytes(n_vals, width)];
+                for (i, &v) in vals.iter().enumerate() {
+                    put_bits(&mut buf, i * width as usize, v, width);
+                }
+                for from in 0..n_vals {
+                    for n in 0..=n_vals - from {
+                        let mut want = Vec::new();
+                        for_each_lane(&buf, from, n, width, |v| want.push(v as u32))
+                            .expect("in range");
+                        let mut got = vec![u32::MAX; n];
+                        unpack_lanes_u32(&buf, from, width, &mut got).expect("in range");
+                        assert_eq!(got, want, "width {width} from {from} n {n}");
+                    }
+                    // Past the payload both refuse alike (a partial last
+                    // byte may still hold one more whole lane).
+                    let n = n_vals - from + 9;
+                    let mut over = vec![0u32; n];
+                    assert_eq!(
+                        unpack_lanes_u32(&buf, from, width, &mut over).is_none(),
+                        for_each_lane(&buf, from, n, width, |_| ()).is_none(),
+                        "width {width} from {from}: overrun"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Bytes of slack past a group stream's payload, so every 8- and
+    /// 16-byte load the group kernels make stays inside the buffer.
+    const GROUP_SLACK: usize = 32;
+
+    /// `n` pseudo-random `width`-bit lanes packed from bit 0, followed by
+    /// `slack` zero bytes.
+    fn random_stream(seed: &mut u64, n: usize, width: u8, slack: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; payload_bytes(n, width) + slack];
+        for i in 0..n {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            put_bits(&mut buf, i * width as usize, *seed & low_mask(width), width);
+        }
+        buf
+    }
+
+    #[test]
+    fn scalar_groups_agree_with_for_each_lane_at_every_width_and_phase() {
+        // Called directly, so the scalar kernel is graded on every target,
+        // including one whose dispatcher would hand the run to AVX2.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        for width in 1..=32u8 {
+            for from in 0..LANE_GROUP {
+                for groups in [1usize, 2, 5, 16] {
+                    let n = from + groups * LANE_GROUP;
+                    let buf = random_stream(&mut seed, n, width, GROUP_SLACK);
+                    let mut want = Vec::new();
+                    for_each_lane(&buf, from, n - from, width, |v| want.push(v as u32))
+                        .expect("in range");
+                    let mut got = vec![u32::MAX; n - from];
+                    unpack_groups_scalar(&buf, from * width as usize, width, &mut got);
+                    assert_eq!(got, want, "width {width} from {from} groups {groups}");
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_groups_agree_with_the_scalar_groups() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for width in 1..=SIMD_UNPACK_MAX_WIDTH {
+            for from in 0..LANE_GROUP {
+                for groups in [1usize, 2, 5, 16] {
+                    // With slack every group fits the vector loads; without
+                    // it the kernel stops short and leaves the tail.
+                    for slack in [0, GROUP_SLACK] {
+                        let n = from + groups * LANE_GROUP;
+                        let buf = random_stream(&mut seed, n, width, slack);
+                        let start_bit = from * usize::from(width);
+                        let mut simd = vec![u32::MAX; n - from];
+                        // SAFETY: avx2 was detected above.
+                        let done = unsafe { unpack_groups_avx2(&buf, start_bit, width, &mut simd) };
+                        assert!(done.is_multiple_of(LANE_GROUP) && done <= simd.len());
+                        if slack > 0 {
+                            assert_eq!(done, simd.len(), "width {width}: every group fits");
+                        }
+                        // The scalar kernel needs its loads inside the buffer
+                        // too: give it the same lanes with the slack.
+                        let mut padded = buf.clone();
+                        padded.resize(payload_bytes(n, width) + GROUP_SLACK, 0);
+                        let mut scalar = vec![0u32; n - from];
+                        unpack_groups_scalar(&padded, start_bit, width, &mut scalar);
+                        assert_eq!(
+                            simd[..done],
+                            scalar[..done],
+                            "width {width} from {from} groups {groups} slack {slack}"
+                        );
+                        assert!(
+                            simd[done..].iter().all(|&v| v == u32::MAX),
+                            "no write past done"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn for_each_lane_reads_runs_at_every_width_and_refuses_overruns() {
         for width in [0u8, 1, 5, 8, 13, 32, 64] {
             let n = 41;
             let values: Vec<u64> = (0..n as u64)
-                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & mask(width))
+                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & low_mask(width))
                 .collect();
             let mut buf = vec![0u8; payload_bytes(n, width)];
             for (i, &v) in values.iter().enumerate() {
@@ -237,13 +555,6 @@ mod tests {
             if width > 0 {
                 assert!(for_each_lane(&buf, n, 16, width, |_| {}).is_none());
             }
-        }
-    }
-
-    fn mask(width: u8) -> u64 {
-        match width {
-            64 => u64::MAX,
-            w => (1u64 << w) - 1,
         }
     }
 
@@ -308,14 +619,7 @@ mod tests {
         for width in 0..=MAX_WIDTH {
             let n = 37;
             let values: Vec<u64> = (0..n as u64)
-                .map(|i| {
-                    let mask = if width == 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << width) - 1
-                    };
-                    (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & mask
-                })
+                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & low_mask(width))
                 .collect();
             let mut buf = vec![0u8; payload_bytes(n, width)];
             for (i, &v) in values.iter().enumerate() {

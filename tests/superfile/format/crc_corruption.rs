@@ -525,14 +525,16 @@ fn corrupt_fts_bitset_block_rejected() {
     const ENCODING_OFF: usize = 3;
     const ENCODING_MASK: u8 = 0b11;
     const ENCODING_BITSET: u8 = 1;
+    const ENCODING_RUN: u8 = 3;
     const BLOCK_HEADER: usize = 4;
-    assert_eq!(
-        bytes[block0 + ENCODING_OFF] & ENCODING_MASK,
-        ENCODING_BITSET,
-        "first postings term's block must be bitset-encoded on this dense corpus"
+    let encoding = bytes[block0 + ENCODING_OFF] & ENCODING_MASK;
+    assert!(
+        encoding == ENCODING_BITSET || encoding == ENCODING_RUN,
+        "first postings term's block must be dense (bitset or run) on this corpus, got {encoding}"
     );
-    // Flip a byte in the presence bitmap, just past the 4-byte block header.
-    assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/bitset block presence");
+    // Flip a byte just past the 4-byte block header: the presence bitmap of
+    // a bitset block, the origin word of a run.
+    assert_corruption_rejected(bytes, block0 + BLOCK_HEADER, "fts/dense block body");
 }
 
 #[test]

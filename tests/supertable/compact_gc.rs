@@ -28,7 +28,7 @@ use arrow_schema::{DataType, Field, Schema};
 use chrono::{Duration as ChronoDuration, Utc};
 use datafusion::prelude::{Expr, col, lit};
 use infino::{
-    Bm25SearchOptions, CompactionSettings, GcSettings, OptimizeOptions,
+    Bm25SearchOptions, CompactionSettings, GcSettings, OptimizeOptions, OptimizeSteps,
     config::CrcVerification,
     superfile::{
         builder::FtsConfig, format::footer::read_kv_metadata, fts::reader::BoolMode,
@@ -414,6 +414,18 @@ fn optimize_honors_overridden_gc_safety_gap() {
         ..CompactionSettings::default()
     })
     .with_gc(GcSettings::default().with_safety_gap(Duration::ZERO));
+
+    // With the gc step off, nothing is reclaimed even at a zero gap.
+    let mut no_gc = OptimizeSteps::default();
+    no_gc.gc = false;
+    st.optimize(&opts.clone().with_steps(no_gc))
+        .expect("optimize with gc off");
+    assert_eq!(
+        count_dir(&data_dir),
+        n_commits + n_after_compact,
+        "gc step off must keep the orphaned superfiles"
+    );
+
     st.optimize(&opts).expect("optimize with gc safety_gap=0");
 
     let r = st.reader().expect("reader");
