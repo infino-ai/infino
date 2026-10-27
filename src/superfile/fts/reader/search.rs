@@ -2410,6 +2410,67 @@ mod tests {
         }
     }
 
+    /// A single-term search long enough to seed its bar does not seed it
+    /// under a negation: a seed over docs the negation drops would set the
+    /// bar too high. Here the term's best docs all carry the negated term,
+    /// and the docs that do answer sit in blocks whose best score is under
+    /// theirs, so a bar seeded from them would skip every answer. Every doc
+    /// has one length, so tf alone orders the scores. The answer is the term
+    /// ranked alone with the negated docs dropped, compared doc for doc and
+    /// bit for bit, with the heap collector and the buffer.
+    #[tokio::test]
+    async fn a_single_term_seed_is_not_taken_over_negated_docs() {
+        /// Enough docs for the single-term walk to seed (`seed::MIN_BLOCKS`
+        /// blocks of `BLOCK_LEN`), every one holding `x`.
+        const N_DOCS: u32 = 34_000;
+        /// Tokens per doc.
+        const DOC_LEN: usize = 5;
+        for k in [64, BUFFERED_TOPK_MIN_K + 100] {
+            // The best `k` (tf 3) lead the list and are all negated; the `k`
+            // that answer (tf 2) sit together at the middle.
+            let answer = N_DOCS / 2..N_DOCS / 2 + k as u32;
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..N_DOCS {
+                let (tf, neg) = match i {
+                    _ if i < k as u32 => (3, 1),
+                    _ if answer.contains(&i) => (2, 0),
+                    _ => (1, 0),
+                };
+                let text = ["x "].repeat(tf).concat()
+                    + &["neg "].repeat(neg).concat()
+                    + &["pad "].repeat(DOC_LEN - tf - neg).concat();
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            let bits = |hits: Vec<(RowId, f32)>| -> Vec<(u32, u32)> {
+                hits.into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect()
+            };
+            let lists = ClauseLists {
+                shoulds: &["x"],
+                negatives: &["neg"],
+                ..ClauseLists::default()
+            };
+            let got = bits(
+                r.search_excluding("body", lists, k, f32::NEG_INFINITY)
+                    .await
+                    .expect("search"),
+            );
+            let mut want = bits(
+                r.search("body", &["x"], N_DOCS as usize, BoolMode::Or)
+                    .await
+                    .expect("ranked alone"),
+            );
+            want.retain(|&(d, _)| d >= k as u32);
+            want.truncate(k);
+            assert!(want.iter().all(|&(d, _)| answer.contains(&d)), "k {k}");
+            assert_eq!(got, want, "k {k}");
+        }
+    }
+
     /// A table-wide search scores with its map's idf alone: a scored term
     /// the map leaves out is an error, never this superfile's own idf.
     #[tokio::test]
