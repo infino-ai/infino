@@ -154,11 +154,30 @@ fn hydrate_with_budget(
             .try_reserve(wave_bytes as usize)
             .map_err(|e| BuildError::OverBudget(format!("during hydrate, {e}")))?;
 
+        // Reserve the wave's ids in chunk order, under one short lock, before
+        // the parallel build: ids are monotonic, so this gives the chunks
+        // contiguous ranges in input order, and a later merge of id-adjacent
+        // superfiles then keeps the rows in the order they were loaded.
+        // Reserving inside the build would hand the ranges out in whatever
+        // order the workers reached the lock.
+        let id_spans: Vec<Vec<(i128, i128)>> = {
+            let generator = inner
+                .id_generator
+                .lock()
+                .expect("id_generator mutex poisoned");
+            wave.iter()
+                .map(|chunk| generator.reserve_range(chunk.rows))
+                .collect()
+        };
+
         // Build the wave's superfiles in parallel and commit them together.
         // Committing per wave keeps only one wave in memory.
         let shards: Vec<ShardOutput> = build_pool.install(|| {
             wave.par_iter()
-                .map(|chunk| build_hydrate_shard(inner, &manifest, &base_opts, chunk))
+                .zip(id_spans.par_iter())
+                .map(|(chunk, spans)| {
+                    build_hydrate_shard(inner, &manifest, &base_opts, chunk, spans)
+                })
                 .collect::<Result<_, BuildError>>()
         })?;
         let rows: u64 = wave.iter().map(|chunk| chunk.rows as u64).sum();
@@ -268,14 +287,14 @@ impl Chunk {
 /// does), stream through [`SuperfileBuilder::build_no_blob_from_batches_to`], and
 /// wrap the bytes with the manifest metadata a publish needs.
 ///
-/// It runs on many rayon workers at once, and the id generator is their only
-/// shared state. So it reserves the chunk's whole id range under one short lock
-/// and builds the arrays outside it, and the workers don't queue on the lock.
+/// It runs on many rayon workers at once and shares nothing: the chunk's ids
+/// come in as `id_spans`, reserved by the caller in wave order.
 fn build_hydrate_shard(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
     base_opts: &BuilderOptions,
     chunk: &Chunk,
+    id_spans: &[(i128, i128)],
 ) -> Result<ShardOutput, BuildError> {
     // `target_rows` is clamped to this, so only a single oversized input batch
     // can get here.
@@ -286,15 +305,7 @@ fn build_hydrate_shard(
         });
     }
 
-    // Reserve all ids for the chunk under one short lock. Ids are monotonic, so
-    // the min/max are just the first and last of the reserved spans.
-    let id_spans = {
-        let generator = inner
-            .id_generator
-            .lock()
-            .expect("id_generator mutex poisoned");
-        generator.reserve_range(chunk.rows)
-    };
+    // Ids are monotonic, so the min/max are the first and last of the spans.
     let id_min = id_spans.first().map_or(0, |&(first, _)| first);
     let id_max = id_spans.last().map_or(0, |&(_, last)| last);
     // Flatten the spans into one id per row, in row order (total == rows).
