@@ -23,6 +23,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::future::join;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::OnceCell;
@@ -1146,6 +1147,17 @@ impl FtsReader {
             .await
     }
 
+    /// Everything scoring `column` reads besides the postings — the length
+    /// buckets and the doc-id map — fetched together, so a cold superfile's
+    /// query issues them in one wave with its postings rather than one after
+    /// another. Each is a no-op once read.
+    pub(crate) async fn prewarm_scoring(&self, column: &str) -> Result<(), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let (norms, map) = join(self.ensure_norms(column_id), self.ensure_doc_map()).await;
+        norms?;
+        map.map(|_| ())
+    }
+
     /// The doc-id map, for a translation that runs off the async path.
     ///
     /// A query has read it by then ([`Self::ensure_doc_map`]), and a
@@ -1220,6 +1232,13 @@ impl FtsReader {
         Some(self.columns[id as usize].baked_avgdl)
     }
 
+    /// The parameters `column` declares: what its bounds, and the heads a
+    /// term index takes from it, are scored at.
+    pub(crate) fn column_params(&self, column: &str) -> Option<bm25::Bm25Params> {
+        let id = self.resolve_column_id(column).ok()?;
+        Some(self.columns[id as usize].declared_params)
+    }
+
     test_visible! {
     /// A column's stored per-document lengths, one per local doc id: the
     /// array the norm table is quantized from, as the build wrote it
@@ -1291,13 +1310,13 @@ impl FtsReader {
         // truncated buffer, so the slice below is within what came back.
         let array = self
             .source
-            .range_async(col.array_with_crc_range())
+            .range_async(col.norms_fetch_range())
             .await
             .map_err(|e| FtsError::RangeFetch {
                 what: LENGTH_ARRAY,
                 source: e,
             })?;
-        col.install_norms(&array)?;
+        col.install_fetched_norms(&array)?;
         Ok(())
     }
 
@@ -2633,6 +2652,66 @@ mod tests {
     ///
     /// Documents are built at a spread of lengths so the quantization is
     /// exercised across buckets rather than landing them all in one.
+    /// A lazy reader that does not verify what it reads fetches the bucket
+    /// array alone to score, a third of the length span, and scores as an
+    /// eager reader does; one that verifies reads the span whole, with its
+    /// CRC.
+    #[tokio::test]
+    async fn an_unverified_lazy_open_reads_only_the_buckets_to_score() {
+        /// Documents in the fixture.
+        const N_DOCS: u32 = 512;
+
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for doc in 0..N_DOCS {
+            let n_tokens = (doc % 64) + 1;
+            let text = (0..n_tokens)
+                .map(|t| format!("t{t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            b.add_doc(0, doc, &text).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let eager = FtsReader::open(blob.clone(), json).expect("open");
+
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob.clone()));
+        let lazy = FtsReader::open_lazy(src, json, OpenOptions { verify_crc: false })
+            .await
+            .expect("open_lazy");
+        let column = &lazy.columns[0];
+        let stored = column
+            .stored_norms
+            .as_ref()
+            .expect("the current version stores its norms");
+        assert_eq!(
+            column.norms_fetch_range(),
+            stored.buckets,
+            "unverified, the read is the bucket array alone"
+        );
+        assert_eq!(
+            column.norms_fetch_range().len() * 3 + format::CRC_BYTES,
+            column.array_with_crc_range().len(),
+            "two bytes of length and one of bucket per document, then the CRC"
+        );
+        assert_eq!(
+            column.norms().dl_norm_k1.buckets(),
+            eager.columns[0].norms().dl_norm_k1.buckets(),
+            "the lazy reader scores by the same buckets"
+        );
+
+        let src: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(blob));
+        let verifying = FtsReader::open_lazy(src, json, OpenOptions { verify_crc: true })
+            .await
+            .expect("open_lazy");
+        let column = &verifying.columns[0];
+        assert_eq!(
+            column.norms_fetch_range(),
+            column.array_with_crc_range(),
+            "a verified read takes the span the CRC covers"
+        );
+    }
+
     #[test]
     fn stored_norms_match_what_deriving_them_would_give() {
         /// Documents in the fixture.
@@ -4279,6 +4358,16 @@ mod tests {
         inner: BytesLazyByteSource,
         ranges: Mutex<Vec<(u64, u64)>>,
     }
+    /// The bytes a lazy reader fetches to score `column`: the bucket array a
+    /// blob that stores one, else the length array it derives the buckets
+    /// from. What a test that watches the norms read has to watch.
+    fn norms_region(column: &ColumnMeta) -> Range<usize> {
+        match &column.stored_norms {
+            Some(stored) => stored.buckets.clone(),
+            None => column.doc_lengths_range.clone(),
+        }
+    }
+
     impl RecordingSource {
         fn note(&self, start: u64, len: u64) {
             self.ranges.lock().expect("ranges").push((start, len));
@@ -4335,7 +4424,7 @@ mod tests {
             .await
             .expect("open_lazy");
         let dictionary = r.dict_range.clone();
-        let lengths = r.columns[0].doc_lengths_range.clone();
+        let lengths = norms_region(&r.columns[0]);
         let opened = recording.len();
         assert_eq!(
             recording.touches(0, &dictionary),
@@ -4421,7 +4510,7 @@ mod tests {
         loop {
             batches += 1;
             let chunk = r
-                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH)
+                .term_index_facts_after(&dict_bytes, "body", after.as_deref(), BATCH, 0)
                 .await
                 .expect("facts batch");
             let done = chunk.len() < BATCH;
@@ -4924,7 +5013,7 @@ mod tests {
     async fn reader_pausing_on_the_length_array() -> (Arc<PausingSource>, Arc<FtsReader>) {
         let (blob, json) = build_blob();
         let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
-        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let lengths = norms_region(&eager.columns[0]);
         let source = Arc::new(PausingSource {
             inner: BytesLazyByteSource::new(blob),
             region: lengths,
@@ -5076,7 +5165,7 @@ mod tests {
         let real = eager.column_length_stats("body").expect("eager lengths");
         let source = Arc::new(FailingOnceSource {
             inner: BytesLazyByteSource::new(blob),
-            region: eager.columns[0].doc_lengths_range.clone(),
+            region: norms_region(&eager.columns[0]),
             armed: AtomicBool::new(false),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();
@@ -5126,7 +5215,7 @@ mod tests {
         let eager = FtsReader::open(blob.clone(), json).expect("eager open");
         let source = Arc::new(FailingOnceSource {
             inner: BytesLazyByteSource::new(blob),
-            region: eager.columns[0].doc_lengths_range.clone(),
+            region: norms_region(&eager.columns[0]),
             armed: AtomicBool::new(false),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();
@@ -5184,7 +5273,7 @@ mod tests {
         let eager = FtsReader::open(blob.clone(), json).expect("eager open");
         let source = Arc::new(FailingOnceSource {
             inner: BytesLazyByteSource::new(blob),
-            region: eager.columns[0].doc_lengths_range.clone(),
+            region: norms_region(&eager.columns[0]),
             armed: AtomicBool::new(false),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();

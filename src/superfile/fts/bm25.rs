@@ -123,7 +123,7 @@ const LEN_QUANT_MANTISSA_BITS: u32 = 3;
 /// two docs whose true lengths differ by more than one bucket. Inverse
 /// of [`dequantize_len`].
 #[inline]
-pub(super) fn quantize_len(len: u32) -> u8 {
+pub(crate) fn quantize_len(len: u32) -> u8 {
     if len < LEN_QUANT_EXACT_MAX {
         len as u8
     } else {
@@ -141,7 +141,7 @@ pub(super) fn quantize_len(len: u32) -> u8 {
 /// document length. The result is the exact length for small docs and a
 /// bucket representative (within ~6.25%) for larger ones.
 #[inline]
-pub(super) fn dequantize_len(b: u8) -> u32 {
+pub(crate) fn dequantize_len(b: u8) -> u32 {
     let i = b as u32;
     if i < LEN_QUANT_EXACT_MAX {
         i
@@ -215,6 +215,15 @@ pub fn score(idf_t: f32, tf: u32, dl: u32, avgdl: f32, params: Bm25Params) -> f3
         return 0.0;
     }
     idf_t * tf / denom
+}
+
+/// The length-normalized term frequency `tf / (tf + dl_norm_k1)`: what a
+/// score multiplies the idf by. A term-index tier orders its entries by
+/// it and bounds its blocks with it.
+#[inline(always)]
+pub fn tf_factor(tf: u32, dl_norm_k1: f32) -> f32 {
+    let tf = tf as f32;
+    tf / (tf + dl_norm_k1)
 }
 
 /// BM25 score using a precomputed `dl_norm_k1 = K1 * (1 - B + B * dl/avgdl)`

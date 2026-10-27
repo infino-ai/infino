@@ -129,6 +129,160 @@ pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Bytes of a packed sidecar's header and block directory for `n_docs`
+/// documents: what a read of a few rows fetches first, to find their blocks.
+pub(crate) fn directory_len(n_docs: usize) -> usize {
+    HEADER_BYTES + n_docs.div_ceil(BLOCK_DOCS) * DIR_ENTRY_BYTES
+}
+
+/// Check a packed sidecar's header against `n_docs` and return its block
+/// count. `bytes` must hold the header and the directory.
+fn check_header(bytes: &[u8], n_docs: usize) -> Result<usize, String> {
+    let declared = u32_le_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
+    if declared != n_docs {
+        return Err(format!(
+            "packed id sidecar declares {declared} docs, superfile has {n_docs}"
+        ));
+    }
+    if u32_le_at(bytes, 4) != Some(BLOCK_DOCS as u32) {
+        return Err("packed id sidecar block size is not the reader's".into());
+    }
+    let n_blocks = u32_le_at(bytes, 8).ok_or("packed id sidecar truncated")? as usize;
+    if n_blocks != n_docs.div_ceil(BLOCK_DOCS) {
+        return Err("packed id sidecar block count does not match n_docs".into());
+    }
+    if bytes.len() < HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES {
+        return Err("packed id sidecar directory truncated".into());
+    }
+    Ok(n_blocks)
+}
+
+/// A packed sidecar's header and directory alone, over the bytes
+/// [`directory_len`] names: enough to place every block, so a read of a few
+/// rows fetches those blocks and nothing else of the sidecar.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PackedDirectory<'a> {
+    bytes: &'a [u8],
+    n_blocks: usize,
+}
+
+impl<'a> PackedDirectory<'a> {
+    pub(crate) fn open(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
+        let n_blocks = check_header(bytes, n_docs)?;
+        Ok(Self { bytes, n_blocks })
+    }
+
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// Where block `b` lies in the sidecar, as offsets from its start: from
+    /// its directory entry to the next block's, or to the sidecar's end for
+    /// the last. `None` for a block past the end or a directory that does not
+    /// ascend.
+    pub(crate) fn block_range(&self, b: usize, sidecar_len: usize) -> Option<Range<usize>> {
+        if b >= self.n_blocks {
+            return None;
+        }
+        let start = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
+        let end = match b + 1 < self.n_blocks {
+            true => u64_le_at(self.bytes, HEADER_BYTES + (b + 1) * DIR_ENTRY_BYTES)? as usize,
+            false => sidecar_len,
+        };
+        (start < end && end <= sidecar_len).then_some(start..end)
+    }
+}
+
+/// The ids of `docs` — ascending, every one in block `b` — decoded from the
+/// block's own bytes, appended to `out` in `docs` order. `None` when the block
+/// is malformed or a doc is not its.
+pub(crate) fn ids_in_block(
+    block: &[u8],
+    b: usize,
+    n_docs: usize,
+    n_blocks: usize,
+    docs: &[u32],
+    out: &mut Vec<i128>,
+) -> Option<()> {
+    let expected = match b + 1 == n_blocks {
+        true => n_docs - b * BLOCK_DOCS,
+        false => BLOCK_DOCS,
+    };
+    let blk = parse_block(block, 0, expected)?;
+    if docs.iter().any(|&d| d as usize / BLOCK_DOCS != b) {
+        return None;
+    }
+    let mut his = Vec::new();
+    let mut los = Vec::new();
+    decode_docs(block, &blk, docs, &mut his, &mut los, |_, id| out.push(id))
+}
+
+/// Block `b`'s header and where its ids sit when the block starts at `off`
+/// in `bytes`, or `None` if the header is bad or the block runs past the
+/// bytes. `expected` is how many docs the block must hold.
+fn parse_block(bytes: &[u8], off: usize, expected: usize) -> Option<IdBlock> {
+    let header = bytes.get(off..off + BLOCK_HEADER_BYTES)?;
+    let hi_width = header[HI_WIDTH_AT];
+    let lo_width = header[LO_WIDTH_AT];
+    let n_in_block =
+        u16::from_le_bytes([header[N_IN_BLOCK_AT], header[N_IN_BLOCK_AT + 1]]) as usize;
+    if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_in_block != expected {
+        return None;
+    }
+    let hi_start = off + BLOCK_HEADER_BYTES;
+    let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
+    let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
+    bytes.get(hi_start..lo_end)?;
+    Some(IdBlock {
+        hi_base: u64::from_le_bytes(header[..8].try_into().expect("8 bytes")),
+        lo_base: u64::from_le_bytes(header[8..16].try_into().expect("8 bytes")),
+        hi_width,
+        lo_width,
+        n_in_block,
+        hi: hi_start..lo_start,
+        lo: lo_start..lo_end,
+    })
+}
+
+/// The ids of `docs`, all of one block `blk` in `bytes`, through
+/// `sink(index_in_docs, id)`: unpacked wholesale once the run asks for at
+/// least `1 / BULK_DENSITY` of the block, lane by lane otherwise.
+fn decode_docs(
+    bytes: &[u8],
+    blk: &IdBlock,
+    docs: &[u32],
+    his: &mut Vec<u64>,
+    los: &mut Vec<u64>,
+    mut sink: impl FnMut(usize, i128),
+) -> Option<()> {
+    let hi_bytes = &bytes[blk.hi.clone()];
+    let lo_bytes = &bytes[blk.lo.clone()];
+    if docs.len() * BULK_DENSITY < blk.n_in_block {
+        for (k, &d) in docs.iter().enumerate() {
+            let lane = d as usize % BLOCK_DOCS;
+            if lane >= blk.n_in_block {
+                return None;
+            }
+            let hi = get_bits(hi_bytes, lane, blk.hi_width)?;
+            let lo = get_bits(lo_bytes, lane, blk.lo_width)?;
+            sink(k, blk.id(hi, lo));
+        }
+    } else {
+        his.clear();
+        los.clear();
+        for_each_lane(hi_bytes, 0, blk.n_in_block, blk.hi_width, |v| his.push(v))?;
+        for_each_lane(lo_bytes, 0, blk.n_in_block, blk.lo_width, |v| los.push(v))?;
+        for (k, &d) in docs.iter().enumerate() {
+            let lane = d as usize % BLOCK_DOCS;
+            if lane >= blk.n_in_block {
+                return None;
+            }
+            sink(k, blk.id(his[lane], los[lane]));
+        }
+    }
+    Some(())
+}
+
 /// A packed id sidecar over borrowed bytes.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PackedIds<'a> {
@@ -142,23 +296,7 @@ impl<'a> PackedIds<'a> {
     /// would read the whole sidecar from disk on a cold open, even for a query
     /// that never asks for an `_id`. A bad block shows up as `None` on read.
     pub(crate) fn open(bytes: &'a [u8], n_docs: usize) -> Result<Self, String> {
-        let declared =
-            u32_le_at(bytes, 0).ok_or("packed id sidecar shorter than its header")? as usize;
-        if declared != n_docs {
-            return Err(format!(
-                "packed id sidecar declares {declared} docs, superfile has {n_docs}"
-            ));
-        }
-        if u32_le_at(bytes, 4) != Some(BLOCK_DOCS as u32) {
-            return Err("packed id sidecar block size is not the reader's".into());
-        }
-        let n_blocks = u32_le_at(bytes, 8).ok_or("packed id sidecar truncated")? as usize;
-        if n_blocks != n_docs.div_ceil(BLOCK_DOCS) {
-            return Err("packed id sidecar block count does not match n_docs".into());
-        }
-        if bytes.len() < HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES {
-            return Err("packed id sidecar directory truncated".into());
-        }
+        let n_blocks = check_header(bytes, n_docs)?;
         Ok(Self {
             bytes,
             n_docs,
@@ -180,35 +318,12 @@ impl<'a> PackedIds<'a> {
     #[inline]
     fn block(&self, b: usize) -> Option<IdBlock> {
         let off = u64_le_at(self.bytes, HEADER_BYTES + b * DIR_ENTRY_BYTES)? as usize;
-        let header = self.bytes.get(off..off + BLOCK_HEADER_BYTES)?;
-        let hi_width = header[HI_WIDTH_AT];
-        let lo_width = header[LO_WIDTH_AT];
-        let n_in_block =
-            u16::from_le_bytes([header[N_IN_BLOCK_AT], header[N_IN_BLOCK_AT + 1]]) as usize;
-
         // Every block holds BLOCK_DOCS docs but the last, which holds the rest.
         let expected = match b + 1 == self.n_blocks {
             true => self.n_docs - b * BLOCK_DOCS,
             false => BLOCK_DOCS,
         };
-
-        if hi_width > MAX_WIDTH || lo_width > MAX_WIDTH || n_in_block != expected {
-            return None;
-        }
-
-        let hi_start = off + BLOCK_HEADER_BYTES;
-        let lo_start = hi_start + payload_bytes(n_in_block, hi_width);
-        let lo_end = lo_start + payload_bytes(n_in_block, lo_width);
-        self.bytes.get(hi_start..lo_end)?;
-        Some(IdBlock {
-            hi_base: u64::from_le_bytes(header[..8].try_into().expect("8 bytes")),
-            lo_base: u64::from_le_bytes(header[8..16].try_into().expect("8 bytes")),
-            hi_width,
-            lo_width,
-            n_in_block,
-            hi: hi_start..lo_start,
-            lo: lo_start..lo_end,
-        })
+        parse_block(self.bytes, off, expected)
     }
 
     /// One doc's id, through the same block path `get_many` takes.
@@ -262,31 +377,14 @@ impl<'a> PackedIds<'a> {
                 return None;
             }
             let blk = self.block(b)?;
-            let hi_bytes = &self.bytes[blk.hi.clone()];
-            let lo_bytes = &self.bytes[blk.lo.clone()];
-            if (j - i) * BULK_DENSITY < blk.n_in_block {
-                for (k, &d) in docs.iter().enumerate().take(j).skip(i) {
-                    let lane = d as usize % BLOCK_DOCS;
-                    if lane >= blk.n_in_block {
-                        return None;
-                    }
-                    let hi = get_bits(hi_bytes, lane, blk.hi_width)?;
-                    let lo = get_bits(lo_bytes, lane, blk.lo_width)?;
-                    sink(k, blk.id(hi, lo));
-                }
-            } else {
-                his.clear();
-                los.clear();
-                for_each_lane(hi_bytes, 0, blk.n_in_block, blk.hi_width, |v| his.push(v))?;
-                for_each_lane(lo_bytes, 0, blk.n_in_block, blk.lo_width, |v| los.push(v))?;
-                for (k, &d) in docs.iter().enumerate().take(j).skip(i) {
-                    let lane = d as usize % BLOCK_DOCS;
-                    if lane >= blk.n_in_block {
-                        return None;
-                    }
-                    sink(k, blk.id(his[lane], los[lane]));
-                }
-            }
+            decode_docs(
+                self.bytes,
+                &blk,
+                &docs[i..j],
+                &mut his,
+                &mut los,
+                |k, id| sink(i + k, id),
+            )?;
             i = j;
         }
         Some(())
@@ -551,5 +649,65 @@ mod tests {
                 assert_eq!(p.get(good), Some(ids[good as usize]), "{what}: doc {good}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod block_tests {
+    use super::*;
+
+    /// Rows in the fixture: three full blocks and a partial fourth.
+    const ROWS: usize = 3 * BLOCK_DOCS + 17;
+
+    fn raw_ids() -> Vec<u8> {
+        // Ids with both halves varying, not monotonic, so a block's bases and
+        // widths are all exercised.
+        (0..ROWS)
+            .flat_map(|i| {
+                let hi = (i as u128 % 5) << 64;
+                let lo = ((i as u128 * 7919) % 100_003) + (1u128 << 40);
+                ((hi | lo) as i128).to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// A block read on its own, through the directory's range for it,
+    /// decodes the same ids the whole sidecar does.
+    #[test]
+    fn a_block_decodes_alone_as_in_the_whole_sidecar() {
+        let raw = raw_ids();
+        let packed = encode_packed(&raw);
+        let whole = PackedIds::open(&packed, ROWS).expect("whole sidecar");
+        let dir = PackedDirectory::open(&packed[..directory_len(ROWS)], ROWS).expect("directory");
+        assert_eq!(dir.n_blocks(), ROWS.div_ceil(BLOCK_DOCS));
+        for b in 0..dir.n_blocks() {
+            let range = dir.block_range(b, packed.len()).expect("block in place");
+            let docs: Vec<u32> = [0usize, 1, 2, 500, 1023]
+                .iter()
+                .map(|&lane| (b * BLOCK_DOCS + lane) as u32)
+                .filter(|&d| (d as usize) < ROWS)
+                .collect();
+            let mut alone = Vec::new();
+            ids_in_block(&packed[range], b, ROWS, dir.n_blocks(), &docs, &mut alone)
+                .expect("block decodes");
+            let mut together = Vec::new();
+            whole.get_many(&docs, &mut together).expect("whole decodes");
+            assert_eq!(alone, together, "block {b}");
+        }
+        // A doc of another block is refused, as is a block out of range.
+        let mut out = Vec::new();
+        let range = dir.block_range(0, packed.len()).expect("block 0");
+        assert!(
+            ids_in_block(
+                &packed[range],
+                0,
+                ROWS,
+                dir.n_blocks(),
+                &[BLOCK_DOCS as u32],
+                &mut out
+            )
+            .is_none()
+        );
+        assert!(dir.block_range(dir.n_blocks(), packed.len()).is_none());
     }
 }

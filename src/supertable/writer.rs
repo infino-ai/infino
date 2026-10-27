@@ -87,7 +87,7 @@ use object_store::{MultipartUpload, PutPayload, UploadPart};
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tempfile::{Builder as TempDirBuilder, NamedTempFile, TempDir};
+use tempfile::{NamedTempFile, TempDir};
 use tokio::{
     sync::{
         Semaphore,
@@ -111,6 +111,7 @@ use crate::{
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector},
+        rss::available_memory_bytes,
     },
     storage::{StorageError, StorageProvider},
     superfile::{
@@ -127,7 +128,7 @@ use crate::{
                 sub_hdr,
             },
         },
-        fts::builder::doc_lengths_entry_size,
+        fts::{bm25::Bm25Params, builder::doc_lengths_entry_size},
         reader::vector_layout_from_kv,
         vector::{
             builder::{
@@ -2934,7 +2935,7 @@ impl SupertableWriter {
                             term_index::reserve_segment(
                                 storage.as_ref(),
                                 contributions,
-                                &term_index::BuildPolicy::default(),
+                                &self.inner.options.term_index_build_policy(),
                                 base,
                                 true,
                             ),
@@ -2993,6 +2994,13 @@ impl Drop for SupertableWriter {
 /// re-decode through DataFusion or parquet-rs's stats reader.
 pub struct ShardOutput {
     bytes: Bytes,
+    /// The id the superfile is published under, minted at build time so a
+    /// contribution gathered while building can name it.
+    superfile_id: Uuid,
+    /// The superfile's term-index contribution, gathered while it was
+    /// built; `None` when the build gathered none and the prepare reads it
+    /// from the finished bytes.
+    term_contribution: Option<TermContribution>,
     n_docs: u64,
     /// `id_min` / `id_max`: only meaningful when `n_docs > 0`.
     /// For a 0-doc shard (empty slice — shouldn't happen given
@@ -3019,11 +3027,28 @@ impl ShardOutput {
     ) -> Self {
         Self {
             bytes,
+            superfile_id: Uuid::new_v4(),
+            term_contribution: None,
             n_docs,
             id_min,
             id_max,
             scalar_stats,
         }
+    }
+
+    /// Attach the term-index contribution gathered while these bytes were
+    /// built, under the id the superfile is then published as.
+    /// The id the superfile is published under.
+    pub(in crate::supertable) fn superfile_id(&self) -> Uuid {
+        self.superfile_id
+    }
+
+    pub(in crate::supertable) fn with_term_contribution(
+        mut self,
+        contribution: TermContribution,
+    ) -> Self {
+        self.term_contribution = Some(contribution);
+        self
     }
 }
 
@@ -3074,6 +3099,13 @@ fn build_one_shard_with_layout(
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
+    // The term-index contribution is gathered as the postings are written
+    // rather than read back from the finished superfile.
+    let superfile_id = Uuid::new_v4();
+    let head_sink = term_head_sink_for(manifest)?;
+    if let Some((sink, depth)) = &head_sink {
+        builder.set_term_head_sink(Box::new(sink.clone()), *depth);
+    }
 
     let scalar_schema = manifest.scalar_schema();
     // The supertable always prepends the id column at index 0 of the
@@ -3147,13 +3179,41 @@ fn build_one_shard_with_layout(
         (id_min, id_max)
     };
 
+    let term_contribution = head_sink
+        .map(|(sink, _)| sink.into_contribution(superfile_id, id_min))
+        .transpose()
+        .map_err(|e| BuildError::Store(e.to_string()))?
+        .flatten();
     Ok(ShardOutput {
         bytes,
+        superfile_id,
+        term_contribution,
         n_docs,
         id_min,
         id_max,
         scalar_stats,
     })
+}
+
+/// The sink a shard build hands its terms to, with the head depth, when
+/// the table keeps a term index: storage-backed, with text columns. The
+/// builder's column names resolve to the ids the index keys terms by; a
+/// column the table does not have contributes nothing.
+pub(in crate::supertable) fn term_head_sink_for(
+    manifest: &ManifestSnapshot,
+) -> Result<Option<(term_index::HeadSink, usize)>, BuildError> {
+    if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
+        return Ok(None);
+    }
+    let columns: HashMap<String, FieldId> = manifest
+        .fts_configs()
+        .iter()
+        .filter_map(|c| Some((c.column.clone(), manifest.field_id(&c.column)?)))
+        .collect();
+    let policy = manifest.options.term_index_build_policy();
+    let sink = term_index::HeadSink::new(columns, policy.scratch_root.as_deref())
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    Ok(Some((sink, policy.head_depth_per_superfile)))
 }
 
 /// Pull the superfile's `(total_size, vec_off/len, fts_off/len)`
@@ -3686,7 +3746,8 @@ pub(crate) fn build_fts_summary(
 /// `df` and where its postings sit. The reader's source is the bytes just
 /// built, so the awaited calls resolve without I/O; the bridge only lends
 /// them an executor from this synchronous prepare path. Every term carries
-/// its score ceiling in this superfile, at the superfile's own statistics.
+/// its score ceiling in this superfile, at the superfile's own statistics,
+/// and its head to the policy's depth.
 pub(in crate::supertable) fn build_term_contribution(
     reader: &SuperfileReader,
     manifest: &ManifestSnapshot,
@@ -3697,12 +3758,18 @@ pub(in crate::supertable) fn build_term_contribution(
     if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
         return Ok(None);
     }
-    let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, id_min)
-        .map_err(|e| BuildError::Store(e.to_string()))?;
+    let policy = manifest.options.term_index_build_policy();
+    let mut writer = term_index::ContributionWriter::create_in_scratch(
+        superfile_id,
+        id_min,
+        policy.scratch_root.as_deref(),
+    )
+    .map_err(|e| BuildError::Store(e.to_string()))?;
     bridge_sync_to_async(write_superfile_terms(
         reader,
         &manifest.options.legacy_names(),
         &mut writer,
+        &manifest.options.term_index_build_policy(),
     ))
     .map_err(|e| BuildError::Store(e.to_string()))?;
     writer
@@ -3723,6 +3790,7 @@ async fn write_superfile_terms(
     reader: &SuperfileReader,
     legacy: &LegacyNames,
     writer: &mut term_index::ContributionWriter,
+    policy: &term_index::BuildPolicy,
 ) -> Result<(), TermIndexError> {
     let Some(fts) = reader.fts() else {
         return Ok(());
@@ -3743,6 +3811,18 @@ async fn write_superfile_terms(
             source,
         })?;
     for (_, column, column_id) in &columns {
+        if let (Some(avgdl), Some(params)) =
+            (fts.column_baked_avgdl(column), fts.column_params(column))
+        {
+            writer.set_scoring(
+                *column_id,
+                term_index::ColumnScoring {
+                    avgdl,
+                    params,
+                    scored_docs: 0,
+                },
+            );
+        }
         let mut after: Option<Vec<u8>> = None;
         loop {
             let chunk = fts
@@ -3751,30 +3831,41 @@ async fn write_superfile_terms(
                     column,
                     after.as_deref(),
                     TERM_INDEX_BATCH_TERMS,
+                    policy.head_depth_per_superfile,
                 )
                 .await
                 .map_err(|source| TermIndexError::Read {
                     what: "term facts",
                     source,
                 })?;
-            for (term, fact) in &chunk {
+            let n_in_chunk = chunk.len();
+            let last_term = chunk.last().map(|(term, _)| term.clone());
+            for (term, fact) in chunk {
                 let term =
-                    from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
+                    from_utf8(&term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
                 // A term the dictionary lists but no cursor could describe
                 // keeps its presence and is given the ceiling that prunes
                 // nothing rather than one that could be wrong.
-                let (df, bound, location) = match fact {
+                let (df, bound, location, tail, head) = match fact {
                     Some(f) => (
                         f.df,
                         f.bound,
                         term_index::Location::from_dict_value(f.entry),
+                        f.head.tail,
+                        f.head.docs,
                     ),
-                    None => (0, f32::INFINITY, term_index::Location::None),
+                    None => (
+                        0,
+                        f32::INFINITY,
+                        term_index::Location::None,
+                        f32::INFINITY,
+                        Vec::new(),
+                    ),
                 };
-                writer.push(&column_id.term_key(term), df, bound, location)?;
+                writer.push(&column_id.term_key(term), df, bound, location, tail, &head)?;
             }
-            let done = chunk.len() < TERM_INDEX_BATCH_TERMS;
-            after = chunk.into_iter().last().map(|(term, _)| term);
+            let done = n_in_chunk < TERM_INDEX_BATCH_TERMS;
+            after = last_term;
             if done {
                 break;
             }
@@ -3818,7 +3909,8 @@ pub(super) fn prepare_superfile(
     inner: &SupertableInner,
     shard: ShardOutput,
 ) -> Result<Option<PreparedSuperfile>, BuildError> {
-    prepare_superfile_named(inner, &inner.manifest.load(), shard, None)
+    let manifest = inner.manifest.load();
+    prepare_superfile_named(inner, &manifest, shard, None)
 }
 
 /// [`prepare_superfile`] with the source stem the entry carries: `Some`
@@ -3893,7 +3985,7 @@ pub(super) fn prepare_superfile_named(
         // Hidden cell superfile; stamped by the hidden manifest's own
         // `update`. Irrelevant to the user-side drain watermark.
         birth_version: 0,
-        superfile_id: uuid::Uuid::new_v4(),
+        superfile_id: shard.superfile_id,
         uri,
         stem: stem.map(str::to_owned),
         physical_schema: Some(Arc::new(PhysicalSchema::of_reader(
@@ -3916,8 +4008,12 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
-    let term_contribution =
-        build_term_contribution(&reader, manifest, entry.superfile_id, entry.id_min)?;
+    // A build that gathered its contribution as it wrote hands it over;
+    // one that did not has it read from the finished bytes.
+    let term_contribution = match shard.term_contribution {
+        Some(contribution) => Some(contribution),
+        None => build_term_contribution(&reader, manifest, entry.superfile_id, entry.id_min)?,
+    };
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
@@ -4154,7 +4250,8 @@ pub(crate) fn commit_built_superfile(st: &Supertable, bytes: Bytes) -> Result<()
         });
     let scalar_stats = ScalarStatsAgg::from_batches(&batch.schema(), &[&batch]);
     let shard = ShardOutput::new_with_params(bytes, reader.n_docs(), id_min, id_max, scalar_stats);
-    let prepared = prepare_superfile_named(inner, &inner.manifest.load(), shard, None)?
+    let manifest = inner.manifest.load();
+    let prepared = prepare_superfile_named(inner, &manifest, shard, None)?
         .ok_or_else(|| BuildError::Store("built superfile holds no rows".into()))?;
     let publish = collect_prepared_superfiles(inner, vec![prepared])?;
     st.block_on_query(persist_superfile_publish_batch_async(
@@ -7238,6 +7335,8 @@ fn build_one_shard_from_packed_cells(
 
     Ok(ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs,
         id_min,
         id_max,
@@ -7352,6 +7451,8 @@ fn build_prepared_from_spilled_cells(
     };
     let shard = ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs: n_docs as u64,
         id_min,
         id_max,
@@ -7811,6 +7912,8 @@ fn build_one_packed_shard_via_drain(
 
     Ok(Some(ShardOutput {
         bytes,
+        superfile_id: Uuid::new_v4(),
+        term_contribution: None,
         n_docs,
         id_min,
         id_max,
@@ -10992,9 +11095,12 @@ pub(in crate::supertable) async fn stamp_term_index(
                                     "term index: publish lost a race, rebased the build onto the commits since"
                                 );
                             }
+                            // The rebased root is made of segments already on
+                            // storage, their slices and tier objects with them.
                             Some(term_index::Built {
                                 root,
                                 slices: Vec::new(),
+                                tiers: Vec::new(),
                             })
                         }
                         None => match fold_term_index(&old, base, prior, current, &entries).await
@@ -11021,6 +11127,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         term_index::Built {
                             root: base,
                             slices: Vec::new(),
+                            tiers: Vec::new(),
                         }
                     } else {
                         collect_and_build_term_index(&old, &missing, base).await?
@@ -11041,6 +11148,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
+            term_index::write_tiers(storage.as_ref(), built.tiers).await?;
             term_index::write_slices(storage.as_ref(), built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
@@ -11097,7 +11205,33 @@ async fn merge_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
-    let scratch = term_index_scratch()?;
+    let policy = manifest.options.term_index_build_policy();
+    let scratch = term_index_scratch(&policy)?;
+    // Superfiles no segment lists get one segment of their own, numbered
+    // past the ones `current` lists, and merge like the rest.
+    let missing = unlisted(current, entries);
+    // When nothing `current` lists is still live — a compaction that
+    // replaced every superfile — its segments hold only postings the merge
+    // would drop, so they are not fetched: the fresh build over `entries`
+    // is the index, in `entries` order, as the merge would have numbered it.
+    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+    if !current.superfiles.iter().any(|id| live.contains(id)) {
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let fresh: Vec<Arc<SuperfileEntry>> = missing
+            .iter()
+            .filter(|e| seen.insert(e.superfile_id))
+            .cloned()
+            .collect();
+        let contributions = collect_contributions(manifest, &fresh, scratch.path()).await?;
+        return run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "term-index build",
+            move || term_index::build(&contributions, &policy),
+        )
+        .instrument(detail_span!("term_index.build", superfiles = fresh.len(),))
+        .await
+        .map_err(|e| TermIndexError::Build(e.to_string()))?;
+    }
     let mut sources =
         term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
             .instrument(detail_span!(
@@ -11105,9 +11239,6 @@ async fn merge_term_index(
                 segments = current.segments.len(),
             ))
             .await?;
-    // Superfiles no segment lists get one segment of their own, numbered
-    // past the ones `current` lists, and merge like the rest.
-    let missing = unlisted(current, entries);
     let mut old = Root {
         superfiles: current.superfiles.clone(),
         id_mins: current.id_mins.clone(),
@@ -11115,9 +11246,18 @@ async fn merge_term_index(
     };
     if !missing.is_empty() {
         let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
-        let built =
-            term_index::build_onto(old, &contributions, &term_index::BuildPolicy::default())?;
-        sources.push(term_index::spill_slices(scratch.path(), built.slices)?);
+        let built = term_index::build_onto(old, &contributions, &policy)?;
+        let fresh = built
+            .root
+            .segments
+            .last()
+            .expect("a build onto a root appends its segment");
+        term_index::spill_tiers(scratch.path(), &fresh.slices, built.tiers)?;
+        sources.push(term_index::spill_slices(
+            scratch.path(),
+            &fresh.slices,
+            built.slices,
+        )?);
         old = built.root;
     }
 
@@ -11139,12 +11279,14 @@ async fn merge_term_index(
         .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
         .collect();
 
-    let (segment, slices) = run_on_pool(
+    let policy = term_index::BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
+        ..policy
+    };
+    let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
-        move || {
-            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
-        },
+        move || term_index::merge_segments(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!(
         "term_index.merge",
@@ -11153,8 +11295,12 @@ async fn merge_term_index(
     ))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(segment);
-    Ok(term_index::Built { root, slices })
+    root.segments.push(merged.segment);
+    Ok(term_index::Built {
+        root,
+        slices: merged.slices,
+        tiers: merged.tiers,
+    })
 }
 
 /// Fold the delta segments committed since `prior` onto `base`, the build
@@ -11196,6 +11342,7 @@ async fn fold_term_index(
         return Ok(Some(term_index::Built {
             root,
             slices: Vec::new(),
+            tiers: Vec::new(),
         }));
     }
     let storage = manifest
@@ -11203,25 +11350,33 @@ async fn fold_term_index(
         .storage
         .as_ref()
         .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
-    let scratch = term_index_scratch()?;
+    let policy = manifest.options.term_index_build_policy();
+    let policy = term_index::BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
+        ..policy
+    };
+    let scratch = term_index_scratch(&policy)?;
     let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
-    let (segment, slices) = run_on_pool(
+    let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
-        move || {
-            term_index::merge_segments(&sources, &ordinals, &term_index::BuildPolicy::default())
-        },
+        move || term_index::merge_segments(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(segment);
-    Ok(Some(term_index::Built { root, slices }))
+    root.segments.push(merged.segment);
+    Ok(Some(term_index::Built {
+        root,
+        slices: merged.slices,
+        tiers: merged.tiers,
+    }))
 }
 
-/// A scratch directory for one term-index build, removed when dropped.
-fn term_index_scratch() -> io::Result<TempDir> {
-    TempDirBuilder::new().prefix("infino-term-index-").tempdir()
+/// A scratch directory for one term-index build, removed when dropped:
+/// on the table's disk when it has one (see `BuildPolicy::scratch_root`).
+fn term_index_scratch(policy: &term_index::BuildPolicy) -> io::Result<TempDir> {
+    term_index::scratch_dir(policy.scratch_root.as_deref())
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
@@ -11233,41 +11388,154 @@ async fn collect_and_build_term_index(
     entries: &[Arc<SuperfileEntry>],
     onto: Root,
 ) -> Result<term_index::Built, TermIndexError> {
-    let scratch = term_index_scratch()?;
+    let policy = manifest.options.term_index_build_policy();
+    let scratch = term_index_scratch(&policy)?;
     let contributions = collect_contributions(manifest, entries, scratch.path()).await?;
-    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
+    term_index::build_onto(onto, &contributions, &policy)
 }
 
 /// Walk each of `entries`' dictionaries, one superfile at a time, spilling
 /// its contribution under `dir`.
+/// Per superfile of `superfiles`, by position, the average length and
+/// parameters each text column scores at, as the manifest records them:
+/// what a merge keys the superfile's tier entries at. A superfile the
+/// manifest does not list, or a column it records no average for, is left
+/// out and keys at the default.
+fn scoring_by_ordinal(
+    manifest: &ManifestSnapshot,
+    superfiles: &[Uuid],
+) -> Vec<BTreeMap<FieldId, term_index::ColumnScoring>> {
+    let mut by_id = scoring_by_superfile(manifest);
+    superfiles
+        .iter()
+        .map(|id| by_id.remove(id).unwrap_or_default())
+        .collect()
+}
+
+/// Each superfile's scoring facts per full-text column, by superfile id:
+/// what [`scoring_by_ordinal`] lays out by a root's ordinals, and what a
+/// commit hands the fold that may follow it, before its ordinals exist.
+fn scoring_by_superfile(
+    manifest: &ManifestSnapshot,
+) -> HashMap<Uuid, BTreeMap<FieldId, term_index::ColumnScoring>> {
+    let columns: Vec<(FieldId, Bm25Params)> = manifest
+        .fts_configs()
+        .iter()
+        .filter_map(|c| Some((manifest.field_id(&c.column)?, c.bm25)))
+        .collect();
+    manifest
+        .superfiles
+        .iter()
+        .map(|entry| {
+            let scoring = columns
+                .iter()
+                .filter_map(|(column, params)| {
+                    let summary = entry.fts_summary.get(column)?;
+                    // A summary written before the average was baked keys
+                    // its entries at the default; its document count still
+                    // turns a legacy bound into a key.
+                    let avgdl = summary
+                        .baked_avgdl
+                        .unwrap_or(term_index::ColumnScoring::default().avgdl);
+                    let scored_docs = summary
+                        .length_stats
+                        .as_ref()
+                        .map_or(entry.n_docs, |l| l.n_scored_docs);
+                    Some((
+                        *column,
+                        term_index::ColumnScoring {
+                            avgdl,
+                            params: *params,
+                            scored_docs,
+                        },
+                    ))
+                })
+                .collect();
+            (entry.superfile_id, scoring)
+        })
+        .collect()
+}
+
+/// The most superfiles an index rebuild walks at once. Each walk is one
+/// open reader and a pass over its dictionary and postings — a core's worth
+/// of work — so a table of a thousand superfiles rebuilds in minutes rather
+/// than hours.
+const CONTRIBUTION_WALKS_MAX: usize = 16;
+/// Memory one walk is budgeted at: the reader's resident dictionary and
+/// norms, its prefetched postings and the head heaps, on a superfile of a
+/// gigabyte. The walks at once are the memory available over this, up to
+/// the maximum: sixteen walks over a billion-document table peaked an
+/// 85 GB host at 84 GB.
+const CONTRIBUTION_WALK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Walks at once when the available memory cannot be read.
+const CONTRIBUTION_WALKS_FALLBACK: usize = 4;
+
+/// Each of `entries`' term-index contributions, in `entries` order, walked
+/// as many superfiles at a time as memory allows, up to
+/// [`CONTRIBUTION_WALKS_MAX`].
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     dir: &Path,
 ) -> Result<Vec<TermContribution>, TermIndexError> {
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let opt_storage = manifest.options.storage.as_ref();
     let legacy = manifest.options.legacy_names();
-    let mut contributions = Vec::with_capacity(entries.len());
+    let policy = manifest.options.term_index_build_policy();
+    let width = available_memory_bytes().map_or(CONTRIBUTION_WALKS_FALLBACK, |bytes| {
+        ((bytes / CONTRIBUTION_WALK_BYTES) as usize).clamp(1, CONTRIBUTION_WALKS_MAX)
+    });
+    let walks = Arc::new(Semaphore::new(width));
+    let mut tasks = Vec::with_capacity(entries.len());
     for entry in entries {
-        let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
+        let permit = Arc::clone(&walks)
+            .acquire_owned()
             .await
-            .map_err(TermIndexError::Open)?;
-        // The walk reads most of the FTS section, whose reads skip the block
-        // cache, so each would be its own GET. Fetch the section in bulk first.
-        // On failure the walk still works, read by read.
-        if let Some(cache) = disk_cache
-            && let Some((start, len)) = entry.subsection_offsets.as_ref().and_then(|o| o.fts)
-            && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
-        {
-            warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
-        }
-        let mut writer =
-            term_index::ContributionWriter::create(dir, entry.superfile_id, entry.id_min)?;
-        write_superfile_terms(&reader, &legacy, &mut writer).await?;
-        contributions.push(writer.finish()?);
-        drop(reader);
+            .map_err(|_| TermIndexError::Build("contribution walks closed".into()))?;
+        let store = Arc::clone(&manifest.options.store);
+        let disk_cache = manifest.options.disk_cache.clone();
+        let storage = manifest.options.storage.clone();
+        let legacy = legacy.clone();
+        let policy = policy.clone();
+        let dir = dir.to_path_buf();
+        let entry = Arc::clone(entry);
+        // The walk is minutes of decoding per superfile between its reads:
+        // it runs on a blocking thread, driving its reads through the
+        // runtime, so the workers stay free for queries.
+        let runtime = tokio::runtime::Handle::current();
+        tasks.push(tokio::task::spawn_blocking(move || {
+            runtime.block_on(async move {
+                let _walking = permit;
+                let reader = open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    storage.as_ref(),
+                    &entry,
+                    ReadIntent::Stream,
+                )
+                .await
+                .map_err(TermIndexError::Open)?;
+                // The walk reads most of the FTS section, whose reads skip the
+                // block cache, so each would be its own GET. Fetch the section in
+                // bulk first. On failure the walk still works, read by read.
+                if let Some(cache) = disk_cache.as_ref()
+                    && let Some((start, len)) =
+                        entry.subsection_offsets.as_ref().and_then(|o| o.fts)
+                    && let Err(e) = cache.prefetch_range(&entry.uri, start, len).await
+                {
+                    warn!("term index: fts prefetch failed for {}: {e}", entry.uri.0);
+                }
+                let mut writer =
+                    term_index::ContributionWriter::create(&dir, entry.superfile_id, entry.id_min)?;
+                write_superfile_terms(&reader, &legacy, &mut writer, &policy).await?;
+                writer.finish()
+            })
+        }));
+    }
+    let mut contributions = Vec::with_capacity(entries.len());
+    for task in tasks {
+        contributions.push(
+            task.await
+                .map_err(|e| TermIndexError::Build(format!("contribution walk: {e}")))??,
+        );
     }
     Ok(contributions)
 }
@@ -12326,7 +12594,13 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let policy = term_index::BuildPolicy::default();
+        // The fold that may follow the commit keys the tiers it rewrites by
+        // each superfile's own scoring; the manifest being committed holds
+        // the new superfiles' facts as well as the old.
+        let policy = term_index::BuildPolicy {
+            scoring_by_superfile: Arc::new(scoring_by_superfile(&new_manifest)),
+            ..current_manifest.options.term_index_build_policy()
+        };
         let store = storage.as_ref();
         // A fold the root calls for is CPU work, merged on the reader pool as
         // optimize's rebuild and fold merge theirs.
@@ -15793,6 +16067,209 @@ supertable:
     #[test]
     fn merge_ranges_empty_input_is_empty() {
         assert!(merge_ranges(Vec::new()).is_empty());
+    }
+
+    /// What a builder gathers for the term index as it writes a superfile
+    /// is exactly what a reader derives from the finished bytes: the same
+    /// terms, frequencies, bounds, locations, heads and tails, byte for
+    /// byte. The corpus has a term above the head depth (a tail and a
+    /// truncated head), one with tied impacts (the tie order), and one
+    /// with a single posting (the inline entry).
+    #[test]
+    fn a_builder_gathered_contribution_is_the_reader_derived_one() {
+        for positions in [false, true] {
+            gathered_matches_derived(positions);
+        }
+    }
+
+    /// One run of the comparison, with the column's positions on or off:
+    /// positions change which single-posting terms inline and give short
+    /// terms the positional form.
+    fn gathered_matches_derived(positions: bool) {
+        const DOCS: usize = 300;
+        const HEAD_DEPTH: usize = 64;
+        let mut fts = FtsConfig::new("title");
+        fts.positions = positions;
+        let options =
+            SupertableOptions::new(schema_id_title(), vec![fts], vec![]).expect("valid options");
+        let st = Supertable::create(options).expect("create");
+        let manifest = st.reader().expect("reader").manifest().clone();
+        let titles: Vec<String> = (0..DOCS)
+            .map(|i| {
+                let mut words = vec!["alpha"; 1 + i % 5];
+                words.extend(std::iter::repeat_n("filler", i % 7));
+                if i % 30 == 0 {
+                    words.extend(["beta", "beta"]);
+                }
+                if i == 17 {
+                    words.push("gamma");
+                }
+                words.join(" ")
+            })
+            .collect();
+        let ids = Decimal128Array::from_iter_values((1..=DOCS as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(38, 0)
+            .expect("ids");
+        let batch = RecordBatch::try_new(
+            manifest.scalar_schema(),
+            vec![
+                Arc::new(ids),
+                Arc::new(LargeStringArray::from(
+                    titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+        let columns = HashMap::from([(
+            "title".to_owned(),
+            manifest.field_id("title").expect("title id"),
+        )]);
+        let sink = term_index::HeadSink::new(columns, None).expect("sink");
+        let mut builder = SuperfileBuilder::new(builder_options_of(&manifest)).expect("builder");
+        builder.set_term_head_sink(Box::new(sink.clone()), HEAD_DEPTH);
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(builder.finish().expect("finish"));
+        let superfile_id = Uuid::new_v4();
+        let gathered = sink
+            .into_contribution(superfile_id, 1)
+            .expect("gathered contribution")
+            .expect("the builder drove the sink to its end");
+
+        let reader = SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
+            .expect("open");
+        let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, 1, None)
+            .expect("writer");
+        let policy = term_index::BuildPolicy {
+            head_depth_per_superfile: HEAD_DEPTH,
+            ..term_index::BuildPolicy::default()
+        };
+        bridge_sync_to_async(write_superfile_terms(
+            &reader,
+            &manifest.options.legacy_names(),
+            &mut writer,
+            &policy,
+        ))
+        .expect("derived facts");
+        let derived = writer.finish().expect("derived contribution");
+
+        let a = std::fs::read(&gathered.path).expect("gathered bytes");
+        let b = std::fs::read(&derived.path).expect("derived bytes");
+        assert!(!a.is_empty(), "the corpus has terms");
+        let difference = term_index::first_contribution_difference(&gathered.path, &derived.path)
+            .expect("both readable");
+        assert!(
+            a == b,
+            "positions {positions}: the gathered contribution is the derived one, byte for byte; first difference: {difference:?}"
+        );
+    }
+
+    /// The contribution a merge gathers as it writes the merged superfile
+    /// is the one derived from that superfile's bytes, byte for byte —
+    /// deleted rows dropped and the survivors renumbered on both sides.
+    #[test]
+    fn a_merge_gathered_contribution_is_the_reader_derived_one() {
+        const HEAD_DEPTH: usize = 64;
+        let mut fts = FtsConfig::new("title");
+        fts.positions = true;
+        let options =
+            SupertableOptions::new(schema_id_title(), vec![fts], vec![]).expect("valid options");
+        let st = Supertable::create(options).expect("create");
+        let manifest = st.reader().expect("reader").manifest().clone();
+        let part = |lo: usize, n: usize| -> Arc<SuperfileReader> {
+            let titles: Vec<String> = (lo..lo + n)
+                .map(|i| {
+                    let mut words = vec!["alpha"; 1 + i % 5];
+                    words.extend(std::iter::repeat_n("filler", i % 7));
+                    if i % 30 == 0 {
+                        words.extend(["beta", "beta"]);
+                    }
+                    if i % 97 == 17 {
+                        words.push("gamma");
+                    }
+                    words.join(" ")
+                })
+                .collect();
+            let ids = Decimal128Array::from_iter_values(
+                (lo as i128 + 1..=(lo + n) as i128).collect::<Vec<_>>(),
+            )
+            .with_precision_and_scale(38, 0)
+            .expect("ids");
+            let batch = RecordBatch::try_new(
+                manifest.scalar_schema(),
+                vec![
+                    Arc::new(ids),
+                    Arc::new(LargeStringArray::from(
+                        titles.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("batch");
+            let mut builder =
+                SuperfileBuilder::new(builder_options_of(&manifest)).expect("builder");
+            builder.add_batch(&batch, &[]).expect("add_batch");
+            let bytes = Bytes::from(builder.finish().expect("finish"));
+            Arc::new(
+                SuperfileReader::open_with(bytes, manifest.options.superfile_open_options())
+                    .expect("open"),
+            )
+        };
+        let readers = [part(0, 120), part(120, 90), part(210, 150)];
+        // The middle part loses rows to the merge, among them a beta
+        // carrier (row 30) and the gamma carrier (row 17).
+        let deleted: roaring::RoaringBitmap = [3u32, 17, 30, 71].into_iter().collect();
+        let inputs = crate::superfile::builder::same_shape_inputs(&[
+            (Arc::clone(&readers[0]), None),
+            (Arc::clone(&readers[1]), Some(Arc::new(deleted))),
+            (Arc::clone(&readers[2]), None),
+        ]);
+        let columns = HashMap::from([(
+            "title".to_owned(),
+            manifest.field_id("title").expect("title id"),
+        )]);
+        let sink = term_index::HeadSink::new(columns, None).expect("sink");
+        let mut merged = Vec::new();
+        SuperfileBuilder::build_from_readers_fts_merge_with_heads(
+            &inputs,
+            builder_options_of(&manifest),
+            &mut merged,
+            Some((Box::new(sink.clone()), HEAD_DEPTH)),
+        )
+        .expect("merge");
+        let superfile_id = Uuid::new_v4();
+        let gathered = sink
+            .into_contribution(superfile_id, 1)
+            .expect("gathered contribution")
+            .expect("the merge drove the sink to its end");
+
+        let reader = SuperfileReader::open_with(
+            Bytes::from(merged),
+            manifest.options.superfile_open_options(),
+        )
+        .expect("open merged");
+        assert_eq!(reader.n_docs(), 120 + 90 - 4 + 150, "the survivors");
+        let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, 1, None)
+            .expect("writer");
+        let policy = term_index::BuildPolicy {
+            head_depth_per_superfile: HEAD_DEPTH,
+            ..term_index::BuildPolicy::default()
+        };
+        bridge_sync_to_async(write_superfile_terms(
+            &reader,
+            &manifest.options.legacy_names(),
+            &mut writer,
+            &policy,
+        ))
+        .expect("derived facts");
+        let derived = writer.finish().expect("derived contribution");
+        let a = std::fs::read(&gathered.path).expect("gathered bytes");
+        let b = std::fs::read(&derived.path).expect("derived bytes");
+        assert!(!a.is_empty(), "the corpus has terms");
+        let difference = term_index::first_contribution_difference(&gathered.path, &derived.path)
+            .expect("both readable");
+        assert!(
+            a == b,
+            "the merge-gathered contribution is the derived one, byte for byte; first difference: {difference:?}"
+        );
     }
 
     // ---- build_subsection_offsets on real superfile bytes ------------

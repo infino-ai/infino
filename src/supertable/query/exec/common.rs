@@ -64,7 +64,7 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use rayon::{ThreadPool, prelude::*};
-use tracing::{Instrument, Span};
+use tracing::{Instrument, Span, warn};
 
 use crate::{
     memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
@@ -83,7 +83,6 @@ use crate::{
             SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
             superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
         },
-        reader_cache::ReadIntent,
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
     },
     utils::trace::record,
@@ -1025,6 +1024,10 @@ async fn resolve_columns(
         }
     }
 
+    // Opened as the search that found the hits opened: by ranges alone on a
+    // table the cache cannot hold, so resolving a hit's columns never starts
+    // a whole-file download the search itself declined.
+    let intent = reader.open_intent();
     let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
         let entry = manifest
             .lookup_superfile_entry(uri)
@@ -1042,7 +1045,7 @@ async fn resolve_columns(
             &entry.uri,
             &entry.storage_path(),
             entry.subsection_offsets.as_ref(),
-            ReadIntent::Warm,
+            intent,
         )
         .await
         .map(|reader| (index, reader))
@@ -1362,6 +1365,31 @@ pub(crate) async fn take_rows_byte_source(
     local_doc_ids: &[u32],
     names: &[&str],
 ) -> DfResult<RecordBatch> {
+    // The bare `_id` projection of a few rows comes from the packed sidecar's
+    // blocks when the superfile carries one: a couple of kilobytes a block,
+    // no page index. A read of enough rows takes the sidecar whole instead,
+    // through the path below. A sidecar that cannot be read leaves the rows
+    // to the Parquet column, which holds the same ids.
+    if let [name] = names
+        && *name == reader.id_column()
+        && !reader.id_sidecar_serves(local_doc_ids, name)
+    {
+        match reader.ids_from_sidecar_blocks(local_doc_ids).await {
+            Ok(Some(ids)) => {
+                let field = reader
+                    .schema()
+                    .field_with_name(name)
+                    .map_err(QueryError::internal)?
+                    .clone();
+                return RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![ids])
+                    .map_err(|e| QueryError::internal(e).into());
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%error, "reading _id from Parquet, the id sidecar blocks did not serve");
+            }
+        }
+    }
     let metadata = reader
         .parquet_metadata_with_page_index()
         .await

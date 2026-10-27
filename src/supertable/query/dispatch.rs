@@ -39,7 +39,13 @@
 //! descending for BM25 relevance) stays with each caller; this layer
 //! returns the per-unit tagged+filtered hit lists.
 
-use std::{collections::HashSet, future::Future, sync::Arc, time::Instant};
+use std::{
+    collections::{HashSet, VecDeque},
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::Instant,
+};
 
 use arrow_array::Decimal128Array;
 use datafusion::common::runtime::SpawnedTask;
@@ -744,12 +750,60 @@ where
 ///
 /// Records its opens by tier as [`fanout_with`] does. A skipped unit is
 /// never opened, so it is not counted.
-pub(crate) async fn fanout_with_ordered<P, R, B, Fut, S>(
+/// The units of a fan-out: each superfile (or a slice of one) with the
+/// parameters its kernel runs under.
+/// Opens issued in all ahead of a plan that is still resolving. Enough to
+/// overlap the plan's round trip with real work; few enough that a plan
+/// which keeps a dozen superfiles out of a thousand has wasted little. The
+/// full window applies once the plan is in, or where there is none.
+/// Measured at a billion documents against object storage: a full window
+/// issued ahead of the plan opened sixty-four superfiles a merge then ruled
+/// out, more bytes than the whole pruned query; a window of eight that
+/// refilled as opens finished issued fifty.
+const PENDING_PLAN_WINDOW: usize = 8;
+
+/// Windows of units a fan-out must have for the cap above to apply. A plan
+/// is worth waiting for where it can rule out more than a window or two of
+/// opens; on a table of a few windows the opens that would run ahead of it
+/// are most of the query, and holding them costs the plan's round trip for
+/// nothing. Measured at a hundred million documents, 112 superfiles: the
+/// cap cost 13% at k=100, where the merge rarely prunes.
+const PENDING_PLAN_MIN_WINDOWS: usize = 4;
+
+/// Opens in flight until the first of them have answered. The running floor
+/// is what lets a kernel skip posting blocks and the fan-out skip whole
+/// superfiles, and it forms from the first answers; a window opened wide
+/// before any answer scores every superfile against no floor at all. A
+/// billion documents measured: the full window from the start read three
+/// to four times the postings of a query the merge does not serve, for no
+/// gain in its wall. The configured window applies once this many have
+/// answered.
+const FLOOR_WINDOW: usize = 64;
+
+pub(crate) type Units<P> = Vec<(Arc<SuperfileEntry>, P)>;
+/// What a plan that arrives while a fan-out runs does to the units not yet
+/// issued: given them, it returns the ones to go on with in the order to
+/// issue them, and results settled without an open — already folded into
+/// whatever the caller folds results into, so the driver only collects them.
+pub(crate) type Replan<'a, P, R> = Box<dyn FnOnce(Units<P>) -> (Units<P>, Vec<R>) + Send + 'a>;
+/// A plan in the making, resolving beside the opens it may change; `None`
+/// when it has nothing to apply.
+pub(crate) type ReplanFuture<'a, P, R> =
+    Pin<Box<dyn Future<Output = Option<Replan<'a, P, R>>> + Send + 'a>>;
+
+/// The ordered fan-out, with an optional plan that arrives while it runs:
+/// the units are issued in the order given, `window` at a time, and when
+/// `replan` resolves the units not yet issued are handed to it and replaced
+/// by what it returns. A plan still unresolved when the last open finishes
+/// is dropped unawaited.
+pub(crate) async fn fanout_with_ordered<'a, P, R, B, Fut, S>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     window: usize,
     skip_before_open: S,
     body: B,
+    mut on_result: impl FnMut(&R),
+    replan: Option<ReplanFuture<'a, P, R>>,
 ) -> Result<Vec<R>, QueryError>
 where
     P: Send + 'static,
@@ -761,22 +815,33 @@ where
         + 'static,
     Fut: Future<Output = Result<R, QueryError>> + Send + 'static,
 {
+    let tiers = OpenTierCounts::for_current_span();
+    // Nothing to open — the index answered for every superfile, or the
+    // floor ruled them all out — is still an outcome the phase reports.
     if units.is_empty() {
+        if let Some(tiers) = &tiers {
+            tiers.record_on(&Span::current());
+        }
         return Ok(Vec::new());
     }
     trace!(
         units = units.len(),
         window, "fanning query out across superfiles in ceiling order"
     );
-    let tiers = OpenTierCounts::for_current_span();
-    let ctx = FanoutContext::new(reader, &units, true, ReadIntent::Warm, tiers.clone()).await;
-    // One unit: inline, as in [`fanout_with`]; nothing to overlap against.
-    if units.len() == 1 {
+    let ctx = FanoutContext::new(reader, &units, true, reader.open_intent(), tiers.clone()).await;
+    let started = Instant::now();
+    // One unit and no plan to wait for: inline, as in [`fanout_with`];
+    // nothing to overlap against.
+    if units.len() == 1 && replan.is_none() {
         let (entry, params) = units.into_iter().next().expect("len == 1");
         let out = match skip_before_open(&params) {
             true => Vec::new(),
             false => vec![ctx.run(body, entry, params).await?],
         };
+        if let Some(r) = out.first() {
+            on_result(r);
+            reader.note_open_cost(started.elapsed().as_nanos() as u64);
+        }
         if let Some(tiers) = &tiers {
             tiers.record_on(&Span::current());
         }
@@ -784,22 +849,73 @@ where
     }
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut out = Vec::with_capacity(units.len());
-    let mut pending = units.into_iter();
+    let mut opened = 0u64;
+    let mut pending: VecDeque<(Arc<SuperfileEntry>, P)> = units.into();
+    let mut replan = replan;
     let window = window.max(1);
+    let cap_ahead_of_plan = pending.len() > PENDING_PLAN_MIN_WINDOWS * window;
     loop {
-        while in_flight.len() < window {
-            let Some((entry, params)) = pending.next() else {
+        let issue = match (
+            replan.is_some() && cap_ahead_of_plan,
+            out.len() < FLOOR_WINDOW,
+        ) {
+            (true, _) => PENDING_PLAN_WINDOW
+                .saturating_sub(opened as usize)
+                .min(window),
+            (false, true) => FLOOR_WINDOW.min(window),
+            (false, false) => window,
+        };
+        while in_flight.len() < issue {
+            let Some((entry, params)) = pending.pop_front() else {
                 break;
             };
             if skip_before_open(&params) {
                 continue;
             }
             in_flight.push(ctx.spawn(&body, entry, params));
+            opened += 1;
         }
-        match in_flight.next().await {
-            Some(result) => out.push(result?),
-            None => break,
+        // The plan is polled beside the opens for as long as any run: one
+        // that reports once every unit is issued changes no open, but what
+        // it read is in memory for the next query of its terms. Once the
+        // opens are done it is dropped unawaited — unless units still wait
+        // on it, which the select below then awaits alone.
+        if in_flight.is_empty() && (pending.is_empty() || replan.is_none()) {
+            break;
         }
+        // A finished unit is seen here, on the one task that drives the
+        // fan-out, before the next unit starts: what the caller folds from
+        // it (a floor from its scores) needs no lock the units would queue
+        // on. The plan, when it resolves, is applied here too, before the
+        // next unit is issued; it comes first when both are ready.
+        tokio::select! {
+            biased;
+            plan = async {
+                match replan.as_mut() {
+                    Some(plan) => plan.await,
+                    None => None,
+                }
+            }, if replan.is_some() => {
+                replan = None;
+                if let Some(plan) = plan {
+                    let (keep, settled) = plan(pending.drain(..).collect());
+                    pending = keep.into();
+                    out.extend(settled);
+                }
+            }
+            next = in_flight.next(), if !in_flight.is_empty() => {
+                if let Some(result) = next {
+                    let r = result?;
+                    on_result(&r);
+                    out.push(r);
+                }
+            }
+        }
+    }
+    // What an open cost this query: the fan-out's wall over the opens it
+    // made, the saving a tier merge can weigh a round's exclusions at.
+    if let Some(per_open) = (started.elapsed().as_nanos() as u64).checked_div(opened) {
+        reader.note_open_cost(per_open);
     }
     if let Some(tiers) = &tiers {
         tiers.record_on(&Span::current());
@@ -827,19 +943,21 @@ where
         reader,
         units,
         true,
-        ReadIntent::Warm, // FTS/local-hit path: warm toward a full mmap
+        reader.open_intent(),
         local_hits_body(kernel),
     )
     .await
 }
 
 /// [`fanout_local_hits`] in ceiling order — see [`fanout_with_ordered`].
-pub(crate) async fn fanout_local_hits_ordered<P, K, Fut, S>(
+pub(crate) async fn fanout_local_hits_ordered<'a, P, K, Fut, S>(
     reader: &SupertableReader,
     units: Vec<(Arc<SuperfileEntry>, P)>,
     window: usize,
     skip_before_open: S,
     kernel: K,
+    on_result: impl FnMut(&Vec<SuperfileHit>),
+    replan: Option<ReplanFuture<'a, P, Vec<SuperfileHit>>>,
 ) -> Result<Vec<Vec<SuperfileHit>>, QueryError>
 where
     P: Send + 'static,
@@ -853,6 +971,8 @@ where
         window,
         skip_before_open,
         local_hits_body(kernel),
+        on_result,
+        replan,
     )
     .await
 }
@@ -957,7 +1077,13 @@ mod codec_verify_tests {
 
 #[cfg(test)]
 mod fanout_tier_tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     use super::*;
     use crate::{
@@ -1016,6 +1142,91 @@ mod fanout_tier_tests {
 
         let reopened = Supertable::open(options()).expect("reopen");
         assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
+    }
+
+    /// Superfiles in the plan fixture: more than four windows of them, so the
+    /// cap ahead of a plan applies, and more than the cap lets through.
+    const PLANNED_COMMITS: usize = 40;
+    /// How long the fixture's plan takes to arrive: long after the opens
+    /// issued ahead of it, which do nothing, have finished.
+    const PLAN_DELAY: Duration = Duration::from_millis(100);
+    /// A window the fixture exceeds four times over, no narrower than the
+    /// cap, so the cap is what holds.
+    const WIDE_WINDOW: usize = PENDING_PLAN_WINDOW;
+
+    /// While a plan is still to come only a few opens run ahead of it, and
+    /// the fan-out waits for the plan rather than ending when those finish:
+    /// every unit the plan keeps is answered. The opens hold until the plan
+    /// is in, as a cold open outlasts the plan's round trip, so what ran
+    /// ahead of the plan is exactly what the window let through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_plan_holds_the_fanout_to_a_few_opens_until_it_arrives() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        for i in 0..PLANNED_COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&[&format!("title {i}")]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let reader = table.reader().expect("reader");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| (Arc::clone(entry), ()))
+            .collect();
+        assert_eq!(units.len(), PLANNED_COMMITS);
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_before_plan = Arc::new(AtomicUsize::new(0));
+        // Opens wait on this until the plan is in; the plan then lets every
+        // unit through.
+        let gate = Arc::new(Semaphore::new(0));
+        let plan: ReplanFuture<'_, (), ()> = {
+            let opened = Arc::clone(&opened);
+            let opened_before_plan = Arc::clone(&opened_before_plan);
+            let gate = Arc::clone(&gate);
+            Box::pin(async move {
+                tokio::time::sleep(PLAN_DELAY).await;
+                opened_before_plan.store(opened.load(Ordering::Acquire), Ordering::Release);
+                gate.add_permits(PLANNED_COMMITS);
+                let keep_all: Replan<'_, (), ()> = Box::new(|units| (units, Vec::new()));
+                Some(keep_all)
+            })
+        };
+        let body = {
+            let opened = Arc::clone(&opened);
+            let gate = Arc::clone(&gate);
+            move |_, _, _, _, ()| {
+                opened.fetch_add(1, Ordering::AcqRel);
+                let gate = Arc::clone(&gate);
+                async move {
+                    gate.acquire().await.expect("gate open").forget();
+                    Ok::<(), QueryError>(())
+                }
+            }
+        };
+        let out = fanout_with_ordered(
+            &reader,
+            units,
+            WIDE_WINDOW,
+            |_: &()| false,
+            body,
+            |_: &()| {},
+            Some(plan),
+        )
+        .await
+        .expect("fan-out");
+        assert_eq!(out.len(), PLANNED_COMMITS, "every unit the plan kept ran");
+        assert_eq!(
+            opened_before_plan.load(Ordering::Acquire),
+            PENDING_PLAN_WINDOW,
+            "only the pending-plan window ran ahead of the plan"
+        );
     }
 }
 

@@ -313,9 +313,7 @@ impl NormTable {
         out
     }
 
-    /// The buckets this table scores by. Test-only: the query path indexes
-    /// them and never needs the slice.
-    #[cfg(test)]
+    /// The buckets this table scores by.
     pub(super) fn buckets(&self) -> &[u8] {
         &self.bytes
     }
@@ -345,7 +343,7 @@ impl NormTable {
 /// Decode table for one parameter set: bucket → `dl_norm_k1`. Filled in
 /// place on the heap so the 256 `f32`s are not built on the stack and
 /// moved.
-fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
+pub(crate) fn build_lut(avgdl: f32, params: bm25::Bm25Params) -> Arc<[f32; 256]> {
     let mut lut = Box::new([0.0_f32; 256]);
     for (bucket, slot) in lut.iter_mut().enumerate() {
         let dl = bm25::dequantize_len(bucket as u8);
@@ -577,12 +575,12 @@ impl ColumnMeta {
         }
         let array = self
             .source
-            .get_range(self.array_with_crc_range())
+            .get_range(self.norms_fetch_range())
             .map_err(|e| FtsError::RangeFetch {
                 what: LENGTH_ARRAY,
                 source: e,
             })?;
-        self.install_norms(&array)
+        self.install_fetched_norms(&array)
     }
 
     /// Check `array_with_crc` (the length array and its CRC, as read) and
@@ -611,6 +609,42 @@ impl ColumnMeta {
     /// bucket array beside it when the blob stores one. Read off the ranges
     /// the open path computed and bounded against the blob, so no reader of
     /// the region carries arithmetic of its own.
+    /// The bytes a cold read of this column's norms fetches. A checked read
+    /// takes the whole span with its CRC, which covers the lengths and the
+    /// buckets together. An unchecked read of a blob that stores its buckets
+    /// takes the bucket array alone: it is what scoring indexes, a third of
+    /// the span, and the lengths beside it serve nothing on the query path.
+    pub(super) fn norms_fetch_range(&self) -> Range<usize> {
+        match &self.stored_norms {
+            Some(stored) if !self.verify_crc => stored.buckets.clone(),
+            _ => self.array_with_crc_range(),
+        }
+    }
+
+    /// Install the norms from the bytes [`Self::norms_fetch_range`] names.
+    pub(super) fn install_fetched_norms(&self, bytes: &[u8]) -> Result<&ColumnNorms, FtsError> {
+        match &self.stored_norms {
+            Some(stored) if !self.verify_crc => {
+                if bytes.len() != stored.buckets.len() {
+                    return Err(FtsError::Read(ReadError::Malformed(format!(
+                        "doc-length bucket array of column '{}' is {} bytes, expected {}",
+                        self.name,
+                        bytes.len(),
+                        stored.buckets.len()
+                    ))));
+                }
+                let norms = ColumnNorms::from_stored(
+                    Arc::from(bytes),
+                    stored,
+                    self.declared_params,
+                    self.baked_avgdl,
+                );
+                Ok(self.base_norms.get_or_init(|| norms))
+            }
+            _ => self.install_norms(bytes),
+        }
+    }
+
     pub(super) fn array_len(&self) -> usize {
         self.doc_lengths_range.len()
             + self
