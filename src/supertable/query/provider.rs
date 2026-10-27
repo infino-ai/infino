@@ -2213,8 +2213,8 @@ mod tests {
             vector::layout::VectorLayout,
         },
         supertable::{
-            hydrate::hydrate_from_reader,
             Supertable, SupertableOptions,
+            hydrate::hydrate_from_reader,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
             query::{read_ahead::fixture, sql::sql_session_context},
         },
@@ -2913,7 +2913,10 @@ mod tests {
 
     /// A second-resolution timestamp literal at `hour`.
     fn at_hour(hour: i64) -> Expr {
-        lit(ScalarValue::TimestampSecond(Some(hour * SECS_PER_HOUR), None))
+        lit(ScalarValue::TimestampSecond(
+            Some(hour * SECS_PER_HOUR),
+            None,
+        ))
     }
 
     /// Seconds in an hour, for the timestamp fixtures.

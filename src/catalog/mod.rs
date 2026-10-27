@@ -2236,7 +2236,9 @@ mod tests {
             .expect("create_table");
         let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
         for file in 0..CACHELESS_SUPERFILES {
-            let n: Vec<i64> = (0..CACHELESS_ROWS).map(|i| file * CACHELESS_ROWS + i).collect();
+            let n: Vec<i64> = (0..CACHELESS_ROWS)
+                .map(|i| file * CACHELESS_ROWS + i)
+                .collect();
             let payload: Vec<String> = (0..CACHELESS_ROWS)
                 .map(|_| {
                     (0..CACHELESS_PAYLOAD_BYTES)
@@ -2265,7 +2267,9 @@ mod tests {
         let before = conn.usage_snapshot();
         let last_file_from = (CACHELESS_SUPERFILES - 1) * CACHELESS_ROWS;
         let out = conn
-            .query_sql(&format!("SELECT COUNT(*) FROM wide WHERE n >= {last_file_from}"))
+            .query_sql(&format!(
+                "SELECT COUNT(*) FROM wide WHERE n >= {last_file_from}"
+            ))
             .expect("query");
         let count = out[0]
             .column(0)
