@@ -2213,6 +2213,90 @@ mod tests {
     // one of the three ops that lock it (open / drop / create) and asserts the
     // op does not panic and still produces a correct result.
 
+    /// Rows per superfile in the cacheless-read test, and how many superfiles.
+    const CACHELESS_ROWS: i64 = 2_000;
+    const CACHELESS_SUPERFILES: i64 = 3;
+    /// Payload bytes per row, incompressible, so each superfile is far
+    /// larger than its footer.
+    const CACHELESS_PAYLOAD_BYTES: usize = 400;
+
+    /// A storage-backed connection with no disk cache opens superfiles by
+    /// range: a query that prunes to one of three superfiles fetches that
+    /// one and the others' footers, not every object whole. Measured through
+    /// the connection's usage ledger against the bytes on disk.
+    #[test]
+    fn a_cacheless_query_fetches_only_the_superfiles_it_reads() {
+        let (conn, dir) = storage_conn();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("payload", DataType::LargeUtf8, false),
+        ]));
+        let table = conn
+            .create_table("wide", Arc::clone(&schema), IndexSpec::new())
+            .expect("create_table");
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for file in 0..CACHELESS_SUPERFILES {
+            let n: Vec<i64> = (0..CACHELESS_ROWS).map(|i| file * CACHELESS_ROWS + i).collect();
+            let payload: Vec<String> = (0..CACHELESS_ROWS)
+                .map(|_| {
+                    (0..CACHELESS_PAYLOAD_BYTES)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            char::from(b'a' + (seed % 26) as u8)
+                        })
+                        .collect()
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(n)),
+                    Arc::new(LargeStringArray::from(payload)),
+                ],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        let on_disk: u64 = walkdir_parquet_bytes(dir.path());
+        assert!(on_disk > 0, "the table wrote superfiles");
+
+        let before = conn.usage_snapshot();
+        let last_file_from = (CACHELESS_SUPERFILES - 1) * CACHELESS_ROWS;
+        let out = conn
+            .query_sql(&format!("SELECT COUNT(*) FROM wide WHERE n >= {last_file_from}"))
+            .expect("query");
+        let count = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count")
+            .value(0);
+        assert_eq!(count, CACHELESS_ROWS);
+        let fetched = conn.usage_snapshot().since(&before).get_bytes;
+        assert!(
+            fetched * 2 < on_disk,
+            "a query over one superfile of {CACHELESS_SUPERFILES} fetched {fetched} of {on_disk} bytes"
+        );
+    }
+
+    /// Bytes of every `.parquet` file under `root`.
+    fn walkdir_parquet_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    total += walkdir_parquet_bytes(&path);
+                } else if path.extension().is_some_and(|e| e == "parquet") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
     #[test]
     fn poisoned_gate_does_not_wedge_open() {
         let (conn, _dir) = storage_conn();

@@ -111,13 +111,14 @@ use crate::{
     supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
 };
 
-/// Row groups per batch. With two, the scan decodes one batch while the next
-/// one downloads; more would only hold more memory.
+/// Fewest row groups a batch takes, when they fit: with two, the scan
+/// decodes one while the next downloads.
 const READ_AHEAD_ROW_GROUPS: usize = 2;
 
-/// Most bytes one reader (one file in one partition) may hold. Two row groups
-/// of the projected columns are usually a few MiB; a row group bigger than
-/// this is left to the scan.
+/// Most bytes one reader (one file in one partition) may hold, and so how
+/// many row groups a batch takes: as many as fit, which on a file of small
+/// row groups is what turns a round trip per row group into one per batch.
+/// A row group bigger than this is left to the scan.
 const READ_AHEAD_MAX_BYTES: usize = 16 << 20;
 
 /// Most bytes all readers of one scan may hold, so a scan stays bounded even
@@ -156,6 +157,9 @@ pub(crate) struct ScanReadAhead {
     batches: Mutex<Vec<Weak<Mutex<Held>>>>,
     /// Registers the scan with the budget on its first batch.
     registered: Once,
+    /// Most bytes one reader may hold: [`READ_AHEAD_MAX_BYTES`], or less
+    /// under test.
+    reader_cap_bytes: usize,
 }
 
 impl fmt::Debug for ScanReadAhead {
@@ -185,7 +189,16 @@ impl ScanReadAhead {
             held: AtomicUsize::new(0),
             batches: Mutex::new(Vec::new()),
             registered: Once::new(),
+            reader_cap_bytes: READ_AHEAD_MAX_BYTES,
         }
+    }
+
+    /// The same scan with a smaller per-reader cap, so a test over a small
+    /// file can pin how many row groups a batch takes.
+    #[cfg(test)]
+    pub(crate) fn with_reader_cap(mut self, bytes: usize) -> Self {
+        self.reader_cap_bytes = bytes;
+        self
     }
 
     /// Hand over the scan's filter and schema adapter (DataFusion's default if
@@ -875,7 +888,7 @@ impl ReadAhead {
     }
 
     /// Start downloading the next batch: `columns` of the planned row groups
-    /// after the last one held, up to [`READ_AHEAD_ROW_GROUPS`].
+    /// after the last one held, as many as fit the reader's cap.
     /// - It stops at a row group the scan reads only in part; the scan reads
     ///   that one itself.
     /// - It skips row groups whose columns are already local.
@@ -897,20 +910,32 @@ impl ReadAhead {
             .max()
             .map_or(row_group, |held| held.max(row_group));
         let location = &self.file.object_meta.location;
+        let held: usize = self.batches.iter().map(|b| b.charge).sum();
+        let cap = self.scan.reader_cap_bytes;
+        // As many row groups as fit what the reader may still hold, and at
+        // least the minimum: a batch of small row groups then costs one
+        // round trip rather than one per row group. Counted by the projected
+        // chunks alone; the spans they merge into are measured below, and a
+        // batch that overshoots the cap there is trimmed from the end.
         let mut row_groups: Vec<(usize, Vec<Range<u64>>)> = Vec::new();
-        for rg in order.after(after).take(READ_AHEAD_ROW_GROUPS) {
+        let mut planned = 0usize;
+        for rg in order.after(after) {
             let meta = self.meta.row_group(rg);
             if !order.reads_whole(rg, meta.num_rows() as usize) {
                 break;
             }
             let ranges: Vec<Range<u64>> = columns.iter().map(|&c| chunk_range(meta, c)).collect();
+            let bytes: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
+            if row_groups.len() >= READ_AHEAD_ROW_GROUPS && held + planned + bytes > cap {
+                break;
+            }
+            planned += bytes;
             if !ranges.iter().all(|r| self.scan.store.is_local(location, r)) {
                 row_groups.push((rg, ranges));
             }
         }
         // The batch holds whole spans, gaps included, so reserve those. Drop row
         // groups from the end until it fits the reader's cap.
-        let held: usize = self.batches.iter().map(|b| b.charge).sum();
         let blocks = self.scan.store.cache_blocks(location);
         let (clusters, charge) = loop {
             if row_groups.is_empty() {
@@ -929,7 +954,7 @@ impl ReadAhead {
                 .flatten()
                 .map(|span| (span.end - span.start) as usize)
                 .sum();
-            if held + charge <= READ_AHEAD_MAX_BYTES {
+            if held + charge <= cap {
                 break (clusters, charge);
             }
             row_groups.pop();
@@ -1534,11 +1559,12 @@ mod tests {
         filters: &[Expr],
         table: SchemaRef,
     ) -> Arc<ScanReadAhead> {
-        let scan = Arc::new(ScanReadAhead::new(
-            Arc::clone(store),
-            Arc::clone(budget),
-            Arc::clone(&table),
-        ));
+        // The test file's row groups are small, so the default cap would
+        // take them all; these tests pin batches of two.
+        let scan = Arc::new(
+            ScanReadAhead::new(Arc::clone(store), Arc::clone(budget), Arc::clone(&table))
+                .with_reader_cap(two_row_groups_cap()),
+        );
         if let Some(filter) = conjunction(filters.iter().cloned()) {
             scan.set_predicate(predicate(&filter, table), None);
         }
@@ -1589,6 +1615,13 @@ mod tests {
         meta: &Arc<ParquetMetaData>,
     ) -> ReadAhead {
         reader_of(&scan(store, budget, &[]), path, meta)
+    }
+
+    /// A reader cap that admits exactly two of the test file's row groups:
+    /// the spans of two, with no room for a third.
+    fn two_row_groups_cap() -> usize {
+        let (_, meta) = small_file();
+        charge(&meta, &[0, 1])
     }
 
     /// The projected columns' whole chunks in row group `rg`.
@@ -1669,6 +1702,27 @@ mod tests {
             chunks(&meta, 2),
             "and the cache is told, so it still knows where the scan is"
         );
+    }
+
+    /// With the shipped cap, a batch takes every row group that fits: on a
+    /// file of small row groups that is all of them, one round trip instead
+    /// of one per pair.
+    #[tokio::test]
+    async fn a_batch_takes_as_many_row_groups_as_fit_the_cap() {
+        let (superfile, store, path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        let scan = Arc::new(ScanReadAhead::new(
+            Arc::clone(&store),
+            Arc::clone(&budget),
+            schema(),
+        ));
+        let mut reader = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        let reads = superfile.reads();
+        for rg in 2..GROUPS {
+            assert!(touched(&reads, &meta, rg), "row group {rg} fetched ahead");
+        }
     }
 
     #[tokio::test]

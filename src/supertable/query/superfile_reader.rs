@@ -48,8 +48,12 @@ use tracing::Span;
 
 use crate::{
     storage::StorageProvider,
-    superfile::{ReadError, SuperfileReader},
+    superfile::{
+        LazyByteSource, ReadError,
+        reader::{OpenOptions, SuperfileReader},
+    },
     supertable::{
+        lazy_source::StorageRangeSource,
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
             DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
@@ -100,8 +104,8 @@ pub async fn superfile_reader(
 
 /// [`superfile_reader`], also saying which tier served the file: the
 /// in-memory tier is [`OpenTier::Memory`], the disk cache reports its own
-/// walk, and the storage-only fallback is a whole-object GET, so
-/// [`OpenTier::Source`]. For a scan that counts where its files came from.
+/// walk, and the storage-only fallback is a lazy reader over range reads,
+/// so [`OpenTier::Lazy`]. For a scan that counts where its files came from.
 pub async fn superfile_reader_tiered(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
@@ -129,21 +133,30 @@ pub async fn superfile_reader_tiered(
             .map_err(cache_open_failed);
     }
 
-    // 3. Storage-only fallback. This covers reopened LocalFs/S3
-    // handles configured with durable storage but no disk cache.
-    // It is intentionally whole-object: callers who need bounded
-    // memory attach `DiskCacheStore`, which uses lazy/range opens.
+    // 3. Storage-only fallback, for handles configured with durable storage
+    // but no disk cache. A lazy reader over range reads of the object: a
+    // query then fetches the footer and the row groups it touches, and the
+    // scan's read-ahead batches the rest. Fetching the whole object here
+    // cost a one-hour query over a 1 GiB superfile the whole gigabyte, and a
+    // scan over many files that many gigabytes resident at once.
     if let Some(storage) = storage {
-        let (bytes, _) =
-            storage
-                .get(storage_key)
-                .await
-                .map_err(|e| ReaderCacheError::OpenFailed {
-                    source: fetch_failed(format!("storage fetch {storage_key}"), e),
-                })?;
-        let reader = SuperfileReader::open(bytes)
+        let source: Arc<dyn LazyByteSource> = match offsets {
+            Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
+                Arc::clone(storage),
+                storage_key.to_owned(),
+                o.total_size,
+            )),
+            _ => Arc::new(StorageRangeSource::with_unknown_size(
+                Arc::clone(storage),
+                storage_key.to_owned(),
+            )),
+        };
+        // No CRC check: it reads the whole file, and this path reads only
+        // the ranges a query touches.
+        let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+            .await
             .map_err(|source| ReaderCacheError::OpenFailed { source })?;
-        return Ok((Arc::new(reader), OpenTier::Source));
+        return Ok((Arc::new(reader), OpenTier::Lazy));
     }
 
     Err(ReaderCacheError::NotFound { uri: *uri })
@@ -396,7 +409,7 @@ mod tests {
         .await
         .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
-        assert_eq!(tier, OpenTier::Source);
+        assert_eq!(tier, OpenTier::Lazy, "a cacheless open reads by range");
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------
