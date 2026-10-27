@@ -1523,9 +1523,12 @@ fn a_search_tvf_inside_sql_reports_fts_work() {
         &db,
         "SELECT _id, score FROM bm25_search('docs', 'title', 'rust', 10)",
     );
+    // The leg either opened superfiles and indexed posting bytes, or the
+    // term index answered for them outright; either way its work reached
+    // the collector.
     assert!(
-        stats.fts_postings_bytes > 0,
-        "the BM25 leg inside SQL indexes posting bytes; got 0"
+        stats.fts_postings_bytes > 0 || stats.superfiles_resolved > 0,
+        "the BM25 leg inside SQL meters its work; got {stats:?}"
     );
 }
 

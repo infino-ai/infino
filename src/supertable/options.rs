@@ -86,7 +86,10 @@ use crate::{
     supertable::{
         companion::CompanionSpec,
         manifest::{
-            SuperfileUri, UserCentroidCache, disk_cache::ManifestDiskCache, list::PartitionStrategy,
+            SuperfileUri, UserCentroidCache,
+            disk_cache::ManifestDiskCache,
+            list::PartitionStrategy,
+            term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
         },
         schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
@@ -219,11 +222,15 @@ const DEFAULT_PART_SIZE_THRESHOLD_BYTES: u64 = 10 * (1 << 20);
 /// triggered them. Lazy load stays available as an explicit opt-in
 /// (`with_eager_load_threshold(0)`).
 const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
-/// Default for [`SupertableOptions::bound_ordered_open_window`]. Sixty-four
-/// covers any compacted table up to a few hundred million rows outright, so
-/// the ceiling order changes nothing there; pruning begins where tables have
-/// more superfiles than that, which is where it pays.
-const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 64;
+/// Default for [`SupertableOptions::bound_ordered_open_window`]. Two hundred
+/// and fifty-six covers any compacted table up to a billion rows or so
+/// outright, so the ceiling order changes nothing there; pruning by the
+/// running floor begins where tables have more superfiles than that. A
+/// query a term index's merge cannot prune opens every superfile, and a
+/// window this wide opens a thousand in four rounds of requests rather than
+/// seventeen; what each open fetches is a few hundred kilobytes at most once
+/// a superfile's arrays are cached, and a few megabytes on first touch.
+const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -380,6 +387,31 @@ pub struct SupertableOptions {
     /// I/O concurrency, deliberately independent of the reader pool's CPU
     /// width: a one-thread pool must not serialize fifteen superfile opens.
     pub bound_ordered_open_window: usize,
+    /// Documents the term index keeps per term in its *tier* — a term's
+    /// best documents per superfile, read ahead of any superfile open so a
+    /// ranked multi-term query opens the superfiles that hold its top k
+    /// rather than every one its terms appear in. The cap on a term's
+    /// entries across all superfiles: when the superfiles' heads together
+    /// exceed it, every head is cut to the same shallower depth. `None`
+    /// leaves the heads at [`Self::term_head_depth`]; `Some(0)` keeps no
+    /// tiers, and the ranked path opens by score ceiling alone, as it did
+    /// before tiers existed.
+    pub term_tier_entries_per_term: Option<u64>,
+    /// Documents each superfile keeps per term in its head (see
+    /// `term_tier_entries_per_term`), clamped to `1..=4096`. `None` is the
+    /// engine's depth, chosen so that a superfile's tail — the first
+    /// document its head leaves out — sits well below its best, which is
+    /// what lets a query rule the superfile out without opening it. To
+    /// keep no tiers, set `term_tier_entries_per_term` to zero.
+    pub term_head_depth: Option<usize>,
+    /// Whether a ranked query merges its terms' tiers only when that is
+    /// measured to pay on this table: a running cost per tier entry
+    /// against the opens the merge could save, and per class of query the
+    /// wall of the search with the merge against without it, the cheaper
+    /// taken and the other tried one query in sixteen. Off, the merge
+    /// runs for every query the tiers can serve (what a test of the merge
+    /// wants).
+    pub tier_merge_gate: bool,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -790,6 +822,9 @@ impl SupertableOptions {
             disk_cache: None,
             manifest_disk_cache: None,
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
+            term_tier_entries_per_term: None,
+            term_head_depth: None,
+            tier_merge_gate: true,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -945,6 +980,45 @@ impl SupertableOptions {
     pub fn with_bound_ordered_open_window(mut self, window: usize) -> Self {
         self.bound_ordered_open_window = window.max(1);
         self
+    }
+
+    /// Documents the term index keeps per term in its tier (see
+    /// [`Self::term_tier_entries_per_term`]); `0` keeps no tiers.
+    pub fn with_term_tier_entries_per_term(mut self, entries: u64) -> Self {
+        self.term_tier_entries_per_term = Some(entries);
+        self
+    }
+
+    /// Whether the tier merge is skipped where it cannot pay for itself
+    /// (see [`Self::tier_merge_gate`]).
+    pub fn with_tier_merge_gate(mut self, gate: bool) -> Self {
+        self.tier_merge_gate = gate;
+        self
+    }
+
+    /// Documents each superfile keeps per term in its head (see
+    /// [`Self::term_head_depth`]).
+    pub fn with_term_head_depth(mut self, depth: usize) -> Self {
+        self.term_head_depth = Some(depth);
+        self
+    }
+
+    /// What the term-index build takes from these options.
+    pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
+        // Every superfile keeps its head to the same depth, at least one
+        // document and at most what the index holds; the cap on a term's
+        // entries binds only when the caller sets one.
+        BuildPolicy {
+            tier_entries_per_term: self.term_tier_entries_per_term.unwrap_or(u64::MAX),
+            head_depth_per_superfile: self
+                .term_head_depth
+                .unwrap_or(HEAD_DEPTH)
+                .clamp(1, HEAD_DEPTH_MAX),
+            pool: Some(Arc::clone(&self.writer_pool)),
+            spill_to_disk: true,
+            scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
+            ..BuildPolicy::default()
+        }
     }
 
     /// Attach an on-disk cache for compressed manifest-part bytes.

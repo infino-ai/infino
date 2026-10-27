@@ -272,9 +272,10 @@ part share a single fetch.
 Which superfiles contain a term is answered by one table-level
 structure rather than by anything carried per superfile. For every
 `(column, term)` the term index records the superfiles that hold it and,
-for each, the term's document frequency there, an upper bound on the
-BM25 score the term can reach there, and where the term's postings sit
-in that superfile's bytes. One artifact therefore answers three
+for each, the term's document frequency there, the key of its best
+document there (the length-normalized term frequency a score multiplies
+the idf by, from which a score ceiling is computed at the query's idf),
+and where the term's postings sit in that superfile's bytes. One artifact therefore answers three
 questions: where a term lives, how often it occurs table-wide, and where
 its postings are. Per-superfile bloom filters would saturate on a large
 table and then prune nothing, and inlining every superfile's term
@@ -319,6 +320,75 @@ reader pool, and never opens one whose ceiling is below the running
 k-th score — the in-superfile block-max reasoning lifted one level. And
 its cursors are built from the index's recorded postings locations, so
 the superfile's own dictionary is not read on that path.
+
+A ceiling is a bound on a superfile's best document for one term, and
+on a large table nearly every superfile's ceiling for a common term
+clears the running k-th score, so a query over common terms opened most
+of the table. The index therefore also keeps, per term and per
+superfile, a *head*: the term's best documents in that superfile, each
+as `(local document id, term frequency, length bucket)` — the facts a
+score is computed from, not a score, so a reader computes a candidate's
+contribution exactly as the superfile's kernel would (the table's idf
+times `tf / (tf + norm)` at the same quantized length) and a one- or
+two-term query knows its candidates' scores bit for bit before any open.
+A head is ordered by the length-normalized term frequency at the
+superfile's own average length and cut into blocks of 64; the blocks
+are laid out in *regions*, region `r` holding block `r` of every
+superfile deep enough, so one ranged fetch reads the first block of
+every superfile and a later fetch deepens one superfile alone. Each
+block's directory entry carries the superfile, the block's largest key
+and its *tail* — the key of the first document past the block, or past
+the head the key of the best document the head left out — which bounds
+what the superfile can still hold beyond what was read; a reader scales
+a key to the table's average as it scales any stored ceiling. A head
+keeps a superfile's whole list when the list is short and its best
+documents to a fixed depth otherwise; a per-term cap, when a table sets
+one, lowers that depth for every superfile alike. A posting records the
+key of its superfile's best document as the term's bound there, so a
+ceiling needs no per-superfile statistics to compute. A build writes each slice and tier object to scratch as it
+cuts it and uploads from there, so a rebuild of the whole index needs
+memory for the uploads in flight, not for the index. The
+blocks of every term in a slice sit back to back in that slice's tier
+object, named by offset from the run, so a query reads a block with a
+ranged fetch (each block carries a checksum) and a term's tier costs the
+index a few bytes more in the slice. A tier of no more than a few entries
+is written in the run itself instead: on a table of short texts most
+terms have a posting or two, and a block's fixed header would outweigh
+them.
+
+A ranked query of plain terms merges its terms' tiers before it opens
+anything, when the table has learned that this pays: per class of query
+(conjunction, disjunction or a mix; a bucket of `k`; of the term count;
+of the rarest term's idf) it keeps a running wall of the search with the
+merge and without it, alternates until both are measured, takes the
+cheaper way and tries the other one query in sixteen. Per superfile it reads the terms' heads a block at a time and
+joins them by document, so a document read under several terms is
+known with its contributions from each and bounded through the other
+terms' tails; from the documents carrying every required term it takes
+a lower bound on the k-th score, and from the tails an upper bound on
+anything it has not seen. Superfiles whose
+upper bound cannot reach the k-th lower bound are not opened, a
+conjunction's superfiles that a complete term has shown hold no joint
+document are not opened, a conjunction of one or two bare terms whose
+required heads are whole is answered from the index without an open,
+and the k-th lower bound seeds the floor every kernel prunes against
+from its first block. Nothing in the answer
+changes — the superfiles that do open run the same kernels against the
+same floor semantics — only which superfiles open. Impacts are stored at
+the superfile's own statistics and rescaled to the table's as ceilings
+are, upward for an upper bound and downward for a lower one.
+
+Heads are gathered where the postings already are: the builder that
+writes a superfile hands each term's best documents to a sink as it
+writes the term's postings, and the sink spills them as the superfile's
+contribution; a superfile built without the sink has its heads read
+from its own index with the single-term kernel instead, which gives the
+same bytes. The delta segment pools the contributions into tiers, and
+the maintenance rebuild re-pools every segment's tiers table-wide. A
+superfile's bytes are not changed by any of this. An index written by
+the layout before tiers is still read: its bounds, scores at each
+superfile's own idf, serve ceilings as they did, and the next
+maintenance rebuild writes the current layout.
 
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new

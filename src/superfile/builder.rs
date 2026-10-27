@@ -105,7 +105,7 @@ use crate::{
                 chain_tokenizer,
             },
             bm25,
-            builder::FtsBuilder,
+            builder::{FtsBuilder, TermHeadSink},
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{BisectParams, ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
@@ -1409,6 +1409,16 @@ impl SuperfileBuilder {
             prebuilt_multi_cell: None,
             next_local_doc_id: 0,
         })
+    }
+
+    /// Hand every FTS term's facts to `sink` as the blob is written, with
+    /// its best `depth` documents by impact (see
+    /// [`FtsBuilder::set_term_head_sink`]). No-op when the table has no
+    /// text columns.
+    pub(crate) fn set_term_head_sink(&mut self, sink: Box<dyn TermHeadSink>, depth: usize) {
+        if let Some(fb) = self.fts_builder.as_mut() {
+            fb.set_term_head_sink(sink, depth);
+        }
     }
 
     /// Override the FTS builder's in-RAM spill threshold (forwarded
@@ -2825,8 +2835,19 @@ impl SuperfileBuilder {
         base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm)
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm, None)
     }
+    }
+
+    /// [`Self::build_from_readers_fts_merge_to`], handing each written
+    /// term's facts to `term_heads` (see [`Self::set_term_head_sink`]).
+    pub(crate) fn build_from_readers_fts_merge_with_heads<W: Write>(
+        inputs: &[MergeInput],
+        base: BuilderOptions,
+        output: W,
+        term_heads: Option<(Box<dyn TermHeadSink>, usize)>,
+    ) -> Result<SuperfileStats, BuildError> {
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm, term_heads)
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
@@ -2836,9 +2857,13 @@ impl SuperfileBuilder {
         base: BuilderOptions,
         output: W,
         merge: PostingMerge,
+        term_heads: Option<(Box<dyn TermHeadSink>, usize)>,
     ) -> Result<SuperfileStats, BuildError> {
         let builder_opts = merge_builder_opts(inputs, base)?;
-        let superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        if let Some((sink, depth)) = term_heads {
+            superfile_builder.set_term_head_sink(sink, depth);
+        }
 
         let mut rows_of = Vec::with_capacity(inputs.len());
         let mut n_out_docs = 0u32;
@@ -7297,6 +7322,7 @@ mod tests {
             base(),
             &mut accumulator,
             PostingMerge::Accumulator,
+            None,
         )
         .expect("accumulator merge");
         let mut sorted = Vec::new();
@@ -7305,6 +7331,7 @@ mod tests {
             base(),
             &mut sorted,
             PostingMerge::TermByTerm,
+            None,
         )
         .expect("sorted merge");
         assert!(!sorted.is_empty(), "merge wrote a superfile");
@@ -7555,6 +7582,7 @@ mod tests {
                     base,
                     &mut out,
                     PostingMerge::TermByTerm,
+                    None,
                 )
             })
             .expect("sorted merge");

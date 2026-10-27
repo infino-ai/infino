@@ -39,6 +39,10 @@ pub struct SuperfileStats {
     pub size_bytes: u64,
     pub n_docs: u64,
     pub tombstoned_docs: u64,
+    /// The smallest document id the superfile holds: the key compaction
+    /// packs neighbours by, so merged outputs keep the disjoint, monotone
+    /// id ranges ingest gave their inputs.
+    pub id_min: i128,
     /// Already owned by another compaction so skip it.
     pub sealed_by_other: bool,
     /// Commit version the superfile was born at. A merged superfile carries
@@ -146,6 +150,12 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
     jobs
 }
 
+/// A superfile at least this share deleted is rewritten by the next pass
+/// whatever its neighbours amount to: packing by id would otherwise leave
+/// it waiting for neighbours that may never fill a job, and the space its
+/// deleted rows hold with it.
+const RECLAIM_DELETED_PERCENT: u64 = 50;
+
 fn pack_partition(
     key: &[u8],
     segs: Vec<&SuperfileStats>,
@@ -162,12 +172,19 @@ fn pack_partition(
         .filter(|s| !s.sealed_by_other && (s.size_bytes < target_bytes || s.stale_type))
         .collect();
 
-    // Most-deleted first (reclaim space soonest), then smallest, then ID.
+    // Neighbours by document id pack together: ingest gives each superfile
+    // a contiguous id range disjoint from every other's, and a job over
+    // adjacent ranges produces an output whose range is as disjoint and as
+    // monotone as its inputs'. A ranked search profits from that — a
+    // superfile whose best document can only tie the k-th score is skipped
+    // when every id it holds is past the tied document's, which ranges
+    // that do not interleave make the common case. Every sub-target
+    // superfile is a candidate regardless; a deleted-heavy one no longer
+    // leads the pass, and is instead rewritten with whatever neighbours
+    // its job has gathered (see [`RECLAIM_DELETED_PERCENT`]).
     candidates.sort_by(|a, b| {
-        let lhs = a.tombstoned_docs as u128 * b.n_docs.max(1) as u128;
-        let rhs = b.tombstoned_docs as u128 * a.n_docs.max(1) as u128;
-        rhs.cmp(&lhs)
-            .then(a.size_bytes.cmp(&b.size_bytes))
+        a.id_min
+            .cmp(&b.id_min)
             .then(a.superfile_id.cmp(&b.superfile_id))
     });
 
@@ -196,14 +213,26 @@ fn pack_partition(
     );
 }
 
+/// What a job keeps of each input to order the merge; see [`PendingJob::emit`].
+#[derive(Clone, Copy)]
+struct Member {
+    id: Uuid,
+    tombstoned_docs: u64,
+    n_docs: u64,
+    size_bytes: u64,
+}
+
 #[derive(Default)]
 struct PendingJob {
-    inputs: Vec<Uuid>,
+    members: Vec<Member>,
     live_bytes: u64,
     raw_bytes: u64,
     /// Whether an input holds a column in a type the table has moved on
     /// from; the job then runs however small.
     stale_type: bool,
+    /// Whether an input is at least [`RECLAIM_DELETED_PERCENT`] deleted;
+    /// the job then runs however small, to reclaim the space.
+    reclaiming: bool,
 }
 
 impl PendingJob {
@@ -214,9 +243,16 @@ impl PendingJob {
 
     fn push(&mut self, s: &SuperfileStats) {
         self.raw_bytes += s.size_bytes;
-        self.inputs.push(s.superfile_id);
+        self.members.push(Member {
+            id: s.superfile_id,
+            tombstoned_docs: s.tombstoned_docs,
+            n_docs: s.n_docs,
+            size_bytes: s.size_bytes,
+        });
         self.live_bytes += s.live_bytes();
         self.stale_type |= s.stale_type;
+        self.reclaiming |= s.tombstoned_docs as u128 * 100
+            >= s.n_docs.max(1) as u128 * RECLAIM_DELETED_PERCENT as u128;
     }
 
     /// Emit a CompactionJob when the pending inputs clear either leg of the
@@ -224,6 +260,11 @@ impl PendingJob {
     /// - size: `>= 2` inputs and live bytes reach `min_output_bytes`;
     /// - count: `>= min_superfiles_for_merge` inputs (already `>= 2`), which
     ///   fires even when the live bytes sit far below the size floor.
+    ///
+    /// A job holding a stale-typed input runs however small, one input
+    /// included: the rewrite converges the type. One holding a mostly
+    /// deleted input runs however small too, with the two inputs a merge
+    /// needs: the rewrite reclaims the deleted rows' space.
     fn emit(
         &mut self,
         key: &[u8],
@@ -232,13 +273,33 @@ impl PendingJob {
         merge_memory_mb: Option<u64>,
         jobs: &mut Vec<CompactionJob>,
     ) {
-        let size_ready = self.inputs.len() >= 2 && self.live_bytes >= min_output_bytes;
-        let count_ready = self.inputs.len() >= min_superfiles_for_merge;
-        let converging = self.stale_type && !self.inputs.is_empty();
-        if size_ready || count_ready || converging {
+        let size_ready = self.members.len() >= 2 && self.live_bytes >= min_output_bytes;
+        let count_ready = self.members.len() >= min_superfiles_for_merge;
+        let converging = self.stale_type && !self.members.is_empty();
+        let reclaiming = self.reclaiming && self.members.len() >= 2;
+        if size_ready || count_ready || converging || reclaiming {
+            // A job's inputs were gathered in id order; they merge
+            // most-deleted first, then smallest, then by id. The merged
+            // superfile's document order starts from its inputs'
+            // concatenation before the reorder refines it, and a start in
+            // id order — ingest order — leaves the ranked kernels pruning
+            // a fifth less on the output: on a 5.3M-document table
+            // compacted to one superfile, the same inputs merged in id
+            // order answered at 1.20 the time at k=10 and 1.13 at k=100,
+            // every query shape alike, against this order. The output's
+            // id range is the same either way, so jobs still produce
+            // superfiles whose ranges do not interleave.
+            let mut members = mem::take(&mut self.members);
+            members.sort_by(|a, b| {
+                let lhs = a.tombstoned_docs as u128 * b.n_docs.max(1) as u128;
+                let rhs = b.tombstoned_docs as u128 * a.n_docs.max(1) as u128;
+                rhs.cmp(&lhs)
+                    .then(a.size_bytes.cmp(&b.size_bytes))
+                    .then(a.id.cmp(&b.id))
+            });
             jobs.push(CompactionJob {
                 partition_key: key.to_vec(),
-                inputs: mem::take(&mut self.inputs),
+                inputs: members.into_iter().map(|m| m.id).collect(),
                 estimated_output_bytes: self.live_bytes,
                 merge_memory_mb,
             });
@@ -273,6 +334,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             size_bytes: mib(size_mib),
             n_docs,
             tombstoned_docs: tombstoned,
+            id_min: id as i128,
             sealed_by_other: false,
             birth_version: 0,
             stale_type: false,
@@ -427,13 +489,74 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert_eq!(jobs[0].estimated_output_bytes, mib(1000));
     }
 
+    /// Candidates pack by document id, whatever order they are listed in
+    /// and however deleted: a job's inputs are id-adjacent, so its output's
+    /// range does not interleave with any other output's.
+    /// Packing by id must not strand a mostly deleted superfile: four
+    /// 300 MiB superfiles fill a job without the 900 MiB one at the
+    /// highest id that is 72% deleted, which the reclaim leg then rewrites
+    /// with the neighbour left over. Alone it waits, as every merge needs
+    /// two inputs; under the share it waits for its neighbours as any
+    /// other does.
     #[test]
-    fn prefers_most_deleted_first() {
-        let mut segs: Vec<_> = (0..9).map(|i| seg(i, 100, 1000, 0)).collect();
-        let dead_heavy = seg(100, 100, 1000, 900);
+    fn a_mostly_deleted_superfile_is_rewritten_by_the_next_pass() {
+        let mut segs: Vec<_> = (0..4).map(|i| seg(i, 300, 1000, 0)).collect();
+        let dead_heavy = seg(4, 900, 1000, 720);
         segs.push(dead_heavy.clone());
         let jobs = select(&segs, &default_cfg());
-        assert_eq!(jobs[0].inputs[0], dead_heavy.superfile_id);
+        let holder = jobs
+            .iter()
+            .find(|j| j.inputs.contains(&dead_heavy.superfile_id))
+            .expect("the mostly deleted superfile is in a job");
+        assert_eq!(holder.inputs.len(), 2, "with the neighbour left over");
+        assert!(select(&segs[4..], &default_cfg()).is_empty(), "alone");
+        segs[4] = seg(4, 900, 1000, 100);
+        let jobs = select(&segs, &default_cfg());
+        assert!(
+            jobs.iter()
+                .all(|j| !j.inputs.contains(&segs[4].superfile_id)),
+            "lightly deleted, it waits with its neighbour: {jobs:?}"
+        );
+    }
+
+    #[test]
+    fn packs_id_adjacent_superfiles_together() {
+        // Ten sub-target superfiles listed out of id order, one of them
+        // mostly deleted; each job fills to the target from the lowest ids.
+        let order = [7u128, 2, 9, 0, 4, 1, 8, 3, 6, 5];
+        let segs: Vec<_> = order
+            .iter()
+            .map(|&i| seg(i, 300, 1000, if i == 9 { 900 } else { 0 }))
+            .collect();
+        let jobs = select(&segs, &default_cfg());
+        assert!(jobs.len() >= 2, "several jobs");
+        let mut seen = 0u128;
+        for job in &jobs {
+            let ids: Vec<u128> = job.inputs.iter().map(|u| u.as_u128()).collect();
+            let mut sorted = ids.clone();
+            sorted.sort_unstable();
+            assert!(
+                sorted.windows(2).all(|w| w[0] + 1 == w[1]) && sorted[0] == seen,
+                "job inputs are the next ids: {ids:?} after {seen}"
+            );
+            seen = sorted[sorted.len() - 1] + 1;
+        }
+    }
+
+    #[test]
+    fn a_job_merges_most_deleted_first_then_smallest_then_by_id() {
+        // Four id-adjacent inputs of one job: the deleted-heavy one leads,
+        // then the two clean ones smallest first, then id breaks the tie.
+        let segs = vec![
+            seg(0, 300, 1000, 0),
+            seg(1, 200, 1000, 0),
+            seg(2, 300, 1000, 600),
+            seg(3, 200, 1000, 0),
+        ];
+        let jobs = select(&segs, &default_cfg());
+        assert_eq!(jobs.len(), 1, "one job: {jobs:?}");
+        let ids: Vec<u128> = jobs[0].inputs.iter().map(|u| u.as_u128()).collect();
+        assert_eq!(ids, vec![2, 1, 3, 0]);
     }
 
     #[test]
@@ -489,7 +612,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         assert!(p.fits(&a, target, max_memory));
         p.push(&a);
         assert_eq!(p.live_bytes, mib(60));
-        assert_eq!(p.inputs.len(), 1);
+        assert_eq!(p.members.len(), 1);
         // A second 60 MiB superfile would overflow the 100 MiB target.
         let b = seg(2, 60, 1000, 0);
         assert!(!p.fits(&b, target, max_memory));
@@ -541,6 +664,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
                 size_bytes: mib(size_mib),
                 n_docs,
                 tombstoned_docs: n_docs * tombstone_pct / 100,
+                id_min: index as i128,
                 sealed_by_other,
                 birth_version,
                 stale_type: false,
@@ -635,7 +759,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         p.emit(&[], 0, 2, None, &mut jobs);
         assert!(jobs.is_empty(), "single-input job must not emit");
         // Reset to default after emit attempt.
-        assert_eq!(p.inputs.len(), 0);
+        assert_eq!(p.members.len(), 0);
         assert_eq!(p.live_bytes, 0);
     }
     /// A file holding a column in a type the table has moved on from is a

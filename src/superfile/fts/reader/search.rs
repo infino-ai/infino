@@ -606,7 +606,7 @@ impl FtsReader {
                 (_, allow) => Some(AtomExcludeFilter::with_allow(
                     negative_atoms,
                     allow.map(RowSet::new),
-                    self.doc_map.clone(),
+                    self.doc_map().clone(),
                 )),
             };
             // The atom walk is the whole kernel for phrase shapes —
@@ -635,7 +635,9 @@ impl FtsReader {
         }
 
         // Negatives are a hard exclusion filter that only seeks doc ids, so
-        // they are built to count: no tfs, idf or bounds.
+        // they are built to count: no tfs, idf or bounds. They come from the
+        // memo like the scored terms where the index located them; a lazy
+        // reader otherwise fetches the dictionary whole to find them.
         let neg_cursors = match lists.negatives {
             [] => Vec::new(),
             negatives => {
@@ -645,15 +647,19 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    lists.prefetched,
                 )
                 .await?
             }
         };
         // term-dictionary ranges the builds below request — one per
-        // `build_term_cursors` call (the dictionary fetch is a real
-        // byte-source range on every query, warm or cold).
-        let mut dict_ranges = u64::from(!lists.negatives.is_empty());
+        // `build_term_cursors` call that the memo does not cover (the
+        // dictionary fetch is a real byte-source range on every query,
+        // warm or cold).
+        let negatives_from_memo = lists
+            .prefetched
+            .is_some_and(|m| lists.negatives.iter().all(|t| m.contains(t)));
+        let mut dict_ranges = u64::from(!lists.negatives.is_empty() && !negatives_from_memo);
         // The gate exists when there is anything to gate on: a negated
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
@@ -661,7 +667,7 @@ impl FtsReader {
             (_, allow) => Some(ExcludeFilter::with_allow(
                 neg_cursors,
                 allow.map(RowSet::new),
-                self.doc_map.clone(),
+                self.doc_map().clone(),
             )),
         };
 
@@ -1254,6 +1260,7 @@ impl FtsReader {
         // column could park every core with nothing left to drive the read
         // that would release them.
         self.ensure_norms(column_id).await?;
+        self.ensure_doc_map().await?;
         let term_bytes = match source {
             SingleSource::Absent => return Ok((Vec::new(), MatchWork::default(), 0)),
             SingleSource::Inline { doc_id, tf } => {
@@ -1631,6 +1638,7 @@ impl FtsReader {
         if purpose.scores() {
             self.ensure_norms(column_id).await?;
         }
+        self.ensure_doc_map().await?;
 
         // Resolve each term to an inline (df=1) value, a PFOR metadata
         // offset, or a miss — preserving query order and arity (a miss is a
