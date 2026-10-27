@@ -64,7 +64,7 @@ use rayon::ThreadPool;
 use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, task, task::JoinSet};
+use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -456,12 +456,15 @@ async fn join_one(
     }
 }
 
-/// Write one fetched object to `path` from a blocking thread that owns
-/// the bytes, so nothing copies them first.
+/// Write one fetched object to `path` through the runtime's file I/O,
+/// chunk by chunk, so a task stopped by `run_bounded` stops between
+/// chunks rather than finishing the write on a blocking thread after the
+/// caller has removed the directory. `write_all` hands the bytes over in
+/// pieces; nothing copies the object whole first.
 async fn write_object(path: PathBuf, bytes: Bytes) -> Result<(), TermIndexError> {
-    task::spawn_blocking(move || fs::write(&path, bytes.as_ref()))
-        .await
-        .map_err(|e| TermIndexError::Build(format!("object spill: {e}")))??;
+    let mut file = async_fs::File::create(&path).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
     Ok(())
 }
 
