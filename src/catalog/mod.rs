@@ -2091,8 +2091,8 @@ mod tests {
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        StringViewArray,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
+        LargeStringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -4400,6 +4400,109 @@ mod tests {
             grouped_counts(&after_delete.query_sql(grouped).expect("grouped")),
             vec![("fhv".to_string(), 1), ("yellow".to_string(), 3)]
         );
+    }
+
+    /// A nullable `title` and a nullable `fare` over two superfiles: four non-null fares summing
+    /// to 20, and the non-null titles yellow twice, green once and fhv once.
+    fn create_fares(conn: &Connection, name: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, true),
+            Field::new("fare", DataType::Float64, true),
+        ]));
+        let table = conn
+            .create_table(name, Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        let batch = |titles: Vec<Option<&str>>, fares: Vec<Option<f64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles)),
+                    Arc::new(Float64Array::from(fares)),
+                ],
+            )
+            .expect("batch")
+        };
+        table
+            .append(&batch(
+                vec![Some("yellow"), None, Some("green")],
+                vec![Some(10.0), Some(2.5), None],
+            ))
+            .expect("append 1");
+        table
+            .append(&batch(
+                vec![Some("yellow"), Some("fhv"), None],
+                vec![None, Some(7.0), Some(0.5)],
+            ))
+            .expect("append 2");
+    }
+
+    /// The single value in column `column` of a one-row result.
+    fn single<A: Array + Clone + 'static>(batches: &[RecordBatch], column: usize) -> A {
+        batches[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<A>()
+            .expect("column type")
+            .clone()
+    }
+
+    /// `COUNT(column)` counts the column's non-null rows from the manifest's null counts, alone
+    /// and beside `SUM` (the pair an average is assembled from), with no scan; under a range on
+    /// the same column it still counts only non-null rows.
+    #[test]
+    fn query_sql_answers_column_counts_from_manifest_stats() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let count_only = "SELECT count(fare) AS n FROM fares";
+        let counted = conn.query_sql(count_only).expect("count");
+        assert_eq!(single::<Int64Array>(&counted, 0).value(0), 4);
+
+        let pair = "SELECT sum(fare) AS s, count(fare) AS n FROM fares";
+        let summed = conn.query_sql(pair).expect("sum and count");
+        assert_eq!(single::<Float64Array>(&summed, 0).value(0), 20.0);
+        assert_eq!(single::<Int64Array>(&summed, 1).value(0), 4);
+
+        for sql in [count_only, pair] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(
+                !scans(&plan),
+                "answered from manifest stats, no scan: {sql}"
+            );
+        }
+
+        let ranged = conn
+            .query_sql("SELECT count(fare) AS n FROM fares WHERE fare >= 0")
+            .expect("ranged count");
+        assert_eq!(single::<Int64Array>(&ranged, 0).value(0), 4);
+    }
+
+    /// A grouped count filtered to the grouping column's non-null values is answered from the
+    /// value counts even though the column holds nulls; unfiltered, the null group needs the scan.
+    #[test]
+    fn query_sql_answers_not_null_grouped_counts_from_value_counts() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let not_null = "SELECT title, count(*) FROM fares WHERE title IS NOT NULL GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(not_null).expect("grouped")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 2)
+            ]
+        );
+        let plan = conn
+            .query_sql(&format!("EXPLAIN {not_null}"))
+            .expect("explain");
+        assert!(!scans(&plan), "answered from value counts, no scan");
+
+        let whole = "SELECT title, count(*) FROM fares GROUP BY title";
+        let plan = conn
+            .query_sql(&format!("EXPLAIN {whole}"))
+            .expect("explain");
+        assert!(scans(&plan), "the null group is not in the value counts");
     }
 
     /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
