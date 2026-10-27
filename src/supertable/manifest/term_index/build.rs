@@ -111,6 +111,12 @@ pub(crate) struct BuildPolicy {
     /// from its contributions instead. A superfile or column absent here
     /// keys at [`ColumnScoring::default`].
     pub(crate) scoring_by_ordinal: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>,
+    /// The same facts by superfile id, for a commit: its root's ordinals
+    /// are assigned as the commit's segment is reserved, so the fold that
+    /// follows the commit keys the segments it merges by ordinal from this
+    /// map and the root it folds. Empty, a fold keys at
+    /// [`ColumnScoring::default`] like any merge without the table.
+    pub(crate) scoring_by_superfile: Arc<HashMap<Uuid, BTreeMap<FieldId, ColumnScoring>>>,
 }
 
 /// How a segment writer keys an entry: by the superfile ordinal and column
@@ -171,6 +177,7 @@ impl Default for BuildPolicy {
             scratch_root: None,
             merge_shards: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
+            scoring_by_superfile: Arc::new(HashMap::new()),
         }
     }
 }

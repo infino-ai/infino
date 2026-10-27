@@ -11405,23 +11405,29 @@ fn scoring_by_ordinal(
     manifest: &ManifestSnapshot,
     superfiles: &[Uuid],
 ) -> Vec<BTreeMap<FieldId, term_index::ColumnScoring>> {
-    let by_id: HashMap<Uuid, &Arc<SuperfileEntry>> = manifest
-        .superfiles
+    let mut by_id = scoring_by_superfile(manifest);
+    superfiles
         .iter()
-        .map(|e| (e.superfile_id, e))
-        .collect();
+        .map(|id| by_id.remove(id).unwrap_or_default())
+        .collect()
+}
+
+/// Each superfile's scoring facts per full-text column, by superfile id:
+/// what [`scoring_by_ordinal`] lays out by a root's ordinals, and what a
+/// commit hands the fold that may follow it, before its ordinals exist.
+fn scoring_by_superfile(
+    manifest: &ManifestSnapshot,
+) -> HashMap<Uuid, BTreeMap<FieldId, term_index::ColumnScoring>> {
     let columns: Vec<(FieldId, Bm25Params)> = manifest
         .fts_configs()
         .iter()
         .filter_map(|c| Some((manifest.field_id(&c.column)?, c.bm25)))
         .collect();
-    superfiles
+    manifest
+        .superfiles
         .iter()
-        .map(|id| {
-            let Some(entry) = by_id.get(id) else {
-                return BTreeMap::new();
-            };
-            columns
+        .map(|entry| {
+            let scoring = columns
                 .iter()
                 .filter_map(|(column, params)| {
                     let summary = entry.fts_summary.get(column)?;
@@ -11444,7 +11450,8 @@ fn scoring_by_ordinal(
                         },
                     ))
                 })
-                .collect()
+                .collect();
+            (entry.superfile_id, scoring)
         })
         .collect()
 }
@@ -12587,7 +12594,13 @@ pub(crate) async fn try_commit_attempt(
                 true => current_manifest.term_index_complete(),
                 false => current_manifest.holds_no_superfiles(),
             };
-        let policy = current_manifest.options.term_index_build_policy();
+        // The fold that may follow the commit keys the tiers it rewrites by
+        // each superfile's own scoring; the manifest being committed holds
+        // the new superfiles' facts as well as the old.
+        let policy = term_index::BuildPolicy {
+            scoring_by_superfile: Arc::new(scoring_by_superfile(&new_manifest)),
+            ..current_manifest.options.term_index_build_policy()
+        };
         let store = storage.as_ref();
         // A fold the root calls for is CPU work, merged on the reader pool as
         // optimize's rebuild and fold merge theirs.

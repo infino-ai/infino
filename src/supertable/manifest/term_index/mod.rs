@@ -541,7 +541,29 @@ async fn publish_root(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
-    if let Err(error) = fold_tail(storage, &mut root, policy, pool).await {
+    // A commit's policy knows its superfiles' scoring by id, not by
+    // ordinal — the ordinals are this root's; the fold's merge keys the
+    // tiers it rewrites by ordinal, so the table is laid out by the root
+    // here. A policy that already carries the ordinal table keeps it.
+    let fold_policy = match policy.scoring_by_ordinal.is_empty() {
+        true => BuildPolicy {
+            scoring_by_ordinal: Arc::new(
+                root.superfiles
+                    .iter()
+                    .map(|id| {
+                        policy
+                            .scoring_by_superfile
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            ),
+            ..policy.clone()
+        },
+        false => policy.clone(),
+    };
+    if let Err(error) = fold_tail(storage, &mut root, &fold_policy, pool).await {
         warn!(%error, "term index: folding segments at commit failed; publishing the root unfolded");
     }
     write_root(storage, &root).await
