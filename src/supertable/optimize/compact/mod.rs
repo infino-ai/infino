@@ -419,8 +419,13 @@ impl Supertable {
             let manifest = inner.manifest.load_full();
 
             // Prefetch sidecars using the cache to batch storage GETs.
-            // This populates both bitmap and seal information for all superfiles.
-            // The cache returns empty bitmaps for superfiles without tombstones.
+            // This populates both bitmap and seal information for all
+            // superfiles, including the seals on superfiles the manifest
+            // lists no tombstones for: a compactor seals those by creating
+            // their sidecar, which the manifest never learns of, and a plan
+            // that cannot see such a seal names inputs another compactor
+            // holds. The cache returns empty bitmaps for superfiles without
+            // tombstones.
             let superfile_ids: Vec<Uuid> = manifest
                 .get_all_superfiles()
                 .iter()
@@ -430,7 +435,7 @@ impl Supertable {
             let sidecar_map: HashMap<Uuid, (Arc<RoaringBitmap>, Option<SealRecord>)> =
                 if let Some(cache) = &inner.tombstone_cache {
                     let now = Instant::now();
-                    cache.prefetch(&superfile_ids, now).await;
+                    cache.prefetch_seals(&superfile_ids, now).await;
 
                     // Build a map of superfile_id → (bitmap, seal) by checking the cache.
                     // Cache hits are O(1); any misses are already prefetched above.
@@ -1933,6 +1938,16 @@ fn collect_merge(
         Ok((_, Err(e @ CompactionError::BatchDropped(_)))) => {
             dropped.record(1, e);
             return true;
+        }
+        // Another compactor holds an input this job planned around, which
+        // the plan could not have seen: the seal landed after it. The job
+        // is dropped, its inputs stay with their holder, and the pass goes
+        // on with the rest, which is independent of it. Neither a failure
+        // streak nor the pass's result: the table is not sick, and the
+        // holder's pass is doing this job's work.
+        Ok((_, Err(e @ CompactionError::SidecarConflict { .. }))) => {
+            dropped.record(1, e);
+            return false;
         }
         Ok((_, Err(e))) => e,
         Err(e) => CompactionError::Build(format!("merge task failed: {e}")),
@@ -4198,6 +4213,48 @@ mod tests {
             .await
             .expect("compact");
         assert!(superfile_count(&st) < before, "default steps should merge");
+    }
+
+    /// An input another compactor holds is left to it. The seal is on a
+    /// superfile that never had a tombstone, so the manifest lists no
+    /// sidecar for it: the plan has to read the seal from storage to know.
+    /// The pass merges what it can around the held input and succeeds, and
+    /// once the seal is older than the stale threshold the next pass takes
+    /// the input over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_leaves_an_input_another_compactor_holds() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        commit_ten_small_files(&st);
+        let held = *listed_ids(&st).last().expect("ten superfiles");
+        let foreign_cid = Uuid::new_v4();
+        tombstones_admin::seal(
+            &wal_store_for(&st),
+            held,
+            foreign_cid,
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("seal as a foreign compaction");
+
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("the pass succeeds around the held input");
+        let after = listed_ids(&st);
+        assert!(after.len() < 10, "the free inputs merged");
+        assert!(after.contains(&held), "the held input was left to its holder");
+
+        // Past the threshold the seal is abandoned and the input is fair game.
+        let cfg = CompactionSettings {
+            stale_seal_timeout_ms: 0,
+            ..small_compact_cfg()
+        };
+        st.compact_async(&cfg).await.expect("the second pass");
+        assert!(
+            !listed_ids(&st).contains(&held),
+            "a stale seal no longer holds the input"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6934,6 +6991,35 @@ mod tests {
                 merge_input_mb: None,
             })
             .collect()
+    }
+
+    /// A seal that lands after planning is a race the plan could not see.
+    /// The job it hits is dropped and the rest of the pass commits; the
+    /// pass reports the drop rather than failing on it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_seal_placed_after_planning_drops_only_that_job() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = make_st(&dir);
+        let jobs = pair_jobs(&st, 2);
+        let held = jobs[1].inputs[0];
+        tombstones_admin::seal(
+            &wal_store_for(&st),
+            held,
+            Uuid::new_v4(),
+            Utc::now(),
+            DEFAULT_STALE_SEAL_TIMEOUT,
+        )
+        .await
+        .expect("seal as a foreign compaction");
+
+        let dropped = st
+            .run_compaction_jobs_with(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 1, || true)
+            .await
+            .expect("the pass succeeds");
+        assert_eq!(dropped, 1, "the job on the held input is reported dropped");
+        let after = listed_ids(&st);
+        assert_eq!(after.len(), 3, "one pair merged, the other pair untouched");
+        assert!(after.contains(&held));
     }
 
     /// A storage error on one batch's commit costs that batch only. The
