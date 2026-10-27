@@ -115,6 +115,7 @@ impl !core::panic::unwind_safe::UnwindSafe for infino::GcError
 #[non_exhaustive] pub enum infino::InfinoError
 pub infino::InfinoError::AlreadyExists(alloc::string::String)
 pub infino::InfinoError::Backend(alloc::string::String)
+pub infino::InfinoError::Cancelled(alloc::string::String)
 pub infino::InfinoError::Cardinality(alloc::string::String)
 pub infino::InfinoError::Config(alloc::string::String)
 pub infino::InfinoError::Conflict(alloc::string::String)
@@ -607,6 +608,7 @@ pub fn infino::Connection::drop_table(&self, &str, bool) -> core::result::Result
 pub fn infino::Connection::list_tables(&self) -> core::result::Result<alloc::vec::Vec<alloc::string::String>, infino::InfinoError>
 pub fn infino::Connection::open_table(&self, &str) -> core::result::Result<infino::Supertable, infino::InfinoError>
 pub fn infino::Connection::query_sql(&self, &str) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Connection::query_sql_cancellable(&self, &str, &infino::QueryCancel) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Connection::schema(&self, &str) -> core::result::Result<infino::TableSchema, infino::InfinoError>
 pub fn infino::Connection::update_storage_credentials(&self, &[(alloc::string::String, alloc::string::String)]) -> bool
 impl core::clone::Clone for infino::Connection
@@ -864,6 +866,24 @@ impl core::marker::Unpin for infino::PlannedRepair
 impl core::marker::UnsafeUnpin for infino::PlannedRepair
 impl core::panic::unwind_safe::RefUnwindSafe for infino::PlannedRepair
 impl core::panic::unwind_safe::UnwindSafe for infino::PlannedRepair
+pub struct infino::QueryCancel
+impl infino::QueryCancel
+pub fn infino::QueryCancel::cancel(&self)
+pub fn infino::QueryCancel::is_cancelled(&self) -> bool
+pub fn infino::QueryCancel::new() -> Self
+impl core::clone::Clone for infino::QueryCancel
+pub fn infino::QueryCancel::clone(&self) -> Self
+impl core::default::Default for infino::QueryCancel
+pub fn infino::QueryCancel::default() -> Self
+impl core::fmt::Debug for infino::QueryCancel
+pub fn infino::QueryCancel::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for infino::QueryCancel
+impl core::marker::Send for infino::QueryCancel
+impl core::marker::Sync for infino::QueryCancel
+impl core::marker::Unpin for infino::QueryCancel
+impl core::marker::UnsafeUnpin for infino::QueryCancel
+impl core::panic::unwind_safe::RefUnwindSafe for infino::QueryCancel
+impl core::panic::unwind_safe::UnwindSafe for infino::QueryCancel
 #[non_exhaustive] pub struct infino::ReindexOptions
 pub infino::ReindexOptions::mode: infino::ReindexMode
 pub infino::ReindexOptions::stale_seal_timeout_ms: core::option::Option<u64>

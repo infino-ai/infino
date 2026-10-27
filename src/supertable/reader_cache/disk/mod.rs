@@ -11,6 +11,7 @@ use std::{
     collections::HashSet,
     fmt, fs,
     path::PathBuf,
+    process,
     sync::{
         Arc, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -87,6 +88,10 @@ const BLOCKS_IDX_TMP_INFIX: &str = ".idx.tmp.";
 /// fetch's tempfile is seconds old, so one this stale can only be a crashed fetch's leftover;
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
 const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Numbers each download's tempfile across every store in this process, see
+/// [`DiskCacheStore::tmp_path`].
+static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 
 /// Process-global count of in-flight foreground queries. Used with
 /// [`foreground_notify`] so a fill's `select!` wakes promptly when a query
@@ -409,8 +414,6 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
-    /// Numbers each download's tempfile, see [`Self::tmp_path`].
-    tmp_seq: AtomicU64,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -441,6 +444,12 @@ pub(crate) use fetch::skip_background_fill;
 pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
 
 impl DiskCacheStore {
+    /// Where a build may spill its scratch: beside the cache, on the disk
+    /// sized for the table, rather than in the system temporary directory.
+    pub(crate) fn scratch_root(&self) -> PathBuf {
+        self.config.cache_root.join("scratch")
+    }
+
     /// Construct a new disk cache rooted at `config.cache_root`
     /// (created if absent) backed by `storage`. `pinned_fn`
     /// returns the currently-pinned URI set on each eviction
@@ -490,7 +499,6 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
-            tmp_seq: AtomicU64::new(0),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
@@ -671,10 +679,14 @@ impl DiskCacheStore {
     }
 
     /// A fresh tempfile for one download of `uri`, renamed to `cache_path` once complete. Every
-    /// call names a new file, since several downloads of one superfile can run at once.
+    /// call names a new file, since several downloads of one superfile can run at once. That
+    /// holds across stores too: two stores over one `cache_root`, in this process or another,
+    /// never share a name, since the number is process-wide and the name carries the process id.
     pub(crate) fn tmp_path(&self, uri: &SuperfileUri) -> PathBuf {
-        let seq = self.tmp_seq.fetch_add(1, Ordering::Relaxed);
-        self.config.cache_root.join(uri.cache_tmp_filename(seq))
+        let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        self.config
+            .cache_root
+            .join(uri.cache_tmp_filename(process::id(), seq))
     }
 
     // Test and bench helpers. Compiled only for tests and the `test-helpers` feature, never into
@@ -747,12 +759,13 @@ pub(crate) mod test_support {
 
     /// Storage that records every ranged GET, so a test can check which bytes left object storage.
     /// [`Self::pause_next_read`] parks the next ranged GET until [`Self::resume`], so a test can act
-    /// in the middle of a download.
+    /// in the middle of a download; [`Self::pause_read_after`] lets some go by first.
     #[derive(Debug)]
     pub(crate) struct RecordingStorage {
         inner: Arc<dyn StorageProvider>,
         ranges: Mutex<Vec<Range<u64>>>,
-        pause_next: AtomicBool,
+        /// Ranged GETs to let through before parking one; `None` parks none.
+        pause_after: Mutex<Option<usize>>,
         paused: AtomicBool,
         resume: Notify,
     }
@@ -762,7 +775,7 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 inner,
                 ranges: Mutex::new(Vec::new()),
-                pause_next: AtomicBool::new(false),
+                pause_after: Mutex::new(None),
                 paused: AtomicBool::new(false),
                 resume: Notify::new(),
             })
@@ -777,7 +790,28 @@ pub(crate) mod test_support {
         }
 
         pub(crate) fn pause_next_read(&self) {
-            self.pause_next.store(true, Ordering::SeqCst);
+            self.pause_read_after(0);
+        }
+
+        /// Park the ranged GET that follows the next `reads`.
+        pub(crate) fn pause_read_after(&self, reads: usize) {
+            *self.pause_after.lock().expect("pause_after") = Some(reads);
+        }
+
+        /// Whether this ranged GET is the one to park, counting it off.
+        fn take_pause(&self) -> bool {
+            let mut pause_after = self.pause_after.lock().expect("pause_after");
+            match *pause_after {
+                Some(0) => {
+                    *pause_after = None;
+                    true
+                }
+                Some(reads) => {
+                    *pause_after = Some(reads - 1);
+                    false
+                }
+                None => false,
+            }
         }
 
         pub(crate) fn is_paused(&self) -> bool {
@@ -799,7 +833,7 @@ pub(crate) mod test_support {
         }
         async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
             self.ranges.lock().expect("ranges").push(range.clone());
-            if self.pause_next.swap(false, Ordering::SeqCst) {
+            if self.take_pause() {
                 self.paused.store(true, Ordering::SeqCst);
                 self.resume.notified().await;
             }
@@ -975,6 +1009,31 @@ pub(crate) mod test_support {
         )
         .expect("batch");
         b.add_batch(&batch, &[]).expect("add_batch");
+        Bytes::from(b.finish().expect("finish"))
+    }
+
+    /// Rows in [`multi_block_vector_superfile_bytes`]: enough that the vector section sits outside
+    /// the tail a lazy open reads first.
+    const MULTI_BLOCK_VECTOR_ROWS: u64 = 4_000;
+
+    /// A vector superfile several cache blocks long. A lazy open without size hints reads the tail,
+    /// then the vector section's header near the front of the file through its block source.
+    pub(crate) fn multi_block_vector_superfile_bytes() -> Bytes {
+        let schema = Arc::new(Schema::new(vec![decimal128_id_field("doc_id")]));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![],
+            vec![default_vector_config("emb", 7)],
+        );
+        let mut b = SuperfileBuilder::new(opts).expect("builder");
+        let ids = decimal128_ids((1..=MULTI_BLOCK_VECTOR_ROWS).collect::<Vec<u64>>());
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(ids)]).expect("batch");
+        let embeddings: Vec<f32> = (0..MULTI_BLOCK_VECTOR_ROWS * 16)
+            .map(|i| (i.wrapping_mul(2_654_435_761) % 1000) as f32 / 1000.0)
+            .collect();
+        b.add_batch(&batch, &[embeddings.as_slice()])
+            .expect("add_batch");
         Bytes::from(b.finish().expect("finish"))
     }
 

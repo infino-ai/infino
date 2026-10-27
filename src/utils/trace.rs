@@ -352,8 +352,23 @@ impl CloseOut {
         if !cfg!(feature = "detailed-tracing") {
             return;
         }
+        Span::current().record("rows_out", rows_out);
+        self.record_usage();
+    }
+
+    /// [`Self::finish`] for a read that failed or was cancelled: what it read
+    /// before it stopped, and no `rows_out`, so it does not pass for a read
+    /// that returned nothing.
+    pub(crate) fn finish_failed(self) {
+        if !cfg!(feature = "detailed-tracing") {
+            return;
+        }
+        self.record_usage();
+    }
+
+    /// The op-stats counters and the store requests, on the current span.
+    fn record_usage(self) {
         let span = Span::current();
-        span.record("rows_out", rows_out);
         if let Some(stats) = self.op_stats {
             let stats = stats.snapshot();
             span.record("sql_page_bytes", stats.sql_page_bytes);
@@ -361,6 +376,9 @@ impl CloseOut {
             span.record("rows_materialized", stats.rows_materialized);
             span.record("kernel_cpu_ns", stats.kernel_cpu_ns);
             span.record("fts_postings_bytes", stats.fts_postings_bytes);
+            span.record("tier_bytes", stats.tier_bytes);
+            span.record("tier_entries", stats.tier_entries);
+            span.record("superfiles_resolved", stats.superfiles_resolved);
             span.record("vector_cells_scanned", stats.vector_cells_scanned);
             span.record("vector_candidates_scanned", stats.vector_candidates_scanned);
             span.record("vector_rows_reranked", stats.vector_rows_reranked);

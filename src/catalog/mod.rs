@@ -13,6 +13,7 @@
 //! durable backends, in-process for `memory://`), not a raw directory
 //! scan, so it never lists a table that can't be opened.
 
+mod cancel;
 mod index_spec;
 mod manifest;
 mod options;
@@ -29,6 +30,7 @@ use std::{
     fs,
     io::{Error as IoError, ErrorKind},
     ops::ControlFlow,
+    panic,
     path::Path,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -39,12 +41,16 @@ use std::{
 
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+pub use cancel::QueryCancel;
 use dashmap::DashMap;
 use datafusion::{
-    common::tree_node::{TreeNode, TreeNodeRecursion},
+    common::{
+        runtime::SpawnedTask,
+        tree_node::{TreeNode, TreeNodeRecursion},
+    },
     execution::{context::SQLOptions, session_state::SessionState},
     logical_expr::{BinaryExpr, Operator},
-    prelude::Expr,
+    prelude::{Expr, SessionContext},
     sql::{
         parser::{DFParserBuilder, Statement as DFStatement},
         sqlparser::{
@@ -67,7 +73,7 @@ use manifest::{
 };
 pub use options::{ColdFetchMode, ConnectOptions};
 pub use table::Supertable;
-use tokio::runtime::{Handle, Runtime};
+use tokio::{runtime::Runtime, sync::Semaphore};
 use tracing::{Instrument, debug, info, warn};
 use uri::{Backend, parse_uri};
 
@@ -96,6 +102,16 @@ const TABLE_CACHE_LOCATION_FILE: &str = ".table-location";
 const READ_ONLY_REFUSAL: &str =
     "query_sql is read-only; writes go through the table's append / update / delete API";
 
+/// Most table opens a cancel can cut short that may be in flight at once, process-wide. Each holds
+/// a thread of the I/O runtime's blocking pool (tokio's default 512), and an open needs more of
+/// that pool for its own work (manifest decode, local file reads), so the bound stays well below
+/// it: opens waiting on one table's build can never take every thread and stall the build they
+/// wait on. Past it, an open runs on the calling thread, as it did before a cancel could reach it.
+const MAX_CANCELLABLE_OPENS: usize = 64;
+
+/// Slots for the opens [`MAX_CANCELLABLE_OPENS`] bounds.
+static CANCELLABLE_OPENS: Semaphore = Semaphore::const_new(MAX_CANCELLABLE_OPENS);
+
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
@@ -103,7 +119,7 @@ use crate::{
     config::DEFAULT_CONNECTION_BUDGET_BYTES,
     error::{datafusion_error, datafusion_planning_error},
     memory::ConnectionMemoryBudget,
-    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, carry_span, shared_io_runtime},
     runtime_metrics::{
         io::{UsageMeter, UsageSnapshot},
         op_stats,
@@ -817,9 +833,13 @@ impl Connection {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn schema(&self, name: &str) -> Result<TableSchema, InfinoError> {
+        // A hosted connection reads the document the endpoint serves; the
+        // local handle below is the engine's own.
         #[cfg(feature = "remote")]
-        if let CatalogStore::Remote(_) = &self.inner.store {
-            return Err(remote_schema_unsupported("schema", name));
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c
+                .schema_document(name)
+                .map_err(|e| e.with_context("schema", Some(name)));
         }
         let handle = self.open_table_handle(name)?;
         Ok((*handle.table_schema()).clone())
@@ -857,9 +877,13 @@ impl Connection {
         patch: &SchemaPatch,
         expected: Option<u32>,
     ) -> Result<TableSchema, InfinoError> {
+        // The endpoint creates the table from the patch when there is none,
+        // as the local path below does, so a hosted write forwards whole.
         #[cfg(feature = "remote")]
-        if let CatalogStore::Remote(_) = &self.inner.store {
-            return Err(remote_schema_unsupported("apply_schema", name));
+        if let CatalogStore::Remote(c) = &self.inner.store {
+            return c
+                .apply_schema(name, patch, expected)
+                .map_err(|e| e.with_context("apply_schema", Some(name)));
         }
         let handle = match self.open_table_handle(name) {
             Ok(handle) => handle,
@@ -1090,6 +1114,54 @@ impl Connection {
     /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.query_sql_cancellable(sql, &QueryCancel::new())
+    }
+
+    /// [`query_sql`](Self::query_sql) that stops when `cancel` fires.
+    ///
+    /// Fire `cancel` from another thread and the call returns
+    /// [`InfinoError::Cancelled`] soon after, whether the query is resolving
+    /// its tables, planning (which opens the files it reads) or executing. The
+    /// planning and execution it drops stop at their next await point and
+    /// give back the cache and memory they reserved. A handle that has
+    /// already fired returns at once, without reading anything.
+    ///
+    /// What a cancel does not cut short:
+    /// - Work already handed off, which finishes after the call returns: a
+    ///   table being opened or checked for a newer manifest (the table is
+    ///   ready for the next query), an object-store read a search function is
+    ///   waiting on, CPU work on the reader pool, a manifest part being loaded
+    ///   (it lands in the cache for the next query), and the background
+    ///   download of a file the query opened, as after any query. Until a
+    ///   table open handed off this way is done, its reads count as the
+    ///   connection's foreground reads and the call's trace span stays open.
+    ///   Under bounded staleness, the open has already taken the table's
+    ///   freshness check, so a query right after the cancel is served the
+    ///   snapshot from before it until the open lands, as a concurrent query
+    ///   would be.
+    /// - A table open while many others are in flight across the process: it
+    ///   runs on the calling thread, and the call waits for it.
+    /// - Execution on the calling thread: the result is gathered there, so a
+    ///   plan over cached data that does its work without yielding (one
+    ///   partition, no read to wait on) sees the cancel only once it yields.
+    /// - A hosted connection's request: the handle is checked only before it
+    ///   is sent.
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec, InfinoError, QueryCancel};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # db.create_table("posts", schema, IndexSpec::new().fts("body"))?;
+    /// let cancel = QueryCancel::new();
+    /// // Typically fired from another thread, for example when a deadline passes.
+    /// cancel.cancel();
+    /// let result = db.query_sql_cancellable("SELECT _id FROM posts", &cancel);
+    /// assert!(matches!(result, Err(InfinoError::Cancelled(_))));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[cfg_attr(
         feature = "detailed-tracing",
         // Connection-level entry: no table handle yet, so no `role` — the
@@ -1098,7 +1170,9 @@ impl Connection {
         // counters the meter collected for it, and the object-store
         // requests and bytes the connection issued meanwhile, so the span,
         // the billed read work and the GETs can be read against each other.
-        tracing::instrument(skip_all, fields(
+        // Named for `query_sql`, which every caller's trace already searches
+        // by; the plain form adds no span of its own.
+        tracing::instrument(name = "query_sql", skip_all, fields(
             sql = sql,
             origin = OpOrigin::Query.as_str(),
             rows_out = tracing::field::Empty,
@@ -1113,11 +1187,21 @@ impl Connection {
             store_bg_get_bytes = tracing::field::Empty,
         ))
     )]
-    pub fn query_sql(&self, sql: &str) -> Result<Vec<RecordBatch>, InfinoError> {
+    pub fn query_sql_cancellable(
+        &self,
+        sql: &str,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
 
+        cancel
+            .check()
+            .map_err(|e| e.with_context("query_sql", None))?;
+
         // A hosted connection forwards the SQL to the endpoint; the local
-        // DataFusion path below runs only for local backends.
+        // DataFusion path below runs only for local backends. The request
+        // blocks until the endpoint answers, so the cancel above is the only
+        // one it sees.
         #[cfg(feature = "remote")]
         if let CatalogStore::Remote(c) = &self.inner.store {
             return c.query_sql(sql);
@@ -1154,19 +1238,11 @@ impl Connection {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            match self.open_table_handle(&name) {
-                // Minting its reader can fail like any manifest load (a
-                // storage fault, refused credentials), and keeps that cause. A
-                // table purged since it was opened is skipped like a name that
-                // was never a table, so the planner reports it, as the search
-                // table functions do.
-                Ok(table) => match table.register_into(&ctx, &name).map_err(InfinoError::from) {
-                    Ok(_) => handles.push(table),
-                    Err(InfinoError::NotFound(_)) => {}
-                    Err(e) => return Err(e.with_context("query_sql", None)),
-                },
-                Err(InfinoError::NotFound(_)) => {}
-                Err(e) => return Err(e.with_context("query_sql", None)),
+            if let Some(table) = self
+                .open_and_register_cancellable(&ctx, &name, cancel)
+                .map_err(|e| e.with_context("query_sql", None))?
+            {
+                handles.push(table);
             }
         }
 
@@ -1217,8 +1293,11 @@ impl Connection {
             // surfaces through the join as a query error.
             let planner_ctx = ctx.clone();
             // The planning task runs on another thread, which inherits no
-            // span on its own: instrument it, or the spans it creates start
-            // a trace of their own and the plan phase vanishes from this one.
+            // span on its own. `sql.plan` is made here, under this call's
+            // span, and the task carries it along. The task tracer
+            // (`trace::follow_spans_into_datafusion_tasks`) is installed only
+            // with `detailed-tracing`, so the span is attached here too, or
+            // planning's log lines lose this call's span in every other build.
             let planning = async move {
                 // Plan the statement already parsed and checked, check the plan, execute.
                 // `SessionContext::sql` would run a DDL or session statement while producing
@@ -1254,7 +1333,10 @@ impl Connection {
             }
             .instrument(detail_span!("sql.plan"))
             .in_current_span();
-            let (task_ctx, plan) = Handle::current().spawn(planning).await.map_err(|join| {
+            // A `SpawnedTask` aborts the task when dropped, so a cancel stops
+            // the file opens planning is making instead of leaving them to
+            // run on, detached.
+            let (task_ctx, plan) = SpawnedTask::spawn(planning).await.map_err(|join| {
                 // A panic while planning is the engine's fault, never the query's.
                 InfinoError::Backend(format!("planning task failed: {join}"))
             })??;
@@ -1285,6 +1367,10 @@ impl Connection {
                 .map(crate::supertable::schema::strip_field_ids)
                 .collect::<Vec<_>>())
         };
+        // The cancel races the whole query. Dropping `drive` stops planning
+        // (its `SpawnedTask`) and execution (DataFusion aborts its partition
+        // tasks on drop).
+        let drive = cancel.unless_cancelled(drive);
         // A query that names a `FROM` catalog table drives on that table's
         // runtime; otherwise the connection's own. The fallback still has to
         // be multi-thread: a table-free query can be a search TVF, which
@@ -1298,11 +1384,80 @@ impl Connection {
                 .map_err(|e: InfinoError| e.with_context("query_sql", None)),
         };
 
-        if let Ok(batches) = &result {
-            close_out.finish_batches(batches);
+        // A failed or cancelled query records what it read too; for a cancelled one, the reads it
+        // made before it stopped are the number worth seeing.
+        match &result {
+            Ok(batches) => close_out.finish_batches(batches),
+            Err(_) => close_out.finish_failed(),
         }
 
         result
+    }
+
+    /// [`Self::open_and_register`] for one query, returning `Cancelled` as soon
+    /// as `cancel` fires.
+    ///
+    /// An open that may read storage moves to the I/O runtime's blocking pool
+    /// and races the cancel: a table not built yet loads its whole manifest,
+    /// which nothing can interrupt midway, and a snapshot due its freshness
+    /// check reads the pointer, and a newer manifest if one was published. A
+    /// cancelled open still finishes, so the next query finds the table
+    /// built. An open that reads nothing stays on the calling thread, since
+    /// the hop would cost more than the open, and so does one past
+    /// [`MAX_CANCELLABLE_OPENS`].
+    fn open_and_register_cancellable(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+        cancel: &QueryCancel,
+    ) -> Result<Option<SupertableHandle>, InfinoError> {
+        cancel.check()?;
+        // A memory catalog opens without reading storage, and a hosted one
+        // never opens tables here.
+        let CatalogStore::Storage { handles, .. } = &self.inner.store else {
+            return self.open_and_register(ctx, name);
+        };
+        if let Some(table) = live_handle(handles, name).filter(|t| !t.pointer_refresh_pending()) {
+            return register(table, ctx, name);
+        }
+        let Ok(slot) = CANCELLABLE_OPENS.try_acquire() else {
+            return self.open_and_register(ctx, name);
+        };
+        let conn = self.clone();
+        let session = ctx.clone();
+        let table = name.to_owned();
+        // The SQL provider takes the query's work counters from the thread
+        // that registers it (`op_stats::current`), so they move with the open.
+        let collector = op_stats::current();
+        let runtime = shared_io_runtime();
+        // Dropping the handle on a cancel leaves the open running, holding
+        // its slot until it is done.
+        let opening = runtime.spawn_blocking(carry_span(move || {
+            let _slot = slot;
+            op_stats::attached(collector, || conn.open_and_register(&session, &table))
+        }));
+        let opened = async {
+            match opening.await {
+                Ok(registered) => registered,
+                // A panic reaches the caller as it does from an inline open.
+                Err(join) => panic::resume_unwind(join.into_panic()),
+            }
+        };
+        bridge_on_runtime(cancel.unless_cancelled(opened), &runtime)
+    }
+
+    /// Open the catalog table `name` and register it into `ctx`, or `None`
+    /// for a table that is not there.
+    fn open_and_register(
+        &self,
+        ctx: &SessionContext,
+        name: &str,
+    ) -> Result<Option<SupertableHandle>, InfinoError> {
+        match self.open_table_handle(name) {
+            Ok(table) => register(table, ctx, name),
+            Err(InfinoError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Runtime for the table-free `query_sql` fallback.
@@ -1478,6 +1633,24 @@ fn connective_upper_bound(sql: &str) -> usize {
     count
 }
 
+/// Register the opened `table` into `ctx` as `name`.
+///
+/// `None` when the table was purged since it was opened: the name is then
+/// skipped like one that was never a table, and the planner reports it, as
+/// the search table functions do. Any other failure minting its reader (a
+/// storage fault, refused credentials) keeps its cause.
+fn register(
+    table: SupertableHandle,
+    ctx: &SessionContext,
+    name: &str,
+) -> Result<Option<SupertableHandle>, InfinoError> {
+    match table.register_into(ctx, name).map_err(InfinoError::from) {
+        Ok(_) => Ok(Some(table)),
+        Err(InfinoError::NotFound(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 fn connective_cap_error(surface: &str) -> InfinoError {
     InfinoError::Query(format!(
         "{surface} has more than {MAX_PREDICATE_CONNECTIVES} AND/OR connectives; rewrite long value lists as IN (...)"
@@ -1609,6 +1782,12 @@ fn backend_to_provider(
                 "remote backend has no storage provider".to_string(),
             ));
         }
+    };
+    // Tests slow or count reads by wrapping what the connection builds.
+    #[cfg(test)]
+    let provider = match &options.storage_wrapper {
+        Some(wrap) => provider.map(|provider| (wrap.0)(provider)),
+        None => provider,
     };
     Ok(provider)
 }
@@ -1833,16 +2012,6 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
     Ok((Arc::new(Schema::new(fields)), indexes))
 }
 
-/// The schema document is served by the engine; a hosted connection does
-/// not carry it over the wire yet.
-#[cfg(feature = "remote")]
-fn remote_schema_unsupported(operation: &'static str, name: &str) -> InfinoError {
-    InfinoError::Backend(
-        "the schema document is not available over a hosted connection yet".to_string(),
-    )
-    .with_context(operation, Some(name))
-}
-
 fn validate_schema(schema: &SchemaRef) -> Result<(), InfinoError> {
     let mut seen = HashSet::new();
     for field in schema.fields() {
@@ -1911,9 +2080,13 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{
+            Arc, Mutex, MutexGuard, PoisonError,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use arrow::util::pretty::pretty_format_batches;
@@ -1935,7 +2108,12 @@ mod tests {
         Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
         supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
-        test_helpers::{build_title_batch, schema_id_title},
+        test_helpers::{
+            build_title_batch,
+            fault_storage::{FaultOp, FaultStorage},
+            schema_id_title,
+            slow_storage::SlowStorage,
+        },
     };
 
     const TOP_K: usize = 10;
@@ -5851,5 +6029,478 @@ mod tests {
             delta_b.is_zero(),
             "connection B must stay quiet while A writes: {delta_b:?}"
         );
+    }
+
+    // ---- cancelling a query ----
+
+    /// Superfiles in the cancel fixture: one per append, so a query over it
+    /// reads this many files, each with its own reads.
+    const CANCEL_FIXTURE_FILES: usize = 48;
+    /// How long each read of the slowed store takes.
+    const SLOW_READ: Duration = Duration::from_millis(40);
+    /// How soon a cancelled query must return. The call does not wait for
+    /// the work it drops, so this is generous even for a slow runner.
+    const CANCEL_RETURN_BOUND: Duration = Duration::from_secs(2);
+    /// How long a test waits for something it expects to happen: a query to
+    /// start reading, an uncancelled one to finish, the cache to go quiet.
+    /// Generous, since a slow runner pays every read's delay in turn.
+    const QUERY_DEADLINE: Duration = Duration::from_secs(30);
+    /// How long the test watches for reads once the query has returned:
+    /// many slow reads' worth, so work still running would show up.
+    const AFTER_CANCEL_WINDOW: Duration = Duration::from_millis(600);
+    /// A read only planning makes here: a superfile's tombstone sidecar.
+    const SIDECAR: &str = ".tombstones";
+    /// A read only execution makes here: a superfile's data. Planning opens
+    /// the files from the bytes the manifest carries.
+    const SUPERFILE: &str = ".sf.parquet";
+    /// Poll cadence while a test waits on a count.
+    const CANCEL_POLL: Duration = Duration::from_millis(5);
+    /// Files and rows per file in the execution-phase fixture: enough rows
+    /// that each file's data lies past what the manifest carries, so the
+    /// query reads it, and sorts it, while it executes.
+    const LARGE_FILES: usize = 8;
+    const ROWS_PER_LARGE_FILE: usize = 5_000;
+    /// An odd multiplier that scatters consecutive row numbers across the
+    /// 128-bit range, so the titles' hex compresses poorly.
+    const SCATTER: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c835;
+    /// A query that reads every file: no statistic answers it.
+    const READ_EVERY_FILE: &str = "SELECT count(title) FROM docs WHERE title LIKE '%fox%'";
+    /// The same rows sorted, so execution holds memory while it reads.
+    const SORT_EVERY_FILE: &str = "SELECT title FROM docs WHERE title LIKE '%fox%' ORDER BY title";
+
+    /// The slowed stores a connection built, one per provider in the order it
+    /// built them: the catalog root, then each table as it was opened.
+    #[derive(Default)]
+    struct SlowStores {
+        stores: Mutex<Vec<Arc<SlowStorage>>>,
+        /// Whether stores built from now on start with their reads held.
+        hold_new: AtomicBool,
+    }
+
+    impl SlowStores {
+        fn wrap(&self, inner: Arc<dyn StorageProvider>) -> Arc<dyn StorageProvider> {
+            let slow = SlowStorage::wrap(inner, SLOW_READ);
+            if self.hold_new.load(Ordering::SeqCst) {
+                slow.hold_reads();
+            }
+            self.lock().push(Arc::clone(&slow));
+            slow
+        }
+
+        fn lock(&self) -> MutexGuard<'_, Vec<Arc<SlowStorage>>> {
+            self.stores.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Hold the reads of every store built from now on, until
+        /// [`Self::release_reads`].
+        fn hold_new_stores(&self) {
+            self.hold_new.store(true, Ordering::SeqCst);
+        }
+
+        /// Hold the reads of every store built so far, until
+        /// [`Self::release_reads`].
+        fn hold_reads(&self) {
+            self.lock().iter().for_each(|s| s.hold_reads());
+        }
+
+        fn release_reads(&self) {
+            self.hold_new.store(false, Ordering::SeqCst);
+            self.lock().iter().for_each(|s| s.release_reads());
+        }
+
+        /// Providers built so far.
+        fn built(&self) -> usize {
+            self.lock().len()
+        }
+
+        fn reads(&self) -> usize {
+            self.lock().iter().map(|s| s.reads()).sum()
+        }
+
+        fn reads_of(&self, fragment: &str) -> usize {
+            self.lock().iter().map(|s| s.reads_of(fragment)).sum()
+        }
+
+        /// Reads started on the `index`th provider built.
+        fn reads_on(&self, index: usize) -> usize {
+            self.lock().get(index).map_or(0, |s| s.reads())
+        }
+    }
+
+    /// Poll until `done` holds, or fail naming `what`.
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + QUERY_DEADLINE;
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            thread::sleep(CANCEL_POLL);
+        }
+    }
+
+    /// A table named `name` at `conn` holding `files` superfiles, each with
+    /// `rows` live titles with "fox" in them and one deleted row. The deletes
+    /// give every superfile a tombstone sidecar, which planning fetches from
+    /// storage. Each title ends in a hex string that compresses poorly, so
+    /// enough rows put a file's data past what the manifest carries for it.
+    fn write_fox_table(conn: &Connection, name: &str, files: usize, rows: usize) {
+        let table = conn
+            .create_table(name, schema_id_title(), IndexSpec::new().fts("title"))
+            .expect("create");
+        for i in 0..files {
+            let mut titles: Vec<String> = (0..rows)
+                .map(|j| {
+                    let n = (i * rows + j) as u128;
+                    format!("fox {i} {:032x}", n.wrapping_mul(SCATTER))
+                })
+                .collect();
+            titles.push(format!("gone {i}"));
+            let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+            table.append(&build_title_batch(&titles)).expect("append");
+        }
+        let deleted = table
+            .delete(col("title").like(lit("gone%")))
+            .expect("delete");
+        assert_eq!(deleted.n_tombstoned(), files);
+    }
+
+    /// A catalog at a fresh directory holding the `docs` fox table.
+    fn many_file_table() -> tempfile::TempDir {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", CANCEL_FIXTURE_FILES, 1);
+        dir
+    }
+
+    /// A connection to `dir` with an empty disk cache (so every file is cold)
+    /// whose reads are slowed, and the slowed stores.
+    fn slow_cold_conn(dir: &Path, cache: &Path) -> (Connection, Arc<SlowStores>) {
+        slow_cold_conn_with(dir, cache, ConnectOptions::new())
+    }
+
+    /// [`slow_cold_conn`] with `options` for everything but the cache and the
+    /// slowed stores.
+    fn slow_cold_conn_with(
+        dir: &Path,
+        cache: &Path,
+        options: ConnectOptions,
+    ) -> (Connection, Arc<SlowStores>) {
+        let stores = Arc::new(SlowStores::default());
+        let wrapping = Arc::clone(&stores);
+        let options = options
+            .with_cache_dir(cache)
+            .with_storage_wrapper(move |inner| wrapping.wrap(inner));
+        let conn = connect_with(dir.to_str().expect("utf8 path"), options).expect("connect");
+        (conn, stores)
+    }
+
+    /// Run `sql` on its own thread under `cancel`, and hand back the result
+    /// with the time the call returned.
+    fn query_in_background(
+        conn: &Connection,
+        sql: &str,
+        cancel: &QueryCancel,
+    ) -> mpsc::Receiver<(Result<Vec<RecordBatch>, InfinoError>, Instant)> {
+        let (sent, received) = mpsc::channel();
+        let conn = conn.clone();
+        let cancel = cancel.clone();
+        let sql = sql.to_owned();
+        thread::spawn(move || {
+            let result = conn.query_sql_cancellable(&sql, &cancel);
+            let _ = sent.send((result, Instant::now()));
+        });
+        received
+    }
+
+    /// Cancel the query `running` and check that the call returned
+    /// `Cancelled` within [`CANCEL_RETURN_BOUND`].
+    fn cancel_and_expect_cancelled(
+        cancel: &QueryCancel,
+        running: &mpsc::Receiver<(Result<Vec<RecordBatch>, InfinoError>, Instant)>,
+    ) {
+        let cancelled_at = Instant::now();
+        cancel.cancel();
+        let (result, returned_at) = running
+            .recv_timeout(CANCEL_RETURN_BOUND)
+            .expect("the cancelled query returns");
+        assert!(
+            matches!(result, Err(InfinoError::Cancelled(_))),
+            "got {result:?}"
+        );
+        assert!(returned_at - cancelled_at < CANCEL_RETURN_BOUND);
+    }
+
+    /// No foreground read lands for [`AFTER_CANCEL_WINDOW`]: what the
+    /// cancelled query dropped stopped, rather than reading on detached.
+    fn assert_no_foreground_read_follows(conn: &Connection) {
+        let at_return = conn.usage_snapshot().get_count;
+        thread::sleep(AFTER_CANCEL_WINDOW);
+        assert_eq!(
+            conn.usage_snapshot().get_count,
+            at_return,
+            "a foreground read landed after the cancelled query returned"
+        );
+    }
+
+    /// Wait until no read starts for [`AFTER_CANCEL_WINDOW`].
+    fn wait_until_quiet(stores: &SlowStores) {
+        let deadline = Instant::now() + QUERY_DEADLINE;
+        let mut reads = stores.reads();
+        loop {
+            thread::sleep(AFTER_CANCEL_WINDOW);
+            let now = stores.reads();
+            if now == reads {
+                return;
+            }
+            assert!(Instant::now() < deadline, "reads never went quiet");
+            reads = now;
+        }
+    }
+
+    /// The disk cache's ledger once nothing is reading any more: every charged
+    /// byte is held by something the cache holds.
+    fn assert_cache_ledger_settles(conn: &Connection, stores: &SlowStores) {
+        wait_until_quiet(stores);
+        let table = conn.open_table_handle("docs").expect("open");
+        let cache = table.options().disk_cache.clone().expect("disk cache");
+        table.block_on_query(cache.block_writes_settled());
+        cache.assert_budget_consistent();
+    }
+
+    fn fox_count(batches: &[RecordBatch]) -> i64 {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count yields Int64")
+            .value(0)
+    }
+
+    /// A query cancelled while planning reads a large table's files stops
+    /// reading them: it returns `Cancelled` at once, and no foreground read
+    /// lands after it returned. What it reserved in the disk cache comes
+    /// back, and the same query then answers in full.
+    #[test]
+    fn a_query_cancelled_while_planning_stops_reading() {
+        let dir = many_file_table();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("planning reads a sidecar", || stores.reads_of(SIDECAR) > 0);
+        cancel_and_expect_cancelled(&cancel, &running);
+        assert_no_foreground_read_follows(&conn);
+
+        assert_cache_ledger_settles(&conn, &stores);
+        let rows = conn
+            .query_sql(READ_EVERY_FILE)
+            .expect("query after the cancel");
+        assert_eq!(fox_count(&rows), CANCEL_FIXTURE_FILES as i64);
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
+    /// A query cancelled while it executes, reading the files' data and
+    /// holding sort memory, returns at once and gives the memory back.
+    ///
+    /// Whether the reads stop is the planning test's to show: here every
+    /// file's reads start together (one partition each, with read-ahead), so
+    /// they are all in flight before the cancel. Execution's partition tasks,
+    /// and the read-ahead downloads they own, are DataFusion tasks that are
+    /// aborted when the query is dropped.
+    #[test]
+    fn a_query_cancelled_while_executing_returns_and_frees_its_memory() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", LARGE_FILES, ROWS_PER_LARGE_FILE);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let budget = Arc::clone(&conn.inner.connection_memory_budget);
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background(&conn, SORT_EVERY_FILE, &cancel);
+        wait_until("execution reads data and holds sort memory", || {
+            stores.reads_of(SUPERFILE) > 0 && budget.used() > 0
+        });
+        cancel_and_expect_cancelled(&cancel, &running);
+        wait_until("the sort memory comes back", || budget.used() == 0);
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
+    /// Cancelling the query that started reading the files does not disturb
+    /// another that joined it on the same files: the other answers in full,
+    /// and the cache's ledger balances once both are done.
+    #[test]
+    fn cancelling_one_query_leaves_a_concurrent_one_whole() {
+        let dir = many_file_table();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let cancelled = query_in_background(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("the first query reads a sidecar", || {
+            stores.reads_of(SIDECAR) > 0
+        });
+        let sidecar_reads = stores.reads_of(SIDECAR);
+        let whole = query_in_background(&conn, READ_EVERY_FILE, &QueryCancel::new());
+        wait_until("the second query reads too", || {
+            stores.reads_of(SIDECAR) > sidecar_reads
+        });
+        cancel_and_expect_cancelled(&cancel, &cancelled);
+
+        let (result, _) = whole
+            .recv_timeout(QUERY_DEADLINE)
+            .expect("the other query returns");
+        assert_eq!(
+            fox_count(&result.expect("the other query")),
+            CANCEL_FIXTURE_FILES as i64
+        );
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
+    /// A handle that has already fired stops the query before it reads
+    /// anything, not even the catalog.
+    #[test]
+    fn a_cancelled_handle_reads_nothing() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", 1, 1);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+        cancel.cancel();
+
+        let result = conn.query_sql_cancellable(READ_EVERY_FILE, &cancel);
+        assert!(
+            matches!(result, Err(InfinoError::Cancelled(_))),
+            "got {result:?}"
+        );
+        assert_eq!(stores.reads(), 0, "the cancelled query read nothing");
+    }
+
+    /// A cancel that fires while the query opens the first table it names
+    /// returns at once, with that table's manifest still loading. The open
+    /// finishes on its own, so the next query finds the table built, and the
+    /// second table is never opened.
+    #[test]
+    fn a_query_cancelled_while_opening_a_table_returns_and_opens_no_more() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", 1, 1);
+        write_fox_table(&conn, "more", 1, 1);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        // Providers are built in order: the catalog root, then `docs` when
+        // the query opens it. The open of `docs` is held until the cancelled
+        // query has returned.
+        stores.hold_new_stores();
+        let running = query_in_background(&conn, "SELECT count(*) FROM docs, more", &cancel);
+        wait_until("the query opens docs", || stores.reads_on(1) > 0);
+        cancel_and_expect_cancelled(&cancel, &running);
+
+        stores.release_reads();
+        wait_until_quiet(&stores);
+        assert_eq!(stores.built(), 2, "more was never opened");
+        let rows = conn
+            .query_sql("SELECT count(*) FROM docs")
+            .expect("query after the cancel");
+        assert_eq!(fox_count(&rows), 1);
+        assert_eq!(stores.built(), 2, "the cancelled open built docs");
+    }
+
+    /// The bounded-staleness window the freshness tests run under: short, so
+    /// a test can wait it out.
+    const STALENESS_WINDOW: Duration = Duration::from_millis(50);
+
+    /// Under `consistency`, a cancel that fires while the query checks an
+    /// open table for a newer manifest returns at once, with that pointer
+    /// read still under way, and the table answers in full afterwards.
+    fn cancel_while_checking_for_a_newer_manifest(consistency: Consistency) {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", 1, 1);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let options = ConnectOptions::new().with_read_consistency(consistency);
+        let (conn, stores) = slow_cold_conn_with(dir.path(), cache.path(), options);
+        conn.query_sql("SELECT count(*) FROM docs")
+            .expect("opens docs");
+        let cancel = QueryCancel::new();
+
+        stores.hold_reads();
+        // Past the window, the next query is due its freshness check.
+        thread::sleep(STALENESS_WINDOW);
+        let pointer_reads = stores.reads_of(POINTER_PATH);
+        let running = query_in_background(&conn, "SELECT count(*) FROM docs", &cancel);
+        wait_until("the query reads the pointer", || {
+            stores.reads_of(POINTER_PATH) > pointer_reads
+        });
+        cancel_and_expect_cancelled(&cancel, &running);
+
+        stores.release_reads();
+        let rows = conn
+            .query_sql("SELECT count(*) FROM docs")
+            .expect("query after the cancel");
+        assert_eq!(fox_count(&rows), 1);
+    }
+
+    /// Strong reads the pointer before every query.
+    #[test]
+    fn a_strong_query_cancelled_while_checking_for_a_newer_manifest_returns() {
+        cancel_while_checking_for_a_newer_manifest(Consistency::Strong);
+    }
+
+    /// Bounded staleness reads it once the window has passed.
+    #[test]
+    fn a_bounded_query_cancelled_while_checking_for_a_newer_manifest_returns() {
+        cancel_while_checking_for_a_newer_manifest(Consistency::BoundedStaleness(STALENESS_WINDOW));
+    }
+
+    /// A pointer read that fails while a Strong query checks for a newer
+    /// manifest fails the query with that storage error, rather than serving
+    /// the snapshot it has or reporting the table as missing.
+    #[test]
+    fn a_failed_freshness_check_fails_a_strong_query() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", 1, 1);
+        let faults = Arc::new(Mutex::new(Vec::<Arc<FaultStorage>>::new()));
+        let wrapping = Arc::clone(&faults);
+        let options = ConnectOptions::new()
+            .with_read_consistency(Consistency::Strong)
+            .with_storage_wrapper(move |inner| {
+                let faulty = FaultStorage::wrap(inner);
+                wrapping
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(Arc::clone(&faulty));
+                faulty
+            });
+        let conn = connect_with(dir.path().to_str().expect("utf8 path"), options).expect("connect");
+        conn.query_sql("SELECT count(*) FROM docs")
+            .expect("opens docs");
+
+        faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .for_each(|f| f.fail(FaultOp::Get, POINTER_PATH, usize::MAX));
+        let failed = conn
+            .query_sql("SELECT count(*) FROM docs")
+            .expect_err("the pointer read fails");
+        assert!(matches!(failed, InfinoError::Io(_)), "got {failed:?}");
+    }
+
+    /// Rows the CPU-bound cancel test counts: many seconds of work in a debug
+    /// build if left alone, and still finite if a regression lets it run.
+    const COUNTED_ROWS: u64 = 10_000_000_000;
+    /// How long that query runs before the test cancels it.
+    const EXECUTE_BEFORE_CANCEL: Duration = Duration::from_millis(200);
+
+    /// A query with no read to wait on returns promptly when cancelled too: a
+    /// count over generated rows returns `Cancelled` soon after the cancel
+    /// instead of counting on. The call returns whichever phase the cancel
+    /// lands in, planning on a slow runner or, usually, execution.
+    #[test]
+    fn a_query_cancelled_while_computing_stops() {
+        let conn = connect("memory://").expect("connect");
+        let cancel = QueryCancel::new();
+        let sql = format!("SELECT count(*) FROM range({COUNTED_ROWS})");
+        let running = query_in_background(&conn, &sql, &cancel);
+        thread::sleep(EXECUTE_BEFORE_CANCEL);
+        cancel_and_expect_cancelled(&cancel, &running);
     }
 }

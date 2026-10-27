@@ -60,15 +60,29 @@ mydb/                                     database root (the connect() path)
 │   │   ├── root-<blake3>.bin             binary · magic "INFTIDX1", immutable,
 │   │   │                                 content-addressed; the manifest names one
 │   │   │       ├ stores : the covered superfiles (uuid + smallest doc id) and,
-│   │   │       │          per segment, every slice's key range, hash and length
+│   │   │       │          per layer, every slice's key range, hash and the
+│   │   │       │          hash of its tier object
 │   │   │       └ used   : resident; binary-searched to find the slice for a term
-│   │   └── slice-<blake3>.bin            binary · magic "INFTSLC1", immutable,
-│   │                                     content-addressed, a few MB each
-│   │           ├ stores : one contiguous range of (column, term) keys: a front-coded
-│   │           │          block dictionary over postings of (superfile ordinal,
-│   │           │          df, score ceiling, postings location)
-│   │           └ used   : exact term routing, part selection, ceiling-ordered
-│   │                      opening, and cursor build without the superfile dictionary
+│   │   ├── slice-<blake3>.bin            binary · magic "INFTSLC1", immutable,
+│   │   │                                 content-addressed, a few MB each
+│   │   │       ├ stores : one contiguous range of (column, term) keys: a front-coded
+│   │   │       │          block dictionary over runs of postings (superfile ordinal,
+│   │   │       │          df, the key of the term's best document there, the key
+│   │   │       │          past its head, postings location) and the term's tier
+│   │   │       │          reference — a few entries inline, else its chunks in
+│   │   │       │          the slice's tier object
+│   │   │       └ used   : exact term routing, part selection, ceiling-ordered
+│   │   │                  opening, and cursor build without the superfile dictionary
+│   │   └── tier-<blake3>.bin             binary, immutable, content-addressed, one
+│   │                                     per slice; read by ranged fetches
+│   │           ├ stores : per term, its heads — each superfile's best documents as
+│   │           │          (row, term frequency, length bucket) — in blocks of 64
+│   │           │          laid out region-major (region r holds block r of every
+│   │           │          superfile), each chunk a CRC'd directory of (superfile,
+│   │           │          best key, tail) entries and CRC'd block bodies
+│   │           └ used   : the pre-open merge of a ranked query: per-superfile
+│   │                      score bounds, the k-th-score threshold, superfiles
+│   │                      answered from the index
 │   │
 │   ├── data/
 │   │   └── <superfile>.sf.parquet        the superfiles: seg-<uuid>, or <stem>-<uuid> when appended with a source name
@@ -147,7 +161,7 @@ Every hop below the two pointer files is content-addressed with a blake3 hash, s
 - `data/` holds the superfiles; `superfiles/` holds only their tombstones. The directory name is misleading.
 - The live set is whatever the current manifest names. An update writes a new superfile and tombstones the old one, so `data/` accumulates more `.sf.parquet` files than the table's live row count until GC removes the dead ones.
 - `wal/mutations/` is normally empty. A `<walid>.json` (and, for UPDATE, its `.arrow` sidecar) exists only while a mutation is in flight or was interrupted; the next recovery sweep drains it.
-- `term-index/` is derived, not source data: every posting can be recomputed from its superfile's own dictionary, and a reader that cannot load the root or a slice routes by the manifest summaries instead. Every commit that adds a superfile appends a delta segment and a new root; a maintenance pass (`optimize`) folds the deltas into one base, keeping any deltas committed while it ran after that base (or re-indexing their superfiles on top of it), for the next pass to fold. A removal never invalidates it: a posting is followed only if its superfile is still listed by the reader's manifest, so a stale index is incomplete, never wrong. Superseded roots and slices age out through GC like every other derived artifact.
+- `term-index/` is derived, not source data: every posting can be recomputed from its superfile's own dictionary, and a reader that cannot load the root or a slice routes by the manifest summaries instead. Every commit that adds a superfile appends a delta layer and a new root; a maintenance pass (`optimize`) folds the deltas into one base, keeping any deltas committed while it ran after that base (or re-indexing their superfiles on top of it), for the next pass to fold. A removal never invalidates it: a posting is followed only if its superfile is still listed by the reader's manifest, so a stale index is incomplete, never wrong. Superseded roots and slices age out through GC like every other derived artifact.
 
 ## Source references
 
@@ -165,5 +179,6 @@ Anchored by symbol so they survive line moves:
 | `wal/mutations/` state-doc + `.arrow` sidecar | `WAL_DIR`, `WalStore` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | `superfiles/<id>.tombstones` sidecar paths | `SUPERFILES_DIR`, `tombstones_path` | [src/supertable/wal/persistence.rs](../../src/supertable/wal/persistence.rs) |
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |
-| `term-index/root-<hash>.bin` and `slice-<hash>.bin` names, root and slice binary layouts, posting encoding | `STORAGE_PREFIX`, `ROOT_MAGIC`, `SLICE_MAGIC`, `Root`, `Slice`, `Posting` | [src/supertable/manifest/term_index/format.rs](../../src/supertable/manifest/term_index/format.rs) |
-| term-index build: per-superfile contributions, k-way merge into slices, delta segments | `ContributionWriter`, `build_segment`, `append_delta` | [src/supertable/manifest/term_index/build.rs](../../src/supertable/manifest/term_index/build.rs), [mod.rs](../../src/supertable/manifest/term_index/mod.rs) |
+| `term-index/root-<hash>.bin`, `slice-<hash>.bin` and `tier-<hash>.bin` names, root and slice binary layouts, posting and run encoding, the layout before tiers still read | `STORAGE_PREFIX`, `ROOT_MAGIC`, `SLICE_MAGIC`, `Root`, `Slice`, `Posting`, `Run` | [src/supertable/manifest/term_index/format.rs](../../src/supertable/manifest/term_index/format.rs) |
+| tier object layout: chunks of a directory and blocks of 64 entries, region-major, a CRC per directory and per block | `TierChunk`, `TierDirectory`, `BLOCK_ENTRIES`, `encode_tier` | [src/supertable/manifest/term_index/tier.rs](../../src/supertable/manifest/term_index/tier.rs) |
+| term-index build: per-superfile contributions, k-way merge into slices, delta layers | `ContributionWriter`, `build_layer`, `append_delta` | [src/supertable/manifest/term_index/build.rs](../../src/supertable/manifest/term_index/build.rs), [mod.rs](../../src/supertable/manifest/term_index/mod.rs) |

@@ -81,6 +81,8 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
+#[cfg(feature = "detailed-tracing")]
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
@@ -105,9 +107,9 @@ use crate::{
                 chain_tokenizer,
             },
             bm25,
-            builder::FtsBuilder,
+            builder::{FtsBuilder, TermHeadSink},
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
-            reorder::{BisectParams, ForwardIndex, bisect_order},
+            reorder::{BisectParams, ForwardIndex, bisect_order_reported},
             sorted_merge::SortedInput,
             tokenize::STANDARD_TOKENIZER,
         },
@@ -307,16 +309,24 @@ pub(crate) fn survivor_rows(
 /// they are not, and reading a posting's id as a row silently files it
 /// under a different document, so the input's own map composes in: a
 /// blob id goes wherever the row it stands for goes.
-fn remap_by_blob_id<T: Copy>(fts: &FtsReader, remap_by_row: &[Option<T>]) -> Vec<Option<T>> {
+fn remap_by_blob_id<T: Copy>(
+    fts: &FtsReader,
+    remap_by_row: &[Option<T>],
+) -> Result<Vec<Option<T>>, BuildError> {
     if !fts.has_doc_map() {
-        return remap_by_row.to_vec();
+        return Ok(remap_by_row.to_vec());
     }
-    (0..fts.n_docs())
+    let map = fts.doc_map().map_err(|e| {
+        BuildError::Io(Error::other(format!(
+            "fts merge input: read doc-id map failed: {e}"
+        )))
+    })?;
+    Ok((0..fts.n_docs())
         .map(|b| {
-            let row = fts.row_of(FtsDocId::new(b));
+            let row = map.row_of(FtsDocId::new(b));
             remap_by_row.get(row.get() as usize).copied().flatten()
         })
-        .collect()
+        .collect())
 }
 
 /// Place one input's stored document lengths at the output positions its
@@ -369,6 +379,30 @@ fn term_bucket(term: &[u8]) -> u32 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     ((h >> 32) as u32 ^ h as u32) & ((1 << REORDER_TERM_BUCKET_BITS) - 1)
+}
+
+/// How many documents carry a term set no other document carries, for the
+/// reorder span. Sets are compared by a hash of their sorted terms, so a rare
+/// collision counts two sets as one.
+#[cfg(feature = "detailed-tracing")]
+fn count_distinct_term_sets(docs: &[&[u32]]) -> usize {
+    let mut hashes: Vec<u64> = docs
+        .par_iter()
+        .map(|doc| {
+            let mut terms = doc.to_vec();
+            terms.sort_unstable();
+            // FNV-1a over the term ids.
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for t in terms {
+                h ^= u64::from(t);
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            h
+        })
+        .collect();
+    hashes.par_sort_unstable();
+    hashes.dedup();
+    hashes.len()
 }
 
 /// How an FTS merge carries its inputs' postings into the output.
@@ -1411,6 +1445,16 @@ impl SuperfileBuilder {
         })
     }
 
+    /// Hand every FTS term's facts to `sink` as the blob is written, with
+    /// its best `depth` documents by impact (see
+    /// [`FtsBuilder::set_term_head_sink`]). No-op when the table has no
+    /// text columns.
+    pub(crate) fn set_term_head_sink(&mut self, sink: Box<dyn TermHeadSink>, depth: usize) {
+        if let Some(fb) = self.fts_builder.as_mut() {
+            fb.set_term_head_sink(sink, depth);
+        }
+    }
+
     /// Override the FTS builder's in-RAM spill threshold (forwarded
     /// to [`FtsBuilder::set_spill_threshold_bytes`]). No-op if this
     /// `SuperfileBuilder` was constructed without any FTS columns.
@@ -1616,7 +1660,7 @@ impl SuperfileBuilder {
         let (remap_by_row, n_kept) = survivor_rows(fts.n_docs(), deleted, base);
         // Postings and lengths are keyed by the input's doc ids, which are
         // its rows only when it kept arrival order.
-        let remap = remap_by_blob_id(fts, &remap_by_row);
+        let remap = remap_by_blob_id(fts, &remap_by_row)?;
         // This carry appends in arrival order, so an output row is the
         // doc id the output blob stores it under. The reordering merge
         // is the path where the two part company, and it converts
@@ -2635,7 +2679,7 @@ impl SuperfileBuilder {
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
-            .collect();
+            .collect::<Result<_, _>>()?;
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
@@ -2700,7 +2744,16 @@ impl SuperfileBuilder {
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
         // An ineligible term is skipped before its postings are read.
-        let pick_span = detail_span!("merge_order_pick_terms").entered();
+        let pick_span = detail_span!(
+            "merge_order_pick_terms",
+            terms = df.iter().filter(|&&d| d > 0).count(),
+            eligible_terms = (0..n_buckets as u32).filter(|&t| eligible(t)).count(),
+            eligible_postings = eligible_postings,
+            terms_per_doc = terms_per_doc,
+            chunk_docs = plan.chunk_docs,
+            runs = (n_out_docs as usize).div_ceil(plan.chunk_docs.max(1)),
+        )
+        .entered();
         let n = n_out_docs as usize;
         let mut order: Vec<u32> = Vec::with_capacity(n);
         let mut grouped_any = false;
@@ -2711,6 +2764,7 @@ impl SuperfileBuilder {
             let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
             let mut filled: Vec<u8> = vec![0; run];
             let mut worst: Vec<u8> = vec![0; run];
+            let collect_span = detail_span!("merge_order_collect", docs = run).entered();
             for (((reader, _), rows), span) in
                 readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
             {
@@ -2772,6 +2826,8 @@ impl SuperfileBuilder {
                 }
             }
 
+            drop(collect_span);
+
             let docs: Vec<&[u32]> = (0..run)
                 .map(|row| {
                     let lo = row * terms_per_doc;
@@ -2784,14 +2840,49 @@ impl SuperfileBuilder {
                 true => order.extend(first_row as u32..past_row as u32),
                 false => {
                     grouped_any = true;
+                    let bisect_span = detail_span!(
+                        "merge_order_bisect",
+                        docs = run,
+                        postings = docs.iter().map(|d| d.len()).sum::<usize>(),
+                        empty_docs = docs.iter().filter(|d| d.is_empty()).count(),
+                        distinct_docs = count_distinct_term_sets(&docs),
+                        reference = tracing::field::Empty,
+                        pool_threads = tracing::field::Empty,
+                        others_at_start = tracing::field::Empty,
+                        others_at_end = tracing::field::Empty,
+                        held_ms = tracing::field::Empty,
+                        splits = tracing::field::Empty,
+                        rounds = tracing::field::Empty,
+                        swaps = tracing::field::Empty,
+                        settled = tracing::field::Empty,
+                        converged = tracing::field::Empty,
+                        capped = tracing::field::Empty,
+                        predicted_gain = tracing::field::Empty,
+                        actual_gain = tracing::field::Empty,
+                        wasted_rounds = tracing::field::Empty,
+                        by_depth = tracing::field::Empty,
+                    )
+                    .entered();
                     let fwd = ForwardIndex::from_docs(&docs);
                     drop(docs);
-                    let _bisect_span = detail_span!("merge_order_bisect", docs = run).entered();
-                    order.extend(
-                        bisect_order(&fwd, BisectParams::default())
-                            .into_iter()
-                            .map(|d| d + first_row as u32),
-                    );
+                    let (run_order, report) = bisect_order_reported(&fwd, BisectParams::default());
+                    let total = report.total();
+                    bisect_span.record("reference", report.reference);
+                    bisect_span.record("pool_threads", report.pool_threads);
+                    bisect_span.record("others_at_start", report.others_at_start);
+                    bisect_span.record("others_at_end", report.others_at_end);
+                    bisect_span.record("held_ms", total.held_ns / 1_000_000);
+                    bisect_span.record("splits", total.splits);
+                    bisect_span.record("rounds", total.rounds);
+                    bisect_span.record("swaps", total.swaps);
+                    bisect_span.record("settled", total.settled);
+                    bisect_span.record("converged", total.converged);
+                    bisect_span.record("capped", total.capped);
+                    bisect_span.record("predicted_gain", total.predicted_gain);
+                    bisect_span.record("actual_gain", total.actual_gain);
+                    bisect_span.record("wasted_rounds", total.wasted_rounds);
+                    bisect_span.record("by_depth", tracing::field::display(&report));
+                    order.extend(run_order.into_iter().map(|d| d + first_row as u32));
                 }
             }
             first_row = past_row;
@@ -2825,8 +2916,19 @@ impl SuperfileBuilder {
         base: BuilderOptions,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm)
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm, None)
     }
+    }
+
+    /// [`Self::build_from_readers_fts_merge_to`], handing each written
+    /// term's facts to `term_heads` (see [`Self::set_term_head_sink`]).
+    pub(crate) fn build_from_readers_fts_merge_with_heads<W: Write>(
+        inputs: &[MergeInput],
+        base: BuilderOptions,
+        output: W,
+        term_heads: Option<(Box<dyn TermHeadSink>, usize)>,
+    ) -> Result<SuperfileStats, BuildError> {
+        Self::fts_merge_to(inputs, base, output, PostingMerge::TermByTerm, term_heads)
     }
 
     /// [`Self::build_from_readers_fts_merge_to`] with the posting path
@@ -2836,9 +2938,13 @@ impl SuperfileBuilder {
         base: BuilderOptions,
         output: W,
         merge: PostingMerge,
+        term_heads: Option<(Box<dyn TermHeadSink>, usize)>,
     ) -> Result<SuperfileStats, BuildError> {
         let builder_opts = merge_builder_opts(inputs, base)?;
-        let superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        let mut superfile_builder = SuperfileBuilder::new(builder_opts)?;
+        if let Some((sink, depth)) = term_heads {
+            superfile_builder.set_term_head_sink(sink, depth);
+        }
 
         let mut rows_of = Vec::with_capacity(inputs.len());
         let mut n_out_docs = 0u32;
@@ -3046,7 +3152,7 @@ impl SuperfileBuilder {
                                 .iter()
                                 .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
                                 .collect();
-                            let remap = remap_by_blob_id(fts, &remap_by_row);
+                            let remap = remap_by_blob_id(fts, &remap_by_row)?;
                             scatter_doc_lengths(
                                 fts,
                                 &remap,
@@ -6055,7 +6161,8 @@ mod tests {
     ) -> (Vec<(Vec<u8>, u32, u32, Vec<u32>)>, Vec<u32>) {
         let fts = reader.fts().expect("merged superfile has an FTS blob");
         let n_cols = fts.fts_columns().count() as u32;
-        let row_of = |doc_id: u32| fts.row_of(FtsDocId::new(doc_id)).get();
+        let map = fts.doc_map().expect("doc-id map");
+        let row_of = |doc_id: u32| map.row_of(FtsDocId::new(doc_id)).get();
         let mut postings: Vec<(Vec<u8>, u32, u32, Vec<u32>)> = Vec::new();
         let mut doc_lengths: Vec<u32> = Vec::new();
         for column_id in 0..n_cols {
@@ -6829,7 +6936,7 @@ mod tests {
 
         let mapped = reader_over(Some(MAP.to_vec()));
         assert!(mapped.has_doc_map());
-        let by_blob = remap_by_blob_id(&mapped, &remap_by_row);
+        let by_blob = remap_by_blob_id(&mapped, &remap_by_row).expect("remap");
         assert_eq!(by_blob.len(), MAP.len());
         for (blob_id, &row) in MAP.iter().enumerate() {
             assert_eq!(
@@ -6850,7 +6957,10 @@ mod tests {
         // An input that kept arrival order asks nothing of the map.
         let plain = reader_over(None);
         assert!(!plain.has_doc_map());
-        assert_eq!(remap_by_blob_id(&plain, &remap_by_row), remap_by_row);
+        assert_eq!(
+            remap_by_blob_id(&plain, &remap_by_row).expect("remap"),
+            remap_by_row
+        );
     }
 
     #[test]
@@ -7297,6 +7407,7 @@ mod tests {
             base(),
             &mut accumulator,
             PostingMerge::Accumulator,
+            None,
         )
         .expect("accumulator merge");
         let mut sorted = Vec::new();
@@ -7305,6 +7416,7 @@ mod tests {
             base(),
             &mut sorted,
             PostingMerge::TermByTerm,
+            None,
         )
         .expect("sorted merge");
         assert!(!sorted.is_empty(), "merge wrote a superfile");
@@ -7555,6 +7667,7 @@ mod tests {
                     base,
                     &mut out,
                     PostingMerge::TermByTerm,
+                    None,
                 )
             })
             .expect("sorted merge");

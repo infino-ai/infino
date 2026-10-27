@@ -162,7 +162,9 @@ impl DiskCacheStore {
                 .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
             {
                 self.release_entry_accounting(&removed);
-                self.retain_block_file(&uri, &removed, now_us);
+                if let Some(source) = removed.block_source() {
+                    self.retain_block_file(&uri, source, now_us);
+                }
             }
         }
     }
@@ -353,11 +355,19 @@ impl DiskCacheStore {
         }
     }
 
-    /// Reserve a whole file for a Warm open's background download, or say the budget cannot hold
-    /// it: eviction ran out of victims, the one error it raises (`BudgetExceeded`). A caller that
-    /// cannot reserve opens the file lazily and charges only the blocks it reads.
-    pub(crate) async fn reserve_whole_file(&self, bytes: u64) -> bool {
-        self.reserve_manual(bytes).await.is_ok()
+    /// Reserve a whole file of `bytes` for a Warm open's background download. `None` when the open
+    /// allows no download, or when the budget cannot hold the file: eviction ran out of victims,
+    /// the one error it raises (`BudgetExceeded`). Without it the open stays lazy and charges only
+    /// the blocks it reads. The guard gives the bytes back unless committed.
+    pub(crate) async fn reserve_whole_file(
+        &self,
+        allow_background_fill: bool,
+        bytes: u64,
+    ) -> Option<Reservation<'_>> {
+        if !allow_background_fill {
+            return None;
+        }
+        self.reserve(bytes).await.ok()
     }
 
     /// Reserve `bytes` only if the budget has room now, never evicting. For a caller that cannot
@@ -487,6 +497,16 @@ impl DiskCacheStore {
             bytes,
             committed: false,
         })
+    }
+
+    /// Take over `bytes` already charged (a file the startup scan counted), so they are given back
+    /// unless committed, as a fresh reservation's are.
+    pub(crate) fn adopt_charge(&self, bytes: u64) -> Reservation<'_> {
+        Reservation {
+            store: self,
+            bytes,
+            committed: false,
+        }
     }
 
     /// Like [`Self::reserve`], but only from free space: `None` instead of evicting.

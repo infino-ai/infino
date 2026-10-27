@@ -1,0 +1,44 @@
+{
+  "format_version": "3.0",
+  "manifest_id": 0,
+  "options_hash": "blake3:c9e7fc9e3f52b5067babce99a7c27fc003888033cfc8becd882788e24da5242c",
+  "schema": {
+    "fields": [
+      {
+        "id": 1,
+        "index": {
+          "analyzer": "standard",
+          "b": 0.75,
+          "k1": 1.2000000476837158,
+          "kind": "fts",
+          "positions": true,
+          "stored": true
+        },
+        "name": "body",
+        "nullable": true,
+        "type": "large_utf8"
+      }
+    ],
+    "last_field_id": 1,
+    "max_depth": 20,
+    "max_fields": 10000,
+    "schema_id": 1,
+    "tombstoned": []
+  },
+  "id_column": "_id",
+  "commit_token": "84dab25d-89ba-4726-a855-42367b9df035",
+  "vector_index_storage_prefix": null,
+  "deleted_user_ids_inline_b64": null,
+  "slow_vector_state_uri": null,
+  "slow_vector_state_content_hash": null,
+  "partition_strategy": {
+    "kind": "ingestion_time",
+    "granularity_secs": 86400
+  },
+  "global_vector_index": null,
+  "drained_ranges": [],
+  "parts": [],
+  "tombstone_seqs": {},
+  "superseded_cells": {},
+  "split_checks": {}
+}

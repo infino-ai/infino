@@ -72,21 +72,23 @@
 
 use std::{
     borrow::Cow,
-    cmp::{Ordering, Reverse},
-    collections::{BTreeSet, BinaryHeap, HashMap, HashSet},
+    cmp::Ordering,
+    collections::{BTreeSet, HashMap, HashSet},
+    iter::repeat_n,
     slice,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering},
     },
     time::Instant,
 };
 
 use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, LargeStringArray};
+use futures::future::join;
 use roaring::RoaringBitmap;
 use tokio::sync::OnceCell;
-use tracing::{Instrument, debug};
+use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
 /// Fewest should-terms for which a ranged kernel is shipped to the
@@ -111,7 +113,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    InfinoError,
+    InfinoError, config,
     runtime_bridge::run_on_pool,
     runtime_metrics::op_stats,
     superfile::{
@@ -140,10 +142,13 @@ use crate::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope, TermMemos},
             dispatch,
-            exec::common::{resolve_hits_named, take_rows_byte_source},
+            exec::common::{
+                hit_output_schema, resolve_hits_named, take_file_columns, take_rows_byte_source,
+            },
             prune::{PruneLeaf, select_superfiles},
+            tier,
         },
-        reader_cache::{ReadIntent, disk::ForegroundQueryGuard},
+        reader_cache::disk::ForegroundQueryGuard,
         schema::FieldId,
         tombstones::SidecarCache,
     },
@@ -271,6 +276,85 @@ impl UnrankedMatchSet {
     }
 }
 
+/// One parsed unranked match, ready to run against any of its superfiles:
+/// the terms and phrases on each side of the negation, the index
+/// locations that let a superfile skip its dictionary, and the statistics
+/// sink. Shared by the walks that produce hits and the one that produces
+/// columns, so the two cannot drift apart in what they match.
+struct MatchKernel {
+    /// The matched column's field id, which finds the column under the
+    /// name a file written before a rename labelled it with.
+    column_field_id: Option<FieldId>,
+    column: String,
+    mode: BoolMode,
+    /// Any phrase atom, matched or negated, takes the phrase-aware walk.
+    phrase_involved: bool,
+    has_negatives: bool,
+    terms: Vec<String>,
+    phrases: Vec<Phrase<String>>,
+    negatives: Vec<String>,
+    negative_phrases: Vec<Phrase<String>>,
+    locations: IndexLocations,
+    op_stats: Option<Arc<op_stats::OpStatsCollector>>,
+}
+
+impl MatchKernel {
+    /// The rows of superfile `suid`, read through `r`, that the match
+    /// keeps: the positive walk minus any row a negated atom reaches.
+    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+        // A file written before a rename labels the column as it was then,
+        // and its dictionary is keyed by that label; the id is what finds
+        // the column in either file.
+        let column = r
+            .column_alias(self.column_field_id, &self.column)
+            .to_owned();
+        let memo = memo_from_locations(r, &self.locations, suid).await;
+        let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
+        // Any phrase atom (match or negated) takes the phrase-aware walk;
+        // plain-token queries keep the optimized token_match path.
+        let (docs, mut work) = match self.phrase_involved {
+            true => {
+                r.atoms_match_ids(&column, &refs, &self.phrases, self.mode)
+                    .await?
+            }
+            false => {
+                r.token_match_prefetched(&column, &refs, self.mode, memo.as_deref())
+                    .await?
+            }
+        };
+        // Drop any positive match that also carries a negated atom (union
+        // of the negatives). The df / count fast paths can't express
+        // exclusion, so negation forces a materialized walk over both sets.
+        let docs = if self.has_negatives {
+            let neg_refs: Vec<&str> = self.negatives.iter().map(String::as_str).collect();
+            let (neg_docs, neg_work) = match self.negative_phrases.is_empty() {
+                true => {
+                    r.token_match_prefetched(&column, &neg_refs, BoolMode::Or, memo.as_deref())
+                        .await?
+                }
+                false => {
+                    r.atoms_match_ids(&column, &neg_refs, &self.negative_phrases, BoolMode::Or)
+                        .await?
+                }
+            };
+            work.merge(neg_work);
+            let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
+            docs.into_iter()
+                .filter(|d| !excluded.contains(d.get()))
+                .collect::<Vec<_>>()
+        } else {
+            docs
+        };
+        // One flush per superfile: positive + negation walks.
+        if let Some(stats) = &self.op_stats {
+            stats.add_fts_postings_bytes(work.postings_bytes);
+            stats.add_planned_read_ranges(work.planned_ranges);
+            stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
+        }
+        Ok(docs)
+    }
+}
+
 /// The presence leaf a match set prunes with: its bare terms plus every
 /// phrase's members, under the strongest mode those atoms allow.
 ///
@@ -368,8 +452,13 @@ fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
 /// the amount of *skipped work* depends on segment completion order.
 struct SharedTopK {
     k: usize,
-    /// Min-heap (via `Reverse`) of the best `k` scores seen so far.
-    heap: Mutex<BinaryHeap<Reverse<OrdScore>>>,
+    /// The best `k` scores seen so far, descending, each with the largest
+    /// `_id` its superfile holds. A finished unit's scores merge in by one
+    /// linear pass, so a unit costs its own length plus `k` whatever the
+    /// heap of the moment holds — not a heap operation per score, which
+    /// the first wave of units, all finishing against an empty heap under
+    /// one lock, paid in full.
+    top: Mutex<Vec<FloorEntry>>,
     /// The current floor — `NEG_INFINITY` until `k` scores have been
     /// seen, monotone after. Shared with the atom walks as their live
     /// mid-walk bar (see [`LiveFloor`]), so it rises both from finished
@@ -377,19 +466,30 @@ struct SharedTopK {
     floor: LiveFloor,
 }
 
-/// Total-order f32 wrapper for the [`SharedTopK`] heap (BM25 scores
-/// are finite, but `f32` still needs an `Ord` shim).
-#[derive(PartialEq)]
-struct OrdScore(f32);
-impl Eq for OrdScore {}
-impl PartialOrd for OrdScore {
+/// One score in the [`SharedTopK`] heap with the largest `_id` of the
+/// superfile it came from: what a tie at the floor is compared against.
+/// Ordered by score, then by `_id` range *descending*, so of two equal
+/// scores the one from the higher range is the lesser and leaves the
+/// heap first: the stable top-k keeps the lower `_id` of a tie, and so
+/// does the heap — a seed placeholder (`i128::MAX`) in particular gives
+/// way to a real score equal to it. BM25 scores are finite, but `f32`
+/// still needs an `Ord` shim.
+#[derive(PartialEq, Clone, Copy)]
+struct FloorEntry {
+    score: f32,
+    id_max: i128,
+}
+impl Eq for FloorEntry {}
+impl PartialOrd for FloorEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for OrdScore {
+impl Ord for FloorEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.id_max.cmp(&self.id_max))
     }
 }
 
@@ -397,7 +497,7 @@ impl SharedTopK {
     fn new(k: usize) -> Arc<Self> {
         Arc::new(Self {
             k,
-            heap: Mutex::new(BinaryHeap::new()),
+            top: Mutex::new(Vec::new()),
             floor: LiveFloor::new(),
         })
     }
@@ -413,27 +513,99 @@ impl SharedTopK {
         &self.floor
     }
 
-    /// Merge one finished segment's (tombstone-surviving) scores and
-    /// publish the new kth-best as the floor once k scores are known.
-    fn merge(&self, scores: impl IntoIterator<Item = f32>) {
-        let mut heap = self.heap.lock().expect("SharedTopK mutex poisoned");
-        for s in scores {
-            if heap.len() < self.k {
-                heap.push(Reverse(OrdScore(s)));
-            } else if let Some(Reverse(OrdScore(min))) = heap.peek()
-                && s > *min
-            {
-                heap.pop();
-                heap.push(Reverse(OrdScore(s)));
+    /// Merge one finished segment's (tombstone-surviving) scores, from a
+    /// superfile whose `_id`s reach `id_max`, and publish the new kth-best
+    /// as the floor once k scores are known.
+    ///
+    /// A unit's scores are first held against the live floor — the floor
+    /// only rises, so a score below it can never enter — which leaves
+    /// nothing for most units once `k` scores are known. What remains
+    /// enters the top: a few entries by binary search and insertion, a
+    /// first-wave unit's many by one sorted linear merge. A unit's hits
+    /// arrive in document order, so nothing here relies on theirs. The
+    /// ceiling-ordered fan-out calls this from the one task that drives
+    /// it, as each unit finishes; only the unordered fan-out's units call
+    /// it themselves, and those all run at once.
+    fn merge(&self, id_max: i128, scores: impl IntoIterator<Item = f32>) {
+        /// Entries up to which insertion beats a sort and a merge.
+        const FEW: usize = 32;
+        let floor = self.floor.load();
+        let mut entering: Vec<FloorEntry> = scores
+            .into_iter()
+            .filter(|&score| score >= floor)
+            .map(|score| FloorEntry { score, id_max })
+            .collect();
+        if entering.is_empty() {
+            return;
+        }
+        if entering.len() > FEW {
+            entering.sort_unstable_by(|a, b| b.cmp(a));
+        }
+        let k = self.k;
+        let mut top = self.top.lock().expect("SharedTopK mutex poisoned");
+        if top.len() >= k {
+            let min = top[k - 1];
+            entering.retain(|e| *e > min);
+            if entering.is_empty() {
+                return;
             }
         }
-        if heap.len() == self.k
-            && let Some(Reverse(OrdScore(min))) = heap.peek()
-        {
+        if entering.len() <= FEW {
+            for e in entering {
+                let at = top.partition_point(|t| *t >= e);
+                if at < k {
+                    top.insert(at, e);
+                    top.truncate(k);
+                }
+            }
+        } else {
+            let mut merged: Vec<FloorEntry> =
+                Vec::with_capacity((top.len() + entering.len()).min(k));
+            let (mut i, mut j) = (0, 0);
+            while merged.len() < k && (i < top.len() || j < entering.len()) {
+                let take_top = match (top.get(i), entering.get(j)) {
+                    (Some(a), Some(b)) => a >= b,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if take_top {
+                    merged.push(top[i]);
+                    i += 1;
+                } else {
+                    merged.push(entering[j]);
+                    j += 1;
+                }
+            }
+            *top = merged;
+        }
+        if top.len() == k {
             // `raise` rather than a plain store: running walks may have
-            // published a higher local kth than this merge's heap min,
-            // and the floor must never move down.
-            self.floor.raise(*min);
+            // published a higher local kth than this merge's k-th, and the
+            // floor must never move down.
+            self.floor.raise(top[k - 1].score);
+        }
+    }
+
+    /// Whether a superfile whose `_id`s start at `id_min` and whose
+    /// ceiling equals `floor` can be skipped: `k` scores are known, and
+    /// every one at the floor came from a superfile whose `_id`s all lie
+    /// below `id_min`. The final top-k breaks a tie at the k-th score by
+    /// ascending `_id`, so a document of this superfile tied at the floor
+    /// ranks behind each of those, and one below it is out regardless.
+    /// Sound for any `_id` ranges: every `_id` of this superfile is at
+    /// least `id_min`, and every tied document's is at most its
+    /// superfile's `id_max`. A seed placeholder carries `i128::MAX` and so
+    /// never justifies a skip.
+    ///
+    /// Of the entries at the floor the last is the one from the highest
+    /// range (equal scores order by range descending), so one look settles
+    /// it. A floor the live walks have raised above the k-th entry has no
+    /// entry to compare against here and keeps the superfile open.
+    fn tie_skippable(&self, floor: f32, id_min: i128) -> bool {
+        let top = self.top.lock().expect("SharedTopK mutex poisoned");
+        top.len() >= self.k && {
+            let last = top[self.k - 1];
+            last.score == floor && last.id_max < id_min
         }
     }
 }
@@ -542,6 +714,20 @@ pub(crate) async fn memo_from_locations(
     Some(Arc::new(memo))
 }
 
+/// What a ranked fan-out unit carries to its kernel and its skip test.
+#[derive(Clone)]
+struct UnitParams {
+    /// The doc-id sub-range the unit scores, `None` for the whole superfile.
+    range: Option<(u32, u32)>,
+    superfile_id: Uuid,
+    uri: SuperfileUri,
+    /// The highest score the unit can reach, from the term index.
+    ceiling: f32,
+    /// The superfile's `_id` range.
+    id_min: i128,
+    id_max: i128,
+}
+
 /// Whether a superfile whose best possible score is `ceiling` can still
 /// place a document once the running k-th score is `floor`. Only a ceiling
 /// strictly below the floor cannot: a ceiling equal to it may hold a
@@ -583,12 +769,22 @@ fn table_scoring(column: &str, params: Option<Bm25Params>, avgdl: Option<f32>) -
     }
 }
 
+/// The parameters `column` declares, which every superfile scores it at
+/// unless a query overrides them.
+fn column_params(manifest: &ManifestSnapshot, column: &str) -> Option<Bm25Params> {
+    manifest
+        .fts_configs()
+        .iter()
+        .find(|c| c.column == column)
+        .map(|c| c.bm25)
+}
+
 /// The average length `entry`'s `column` was built at, as its manifest
 /// summary records it. A file whose summary records none is scored at
 /// that average rather than the table's: its stored bounds and term-index
 /// ceilings only hold there, and without the value nothing can rescale
 /// them before the file is opened.
-fn baked_avgdl(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
+pub(super) fn baked_avgdl(entry: &SuperfileEntry, column: FieldId) -> Option<f32> {
     entry
         .fts_summary
         .get(&column)
@@ -987,52 +1183,238 @@ impl SupertableReader {
         }
         all_terms.sort_unstable();
         all_terms.dedup();
-        let ceilings: Option<HashMap<Uuid, f32>> =
-            match (&term_index, bm25_params, manifest.field_id(column)) {
-                // Ceilings rescale by each term's table idf, so they order and
-                // skip only when the map holds every scored term.
-                // An exact count opens every superfile, so it skips the read.
-                (Some(index), None, Some(column_id))
-                    if !exact_count && all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
-                {
-                    let terms: Vec<&str> = musts
-                        .iter()
-                        .chain(shoulds.iter())
-                        .map(String::as_str)
-                        .collect();
-                    let phrases: Vec<Vec<&str>> = must_phrases
-                        .iter()
-                        .chain(should_phrases.iter())
-                        .map(|p| p.iter().map(String::as_str).collect())
-                        .collect();
-                    let gidf = global_idf.clone();
-                    // Every term is in the map (the guard above); the fallback
-                    // only satisfies the type.
-                    let idf_used = move |term: &str, _local: f32| {
-                        gidf.get(term).copied().unwrap_or(f32::INFINITY)
-                    };
-                    let mut ceilings = index
-                        .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
-                        .instrument(term_span.clone())
-                        .await?;
-                    ceilings_at_table_avgdl(&mut ceilings, &kept, column_id, table_avgdl);
-                    Some(ceilings)
+        // The index serves a ranked query when every scored term's idf is
+        // table-wide and no scoring override is in force: ceilings and
+        // tiers hold impacts at the declared parameters.
+        // An exact count opens every superfile, so it skips the index read.
+        let index_column = match (&term_index, bm25_params, manifest.field_id(column)) {
+            (Some(index), None, Some(column_id))
+                if !exact_count && all_terms.iter().all(|t| global_idf.contains_key(*t)) =>
+            {
+                Some((index, column_id))
+            }
+            _ => None,
+        };
+        let mut ceilings: Option<HashMap<Uuid, f32>> = None;
+        // Tier selection: with every scored term's tier readable, the query
+        // chooses its superfiles from the documents the tiers name — per
+        // superfile a bound that knows which documents carry several of the
+        // terms, and a superfile a required term has shown holds no
+        // candidate is not opened. The bounds tighten the ceilings, and the
+        // merge's lower bound on the k-th score is seeded into the shared
+        // floor. A phrase is bounded by its members and a negation by its
+        // positive terms, but neither yields a threshold: such a query is
+        // bounded and ordered, and seeds nothing. A query of more terms
+        // than the merge tracks keeps the ceilings. Only a complete index
+        // can rule a superfile out: one that does not yet list every live
+        // superfile knows nothing about the rest.
+        // Rows deleted from each kept superfile: the tiers still hold them,
+        // so the merge reads past them, and a kernel admits only the live
+        // rows, so its k best are live. A sidecar that cannot be read
+        // leaves the query to its ceilings and the kernel's own filter.
+        // Whether any kept superfile has deleted rows, from the sidecar
+        // cache's view of the manifest and without reading a sidecar: a
+        // unit whose superfile has them builds its live-row set from the
+        // kept set's row counts.
+        let tombstoned = self
+            .tombstone_cache
+            .as_ref()
+            .is_some_and(|c| kept.iter().any(|e| c.may_have_tombstones(e.superfile_id)));
+        // A scope that admits only some rows of a superfile is one the
+        // index cannot see, and the merge's threshold is the k-th score
+        // over every row: seeding the floor with it, or ruling a superfile
+        // out under it, would prune the admitted rows that score below it.
+        // Such a search keeps its ceilings; a scope that only chooses
+        // superfiles leaves the merge sound, since it works over the kept
+        // set.
+        // A table of one superfile has nothing for a merge to rule out or
+        // order, and its kernel seeds its own floor from its own blocks; the
+        // merge would only cost its reads and rounds on every query, and the
+        // gate its samples learning so.
+        let tiers_serve = index_column.is_some()
+            && kept.len() > 1
+            && scope.is_none_or(|s| !s.bounds_rows(&kept))
+            && all_terms.len() <= tier::MAX_TIER_TERMS
+            && manifest.term_index_complete()
+            && !config::global().diagnostics.disable_tier_selection;
+        // Whether to merge at all is the table's learned call per class of
+        // query; the search is timed from here so the call can be judged.
+        let rarest_idf = all_terms
+            .iter()
+            .filter_map(|t| global_idf.get(*t))
+            .fold(0.0f32, |m, &idf| m.max(idf));
+        let policy_class = tier::TierPolicy::class(
+            shoulds.is_empty() && should_phrases.is_empty(),
+            musts.is_empty() && must_phrases.is_empty(),
+            k,
+            all_terms.len(),
+            rarest_idf,
+        );
+        let ranked_started = Instant::now();
+        let learned = manifest.options.tier_merge_gate;
+        let merge_now = tiers_serve && (!learned || self.tier_policy().merge(policy_class));
+        // The deny sets, resolved only for a merge: it reads past the
+        // deleted rows, and the units then admit rows by the same sets, so
+        // a delete committed between the two reads cannot leave the
+        // threshold counting a row a kernel drops. Without a merge each
+        // unit looks its own up, as before. A sidecar that cannot be read
+        // leaves the merge unprepared and every unit to its own lookup.
+        let mut deny: Vec<Option<Arc<RoaringBitmap>>> = vec![None; kept.len()];
+        let mut deny_known = true;
+        if merge_now && let Some(cache) = &self.tombstone_cache {
+            let now = Instant::now();
+            let ids: Vec<Uuid> = kept.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+            for (slot, entry) in deny.iter_mut().zip(kept.iter()) {
+                match dispatch::tombstone_deny_set(cache, entry.superfile_id, now) {
+                    Ok(set) => *slot = set,
+                    Err(_) => {
+                        deny_known = false;
+                        break;
+                    }
                 }
-                _ => None,
+            }
+        }
+        let deny_by_superfile: Arc<HashMap<Uuid, Arc<RoaringBitmap>>> =
+            Arc::new(match merge_now && deny_known {
+                true => kept
+                    .iter()
+                    .zip(&deny)
+                    .map(|(e, d)| (e.superfile_id, d.clone().unwrap_or_default()))
+                    .collect(),
+                false => HashMap::new(),
+            });
+        // The merge, when it runs, runs beside the first opens rather than
+        // before them: its tier reads are a round trip of their own on a
+        // cold store, and spent ahead of the opens they would cost what
+        // they save. The fan-out starts in ceiling order; the units not
+        // yet issued when the merge reports are re-planned by what it
+        // found — answered from the index, ruled out, or reordered by
+        // their tighter bounds — and its threshold is seeded into the
+        // floor. What the merge needs is gathered here and it is started
+        // at the fan-out; `selected` records that it reported in time.
+        let selected = AtomicBool::new(false);
+        // Whether the merge, having reported, did anything the opens
+        // would not have: ruled a superfile out, answered for one, or
+        // seeded a threshold the kernels prune against. What the policy
+        // learns from, timing aside.
+        let pruned = AtomicBool::new(false);
+        // Whether the merge declined before any read — a term with
+        // postings in a layer without a tier, a superfile the root does
+        // not list: the class learns there is nothing to merge here.
+        let declined = AtomicBool::new(false);
+        let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();
+        let merge_term_refs: Vec<&str> = merge_terms.iter().map(String::as_str).collect();
+        let merge_kept: Vec<Arc<SuperfileEntry>> = match merge_now {
+            true => kept.clone(),
+            false => Vec::new(),
+        };
+        let mut tier_query: Option<tier::TierQuery<'_>> = None;
+        if let Some((_, column_id)) = index_column
+            && merge_now
+        {
+            // Bits over the distinct terms: the bare terms score on their
+            // own; a match must carry the musts and every member of a
+            // must-phrase.
+            let index_of = |n: &String| merge_term_refs.iter().position(|t| *t == n.as_str());
+            let bits = |names: &[String]| -> tier::TermMask {
+                names
+                    .iter()
+                    .filter_map(index_of)
+                    .fold(0, |m, i| m | (1 << i))
             };
-        if let Some(c) = &ceilings {
+            let scoring = bits(&musts) | bits(&shoulds);
+            // A phrase's members in order, a repeated word repeated: the
+            // kernel weights every occurrence.
+            let members = |p: &[String]| -> Vec<usize> { p.iter().filter_map(index_of).collect() };
+            let tier_phrases: Vec<(Vec<usize>, bool)> = must_phrases
+                .iter()
+                .map(|p| (members(p), true))
+                .chain(should_phrases.iter().map(|p| (members(p), false)))
+                .collect();
+            let required = bits(&musts)
+                | tier_phrases
+                    .iter()
+                    .filter(|p| p.1)
+                    .flat_map(|p| p.0.iter())
+                    .fold(0, |m, &i| m | (1 << i));
+            // A bare term repeated in the query is weighted by its count in
+            // the kernels; the tiers score each term once, so such a query
+            // is not served.
+            let repeated = musts.len() + shoulds.len() != scoring.count_ones() as usize;
+            if let Some(params) = column_params(manifest, column)
+                && !repeated
+                && deny_known
+            {
+                tier_query = Some(tier::TierQuery {
+                    column: column_id,
+                    terms: &merge_term_refs,
+                    required,
+                    scoring,
+                    phrases: tier_phrases,
+                    // A negated phrase excludes as a negated term does: the
+                    // heads cannot see the adjacency that unmakes a match.
+                    negated: !negatives.is_empty() || !negative_phrases.is_empty(),
+                    k,
+                    deny,
+                    table_avgdl,
+                    params,
+                    open_cost_ns: self.open_cost_ns(),
+                    entry_cost_ns: self.tier_entry_cost_ns(),
+                    merge_gate: manifest.options.tier_merge_gate,
+                });
+            }
+        }
+        if let Some((index, column_id)) = index_column {
+            // Ceilings rescale by each term's table idf, so they order and
+            // skip only when the map holds every scored term.
+            let terms: Vec<&str> = musts
+                .iter()
+                .chain(shoulds.iter())
+                .map(String::as_str)
+                .collect();
+            let phrases: Vec<Vec<&str>> = must_phrases
+                .iter()
+                .chain(should_phrases.iter())
+                .map(|p| p.iter().map(String::as_str).collect())
+                .collect();
+            let gidf = global_idf.clone();
+            // Every term is in the map (the guard above); the fallback
+            // only satisfies the type.
+            let idf_used = move |term: &str| gidf.get(term).copied().unwrap_or(f32::INFINITY);
+            let mut c = index
+                .query_ceilings(column_id, &terms, &phrases, &kept, &idf_used)
+                .instrument(term_span.clone())
+                .await?;
+            ceilings_at_table_avgdl(&mut c, &kept, column_id, table_avgdl);
             let ceiling_of =
                 |e: &Arc<SuperfileEntry>| c.get(&e.superfile_id).copied().unwrap_or(f32::INFINITY);
-            kept.sort_by(|a, b| ceiling_of(b).total_cmp(&ceiling_of(a)));
+            kept.sort_by(|a, b| {
+                ceiling_of(b)
+                    .total_cmp(&ceiling_of(a))
+                    .then(a.id_min.cmp(&b.id_min))
+            });
+            ceilings = Some(c);
         }
         // The index also knows where each term's postings sit in every
         // indexed superfile, so a cursor set can be built from those
-        // locations and the superfile's dictionary never read.
+        // locations and the superfile's dictionary never read. That holds
+        // for every term the walk looks up, the negated ones included: they
+        // score nothing, but a superfile that had to find one in its
+        // dictionary would read the dictionary whole — tens of megabytes on
+        // a large superfile, for every superfile the query opens.
+        let mut located: Vec<&str> = all_terms.clone();
+        located.extend(negatives.iter().map(String::as_str));
+        for p in &negative_phrases {
+            located.extend(p.iter().map(String::as_str));
+        }
+        located.sort_unstable();
+        located.dedup();
         let index_locations = self
-            .index_locations(column, &all_terms, &kept)
+            .index_locations(column, &located, &kept)
             .instrument(term_span.clone())
             .await?;
-        term_span.record("terms", all_terms.len());
+        term_span.record("terms", located.len());
         trace::end(term_span);
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
@@ -1046,16 +1428,15 @@ impl SupertableReader {
             .and_then(|s| s.allow.clone())
             .map(Arc::new);
         // An exact count walks each superfile whole: the ranged union
-        // kernel prunes and does not count.
-        let fanout = match exact_count || has_phrases || per_row_scope.is_some() {
+        // kernel prunes and does not count. A superfile with deleted rows
+        // is walked by the clause kernels, which admit only its live rows;
+        // the ranged union kernel has no such gate.
+        let fanout = match exact_count || has_phrases || per_row_scope.is_some() || tombstoned {
             true => FanOut::PerSuperfile,
             false => fanout_for(musts.len(), shoulds.len(), !negatives.is_empty()),
         };
         let work_units = build_work_units(&kept_refs, fanout, pool_threads);
-        let units: Vec<(
-            Arc<SuperfileEntry>,
-            (Option<(u32, u32)>, Uuid, SuperfileUri, f32),
-        )> = work_units
+        let units: Vec<(Arc<SuperfileEntry>, UnitParams)> = work_units
             .into_iter()
             .map(|u| {
                 let suid = u.entry.superfile_id;
@@ -1064,10 +1445,17 @@ impl SupertableReader {
                     .as_ref()
                     .and_then(|c| c.get(&suid).copied())
                     .unwrap_or(f32::INFINITY);
-                (u.entry, (u.range, suid, uri, ceiling))
+                let params = UnitParams {
+                    range: u.range,
+                    superfile_id: suid,
+                    uri,
+                    ceiling,
+                    id_min: u.entry.id_min,
+                    id_max: u.entry.id_max,
+                };
+                (u.entry, params)
             })
             .collect();
-
         let must_arc: Arc<Vec<String>> = Arc::new(musts);
         let should_arc: Arc<Vec<String>> = Arc::new(shoulds);
         let neg_arc: Arc<Vec<String>> = Arc::new(negatives);
@@ -1078,7 +1466,9 @@ impl SupertableReader {
         let column_arc = Arc::new(column_owned);
         // Exact count only: each superfile's row count, to turn its
         // tombstones into an allow-set, and the running total.
-        let row_counts: Arc<HashMap<Uuid, u64>> = Arc::new(match exact_count {
+        // What a live-row set is built against: every kept superfile's
+        // row count, when an exact count or a deleted row needs one.
+        let row_counts: Arc<HashMap<Uuid, u64>> = Arc::new(match exact_count || tombstoned {
             true => kept.iter().map(|e| (e.superfile_id, e.n_docs)).collect(),
             false => HashMap::new(),
         });
@@ -1092,6 +1482,7 @@ impl SupertableReader {
         // excluded from the merge so deleted rows never raise the bar.
         let shared = SharedTopK::new(k);
         let floor_handle = Arc::clone(&shared);
+        let merger = Arc::clone(&shared);
         let tombstones = self.tombstone_cache.clone();
         let op_stats = self.op_stats.clone();
         let now = Instant::now();
@@ -1130,13 +1521,18 @@ impl SupertableReader {
                 .collect(),
             None => HashSet::new(),
         });
-        let kernel = move |r: Arc<SuperfileReader>,
-                           (range, suid, uri, _ceiling): (
-            Option<(u32, u32)>,
-            Uuid,
-            SuperfileUri,
-            f32,
-        )| {
+        let merge_in_unit = exact_count || ceilings.is_none();
+        // What the merge, started at the fan-out below, scores and seeds.
+        let merge_idf = global_idf.clone();
+        let merge_floor = Arc::clone(&shared);
+        let kernel = move |r: Arc<SuperfileReader>, params: UnitParams| {
+            let UnitParams {
+                range,
+                superfile_id: suid,
+                uri,
+                id_max,
+                ..
+            } = params;
             let avgdl = at_table_avgdl.contains(&suid).then_some(table_avgdl);
             let column_arc = Arc::clone(&column_arc);
             let must_arc = Arc::clone(&must_arc);
@@ -1149,6 +1545,7 @@ impl SupertableReader {
             let cursor_sets = Arc::clone(&cursor_sets);
             let reader_pool = Arc::clone(&reader_pool);
             let tombstones = tombstones.clone();
+            let deny_by_superfile = Arc::clone(&deny_by_superfile);
             let global_idf = global_idf.clone();
             let prefetch_memos = prefetch_memos.clone();
             let index_locations = Arc::clone(&index_locations);
@@ -1174,14 +1571,39 @@ impl SupertableReader {
                 // This superfile's open-wave fetches (global stats): the
                 // cursor builds below serve the scored terms from the memo
                 // instead of re-reading what the df wave already fetched.
-                let memo: Option<Arc<FetchedTermMemo>> =
+                let memo = async {
                     match prefetch_memos.as_ref().and_then(|m| m.get(&suid)).cloned() {
                         Some(memo) => Some(memo),
                         // No open-wave memo: build one from the term index's
                         // locations, fetching postings only. A failure here
                         // costs the dictionary read, never the answer.
                         None => memo_from_locations(&r, &index_locations, suid).await,
+                    }
+                };
+                // What scoring reads besides the postings — the length buckets
+                // and the doc-id map — goes in the same wave as the postings,
+                // so a cold superfile costs one round trip before its kernel
+                // rather than three. A read that fails here is read again by
+                // the kernel's own entry, which reports it.
+                // A resident superfile has every byte in memory: nothing to
+                // prewarm, and on a warm table a future per superfile is
+                // measurable against a query of a millisecond.
+                let prewarm = async {
+                    if r.parquet_bytes().is_some() {
+                        return;
+                    }
+                    let scoring = async {
+                        if let Some(fts) = r.fts()
+                            && let Err(error) = fts.prewarm_scoring(&column_arc).await
+                        {
+                            debug!(%error, "prewarm of the scoring reads failed; the kernel reads them");
+                        }
                     };
+                    // The id sidecar's directory too, so resolving this
+                    // superfile's hits costs one round trip for their blocks.
+                    join(scoring, r.prewarm_id_directory()).await;
+                };
+                let (memo, ()): (Option<Arc<FetchedTermMemo>>, ()) = join(memo, prewarm).await;
                 // Share the global kth-best floor with every superfile —
                 // single-term queries included — so each prunes its scored
                 // scan against the running top-k instead of returning a full
@@ -1199,7 +1621,12 @@ impl SupertableReader {
                     false => shared.floor(),
                 };
                 let (live_floor, allow) = {
-                    let tomb = tombstones.as_ref().map(|c| c.bitmap_for(suid, now));
+                    // The set the merge read for this superfile, when every
+                    // sidecar was readable then; else this unit's own lookup.
+                    let tomb = match deny_by_superfile.get(&suid) {
+                        Some(set) => Some(Ok(Arc::clone(set))),
+                        None => tombstones.as_ref().map(|c| c.bitmap_for(suid, now)),
+                    };
                     // The atom walks may also read the floor LIVE mid-walk and
                     // publish their own local kth into it — but a kernel heap
                     // is pre-tombstone-filter, so only a superfile with no
@@ -1217,10 +1644,14 @@ impl SupertableReader {
                             _ => Some(shared.live_floor()),
                         }
                     };
-                    // An exact count leaves deleted rows out, as `count` does:
-                    // on a superfile with tombstones, allow only the live rows.
-                    let allow = match (&tomb, exact_count) {
-                        (Some(Ok(deleted)), true) if !deleted.is_empty() => {
+                    // A superfile with deleted rows admits only its live
+                    // rows: a kernel's heap then holds the k best live
+                    // documents, where the filter after the walk would have
+                    // dropped the deleted among the k best of all (and an
+                    // exact count counts the live rows alone, as `count`
+                    // does).
+                    let allow = match &tomb {
+                        Some(Ok(deleted)) if !deleted.is_empty() => {
                             let rows = row_counts.get(&suid).copied().ok_or_else(|| {
                                 QueryError::Internal(format!(
                                     "superfile {suid} missing from the kept set"
@@ -1340,6 +1771,7 @@ impl SupertableReader {
                                 floor,
                                 &scoring,
                             )
+                            .instrument(trace::phase(phases, || detail_span!("fts.prepare")))
                             .await?;
                         if let Some(stats) = &op_stats {
                             stats.add_fts_postings_bytes(prep.postings_bytes());
@@ -1437,39 +1869,236 @@ impl SupertableReader {
                 // so the bitmap lookup is an in-memory hit; on a cache
                 // miss/error we simply don't merge (a lower floor is
                 // always safe).
-                match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
-                    Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
-                        hits.iter()
-                            .filter(|(d, _)| !bitmap.contains(d.get()))
-                            .map(|(_, s)| *s),
-                    ),
-                    Some(Err(_)) => {}
-                    _ => shared.merge(hits.iter().map(|(_, s)| *s)),
+                // Under the ceiling-ordered fan-out the driver merges a
+                // unit's surviving scores as the unit finishes; the
+                // unordered fan-out's units, all running at once, merge
+                // their own here.
+                if merge_in_unit {
+                    match tombstones.as_ref().map(|c| c.bitmap_for(suid, now)) {
+                        Some(Ok(bitmap)) if !bitmap.is_empty() => shared.merge(
+                            id_max,
+                            hits.iter()
+                                .filter(|(d, _)| !bitmap.contains(d.get()))
+                                .map(|(_, s)| *s),
+                        ),
+                        Some(Err(_)) => {}
+                        _ => shared.merge(id_max, hits.iter().map(|(_, s)| *s)),
+                    }
                 }
                 Ok(rows_as_local_ids(hits))
             }
         };
-        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        // An exact count opens every unit: a skipped superfile's matches
-        // would go uncounted.
+        let fanout_span = trace::phase(phases, || {
+            tiered_span!(
+                "fts.fanout",
+                units = units.len(),
+                resolved = tracing::field::Empty,
+                ruled_out = tracing::field::Empty,
+            )
+        });
+        let fanout_records = fanout_span.clone();
+        // The merge, prepared here. With its tier chunks in memory it runs
+        // first: it costs no round trip, and the kernels it spares cost
+        // more than the wait. With chunks to read from storage it runs
+        // beside the first opens, and re-plans the units not yet issued
+        // when it reports. Either way one plan applies what it found.
+        let mut units = units;
+        let mut settled_before: Vec<Vec<SuperfileHit>> = Vec::new();
+        let mut replan: Option<dispatch::ReplanFuture<'_, UnitParams, Vec<SuperfileHit>>> = None;
+        if let (Some(query), Some((index, _))) = (tier_query, index_column) {
+            let global_idf = merge_idf;
+            let pool = &manifest.options.reader_pool;
+            let span = fanout_span.clone();
+            let merger = merge_floor;
+            // The kept superfiles in the order the merge bounds them.
+            let merged_ids: Vec<Uuid> = merge_kept.iter().map(|e| e.superfile_id).collect();
+            // Units per superfile: a superfile the index answers for is
+            // answered only when none of its units was issued — an issued
+            // unit's kernel answers for its rows, and the rest open as planned.
+            let units_of: HashMap<Uuid, usize> =
+                units.iter().fold(HashMap::new(), |mut m, (e, _)| {
+                    *m.entry(e.superfile_id).or_insert(0) += 1;
+                    m
+                });
+            let reader = self;
+            let selected = &selected;
+            let pruned = &pruned;
+            // What a selection does to the units it is handed: the
+            // superfiles the index answers for are settled and their
+            // scores folded into the floor, the ruled-out dropped, the rest
+            // reordered by their tighter bounds, and the threshold seeded.
+            let make_plan = move |selection: tier::TierSelection| -> dispatch::Replan<'_, UnitParams, Vec<SuperfileHit>> {
+                if let Some(stats) = &reader.op_stats {
+                    stats.add_tier_read(selection.tier_bytes, selection.entries_read);
+                }
+                if let Some(per_entry) = selection.merge_ns.checked_div(selection.entries_read) {
+                    reader.note_tier_entry_cost(per_entry);
+                }
+                Box::new(move |remaining: dispatch::Units<UnitParams>| {
+                    let bounds_of: HashMap<Uuid, tier::SuperfileBounds> =
+                        merged_ids.iter().copied().zip(selection.bounds).collect();
+                    let mut answers: HashMap<Uuid, Vec<(u32, f32)>> = selection
+                        .resolved
+                        .into_iter()
+                        .map(|(si, hits)| (merged_ids[si], hits))
+                        .collect();
+                    let mut remaining_of: HashMap<Uuid, usize> = HashMap::new();
+                    for (e, _) in &remaining {
+                        *remaining_of.entry(e.superfile_id).or_insert(0) += 1;
+                    }
+                    answers.retain(|id, _| remaining_of.get(id) == units_of.get(id));
+                    let answered: HashSet<Uuid> = answers.keys().copied().collect();
+                    let mut keep: Vec<(Arc<SuperfileEntry>, UnitParams, f32)> =
+                        Vec::with_capacity(remaining.len());
+                    let mut settled: Vec<Vec<SuperfileHit>> = Vec::new();
+                    let mut ruled_out = 0u64;
+                    for (entry, mut params) in remaining {
+                        let id = entry.superfile_id;
+                        if answered.contains(&id) {
+                            // The merge read past every deleted row, so
+                            // what it answers with is live; its scores
+                            // are real documents at known ids, and raise
+                            // the floor and settle ties.
+                            if let Some(hits) = answers.remove(&id) {
+                                merger.merge(entry.id_max, hits.iter().map(|h| h.1));
+                                settled.push(dispatch::tag_hits(&entry, hits));
+                            }
+                            continue;
+                        }
+                        let Some(b) = bounds_of.get(&id) else {
+                            keep.push((entry, params, f32::NEG_INFINITY));
+                            continue;
+                        };
+                        if b.ub == f32::NEG_INFINITY {
+                            ruled_out += 1;
+                            continue;
+                        }
+                        // A merged bound is at most the ceiling; the skip
+                        // decision reads it as such.
+                        params.ceiling = b.ub.min(params.ceiling);
+                        keep.push((entry, params, b.lb));
+                    }
+                    // The rest open by their upper bound, as the ceiling
+                    // path opens by ceiling, then by their best known
+                    // candidate; equal bounds open in `_id` order, so a run
+                    // of superfiles that can only tie is settled by the
+                    // first of them.
+                    keep.sort_by(|(a, x, xl), (b, y, yl)| {
+                        y.ceiling
+                            .total_cmp(&x.ceiling)
+                            .then(yl.total_cmp(xl))
+                            .then(a.id_min.cmp(&b.id_min))
+                    });
+                    // The tiers' lower bound on the k-th score is a floor
+                    // every kernel may prune against; the real scores that
+                    // replace these placeholders only raise it.
+                    if selection.theta_lb.is_finite() {
+                        merger.merge(i128::MAX, repeat_n(selection.theta_lb, k));
+                    }
+                    let resolved = answered.len() as u64;
+                    if resolved > 0 && let Some(stats) = &reader.op_stats {
+                        stats.add_superfiles_resolved(resolved);
+                    }
+                    span.record("resolved", resolved);
+                    span.record("ruled_out", ruled_out);
+                    selected.store(true, AtomicOrdering::Relaxed);
+                    pruned.store(
+                        resolved + ruled_out > 0 || selection.theta_lb.is_finite(),
+                        AtomicOrdering::Relaxed,
+                    );
+                    (keep.into_iter().map(|(e, p, _)| (e, p)).collect(), settled)
+                })
+            };
+            // The tiers only make the query faster, and the ceilings are in
+            // hand: a tier that cannot be read or does not verify leaves
+            // the query to them.
+            let unreadable = |e: term_index::TermIndexError| {
+                warn!(error = %e, "term-index tier unreadable; the query keeps its ceilings");
+            };
+            let prepared = tier::prepare_merge(index, &query, &merge_kept, &global_idf, pool)
+                .await
+                .unwrap_or_else(|e| {
+                    unreadable(e);
+                    None
+                });
+            if prepared.is_none() {
+                declined.store(true, AtomicOrdering::Relaxed);
+            }
+            let window = manifest.options.bound_ordered_open_window.max(1);
+            match prepared {
+                Some(prepared) if prepared.resident => {
+                    let selection = prepared.run().await.unwrap_or_else(|e| {
+                        unreadable(e);
+                        None
+                    });
+                    if let Some(selection) = selection {
+                        let (keep, settled) = make_plan(selection)(units);
+                        units = keep;
+                        settled_before = settled;
+                    }
+                }
+                // On a table whose kept units all issue at once, a merge that
+                // must read its tiers would report after every open is under
+                // way and change none; its reads would only compete with the
+                // opens, and the gate would spend samples on a plan that
+                // cannot act. Its first wave is read without waiting, for the
+                // next query of these terms, and nothing is reported.
+                Some(prepared) if units.len() <= window => {
+                    prepared.prefetch(Arc::clone(index));
+                }
+                Some(prepared) => {
+                    replan = Some(Box::pin(async move {
+                        match prepared.run().await {
+                            Ok(Some(selection)) => Some(make_plan(selection)),
+                            Ok(None) => None,
+                            Err(e) => {
+                                unreadable(e);
+                                None
+                            }
+                        }
+                    }));
+                }
+                None => {}
+            }
+        }
         let per_unit = match !exact_count && ceilings.is_some() {
             // Units are in descending ceiling order. A unit whose ceiling is
             // strictly below the running k-th score cannot place a document
             // in the top k — not even a tie the stable `_id` order could
-            // admit — so it is never opened.
+            // admit — so it is never opened; one whose ceiling equals it
+            // can only tie, and is not opened either once every document
+            // at the floor precedes its own in `_id` order.
             true => {
                 let window = manifest.options.bound_ordered_open_window.max(1);
+                // A superfile whose ceiling only ties the running k-th score
+                // is skipped once the tie is settled by `_id` order: every
+                // `_id` it holds is past the tied document's. That needs
+                // an exact comparison, no tolerance widening the floor.
+                let tie_walk = score_tolerance <= 0.0;
+                // The driver folds each finished unit's surviving scores
+                // (tombstoned ones are already gone) into the floor.
+                let id_max_of: HashMap<SuperfileUri, i128> =
+                    units.iter().map(|(_, p)| (p.uri, p.id_max)).collect();
                 dispatch::fanout_local_hits_ordered(
                     self,
                     units,
                     window,
-                    move |(_, _, _, ceiling): &(Option<(u32, u32)>, Uuid, SuperfileUri, f32)| {
-                        !ceiling_can_compete(
-                            *ceiling,
-                            competitive_floor(floor_handle.floor(), score_tolerance),
-                        )
+                    move |params: &UnitParams| {
+                        let floor = competitive_floor(floor_handle.floor(), score_tolerance);
+                        !ceiling_can_compete(params.ceiling, floor)
+                            || (tie_walk
+                                && params.ceiling == floor
+                                && floor_handle.tie_skippable(floor, params.id_min))
                     },
                     kernel,
+                    move |hits: &Vec<SuperfileHit>| {
+                        if let Some(first) = hits.first()
+                            && let Some(&id_max) = id_max_of.get(&first.superfile)
+                        {
+                            merger.merge(id_max, hits.iter().map(|h| h.score));
+                        }
+                    },
+                    replan,
                 )
                 .instrument(fanout_span)
                 .await?
@@ -1480,7 +2109,37 @@ impl SupertableReader {
                     .await?
             }
         };
+        // The index served but no merge reported in time — it declined,
+        // or every unit was issued before it did: it answered for nothing
+        // and ruled nothing out, and the span says so.
+        if tiers_serve && !selected.load(AtomicOrdering::Relaxed) {
+            fanout_records.record("resolved", 0u64);
+            fanout_records.record("ruled_out", 0u64);
+        }
+        let mut per_unit = per_unit;
+        per_unit.extend(settled_before);
         let hits = select_top_k_stable(self, per_unit, k).await?;
+        // Noted for the way the policy chose, whether or not the merge
+        // then ran: a shape it declines every time is thereby measured as
+        // the cost of asking, and the class settles on not asking.
+        if tiers_serve && learned {
+            // A merge that reported says whether it did anything; one that
+            // declined did nothing by construction; one that did not get
+            // to report says nothing.
+            let outcome = if selected.load(AtomicOrdering::Relaxed) {
+                Some(pruned.load(AtomicOrdering::Relaxed))
+            } else if declined.load(AtomicOrdering::Relaxed) {
+                Some(false)
+            } else {
+                None
+            };
+            self.tier_policy().note(
+                policy_class,
+                merge_now,
+                outcome,
+                ranked_started.elapsed().as_nanos() as u64,
+            );
+        }
         Ok((hits, count_handle.load(AtomicOrdering::Relaxed)))
     }
 
@@ -1552,21 +2211,20 @@ impl SupertableReader {
         {
             let mut fresh: Vec<(&str, f32)> = Vec::with_capacity(misses.len());
             let asked: Vec<&str> = misses.iter().map(String::as_str).collect();
-            let runs = index.postings_many(column_id, &asked).await?;
+            let runs = index.runs_many(column_id, &asked).await?;
             // The index keeps postings for removed superfiles, so only live
             // ones count; liveness is checked for the terms' holders alone.
             let holders: HashSet<Uuid> = runs
                 .iter()
-                .flat_map(|run| run.iter())
+                .flat_map(|r| term_index::postings_of(r))
                 .filter_map(|p| index.superfile_id(p.superfile))
                 .collect();
             let live = manifest
                 .live_among(&index, &holders)
                 .await
                 .map_err(QueryError::ManifestLoad)?;
-            for (t, postings) in misses.iter().zip(runs) {
-                let df: u64 = postings
-                    .iter()
+            for (t, runs) in misses.iter().zip(runs) {
+                let df: u64 = term_index::postings_of(&runs)
                     .filter(|p| {
                         index
                             .superfile_id(p.superfile)
@@ -1608,7 +2266,7 @@ impl SupertableReader {
             self,
             units,
             false,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, _entry, _sidecars, _now, (suid, full): (Uuid, bool)| {
                 let column_arc = Arc::clone(&column_arc);
                 let terms_arc = Arc::clone(&terms_arc);
@@ -1747,7 +2405,7 @@ impl SupertableReader {
             self,
             units,
             false,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, _entry, _sidecars, _now, ()| {
                 let column_arc = Arc::clone(&column_arc);
                 let prefix_arc = Arc::clone(&prefix_arc);
@@ -1922,6 +2580,135 @@ impl SupertableReader {
         query: &str,
         mode: BoolMode,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.token_match_hits_async(column, query, mode, true).await
+    }
+
+    /// [`Self::token_match_async`] with a say over whether every hit
+    /// leaves carrying its stable `_id`. A caller that never reads the
+    /// ids, an aggregate over the match that projects only scalar
+    /// columns, passes `false` and skips the stamping. A file whose ids
+    /// follow from span arithmetic is stamped as the fan-out tags its
+    /// hits, so there the skip saves one pass over the hits; on a
+    /// cell-packed or gapped-span file stamping reads the file's `_id`
+    /// column, and that read is what the skip saves. Hits then carry a
+    /// stable id only where the fan-out tagged one, and must not be asked
+    /// for `_id`.
+    pub(crate) async fn token_match_hits_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        stamp_stable_ids: bool,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(Vec::new());
+        };
+        let phases = self.phase_spans();
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let per_unit = dispatch::fanout_local_hits(self, units, move |r, suid| {
+            let kernel = Arc::clone(&kernel);
+            async move {
+                Ok(kernel
+                    .docs(&r, suid)
+                    .await?
+                    .into_iter()
+                    .map(|d| (d.get(), 0.0f32))
+                    .collect::<Vec<_>>())
+            }
+        })
+        .instrument(fanout_span)
+        .await?;
+        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
+        // reallocations copy the whole hit vec repeatedly at 1M hits.
+        let total: usize = per_unit.iter().map(Vec::len).sum();
+        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
+        for unit in per_unit {
+            hits.extend(unit);
+        }
+        if stamp_stable_ids {
+            dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
+        }
+        Ok(hits)
+    }
+
+    /// The matching rows' `names` columns, one batch per superfile in no
+    /// particular order, for a consumer that reads neither `_id` nor the
+    /// score: an aggregate over the match. Each superfile's rows go from
+    /// the kernel's walk to a column take and out as their own batch, with
+    /// no hit per row, no stable-id stamping and no global interleave in
+    /// between, which on a match of a few hundred thousand rows is most of
+    /// what producing a hit set costs. Tombstoned rows are left out, as
+    /// the hit path leaves them out.
+    pub(crate) async fn token_match_columns_async(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        names: &[&str],
+    ) -> Result<Vec<RecordBatch>, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(Vec::new());
+        };
+        let manifest = Arc::clone(self.manifest());
+        let out_schema =
+            hit_output_schema(&manifest.stored_schema(), names).map_err(QueryError::DataFusion)?;
+        let names: Arc<Vec<String>> = Arc::new(names.iter().map(|s| (*s).to_string()).collect());
+        let op_stats = self.op_stats.clone();
+        let shared = self.shared_inner();
+        let schema_id = manifest.table_schema().schema_id();
+        let phases = self.phase_spans();
+        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         suid: Uuid| {
+            let kernel = Arc::clone(&kernel);
+            let manifest = Arc::clone(&manifest);
+            let out_schema = Arc::clone(&out_schema);
+            let names = Arc::clone(&names);
+            let op_stats = op_stats.clone();
+            let shared = Arc::clone(&shared);
+            async move {
+                let docs = kernel.docs(&r, suid).await?;
+                let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
+                if let Some(cache) = cache.as_ref()
+                    && let Some(deny) =
+                        dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                {
+                    locals.retain(|local| !deny.contains(*local));
+                }
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                // The same rows of the same superfile under the same columns
+                // and schema are the same batch for as long as the immutable
+                // superfile lives; the hit path memoises them under that
+                // key, and so does this.
+                let decoded = &shared.decoded_scalar_cache;
+                if let Some(batch) = decoded.get(entry.uri, schema_id, &locals, &refs) {
+                    return Ok(batch);
+                }
+                let batch =
+                    take_file_columns(&manifest, &r, locals.clone(), &refs, &out_schema, &op_stats)
+                        .await
+                        .map_err(QueryError::DataFusion)?;
+                decoded.insert(entry.uri, schema_id, &locals, &refs, batch.clone());
+                Ok(batch)
+            }
+        };
+        dispatch::fanout_with(self, units, true, self.open_intent(), body)
+            .instrument(fanout_span)
+            .await
+    }
+
+    /// What every unranked match walk starts from: the superfiles the
+    /// query's terms can match (`None` when there are none) and the kernel
+    /// that finds the matching rows in any one of them.
+    async fn match_kernel(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+    ) -> Result<Option<(Vec<(Arc<SuperfileEntry>, Uuid)>, Arc<MatchKernel>)>, QueryError> {
         let phases = self.phase_spans();
         let select_span = trace::phase(phases, || {
             detail_span!(
@@ -1937,11 +2724,8 @@ impl SupertableReader {
         select_span.record("survivors", kept.len());
         trace::end(select_span);
         if kept.is_empty() {
-            return Ok(Vec::new());
+            return Ok(None);
         }
-        let match_mode = match_set.mode;
-        let has_negatives = !negatives.is_empty();
-        let phrase_involved = match_set.has_phrases() || !negatives.phrases.is_empty();
         // Every plain term the kernel resolves, positive and negated: the
         // index's locations for them let each superfile skip its dictionary.
         let all_terms: Vec<&str> = match_set
@@ -1963,96 +2747,20 @@ impl SupertableReader {
                 (e, id)
             })
             .collect();
-        let column_field_id = self.manifest().field_id(column);
-        let column_arc = Arc::new(column.to_owned());
-        let term_arc: Arc<Vec<String>> = Arc::new(match_set.terms);
-        let phrase_arc: Arc<Vec<Phrase<String>>> = Arc::new(match_set.phrases);
-        let neg_arc: Arc<Vec<String>> = Arc::new(negatives.terms);
-        let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negatives.phrases);
-        let op_stats = self.op_stats.clone();
-        let kernel = move |r: Arc<SuperfileReader>, suid: Uuid| {
-            let column_arc = Arc::clone(&column_arc);
-            let term_arc = Arc::clone(&term_arc);
-            let phrase_arc = Arc::clone(&phrase_arc);
-            let neg_arc = Arc::clone(&neg_arc);
-            let neg_ph_arc = Arc::clone(&neg_ph_arc);
-            let locations = Arc::clone(&locations);
-            let op_stats = op_stats.clone();
-            async move {
-                // A file written before a rename labels the column as it was
-                // then, and its dictionary is keyed by that label; the id is
-                // what finds the column in either file.
-                let column_arc = r.column_alias(column_field_id, &column_arc).to_owned();
-
-                let memo = memo_from_locations(&r, &locations, suid).await;
-                let refs: Vec<&str> = term_arc.iter().map(|s| s.as_str()).collect();
-                // Any phrase atom (match or negated) takes the
-                // phrase-aware walk; plain-token queries keep the
-                // optimized token_match path unchanged.
-                let (docs, mut work) = match phrase_involved {
-                    true => {
-                        r.atoms_match_ids(&column_arc, &refs, &phrase_arc, match_mode)
-                            .await?
-                    }
-                    false => {
-                        r.token_match_prefetched(&column_arc, &refs, match_mode, memo.as_deref())
-                            .await?
-                    }
-                };
-                // Drop any positive match that also carries a negated
-                // atom (union of the negatives). The df / count fast
-                // paths can't express exclusion, so negation forces a
-                // materialized walk over both sets.
-                let docs = if has_negatives {
-                    let neg_refs: Vec<&str> = neg_arc.iter().map(|s| s.as_str()).collect();
-                    let (neg_docs, neg_work) = match neg_ph_arc.is_empty() {
-                        true => {
-                            r.token_match_prefetched(
-                                &column_arc,
-                                &neg_refs,
-                                BoolMode::Or,
-                                memo.as_deref(),
-                            )
-                            .await?
-                        }
-                        false => {
-                            r.atoms_match_ids(&column_arc, &neg_refs, &neg_ph_arc, BoolMode::Or)
-                                .await?
-                        }
-                    };
-                    work.merge(neg_work);
-                    let excluded: RoaringBitmap = neg_docs.into_iter().map(RowId::get).collect();
-                    docs.into_iter()
-                        .filter(|d| !excluded.contains(d.get()))
-                        .collect::<Vec<_>>()
-                } else {
-                    docs
-                };
-                // One flush per superfile: positive + negation walks.
-                if let Some(stats) = &op_stats {
-                    stats.add_fts_postings_bytes(work.postings_bytes);
-                    stats.add_planned_read_ranges(work.planned_ranges);
-                    stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
-                }
-                Ok(docs
-                    .into_iter()
-                    .map(|d| (d.get(), 0.0f32))
-                    .collect::<Vec<_>>())
-            }
+        let kernel = MatchKernel {
+            column_field_id: self.manifest().field_id(column),
+            column: column.to_owned(),
+            mode: match_set.mode,
+            phrase_involved: match_set.has_phrases() || !negatives.phrases.is_empty(),
+            has_negatives: !negatives.is_empty(),
+            terms: match_set.terms,
+            phrases: match_set.phrases,
+            negatives: negatives.terms,
+            negative_phrases: negatives.phrases,
+            locations,
+            op_stats: self.op_stats.clone(),
         };
-        let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_local_hits(self, units, kernel)
-            .instrument(fanout_span)
-            .await?;
-        // Exact pre-size: `Flatten`'s size_hint is opaque, and growth
-        // reallocations copy the whole hit vec repeatedly at 1M hits.
-        let total: usize = per_unit.iter().map(Vec::len).sum();
-        let mut hits: Vec<SuperfileHit> = Vec::with_capacity(total);
-        for unit in per_unit {
-            hits.extend(unit);
-        }
-        dispatch::attach_stable_ids_to_hits(self, &mut hits).await?;
-        Ok(hits)
+        Ok(Some((units, Arc::new(kernel))))
     }
 
     /// A single term's count, straight from the term index, or `None` when
@@ -2187,7 +2895,7 @@ impl SupertableReader {
             self,
             units,
             true,
-            ReadIntent::Warm,
+            self.open_intent(),
             move |r, entry, tombstone_cache, now, _params: ()| {
                 let op_stats = op_stats.clone();
                 let column_arc = Arc::clone(&column_arc);
@@ -2494,7 +3202,7 @@ impl SupertableReader {
             }
         };
         let fanout_span = trace::phase(phases, || tiered_span!("fts.fanout", units = units.len()));
-        let per_unit = dispatch::fanout_with(self, units, true, ReadIntent::Warm, body)
+        let per_unit = dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(fanout_span)
             .await?;
         let mut hits: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
@@ -2945,6 +3653,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
@@ -2997,6 +3708,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
@@ -3048,6 +3762,9 @@ impl Supertable {
             kernel_cpu_ns = tracing::field::Empty,
             planned_read_ranges = tracing::field::Empty,
             fts_postings_bytes = tracing::field::Empty,
+            tier_bytes = tracing::field::Empty,
+            tier_entries = tracing::field::Empty,
+            superfiles_resolved = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
@@ -3295,6 +4012,108 @@ mod tests {
     /// A tolerance raises the bar a superfile's ceiling has to clear, which
     /// is the whole mechanism: a ceiling that would have been read because it
     /// ties the k-th score is skipped once the caller accepts a shortfall.
+    /// A superfile whose ceiling ties the floor is skippable once `k`
+    /// scores are known and every one at the floor came from superfiles
+    /// below its `_id` range; a seed placeholder, or a floor score from a
+    /// superfile at or above that range, keeps it open.
+    /// Merging many scores at once (a sorted merge) keeps the same top-k
+    /// as inserting a few at a time, and a floor the walks have raised
+    /// drops what it already excludes.
+    #[test]
+    fn the_shared_floor_merges_many_scores_as_it_inserts_few() {
+        let k = 40;
+        let mut next = crate::test_helpers::xorshift(7);
+        let mut draw =
+            |n: usize| -> Vec<f32> { (0..n).map(|_| (next() % 10_000) as f32 / 100.0).collect() };
+        let (many, few) = (SharedTopK::new(k), SharedTopK::new(k));
+        let mut reference: Vec<f32> = Vec::new();
+        for (id_max, batch) in [(100i128, 200usize), (200, 7), (300, 150), (400, 3)] {
+            let scores = draw(batch);
+            reference.extend(&scores);
+            many.merge(id_max, scores.iter().copied());
+            for s in &scores {
+                few.merge(id_max, [*s]);
+            }
+            reference.sort_by(|a, b| b.total_cmp(a));
+            reference.truncate(k);
+            for (label, shared) in [("many", &many), ("few", &few)] {
+                let top: Vec<f32> = shared
+                    .top
+                    .lock()
+                    .expect("lock")
+                    .iter()
+                    .map(|e| e.score)
+                    .collect();
+                assert_eq!(top, reference, "{label} after id_max {id_max}");
+                assert_eq!(shared.floor(), reference[k - 1], "{label} floor");
+            }
+        }
+        // A walk raised the live floor past the k-th: a score under it is
+        // dropped before the lock, one equal to it still enters.
+        let raised = reference[k / 2];
+        let scores_of = |shared: &SharedTopK| -> Vec<f32> {
+            shared
+                .top
+                .lock()
+                .expect("lock")
+                .iter()
+                .map(|e| e.score)
+                .collect()
+        };
+        let at_raised = scores_of(&many).iter().filter(|s| **s == raised).count();
+        many.live_floor().raise(raised);
+        many.merge(500, [raised - 0.005, raised, raised + 0.005]);
+        let top = scores_of(&many);
+        assert_eq!(top.len(), k);
+        assert!(
+            top.contains(&(raised + 0.005)),
+            "above the raised floor enters"
+        );
+        assert_eq!(
+            top.iter().filter(|s| **s == raised).count(),
+            at_raised + 1,
+            "equal to the raised floor enters"
+        );
+        assert!(!top.contains(&(raised - 0.005)), "under it is dropped");
+    }
+
+    #[test]
+    fn a_tie_at_the_floor_is_skipped_only_behind_lower_ids() {
+        let shared = SharedTopK::new(3);
+        assert!(!shared.tie_skippable(1.0, 100), "no scores known yet");
+        shared.merge(300, [2.0, 1.0, 1.0]);
+        assert_eq!(shared.floor(), 1.0);
+        assert!(
+            !shared.tie_skippable(1.0, 100),
+            "ties from a superfile reaching id 300 are not settled for id 100"
+        );
+        assert!(
+            shared.tie_skippable(1.0, 400),
+            "but they are for one past it"
+        );
+        // Equal scores from a lower range take the tied places.
+        shared.merge(50, [1.0, 1.0]);
+        assert!(
+            shared.tie_skippable(1.0, 100),
+            "both ties now sit below id 100"
+        );
+        assert!(
+            !shared.tie_skippable(1.0, 50),
+            "a tie at id 50 is not below id 50"
+        );
+        let seeded = SharedTopK::new(2);
+        seeded.merge(i128::MAX, [1.0, 1.0]);
+        assert!(
+            !seeded.tie_skippable(1.0, 100),
+            "a seed is no document and justifies no skip"
+        );
+        seeded.merge(10, [1.0, 1.0]);
+        assert!(
+            seeded.tie_skippable(1.0, 100),
+            "real scores equal to the seeds replace them"
+        );
+    }
+
     #[test]
     fn a_tolerance_raises_the_bar() {
         let floor = 100.0f32;
@@ -3364,7 +4183,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BoolMode, FanOut, SuperfileHit, SupertableReader, build_work_units,
+        BoolMode, FanOut, SharedTopK, SuperfileHit, SupertableReader, build_work_units,
         ceilings_at_table_avgdl, fanout_for,
     };
     use crate::{

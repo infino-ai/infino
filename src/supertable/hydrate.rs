@@ -154,11 +154,30 @@ fn hydrate_with_budget(
             .try_reserve(wave_bytes as usize)
             .map_err(|e| BuildError::OverBudget(format!("during hydrate, {e}")))?;
 
+        // Reserve the wave's ids in chunk order, under one short lock, before
+        // the parallel build: ids are monotonic, so this gives the chunks
+        // contiguous ranges in input order, and a later merge of id-adjacent
+        // superfiles then keeps the rows in the order they were loaded.
+        // Reserving inside the build would hand the ranges out in whatever
+        // order the workers reached the lock.
+        let id_spans: Vec<Vec<(i128, i128)>> = {
+            let generator = inner
+                .id_generator
+                .lock()
+                .expect("id_generator mutex poisoned");
+            wave.iter()
+                .map(|chunk| generator.reserve_range(chunk.rows))
+                .collect()
+        };
+
         // Build the wave's superfiles in parallel and commit them together.
         // Committing per wave keeps only one wave in memory.
         let shards: Vec<ShardOutput> = build_pool.install(|| {
             wave.par_iter()
-                .map(|chunk| build_hydrate_shard(inner, &manifest, &base_opts, chunk))
+                .zip(id_spans.par_iter())
+                .map(|(chunk, spans)| {
+                    build_hydrate_shard(inner, &manifest, &base_opts, chunk, spans)
+                })
                 .collect::<Result<_, BuildError>>()
         })?;
         let rows: u64 = wave.iter().map(|chunk| chunk.rows as u64).sum();
@@ -268,14 +287,14 @@ impl Chunk {
 /// does), stream through [`SuperfileBuilder::build_no_blob_from_batches_to`], and
 /// wrap the bytes with the manifest metadata a publish needs.
 ///
-/// It runs on many rayon workers at once, and the id generator is their only
-/// shared state. So it reserves the chunk's whole id range under one short lock
-/// and builds the arrays outside it, and the workers don't queue on the lock.
+/// It runs on many rayon workers at once and shares nothing: the chunk's ids
+/// come in as `id_spans`, reserved by the caller in wave order.
 fn build_hydrate_shard(
     inner: &SupertableInner,
     manifest: &ManifestSnapshot,
     base_opts: &BuilderOptions,
     chunk: &Chunk,
+    id_spans: &[(i128, i128)],
 ) -> Result<ShardOutput, BuildError> {
     // `target_rows` is clamped to this, so only a single oversized input batch
     // can get here.
@@ -286,15 +305,7 @@ fn build_hydrate_shard(
         });
     }
 
-    // Reserve all ids for the chunk under one short lock. Ids are monotonic, so
-    // the min/max are just the first and last of the reserved spans.
-    let id_spans = {
-        let generator = inner
-            .id_generator
-            .lock()
-            .expect("id_generator mutex poisoned");
-        generator.reserve_range(chunk.rows)
-    };
+    // Ids are monotonic, so the min/max are the first and last of the spans.
     let id_min = id_spans.first().map_or(0, |&(first, _)| first);
     let id_max = id_spans.last().map_or(0, |&(_, last)| last);
     // Flatten the spans into one id per row, in row order (total == rows).
@@ -446,6 +457,12 @@ mod tests {
     const MANY_CORES: usize = 64;
     /// Smallest vector dim a table accepts.
     const EMB_DIM: usize = 16;
+    /// Chunks the ordering test builds in one wave: enough that a parallel
+    /// build reaching the id generator in completion order cannot stay in
+    /// input order by luck.
+    const ORDER_WAVE_CHUNKS: i64 = 64;
+    /// Rows per chunk in the ordering test, one batch each.
+    const ORDER_CHUNK_ROWS: i64 = 1_000;
 
     fn user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1050,6 +1067,48 @@ mod tests {
         let peak = table.inner().options.connection_memory_budget.peak() as u64;
         assert_eq!(peak, 2 * slot, "a wave held two chunks, no more");
         assert!(peak <= budget);
+    }
+
+    /// Ids follow the input order across a wave. The wave's chunks are built
+    /// in parallel, and the ids are what later orders the table: compaction
+    /// packs merge inputs by lowest id, so a load whose chunks got their id
+    /// ranges in build-completion order would come out of a merge with its
+    /// rows shuffled across the wave. With one batch per chunk and a budget
+    /// that admits the whole input, every chunk races in one wave; reading
+    /// the rows back by id must give them back in the order they were read.
+    #[test]
+    fn hydrate_keeps_input_order_across_a_wave() {
+        let (_dir, db, table) = table_with(ints_schema());
+        let batches: Vec<RecordBatch> = (0..ORDER_WAVE_CHUNKS)
+            .map(|i| ints_batch(i * ORDER_CHUNK_ROWS + 1, (i + 1) * ORDER_CHUNK_ROWS))
+            .collect();
+        let slot = as_chunk(&batches[0]).slot();
+        // Room for every chunk at once, so the whole input is one wave.
+        let budget = slot * (ORDER_WAVE_CHUNKS as u64 + 1);
+
+        let committed = hydrate_with_budget(
+            &table,
+            &mut reader(ints_schema(), batches),
+            ORDER_CHUNK_ROWS as usize,
+            MANY_CORES,
+            &mut || Some(budget),
+        )
+        .expect("hydrate");
+        assert_eq!(committed as i64, ORDER_WAVE_CHUNKS * ORDER_CHUNK_ROWS);
+        assert_eq!(
+            table.inner().manifest.load().get_all_superfiles().len(),
+            ORDER_WAVE_CHUNKS as usize,
+            "one superfile per batch"
+        );
+
+        let by_id = query(&db, "SELECT n FROM t ORDER BY _id");
+        let in_input_order: Vec<String> = (1..=ORDER_WAVE_CHUNKS * ORDER_CHUNK_ROWS)
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(
+            by_id, in_input_order,
+            "rows read back by id are in input order"
+        );
     }
 
     /// A small budget caps chunk size below `target_rows`.

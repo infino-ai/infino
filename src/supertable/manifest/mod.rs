@@ -77,7 +77,11 @@ use rustc_hash::FxHashSet;
 /// One column's statistics read in place, from a decoded map or a section
 /// row: the one access path the pruner, the planner and the commit share.
 pub use summaries::ColumnStats;
-use tokio::{join, sync::OnceCell, task::spawn_blocking};
+use tokio::{
+    join,
+    sync::OnceCell,
+    task::{JoinError, spawn, spawn_blocking},
+};
 use tracing::{Instrument, warn};
 use uuid::Uuid;
 use xxhash_rust::xxh3::xxh3_64;
@@ -1545,7 +1549,7 @@ impl ManifestSnapshot {
     }
 
     /// Whether a term-index rebuild would change anything: false when the
-    /// table is empty, or when the index is complete, has one segment, and
+    /// table is empty, or when the index is complete, has one layer, and
     /// lists exactly the live superfiles. An index that will never load is
     /// rebuilt; one that failed to load for now is an error.
     pub(crate) async fn needs_term_index_rebuild(
@@ -1565,11 +1569,11 @@ impl ManifestSnapshot {
             Err(e) => return Err(e),
         };
         let root = index.root();
-        // Every commit since the last rebuild appends a segment.
-        if root.segments.len() != 1 {
+        // Every commit since the last rebuild appends a layer.
+        if root.layers.len() != 1 {
             return Ok(true);
         }
-        // A commit that only removes superfiles appends no segment, so the
+        // A commit that only removes superfiles appends no layer, so the
         // root can still list superfiles that are gone.
         Ok(root.superfiles.len() != entries.len()
             || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))
@@ -2207,6 +2211,16 @@ impl ManifestSnapshot {
     ///   blake3 doesn't match the manifest list's recorded hash.
     /// - `OpenError::ManifestPartParse { … }` for Avro / zstd
     ///   decode failures.
+    ///
+    /// A cold load runs as a task of its own and lands in the part's cell
+    /// even if the caller is dropped midway (a cancelled query). Decoding a
+    /// part claims bytes from the loader's open-blob budget that are never
+    /// given back, so a load abandoned after its decode started and run
+    /// again would claim them twice, and repeated cancels would drain the
+    /// budget until opens stop getting their inline open blobs. Only loads
+    /// through here: [`Self::derive_length_totals`] decodes parts without
+    /// keeping them, so a BM25 query cancelled there, over a manifest that
+    /// records no length totals, decodes them again on its rerun.
     pub async fn get_part_by_id(
         &self,
         part_id: PartId,
@@ -2220,8 +2234,21 @@ impl ManifestSnapshot {
             .entry(part_id)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
-        let loaded = cell.get_or_try_init(|| loader.load(part_id)).await?;
-        Ok(Arc::clone(loaded))
+        if let Some(loaded) = cell.get() {
+            return Ok(Arc::clone(loaded));
+        }
+        let loader = Arc::clone(loader);
+        let loading = spawn(
+            async move {
+                cell.get_or_try_init(|| loader.load(part_id))
+                    .await
+                    .map(Arc::clone)
+            }
+            .in_current_span(),
+        );
+        loading
+            .await
+            .map_err(ManifestLoadError::task("part load"))?
     }
 
     /// Fp32 fine centroids for this USER manifest's stripped summary
@@ -3308,6 +3335,9 @@ pub struct ManifestPartLoader {
     /// new root and loads that instead. A root that can never load is kept
     /// as its failure.
     term_index: tokio::sync::Mutex<Option<TermIndexSlot>>,
+    /// The tier chunks read so far, shared by every root this loader goes
+    /// through: a delta commit replaces the root, not the tiers.
+    tier_chunks: term_index::TierChunkCache,
     /// Resolves the column names a part written before field ids used as
     /// summary keys.
     legacy: Arc<LegacyNames>,
@@ -3374,6 +3404,7 @@ impl ManifestPartLoader {
             prefer_routing,
             open_blob_budget: Arc::new(OpenBlobBudget::new(DEFAULT_OPEN_BLOB_BUDGET_BYTES)),
             term_index: tokio::sync::Mutex::new(None),
+            tier_chunks: term_index::new_tier_chunk_cache(),
             legacy: Arc::new(legacy),
         }
     }
@@ -3403,7 +3434,7 @@ impl ManifestPartLoader {
         .await
         {
             Ok(index) => {
-                let index = Arc::new(index);
+                let index = Arc::new(index.with_tier_chunk_cache(Arc::clone(&self.tier_chunks)));
                 *slot = Some(TermIndexSlot::Loaded(Arc::clone(&index)));
                 Ok(index)
             }
@@ -3525,7 +3556,7 @@ impl ManifestPartLoader {
         // Populate the cache for next time (best-effort; the hash was
         // verified above, satisfying `put`'s contract).
         if let Some(cache) = &self.manifest_disk_cache {
-            cache.put(*expected_hash, &bytes).await;
+            cache.put(*expected_hash, bytes).await;
         }
         Ok(parsed)
     }
@@ -3551,7 +3582,7 @@ impl ManifestPartLoader {
         let section =
             parse_summaries_off_thread(bytes.clone(), Some(reference.content_hash)).await?;
         if let Some(cache) = &self.manifest_disk_cache {
-            cache.put(reference.content_hash, &bytes).await;
+            cache.put(reference.content_hash, bytes).await;
         }
         Ok(Arc::new(section))
     }
@@ -3758,16 +3789,12 @@ async fn decode_part_off_thread(
     budget: Arc<OpenBlobBudget>,
     legacy: Arc<LegacyNames>,
 ) -> Result<ManifestPart, ManifestLoadError> {
-    match spawn_blocking(carry_span(move || {
+    let decoded = spawn_blocking(carry_span(move || {
         part::decode_with_blob_budget(&bytes, &budget, &legacy)
     }))
     .await
-    {
-        Ok(result) => Ok(result?),
-        Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
-            format!("part decode task failed: {join_error}"),
-        ))),
-    }
+    .map_err(ManifestLoadError::task("part decode"))?;
+    Ok(decoded?)
 }
 
 /// [`decode_part_off_thread`] preceded by a blake3 content-hash check on
@@ -3797,12 +3824,9 @@ async fn verify_and_decode_part_off_thread(
         }
         part::decode_with_blob_budget(&bytes, &budget, &legacy).map_err(ManifestLoadError::from)
     };
-    match spawn_blocking(carry_span(verify_then_decode)).await {
-        Ok(result) => result,
-        Err(join_error) => Err(ManifestLoadError::Parse(part::PartParseError::Avro(
-            format!("part verify/decode task failed: {join_error}"),
-        ))),
-    }
+    spawn_blocking(carry_span(verify_then_decode))
+        .await
+        .map_err(ManifestLoadError::task("part verify and decode"))?
 }
 
 /// Errors raised by [`ManifestSnapshot::part`] and [`ManifestPartLoader::load`].
@@ -3867,6 +3891,15 @@ pub enum ManifestLoadError {
     /// (see `attach_summaries`), with the error in the log.
     #[error("summaries section: {0}")]
     Summaries(#[from] SummariesError),
+    /// A task loading part of the manifest did not finish: it panicked, or
+    /// the runtime shut down under it. A fault of the engine's, not of the
+    /// bytes it was loading.
+    #[error("{what} task did not finish: {source}")]
+    Task {
+        what: &'static str,
+        #[source]
+        source: JoinError,
+    },
 }
 
 impl From<TermIndexError> for ManifestLoadError {
@@ -3877,6 +3910,11 @@ impl From<TermIndexError> for ManifestLoadError {
 
 impl ManifestLoadError {
     /// True when the backend refused the credentials in use.
+    /// Build [`Self::Task`] for the `what` task, to map a join error with.
+    fn task(what: &'static str) -> impl FnOnce(JoinError) -> Self {
+        move |source| Self::Task { what, source }
+    }
+
     pub(crate) fn is_permission_denied(&self) -> bool {
         match self {
             ManifestLoadError::Storage(e) => e.is_permission_denied(),
@@ -4269,11 +4307,12 @@ impl SuperfileUri {
         format!("seg-{}{SUPERFILE_KEY_SUFFIX}", self.0)
     }
 
-    /// Disk-cache tempfile name for download number `seq` of this superfile. Each download gets its
-    /// own: several can run at once (a foreground fetch, a background fill, a hybrid finalizer),
-    /// and two writers on one tempfile corrupt it.
-    pub fn cache_tmp_filename(self, seq: u64) -> String {
-        format!("{}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
+    /// Disk-cache tempfile name for download number `seq` of this superfile by process `pid`.
+    /// Each download gets its own: several can run at once (a foreground fetch, a background
+    /// fill, a hybrid finalizer, another store over the same directory), and two writers on one
+    /// tempfile corrupt it.
+    pub fn cache_tmp_filename(self, pid: u32, seq: u64) -> String {
+        format!("{}.{pid}.{seq}{CACHE_TMP_EXTENSION}", self.cache_filename())
     }
 
     /// Disk-cache filename for a copy of this superfile that holds everything but its vector blob,
@@ -4302,18 +4341,21 @@ impl SuperfileUri {
     }
 
     /// Inverse of [`Self::cache_tmp_filename`], so the disk cache can find and delete tempfiles a
-    /// crash left behind. Also accepts the unnumbered `seg-<uuid>.sf.parquet.tmp` older builds
-    /// wrote.
+    /// crash left behind. Also accepts the names older builds wrote: `seg-<uuid>.sf.parquet.<seq>.tmp`
+    /// and the unnumbered `seg-<uuid>.sf.parquet.tmp`.
     pub fn from_cache_tmp_filename(name: &str) -> Option<Self> {
-        let body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
-        let body = match body.rsplit_once('.') {
-            Some((cache_name, seq))
-                if !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit()) =>
-            {
-                cache_name
+        let mut body = name.strip_suffix(CACHE_TMP_EXTENSION)?;
+        // At most two numbers: the process id and the download number.
+        for _ in 0..2 {
+            match body.rsplit_once('.') {
+                Some((rest, number))
+                    if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    body = rest;
+                }
+                _ => break,
             }
-            _ => body,
-        };
+        }
         Self::from_cache_filename(body)
     }
 
@@ -6346,14 +6388,18 @@ mod tests {
                 Arc,
                 atomic::{AtomicUsize, Ordering},
             },
-            time::SystemTime,
+            time::{Duration, SystemTime},
         };
 
         use arrow_schema::{DataType, Field, Schema};
         use async_trait::async_trait;
         use bytes::Bytes;
         use dashmap::DashMap;
-        use tokio::{spawn, task::yield_now};
+        use tokio::{
+            spawn,
+            task::yield_now,
+            time::{sleep, timeout},
+        };
         use uuid::Uuid;
 
         use super::super::*;
@@ -6366,7 +6412,16 @@ mod tests {
                     part::{self as part_mod, ContentHash, ManifestPart, PartId},
                 },
             },
+            test_helpers::slow_storage::SlowStorage,
         };
+
+        /// How long the dropped-load test holds the part's read open, so the
+        /// test can drop the caller while the load is in flight.
+        const DROPPED_LOAD_READ_DELAY: Duration = Duration::from_millis(50);
+        /// How long the test waits for that read to start.
+        const DROPPED_LOAD_DEADLINE: Duration = Duration::from_secs(30);
+        /// Poll cadence while it waits.
+        const DROPPED_LOAD_POLL: Duration = Duration::from_millis(1);
 
         #[derive(Debug)]
         struct CountingMockStorage {
@@ -7086,6 +7141,47 @@ mod tests {
             assert_eq!(storage.get_call_count(), 1, "cache hit ⇒ no extra get");
         }
 
+        /// A load whose caller is dropped mid-read, as a cancelled query drops
+        /// it, still lands in the part's cell: the next touch joins it rather
+        /// than reading and decoding the part again. A second decode would
+        /// claim the part's open blobs from the loader's budget a second time.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_load_whose_caller_is_dropped_still_lands_in_the_cell() {
+            let part = make_test_part(17);
+            let (objects, entries) = encode_and_index(from_ref(&part));
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let slow = SlowStorage::wrap(
+                Arc::clone(&storage) as Arc<dyn StorageProvider>,
+                DROPPED_LOAD_READ_DELAY,
+            );
+            let manifest = Arc::new(build_manifest_with_loader(
+                fresh_list(entries),
+                Arc::clone(&slow) as Arc<dyn StorageProvider>,
+            ));
+
+            let caller = spawn({
+                let manifest = Arc::clone(&manifest);
+                async move { manifest.get_part_by_id(part.part_id).await.map(|_| ()) }
+            });
+            timeout(DROPPED_LOAD_DEADLINE, async {
+                while slow.reads() == 0 {
+                    sleep(DROPPED_LOAD_POLL).await;
+                }
+            })
+            .await
+            .expect("the part's read starts");
+            caller.abort();
+            assert!(caller.await.expect_err("aborted").is_cancelled());
+
+            let loaded = manifest.get_part_by_id(part.part_id).await.expect("load");
+            assert_eq!(loaded.part_id, part.part_id);
+            assert_eq!(
+                slow.reads(),
+                1,
+                "the dropped caller's load was joined, not repeated"
+            );
+        }
+
         #[tokio::test]
         async fn concurrent_loaders_coalesce_to_one_get() {
             let part = make_test_part(13);
@@ -7286,12 +7382,13 @@ mod tests {
         assert_eq!(uri.storage_path(), format!("data/seg-{id}.sf.parquet"));
         assert_eq!(uri.cache_filename(), format!("seg-{id}.sf.parquet"));
         assert_eq!(
-            uri.cache_tmp_filename(7),
-            format!("seg-{id}.sf.parquet.7.tmp")
+            uri.cache_tmp_filename(42, 7),
+            format!("seg-{id}.sf.parquet.42.7.tmp")
         );
-        // Numbered tempfiles, and the unnumbered ones older builds left behind, both map back.
+        // Numbered tempfiles, and the shapes older builds left behind, all map back.
         for name in [
-            uri.cache_tmp_filename(7),
+            uri.cache_tmp_filename(42, 7),
+            format!("seg-{id}.sf.parquet.7.tmp"),
             format!("seg-{id}.sf.parquet.tmp"),
         ] {
             assert_eq!(SuperfileUri::from_cache_tmp_filename(&name), Some(uri));

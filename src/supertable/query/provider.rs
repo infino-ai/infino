@@ -2194,11 +2194,14 @@ mod tests {
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
     use tokio::runtime;
 
     use super::*;
     use crate::{
+        config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::FtsConfig,
             fts::{
@@ -2210,9 +2213,12 @@ mod tests {
         supertable::{
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
-            query::read_ahead::fixture,
+            query::{read_ahead::fixture, sql::sql_session_context},
         },
-        test_helpers::{default_tokenizer, fid},
+        test_helpers::{
+            build_title_batch, default_supertable_options, default_tokenizer, fid,
+            lazy_foreground_disk_cache,
+        },
     };
 
     /// Per-column tokenizer resolver for the pruning-walker tests: every
@@ -3094,6 +3100,138 @@ mod tests {
             &provider.prepared_scan_files,
             &restricted.prepared_scan_files
         ));
+    }
+
+    // ---- Doc-id map on a cold SQL scan ---------------------------------
+
+    /// Rows in each of the two commits the doc-id map fixture merges. The
+    /// merge reorders its documents and writes a map of 4 bytes a document,
+    /// here about a megabyte: more than the window a cold open's reads pull
+    /// in around them, so the open does not hold the map already, as it does
+    /// not on a large file.
+    const MAP_FIXTURE_ROWS: usize = 140_000;
+    /// Compaction target for the fixture, in MiB: past both commits
+    /// together, so the merge makes one file of them.
+    const MAP_FIXTURE_TARGET_MB: u64 = 64;
+    /// Words the fixture's titles are drawn from, shared across rows so the
+    /// merge has terms to group documents by.
+    const MAP_FIXTURE_WORDS: usize = 37;
+    /// The one row holding [`MAP_FIXTURE_NEEDLE`].
+    const MAP_FIXTURE_NEEDLE_ROW: usize = 1_234;
+    /// A word in exactly one row, so an `ILIKE` on it is selective enough
+    /// for the index to answer.
+    const MAP_FIXTURE_NEEDLE: &str = "needle";
+
+    /// A table of one file whose FTS section carries a doc-id map, reopened
+    /// cold behind a lazily filled disk cache, and a provider over it.
+    fn provider_over_a_mapped_file() -> (Arc<SupertableProvider>, SessionContext, TempDir, TempDir)
+    {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        {
+            let table = Supertable::create(options()).expect("create");
+            for commit in 0..2 {
+                let titles: Vec<String> = (0..MAP_FIXTURE_ROWS)
+                    .map(|i| {
+                        let row = commit * MAP_FIXTURE_ROWS + i;
+                        let words = format!(
+                            "w{} w{}",
+                            row % MAP_FIXTURE_WORDS,
+                            row / MAP_FIXTURE_WORDS % MAP_FIXTURE_WORDS
+                        );
+                        match row == MAP_FIXTURE_NEEDLE_ROW {
+                            true => format!("{words} {MAP_FIXTURE_NEEDLE}"),
+                            false => words,
+                        }
+                    })
+                    .collect();
+                let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+                let mut writer = table.writer().expect("writer");
+                writer.append(&build_title_batch(&refs)).expect("append");
+                writer.commit().expect("commit");
+            }
+            table
+                .optimize(&OptimizeOptions::compact(CompactionSettings {
+                    target_superfile_size_mb: MAP_FIXTURE_TARGET_MB,
+                    min_fill_percent: 1,
+                    ..CompactionSettings::default()
+                }))
+                .expect("optimize");
+        }
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+        let table = Supertable::open(options().with_disk_cache(cache)).expect("open");
+        let reader = table.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 1, "the merge left one file");
+        let provider = Arc::new(SupertableProvider::new(
+            reader.sql_schemas().scan().clone(),
+            Arc::clone(reader.manifest()),
+            Arc::clone(&table.options().store),
+            table.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        ));
+        let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
+        ctx.register_table(TABLE_NAME, Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register");
+        (provider, ctx, storage_dir, cache_dir)
+    }
+
+    /// Whether each file the provider opened has read its doc-id map.
+    fn doc_maps_read(provider: &SupertableProvider) -> Vec<bool> {
+        provider
+            .prepared_scan_files
+            .iter()
+            .map(|cell| {
+                let fts = cell
+                    .value()
+                    .get()
+                    .expect("prepared")
+                    .reader
+                    .fts()
+                    .expect("fts");
+                assert!(fts.has_doc_map(), "the merge must reorder to mean anything");
+                fts.doc_map_is_read()
+            })
+            .collect()
+    }
+
+    /// A cold SQL scan reads none of a file's doc-id map: a query on other
+    /// columns never needs it, and on a large file the map is hundreds of
+    /// megabytes. An `ILIKE` the index answers reads it once a value
+    /// matched, and not for a word in no row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cold_sql_scan_reads_a_doc_id_map_only_for_an_ilike_that_matched() {
+        let (provider, ctx, _storage_dir, _cache_dir) = provider_over_a_mapped_file();
+        let run = |sql: String| {
+            let ctx = ctx.clone();
+            async move {
+                ctx.sql(&sql)
+                    .await
+                    .expect("plan")
+                    .collect()
+                    .await
+                    .expect("run")
+            }
+        };
+
+        run("SELECT COUNT(*) FROM supertable WHERE substr(title, 1, 2) = 'w1'".to_string()).await;
+        assert_eq!(doc_maps_read(&provider), [false], "a scan read the map");
+
+        run("SELECT COUNT(*) FROM supertable WHERE title ILIKE '%zzqq%'".to_string()).await;
+        assert_eq!(
+            doc_maps_read(&provider),
+            [false],
+            "a match of no row read the map"
+        );
+
+        let hits = run(format!(
+            "SELECT title FROM supertable WHERE title ILIKE '%{MAP_FIXTURE_NEEDLE}%'"
+        ))
+        .await;
+        assert_eq!(hits.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+        assert_eq!(doc_maps_read(&provider), [true], "a match read no map");
     }
 
     // ---- Scalar aggregate helpers over a numeric column -------------

@@ -73,6 +73,10 @@ fn table(dir: &TempDir) -> Supertable {
     let options = SupertableOptions::new(schema(), vec![FtsConfig::new("title")], vec![])
         .expect("options")
         .with_storage(storage)
+        // The tolerance under test loosens the ceiling-ordered walk; with tiers
+        // exact scoring already opens only the holders, leaving a tolerance
+        // nothing to skip, so this table keeps none.
+        .with_term_tier_entries_per_term(0)
         .with_bound_ordered_open_window(1);
     let st = Supertable::create(options).expect("create");
     let mut w = st.writer().expect("writer");

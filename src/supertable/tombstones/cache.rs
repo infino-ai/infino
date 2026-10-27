@@ -221,6 +221,13 @@ impl SidecarCache {
     /// state this issues zero GETs. A per-id refresh error is left
     /// for the later [`Self::bitmap_for`] call to surface; the batch
     /// never fails as a whole.
+    /// Whether the manifest this cache follows records tombstones for
+    /// `superfile_id` at all, from the sequence view alone: no sidecar is
+    /// read. A superfile without them has every row live.
+    pub fn may_have_tombstones(&self, superfile_id: Uuid) -> bool {
+        self.seq_view.load().seqs.contains_key(&superfile_id)
+    }
+
     pub async fn prefetch(&self, superfile_ids: &[Uuid], now: Instant) {
         let view = self.seq_view.load();
         let stale: Vec<(Uuid, u64)> = superfile_ids

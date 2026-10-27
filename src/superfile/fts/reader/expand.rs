@@ -709,7 +709,9 @@ impl FtsReader {
             work.kernel_cpu_ns += ns;
             bits = ored?;
         }
-        let doc_map = self.doc_map.clone();
+        // Read here, after the postings: a superfile no value matched returned
+        // above and never reads it.
+        let doc_map = self.ensure_doc_map().await?.clone();
         let (rows, ns) = run_on_pool(pool, "contains rows", move || {
             timed_section(|| rows_of(bits, &inline, n_docs, &doc_map))
         })

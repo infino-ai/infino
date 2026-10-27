@@ -40,7 +40,7 @@ use crate::{
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
-        id_space::{FtsDocId, RowId, RowSet},
+        id_space::{DocMap, FtsDocId, RowId, RowSet},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -507,7 +507,36 @@ impl FtsReader {
         (distinct, qtf)
     }
 
+    /// The doc-id map for a filter: read now when it checks rows against an
+    /// allow set, and the identity otherwise, which such a filter never
+    /// consults.
+    async fn filter_doc_map(&self, checks_rows: bool) -> Result<DocMap, FtsError> {
+        match checks_rows {
+            true => Ok(self.ensure_doc_map().await?.clone()),
+            false => Ok(DocMap::Identity),
+        }
+    }
+
     pub(crate) async fn prepare_clauses(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+        floor: f32,
+    ) -> Result<PreparedClauses, FtsError> {
+        let prep = self.build_clauses(column, lists, k, floor).await?;
+        // The scoring that follows may run on the reader pool and translates
+        // its hits there, so the map is read now, on this runtime, when there
+        // can be a hit; a superfile without the terms never reads it.
+        if prep.may_hit() {
+            self.ensure_doc_map().await?;
+        }
+        Ok(prep)
+    }
+
+    /// [`Self::prepare_clauses`] before the doc-id map: the cursors, or the
+    /// final hits in blob ids.
+    async fn build_clauses(
         &self,
         column: &str,
         lists: ClauseLists<'_>,
@@ -599,15 +628,31 @@ impl FtsReader {
                 + must_dict
                 + should_dict
                 + negative_dict;
+            // No positive atom of the query is in this superfile, so nothing
+            // here can match: return before the filter, which would read the
+            // doc-id map to check rows there are none of.
+            if must_atoms.is_empty() && should_atoms.is_empty() {
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    count: 0,
+                    exact_count: lists.exact_count,
+                    postings_bytes,
+                    planned_ranges,
+                    kernel_cpu_ns: 0,
+                });
+            }
             // The gate exists when there is anything to gate on: a negated
             // atom, or a pushed-down row set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => Some(AtomExcludeFilter::with_allow(
-                    negative_atoms,
-                    allow.map(RowSet::new),
-                    self.doc_map.clone(),
-                )),
+                (_, allow) => {
+                    let doc_map = self.filter_doc_map(allow.is_some()).await?;
+                    Some(AtomExcludeFilter::with_allow(
+                        negative_atoms,
+                        allow.map(RowSet::new),
+                        doc_map,
+                    ))
+                }
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -635,7 +680,9 @@ impl FtsReader {
         }
 
         // Negatives are a hard exclusion filter that only seeks doc ids, so
-        // they are built to count: no tfs, idf or bounds.
+        // they are built to count: no tfs, idf or bounds. They come from the
+        // memo like the scored terms where the index located them; a lazy
+        // reader otherwise fetches the dictionary whole to find them.
         let neg_cursors = match lists.negatives {
             [] => Vec::new(),
             negatives => {
@@ -645,24 +692,34 @@ impl FtsReader {
                     QueryIdf::ThisFile,
                     CursorUse::Count,
                     None,
-                    None,
+                    lists.prefetched,
                 )
                 .await?
             }
         };
         // term-dictionary ranges the builds below request — one per
-        // `build_term_cursors` call (the dictionary fetch is a real
-        // byte-source range on every query, warm or cold).
-        let mut dict_ranges = u64::from(!lists.negatives.is_empty());
+        // `build_term_cursors` call that the memo does not cover (the
+        // dictionary fetch is a real byte-source range on every query,
+        // warm or cold).
+        let negatives_from_memo = lists
+            .prefetched
+            .is_some_and(|m| lists.negatives.iter().all(|t| m.contains(t)));
+        let mut dict_ranges = u64::from(!lists.negatives.is_empty() && !negatives_from_memo);
         // The gate exists when there is anything to gate on: a negated
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => Some(ExcludeFilter::with_allow(
-                neg_cursors,
-                allow.map(RowSet::new),
-                self.doc_map.clone(),
-            )),
+            (_, allow) => {
+                // The positive terms are resolved below, after the filter;
+                // with an allow set the map is read here so a filter that
+                // checks rows always holds the real one.
+                let doc_map = self.filter_doc_map(allow.is_some()).await?;
+                Some(ExcludeFilter::with_allow(
+                    neg_cursors,
+                    allow.map(RowSet::new),
+                    doc_map,
+                ))
+            }
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the
@@ -841,11 +898,20 @@ impl FtsReader {
     /// translating ids does not disturb that. The unranked siblings
     /// promise ascending ids instead, which translation *does* disturb,
     /// so they use [`Self::ids_to_rows`].
-    #[inline]
-    pub(super) fn hits_to_rows(&self, hits: Vec<(FtsDocId, f32)>) -> Vec<(RowId, f32)> {
-        hits.into_iter()
-            .map(|(doc, score)| (self.row_of(doc), score))
-            .collect()
+    ///
+    /// No hits read no map.
+    pub(super) fn hits_to_rows(
+        &self,
+        hits: Vec<(FtsDocId, f32)>,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let map = self.doc_map()?;
+        Ok(hits
+            .into_iter()
+            .map(|(doc, score)| (map.row_of(doc), score))
+            .collect())
     }
 
     /// Translate an unranked kernel's doc ids into Parquet rows, kept
@@ -857,13 +923,18 @@ impl FtsReader {
     /// pass decodes them in order. On a blob storing its documents in an
     /// order of its own those are different orders, so this re-sorts;
     /// there is nothing to re-sort when there is no map.
-    #[inline]
-    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Vec<RowId> {
-        let mut rows: Vec<RowId> = ids.into_iter().map(|id| self.row_of(id)).collect();
+    ///
+    /// No ids read no map.
+    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Result<Vec<RowId>, FtsError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let map = self.doc_map()?;
+        let mut rows: Vec<RowId> = ids.into_iter().map(|id| map.row_of(id)).collect();
         if self.has_doc_map() {
             rows.sort_unstable();
         }
-        rows
+        Ok(rows)
     }
 
     pub(crate) fn run_prepared(
@@ -871,7 +942,7 @@ impl FtsReader {
         prep: PreparedClauses,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.run_prepared_in_blob_ids(prep)
-            .map(|h| self.hits_to_rows(h))
+            .and_then(|h| self.hits_to_rows(h))
     }
 
     /// [`Self::search_excluding`] scoring every match in one pass: the
@@ -956,7 +1027,7 @@ impl FtsReader {
                 ..
             } => self.run_windowed_union_counted(column_id, cursors, k, filter.as_mut())?,
         };
-        Ok((self.hits_to_rows(hits), count))
+        Ok((self.hits_to_rows(hits)?, count))
     }
 
     /// [`Self::run_prepared`] without the translation, for the one caller
@@ -1088,6 +1159,10 @@ impl FtsReader {
             self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
                 .await?
         };
+        // Each slice's search translates its hits off this runtime.
+        if !cursors.is_empty() {
+            self.ensure_doc_map().await?;
+        }
         Ok(OrCursorSet { column_id, cursors })
     }
 
@@ -1124,7 +1199,7 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
-        .map(|h| self.hits_to_rows(h))
+        .and_then(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each

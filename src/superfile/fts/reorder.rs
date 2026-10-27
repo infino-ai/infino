@@ -35,14 +35,23 @@
 //! an order, so it can be tested against the cost it claims to lower.
 
 use std::{
-    mem,
+    fmt, mem,
     sync::{
         Mutex, PoisonError,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
+    time::Instant,
 };
 
-use rayon::{join, prelude::*};
+#[cfg(feature = "detailed-tracing")]
+use rayon::current_thread_index;
+use rayon::{current_num_threads, join, prelude::*};
+use tracing::Span;
+
+use crate::{
+    runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+    utils::trace::detail_span,
+};
 
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
@@ -126,6 +135,11 @@ pub(crate) struct Bisect<'a> {
     params: BisectParams,
     /// `f64` bits of the reference gain per document; `0` until a round sets it.
     reference: &'a AtomicU64,
+    /// Where splits report what they did.
+    report: &'a RunReport,
+    /// Parent for the spans splits open. Set explicitly because a rayon task
+    /// stolen by another thread runs under whatever span that thread has open.
+    parent: &'a Span,
 }
 
 impl Bisect<'_> {
@@ -168,6 +182,243 @@ impl Default for BisectParams {
             max_rounds: REORDER_MAX_ROUNDS,
         }
     }
+}
+
+/// Splits at least this large get a span of their own. Smaller ones only add
+/// to their depth's totals in [`BisectReport`].
+const SPLIT_SPAN_MIN_DOCS: usize = 1 << 20;
+
+/// Parallel partitions at least this large get a span showing the thread they
+/// ran on. Deep enough that a large run spreads over every core, shallow
+/// enough that a 30M-document run opens a few hundred spans, not thousands.
+const PARALLEL_SPAN_MIN_DOCS: usize = 1 << 18;
+
+/// Bisections running in this process right now.
+static RUNNING: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether splits measure what they did for [`BisectReport`]. Off in normal
+/// builds, so the clocks and extra cost passes cost nothing there.
+const REPORT: bool = cfg!(any(test, feature = "detailed-tracing"));
+
+/// What one bisection did, by depth. Only for spans and tests: nothing here
+/// changes the order.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct BisectReport {
+    /// The gain per document the convergence test measures rounds against.
+    /// Zero when the root moved nothing.
+    pub(crate) reference: f64,
+    /// Threads in the pool the bisection ran on.
+    pub(crate) pool_threads: usize,
+    /// Other bisections running in this process when this one started and
+    /// when it ended. They share the pool with it.
+    pub(crate) others_at_start: usize,
+    pub(crate) others_at_end: usize,
+    /// `levels[depth]` sums every split made at that depth.
+    pub(crate) levels: Vec<LevelReport>,
+}
+
+impl BisectReport {
+    /// All depths added together.
+    pub(crate) fn total(&self) -> LevelReport {
+        let mut total = LevelReport::default();
+        for level in &self.levels {
+            total.add(level);
+        }
+        total
+    }
+}
+
+impl fmt::Display for BisectReport {
+    /// One line per depth.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (depth, level) in self.levels.iter().enumerate() {
+            if level.splits > 0 || level.localized > 0 {
+                writeln!(f, "d{depth} {level}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The splits made at one depth, added together.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LevelReport {
+    pub(crate) splits: u64,
+    /// Documents across those splits.
+    pub(crate) docs: u64,
+    pub(crate) rounds: u64,
+    /// Document pairs swapped across the split.
+    pub(crate) swaps: u64,
+    /// Splits that ended on a round that moved nothing.
+    pub(crate) settled: u64,
+    /// Splits the convergence test ended.
+    pub(crate) converged: u64,
+    /// Splits still moving documents when they hit the round ceiling.
+    pub(crate) capped: u64,
+    /// Sum of the gains the rounds chose their swaps by, taken before any
+    /// swap is applied.
+    pub(crate) predicted_gain: f64,
+    /// How much the cost really fell over those rounds.
+    pub(crate) actual_gain: f64,
+    /// Rounds that moved documents but did not lower the cost.
+    pub(crate) wasted_rounds: u64,
+    /// Partitions whose terms were renumbered here.
+    pub(crate) localized: u64,
+    pub(crate) localize_ns: u64,
+    /// Time in the splits, added across threads.
+    pub(crate) split_ns: u64,
+    /// Splits large enough to run in parallel, and their time per step.
+    pub(crate) parallel_splits: u64,
+    pub(crate) count_ns: u64,
+    pub(crate) gains_ns: u64,
+    pub(crate) rank_ns: u64,
+    pub(crate) swap_ns: u64,
+    /// Thread CPU time in the count, gains and swap steps, which run on one
+    /// thread. Far below their wall time means the thread was waiting for a
+    /// core. Zero where there is no thread CPU clock.
+    pub(crate) serial_cpu_ns: u64,
+    /// Time a parallel split waited in `join` after both its halves were done,
+    /// running other work it had picked up from the pool.
+    pub(crate) held_ns: u64,
+}
+
+impl LevelReport {
+    /// Count what a round that moved documents really lowered the cost by.
+    fn record_actual(&mut self, gain: f64) {
+        self.actual_gain += gain;
+        if gain <= 0.0 {
+            self.wasted_rounds += 1;
+        }
+    }
+
+    fn add(&mut self, other: &LevelReport) {
+        self.splits += other.splits;
+        self.docs += other.docs;
+        self.rounds += other.rounds;
+        self.swaps += other.swaps;
+        self.settled += other.settled;
+        self.converged += other.converged;
+        self.capped += other.capped;
+        self.predicted_gain += other.predicted_gain;
+        self.actual_gain += other.actual_gain;
+        self.wasted_rounds += other.wasted_rounds;
+        self.localized += other.localized;
+        self.localize_ns += other.localize_ns;
+        self.split_ns += other.split_ns;
+        self.parallel_splits += other.parallel_splits;
+        self.count_ns += other.count_ns;
+        self.gains_ns += other.gains_ns;
+        self.rank_ns += other.rank_ns;
+        self.swap_ns += other.swap_ns;
+        self.serial_cpu_ns += other.serial_cpu_ns;
+        self.held_ns += other.held_ns;
+    }
+}
+
+impl fmt::Display for LevelReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ms = |ns: u64| ns / 1_000_000;
+        write!(
+            f,
+            "splits={} docs={} rounds={} swaps={} settled={} converged={} capped={} \
+             predicted={:.0} actual={:.0} wasted_rounds={} localized={} localize_ms={} \
+             split_ms={}",
+            self.splits,
+            self.docs,
+            self.rounds,
+            self.swaps,
+            self.settled,
+            self.converged,
+            self.capped,
+            self.predicted_gain,
+            self.actual_gain,
+            self.wasted_rounds,
+            self.localized,
+            ms(self.localize_ns),
+            ms(self.split_ns),
+        )?;
+        if self.parallel_splits > 0 {
+            write!(
+                f,
+                " parallel_splits={} count_ms={} gains_ms={} rank_ms={} swap_ms={} \
+                 serial_cpu_ms={} held_ms={}",
+                self.parallel_splits,
+                ms(self.count_ns),
+                ms(self.gains_ns),
+                ms(self.rank_ns),
+                ms(self.swap_ns),
+                ms(self.serial_cpu_ns),
+                ms(self.held_ns),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Collects the splits' reports while a bisection runs.
+#[derive(Debug)]
+struct RunReport {
+    levels: Mutex<Vec<LevelReport>>,
+    /// Parent for the split spans, since rayon tasks lose the current span.
+    span: Span,
+}
+
+impl RunReport {
+    fn new() -> Self {
+        Self {
+            levels: Mutex::new(Vec::new()),
+            span: Span::current(),
+        }
+    }
+
+    fn add(&self, depth: u32, level: &LevelReport) {
+        let mut levels = self.levels.lock().unwrap_or_else(PoisonError::into_inner);
+        let depth = depth as usize;
+        if levels.len() <= depth {
+            levels.resize(depth + 1, LevelReport::default());
+        }
+        levels[depth].add(level);
+    }
+
+    /// Add a state's reports, indexed by depth, under one lock.
+    fn add_all(&self, levels: &[LevelReport]) {
+        let mut all = self.levels.lock().unwrap_or_else(PoisonError::into_inner);
+        if all.len() < levels.len() {
+            all.resize(levels.len(), LevelReport::default());
+        }
+        for (into, level) in all.iter_mut().zip(levels) {
+            into.add(level);
+        }
+    }
+
+    fn finish(self, reference: f64) -> BisectReport {
+        BisectReport {
+            reference,
+            pool_threads: current_num_threads(),
+            others_at_start: 0,
+            others_at_end: 0,
+            levels: self
+                .levels
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+}
+
+/// How a split's rounds ended.
+#[derive(Debug, Clone, Copy)]
+enum SplitEnd {
+    /// A round moved nothing.
+    Settled,
+    /// The convergence test stopped it.
+    Converged,
+    /// It ran out of rounds while still moving documents.
+    Capped,
+}
+
+/// Nanoseconds since `start`.
+fn ns_since(start: Instant) -> u64 {
+    start.elapsed().as_nanos() as u64
 }
 
 /// Recursion depth cap, so a pathological corpus cannot drive the
@@ -258,23 +509,40 @@ impl ForwardIndex {
 ///
 /// The identity when there is nothing to gain, which is a corpus too
 /// small to split or one whose documents share no terms.
+#[cfg(test)]
 pub(crate) fn bisect_order(fwd: &ForwardIndex, params: BisectParams) -> Vec<u32> {
+    bisect_order_reported(fwd, params).0
+}
+
+/// The order to store documents in, as `bisect_order` returns it, plus what
+/// the bisection did to get there.
+pub(crate) fn bisect_order_reported(
+    fwd: &ForwardIndex,
+    params: BisectParams,
+) -> (Vec<u32>, BisectReport) {
+    let others_at_start = RUNNING.fetch_add(1, Relaxed);
     let n = fwd.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
-    if n <= MIN_PARTITION {
-        return order;
-    }
-    let pool = StatePool {
-        n_terms: fwd.n_terms,
-        free: Mutex::new(Vec::new()),
-    };
+    let report = RunReport::new();
     let reference = AtomicU64::new(0);
-    let run = Bisect {
-        params,
-        reference: &reference,
-    };
-    split_parallel(fwd, &mut order, 0, &pool, run);
-    order
+    if n > MIN_PARTITION {
+        let pool = StatePool {
+            n_terms: fwd.n_terms,
+            free: Mutex::new(Vec::new()),
+        };
+        let run = Bisect {
+            params,
+            reference: &reference,
+            report: &report,
+            parent: &report.span,
+        };
+        split_parallel(fwd, &mut order, 0, &pool, run);
+    }
+    let reference = f64::from_bits(reference.load(Relaxed));
+    let mut report = report.finish(reference);
+    report.others_at_start = others_at_start;
+    report.others_at_end = RUNNING.fetch_sub(1, Relaxed) - 1;
+    (order, report)
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
@@ -290,7 +558,18 @@ fn split_parallel(
         return;
     }
     if localizing_pays(fwd, order) {
+        let started = REPORT.then(Instant::now);
         let local = pool.with_state(|state| state.localize(fwd, order));
+        if let Some(started) = started {
+            run.report.add(
+                depth,
+                &LevelReport {
+                    localized: 1,
+                    localize_ns: ns_since(started),
+                    ..LevelReport::default()
+                },
+            );
+        }
         let mut inner: Vec<u32> = (0..order.len() as u32).collect();
         let inner_pool = StatePool {
             n_terms: local.n_terms,
@@ -303,16 +582,54 @@ fn split_parallel(
     if order.len() < PARALLEL_MIN_PARTITION {
         // Both of `split`'s entry tests have just been made above, against
         // this same partition.
-        pool.with_state(|state| state.split_halves(fwd, order, depth, run));
+        pool.with_state(|state| {
+            state.split_halves(fwd, order, depth, run);
+            state.flush(run.report);
+        });
         return;
     }
+    let span = match order.len() >= PARALLEL_SPAN_MIN_DOCS {
+        true => detail_span!(
+            "reorder_split_parallel",
+            parent: run.parent,
+            depth = depth,
+            docs = order.len(),
+            worker = current_thread_index(),
+        ),
+        false => Span::none(),
+    };
+    let run = match span.is_none() {
+        true => run,
+        false => Bisect {
+            parent: &span,
+            ..run
+        },
+    };
     let mid = order.len() / 2;
-    pool.with_state(|state| state.refine(fwd, order, mid, depth, true, run));
+    pool.with_state(|state| {
+        state.refine(fwd, order, mid, depth, true, run);
+        state.flush(run.report);
+    });
     let (left, right) = order.split_at_mut(mid);
-    join(
-        || split_parallel(fwd, left, depth + 1, pool, run),
-        || split_parallel(fwd, right, depth + 1, pool, run),
+    let (left_done, right_done) = join(
+        || {
+            split_parallel(fwd, left, depth + 1, pool, run);
+            REPORT.then(Instant::now)
+        },
+        || {
+            split_parallel(fwd, right, depth + 1, pool, run);
+            REPORT.then(Instant::now)
+        },
     );
+    if let (Some(left_done), Some(right_done)) = (left_done, right_done) {
+        run.report.add(
+            depth,
+            &LevelReport {
+                held_ns: ns_since(left_done.max(right_done)),
+                ..LevelReport::default()
+            },
+        );
+    }
 }
 
 /// Whether renumbering this partition's terms would pay for itself.
@@ -398,6 +715,10 @@ struct BisectState {
     /// millions of them over a corpus-sized bisection.
     left_gains: Vec<(f32, u32)>,
     right_gains: Vec<(f32, u32)>,
+    /// Reports of the splits this state made, by depth, until
+    /// [`Self::flush`] adds them to the run's. Saves taking the shared lock
+    /// once per split.
+    levels: Vec<LevelReport>,
 }
 
 impl BisectState {
@@ -412,7 +733,24 @@ impl BisectState {
             touched: Vec::new(),
             left_gains: Vec::new(),
             right_gains: Vec::new(),
+            levels: Vec::new(),
         }
+    }
+
+    fn note(&mut self, depth: u32, level: &LevelReport) {
+        let depth = depth as usize;
+        if self.levels.len() <= depth {
+            self.levels.resize(depth + 1, LevelReport::default());
+        }
+        self.levels[depth].add(level);
+    }
+
+    fn flush(&mut self, report: &RunReport) {
+        if self.levels.is_empty() {
+            return;
+        }
+        report.add_all(&self.levels);
+        self.levels.clear();
     }
 
     /// Renumber the terms this partition carries into a dense range and
@@ -465,9 +803,22 @@ impl BisectState {
             return;
         }
         if localizing_pays(fwd, order) {
+            let started = REPORT.then(Instant::now);
             let local = self.localize(fwd, order);
+            if let Some(started) = started {
+                self.note(
+                    depth,
+                    &LevelReport {
+                        localized: 1,
+                        localize_ns: ns_since(started),
+                        ..LevelReport::default()
+                    },
+                );
+            }
             let mut inner: Vec<u32> = (0..order.len() as u32).collect();
-            BisectState::new(local.n_terms).split(&local, &mut inner, depth, run);
+            let mut inner_state = BisectState::new(local.n_terms);
+            inner_state.split(&local, &mut inner, depth, run);
+            inner_state.flush(run.report);
             apply_inner_order(order, &inner);
             return;
         }
@@ -500,11 +851,52 @@ impl BisectState {
         parallel: bool,
         run: Bisect<'_>,
     ) {
+        let started = REPORT.then(Instant::now);
+        let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
+            true => detail_span!(
+                "reorder_split",
+                parent: run.parent,
+                depth = depth,
+                docs = order.len(),
+                rounds = tracing::field::Empty,
+                swaps = tracing::field::Empty,
+                end = tracing::field::Empty,
+                predicted_gain = tracing::field::Empty,
+                actual_gain = tracing::field::Empty,
+                count_ms = tracing::field::Empty,
+                gains_ms = tracing::field::Empty,
+                rank_ms = tracing::field::Empty,
+                swap_ms = tracing::field::Empty,
+                serial_cpu_ms = tracing::field::Empty,
+            ),
+            false => Span::none(),
+        };
+        let _entered = span.enter();
+        // Per-step clocks only on the large splits, where they cost nothing
+        // next to the step.
+        let timed = parallel && REPORT;
+        let mut level = LevelReport {
+            splits: 1,
+            docs: order.len() as u64,
+            parallel_splits: u64::from(timed),
+            ..LevelReport::default()
+        };
+        let mut end = SplitEnd::Capped;
+
+        let step = timed.then(Instant::now);
+        let cpu = timed.then(thread_cpu_ns).flatten();
         self.count_degrees(fwd, order, mid);
+        if let Some(step) = step {
+            level.count_ns += ns_since(step);
+            level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
+        }
         let n_left = mid as f32;
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
+        // The cost before the last round that moved documents, until the next
+        // gain pass measures what that round really bought.
+        let mut cost_before: Option<f64> = None;
 
         // Taken out of `self` so the ranking can borrow the move-gain
         // tables while writing them, and put back before returning so the
@@ -520,8 +912,19 @@ impl BisectState {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
-            let (moved, round_gain) = {
+            let (moved, round_gain, round_cost) = {
+                let cost = REPORT.then(|| self.partition_cost(n_left, n_right));
+                if let (Some(before), Some(cost)) = (cost_before.take(), cost) {
+                    level.record_actual(before - cost);
+                }
+                let step = timed.then(Instant::now);
+                let cpu = timed.then(thread_cpu_ns).flatten();
                 self.compute_move_gains(n_left, n_right);
+                if let Some(step) = step {
+                    level.gains_ns += ns_since(step);
+                    level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
+                }
+                let step = timed.then(Instant::now);
                 let (left, right) = order.split_at_mut(mid);
                 rank_by_gain(fwd, left, &self.move_gain_left, parallel, &mut left_gains);
                 rank_by_gain(
@@ -541,7 +944,12 @@ impl BisectState {
                 let mut ready = last_swaps.saturating_mul(2).max(SWAP_BLOCK).min(pairs);
                 order_leading_gains(&mut left_gains, ready, parallel);
                 order_leading_gains(&mut right_gains, ready, parallel);
+                if let Some(step) = step {
+                    level.rank_ns += ns_since(step);
+                }
 
+                let step = timed.then(Instant::now);
+                let cpu = timed.then(thread_cpu_ns).flatten();
                 let mut swaps = 0usize;
                 let mut gain = 0.0f64;
                 while swaps < pairs {
@@ -570,12 +978,21 @@ impl BisectState {
                     left[li] = rd;
                     right[ri] = ld;
                 }
-                (swaps, gain)
+                if let Some(step) = step {
+                    level.swap_ns += ns_since(step);
+                    level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
+                }
+                (swaps, gain, cost)
             };
             last_swaps = moved;
+            level.rounds += 1;
             if moved == 0 {
+                end = SplitEnd::Settled;
                 break;
             }
+            level.swaps += moved as u64;
+            level.predicted_gain += round_gain;
+            cost_before = round_cost;
             if round == 0 {
                 if depth == 0 {
                     run.offer_reference(round_gain, order.len());
@@ -585,13 +1002,64 @@ impl BisectState {
                 // was available, so the rounds still to come are not worth
                 // their pass over the partition — and the work they would take
                 // is better spent on a split that is still paying.
+                end = SplitEnd::Converged;
                 break;
             }
+        }
+        if let Some(before) = cost_before {
+            level.record_actual(before - self.partition_cost(n_left, n_right));
         }
 
         self.left_gains = left_gains;
         self.right_gains = right_gains;
         self.clear_degrees();
+
+        let Some(started) = started else {
+            return;
+        };
+        match end {
+            SplitEnd::Settled => level.settled = 1,
+            SplitEnd::Converged => level.converged = 1,
+            SplitEnd::Capped => level.capped = 1,
+        }
+        level.split_ns = ns_since(started);
+        span.record("rounds", level.rounds);
+        span.record("swaps", level.swaps);
+        span.record("end", tracing::field::debug(end));
+        span.record("predicted_gain", level.predicted_gain);
+        span.record("actual_gain", level.actual_gain);
+        span.record("count_ms", level.count_ns / 1_000_000);
+        span.record("gains_ms", level.gains_ns / 1_000_000);
+        span.record("rank_ms", level.rank_ns / 1_000_000);
+        span.record("swap_ms", level.swap_ns / 1_000_000);
+        span.record("serial_cpu_ms", level.serial_cpu_ns / 1_000_000);
+        self.note(depth, &level);
+    }
+
+    /// The cost of the current split, from its degree tables.
+    fn partition_cost(&self, n_left: f32, n_right: f32) -> f64 {
+        let mut cost = 0.0f64;
+        for &t in &self.touched {
+            let t = t as usize;
+            cost += self.term_split_cost(t, n_left, n_right);
+        }
+        cost
+    }
+
+    /// What term `t` costs across both halves of the current split.
+    #[inline]
+    fn term_split_cost(&self, t: usize, n_left: f32, n_right: f32) -> f64 {
+        let left = Side {
+            deg: self.deg_left[t],
+            size: n_left,
+            costs: &self.cost_left,
+        };
+        let right = Side {
+            deg: self.deg_right[t],
+            size: n_right,
+            costs: &self.cost_right,
+        };
+        f64::from(left.cost(left.deg)) + f64::from(right.cost(right.deg))
     }
 
     /// Fill the move gains of every term in the partition from its
@@ -1232,11 +1700,37 @@ mod tests {
         let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
         let mut serial: Vec<u32> = (0..fwd.len() as u32).collect();
         let reference = AtomicU64::new(0);
+        let report = RunReport::new();
         let run = Bisect {
             params: exhaustive(),
             reference: &reference,
+            report: &report,
+            parent: &report.span,
         };
         BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
+    }
+
+    /// The report accounts for every split once, and records the cost really
+    /// falling on a corpus with structure to find.
+    #[test]
+    fn the_report_counts_every_split_once() {
+        let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
+        let (order, report) = bisect_order_reported(&fwd, BisectParams::default());
+        assert_eq!(order, bisect_order(&fwd, BisectParams::default()));
+
+        assert_eq!(report.levels[0].splits, 1, "one root split");
+        assert!(report.reference > 0.0, "the root moved documents");
+        for (depth, level) in report.levels.iter().enumerate() {
+            assert_eq!(
+                level.settled + level.converged + level.capped,
+                level.splits,
+                "every split at depth {depth} ends exactly one way"
+            );
+        }
+        let total = report.total();
+        assert!(total.swaps > 0);
+        assert!(total.actual_gain > 0.0, "the cost fell: {total}");
+        assert!(total.predicted_gain > 0.0);
     }
 }

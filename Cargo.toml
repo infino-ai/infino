@@ -240,6 +240,9 @@ datafusion = "54"
 # proc-macro, so we keep it in [dependencies] rather than re-listing
 # tokio in [dev-dependencies] solely for the macro feature.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs"] }
+# `CancellationToken` behind `QueryCancel`. Already built through
+# DataFusion, so naming it adds no crate to the build.
+tokio-util = "0.7"
 
 # Object-store backend. `object_store` is already
 # transitive via DataFusion 53 (0.12.5) and parquet 58 (0.13.2);

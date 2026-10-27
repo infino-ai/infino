@@ -155,12 +155,20 @@ async fn term_index_slices(
             })
         })?;
 
-    Ok(loaded
-        .segments
+    // Every slice and, beside it, its tier object: all named by the root,
+    // so nothing but the root is read.
+    let uris: Vec<String> = loaded
+        .layers
         .iter()
-        .flat_map(|segment| &segment.slices)
-        .map(|slice| term_index::slice_uri(&slice.content_hash))
-        .collect())
+        .flat_map(|layer| &layer.slices)
+        .flat_map(|slice| {
+            [Some(term_index::slice_uri(&slice.content_hash))]
+                .into_iter()
+                .chain([slice.tier.as_ref().map(term_index::tier_uri)])
+        })
+        .flatten()
+        .collect();
+    Ok(uris)
 }
 
 /// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in
