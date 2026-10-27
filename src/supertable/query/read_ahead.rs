@@ -111,9 +111,12 @@ use crate::{
     supertable::query::df_object_store::{SuperfileObjectStore, merged_ranges},
 };
 
-/// Fewest row groups a batch takes, when they fit: with two, the scan
-/// decodes one while the next downloads.
+/// Fewest row groups a batch takes, when they fit the reader's cap.
 const READ_AHEAD_ROW_GROUPS: usize = 2;
+
+/// Batches a reader keeps in flight: one the scan decodes from and one
+/// downloading, so each batch is sized to half the reader's cap.
+const READ_AHEAD_BATCHES_IN_FLIGHT: usize = 2;
 
 /// Most bytes one reader (one file in one partition) may hold, and so how
 /// many row groups a batch takes: as many as fit, which on a file of small
@@ -912,11 +915,14 @@ impl ReadAhead {
         let location = &self.file.object_meta.location;
         let held: usize = self.batches.iter().map(|b| b.charge).sum();
         let cap = self.scan.reader_cap_bytes;
-        // As many row groups as fit what the reader may still hold, and at
-        // least the minimum: a batch of small row groups then costs one
-        // round trip rather than one per row group. Counted by the projected
-        // chunks alone; the spans they merge into are measured below, and a
-        // batch that overshoots the cap there is trimmed from the end.
+        // A batch may take half of what the reader may hold, so the next
+        // batch can download while the scan decodes this one, and as many
+        // row groups as fit that, with at least the minimum: a batch of small
+        // row groups then costs one round trip rather than one per row group.
+        // Counted by the projected chunks alone; the spans they merge into
+        // are measured below, and a batch that overshoots there is trimmed
+        // from the end.
+        let batch_cap = cap / READ_AHEAD_BATCHES_IN_FLIGHT;
         let mut row_groups: Vec<(usize, Vec<Range<u64>>)> = Vec::new();
         let mut planned = 0usize;
         for rg in order.after(after) {
@@ -926,7 +932,7 @@ impl ReadAhead {
             }
             let ranges: Vec<Range<u64>> = columns.iter().map(|&c| chunk_range(meta, c)).collect();
             let bytes: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
-            if row_groups.len() >= READ_AHEAD_ROW_GROUPS && held + planned + bytes > cap {
+            if row_groups.len() >= READ_AHEAD_ROW_GROUPS && planned + bytes > batch_cap {
                 break;
             }
             planned += bytes;
@@ -1617,12 +1623,13 @@ mod tests {
         reader_of(&scan(store, budget, &[]), path, meta)
     }
 
-    /// A reader cap that admits two of the test file's row groups but not
-    /// three: one byte short of what three take. The file's row groups are
-    /// alike in size, so any two fit and no three do.
+    /// A reader cap under which a batch takes two of the test file's row
+    /// groups but not three, with room for two such batches: a batch gets
+    /// half the cap, one byte short of what three row groups take. The
+    /// file's row groups are alike in size, so any two fit and no three do.
     fn two_row_groups_cap() -> usize {
         let (_, meta) = small_file();
-        charge(&meta, &[0, 1, 2]) - 1
+        (charge(&meta, &[0, 1, 2]) - 1) * READ_AHEAD_BATCHES_IN_FLIGHT
     }
 
     /// The projected columns' whole chunks in row group `rg`.
