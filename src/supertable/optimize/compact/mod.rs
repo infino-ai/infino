@@ -4193,9 +4193,12 @@ mod tests {
         assert!(after.len() < 10, "the free inputs merged");
         assert!(after.contains(&held), "the held input was left to its holder");
 
-        // Past the threshold the seal is abandoned and the input is fair game.
+        // Past the threshold the seal is abandoned and the input is fair
+        // game. Two files are left, too few bytes for the size trigger, so
+        // the count trigger is what plans the merge.
         let cfg = CompactionSettings {
             stale_seal_timeout_ms: 0,
+            min_superfiles_for_merge: 2,
             ..small_compact_cfg()
         };
         st.compact_async(&cfg).await.expect("the second pass");
