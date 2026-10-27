@@ -2213,6 +2213,7 @@ mod tests {
             vector::layout::VectorLayout,
         },
         supertable::{
+            hydrate::hydrate_from_reader,
             Supertable, SupertableOptions,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
             query::{read_ahead::fixture, sql::sql_session_context},
@@ -3026,11 +3027,12 @@ mod tests {
             st.options().disk_cache.clone(),
             reader.tombstone_cache.clone(),
         );
-        let survivors =
-            |filters: &[Expr]| async { provider.surviving_superfile_count(filters).await };
-        assert_eq!(survivors(&[col("time").gt_eq(at_hour(4))]).await, 1);
-        assert_eq!(survivors(&[col("time").lt(at_hour(0))]).await, 0);
-        assert_eq!(survivors(&[col("time").gt_eq(at_hour(6))]).await, 0);
+        let inside = [col("time").gt_eq(at_hour(4))];
+        let before = [col("time").lt(at_hour(0))];
+        let after = [col("time").gt_eq(at_hour(6))];
+        assert_eq!(provider.surviving_superfile_count(&inside).await, 1);
+        assert_eq!(provider.surviving_superfile_count(&before).await, 0);
+        assert_eq!(provider.surviving_superfile_count(&after).await, 0);
     }
 
     /// Rows per superfile the hydrate prune test packs: one two-row batch each.
