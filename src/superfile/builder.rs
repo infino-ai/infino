@@ -81,7 +81,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
-#[cfg(feature = "detailed-tracing")]
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
@@ -258,6 +257,88 @@ fn reorder_plan(
         terms_per_doc,
         chunk_docs: n_docs.div_ceil(runs.max(1)),
     })
+}
+
+/// Keeps each document's most selective terms for the bisection: what the
+/// second pass of `merge_doc_order` does for one input over one stretch of
+/// output rows.
+struct TermPicker<'a, E: Fn(u32) -> bool> {
+    n_fts_columns: u32,
+    terms_per_doc: usize,
+    df: &'a [u32],
+    eligible: &'a E,
+}
+
+impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
+    /// Fill the slots of output rows `first_row..past_row` from `reader`'s
+    /// terms. `slots`, `filled` and `worst` cover exactly those rows. A slot
+    /// list holds the terms carried by the fewest documents; `worst` points
+    /// at its most common one, so a term that cannot displace it costs one
+    /// comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn pick(
+        &self,
+        reader: &SuperfileReader,
+        rows: &[Option<RowId>],
+        first_row: usize,
+        past_row: usize,
+        slots: &mut [u32],
+        filled: &mut [u8],
+        worst: &mut [u8],
+    ) -> Result<(), BuildError> {
+        let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let fts = reader.fts().expect("checked by the caller");
+        for column_id in 0..self.n_fts_columns {
+            // An ineligible term is skipped before its postings are read.
+            let on_term = |term: &[u8]| {
+                let t = term_bucket(term);
+                (self.eligible)(t).then_some(t)
+            };
+            fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                let Some(row) = rows[local_doc as usize] else {
+                    return;
+                };
+                let row = row.get() as usize;
+                if row < first_row || row >= past_row {
+                    return;
+                }
+                let row = row - first_row;
+                let slot_base = row * terms_per_doc;
+                let used = filled[row] as usize;
+                if used < terms_per_doc {
+                    slots[slot_base + used] = t;
+                    if used == 0
+                        || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
+                    {
+                        worst[row] = used as u8;
+                    }
+                    filled[row] = (used + 1) as u8;
+                    return;
+                }
+                let worst_slot = slot_base + worst[row] as usize;
+                if df[t as usize] >= df[slots[worst_slot] as usize] {
+                    return;
+                }
+                slots[worst_slot] = t;
+
+                // The worst moved; find it again over the fixed, small slot
+                // count.
+                let mut w = 0usize;
+                for i in 1..terms_per_doc {
+                    if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
+                        w = i;
+                    }
+                }
+                worst[row] = w as u8;
+            })
+            .map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "fts merge: reading terms for the document order failed: {e}"
+                )))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -2675,31 +2756,48 @@ impl SuperfileBuilder {
         // eligible it is what makes one more informative than another.
         let count_span = detail_span!("merge_order_count_terms").entered();
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
-        let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
             .collect::<Result<_, _>>()?;
-        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
-            let fts = reader.fts().expect("checked above");
-            for column_id in 0..n_fts_columns {
-                fts.for_each_term_doc(
-                    column_id,
-                    |term| Some(term_bucket(term)),
-                    |&t, local_doc| {
-                        if rows[local_doc as usize].is_some() {
-                            df[t as usize] += 1;
-                        }
-                    },
-                )
-                .map_err(|e| {
-                    BuildError::Io(Error::other(format!(
-                        "fts merge: counting terms for the document order failed: {e}"
-                    )))
-                })?;
-            }
-        }
+        // The inputs are counted side by side, each thread into its own table,
+        // and the tables summed: counts come out the same in any order.
+        let df: Vec<u32> = readers
+            .par_iter()
+            .zip(rows_by_blob.par_iter())
+            .try_fold(
+                || vec![0u32; n_buckets],
+                |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
+                    let fts = reader.fts().expect("checked above");
+                    for column_id in 0..n_fts_columns {
+                        fts.for_each_term_doc(
+                            column_id,
+                            |term| Some(term_bucket(term)),
+                            |&t, local_doc| {
+                                if rows[local_doc as usize].is_some() {
+                                    df[t as usize] += 1;
+                                }
+                            },
+                        )
+                        .map_err(|e| {
+                            BuildError::Io(Error::other(format!(
+                                "fts merge: counting terms for the document order failed: {e}"
+                            )))
+                        })?;
+                    }
+                    Ok(df)
+                },
+            )
+            .try_reduce(
+                || vec![0u32; n_buckets],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )?;
         drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
@@ -2766,64 +2864,64 @@ impl SuperfileBuilder {
             let mut filled: Vec<u8> = vec![0; run];
             let mut worst: Vec<u8> = vec![0; run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
-            for (((reader, _), rows), span) in
-                readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
-            {
-                match *span {
-                    Some((lo, hi)) if lo < past_row && hi >= first_row => {}
-                    _ => continue,
+            let picker = TermPicker {
+                n_fts_columns,
+                terms_per_doc,
+                df: &df,
+                eligible: &eligible,
+            };
+            // The inputs this run holds, with the rows of it each covers.
+            let mut covering: Vec<(usize, usize, usize)> = span_of
+                .iter()
+                .enumerate()
+                .filter_map(|(i, span)| match *span {
+                    Some((lo, hi)) if lo < past_row && hi >= first_row => {
+                        Some((i, lo.max(first_row), (hi + 1).min(past_row)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            covering.sort_unstable_by_key(|&(_, start, _)| start);
+            let apart = covering.windows(2).all(|pair| pair[0].2 <= pair[1].1);
+            if apart {
+                // Every row belongs to one input, so inputs whose rows do not
+                // interleave fill disjoint stretches of the slots, side by side;
+                // each still reads its own terms in the order it always did.
+                let (mut slots_rest, mut filled_rest, mut worst_rest) =
+                    (&mut slots[..], &mut filled[..], &mut worst[..]);
+                let mut at = first_row;
+                let mut windows = Vec::with_capacity(covering.len());
+                for &(i, start, end) in &covering {
+                    let skip = start - at;
+                    let take = end - start;
+                    let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
+                    let (s, rest) = rest.split_at_mut(take * terms_per_doc);
+                    slots_rest = rest;
+                    let (_, rest) = filled_rest.split_at_mut(skip);
+                    let (f, rest) = rest.split_at_mut(take);
+                    filled_rest = rest;
+                    let (_, rest) = worst_rest.split_at_mut(skip);
+                    let (w, rest) = rest.split_at_mut(take);
+                    worst_rest = rest;
+                    windows.push((i, start, end, s, f, w));
+                    at = end;
                 }
-                let fts = reader.fts().expect("checked above");
-                for column_id in 0..n_fts_columns {
-                    let on_term = |term: &[u8]| {
-                        let t = term_bucket(term);
-                        let keep = eligible(t);
-                        keep.then_some(t)
-                    };
-                    fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
-                        let Some(row) = rows[local_doc as usize] else {
-                            return;
-                        };
-                        let row = row.get() as usize;
-                        if row < first_row || row >= past_row {
-                            return;
-                        }
-                        let row = row - first_row;
-                        let slot_base = row * terms_per_doc;
-                        let used = filled[row] as usize;
-                        if used < terms_per_doc {
-                            slots[slot_base + used] = t;
-                            if used == 0
-                                || df[t as usize]
-                                    > df[slots[slot_base + worst[row] as usize] as usize]
-                            {
-                                worst[row] = used as u8;
-                            }
-                            filled[row] = (used + 1) as u8;
-                            return;
-                        }
-                        let worst_slot = slot_base + worst[row] as usize;
-                        if df[t as usize] >= df[slots[worst_slot] as usize] {
-                            return;
-                        }
-                        slots[worst_slot] = t;
-
-                        // The worst moved; find it again over the fixed,
-                        // small slot count.
-                        let mut w = 0usize;
-                        for i in 1..terms_per_doc {
-                            if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize]
-                            {
-                                w = i;
-                            }
-                        }
-                        worst[row] = w as u8;
-                    })
-                    .map_err(|e| {
-                        BuildError::Io(Error::other(format!(
-                            "fts merge: reading terms for the document order failed: {e}"
-                        )))
+                windows
+                    .into_par_iter()
+                    .try_for_each(|(i, start, end, s, f, w)| {
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, f, w)
                     })?;
+            } else {
+                for &(i, _, _) in &covering {
+                    picker.pick(
+                        &readers[i].0,
+                        &rows_by_blob[i],
+                        first_row,
+                        past_row,
+                        &mut slots,
+                        &mut filled,
+                        &mut worst,
+                    )?;
                 }
             }
 
