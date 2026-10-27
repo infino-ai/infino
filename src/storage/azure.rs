@@ -333,29 +333,33 @@ impl StorageProvider for AzureStorageProvider {
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
         let path = self.path(uri)?;
         let n = bytes.len() as u64;
-        // Re-issue transient failures like the read paths. Only
-        // `TransientExhausted` re-issues, so an OCC `PreconditionFailed` on
-        // the first issue still surfaces immediately. A create that timed out
-        // may have landed, so a re-issue that meets it reads it back and
-        // reports it created (see `create_with_reissue`).
+        // Re-issue transient failures like the read paths. A create the
+        // store accepted can still come back failed, so every issue carries
+        // this call's id and a `PreconditionFailed` is settled with one HEAD
+        // (see `create_with_reissue`).
+        let id = retry::CreateId::new();
         let out = retry::create_with_reissue(
             uri,
-            &bytes,
+            &id,
             || {
                 let bytes = bytes.clone();
                 async {
-                    let opts = PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    };
                     self.store
-                        .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+                        .put_opts(&path, PutPayload::from_bytes(bytes), id.put_options())
                         .await
                         .map(|r| r.e_tag)
                         .map_err(|e| translate(uri, e))
                 }
             },
-            || self.get(uri),
+            || async {
+                let head = self
+                    .store
+                    .get_opts(&path, retry::head_options())
+                    .await
+                    .map_err(|e| translate(uri, e))?;
+                self.meter.record_head();
+                Ok((head.attributes, head.meta.e_tag))
+            },
         )
         .await;
         if out.is_ok() {
