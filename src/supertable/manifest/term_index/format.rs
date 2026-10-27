@@ -94,11 +94,16 @@ pub(crate) const ROOT_MAGIC: &[u8; 8] = b"INFTIDX1";
 pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// Layout version of the root. `2` added each superfile's smallest doc id;
 /// `3` keys terms by the column's field id instead of its name; `4` names
-/// each slice's tier object beside the slice. A root at version `3` still
-/// decodes — its slices are at version 1 and serve ceilings until the next
-/// maintenance rebuild writes the current layout; anything older does
-/// not, and the index is rebuilt, not translated.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 4;
+/// each slice's tier object beside the slice; `5` records each slice's
+/// byte length again beside its tier, which the fold at commit sizes
+/// segments by. A root at version `4` decodes with every length zero, so
+/// its segments fold at the first commit that gathers enough of them; one
+/// at version `3` still decodes — its slices are at version 1 and serve
+/// ceilings until the next maintenance rebuild writes the current layout;
+/// anything older does not, and the index is rebuilt, not translated.
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 5;
+/// The root version that named tiers but not slice lengths.
+pub(crate) const UNSIZED_ROOT_FORMAT_VERSION: u32 = 4;
 /// The root version before tiers: slices named with their byte length and
 /// no tier object.
 pub(crate) const LEGACY_ROOT_FORMAT_VERSION: u32 = 3;
@@ -292,6 +297,9 @@ pub(crate) struct SliceRef {
     /// The content hash of the slice's tier object — its terms' tier chunks
     /// back to back, in key order — when any of its runs has a tier.
     pub(crate) tier: Option<ContentHash>,
+    /// The slice object's byte length, as the root records it; zero in a
+    /// root written before lengths were recorded beside tiers.
+    pub(crate) len: u64,
 }
 
 /// One build's slice list. The base is segment 0; deltas append.
@@ -403,6 +411,7 @@ impl Root {
                 out.extend_from_slice(&s.content_hash.0);
                 let tier = s.tier.unwrap_or(ContentHash([0u8; HASH_LEN]));
                 out.extend_from_slice(&tier.0);
+                out.extend_from_slice(&s.len.to_le_bytes());
             }
         }
         out
@@ -416,7 +425,11 @@ impl Root {
         let version = check_magic_version(
             &mut c,
             ROOT_MAGIC,
-            &[ROOT_FORMAT_VERSION, LEGACY_ROOT_FORMAT_VERSION],
+            &[
+                ROOT_FORMAT_VERSION,
+                UNSIZED_ROOT_FORMAT_VERSION,
+                LEGACY_ROOT_FORMAT_VERSION,
+            ],
             "root",
         )?;
         let n_superfiles = c.u32("root superfile count")? as usize;
@@ -438,21 +451,26 @@ impl Root {
                 let last_key = c.bytes_u32_len("slice last key")?.to_vec();
                 let hash = c.take(HASH_LEN, "slice hash")?;
                 let content_hash = ContentHash(hash.try_into().expect("32 bytes"));
-                let tier = if version == LEGACY_ROOT_FORMAT_VERSION {
-                    c.u64("slice length")?;
-                    None
+                let (tier, len) = if version == LEGACY_ROOT_FORMAT_VERSION {
+                    (None, c.u64("slice length")?)
                 } else {
                     let hash = c.take(HASH_LEN, "slice tier hash")?;
-                    match hash.iter().all(|b| *b == 0) {
+                    let tier = match hash.iter().all(|b| *b == 0) {
                         true => None,
                         false => Some(ContentHash(hash.try_into().expect("32 bytes"))),
-                    }
+                    };
+                    let len = match version == UNSIZED_ROOT_FORMAT_VERSION {
+                        true => 0,
+                        false => c.u64("slice length")?,
+                    };
+                    (tier, len)
                 };
                 slices.push(SliceRef {
                     first_key,
                     last_key,
                     content_hash,
                     tier,
+                    len,
                 });
             }
             segments.push(Segment { slices });
@@ -743,6 +761,25 @@ fn decode_legacy_run(bytes: &[u8]) -> Result<Run, TermIndexError> {
 /// Encode `root` as the layout before tiers wrote it: each slice named
 /// with its byte length (`lens`, parallel to the slices in order) and no
 /// tier object. What a table indexed by that layout holds.
+/// A root at [`UNSIZED_ROOT_FORMAT_VERSION`]: tiers named, no lengths.
+#[cfg(test)]
+pub(crate) fn encode_unsized_root(root: &Root) -> Vec<u8> {
+    let sized = root.encode();
+    let mut at = ROOT_HEADER_LEN + root.superfiles.len() * (UUID_LEN + I128_LEN) + U32_LEN;
+    let mut out = sized[..at].to_vec();
+    out[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&UNSIZED_ROOT_FORMAT_VERSION.to_le_bytes());
+    for seg in &root.segments {
+        out.extend_from_slice(&sized[at..at + U32_LEN]);
+        at += U32_LEN;
+        for s in &seg.slices {
+            let n = U32_LEN + s.first_key.len() + U32_LEN + s.last_key.len() + HASH_LEN + HASH_LEN;
+            out.extend_from_slice(&sized[at..at + n]);
+            at += n + 8;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1167,7 +1204,41 @@ mod tests {
             tier: tag
                 .is_multiple_of(2)
                 .then_some(ContentHash([tag ^ 0xFF; HASH_LEN])),
+            len: u64::from(tag) * 1000,
         }
+    }
+
+    #[test]
+    fn a_root_records_each_slice_length_and_an_unsized_root_reads_as_zero() {
+        let root = Root {
+            superfiles: vec![Uuid::from_u128(1)],
+            id_mins: vec![7],
+            segments: vec![
+                Segment {
+                    slices: vec![slice_ref("a", "b", 1), slice_ref("c", "d", 2)],
+                },
+                Segment {
+                    slices: vec![slice_ref("c", "d", 3)],
+                },
+            ],
+        };
+        let back = Root::decode(&root.encode()).expect("decodes");
+        assert_eq!(back, root);
+        let lens: Vec<u64> = back
+            .segments
+            .iter()
+            .flat_map(|s| s.slices.iter().map(|r| r.len))
+            .collect();
+        assert_eq!(lens, vec![1000, 2000, 3000]);
+        let without = Root::decode(&encode_unsized_root(&root)).expect("an unsized root decodes");
+        let mut expect = root.clone();
+        for r in expect.segments.iter_mut().flat_map(|s| s.slices.iter_mut()) {
+            r.len = 0;
+        }
+        assert_eq!(
+            without, expect,
+            "lengths read as zero, everything else as written"
+        );
     }
 
     #[test]
@@ -1239,6 +1310,7 @@ mod tests {
             last_key: b.to_vec(),
             content_hash: ContentHash([n; 32]),
             tier: None,
+            len: 0,
         };
         let root = Root {
             superfiles: vec![],
@@ -1427,6 +1499,15 @@ mod tests {
                 },
             ],
         };
+        let mut root = root;
+        for (r, len) in root
+            .segments
+            .iter_mut()
+            .flat_map(|s| s.slices.iter_mut())
+            .zip([100u64, 200, 300])
+        {
+            r.len = len;
+        }
         let legacy = encode_legacy_root(&root, &[100, 200, 300]);
         assert_eq!(
             u32::from_le_bytes(

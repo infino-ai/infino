@@ -915,6 +915,7 @@ impl SliceBuilder {
                 last_key: self.last_key,
                 content_hash,
                 tier,
+                len: bytes.len() as u64,
             },
             bytes,
         ))

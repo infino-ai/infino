@@ -653,6 +653,16 @@ impl AnyCursor {
         }
     }
 
+    /// The most docs the atom can sit on: a term's document frequency, a
+    /// phrase's rarest member's, since every doc a phrase verifies holds
+    /// all of its members.
+    pub(super) fn df_bound(&self) -> u64 {
+        match self {
+            AnyCursor::Term(c) => c.df,
+            AnyCursor::Phrase(p) => p.members.iter().map(|m| m.cursor.df).min().unwrap_or(0),
+        }
+    }
+
     /// Advance to the first (phrase: first *verified*) doc ≥ `target`.
     pub(super) fn skip_to(&mut self, target: u32) -> Result<(), FtsError> {
         match self {

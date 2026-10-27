@@ -6,7 +6,7 @@
 //! entry points (no BM25 scoring, no top-k). Its own `impl FtsReader`
 //! block, split from the reader `core`.
 
-use std::{collections::BinaryHeap, str::from_utf8};
+use std::{cmp::Reverse, collections::BinaryHeap, str::from_utf8};
 
 #[cfg(any(test, feature = "test-helpers"))]
 use super::cursor::TermMeta;
@@ -89,7 +89,55 @@ impl FtsReader {
         mut filter: Option<AtomExcludeFilter>,
         mut on_doc: impl FnMut(u32),
     ) -> Result<(), FtsError> {
+        let atom_postings = atoms
+            .iter()
+            .map(AnyCursor::df_bound)
+            .fold(0u64, u64::saturating_add);
+        let sparse_union = matches!(mode, BoolMode::Or)
+            && or_walk_prefers_heap(atoms.len(), atom_postings, u64::from(self.n_docs));
         match mode {
+            BoolMode::Or if sparse_union => {
+                // A sparse union over many atoms: a heap keyed by current
+                // doc, so a step costs the log of the atom count rather
+                // than the atom count (see `or_walk_unranked`). Atoms
+                // sitting on the same doc pop consecutively and advance
+                // together past it.
+                let mut heap =
+                    doc_heap(&atoms, |a| (!a.is_exhausted()).then(|| a.current_doc_id()));
+                // The atoms sitting on the doc just popped, gathered before any
+                // of them advances so their re-pushes never interleave with
+                // the peeks. One buffer for the whole walk.
+                let mut at_doc: Vec<usize> = Vec::new();
+                while let Some(Reverse((doc, first))) = heap.pop() {
+                    let admitted = match filter.as_mut() {
+                        Some(f) => f.admits(doc)?,
+                        None => true,
+                    };
+                    if admitted {
+                        on_doc(doc);
+                    }
+                    let Some(next) = doc.checked_add(1) else {
+                        break;
+                    };
+                    at_doc.clear();
+                    at_doc.push(first);
+                    while let Some(Reverse((d, i))) = heap.peek().copied() {
+                        if d != doc {
+                            break;
+                        }
+                        heap.pop();
+                        at_doc.push(i);
+                    }
+                    for &i in &at_doc {
+                        let a = &mut atoms[i];
+                        a.skip_to(next)?;
+                        if !a.is_exhausted() {
+                            heap.push(Reverse((a.current_doc_id(), i)));
+                        }
+                    }
+                }
+                Ok(())
+            }
             BoolMode::Or => {
                 while let Some(doc) = atoms
                     .iter()
@@ -881,6 +929,8 @@ pub struct TermLayout {
 #[cfg(test)]
 mod tests {
 
+    use std::ops::Range;
+
     use bytes::Bytes;
 
     use super::{super::test_util::*, *};
@@ -975,6 +1025,149 @@ mod tests {
                 .expect("token_match_count")
                 .0;
             assert_eq!(count, len, "count vs len for {tokens:?} {mode:?}");
+        }
+    }
+
+    /// A union over many terms must equal the planted union exactly under
+    /// every entry that walks it: the term-only match, its count, and the
+    /// phrase-aware atom walk. Five shapes over one corpus of many doc-id
+    /// windows cover each walk either side of its routing:
+    ///
+    /// * ~2000 single-doc terms plus two rarer shared ones, the shape an
+    ///   `IN` list of ids produces: a sparse union, so the match and atom
+    ///   walks take the heap, and so does the count, since the rescans of
+    ///   every window outnumber its heap steps. The shared terms put
+    ///   several cursors on one doc so the dedup is exercised.
+    /// * ten mid-frequency terms: still sparse, so the match and atom walks
+    ///   take the heap; the count keeps the windowed walk because its
+    ///   postings outnumber the window rescans.
+    /// * eight common terms in ~30% of the docs each: the average doc holds
+    ///   more of them than the heap pays for, so the match and atom walks
+    ///   keep the rescan, and the count takes its dense bitset.
+    /// * exactly `OR_HEAP_MIN_TERMS` terms and one fewer, so the rescan
+    ///   walks and the heap walks are checked against the same oracle.
+    #[tokio::test]
+    async fn many_term_unions_equal_the_planted_union() {
+        /// Enough docs for dozens of doc-id windows, so the count's
+        /// windowed walk pays a rescan per window rather than one in all.
+        const N_DOCS: u32 = 200_000;
+        /// Every this-many-th doc carries its own single-doc term.
+        const OWN_EVERY: u32 = 100;
+        /// Strides of the two shared terms, rarer than the own terms so the
+        /// count's gate still sees a sparse union.
+        const SHARED_EVERY: u32 = 997;
+        const PAIR_EVERY: u32 = 1_009;
+        /// Strides of the ten mid-frequency terms (a few hundred docs each).
+        const MID_STRIDES: Range<u32> = 500..510;
+        /// The common terms: `d{k}` sits on the docs whose `(i + k)` falls
+        /// in the first `DENSE_ON` of every `DENSE_PERIOD`, ~30% each.
+        const DENSE_TERMS: Range<u32> = 0..OR_HEAP_MIN_TERMS as u32;
+        const DENSE_PERIOD: u32 = 10;
+        const DENSE_ON: u32 = 3;
+        let dense_has = |i: u32, k: u32| (i + k) % DENSE_PERIOD < DENSE_ON;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            if i.is_multiple_of(OWN_EVERY) {
+                text.push_str(&format!("u{i}"));
+            }
+            if i.is_multiple_of(SHARED_EVERY) {
+                text.push_str(" shared");
+            }
+            if i.is_multiple_of(PAIR_EVERY) {
+                text.push_str(" pair");
+            }
+            for k in MID_STRIDES {
+                if i.is_multiple_of(k) {
+                    text.push_str(&format!(" m{k}"));
+                }
+            }
+            for k in DENSE_TERMS {
+                if dense_has(i, k) {
+                    text.push_str(&format!(" d{k}"));
+                }
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let mut owned: Vec<String> = (0..N_DOCS)
+            .step_by(OWN_EVERY as usize)
+            .map(|i| format!("u{i}"))
+            .collect();
+        owned.push("shared".into());
+        owned.push("pair".into());
+        owned.push("zzz_absent".into());
+        let sparse: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let sparse_oracle: Vec<u32> = (0..N_DOCS)
+            .filter(|i| {
+                i.is_multiple_of(OWN_EVERY)
+                    || i.is_multiple_of(SHARED_EVERY)
+                    || i.is_multiple_of(PAIR_EVERY)
+            })
+            .collect();
+        let mid_owned: Vec<String> = MID_STRIDES.map(|k| format!("m{k}")).collect();
+        let mid: Vec<&str> = mid_owned.iter().map(String::as_str).collect();
+        let mid_oracle: Vec<u32> = (0..N_DOCS)
+            .filter(|i| MID_STRIDES.into_iter().any(|k| i.is_multiple_of(k)))
+            .collect();
+        let dense_owned: Vec<String> = DENSE_TERMS.map(|k| format!("d{k}")).collect();
+        let dense: Vec<&str> = dense_owned.iter().map(String::as_str).collect();
+        let dense_oracle: Vec<u32> = (0..N_DOCS)
+            .filter(|&i| DENSE_TERMS.into_iter().any(|k| dense_has(i, k)))
+            .collect();
+        let own_oracle = |shape: &[&str]| -> Vec<u32> {
+            (0..N_DOCS)
+                .filter(|i| shape.contains(&format!("u{i}").as_str()))
+                .collect()
+        };
+        let shapes: Vec<(&str, Vec<&str>, Vec<u32>)> = vec![
+            ("many sparse and shared", sparse.clone(), sparse_oracle),
+            ("ten mid-frequency", mid, mid_oracle),
+            ("eight common", dense, dense_oracle),
+            (
+                "on the threshold",
+                sparse[..OR_HEAP_MIN_TERMS].to_vec(),
+                own_oracle(&sparse[..OR_HEAP_MIN_TERMS]),
+            ),
+            (
+                "under the threshold",
+                sparse[..OR_HEAP_MIN_TERMS - 1].to_vec(),
+                own_oracle(&sparse[..OR_HEAP_MIN_TERMS - 1]),
+            ),
+        ];
+        for (label, shape, oracle) in shapes {
+            assert!(!oracle.is_empty(), "{label}: oracle must not be empty");
+            let matched: Vec<u32> = r
+                .token_match("body", &shape, BoolMode::Or)
+                .await
+                .expect("token_match")
+                .0
+                .into_iter()
+                .map(|d| d.get())
+                .collect();
+            assert_eq!(matched, oracle, "token_match, {label}");
+            let count = r
+                .token_match_count("body", &shape, BoolMode::Or)
+                .await
+                .expect("token_match_count")
+                .0;
+            assert_eq!(count, oracle.len() as u64, "token_match_count, {label}");
+            let atoms: Vec<u32> = r
+                .atoms_match_ids("body", &shape, &[], BoolMode::Or)
+                .await
+                .expect("atoms_match_ids")
+                .0
+                .into_iter()
+                .map(|d| d.get())
+                .collect();
+            assert_eq!(atoms, oracle, "atoms_match_ids, {label}");
         }
     }
 
