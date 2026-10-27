@@ -536,13 +536,57 @@ pub(crate) fn bisect_order_reported(
             report: &report,
             parent: &report.span,
         };
-        split_parallel(fwd, &mut order, 0, &pool, run);
+        split_levels(fwd, &mut order, &pool, run);
     }
     let reference = f64::from_bits(reference.load(Relaxed));
     let mut report = report.finish(reference);
     report.others_at_start = others_at_start;
     report.others_at_end = RUNNING.fetch_sub(1, Relaxed) - 1;
     (order, report)
+}
+
+/// Split the top of the tree a level at a time, then hand each partition to
+/// [`split_parallel`].
+///
+/// While a level holds fewer partitions than the pool has threads, its splits
+/// run side by side and each spreads its rounds across threads too. No subtree
+/// is queued until the whole level is done, so a round waiting on its own
+/// parallel pieces can only pick up another split of the same level, never a
+/// subtree many times its size. Every partition goes through exactly the steps
+/// [`split_parallel`] would take it through, so the order is the same.
+fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
+    let width = rayon::current_num_threads();
+    let mut level: Vec<&mut [u32]> = vec![order];
+    let mut handed_on: Vec<(&mut [u32], u32)> = Vec::new();
+    let mut depth = 0u32;
+    while !level.is_empty() && level.len() < width {
+        // Only a partition `split_parallel` would refine and halve itself is
+        // split here; any other takes its own path there.
+        let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
+            part.len() > MIN_PARTITION
+                && depth < MAX_DEPTH
+                && part.len() >= PARALLEL_MIN_PARTITION
+                && !localizing_pays(fwd, part)
+        });
+        handed_on.extend(rest.into_iter().map(|part| (part, depth)));
+        level = here
+            .into_par_iter()
+            .flat_map_iter(|part| {
+                let mid = part.len() / 2;
+                pool.with_state(|state| {
+                    state.refine(fwd, part, mid, depth, true, run);
+                    state.flush(run.report);
+                });
+                let (left, right) = part.split_at_mut(mid);
+                [left, right]
+            })
+            .collect();
+        depth += 1;
+    }
+    handed_on.extend(level.into_iter().map(|part| (part, depth)));
+    handed_on
+        .into_par_iter()
+        .for_each(|(part, depth)| split_parallel(fwd, part, depth, pool, run));
 }
 
 /// Split `order` as [`BisectState::split`] does, running the two halves
@@ -606,8 +650,12 @@ fn split_parallel(
         },
     };
     let mid = order.len() / 2;
+    // Only the root's rounds run their gains and sorts in parallel. Below it
+    // the subtrees are already running side by side, and a round waiting on its
+    // own parallel pieces would steal a whole queued subtree and finish it
+    // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
     pool.with_state(|state| {
-        state.refine(fwd, order, mid, depth, true, run);
+        state.refine(fwd, order, mid, depth, depth == 0, run);
         state.flush(run.report);
     });
     let (left, right) = order.split_at_mut(mid);
