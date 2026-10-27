@@ -941,7 +941,7 @@ impl ReadAhead {
             }
         }
         // The batch holds whole spans, gaps included, so reserve those. Drop row
-        // groups from the end until it fits the reader's cap.
+        // groups from the end until it fits its share and the reader's cap.
         let blocks = self.scan.store.cache_blocks(location);
         let (clusters, charge) = loop {
             if row_groups.is_empty() {
@@ -960,7 +960,7 @@ impl ReadAhead {
                 .flatten()
                 .map(|span| (span.end - span.start) as usize)
                 .sum();
-            if held + charge <= cap {
+            if charge <= batch_cap && held + charge <= cap {
                 break (clusters, charge);
             }
             row_groups.pop();
