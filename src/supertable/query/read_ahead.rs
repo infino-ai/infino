@@ -1630,7 +1630,12 @@ mod tests {
     /// file's row groups are alike in size, so any two fit and no three do.
     fn two_row_groups_cap() -> usize {
         let (_, meta) = small_file();
-        (charge(&meta, &[0, 1, 2]) - 1) * READ_AHEAD_BATCHES_IN_FLIGHT
+        two_row_groups_cap_for(&meta)
+    }
+
+    /// [`two_row_groups_cap`] for a file other than the small one.
+    fn two_row_groups_cap_for(meta: &ParquetMetaData) -> usize {
+        (charge(meta, &[0, 1, 2]) - 1) * READ_AHEAD_BATCHES_IN_FLIGHT
     }
 
     /// The projected columns' whole chunks in row group `rg`.
@@ -2298,7 +2303,13 @@ mod tests {
             source,
         )])));
         let budget = ConnectionMemoryBudget::measured();
-        let mut reader = plain_reader(&store, &budget, &path, &meta);
+        // The wide file's row groups are bigger than the small file's, so
+        // the cap that pins two of them is its own.
+        let scan = Arc::new(
+            ScanReadAhead::new(Arc::clone(&store), Arc::clone(&budget), schema())
+                .with_reader_cap(two_row_groups_cap_for(&meta)),
+        );
+        let mut reader = reader_of(&scan, &path, &meta);
         read_row_groups(&mut reader, &meta, &[0, 1]).await;
         let batch = reader.batches.first().expect("a batch");
         let blocks = store.cache_blocks(&path).expect("cached");
