@@ -457,6 +457,12 @@ mod tests {
     const MANY_CORES: usize = 64;
     /// Smallest vector dim a table accepts.
     const EMB_DIM: usize = 16;
+    /// Chunks the ordering test builds in one wave: enough that a parallel
+    /// build reaching the id generator in completion order cannot stay in
+    /// input order by luck.
+    const ORDER_WAVE_CHUNKS: i64 = 64;
+    /// Rows per chunk in the ordering test, one batch each.
+    const ORDER_CHUNK_ROWS: i64 = 1_000;
 
     fn user_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -1061,6 +1067,45 @@ mod tests {
         let peak = table.inner().options.connection_memory_budget.peak() as u64;
         assert_eq!(peak, 2 * slot, "a wave held two chunks, no more");
         assert!(peak <= budget);
+    }
+
+    /// Ids follow the input order across a wave. The wave's chunks are built
+    /// in parallel, and the ids are what later orders the table: compaction
+    /// packs merge inputs by lowest id, so a load whose chunks got their id
+    /// ranges in build-completion order would come out of a merge with its
+    /// rows shuffled across the wave. With one batch per chunk and a budget
+    /// that admits the whole input, every chunk races in one wave; reading
+    /// the rows back by id must give them back in the order they were read.
+    #[test]
+    fn hydrate_keeps_input_order_across_a_wave() {
+        let (_dir, db, table) = table_with(ints_schema());
+        let batches: Vec<RecordBatch> = (0..ORDER_WAVE_CHUNKS)
+            .map(|i| ints_batch(i * ORDER_CHUNK_ROWS + 1, (i + 1) * ORDER_CHUNK_ROWS))
+            .collect();
+        let slot = as_chunk(&batches[0]).slot();
+        // Room for every chunk at once, so the whole input is one wave.
+        let budget = slot * (ORDER_WAVE_CHUNKS as u64 + 1);
+
+        let committed = hydrate_with_budget(
+            &table,
+            &mut reader(ints_schema(), batches),
+            ORDER_CHUNK_ROWS as usize,
+            MANY_CORES,
+            &mut || Some(budget),
+        )
+        .expect("hydrate");
+        assert_eq!(committed as i64, ORDER_WAVE_CHUNKS * ORDER_CHUNK_ROWS);
+        assert_eq!(
+            table.inner().manifest.load().get_all_superfiles().len(),
+            ORDER_WAVE_CHUNKS as usize,
+            "one superfile per batch"
+        );
+
+        let by_id = query(&db, "SELECT n FROM t ORDER BY _id");
+        let in_input_order: Vec<String> = (1..=ORDER_WAVE_CHUNKS * ORDER_CHUNK_ROWS)
+            .map(|n| n.to_string())
+            .collect();
+        assert_eq!(by_id, in_input_order, "rows read back by id are in input order");
     }
 
     /// A small budget caps chunk size below `target_rows`.
