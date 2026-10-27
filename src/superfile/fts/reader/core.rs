@@ -37,7 +37,7 @@ use super::{
     metadata::{
         ColumnLengthStats, ColumnMeta, FtsColumnConfig, LENGTH_ARRAY, OpenOptions, StoredNorms,
     },
-    phrase::{AnyCursor, PhraseCursor},
+    phrase::{AnyCursor, PhraseCursor, distinct_members},
     scorers::{count_and_planned, cursors_max_doc, df_total},
     search::FetchedTermMemo,
     sink::{LiveFloor, TopKEntry, drain_top_k_desc},
@@ -1474,7 +1474,9 @@ impl FtsReader {
             }
         }
         for phrase in phrases {
-            let member_refs: Vec<&str> = phrase.iter().map(|t| t.as_str()).collect();
+            // One cursor per distinct term: a repeated term is fetched,
+            // aligned and decoded once and read at each of its offsets.
+            let (member_refs, member_at) = distinct_members(phrase);
             // A phrase's score is Σ member idf (see `PhraseCursor::new`), so
             // globalizing the members' idf globalizes the phrase — the
             // per-member rescale ratio cancels out of the phrase's tf/length
@@ -1561,6 +1563,7 @@ impl FtsReader {
                 cursors,
                 positions,
                 positional,
+                member_at,
                 phrase.offsets().to_vec(),
             )?)));
         }

@@ -19,9 +19,10 @@ use crate::superfile::{
     fts::{bm25, positions::GroupIndex},
 };
 
-/// One member term of a [`PhraseCursor`]: its posting cursor, its
+/// One distinct term of a [`PhraseCursor`]: its posting cursor, its
 /// fetched position groups, and the current block's group located for
-/// per-pair access.
+/// per-pair access. A term the phrase names more than once is one member,
+/// aligned and decoded once, that every query position naming it reads.
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
     /// A second cursor over the same postings for the block-at-a-time
@@ -144,37 +145,46 @@ impl PhraseMember {
 }
 
 /// The phrase's occurrences at one aligned doc, verified in stages,
-/// rarest member first. A phrase starting at position `s` has member `j` at
-/// `s + offsets[j]`, so the rarest member (`order[0]`) seeds the candidate
-/// starts and each other member, in `order`, keeps the starts it confirms,
-/// compacted in place in `starts`. A member's positions are only read
-/// (`positions_of`, which fills its `pos_scratch`) once some start survives
-/// every rarer member, so on the many docs a rare member rejects the common
-/// members' runs are never decoded. Returns the surviving starts: the
-/// phrase's tf at the doc.
+/// rarest member first. A phrase starting at position `s` has query
+/// position `q`'s term (member `member_at[q]`) at `s + offsets[q]`, so the
+/// rarest query position (`order[0]`) seeds the candidate starts and each
+/// other one, in `order`, keeps the starts it confirms, compacted in place
+/// in `starts`. A member's positions are only read (`positions_of`, which
+/// fills its `pos_scratch`) once some start survives every rarer member, so
+/// on the many docs a rare member rejects the common members' runs are
+/// never decoded. `order` lists the query positions of one member
+/// consecutively, so a repeated term's positions are read once and checked
+/// at each of its offsets. Returns the surviving starts: the phrase's tf at
+/// the doc.
 fn verify_members(
     members: &mut [PhraseMember],
+    member_at: &[usize],
     order: &[usize],
     offsets: &[u32],
     starts: &mut Vec<u32>,
     mut positions_of: impl FnMut(&mut PhraseMember, usize) -> Result<(), FtsError>,
 ) -> Result<u32, FtsError> {
     let anchor = order[0];
-    positions_of(&mut members[anchor], anchor)?;
+    let mut read = member_at[anchor];
+    positions_of(&mut members[read], read)?;
     starts.clear();
     starts.extend(
-        members[anchor]
+        members[read]
             .pos_scratch
             .iter()
             .filter_map(|&p| p.checked_sub(offsets[anchor])),
     );
-    for &j in &order[1..] {
+    for &q in &order[1..] {
         if starts.is_empty() {
             break;
         }
-        positions_of(&mut members[j], j)?;
-        let plist = &members[j].pos_scratch;
-        let off = offsets[j];
+        let m = member_at[q];
+        if m != read {
+            positions_of(&mut members[m], m)?;
+            read = m;
+        }
+        let plist = &members[m].pos_scratch;
+        let off = offsets[q];
         // Compacted in place without a branch on the outcome, which on a
         // common member is close to a coin flip; the search per start stays,
         // as it beat a merge on every lane measured.
@@ -190,6 +200,24 @@ fn verify_members(
         starts.truncate(w);
     }
     Ok(starts.len() as u32)
+}
+
+/// A phrase's distinct terms, in order of first appearance, and for each
+/// of its query positions the index of its term among them. A repeated
+/// term's postings are then fetched, aligned and decoded once.
+pub(super) fn distinct_members(terms: &[String]) -> (Vec<&str>, Vec<usize>) {
+    let mut distinct: Vec<&str> = Vec::with_capacity(terms.len());
+    let member_at = terms
+        .iter()
+        .map(|t| match distinct.iter().position(|d| *d == t) {
+            Some(m) => m,
+            None => {
+                distinct.push(t);
+                distinct.len() - 1
+            }
+        })
+        .collect();
+    (distinct, member_at)
 }
 
 /// Compact `locs` to the entries at `kept` (ascending indices into it).
@@ -211,10 +239,13 @@ fn compact_locs(locs: &mut Vec<(u32, u32)>, kept: &[u32]) {
 /// because the phrase tf in any doc is ≤ every member's tf there and
 /// the BM25 tf-factor is monotone in tf.
 pub(super) struct PhraseCursor {
+    /// One per distinct term, in order of first appearance in the query.
     pub(super) members: Vec<PhraseMember>,
-    /// Each member's **token-position** offset from the phrase's first
-    /// member, in `members` (query) order — strictly ascending, first
-    /// entry `0`.
+    /// For each query position, the index in `members` of its term: the
+    /// identity unless the phrase repeats a term.
+    pub(super) member_at: Vec<usize>,
+    /// Each query position's **token-position** offset from the phrase's
+    /// first term, in query order — strictly ascending, first entry `0`.
     ///
     /// Named for the unit on purpose: a member's positions are addressed
     /// by **byte** offsets into its positions blob. Confusing the two
@@ -233,9 +264,10 @@ pub(super) struct PhraseCursor {
     /// lists drive the candidate doc and the long lists (a common word
     /// like "the") are only skip-confirmed last, once per candidate,
     /// instead of being re-skipped on every advance of a rare member.
-    /// Positional verification still runs in query order (`members`
-    /// order), which the phrase adjacency check requires.
     pub(super) align_order: Vec<usize>,
+    /// Query positions in the order [`verify_members`] checks them: their
+    /// members' `align_order`, a repeated term's positions together.
+    verify_order: Vec<usize>,
     /// Σ member idf — the phrase's scoring constant, and the factor a
     /// bound in the "scaled" form is multiplied back up by.
     pub(super) idf_weight: f32,
@@ -255,8 +287,8 @@ pub(super) struct PhraseCursor {
     /// by [`Self::seek_match`].
     cands: Vec<u32>,
     cand_next: usize,
-    /// Per member (query order), each candidate's (block, pair) location in
-    /// that member's postings, in step with `cands`.
+    /// Per member, each candidate's (block, pair) location in that
+    /// member's postings, in step with `cands`.
     cand_locs: Vec<Vec<(u32, u32)>>,
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
@@ -266,26 +298,36 @@ pub(super) struct PhraseCursor {
 }
 
 impl PhraseCursor {
-    /// Build from member cursors (query order), their fetched
-    /// position runs, and their positional metadata — `(term_meta,
-    /// inline_position)` per member, exactly one of the two present —
-    /// then seek to the first matching doc.
+    /// Build from one cursor per distinct member term (see
+    /// [`distinct_members`]), their fetched position runs, and their
+    /// positional metadata — `(term_meta, inline_position)` per member,
+    /// exactly one of the two present — plus each query position's member
+    /// (`member_at`) and offset, then seek to the first matching doc.
     pub(super) fn new(
         cursors: Vec<TermCursor>,
         positions: Vec<Bytes>,
         positional: Vec<(Option<TermMeta>, Option<u32>)>,
+        member_at: Vec<usize>,
         offsets: Vec<u32>,
     ) -> Result<Self, FtsError> {
-        debug_assert!(cursors.len() >= 2, "single-token phrases degrade to terms");
+        debug_assert!(
+            member_at.len() >= 2,
+            "single-token phrases degrade to terms"
+        );
         debug_assert_eq!(cursors.len(), positions.len());
         debug_assert_eq!(cursors.len(), positional.len());
-        debug_assert_eq!(cursors.len(), offsets.len());
+        debug_assert_eq!(member_at.len(), offsets.len());
+        debug_assert!(member_at.iter().all(|&m| m < cursors.len()));
         debug_assert_eq!(offsets.first(), Some(&0), "offsets are normalized");
         debug_assert!(
             offsets.windows(2).all(|w| w[0] < w[1]),
             "offsets are strictly ascending"
         );
-        let mut idf_sum = 0.0f32;
+        // The phrase's idf counts every query position, a repeated term
+        // once per occurrence, summed in query order.
+        let idf_sum = member_at
+            .iter()
+            .fold(0.0f32, |sum, &m| sum + cursors[m].idf_weight);
         let mut min_scaled_bound = f32::INFINITY;
         let members: Vec<PhraseMember> = cursors
             .into_iter()
@@ -298,7 +340,6 @@ impl PhraseCursor {
                     min_scaled_bound =
                         min_scaled_bound.min(cursor.term_max_bm25 / cursor.idf_weight);
                 }
-                idf_sum += cursor.idf_weight;
                 PhraseMember {
                     probe: cursor.clone(),
                     cursor,
@@ -318,6 +359,12 @@ impl PhraseCursor {
         let n_members = members.len();
         let mut align_order: Vec<usize> = (0..members.len()).collect();
         align_order.sort_by_key(|&i| members[i].cursor.block_count());
+        let mut rank = vec![0usize; n_members];
+        for (r, &m) in align_order.iter().enumerate() {
+            rank[m] = r;
+        }
+        let mut verify_order: Vec<usize> = (0..member_at.len()).collect();
+        verify_order.sort_by_key(|&q| rank[member_at[q]]);
         let mut cursor = Self {
             idf_weight: idf_sum,
             // An unscored phrase has no idf, so no bound either.
@@ -326,8 +373,10 @@ impl PhraseCursor {
                 false => 0.0,
             },
             members,
+            member_at,
             position_offsets: offsets,
             align_order,
+            verify_order,
             current_doc: 0,
             current_tf: 0,
             verify_scratch: Vec::new(),
@@ -561,7 +610,8 @@ impl PhraseCursor {
         let locs = &self.cand_locs;
         self.current_tf = verify_members(
             &mut self.members,
-            &self.align_order,
+            &self.member_at,
+            &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
             |m, j| {
@@ -588,7 +638,8 @@ impl PhraseCursor {
         // so these calls are not optional.
         self.current_tf = verify_members(
             &mut self.members,
-            &self.align_order,
+            &self.member_at,
+            &self.verify_order,
             &self.position_offsets,
             &mut self.verify_scratch,
             |m, _| {
@@ -761,6 +812,8 @@ impl AnyCursor {
 
 #[cfg(test)]
 mod tests {
+
+    use std::slice;
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
@@ -1319,8 +1372,21 @@ mod tests {
     /// The one phrase cursor `terms` builds on `r`'s first column, for
     /// `purpose`.
     async fn phrase_cursor(r: &FtsReader, terms: &[&str], purpose: CursorUse) -> PhraseCursor {
+        phrase_atom(r, &phrase(terms)[0], purpose).await
+    }
+
+    /// The one phrase cursor `p` builds on `r`'s first column, for
+    /// `purpose`.
+    async fn phrase_atom(r: &FtsReader, p: &Phrase<String>, purpose: CursorUse) -> PhraseCursor {
         let (atoms, _) = r
-            .build_atom_cursors(0, &[], &phrase(terms), QueryIdf::ThisFile, None, purpose)
+            .build_atom_cursors(
+                0,
+                &[],
+                slice::from_ref(p),
+                QueryIdf::ThisFile,
+                None,
+                purpose,
+            )
             .await
             .expect("build atoms");
         match atoms.into_iter().next().flatten() {
@@ -1506,6 +1572,175 @@ mod tests {
         pc.current_doc = 0;
         pc.seek_match(0, bar, Some(norms)).expect("seek");
         assert_eq!((pc.current_doc_id(), pc.current_tf), (150, 1));
+    }
+
+    /// A phrase that repeats a term reads one shared member at each of the
+    /// term's offsets. Docs are drawn from a few words, mostly the repeated
+    /// ones, with the full phrases, overlapping repeats and near-misses
+    /// planted among them, across several blocks. For adjacent and gapped
+    /// phrases, every walk must agree with a scan of the tokens: the (doc,
+    /// tf) pairs of the scored and unscored walks, the match ids and count,
+    /// and the ranked scores bit for bit, whose idf counts every query
+    /// position, a repeated term once per occurrence.
+    #[tokio::test]
+    async fn repeated_terms_share_a_member_and_match_a_token_scan() {
+        use crate::superfile::fts::reader::BoolMode;
+        const N_DOCS: usize = 900;
+        const PLANTED: [&str; 7] = [
+            "to be or not to be",
+            "to be to be to be",
+            "be to be to",
+            "to be or not to x",
+            "not to be or to be",
+            "to x be to be x to",
+            "be or to be or x",
+        ];
+        const WORDS: [&str; 5] = ["to", "be", "to", "be", "or"];
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rng = move |m: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % m
+        };
+        let docs: Vec<Vec<&str>> = (0..N_DOCS)
+            .map(|_| {
+                let mut d: Vec<&str> = (0..1 + rng(12))
+                    .map(|_| match rng(4) {
+                        0 => "not",
+                        _ => WORDS[rng(WORDS.len() as u64) as usize],
+                    })
+                    .collect();
+                if rng(3) == 0 {
+                    let at = rng(d.len() as u64 + 1) as usize;
+                    let planted = PLANTED[rng(PLANTED.len() as u64) as usize];
+                    d.splice(at..at, planted.split(' '));
+                }
+                d
+            })
+            .collect();
+        let r = open_positional(docs.iter().map(|d| d.join(" ")));
+        let norms = r.columns[0].dl_norm_k1();
+        let gapped = |terms: &[&str], offsets: &[u32]| Phrase {
+            terms: terms.iter().map(|t| t.to_string()).collect(),
+            offsets: offsets.to_vec(),
+        };
+        let phrases = [
+            Phrase::adjacent(
+                ["to", "be", "or", "not", "to", "be"]
+                    .map(String::from)
+                    .to_vec(),
+            ),
+            Phrase::adjacent(["to", "be", "to", "be"].map(String::from).to_vec()),
+            Phrase::adjacent(["be", "to", "be"].map(String::from).to_vec()),
+            Phrase::adjacent(["to", "to"].map(String::from).to_vec()),
+            Phrase::adjacent(["be", "be", "be"].map(String::from).to_vec()),
+            gapped(&["to", "be", "to"], &[0, 1, 3]),
+            gapped(&["be", "to", "be", "x"], &[0, 2, 3, 5]),
+            gapped(&["to", "to"], &[0, 2]),
+        ];
+        for p in &phrases {
+            let label = format!("{:?} at {:?}", p.terms, p.offsets);
+            let (distinct, _) = distinct_members(p);
+            assert!(distinct.len() < p.len(), "premise: {label} repeats a term");
+            let expected: Vec<(u32, u32)> = docs
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| {
+                    let tf = (0..d.len())
+                        .filter(|&s| {
+                            p.iter()
+                                .zip(p.offsets())
+                                .all(|(t, &o)| d.get(s + o as usize).is_some_and(|w| w == t))
+                        })
+                        .count() as u32;
+                    (tf > 0).then_some((i as u32, tf))
+                })
+                .collect();
+            assert!(!expected.is_empty(), "{label} occurs");
+            let expected_ids: Vec<u32> = expected.iter().map(|&(d, _)| d).collect();
+            let one = slice::from_ref(p);
+
+            let mut scored = phrase_atom(&r, p, CursorUse::Score).await;
+            assert_eq!(scored.members.len(), distinct.len(), "one member per term");
+            let mut seen = Vec::new();
+            while !scored.is_exhausted() {
+                seen.push((scored.current_doc_id(), scored.current_tf));
+                let next = scored.current_doc_id() + 1;
+                scored
+                    .seek_match(next, f32::NEG_INFINITY, Some(norms))
+                    .expect("seek");
+            }
+            assert_eq!(seen, expected, "scored walk, {label}");
+
+            let mut matched = phrase_atom(&r, p, CursorUse::Match).await;
+            let mut docs_seen = Vec::new();
+            while !matched.is_exhausted() {
+                docs_seen.push(matched.current_doc_id());
+                let next = matched.current_doc_id() + 1;
+                matched.skip_to(next).expect("skip");
+            }
+            assert_eq!(docs_seen, expected_ids, "unscored walk, {label}");
+
+            let (ids, _) = r
+                .atoms_match_ids("title", &[], one, BoolMode::And)
+                .await
+                .expect("match ids");
+            let ids: Vec<u32> = ids.iter().map(|d| d.get()).collect();
+            assert_eq!(ids, expected_ids, "match ids, {label}");
+            let (count, _) = r
+                .atoms_match_count("title", &[], one, BoolMode::And, &[], &[])
+                .await
+                .expect("count");
+            assert_eq!(count, expected.len() as u64, "count, {label}");
+
+            // The phrase idf, from each query position's own term cursor.
+            let mut idf = 0.0f32;
+            for t in p.iter() {
+                let c = r
+                    .build_term_cursors(0, &[t], QueryIdf::ThisFile, CursorUse::Score, None, None)
+                    .await
+                    .expect("term cursor");
+                idf += c[0].idf_weight;
+            }
+            let mut ranked: Vec<(u32, u32)> = expected
+                .iter()
+                .map(|&(d, tf)| {
+                    (
+                        d,
+                        bm25::score_with_dl_norm_k1(idf, tf, norms.get(d)).to_bits(),
+                    )
+                })
+                .collect();
+            ranked.sort_by(|a, b| {
+                f32::from_bits(b.1)
+                    .total_cmp(&f32::from_bits(a.1))
+                    .then(a.0.cmp(&b.0))
+            });
+            for k in [1usize, 5, 40, expected.len() + 1] {
+                let hits = r
+                    .search_excluding(
+                        "title",
+                        ClauseLists {
+                            should_phrases: one,
+                            ..ClauseLists::default()
+                        },
+                        k,
+                        f32::NEG_INFINITY,
+                    )
+                    .await
+                    .expect("phrase search");
+                let mut got: Vec<(u32, u32)> =
+                    hits.iter().map(|(d, s)| (d.get(), s.to_bits())).collect();
+                got.sort_by(|a, b| {
+                    f32::from_bits(b.1)
+                        .total_cmp(&f32::from_bits(a.1))
+                        .then(a.0.cmp(&b.0))
+                });
+                let want = &ranked[..k.min(ranked.len())];
+                assert_eq!(got, want, "ranked top-{k}, {label}");
+            }
+        }
     }
 
     /// A three-member phrase matches only where all three are adjacent in
