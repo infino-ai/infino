@@ -2933,7 +2933,7 @@ impl SupertableWriter {
                     segment = Some(
                         bridge_on_runtime(
                             term_index::reserve_segment(
-                                &storage,
+                                storage,
                                 contributions,
                                 &self.inner.options.term_index_build_policy(),
                                 base,
@@ -11148,8 +11148,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
-            term_index::write_tiers(&storage, built.tiers).await?;
-            term_index::write_slices(&storage, built.slices).await?;
+            term_index::write_tiers(storage, built.tiers).await?;
+            term_index::write_slices(storage, built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can

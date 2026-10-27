@@ -266,10 +266,12 @@ fn encode_term(
     ordinals: &[Option<u32>],
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
 ) -> Result<EncodedTerm, TermIndexError> {
-    if budget > 0 && depth > 0 && !term.sources.is_empty() {
-        if let Some(spliced) = splice_term(&mut term, budget, depth, ordinals)? {
-            return Ok(spliced);
-        }
+    if budget > 0
+        && depth > 0
+        && !term.sources.is_empty()
+        && let Some(spliced) = splice_term(&mut term, budget, depth, ordinals)?
+    {
+        return Ok(spliced);
     }
     for source in &term.sources {
         tier_entries(
