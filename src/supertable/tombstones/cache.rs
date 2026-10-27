@@ -59,6 +59,16 @@
 //! ([`SidecarCache::seal_for`], [`SidecarCache::sidecar_for`])
 //! additionally bound entry age by [`DEFAULT_SEAL_TTL`] so a
 //! cross-process seal is observed within that window.
+//!
+//! For the same reason the absent rule above does not apply to seal
+//! lookups: a compactor seals a superfile that has never had a
+//! tombstone by creating its sidecar, and the seq map never learns of
+//! it. A seal lookup on an id the map does not name therefore reads
+//! storage (once per [`DEFAULT_SEAL_TTL`]) instead of answering "no
+//! sidecar", and [`SidecarCache::prefetch_seals`] batches those reads
+//! for the compaction planner. Bitmap lookups keep the absent rule:
+//! a tombstone can only land through the tombstone phase, which does
+//! bump the seq.
 
 use std::{
     collections::BTreeMap,
@@ -148,10 +158,11 @@ struct CachedSidecar {
     etag: Option<String>,
     bitmap: Arc<RoaringBitmap>,
     seal: Option<SealRecord>,
-    /// The seq-view value this entry was fetched under. The entry
-    /// is bitmap-fresh exactly while this matches the current
-    /// view's seq for the superfile.
-    seq: u64,
+    /// The seq-view value this entry was fetched under, `None` when
+    /// the view did not name the superfile (a seal lookup fetched it).
+    /// The entry is bitmap-fresh exactly while this matches the
+    /// current view's seq for the superfile.
+    seq: Option<u64>,
     /// When the entry was fetched — bounds seal staleness (see
     /// [`DEFAULT_SEAL_TTL`]); bitmap reads ignore it.
     fetched_at: Instant,
@@ -230,16 +241,50 @@ impl SidecarCache {
 
     pub async fn prefetch(&self, superfile_ids: &[Uuid], now: Instant) {
         let view = self.seq_view.load();
-        let stale: Vec<(Uuid, u64)> = superfile_ids
+        let stale: Vec<(Uuid, Option<u64>)> = superfile_ids
             .iter()
             .filter_map(|id| {
                 let expected = view.seqs.get(id).copied()?;
                 match self.inner.get(id) {
-                    Some(entry) if entry.seq == expected => None,
+                    Some(entry) if entry.seq == Some(expected) => None,
+                    _ => Some((*id, Some(expected))),
+                }
+            })
+            .collect();
+        self.fetch_batch(stale, now).await;
+    }
+
+    /// As [`Self::prefetch`], for a caller that will read seals: ids the
+    /// seq map does not name are fetched too, since a seal creates the
+    /// sidecar of a superfile that never had a tombstone without the map
+    /// learning of it, and every entry older than [`DEFAULT_SEAL_TTL`] is
+    /// refreshed. In the steady state of a table with no seals in place
+    /// this is one GET per superfile per seal TTL.
+    pub async fn prefetch_seals(&self, superfile_ids: &[Uuid], now: Instant) {
+        let view = self.seq_view.load();
+        let stale: Vec<(Uuid, Option<u64>)> = superfile_ids
+            .iter()
+            .filter_map(|id| {
+                let expected = view.seqs.get(id).copied();
+                match self.inner.get(id) {
+                    Some(entry)
+                        if entry.seq == expected
+                            && now.duration_since(entry.fetched_at) < self.seal_ttl =>
+                    {
+                        None
+                    }
                     _ => Some((*id, expected)),
                 }
             })
             .collect();
+        self.fetch_batch(stale, now).await;
+    }
+
+    /// Fetch every `(id, expected seq)` concurrently and cache what comes
+    /// back. A per-id error leaves any prior entry untouched; the serial
+    /// lookup that follows re-attempts and surfaces it if the id is
+    /// actually consulted.
+    async fn fetch_batch(&self, stale: Vec<(Uuid, Option<u64>)>, now: Instant) {
         if stale.is_empty() {
             return;
         }
@@ -252,9 +297,6 @@ impl SidecarCache {
             let (bitmap, seal, etag) = match result {
                 Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
                 Ok(None) => (Arc::clone(&self.empty_bitmap), None, None),
-                // Leave any prior entry untouched; the serial
-                // bitmap_for fallback re-attempts and surfaces the
-                // error if this id is actually consulted.
                 Err(_) => continue,
             };
             self.inner.insert(
@@ -282,16 +324,20 @@ impl SidecarCache {
         freshness: Freshness,
     ) -> Result<(Arc<RoaringBitmap>, Option<SealRecord>), SidecarCacheError> {
         let view = self.seq_view.load();
-        let Some(expected) = view.seqs.get(&superfile_id).copied() else {
-            // The seq map is authoritative for existence: absent
-            // means no sidecar, so there is nothing to fetch.
+        let expected = view.seqs.get(&superfile_id).copied();
+        if expected.is_none() && freshness == Freshness::Bitmap {
+            // The seq map is authoritative for a bitmap's existence: a
+            // tombstone lands through the tombstone phase, which names
+            // the sidecar here, so absent means no bitmap and there is
+            // nothing to fetch. A seal does not go through that phase,
+            // so a seal lookup falls through to the cache and storage.
             //
             // This view is the newest the process has seen, not the one
             // the caller pinned, so "absent" also covers a superfile a
             // later commit removed while a reader still holds it — and
             // that reader loses its tombstones here. See the module docs.
             return Ok((Arc::clone(&self.empty_bitmap), None));
-        };
+        }
         if let Some(entry) = self.inner.get(&superfile_id) {
             let seq_fresh = entry.seq == expected;
             let fresh = match freshness {
@@ -374,7 +420,7 @@ impl SidecarCache {
     fn refresh_and_return_sidecar(
         &self,
         superfile_id: Uuid,
-        expected_seq: u64,
+        expected_seq: Option<u64>,
     ) -> Result<(Arc<RoaringBitmap>, Option<SealRecord>), SidecarCacheError> {
         let wal_store = self.wal_store.clone();
         let result =
@@ -455,6 +501,81 @@ mod tests {
         let cached = cache.bitmap_for(sf_id, Instant::now()).expect("lookup");
         assert!(cached.is_empty());
         assert_eq!(cache.len(), 0, "no entry is materialized for unmapped ids");
+    }
+
+    /// A compactor seals a superfile that never had a tombstone by creating
+    /// its sidecar, and the manifest's seq map never learns of it. The seal
+    /// lookups must still see it, so a planner does not hand out inputs
+    /// another compactor holds; the bitmap lookup keeps answering from the
+    /// map, with no entry of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seal_on_an_unmapped_superfile_is_seen_by_seal_lookups() {
+        let (_dir, ws, cache) = fixture();
+        let sf_id = Uuid::from_u128(0xBEEF);
+        let seal = SealRecord {
+            compaction_id: Uuid::from_u128(0x5EA1),
+            sealed_at: Utc::now(),
+        };
+        ws.put_tombstones(
+            sf_id,
+            None,
+            &TombstonesSidecar {
+                seal: Some(seal.clone()),
+                bitmap: RoaringBitmap::new(),
+            },
+        )
+        .await
+        .expect("put");
+
+        let now = Instant::now();
+        let seen = cache.seal_for(sf_id, now).expect("seal lookup");
+        assert_eq!(
+            seen.map(|s| s.compaction_id),
+            Some(seal.compaction_id),
+            "the serial seal lookup reads storage for an unmapped id"
+        );
+        let (bitmap, seen) = cache.sidecar_for(sf_id, now).expect("sidecar lookup");
+        assert!(bitmap.is_empty());
+        assert_eq!(seen.map(|s| s.compaction_id), Some(seal.compaction_id));
+        assert!(
+            cache.bitmap_for(sf_id, now).expect("bitmap").is_empty(),
+            "the bitmap lookup still answers from the seq map"
+        );
+    }
+
+    /// The planner's batch: unmapped ids are fetched alongside mapped ones,
+    /// so the per-superfile seal lookups that follow are cache hits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prefetch_seals_fetches_unmapped_ids() {
+        let (_dir, ws, cache) = fixture();
+        let unmapped = Uuid::from_u128(0x1);
+        let mapped = Uuid::from_u128(0x2);
+        let untouched = Uuid::from_u128(0x3);
+        for id in [unmapped, mapped] {
+            ws.put_tombstones(
+                id,
+                None,
+                &TombstonesSidecar {
+                    seal: Some(SealRecord {
+                        compaction_id: id,
+                        sealed_at: Utc::now(),
+                    }),
+                    bitmap: RoaringBitmap::new(),
+                },
+            )
+            .await
+            .expect("put");
+        }
+        cache.reconcile(view(1, &[(mapped, 1)]));
+
+        let now = Instant::now();
+        cache.prefetch_seals(&[unmapped, mapped, untouched], now).await;
+        assert_eq!(cache.len(), 3, "one entry per prefetched id, sealed or not");
+        for id in [unmapped, mapped] {
+            let seal = cache.seal_for(id, now).expect("seal");
+            assert_eq!(seal.map(|s| s.compaction_id), Some(id));
+        }
+        assert!(cache.seal_for(untouched, now).expect("seal").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
