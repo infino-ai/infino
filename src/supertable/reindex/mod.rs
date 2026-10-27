@@ -375,6 +375,11 @@ pub(crate) fn plan_jobs(
                 partition_key: s.partition_key.clone(),
                 inputs: vec![s.superfile_id],
                 estimated_output_bytes: s.live_bytes,
+                // A rewrite reads its one input whole; its rows are not
+                // counted here, since a repair runs one file at a time and
+                // is not admitted against the host like a planned merge.
+                input_bytes: s.live_bytes,
+                live_docs: 0,
                 // A repair is not a planned compaction run, so there are no
                 // per-run settings to honour.
                 merge_input_mb: None,

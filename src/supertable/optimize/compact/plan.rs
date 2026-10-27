@@ -57,7 +57,7 @@ pub struct SuperfileStats {
 }
 
 impl SuperfileStats {
-    fn live_docs(&self) -> u64 {
+    pub(crate) fn live_docs(&self) -> u64 {
         self.n_docs.saturating_sub(self.tombstoned_docs)
     }
 
@@ -95,6 +95,13 @@ pub struct CompactionJob {
     pub inputs: Vec<Uuid>,
     /// Estimated size of the merged superfile.
     pub estimated_output_bytes: u64,
+    /// Bytes of the inputs as stored. A merge opens every input whole and
+    /// holds the bytes until it finishes, so this is the floor of what it
+    /// costs the host from the moment it is admitted.
+    pub input_bytes: u64,
+    /// Rows the output will carry: the inputs' rows less their tombstones.
+    /// An indexed merge keeps per-row bookkeeping for them.
+    pub live_docs: u64,
     /// Memory this job may use, in MiB, from the settings the run was given.
     /// Carried on the job because the planner is where those settings are in
     /// scope; the merge reads it rather than the global configuration, so a
@@ -227,6 +234,7 @@ struct PendingJob {
     members: Vec<Member>,
     live_bytes: u64,
     raw_bytes: u64,
+    live_docs: u64,
     /// Whether an input holds a column in a type the table has moved on
     /// from; the job then runs however small.
     stale_type: bool,
@@ -250,6 +258,7 @@ impl PendingJob {
             size_bytes: s.size_bytes,
         });
         self.live_bytes += s.live_bytes();
+        self.live_docs += s.live_docs();
         self.stale_type |= s.stale_type;
         self.reclaiming |= s.tombstoned_docs as u128 * 100
             >= s.n_docs.max(1) as u128 * RECLAIM_DELETED_PERCENT as u128;
@@ -301,6 +310,8 @@ impl PendingJob {
                 partition_key: key.to_vec(),
                 inputs: members.into_iter().map(|m| m.id).collect(),
                 estimated_output_bytes: self.live_bytes,
+                input_bytes: self.raw_bytes,
+                live_docs: self.live_docs,
                 merge_input_mb,
             });
         }
