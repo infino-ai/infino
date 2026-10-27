@@ -377,7 +377,7 @@ pub(crate) fn plan_jobs(
                 estimated_output_bytes: s.live_bytes,
                 // A repair is not a planned compaction run, so there are no
                 // per-run settings to honour.
-                merge_memory_mb: None,
+                merge_input_mb: None,
             };
             (job, repair)
         })

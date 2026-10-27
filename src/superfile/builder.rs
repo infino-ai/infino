@@ -172,19 +172,20 @@ const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bytes the bisection's forward index may take.
 ///
-/// `merge_memory_mb` is what the compaction run was configured with, which is
-/// what a per-deployment override sets; the global configuration is the
-/// fallback for a merge with no run behind it.
+/// Derived from the merge input cap: `merge_input_mb` is the cap the
+/// compaction run was configured with, which is what a per-deployment
+/// override sets; the global configuration's cap is the fallback for a merge
+/// with no run behind it.
 ///
 /// A merge large enough to be split at the real budget is far larger than a
 /// test can build, so tests narrow this instead of the corpus.
-fn reorder_budget_bytes(merge_memory_mb: Option<u64>) -> u64 {
+fn reorder_budget_bytes(merge_input_mb: Option<u64>) -> u64 {
     #[cfg(test)]
     if let Some(bytes) = tests::reorder_budget_override() {
         return bytes;
     }
-    merge_memory_mb
-        .unwrap_or(global().compaction.max_memory_mb)
+    merge_input_mb
+        .unwrap_or(global().compaction.max_merge_input_mb)
         .saturating_mul(BYTES_PER_MIB)
         / REORDER_FORWARD_INDEX_BUDGET_SHARE
 }
@@ -699,11 +700,11 @@ pub struct BuilderOptions {
     /// Memory this merge may use, in MiB, taken from the compaction settings
     /// the run was given rather than from the global configuration. The
     /// reordering sizes its forward index from a share of it, so a deployment
-    /// that raises the merge budget reorders more documents together.
+    /// that raises the merge input cap reorders more documents together.
     ///
     /// `None` outside compaction, where there is no run to honour and the
     /// configured value is the only one there is.
-    pub(crate) merge_memory_mb: Option<u64>,
+    pub(crate) merge_input_mb: Option<u64>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -811,15 +812,15 @@ impl BuilderOptions {
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
-            merge_memory_mb: None,
+            merge_input_mb: None,
         }
     }
 
-    /// Give the merge the memory budget its compaction run was configured
-    /// with (see [`BuilderOptions::merge_memory_mb`]). `None` leaves it on
-    /// the configured value.
-    pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
-        self.merge_memory_mb = mb;
+    /// Give the merge the input cap its compaction run was configured with
+    /// (see [`BuilderOptions::merge_input_mb`]). `None` leaves it on the
+    /// configured value.
+    pub(crate) fn with_merge_input_mb(mut self, mb: Option<u64>) -> Self {
+        self.merge_input_mb = mb;
         self
     }
 
@@ -2657,7 +2658,7 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
         rows_of: &[Vec<Option<RowId>>],
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -2715,7 +2716,7 @@ impl SuperfileBuilder {
             .filter(|&(t, _)| eligible(t as u32))
             .map(|(_, &d)| u64::from(d))
             .sum();
-        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_memory_mb)
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_input_mb)
         else {
             // No term groups anything; arrival order it is.
             return Ok(None);
@@ -3047,7 +3048,7 @@ impl SuperfileBuilder {
                     n_fts_columns,
                     n_out_docs,
                     &rows_of,
-                    superfile_builder.opts.merge_memory_mb,
+                    superfile_builder.opts.merge_input_mb,
                 )?
             }
             false => None,
@@ -6499,10 +6500,10 @@ mod tests {
             vec![FtsConfig::new("title").positions(true)],
             vec![],
         );
-        assert_eq!(opts.merge_memory_mb, None, "no run behind a plain build");
+        assert_eq!(opts.merge_input_mb, None, "no run behind a plain build");
 
-        let given = opts.clone().with_merge_memory_mb(Some(16_384));
-        assert_eq!(given.merge_memory_mb, Some(16_384));
+        let given = opts.clone().with_merge_input_mb(Some(16_384));
+        assert_eq!(given.merge_input_mb, Some(16_384));
 
         // The merge rebuilds its options from the inputs before it runs, and
         // that reshaping must not drop the budget on the way.
@@ -6515,7 +6516,7 @@ mod tests {
         }];
         let reshaped = merge_builder_opts(&inputs, given).expect("merge options");
         assert_eq!(
-            reshaped.merge_memory_mb,
+            reshaped.merge_input_mb,
             Some(16_384),
             "the budget must reach the builder the merge actually runs with"
         );

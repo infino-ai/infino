@@ -642,7 +642,7 @@ impl Supertable {
         superfiles: &[Arc<SuperfileEntry>],
         tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
         merge: Arc<dyn SuperfileMerge>,
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
     ) -> Result<PreparedSuperfile, BuildError> {
         debug_assert!(
             tombstones.is_empty()
@@ -666,7 +666,7 @@ impl Supertable {
         // a pass could be refused for a budget a serial pass fit inside, on a
         // machine with the memory to spare. What bounds a merge is the host:
         // the runner admits one at a time against free memory, and
-        // `max_memory_mb` caps the input bytes a single job may pack.
+        // `max_merge_input_mb` caps the input bytes a single job may pack.
 
         let semaphore = input_open_permits();
         let mut superfile_readers_tasks = JoinSet::new();
@@ -745,7 +745,7 @@ impl Supertable {
         let builder_options = manifest
             .builder_options()
             .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles))
-            .with_merge_memory_mb(merge_memory_mb);
+            .with_merge_input_mb(merge_input_mb);
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
@@ -939,7 +939,7 @@ impl Supertable {
                 &inputs,
                 &sealed_tombstones,
                 Arc::clone(&merge),
-                job.merge_memory_mb,
+                job.merge_input_mb,
             )
             .await
         {
@@ -2887,7 +2887,7 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![bogus],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -2963,7 +2963,7 @@ mod tests {
             partition_key: entry_a.partition_key.clone(),
             inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
             estimated_output_bytes: 1,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -4639,7 +4639,7 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![superfiles[0].superfile_id, superfiles[2].superfile_id],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let before = part_objects(&dir);
         let peer_handle = peer.clone();
@@ -4708,7 +4708,7 @@ mod tests {
                 .map(|e| e.superfile_id)
                 .collect(),
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         faults.fail_with(
             FaultKind::Precondition,
@@ -6795,13 +6795,13 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), live[0]],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let good = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![live[1], live[2]],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
 
         let err = st
@@ -6879,7 +6879,7 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: pair.to_vec(),
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             })
             .collect()
     }
@@ -7409,7 +7409,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -7492,7 +7492,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.to_vec(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -7532,7 +7532,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -7675,7 +7675,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8138,7 +8138,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8225,7 +8225,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8296,13 +8296,13 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[2], live[3]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
         ];
         st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
@@ -8354,7 +8354,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8419,7 +8419,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: vec![live[0], live[1]],
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8435,7 +8435,7 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
             Duration::ZERO,
         )

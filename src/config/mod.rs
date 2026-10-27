@@ -69,6 +69,14 @@ const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 /// would otherwise be handed that default back with nothing to indicate their
 /// setting had stopped applying — resident memory and per-open cost changing
 /// under them on an upgrade. Failing the load is the loud version.
+/// Keys that still load under their old name, as `(old, new)`. The old name
+/// is a serde alias of the new field, so a config using it keeps working;
+/// the loader warns so it gets updated before the alias is retired.
+const RENAMED_CONFIG_KEYS: &[(&str, &str)] = &[(
+    "compaction.max_memory_mb",
+    "compaction.max_merge_input_mb",
+)];
+
 const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
         "vector.hnsw_recall_slack",
@@ -363,7 +371,9 @@ const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 /// their combined live bytes are far below the size floor. Catches the
 /// small-append fragmentation that would otherwise never reach `min_fill_percent`.
 const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
-const DEFAULT_COMPACTION_MAX_MEMORY_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
+/// Default cap on the raw input bytes one merge packs: the target plus room
+/// for a partition of unusually large superfiles.
+const DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
@@ -392,7 +402,7 @@ impl Default for CompactionSteps {
     }
 }
 
-/// Compaction settings: target size, fill floor, and memory budget.
+/// Compaction settings: target size, fill floor, and merge input cap.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct CompactionSettings {
@@ -420,7 +430,12 @@ pub struct CompactionSettings {
     /// times higher once rows are decoded and the output encoded, and it does
     /// not govern how many merges run at once: the runner admits them against
     /// the host's free memory.
-    pub max_memory_mb: u64,
+    ///
+    /// The YAML key `max_memory_mb` is the deprecated name of this setting;
+    /// it still loads, with a warning, and is listed in
+    /// [`RENAMED_CONFIG_KEYS`]. A file that sets both is rejected.
+    #[serde(alias = "max_memory_mb")]
+    pub max_merge_input_mb: u64,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
     /// `None` (the default) derives the ceiling from the maintenance pool and
@@ -445,7 +460,7 @@ impl Default for CompactionSettings {
             target_superfile_size_mb: DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB,
             min_fill_percent: DEFAULT_COMPACTION_MIN_FILL_PERCENT,
             min_superfiles_for_merge: DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE,
-            max_memory_mb: DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            max_merge_input_mb: DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB,
             max_concurrent_jobs: None,
             stale_seal_timeout_ms: DEFAULT_STALE_SEAL_TIMEOUT_MS,
             steps: CompactionSteps::default(),
@@ -1727,7 +1742,7 @@ impl Config {
     /// This is a CPU ceiling only. The memory bound lives in the compaction
     /// runner, which admits another merge only while the host reports free memory
     /// — an observation, where this layer could only guess from the
-    /// `max_memory_mb` cap. The one exception is a host with no procfs:
+    /// `max_merge_input_mb` cap. The one exception is a host with no procfs:
     /// nothing downstream can bound the merges there, so the derived width is 1.
     /// `compaction` is the settings the pass actually runs with, not
     /// necessarily `self.compaction`: the hidden vector index compacts under
@@ -1743,7 +1758,7 @@ impl Config {
             // `MemAvailable` otherwise — between admissions, and stops
             // widening once less than its reserve share is free. That measures
             // what merges cost on this corpus, where this layer could only
-            // guess from the `max_memory_mb` CAP, which real jobs are
+            // guess from the `max_merge_input_mb` CAP, which real jobs are
             // routinely a fraction of. The derived value is then just the CPU
             // ceiling.
             Some(_) => maintenance,
@@ -1784,8 +1799,10 @@ impl Config {
     /// the embedded-default + extraction machinery.
     pub fn from_figment(fig: Figment) -> Result<Self, ConfigError> {
         // Before extraction, because extraction is exactly where a retired key
-        // would vanish without trace.
+        // would vanish without trace, and where a renamed one is folded into
+        // its new field.
         Self::reject_retired_keys(&fig)?;
+        Self::warn_renamed_keys(&fig);
         let mut cfg: Config = fig.extract()?;
         cfg.clamp_vector_autotuning();
         cfg.validate()?;
@@ -1850,6 +1867,19 @@ impl Config {
                 "vector.centroid_graph_parity_gap must be in [0, 1); falling back to the default"
             );
             v.centroid_graph_parity_gap = DEFAULT_CENTROID_GRAPH_PARITY_GAP;
+        }
+    }
+
+    /// Warn for every [`RENAMED_CONFIG_KEYS`] entry present under its old
+    /// name. The value still loads through the alias; only the name is stale.
+    fn warn_renamed_keys(fig: &Figment) {
+        for (old, new) in RENAMED_CONFIG_KEYS {
+            if fig.find_value(old).is_ok() {
+                warn!(
+                    "`{old}` was renamed to `{new}`; the old key still loads but will be \
+                     removed in a later release, so update the config file"
+                );
+            }
         }
     }
 
@@ -2531,7 +2561,7 @@ supertable:
         );
         assert_eq!(c.min_fill_percent, DEFAULT_COMPACTION_MIN_FILL_PERCENT);
         assert_eq!(
-            c.max_memory_mb, DEFAULT_COMPACTION_MAX_MEMORY_MB,
+            c.max_merge_input_mb, DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB,
             "target + 2048"
         );
     }
@@ -2556,7 +2586,62 @@ supertable:
         let cfg = Config::from_figment(fig).expect("layered yaml");
         assert_eq!(cfg.compaction.target_superfile_size_mb, 2048);
         assert_eq!(cfg.compaction.min_fill_percent, 50);
-        assert_eq!(cfg.compaction.max_memory_mb, 3072);
+        assert_eq!(cfg.compaction.max_merge_input_mb, 3072);
+    }
+
+    /// A merge input cap set in the layered YAML, under the key's current
+    /// name, is loaded.
+    #[test]
+    fn compaction_max_merge_input_mb_loads_under_its_name() {
+        let yaml = r#"
+               compaction:
+                    max_merge_input_mb: 6144
+           "#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("layered yaml");
+        assert_eq!(cfg.compaction.max_merge_input_mb, 6144);
+    }
+
+    /// A config written before the rename keeps working: the old key
+    /// `max_memory_mb` sets the same field. (The loader also logs a warning,
+    /// which this does not capture.)
+    #[test]
+    fn compaction_max_memory_mb_is_the_legacy_key_of_max_merge_input_mb() {
+        let yaml = r#"
+               compaction:
+                    max_memory_mb: 6144
+           "#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let cfg = Config::from_figment(fig).expect("legacy key loads");
+        assert_eq!(cfg.compaction.max_merge_input_mb, 6144);
+        assert_eq!(
+            RENAMED_CONFIG_KEYS,
+            &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")],
+            "the legacy key is the one the loader warns about"
+        );
+    }
+
+    /// Both names in one file is a contradiction waiting to happen, so the
+    /// load fails rather than picking one.
+    #[test]
+    fn compaction_max_memory_mb_beside_max_merge_input_mb_is_rejected() {
+        let yaml = r#"
+               compaction:
+                    max_merge_input_mb: 6144
+                    max_memory_mb: 3072
+           "#;
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(yaml));
+        let err = Config::from_figment(fig).expect_err("both keys at once");
+        assert!(
+            err.to_string().contains("max_merge_input_mb"),
+            "the error names the field: {err}"
+        );
     }
 
     #[test]
@@ -2832,13 +2917,13 @@ vector:
     ///
     /// The memory bound belongs to the compaction runner, which admits merges
     /// only while the host reports free memory. Deriving it here could only
-    /// divide by `max_memory_mb` — the cap the packer stops at, which real jobs
+    /// divide by `max_merge_input_mb` — the cap the packer stops at, which real jobs
     /// rarely approach — so the width caps at the pool and nothing else.
     #[test]
     fn the_derived_width_is_the_pool_width_not_a_memory_estimate() {
         let cfg = Config::default();
         let derived = cfg.compaction_concurrency(&CompactionSettings {
-            max_memory_mb: ANY_BUDGET_MB,
+            max_merge_input_mb: ANY_BUDGET_MB,
             ..CompactionSettings::default()
         });
         // Never zero, whatever the host — a zero would stall the merge loop.
@@ -2846,7 +2931,7 @@ vector:
         // Crucially it does NOT scale with the memory budget: a four-fold
         // budget is the same width, because memory is judged downstream.
         let wide_budget = cfg.compaction_concurrency(&CompactionSettings {
-            max_memory_mb: ANY_BUDGET_MB * 4,
+            max_merge_input_mb: ANY_BUDGET_MB * 4,
             ..CompactionSettings::default()
         });
         assert_eq!(
