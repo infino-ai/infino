@@ -2180,8 +2180,8 @@ mod tests {
     };
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
-    use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{Int64Array, LargeStringArray, RecordBatch, TimestampSecondArray};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         common::DFSchema,
         datasource::physical_plan::FileGroup,
@@ -2872,6 +2872,94 @@ mod tests {
             .build()
             .expect("rt");
         (provider, rt)
+    }
+
+    fn time_hits_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("hits", DataType::Int64, false),
+        ]))
+    }
+
+    /// A no-index table over `time_hits_schema`, one superfile per commit.
+    fn time_hits_opts() -> SupertableOptions {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(time_hits_schema(), vec![], vec![])
+            .expect("opts")
+            .with_writer_pool(pool)
+    }
+
+    /// One row per entry of `hours`, stamped at that hour.
+    fn time_hits_batch(hours: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            time_hits_schema(),
+            vec![
+                Arc::new(TimestampSecondArray::from(
+                    hours.iter().map(|h| h * SECS_PER_HOUR).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vec![1i64; hours.len()])),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// A second-resolution timestamp literal at `hour`.
+    fn at_hour(hour: i64) -> Expr {
+        lit(ScalarValue::TimestampSecond(Some(hour * SECS_PER_HOUR), None))
+    }
+
+    /// Seconds in an hour, for the timestamp fixtures.
+    const SECS_PER_HOUR: i64 = 3_600;
+
+    /// A time-ordered load lands as superfiles with disjoint `time` ranges,
+    /// and a range predicate on the column must prune to the ones the range
+    /// touches: every superfile a one-hour query opens past those is a
+    /// footer fetch and an open for nothing, which at thousands of files is
+    /// the whole latency of the query.
+    #[test]
+    fn superfile_prune_by_timestamp_range() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 3);
+        let provider = SupertableProvider::new(
+            reader.manifest().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+
+        let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
+        assert_eq!(survivors(&[]), 3, "no predicate reads every superfile");
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(4))]),
+            1,
+            "a lower bound keeps only the superfiles whose range reaches it"
+        );
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(2)), col("time").lt(at_hour(3))]),
+            1,
+            "a one-hour window keeps the one superfile holding that hour"
+        );
+        assert_eq!(
+            survivors(&[col("time").lt(at_hour(0))]),
+            0,
+            "a range before the table's first row keeps nothing"
+        );
     }
 
     #[test]
