@@ -7612,12 +7612,10 @@ mod tests {
             (uploaded, uploads_held)
         };
         let (pass, (uploaded, uploads_held)) = tokio::join!(
-            st.run_compaction_jobs_with(
-                jobs,
-                DEFAULT_STALE_SEAL_TIMEOUT,
-                CHARGED_JOBS,
-                || Some((CHARGED_HOST_BYTES, CHARGED_HOST_BYTES))
-            ),
+            st.run_compaction_jobs_with(jobs, DEFAULT_STALE_SEAL_TIMEOUT, CHARGED_JOBS, || Some((
+                CHARGED_HOST_BYTES,
+                CHARGED_HOST_BYTES
+            ))),
             check
         );
         assert!(
