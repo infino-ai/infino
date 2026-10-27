@@ -40,7 +40,7 @@ use crate::{
             posting::{BLOCK_LEN, BlockHeader, decode_block},
             short::{decode_short, short_df},
         },
-        id_space::{FtsDocId, RowId, RowSet},
+        id_space::{DocMap, FtsDocId, RowId, RowSet},
     },
     utils::terms::{DictEntry, make_key},
 };
@@ -507,6 +507,16 @@ impl FtsReader {
         (distinct, qtf)
     }
 
+    /// The doc-id map for a filter: read now when it checks rows against an
+    /// allow set, and the identity otherwise, which such a filter never
+    /// consults.
+    async fn filter_doc_map(&self, checks_rows: bool) -> Result<DocMap, FtsError> {
+        match checks_rows {
+            true => Ok(self.ensure_doc_map().await?.clone()),
+            false => Ok(DocMap::Identity),
+        }
+    }
+
     pub(crate) async fn prepare_clauses(
         &self,
         column: &str,
@@ -618,15 +628,31 @@ impl FtsReader {
                 + must_dict
                 + should_dict
                 + negative_dict;
+            // No positive atom of the query is in this superfile, so nothing
+            // here can match: return before the filter, which would read the
+            // doc-id map to check rows there are none of.
+            if must_atoms.is_empty() && should_atoms.is_empty() {
+                return Ok(PreparedClauses::Done {
+                    hits: Vec::new(),
+                    count: 0,
+                    exact_count: lists.exact_count,
+                    postings_bytes,
+                    planned_ranges,
+                    kernel_cpu_ns: 0,
+                });
+            }
             // The gate exists when there is anything to gate on: a negated
             // atom, or a pushed-down row set.
             let filter = match (negative_atoms.is_empty(), lists.allow.clone()) {
                 (true, None) => None,
-                (_, allow) => Some(AtomExcludeFilter::with_allow(
-                    negative_atoms,
-                    allow.map(RowSet::new),
-                    self.ensure_doc_map().await?.clone(),
-                )),
+                (_, allow) => {
+                    let doc_map = self.filter_doc_map(allow.is_some()).await?;
+                    Some(AtomExcludeFilter::with_allow(
+                        negative_atoms,
+                        allow.map(RowSet::new),
+                        doc_map,
+                    ))
+                }
             };
             // The atom walk is the whole kernel for phrase shapes —
             // `run_prepared` sees only the finished `Done` — so bracket
@@ -683,11 +709,17 @@ impl FtsReader {
         // term present in this superfile, or a pushed-down row set.
         let neg_filter = match (neg_cursors.is_empty(), lists.allow.clone()) {
             (true, None) => None,
-            (_, allow) => Some(ExcludeFilter::with_allow(
-                neg_cursors,
-                allow.map(RowSet::new),
-                self.ensure_doc_map().await?.clone(),
-            )),
+            (_, allow) => {
+                // The positive terms are resolved below, after the filter;
+                // with an allow set the map is read here so a filter that
+                // checks rows always holds the real one.
+                let doc_map = self.filter_doc_map(allow.is_some()).await?;
+                Some(ExcludeFilter::with_allow(
+                    neg_cursors,
+                    allow.map(RowSet::new),
+                    doc_map,
+                ))
+            }
         };
 
         // Fold repeated MUST/SHOULD terms into one weighted cursor each: the

@@ -4735,18 +4735,40 @@ mod tests {
         }
     }
 
-    /// Rows of [`probed_reader`]'s blob that hold [`PROBE_TERM`].
+    /// [`probed_reader`]'s documents, row by row.
+    const PROBE_DOCS: [&str; 4] = ["alpha one", "beta two", "alpha three", "gamma four"];
+    /// Rows of [`PROBE_DOCS`] that hold [`PROBE_TERM`].
     const PROBE_ROWS: [u32; 2] = [0, 2];
-    /// The term [`probed_reader`]'s blob holds in [`PROBE_ROWS`].
+    /// The term [`PROBE_DOCS`] hold in [`PROBE_ROWS`].
     const PROBE_TERM: &str = "alpha";
+    /// The only row of [`PROBE_DOCS`] holding the phrase "alpha one".
+    const PROBE_PHRASE_ROW: u32 = 0;
+    /// A term in no document.
+    const MISSING_TERM: &str = "zzq";
+    /// Documents per term a term-index head keeps in these tests: more than
+    /// [`PROBE_TERM`] has, so its head holds all of them.
+    const PROBE_HEAD_DEPTH: usize = 8;
+    /// Average lengths the scored views in the tests below score at, each
+    /// unlike the blob's own.
+    const VIEW_AVERAGE_LENGTHS: [f32; 3] = [3.0, 4.0, 5.0];
+    /// Flips every bit of the byte a test damages.
+    const DAMAGE_MASK: u8 = 0xFF;
 
-    /// A lazy reader over a blob that stores its four documents in reverse,
-    /// on a [`MapProbeSource`] that knows where the map lies. `verify_crc`
-    /// is the reader's.
+    /// A lazy reader over a blob with positions that stores [`PROBE_DOCS`]
+    /// in reverse, on a [`MapProbeSource`] that knows where the map lies.
+    /// `verify_crc` is the reader's.
     async fn probed_reader(verify_crc: bool) -> (Arc<MapProbeSource>, FtsReader) {
-        let docs = ["alpha one", "beta two", "alpha three", "gamma four"];
-        let order: Vec<u32> = (0..docs.len() as u32).rev().collect();
-        let (blob, json) = build_standard_blob_with(&docs, Some(&order));
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), true)
+            .expect("register column");
+        let order: Vec<u32> = (0..PROBE_DOCS.len() as u32).rev().collect();
+        for (position, &row) in order.iter().enumerate() {
+            b.add_doc(0, position as u32, PROBE_DOCS[row as usize])
+                .expect("add doc");
+        }
+        b.doc_map = Some(order);
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let source = Arc::new(MapProbeSource {
             blob,
             reads: Mutex::new(Vec::new()),
@@ -4754,7 +4776,7 @@ mod tests {
             fail_map_reads: AtomicU32::new(0),
         });
         let src: Arc<dyn LazyByteSource> = source.clone();
-        let r = FtsReader::open_lazy(src, &json, OpenOptions { verify_crc })
+        let r = FtsReader::open_lazy(src, json, OpenOptions { verify_crc })
             .await
             .expect("open_lazy");
         let map = r
@@ -4823,43 +4845,204 @@ mod tests {
         );
     }
 
-    /// A ranked search and an unranked match read the map only once they
-    /// have a hit to translate, and then on the query's runtime: a term
-    /// this superfile lacks reads none of it.
-    #[tokio::test]
-    async fn a_search_reads_the_doc_map_only_for_a_hit_to_translate() {
-        let (source, r) = probed_reader(false).await;
-        let (rows, _) = r
-            .token_match("body", &["zzq"], BoolMode::Or)
-            .await
-            .expect("token_match");
-        assert!(rows.is_empty(), "no row holds the term");
+    /// Every row of `r`'s blob, as an allow set that admits them all.
+    fn every_row(r: &FtsReader) -> Arc<RoaringBitmap> {
+        Arc::new((0..r.n_docs()).collect())
+    }
+
+    /// Rows, ascending.
+    fn sorted(rows: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        let mut rows: Vec<u32> = rows.into_iter().collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The rows a ranked search for `lists` returns, ascending.
+    async fn search_rows(r: &FtsReader, lists: ClauseLists<'_>) -> Vec<u32> {
         let hits = r
-            .search_excluding(
-                "body",
-                ClauseLists {
-                    shoulds: &["zzq"],
-                    ..Default::default()
-                },
-                10,
-                f32::NEG_INFINITY,
-            )
+            .search_excluding("body", lists, 10, f32::NEG_INFINITY)
             .await
             .expect("search");
-        assert!(hits.is_empty(), "no row holds the term");
-        assert!(
-            source.map_reads().is_empty(),
-            "a search without a hit read the map"
-        );
+        sorted(hits.into_iter().map(|(row, _)| row.get()))
+    }
 
+    /// A query with no hit in this file reads none of its map, whatever
+    /// path it takes: a missing term, a negated term the file holds, an
+    /// allow set with a missing phrase, two terms that never share a
+    /// document, an OR cursor set or a term-index head of a missing term.
+    #[tokio::test]
+    async fn no_query_without_a_hit_reads_the_doc_map() {
+        let (source, r) = probed_reader(false).await;
+        let allow = every_row(&r);
+        let missing_phrase = [Phrase::adjacent(vec![
+            MISSING_TERM.to_string(),
+            PROBE_TERM.to_string(),
+        ])];
         let (rows, _) = r
-            .token_match("body", &[PROBE_TERM], BoolMode::Or)
+            .token_match("body", &[MISSING_TERM], BoolMode::Or)
             .await
             .expect("token_match");
-        let mut rows: Vec<u32> = rows.into_iter().map(|row| row.get()).collect();
-        rows.sort_unstable();
-        assert_eq!(rows, PROBE_ROWS);
-        assert_eq!(source.map_reads(), [thread::current().id()]);
+        assert!(rows.is_empty(), "token_match");
+        let (rows, _) = r
+            .atoms_match_ids("body", &[PROBE_TERM, "gamma"], &[], BoolMode::And)
+            .await
+            .expect("atoms_match_ids");
+        assert!(rows.is_empty(), "no row holds both terms");
+        let missing = search_rows(
+            &r,
+            ClauseLists {
+                shoulds: &[MISSING_TERM],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(missing.is_empty(), "ranked search");
+        let negated = search_rows(
+            &r,
+            ClauseLists {
+                shoulds: &[MISSING_TERM],
+                negatives: &[PROBE_TERM],
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(negated.is_empty(), "ranked search with a negated term");
+        let phrase = search_rows(
+            &r,
+            ClauseLists {
+                should_phrases: &missing_phrase,
+                allow: Some(Arc::clone(&allow)),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(phrase.is_empty(), "filtered phrase search");
+        let set = r
+            .build_or_cursor_set("body", &[MISSING_TERM], QueryIdf::ThisFile, None)
+            .await
+            .expect("cursor set");
+        assert!(set.cursors.is_empty(), "OR cursor set");
+        let dict = r.dict_bytes_async().await.expect("dictionary");
+        let facts = r
+            .term_index_facts_with(&dict, "body", &[MISSING_TERM], PROBE_HEAD_DEPTH)
+            .await
+            .expect("term facts");
+        assert!(facts[0].is_none(), "term facts");
+        assert!(
+            source.map_reads().is_empty(),
+            "a query without a hit read the map"
+        );
+    }
+
+    /// Each kind of query with a hit reads the map once, on its own runtime
+    /// rather than through the sync bridge, and names the right rows.
+    #[tokio::test]
+    async fn each_query_with_a_hit_reads_the_doc_map_once_on_its_runtime() {
+        let here = thread::current().id();
+        let hit_phrase = [Phrase::adjacent(vec![
+            PROBE_TERM.to_string(),
+            "one".to_string(),
+        ])];
+        for case in [
+            "ranked search",
+            "filtered phrase search",
+            "token_match",
+            "atoms_match_ids",
+            "OR cursor set",
+            "term-index head",
+        ] {
+            let (source, r) = probed_reader(false).await;
+            let rows = match case {
+                "ranked search" => {
+                    search_rows(
+                        &r,
+                        ClauseLists {
+                            shoulds: &[PROBE_TERM],
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                }
+                "filtered phrase search" => {
+                    search_rows(
+                        &r,
+                        ClauseLists {
+                            must_phrases: &hit_phrase,
+                            allow: Some(every_row(&r)),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                }
+                "token_match" => {
+                    let (rows, _) = r
+                        .token_match("body", &[PROBE_TERM], BoolMode::Or)
+                        .await
+                        .expect("token_match");
+                    sorted(rows.into_iter().map(|row| row.get()))
+                }
+                "atoms_match_ids" => {
+                    let (rows, _) = r
+                        .atoms_match_ids("body", &[PROBE_TERM], &[], BoolMode::Or)
+                        .await
+                        .expect("atoms_match_ids");
+                    sorted(rows.into_iter().map(|row| row.get()))
+                }
+                "OR cursor set" => {
+                    let set = r
+                        .build_or_cursor_set("body", &[PROBE_TERM], QueryIdf::ThisFile, None)
+                        .await
+                        .expect("cursor set");
+                    let hits = r
+                        .search_or_range_prebuilt(&set, 10, 0, r.n_docs(), f32::NEG_INFINITY)
+                        .expect("ranged search");
+                    sorted(hits.into_iter().map(|(row, _)| row.get()))
+                }
+                "term-index head" => {
+                    let dict = r.dict_bytes_async().await.expect("dictionary");
+                    let facts = r
+                        .term_index_facts_with(&dict, "body", &[PROBE_TERM], PROBE_HEAD_DEPTH)
+                        .await
+                        .expect("term facts");
+                    let fact = facts[0].as_ref().expect("the term is in the file");
+                    sorted(fact.head.docs.iter().map(|&(row, _, _)| row))
+                }
+                other => unreachable!("no case {other}"),
+            };
+            let expected = match case {
+                "filtered phrase search" => vec![PROBE_PHRASE_ROW],
+                _ => PROBE_ROWS.to_vec(),
+            };
+            assert_eq!(rows, expected, "{case}");
+            assert_eq!(source.map_reads(), [here], "{case}");
+        }
+    }
+
+    /// The blocking read of the map (what a compaction input's remap uses)
+    /// returns a failed read as an error and keeps nothing, so the next
+    /// read gets the real map, never blob ids taken as rows.
+    #[tokio::test]
+    async fn a_failed_blocking_doc_map_read_is_an_error_and_not_kept() {
+        let (source, r) = probed_reader(true).await;
+        source.fail_map_reads.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(
+                r.doc_map(),
+                Err(FtsError::RangeFetch {
+                    what: "fts/doc-map",
+                    ..
+                })
+            ),
+            "a failed map read must be an error"
+        );
+        assert!(!r.doc_map_is_read(), "a failed read is not kept");
+        let map = r.doc_map().expect("the next read");
+        let last_row = PROBE_DOCS.len() as u32 - 1;
+        assert_eq!(
+            map.row_of(FtsDocId::new(0)),
+            RowId::new(last_row),
+            "blob id 0 holds the last row"
+        );
     }
 
     /// A search filtered to an allow set checks rows before any cursor
@@ -4898,14 +5081,14 @@ mod tests {
         let (source, _) = probed_reader(true).await;
         let map = source.map.get().expect("map").clone();
         let mut damaged = source.blob.to_vec();
-        damaged[map.start] ^= 0xFF;
+        damaged[map.start] ^= DAMAGE_MASK;
         let damaged = Arc::new(MapProbeSource {
             blob: Bytes::from(damaged),
             reads: Mutex::new(Vec::new()),
             map: OnceLock::new(),
             fail_map_reads: AtomicU32::new(0),
         });
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
         let src: Arc<dyn LazyByteSource> = damaged;
         let r = FtsReader::open_lazy(src, json, OpenOptions::default())
             .await
@@ -4927,7 +5110,7 @@ mod tests {
     #[tokio::test]
     async fn views_and_concurrent_queries_share_one_read_of_the_doc_map() {
         let (source, r) = probed_reader(false).await;
-        let views: Vec<FtsReader> = [3.0, 4.0, 5.0]
+        let views: Vec<FtsReader> = VIEW_AVERAGE_LENGTHS
             .into_iter()
             .map(|avgdl| {
                 r.with_scoring(&ScoringView {
