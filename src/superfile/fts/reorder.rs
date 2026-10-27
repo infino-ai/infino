@@ -92,7 +92,12 @@ const MIN_PARTITION: usize = 32;
 ///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
-const REORDER_CONVERGENCE: f32 = 0.05;
+///
+/// At 0.20 rather than 0.05: on a 37M-row pageviews merge the bisection took
+/// 72 s instead of 157 s, the merged file was 0.27% larger, and across 200
+/// title queries every top-10 came back with the same scores, only rows that
+/// tie on score in a different order, at the same query latency.
+const REORDER_CONVERGENCE: f32 = 0.2;
 
 /// Ceiling on a split's move rounds. Equal to the fixed count the bisection
 /// used before the convergence test existed, so setting [`REORDER_CONVERGENCE`]
