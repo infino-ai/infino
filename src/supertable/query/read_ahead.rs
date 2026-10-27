@@ -1617,11 +1617,12 @@ mod tests {
         reader_of(&scan(store, budget, &[]), path, meta)
     }
 
-    /// A reader cap that admits exactly two of the test file's row groups:
-    /// the spans of two, with no room for a third.
+    /// A reader cap that admits two of the test file's row groups but not
+    /// three: one byte short of what three take. The file's row groups are
+    /// alike in size, so any two fit and no three do.
     fn two_row_groups_cap() -> usize {
         let (_, meta) = small_file();
-        charge(&meta, &[0, 1])
+        charge(&meta, &[0, 1, 2]) - 1
     }
 
     /// The projected columns' whole chunks in row group `rg`.
