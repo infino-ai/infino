@@ -413,11 +413,13 @@ pub enum OrAlgo {
 }
 
 /// Doc-id window for the windowed union scorer. Power of two so the
-/// window base is a cheap mask. At 4096 the per-window state — a
-/// `4096 × f32` score accumulator (16 KiB) plus a `4096`-bit presence
-/// bitset (512 B) — stays L1/L2-resident across the accumulate + drain
-/// passes.
-pub(super) const OR_WINDOW: u32 = 4096;
+/// window base is a cheap mask. At 8192 the per-window state — an
+/// `8192 × f32` score accumulator (32 KiB) plus an `8192`-bit presence
+/// bitset (1 KiB) — stays L1/L2-resident across the accumulate + drain
+/// passes, and a union of common terms pays its per-window costs (the
+/// smallest-doc scan, a cursor's step into and out of the window, the
+/// drain's pass over the presence words) half as often as at 4096.
+pub(super) const OR_WINDOW: u32 = 8192;
 /// Number of 64-bit words in the window presence bitset.
 pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
 
