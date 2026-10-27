@@ -1105,7 +1105,10 @@ mod tests {
         let in_input_order: Vec<String> = (1..=ORDER_WAVE_CHUNKS * ORDER_CHUNK_ROWS)
             .map(|n| n.to_string())
             .collect();
-        assert_eq!(by_id, in_input_order, "rows read back by id are in input order");
+        assert_eq!(
+            by_id, in_input_order,
+            "rows read back by id are in input order"
+        );
     }
 
     /// A small budget caps chunk size below `target_rows`.
