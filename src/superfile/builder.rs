@@ -71,7 +71,8 @@ use std::{
     io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
     ops::Range,
     str::from_utf8,
-    sync::Arc,
+    sync::{Arc, mpsc::sync_channel},
+    thread,
     time::Duration,
 };
 
@@ -142,6 +143,10 @@ use crate::{
 /// Merges below this many surviving documents keep arrival order: a
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
+
+/// Batches a merge decodes ahead of the one it is encoding: enough to keep
+/// decoding through a row group's encode, which takes many batches at once.
+const DECODED_BATCHES_AHEAD: usize = 64;
 
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
@@ -3276,45 +3281,70 @@ impl SuperfileBuilder {
             timings.fts += start.elapsed();
             if ordered_batches.is_none() {
                 // Stream surviving rows batch by batch. Do not decode and retain an
-                // entire input in memory.
-                let mut batches = input.batches(&superfile_builder.opts)?;
+                // entire input in memory. A thread of its own decodes the next
+                // few batches and computes their stats while this one encodes
+                // the last; they arrive in the order they were read, so the
+                // output is the same.
+                let opts = superfile_builder.opts.clone();
+                let (sender, decoded) = sync_channel::<
+                    Result<(RecordBatch, SuperfileStats), BuildError>,
+                >(DECODED_BATCHES_AHEAD);
+                thread::scope(|scope| -> Result<(), BuildError> {
+                    scope.spawn(move || {
+                        let batches = match input.batches(&opts) {
+                            Ok(batches) => batches,
+                            Err(e) => {
+                                let _ = sender.send(Err(e));
+                                return;
+                            }
+                        };
+                        for batch in batches {
+                            let decoded = batch.and_then(|batch| {
+                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                                Ok((batch, stats))
+                            });
+                            let failed = decoded.is_err();
+                            // The receiver is gone once the merge has failed.
+                            if sender.send(decoded).is_err() || failed {
+                                return;
+                            }
+                        }
+                    });
+                    loop {
+                        let start = std::time::Instant::now();
+                        let Ok(next) = decoded.recv() else {
+                            break;
+                        };
+                        let (record_batch, stats) = next?;
+                        // Time spent waiting on the decoder, not decoding.
+                        timings.read_parquet += start.elapsed();
+                        stats_collector.push(stats);
 
-                loop {
-                    let start = std::time::Instant::now();
-                    let Some(record_batch) = batches.next().transpose()? else {
-                        break;
-                    };
-                    timings.read_parquet += start.elapsed();
+                        let start = std::time::Instant::now();
+                        body_encoder.write_batch(&record_batch)?;
+                        timings.write_parquet += start.elapsed();
 
-                    let start = std::time::Instant::now();
-                    stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                        &record_batch,
-                    )?);
-                    timings.stats_compute += start.elapsed();
+                        if ids_ok
+                            && !append_stable_id_sidecar(
+                                &mut id_sidecar_bytes,
+                                &record_batch,
+                                &id_column,
+                            )
+                        {
+                            ids_ok = false;
+                            id_sidecar_bytes = Vec::new();
+                        }
 
-                    let start = std::time::Instant::now();
-                    body_encoder.write_batch(&record_batch)?;
-                    timings.write_parquet += start.elapsed();
-
-                    if ids_ok
-                        && !append_stable_id_sidecar(
-                            &mut id_sidecar_bytes,
-                            &record_batch,
-                            &id_column,
-                        )
-                    {
-                        ids_ok = false;
-                        id_sidecar_bytes = Vec::new();
+                        let rows = record_batch.num_rows() as u32;
+                        // A re-analyzed merge indexes the rows as they go by,
+                        // under the doc ids they are written at.
+                        if reanalyze {
+                            superfile_builder.index_fts_batch(&record_batch, rows)?;
+                        }
+                        superfile_builder.next_local_doc_id += rows;
                     }
-
-                    let rows = record_batch.num_rows() as u32;
-                    // A re-analyzed merge indexes the rows as they go by,
-                    // under the doc ids they are written at.
-                    if reanalyze {
-                        superfile_builder.index_fts_batch(&record_batch, rows)?;
-                    }
-                    superfile_builder.next_local_doc_id += rows;
-                }
+                    Ok(())
+                })?;
             }
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
