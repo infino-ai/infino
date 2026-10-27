@@ -1480,7 +1480,8 @@ mod tests {
         supertable::query::{
             df_object_store::SuperfileObjectStore,
             read_ahead::{
-                Batch, Held, ReadAhead, ScanReadAhead, chunk_range, download_bytes, fetch_spans,
+                Batch, Held, READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead, ScanReadAhead, chunk_range,
+                download_bytes, fetch_spans,
                 fixture::{
                     GROUPS, ROWS_PER_GROUP, Superfile, block_cached, schema, small_file, wide_file,
                 },
