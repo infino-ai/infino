@@ -569,6 +569,27 @@ pub(super) fn kth_scored<C: Collector>(
     }
 }
 
+/// [`kth_scored`] with no floor, by scoring every doc and selecting the
+/// `k`-th best once.
+fn kth_selected(
+    k: usize,
+    idf_weight: f32,
+    dl_norm: &NormTable,
+    mut decode: impl FnMut(&mut [u32; BLOCK_LEN], &mut [u32; BLOCK_LEN]) -> Option<usize>,
+) -> f32 {
+    let (mut ids, mut tfs) = ([0u32; BLOCK_LEN], [0u32; BLOCK_LEN]);
+    let mut block: Vec<f32> = Vec::with_capacity(BLOCK_LEN);
+    let mut scores: Vec<f32> = Vec::new();
+    while let Some(n) = decode(&mut ids, &mut tfs) {
+        score_postings(idf_weight, &ids[..n], &tfs[..n], dl_norm, &mut block);
+        scores.extend_from_slice(&block);
+    }
+    match k.checked_sub(1).filter(|&i| i < scores.len()) {
+        Some(i) => *scores.select_nth_unstable_by(i, |a, b| b.total_cmp(a)).1,
+        None => f32::NEG_INFINITY,
+    }
+}
+
 /// `k` from which a multi-term union starts its bar at [`union_seed`]: at a
 /// smaller `k` the bar rises within the first windows anyway.
 const UNION_SEED_MIN_K: usize = 64;
@@ -618,18 +639,23 @@ fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
                 .block_max_bm25
                 .total_cmp(&c.blocks[a].block_max_bm25)
         });
-        // The blocks hold at most `need` × `BLOCK_LEN` docs, which bounds the
-        // buffer however large `k` is.
-        let cap = k.min(need.saturating_mul(BLOCK_LEN));
         let mut blocks = order[..need].iter();
-        let kth = kth_scored(
-            <TopKBuffer as Collector>::with_capacity(k, cap),
-            k,
-            f32::NEG_INFINITY,
-            c.idf_weight,
-            dl_norm,
-            |ids, tfs| blocks.next().map(|&b| c.decode_block_into(b, ids, tfs)),
-        );
+        let decode = |ids: &mut [u32; BLOCK_LEN], tfs: &mut [u32; BLOCK_LEN]| {
+            blocks.next().map(|&b| c.decode_block_into(b, ids, tfs))
+        };
+        // A few blocks' scores are selected from in one pass, cheaper than
+        // offering each to a collector; a lone term's many go through a top-k
+        // buffer, which keeps only those that can still place. The blocks hold
+        // at most `need` × `BLOCK_LEN` docs, which bounds the buffer however
+        // large `k` is.
+        let kth = match lone {
+            true => {
+                let cap = k.min(need.saturating_mul(BLOCK_LEN));
+                let buffer = <TopKBuffer as Collector>::with_capacity(k, cap);
+                kth_scored(buffer, k, f32::NEG_INFINITY, c.idf_weight, dl_norm, decode)
+            }
+            false => kth_selected(k, c.idf_weight, dl_norm, decode),
+        };
         // `NEG_INFINITY` (fewer than `k` docs) stays `NEG_INFINITY`.
         seed = seed.max(kth.next_down());
     }
