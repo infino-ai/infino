@@ -114,7 +114,7 @@ use crate::{
             tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId, StableId},
-        ids,
+        ids::{self, PackedIdEncoder, PackedIdOutput},
         stats::SuperfileStats,
         vector::{
             builder::{
