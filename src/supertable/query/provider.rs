@@ -2180,7 +2180,9 @@ mod tests {
     };
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
-    use arrow_array::{Int64Array, LargeStringArray, RecordBatch, TimestampSecondArray};
+    use arrow_array::{
+        Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator, TimestampSecondArray,
+    };
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         common::DFSchema,
@@ -2961,6 +2963,78 @@ mod tests {
             "a range before the table's first row keeps nothing"
         );
     }
+
+    /// The same range prune over superfiles a bulk load wrote: hydrate
+    /// records the column statistics itself, from the batches it packs.
+    #[test]
+    fn superfile_prune_by_timestamp_range_after_hydrate() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let batches = [[0, 1], [2, 3], [4, 5]].map(|hours| time_hits_batch(&hours));
+        let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), time_hits_schema());
+        hydrate_from_reader(&st, &mut reader, HYDRATE_ROWS_PER_SUPERFILE).expect("hydrate");
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 3);
+        let provider = SupertableProvider::new(
+            reader.manifest().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+        let rt = runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt");
+        let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
+        assert_eq!(survivors(&[col("time").gt_eq(at_hour(4))]), 1);
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(2)), col("time").lt(at_hour(3))]),
+            1
+        );
+        assert_eq!(survivors(&[col("time").lt(at_hour(0))]), 0);
+    }
+
+    /// The same range prune after compaction merged the files: the merged
+    /// superfile's statistics fold its inputs', so a range past them still
+    /// prunes it and a range inside them keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superfile_prune_by_timestamp_range_after_a_merge() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(time_hits_opts().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        st.compact_async(&CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .await
+        .expect("compact");
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 1, "the three files merged into one");
+        let provider = SupertableProvider::new(
+            reader.manifest().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        );
+        let survivors =
+            |filters: &[Expr]| async { provider.surviving_superfile_count(filters).await };
+        assert_eq!(survivors(&[col("time").gt_eq(at_hour(4))]).await, 1);
+        assert_eq!(survivors(&[col("time").lt(at_hour(0))]).await, 0);
+        assert_eq!(survivors(&[col("time").gt_eq(at_hour(6))]).await, 0);
+    }
+
+    /// Rows per superfile the hydrate prune test packs: one two-row batch each.
+    const HYDRATE_ROWS_PER_SUPERFILE: usize = 2;
 
     #[test]
     fn superfile_prune_index_helps_vs_does_not() {
