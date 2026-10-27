@@ -873,6 +873,18 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
 }
 
 /// An opened slice: its dictionary and postings region, borrowed.
+/// Where one dictionary block of a slice starts; see [`Slice::block_marks`].
+#[derive(Debug, Clone)]
+pub(crate) struct BlockMark {
+    /// The block's first key.
+    pub(crate) key: Vec<u8>,
+    /// Postings offset of that key's run.
+    pub(crate) postings_at: u64,
+    /// Offset of the run's first tier chunk in the slice's tier object,
+    /// when it has chunks.
+    pub(crate) tier_at: Option<u64>,
+}
+
 pub(crate) struct Slice<'a> {
     dict: TermBlocks<'a>,
     postings: &'a [u8],
@@ -931,6 +943,41 @@ impl<'a> Slice<'a> {
         } else {
             decode_run_with_tier(run)
         }
+    }
+
+    /// Where each dictionary block starts: its first key, the postings
+    /// offset of that key's run, and the offset of its first tier chunk when
+    /// the run has chunks. Runs and chunks sit in key order, so the bytes
+    /// between two consecutive marks are the bytes of the terms between
+    /// them: what a merge weighs when it cuts the key space into shards.
+    pub(crate) fn block_marks(&self) -> Result<Vec<BlockMark>, TermIndexError> {
+        let mut out = Vec::with_capacity(self.dict.n_blocks());
+        for b in 0..self.dict.n_blocks() {
+            let Some((key, value)) = self.dict.block_first(b) else {
+                return Err(malformed("slice dictionary block"));
+            };
+            let DictEntry::Pfor {
+                metadata_offset, ..
+            } = value
+            else {
+                return Err(malformed("slice entry is not a postings range"));
+            };
+            let tier_at = self
+                .run_at(value)?
+                .tier
+                .and_then(|t| t.chunks.iter().map(|c| c.offset).min());
+            out.push(BlockMark {
+                key,
+                postings_at: metadata_offset,
+                tier_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Bytes in the slice's postings region.
+    pub(crate) fn postings_len(&self) -> u64 {
+        self.postings.len() as u64
     }
 
     /// The postings for `key`, `None` when the slice holds no such term.

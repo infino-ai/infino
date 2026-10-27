@@ -252,9 +252,52 @@ fn encode_chunk(dirs: &[BlockDir], bodies: &[u8]) -> EncodedChunk {
     }
 }
 
+/// One block carried from an existing chunk, or freshly encoded, into a
+/// chunk a merge writes without decoding its entries: its directory facts
+/// and its body bytes, which do not depend on where the block sits.
+pub(crate) struct SplicedBlock<'a> {
+    pub(crate) ordinal: u32,
+    pub(crate) tail: f32,
+    pub(crate) n_entries: usize,
+    pub(crate) crc: u32,
+    pub(crate) body: &'a [u8],
+}
+
+/// A chunk of `blocks`, in ascending ordinal: byte for byte what
+/// [`encode_tier`] writes for the same blocks, since a block's body is a
+/// function of its entries alone and the directory records what the
+/// blocks carry.
+pub(crate) fn encode_spliced_chunk(blocks: &[SplicedBlock<'_>]) -> EncodedChunk {
+    debug_assert!(blocks.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
+    let mut bodies: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.body.len()).sum());
+    let mut dirs: Vec<BlockDir> = Vec::with_capacity(blocks.len());
+    for b in blocks {
+        let start = bodies.len();
+        bodies.extend_from_slice(b.body);
+        dirs.push(BlockDir {
+            ordinal: b.ordinal,
+            tail: b.tail,
+            n_entries: b.n_entries,
+            offset: start,
+            len: b.body.len(),
+            crc: b.crc,
+        });
+    }
+    encode_chunk(&dirs, &bodies)
+}
+
+/// What a chunk's directory records about one block.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BlockFacts {
+    pub(crate) ordinal: u32,
+    pub(crate) tail: f32,
+    pub(crate) n_entries: usize,
+    pub(crate) crc: u32,
+}
+
 /// Append one block's body — the entries of one superfile, sorted by local
 /// id, as three packed streams — to `out`.
-fn encode_block(block: &[TierEntry], out: &mut Vec<u8>) {
+pub(crate) fn encode_block(block: &[TierEntry], out: &mut Vec<u8>) {
     debug_assert!(!block.is_empty() && block.len() <= BLOCK_ENTRIES);
     let n = block.len();
     let mut sorted = [TierEntry {
@@ -358,6 +401,17 @@ impl TierDirectory {
     #[cfg(test)]
     pub(crate) fn block_ordinal(&self, i: usize) -> u32 {
         self.blocks[i].ordinal
+    }
+
+    /// What the directory records about block `i`.
+    pub(crate) fn block_facts(&self, i: usize) -> BlockFacts {
+        let d = &self.blocks[i];
+        BlockFacts {
+            ordinal: d.ordinal,
+            tail: d.tail,
+            n_entries: d.n_entries,
+            crc: d.crc,
+        }
     }
 
     /// Bound on every entry of block `i`'s superfile past the block.
@@ -484,6 +538,19 @@ impl<'a> TierChunk<'a> {
 
     pub(crate) fn n_blocks(&self) -> usize {
         self.directory.n_blocks()
+    }
+
+    /// Block `i` as it can be carried into another chunk: its directory
+    /// facts and its body bytes, which do not depend on the chunk.
+    pub(crate) fn spliced_block(&self, i: usize) -> SplicedBlock<'a> {
+        let facts = self.directory.block_facts(i);
+        SplicedBlock {
+            ordinal: facts.ordinal,
+            tail: facts.tail,
+            n_entries: facts.n_entries,
+            crc: facts.crc,
+            body: &self.bytes[self.directory.block_range(i)],
+        }
     }
 
     /// Decode block `i` into `out` (cleared first).
