@@ -38,10 +38,12 @@ pub(crate) mod tier;
 
 use std::{
     collections::{HashMap, HashSet},
-    fs, io,
+    fs,
+    future::Future,
+    io,
     iter::repeat_n,
     ops::Range,
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -62,7 +64,7 @@ use rayon::ThreadPool;
 use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, sync::Semaphore, task};
+use tokio::{fs as async_fs, task, task::JoinSet};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -122,13 +124,16 @@ const SLICE_FETCH_CONCURRENCY: usize = 8;
 
 /// Objects a merge downloads at once. A rebuild at a billion documents
 /// reads over a hundred gigabytes of slices and tier objects, and at eight
-/// in flight the transfer alone took minutes at a fraction of the host's
-/// bandwidth; the client keeps far more warm connections than this.
-const SEGMENT_FETCH_CONCURRENCY: usize = 32;
+/// in flight the transfer ran at a fraction of the host's bandwidth; the
+/// client keeps far more warm connections than this. Each task holds one
+/// object at a time, so this many of the largest tier object bounds the
+/// transfer's memory.
+const SEGMENT_FETCH_CONCURRENCY: usize = 16;
 
 /// Objects one build writes at once; the write-side twin of
-/// [`SEGMENT_FETCH_CONCURRENCY`].
-const SLICE_WRITE_CONCURRENCY: usize = 32;
+/// [`SEGMENT_FETCH_CONCURRENCY`], with the same memory bound: a spilled
+/// object is read back only as its upload starts.
+const SLICE_WRITE_CONCURRENCY: usize = 16;
 
 /// Ordinals a reserved segment leaves free past the root it was built
 /// against, for the deltas other commits append while its own commit
@@ -392,32 +397,71 @@ async fn write_objects(
     kind: &'static str,
     objects: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
-    // A spilled object is read back only as its upload starts, so at most
-    // the uploads in flight are resident at once. One spawned task per
-    // object, as `download_segments` fetches, for the same reason.
-    let in_flight = Arc::new(Semaphore::new(SLICE_WRITE_CONCURRENCY));
-    let mut tasks = Vec::with_capacity(objects.len());
-    for (hash, built) in objects {
-        let permit = Arc::clone(&in_flight)
-            .acquire_owned()
-            .await
-            .map_err(|_| TermIndexError::Build("object writes closed".into()))?;
+    let jobs = objects.into_iter().map(|(hash, built)| {
         let storage = Arc::clone(storage);
-        tasks.push(tokio::spawn(async move {
-            let _in_flight = permit;
+        async move {
             let bytes = match built {
                 BuiltBytes::Resident(bytes) => bytes,
                 BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
             };
             let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
             debug_assert_eq!(reference.content_hash, hash);
-            Ok::<(), TermIndexError>(())
-        }));
+            Ok(())
+        }
+    });
+    run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
+}
+
+/// Run `jobs` as spawned tasks, at most `limit` at once, so they spread
+/// over the runtime's workers: polled from the one thread that blocks on
+/// a merge's future, as a stream of them would be, they moved bytes at
+/// half the rate. The first error ends the run: no further job starts and
+/// the tasks still running are stopped before it returns, so none writes
+/// into a scratch directory the caller is about to remove.
+async fn run_bounded<I, F>(limit: usize, what: &'static str, jobs: I) -> Result<(), TermIndexError>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = Result<(), TermIndexError>> + Send + 'static,
+{
+    let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
+    let outcome = async {
+        for job in jobs {
+            while running.len() >= limit {
+                join_one(&mut running, what).await?;
+            }
+            running.spawn(job);
+        }
+        while !running.is_empty() {
+            join_one(&mut running, what).await?;
+        }
+        Ok(())
     }
-    for task in tasks {
-        task.await
-            .map_err(|e| TermIndexError::Build(format!("object write: {e}")))??;
+    .await;
+    if outcome.is_err() {
+        running.shutdown().await;
     }
+    outcome
+}
+
+/// Wait for one task of `running` and surface its result; a task that
+/// panicked is reported as a build error.
+async fn join_one(
+    running: &mut JoinSet<Result<(), TermIndexError>>,
+    what: &'static str,
+) -> Result<(), TermIndexError> {
+    match running.join_next().await {
+        Some(Ok(result)) => result,
+        Some(Err(e)) => Err(TermIndexError::Build(format!("{what}: {e}"))),
+        None => Ok(()),
+    }
+}
+
+/// Write one fetched object to `path` from a blocking thread that owns
+/// the bytes, so nothing copies them first.
+async fn write_object(path: PathBuf, bytes: Bytes) -> Result<(), TermIndexError> {
+    task::spawn_blocking(move || fs::write(&path, bytes.as_ref()))
+        .await
+        .map_err(|e| TermIndexError::Build(format!("object spill: {e}")))??;
     Ok(())
 }
 
@@ -759,7 +803,7 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
 }
 
 /// Download every slice of `segments` into `dir`, verified against its
-/// hash, [`SLICE_FETCH_CONCURRENCY`] at a time, and return each segment's
+/// hash, [`SEGMENT_FETCH_CONCURRENCY`] at a time, and return each segment's
 /// slice files in key order. A slice two segments share is fetched once.
 /// Each slice's tier object lands in `dir` too, named by [`tier_path`],
 /// so a merge finds it beside the slice. The bytes skip the manifest
@@ -770,55 +814,56 @@ pub(crate) async fn download_segments(
     segments: &[Segment],
     dir: &Path,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
-    let path_of = |hash: &ContentHash| dir.join(format!("{}.slice", hash.to_hex()));
-    // One spawned task per slice, so the fetches spread over the runtime's
-    // workers: polled from the one thread that blocks on this future, as
-    // a stream of them would be, they moved bytes at half the rate.
     let mut unique: HashSet<ContentHash> = HashSet::new();
-    let in_flight = Arc::new(Semaphore::new(SEGMENT_FETCH_CONCURRENCY));
-    let mut tasks = Vec::new();
-    for slice in segments
+    let jobs = segments
         .iter()
         .flat_map(|segment| &segment.slices)
         .filter(|slice| unique.insert(slice.content_hash))
-    {
-        let permit = Arc::clone(&in_flight)
-            .acquire_owned()
-            .await
-            .map_err(|_| TermIndexError::Build("segment fetches closed".into()))?;
-        let storage = Arc::clone(storage);
-        let path = path_of(&slice.content_hash);
-        let tier_file = tier_path(dir, &slice.content_hash);
-        let (hash, tier) = (slice.content_hash, slice.tier);
-        tasks.push(tokio::spawn(async move {
-            let _in_flight = permit;
-            let bytes = fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
-            async_fs::write(&path, &bytes).await?;
-            if let Some(tier) = &tier {
-                let bytes = fetch_verified(storage.as_ref(), None, &tier_uri(tier), tier).await?;
-                async_fs::write(&tier_file, &bytes).await?;
+        .map(|slice| {
+            let storage = Arc::clone(storage);
+            let path = slice_file_path(dir, &slice.content_hash);
+            let tier_file = tier_path(dir, &slice.content_hash);
+            let (hash, tier) = (slice.content_hash, slice.tier);
+            async move {
+                // One object resident at a time: the slice is on disk
+                // before its tier object is fetched.
+                let bytes =
+                    fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
+                write_object(path, bytes).await?;
+                if let Some(tier) = &tier {
+                    let bytes =
+                        fetch_verified(storage.as_ref(), None, &tier_uri(tier), tier).await?;
+                    write_object(tier_file, bytes).await?;
+                }
+                Ok(())
             }
-            Ok::<(), TermIndexError>(())
-        }));
-    }
-    for task in tasks {
-        task.await
-            .map_err(|e| TermIndexError::Build(format!("segment fetch: {e}")))??;
-    }
-    Ok(segments
+        });
+    run_bounded(SEGMENT_FETCH_CONCURRENCY, "segment fetch", jobs).await?;
+    Ok(slice_files(dir, segments))
+}
+
+/// Where `download_segments` puts the slice named by `hash` under `dir`.
+fn slice_file_path(dir: &Path, hash: &ContentHash) -> PathBuf {
+    dir.join(format!("{}.slice", hash.to_hex()))
+}
+
+/// `segments`' slices as the files `download_segments` places under
+/// `dir`, each with the key range its segment entry records.
+pub(crate) fn slice_files(dir: &Path, segments: &[Segment]) -> Vec<Vec<SliceFile>> {
+    segments
         .iter()
         .map(|segment| {
             segment
                 .slices
                 .iter()
                 .map(|slice| SliceFile {
-                    path: path_of(&slice.content_hash),
+                    path: slice_file_path(dir, &slice.content_hash),
                     first_key: slice.first_key.clone(),
                     last_key: slice.last_key.clone(),
                 })
                 .collect()
         })
-        .collect())
+        .collect()
 }
 
 /// Write freshly built slices into `dir`, each with the key range its
@@ -1397,7 +1442,7 @@ impl TermIndex {
     ///
     /// Terms the resident runs do not answer are grouped by the slice that
     /// holds them, and each distinct slice is fetched once, up to
-    /// [`SLICE_FETCH_CONCURRENCY`] at a time. Looking terms up one by one
+    /// [`SEGMENT_FETCH_CONCURRENCY`] at a time. Looking terms up one by one
     /// instead costs one whole-slice fetch per term, back to back: a query
     /// over hundreds of high-cardinality keys spread across a large index
     /// then spends its time waiting on those fetches in series, and refetches
@@ -1664,7 +1709,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build::TIER_INLINE_MAX,
+        build::{TIER_INLINE_MAX, shard_ranges},
         format::{ROOT_MAGIC, Segment, SliceRef},
         *,
     };
@@ -1689,7 +1734,7 @@ mod tests {
             fid, old_format_fts_fixture, open_old_format_fts_fixture,
             slow_storage::SlowStorage,
         },
-        utils::terms::DictEntry,
+        utils::terms::{DictEntry, TERM_BLOCK_SIZE},
     };
 
     fn contribution(dir: &TempDir, id: u128, terms: &[(&str, &str, u64)]) -> Contribution {
@@ -7237,5 +7282,337 @@ mod tests {
             "the restarted index lists only the new superfiles"
         );
         assert!(reader.count("title", "alpha", BoolMode::Or).expect("count") > 0);
+    }
+
+    /// Heads for `n` documents at descending keys from `base`.
+    fn head_docs(base: f32, n: u32) -> Vec<(u32, f32)> {
+        (0..n).map(|i| (i * 3, base + i as f32 * 0.01)).collect()
+    }
+
+    /// One of the three superfiles of [`tier_shapes`].
+    fn tier_shape(dir: &TempDir, id: u128, alpha: u32, beta: u32, delta: u32) -> Contribution {
+        contribution_with_heads(
+            dir,
+            id,
+            &[
+                ("body", "alpha", head_docs(id as f32, alpha)),
+                ("body", "beta", head_docs(0.3, beta)),
+                ("body", "gamma", head_docs(0.5, 2)),
+                ("body", "delta", head_docs(0.7, delta)),
+            ],
+            1000,
+        )
+    }
+
+    /// Three superfiles whose terms reach every shape a merge's tier can
+    /// take: chunked groups of one and two ranks (`alpha`), exact multiples
+    /// of a block (`delta`), one superfile inline beside one chunked
+    /// (`beta`), and a term small enough to stay inline (`gamma`). Returns
+    /// the merge sources — the base build over superfiles 1 and 2 and the
+    /// delta over 3 — spilled under `dir`.
+    fn tier_shapes(dir: &TempDir, policy: &BuildPolicy) -> Vec<Vec<SliceFile>> {
+        let base = build(
+            &[tier_shape(dir, 1, 60, 5, 64), tier_shape(dir, 2, 60, 2, 2)],
+            policy,
+        )
+        .expect("base");
+        let delta = build_onto(
+            base.root.clone(),
+            &[tier_shape(dir, 3, 90, 30, 128)],
+            policy,
+        )
+        .expect("delta");
+        spill_tiers(dir.path(), &base.root.segments[0].slices, base.tiers)
+            .expect("spill base tiers");
+        spill_tiers(dir.path(), &delta.root.segments[1].slices, delta.tiers)
+            .expect("spill delta tiers");
+        vec![
+            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
+                .expect("spill base"),
+            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+                .expect("spill delta"),
+        ]
+    }
+
+    /// The merge of `sources` under `policy`, with and without splicing,
+    /// must agree byte for byte: the splice is a shortcut for the
+    /// decoding path, never a different result.
+    fn assert_splice_matches_decoding(
+        sources: &[Vec<SliceFile>],
+        ordinals: &[Option<u32>],
+        policy: &BuildPolicy,
+    ) -> build::MergedSegment {
+        let spliced = merge_segments(sources, ordinals, policy).expect("spliced merge");
+        let decoding = merge_segments(
+            sources,
+            ordinals,
+            &BuildPolicy {
+                splice_tiers: false,
+                ..policy.clone()
+            },
+        )
+        .expect("decoding merge");
+        assert_eq!(spliced.slices, decoding.slices, "slices agree");
+        assert_eq!(spliced.tiers, decoding.tiers, "tier objects agree");
+        assert_eq!(spliced.segment, decoding.segment, "segments agree");
+        spliced
+    }
+
+    /// The entries of `term` in a merged output.
+    fn entries_of(merged: &build::MergedSegment, term: &str) -> usize {
+        merged_terms(merged)
+            .iter()
+            .find(|(key, _, _)| key == &fid("body").term_key(term))
+            .map(|(_, _, entries)| entries.len())
+            .expect("the term is in the merge")
+    }
+
+    /// Over every tier shape, a merge that splices writes what the
+    /// decoding merge writes, which is what a fresh build over the
+    /// surviving superfiles writes when no source was truncated.
+    #[test]
+    fn a_spliced_merge_writes_what_the_decoding_merge_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let sources = tier_shapes(&dir, &policy);
+        let merged = assert_splice_matches_decoding(&sources, &[Some(0), None, Some(1)], &policy);
+        let fresh = build(
+            &[
+                tier_shape(&dir, 1, 60, 5, 64),
+                tier_shape(&dir, 3, 90, 30, 128),
+            ],
+            &policy,
+        )
+        .expect("fresh");
+        assert_eq!(merged.slices, fresh.slices, "a fresh build's slices");
+        assert_eq!(merged.tiers, fresh.tiers, "a fresh build's tier objects");
+        assert_eq!(
+            entries_of(&merged, "beta"),
+            35,
+            "the inline head of one superfile sits beside the chunked head of the other"
+        );
+    }
+
+    /// A budget below what the groups hold, or a depth below a group's
+    /// size, sends the term down the decoding path; the two paths still
+    /// agree, and the merge cuts the tier to the policy.
+    #[test]
+    fn a_splice_declines_a_cut_and_the_paths_still_agree() {
+        let wide = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        for (policy, cap) in [
+            (
+                BuildPolicy {
+                    tier_entries_per_term: 100,
+                    ..wide.clone()
+                },
+                100,
+            ),
+            (
+                BuildPolicy {
+                    head_depth_per_superfile: 64,
+                    ..wide.clone()
+                },
+                3 * 64,
+            ),
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            let sources = tier_shapes(&dir, &wide);
+            let merged =
+                assert_splice_matches_decoding(&sources, &[Some(0), Some(1), Some(2)], &policy);
+            let held = entries_of(&merged, "alpha");
+            assert!(
+                held <= cap && held < 60 + 60 + 90,
+                "the merge cut alpha's tier to the policy: {held} entries, cap {cap}"
+            );
+        }
+    }
+
+    /// A tier read in windows smaller than a chunk crosses a window on
+    /// nearly every term and writes what the default window writes.
+    #[test]
+    fn tier_windows_of_any_size_read_the_same_bytes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let sources = tier_shapes(&dir, &policy);
+        let ordinals = [Some(0), None, Some(1)];
+        let wide = merge_segments(&sources, &ordinals, &policy).expect("merge");
+        for window in [1u64, 64, 4096] {
+            let narrow = merge_segments(
+                &sources,
+                &ordinals,
+                &BuildPolicy {
+                    tier_read_window_bytes: window,
+                    ..policy.clone()
+                },
+            )
+            .expect("merge");
+            assert_eq!(narrow.slices, wide.slices, "window {window}: slices");
+            assert_eq!(narrow.tiers, wide.tiers, "window {window}: tiers");
+        }
+    }
+
+    /// A slice's block marks name every dictionary block in key order,
+    /// with run and chunk offsets that rise with the keys.
+    #[test]
+    fn block_marks_cover_every_block_in_order() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            tier_entries_per_term: 100_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[shard_contribution(&dir, 1)], &policy).expect("build");
+        assert_eq!(built.slices.len(), 1, "one slice at the default target");
+        let bytes = bytes_of(&built.slices[0].1);
+        let slice = Slice::open(&bytes).expect("open");
+        let terms = slice.terms_after(None, usize::MAX).expect("terms");
+        let marks = slice.block_marks().expect("marks");
+        assert_eq!(marks.len(), terms.len().div_ceil(TERM_BLOCK_SIZE));
+        for (i, mark) in marks.iter().enumerate() {
+            assert_eq!(
+                mark.key,
+                terms[i * TERM_BLOCK_SIZE].0,
+                "mark {i} names its block's first key"
+            );
+        }
+        assert!(
+            marks
+                .windows(2)
+                .all(|w| w[0].postings_at < w[1].postings_at),
+            "runs sit in key order"
+        );
+        let chunked: Vec<u64> = marks.iter().filter_map(|m| m.tier_at).collect();
+        assert!(!chunked.is_empty(), "some blocks start with a chunked tier");
+        assert!(
+            chunked.windows(2).all(|w| w[0] < w[1]),
+            "chunks sit in key order"
+        );
+        assert!(
+            marks
+                .last()
+                .is_some_and(|m| m.postings_at < slice.postings_len())
+        );
+    }
+
+    /// Shards are cut by the bytes they would merge, so a hot key range —
+    /// terms carrying most of the tier bytes — is spread over shards that
+    /// hold fewer terms each, cut inside a slice, and the sharded merge
+    /// still writes the terms the one-writer merge writes.
+    #[test]
+    fn shard_cuts_fall_by_weight_not_by_slice() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 1 << 20,
+            tier_entries_per_term: 100_000,
+            merge_shards: Some(4),
+            ..BuildPolicy::default()
+        };
+        let names: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
+        let hot = |id: u128| {
+            let entries: Vec<(&str, &str, Vec<(u32, f32)>)> = names
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let n = if (200..400).contains(&i) { 60 } else { 20 };
+                    (
+                        "body",
+                        t.as_str(),
+                        head_docs(id as f32 + i as f32 * 0.001, n),
+                    )
+                })
+                .collect();
+            contribution_with_heads(&dir, id, &entries, 1000)
+        };
+        let built = build(&[hot(1), hot(2), hot(3)], &policy).expect("build");
+        spill_tiers(dir.path(), &built.root.segments[0].slices, built.tiers).expect("spill tiers");
+        let sources = vec![
+            spill_slices(dir.path(), &built.root.segments[0].slices, built.slices)
+                .expect("spill slices"),
+        ];
+        let ranges = shard_ranges(&sources, &policy).expect("ranges");
+        assert_eq!(ranges.len(), 4, "four shards: {ranges:?}");
+        let slice_starts: Vec<&[u8]> = sources[0].iter().map(|f| f.first_key.as_slice()).collect();
+        let cuts: Vec<&[u8]> = ranges.iter().filter_map(|(s, _)| s.as_deref()).collect();
+        assert!(
+            cuts.iter().any(|c| !slice_starts.contains(c)),
+            "a cut falls inside a slice: {cuts:?}"
+        );
+        let in_range = |t: &str, (s, e): &(Option<Vec<u8>>, Option<Vec<u8>>)| {
+            let k = fid("body").term_key(t);
+            s.as_ref().is_none_or(|s| *s <= k) && e.as_ref().is_none_or(|e| k < *e)
+        };
+        let counts: Vec<usize> = ranges
+            .iter()
+            .map(|r| names.iter().filter(|t| in_range(t, r)).count())
+            .collect();
+        let hot_shard = ranges
+            .iter()
+            .position(|r| in_range("t0300", r))
+            .expect("the hot range is in a shard");
+        let most = counts.iter().copied().max().unwrap_or(0);
+        assert!(
+            counts[hot_shard] < most && counts[hot_shard] * 2 < names.len(),
+            "a hot shard holds fewer terms than a cold one: {counts:?}"
+        );
+        let ordinals = [Some(0), Some(1), Some(2)];
+        let many = merge_segments(&sources, &ordinals, &policy).expect("merge");
+        let one = merge_segments(
+            &sources,
+            &ordinals,
+            &BuildPolicy {
+                merge_shards: Some(1),
+                ..policy.clone()
+            },
+        )
+        .expect("merge");
+        assert_eq!(merged_terms(&many), merged_terms(&one));
+    }
+
+    /// One failed object fails the whole transfer, download and upload
+    /// alike, rather than a partial result.
+    #[test]
+    fn one_failed_object_fails_the_transfer() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 2048,
+            tier_entries_per_term: 100_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[shard_contribution(&dir, 1)], &policy).expect("build");
+        assert!(built.slices.len() >= 4, "{} slices", built.slices.len());
+        let store_dir = TempDir::new().expect("store");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        faults.fail(FaultOp::PutAtomic, "term-index/slice-", 1);
+        let put = rt.block_on(write_slices(&faulty, built.slices.clone()));
+        assert!(put.is_err(), "a failed put fails the upload");
+        assert_eq!(faults.fired(), 1);
+
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        let scratch = TempDir::new().expect("scratch");
+        faults.fail(FaultOp::Get, "term-index/slice-", 1);
+        let got = rt.block_on(download_segments(&faulty, &root.segments, scratch.path()));
+        assert!(got.is_err(), "a failed fetch fails the download");
+        assert_eq!(faults.fired(), 2);
+        let good = rt.block_on(download_segments(&local, &root.segments, scratch.path()));
+        assert!(good.is_ok(), "the same download succeeds without the fault");
     }
 }

@@ -967,7 +967,7 @@ impl<'a> Slice<'a> {
                 .tier
                 .and_then(|t| t.chunks.iter().map(|c| c.offset).min());
             out.push(BlockMark {
-                key,
+                key: key.to_vec(),
                 postings_at: metadata_offset,
                 tier_at,
             });

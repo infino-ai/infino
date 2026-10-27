@@ -102,8 +102,9 @@ pub(crate) struct TierEntry {
 }
 
 /// The average length and parameters a column's tier keys are computed
-/// at: recorded by the slice, so a reader and a merge compute the same
-/// key for the same entry.
+/// at: a superfile's own, as the manifest records them, so a reader and a
+/// merge compute the same key for the same entry. A slice records no
+/// scoring; a merge takes each superfile's from the manifest.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColumnScoring {
     pub(crate) avgdl: f32,
@@ -234,22 +235,17 @@ pub(crate) fn encode_tier(groups: &[HeadGroup]) -> Vec<EncodedChunk> {
 
 /// One region: its directory, then its bodies.
 fn encode_chunk(dirs: &[BlockDir], bodies: &[u8]) -> EncodedChunk {
-    let mut out = Vec::with_capacity(TierDirectory::len_for(dirs.len() as u32) + bodies.len());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    for d in dirs {
-        out.extend_from_slice(&d.ordinal.to_le_bytes());
-        out.extend_from_slice(&d.tail.to_le_bytes());
-        out.push(d.n_entries as u8);
-        out.extend_from_slice(&(d.len as u16).to_le_bytes());
-        out.extend_from_slice(&d.crc.to_le_bytes());
-    }
-    let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
-    out[..CHUNK_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(bodies);
-    EncodedChunk {
-        n_blocks: dirs.len() as u32,
-        bytes: out,
-    }
+    let blocks: Vec<SplicedBlock<'_>> = dirs
+        .iter()
+        .map(|d| SplicedBlock {
+            ordinal: d.ordinal,
+            tail: d.tail,
+            n_entries: d.n_entries,
+            crc: d.crc,
+            body: &bodies[d.offset..d.offset + d.len],
+        })
+        .collect();
+    encode_spliced_chunk(&blocks)
 }
 
 /// One block carried from an existing chunk, or freshly encoded, into a
@@ -263,10 +259,10 @@ pub(crate) struct SplicedBlock<'a> {
     pub(crate) body: &'a [u8],
 }
 
-/// A chunk of `blocks`, in ascending ordinal: byte for byte what
-/// [`encode_tier`] writes for the same blocks, since a block's body is a
-/// function of its entries alone and the directory records what the
-/// blocks carry.
+/// A chunk of `blocks`, in ascending ordinal: the one writer of the chunk
+/// layout, for a fresh tier ([`encode_tier`]) and for blocks a merge
+/// carries over alike, since a block's body is a function of its entries
+/// alone and the directory records what the blocks carry.
 pub(crate) fn encode_spliced_chunk(blocks: &[SplicedBlock<'_>]) -> EncodedChunk {
     debug_assert!(blocks.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
     let dir_len = TierDirectory::len_for(blocks.len() as u32);
@@ -288,15 +284,6 @@ pub(crate) fn encode_spliced_chunk(blocks: &[SplicedBlock<'_>]) -> EncodedChunk 
         n_blocks: blocks.len() as u32,
         bytes: out,
     }
-}
-
-/// What a chunk's directory records about one block.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct BlockFacts {
-    pub(crate) ordinal: u32,
-    pub(crate) tail: f32,
-    pub(crate) n_entries: usize,
-    pub(crate) crc: u32,
 }
 
 /// Append one block's body — the entries of one superfile, sorted by local
@@ -407,14 +394,16 @@ impl TierDirectory {
         self.blocks[i].ordinal
     }
 
-    /// What the directory records about block `i`.
-    pub(crate) fn block_facts(&self, i: usize) -> BlockFacts {
+    /// Block `i`'s body carried as it stands, with what the directory
+    /// records about it, into a chunk another merge writes.
+    pub(crate) fn spliced_block<'b>(&self, i: usize, chunk: &'b [u8]) -> SplicedBlock<'b> {
         let d = &self.blocks[i];
-        BlockFacts {
+        SplicedBlock {
             ordinal: d.ordinal,
             tail: d.tail,
             n_entries: d.n_entries,
             crc: d.crc,
+            body: &chunk[d.offset..d.offset + d.len],
         }
     }
 
@@ -547,14 +536,7 @@ impl<'a> TierChunk<'a> {
     /// Block `i` as it can be carried into another chunk: its directory
     /// facts and its body bytes, which do not depend on the chunk.
     pub(crate) fn spliced_block(&self, i: usize) -> SplicedBlock<'a> {
-        let facts = self.directory.block_facts(i);
-        SplicedBlock {
-            ordinal: facts.ordinal,
-            tail: facts.tail,
-            n_entries: facts.n_entries,
-            crc: facts.crc,
-            body: &self.bytes[self.directory.block_range(i)],
-        }
+        self.directory.spliced_block(i, self.bytes)
     }
 
     /// Decode block `i` into `out` (cleared first).

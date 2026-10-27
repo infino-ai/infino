@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Offline driver for the term index's optimize-time fold: opens an
+//! Offline driver for the term index's optimize-time merge: opens an
 //! existing table, fetches its root's segments once into a scratch
 //! directory, and times `merge_segments` over them exactly as optimize's
 //! rebuild merges them — so a change to the merge can be measured in a
@@ -26,6 +26,7 @@ use std::{
     collections::HashMap,
     env, fs, io,
     path::{Path, PathBuf},
+    str::FromStr,
     sync::Arc,
     time::Instant,
 };
@@ -38,24 +39,32 @@ use super::{
     build::{BuildPolicy, BuiltBytes, SliceFile, merge_segments, tier_path},
     download_segments,
     format::Segment,
-    write_slices, write_tiers,
+    slice_files, write_slices, write_tiers,
 };
 use crate::{
-    runtime_metrics::rss::available_memory_bytes,
+    runtime_metrics::rss::{available_memory_bytes, status_field_bytes},
     storage::{GcsStorageProvider, LocalFsStorageProvider, StorageOptions, StorageProvider},
     superfile::builder::FtsConfig,
     supertable::{
-        Supertable, SupertableOptions,
-        manifest::{list::PartitionStrategy, part::ContentHash},
+        Supertable, SupertableOptions, manifest::list::PartitionStrategy,
         writer::scoring_by_ordinal,
     },
 };
 
 /// The text column of the tables this drives (the FineWeb scale tables).
 const COLUMN: &str = "text";
+/// Where the segments go when `FOLD_SCRATCH` is not set.
+const DEFAULT_SCRATCH: &str = "/tmp/infino-fold-scratch";
+/// The scratch subdirectory a run's merged output is spilled to.
+const OUT_DIR: &str = "out";
+const MIB: f64 = 1024.0 * 1024.0;
 
-fn env_num<T: std::str::FromStr>(key: &str) -> Option<T> {
+fn env_num<T: FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|v| v.trim().parse().ok())
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / MIB
 }
 
 fn storage_for(target: &str) -> Arc<dyn StorageProvider> {
@@ -75,27 +84,14 @@ fn storage_for(target: &str) -> Arc<dyn StorageProvider> {
 /// `segments`' slices as files under `dir`, when every slice and tier
 /// object of the root is already there; `None` otherwise.
 fn present_sources(dir: &Path, segments: &[Segment]) -> Option<Vec<Vec<SliceFile>>> {
-    let path_of = |hash: &ContentHash| dir.join(format!("{}.slice", hash.to_hex()));
-    let mut out = Vec::with_capacity(segments.len());
-    for segment in segments {
-        let mut files = Vec::with_capacity(segment.slices.len());
-        for slice in &segment.slices {
-            let path = path_of(&slice.content_hash);
-            if !path.is_file() {
-                return None;
-            }
-            if slice.tier.is_some() && !tier_path(dir, &slice.content_hash).is_file() {
-                return None;
-            }
-            files.push(SliceFile {
-                path,
-                first_key: slice.first_key.clone(),
-                last_key: slice.last_key.clone(),
-            });
-        }
-        out.push(files);
-    }
-    Some(out)
+    let files = slice_files(dir, segments);
+    let complete = segments.iter().zip(&files).all(|(segment, files)| {
+        segment.slices.iter().zip(files).all(|(slice, file)| {
+            file.path.is_file()
+                && (slice.tier.is_none() || tier_path(dir, &slice.content_hash).is_file())
+        })
+    });
+    complete.then_some(files)
 }
 
 fn bytes_of(built: &BuiltBytes) -> u64 {
@@ -105,34 +101,26 @@ fn bytes_of(built: &BuiltBytes) -> u64 {
     }
 }
 
-fn rss_peak_mb() -> u64 {
-    fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("VmHWM:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-        })
-        .map_or(0, |kb| kb / 1024)
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 #[test]
 #[ignore = "offline timing driver: needs FOLD_TABLE and credentials"]
 fn fold_timing() {
     let table = env::var("FOLD_TABLE").expect("FOLD_TABLE=<table uri>");
-    let scratch = PathBuf::from(
-        env::var("FOLD_SCRATCH").unwrap_or_else(|_| "/tmp/infino-fold-scratch".to_owned()),
-    );
+    let scratch =
+        PathBuf::from(env::var("FOLD_SCRATCH").unwrap_or_else(|_| DEFAULT_SCRATCH.to_owned()));
     fs::create_dir_all(&scratch).expect("scratch dir");
     let threads: Option<usize> = env_num("FOLD_THREADS");
     let shards: Option<usize> = env_num("FOLD_SHARDS");
     let runs: usize = env_num("FOLD_RUNS").unwrap_or(1);
-
     let _ = fmt()
         .with_env_filter(EnvFilter::new("term_index::fold=debug"))
         .with_writer(io::stderr)
         .with_target(false)
         .try_init();
+
     let storage = storage_for(&table);
     let schema = Arc::new(Schema::new(vec![Field::new(
         COLUMN,
@@ -167,7 +155,6 @@ fn fold_timing() {
         .expect("load term index")
         .expect("table has a term index");
     let root = index.root().clone();
-    let n_superfiles = manifest.superfiles.len();
     let slices_in: usize = root.segments.iter().map(|s| s.slices.len()).sum();
     let bytes_in: u64 = root
         .segments
@@ -176,11 +163,12 @@ fn fold_timing() {
         .map(|s| s.len)
         .sum();
     eprintln!(
-        "FOLD open {:.1}s table={table} superfiles={n_superfiles} root_superfiles={} segments={} slices={slices_in} slice_bytes={:.1}MiB complete={}",
+        "FOLD open {:.1}s table={table} superfiles={} root_superfiles={} segments={} slices={slices_in} slice_bytes={:.1}MiB complete={}",
         t_open.elapsed().as_secs_f64(),
+        manifest.superfiles.len(),
         root.superfiles.len(),
         root.segments.len(),
-        bytes_in as f64 / (1024.0 * 1024.0),
+        mib(bytes_in),
         manifest.term_index_complete(),
     );
     for (i, segment) in root.segments.iter().enumerate() {
@@ -188,7 +176,7 @@ fn fold_timing() {
         eprintln!(
             "FOLD segment[{i}] slices={} bytes={:.1}MiB tiers={}",
             segment.slices.len(),
-            bytes as f64 / (1024.0 * 1024.0),
+            mib(bytes),
             segment.slices.iter().filter(|s| s.tier.is_some()).count()
         );
     }
@@ -215,16 +203,16 @@ fn fold_timing() {
             sources
         }
     };
-    let local_bytes: u64 = sources
+    let local_bytes: u64 = root
+        .segments
         .iter()
-        .flatten()
-        .map(|f| {
-            fs::metadata(&f.path).map(|m| m.len()).unwrap_or(0)
-                + fs::metadata(f.path.with_extension("tier"))
-                    .map(|m| m.len())
-                    .unwrap_or(0)
+        .zip(&sources)
+        .flat_map(|(segment, files)| segment.slices.iter().zip(files))
+        .map(|(slice, file)| {
+            file_len(&file.path) + file_len(&tier_path(&scratch, &slice.content_hash))
         })
         .sum();
+
     // Exactly the merge optimize's rebuild runs: ordinals keep their
     // place for a superfile still live, and are dropped otherwise.
     let live: HashMap<_, u32> = manifest
@@ -243,7 +231,7 @@ fn fold_timing() {
     let policy = BuildPolicy {
         scoring_by_ordinal: Arc::new(scoring_by_ordinal(&manifest, &new_superfiles)),
         merge_shards: shards,
-        scratch_root: Some(scratch.join("out")),
+        scratch_root: Some(scratch.join(OUT_DIR)),
         ..manifest.options.term_index_build_policy()
     };
     let pool_threads = policy
@@ -252,27 +240,26 @@ fn fold_timing() {
         .map_or(rayon::current_num_threads(), |p| p.current_num_threads());
     eprintln!(
         "FOLD inputs local_bytes={:.1}MiB ordinals={} dropped={dropped} pool_threads={pool_threads} shards={shards:?} avail_mem={:.1}GiB",
-        local_bytes as f64 / (1024.0 * 1024.0),
+        mib(local_bytes),
         ordinals.len(),
-        available_memory_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0 * 1024.0),
+        available_memory_bytes().unwrap_or(0) as f64 / (MIB * 1024.0),
     );
 
     for run in 0..runs {
-        let out_dir = scratch.join("out");
-        let _ = fs::remove_dir_all(&out_dir);
+        let _ = fs::remove_dir_all(scratch.join(OUT_DIR));
         let t = Instant::now();
         let merged = merge_segments(&sources, &ordinals, &policy).expect("merge");
         let secs = t.elapsed().as_secs_f64();
-        let out_slices = merged.slices.len();
         let out_bytes: u64 = merged.slices.iter().map(|(_, b)| bytes_of(b)).sum();
-        let out_tiers = merged.tiers.len();
         let tier_bytes: u64 = merged.tiers.iter().map(|(_, b)| bytes_of(b)).sum();
         eprintln!(
-            "FOLD run[{run}] merge {secs:.1}s slices={out_slices} slice_bytes={:.1}MiB tiers={out_tiers} tier_bytes={:.1}MiB in_rate={:.1}MiB/s rss_peak={}MiB",
-            out_bytes as f64 / (1024.0 * 1024.0),
-            tier_bytes as f64 / (1024.0 * 1024.0),
-            local_bytes as f64 / (1024.0 * 1024.0) / secs,
-            rss_peak_mb(),
+            "FOLD run[{run}] merge {secs:.1}s slices={} slice_bytes={:.1}MiB tiers={} tier_bytes={:.1}MiB in_rate={:.1}MiB/s rss_peak={:.0}MiB",
+            merged.slices.len(),
+            mib(out_bytes),
+            merged.tiers.len(),
+            mib(tier_bytes),
+            mib(local_bytes) / secs,
+            mib(status_field_bytes("VmHWM").unwrap_or(0)),
         );
         // Time the upload of the merged output to a scratch prefix, never
         // the table's own, so the fixture keeps no unreferenced objects.
@@ -286,11 +273,9 @@ fn fold_timing() {
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
                 "FOLD run[{run}] upload {secs:.1}s {:.1}MiB to {upload_to} ({:.1}MiB/s)",
-                (out_bytes + tier_bytes) as f64 / (1024.0 * 1024.0),
-                (out_bytes + tier_bytes) as f64 / (1024.0 * 1024.0) / secs,
+                mib(out_bytes + tier_bytes),
+                mib(out_bytes + tier_bytes) / secs,
             );
-            continue;
         }
-        drop(merged);
     }
 }

@@ -22,7 +22,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque},
+    collections::{BTreeMap, BinaryHeap, HashMap, VecDeque, btree_map::Entry},
     fmt,
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -34,6 +34,7 @@ use std::{
 
 use rayon::{ThreadPool, prelude::*};
 use tempfile::TempDir;
+use tracing::debug;
 use uuid::Uuid;
 
 use super::{
@@ -120,6 +121,28 @@ pub(crate) struct BuildPolicy {
     /// map and the root it folds. Empty, a fold keys at
     /// [`ColumnScoring::default`] like any merge without the table.
     pub(crate) scoring_by_superfile: Arc<HashMap<Uuid, BTreeMap<FieldId, ColumnScoring>>>,
+    /// Bytes a merge cursor reads from a tier object at a time; see
+    /// [`TIER_READ_WINDOW_BYTES`].
+    pub(crate) tier_read_window_bytes: u64,
+    /// Whether a merge carries tier blocks over from its sources' chunks
+    /// (see `splice_term`); off, every term takes the decoding path. Tests
+    /// compare the two paths byte for byte.
+    #[cfg(test)]
+    pub(crate) splice_tiers: bool,
+}
+
+impl BuildPolicy {
+    /// Whether a merge may splice tier blocks.
+    fn splices_tiers(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.splice_tiers
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
 }
 
 /// How a segment writer keys an entry: by the superfile ordinal and column
@@ -181,6 +204,9 @@ impl Default for BuildPolicy {
             merge_shards: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
+            tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
+            #[cfg(test)]
+            splice_tiers: true,
         }
     }
 }
@@ -196,6 +222,9 @@ const ENCODE_BATCH_TERMS: usize = 1 << 13;
 const ENCODE_JOB_MIN_TERMS: usize = 64;
 /// Bytes a merge cursor reads from a tier object at a time, so the terms
 /// of a window share one read rather than each seeking for its own chunks.
+/// A cursor keeps its current window, and a term whose chunks are still
+/// being encoded keeps the window they were read from, so a merge holds a
+/// few windows per cursor on top of the slice's bytes.
 const TIER_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One term as the merge hands it over: its postings and the tier entries
@@ -265,8 +294,10 @@ fn encode_term(
     depth: usize,
     ordinals: &[Option<u32>],
     scoring_of: &dyn Fn(u32) -> ColumnScoring,
+    splice: bool,
 ) -> Result<EncodedTerm, TermIndexError> {
-    if budget > 0
+    if splice
+        && budget > 0
         && depth > 0
         && !term.sources.is_empty()
         && let Some(spliced) = splice_term(&mut term, budget, depth, ordinals)?
@@ -377,13 +408,22 @@ fn encode_term(
 /// A merge's tier for one term carried over from its sources' chunks
 /// without decoding an entry, when that gives the bytes [`encode_term`]'s
 /// decode, re-key, cut and re-encode would give: every group arrives
-/// whole and within `depth`, the groups together fit `budget`, and the
-/// result is too large to be kept inline. A block's body depends only on
-/// its entries, and its directory facts — tail, count, CRC — on the group
-/// it came from, which a superfile's own scoring fixed when the source was
-/// written; so the merged chunks are the sources' blocks, regrouped by
+/// whole and within `depth`, in the blocks [`encode_tier`] cuts (full
+/// blocks but the last), the groups together fit `budget`, and the result
+/// is too large to be kept inline. A block's body depends only on its
+/// entries, and its directory facts — tail, count, CRC — on the group it
+/// came from, so the merged chunks are the sources' blocks, regrouped by
 /// rank and in ascending ordinal. `None` when some group needs the full
 /// path, which then runs instead.
+///
+/// The group's order and tails were computed at the scoring its source
+/// keyed the superfile at. The full path keys at the scoring the merge is
+/// given for the superfile, which is the same: a column's parameters are
+/// fixed when it is created and a superfile's average length is baked
+/// into it, and both paths read them from the superfile. A superfile the
+/// merge has no scoring for (one no longer in the manifest, folded before
+/// a rebuild drops it) keeps its own keys here where the full path would
+/// re-key it at the default; its postings are dropped at the next rebuild.
 fn splice_term(
     term: &mut TermInput,
     budget: u64,
@@ -411,132 +451,136 @@ fn splice_term(
         }
         opened.push(chunks);
     }
-    // Every block as (new ordinal, rank, source, block), then one group
-    // per superfile with its blocks in rank order: a source's chunk `r`
-    // holds the rank-`r` block of each of its groups.
-    let mut placed: Vec<(u32, usize, usize, usize)> = Vec::new();
-    for (si, chunks) in opened.iter().enumerate() {
+    // One group per superfile, by ascending new ordinal: blocks carried
+    // from a source, in rank order (a source's chunk `r` holds the rank-`r`
+    // block of each of its groups), or entries that sat inline in a run
+    // and are encoded fresh. A group split across sources, out of rank
+    // order, or with both kinds is not spliced.
+    enum Group<'a> {
+        Carried(Vec<SplicedBlock<'a>>),
+        Fresh(Vec<TierEntry>),
+    }
+    let mut groups: BTreeMap<u32, Group<'_>> = BTreeMap::new();
+    for chunks in &opened {
         for (r, chunk) in chunks.iter().enumerate() {
             for b in 0..chunk.n_blocks() {
-                let facts = chunk.spliced_block(b);
-                if let Some(ordinal) = renumber(ordinals, facts.ordinal) {
-                    placed.push((ordinal, r, si, b));
+                let block = chunk.spliced_block(b);
+                let Some(ordinal) = renumber(ordinals, block.ordinal) else {
+                    continue;
+                };
+                match groups.entry(ordinal) {
+                    Entry::Vacant(slot) if r == 0 => {
+                        slot.insert(Group::Carried(vec![block]));
+                    }
+                    Entry::Occupied(mut slot) => match slot.get_mut() {
+                        Group::Carried(blocks) if blocks.len() == r => blocks.push(block),
+                        _ => return Ok(None),
+                    },
+                    Entry::Vacant(_) => return Ok(None),
                 }
             }
         }
     }
-    placed.sort_unstable_by_key(|&(o, r, _, _)| (o, r));
-    let mut groups: Vec<(u32, Vec<(usize, usize, usize)>)> = Vec::new();
-    for g in placed.chunk_by(|a, b| a.0 == b.0) {
-        // A group split across sources, or missing a rank, is not spliced.
-        if g.iter().enumerate().any(|(i, &(_, r, _, _))| r != i) {
-            return Ok(None);
+    for e in &term.entries {
+        match groups.entry(e.superfile) {
+            Entry::Vacant(slot) => {
+                slot.insert(Group::Fresh(vec![*e]));
+            }
+            Entry::Occupied(mut slot) => match slot.get_mut() {
+                Group::Fresh(entries) => entries.push(*e),
+                Group::Carried(_) => return Ok(None),
+            },
         }
-        groups.push((g[0].0, g.iter().map(|&(_, r, si, b)| (si, r, b)).collect()));
     }
-    // Inline entries (from sources whose tier was small enough to sit in
-    // the run) form groups of their own, encoded fresh; a superfile with
-    // both would need the full path.
-    let mut inline: Vec<(u32, Vec<TierEntry>)> = Vec::new();
-    term.entries.sort_unstable_by_key(|e| e.superfile);
-    for g in term.entries.chunk_by(|a, b| a.superfile == b.superfile) {
-        let ordinal = g[0].superfile;
-        if groups.iter().any(|(o, _)| *o == ordinal) {
-            return Ok(None);
-        }
-        inline.push((ordinal, g.to_vec()));
-    }
-    // Sizes: every group within depth, and all of them within budget.
+    // Sizes and shapes: every group within depth and cut as a build cuts
+    // it, all of them within budget, and too many entries to inline.
     let mut held = 0u64;
-    let mut n_entries = 0usize;
-    for (_, blocks) in &groups {
-        let n: usize = blocks
-            .iter()
-            .map(|&(si, r, b)| opened[si][r].spliced_block(b).n_entries)
-            .sum();
+    for group in groups.values() {
+        let n = match group {
+            Group::Carried(blocks) => {
+                let canonical = blocks
+                    .iter()
+                    .enumerate()
+                    .all(|(i, b)| b.n_entries == BLOCK_ENTRIES || i + 1 == blocks.len());
+                if !canonical {
+                    return Ok(None);
+                }
+                blocks.iter().map(|b| b.n_entries).sum()
+            }
+            Group::Fresh(entries) => entries.len(),
+        };
         if n > depth {
             return Ok(None);
         }
         held += n as u64;
-        n_entries += n;
     }
-    for (_, entries) in &inline {
-        if entries.len() > depth {
-            return Ok(None);
-        }
-        held += entries.len() as u64;
-        n_entries += entries.len();
-    }
-    if held > budget || n_entries <= TIER_INLINE_MAX {
+    if held > budget || held as usize <= TIER_INLINE_MAX {
         return Ok(None);
     }
-    // Inline groups become one freshly encoded block each; their tail is
-    // the posting's, as a group kept whole gets.
-    let mut fresh: Vec<(u32, Vec<u8>, usize)> = Vec::with_capacity(inline.len());
-    for (ordinal, entries) in &inline {
-        let mut body = Vec::new();
-        encode_block(entries, &mut body);
-        fresh.push((*ordinal, body, entries.len()));
-    }
+    // A fresh group is one block; its tail is the posting's, as a group
+    // kept whole gets.
     let tail_of = |ordinal: u32| -> f32 {
         term.postings
             .binary_search_by_key(&ordinal, |p| p.superfile)
             .map_or(0.0, |i| term.postings[i].tail)
     };
-    // Groups in ascending ordinal; chunk `r` takes every group's rank-`r`
-    // block.
-    let mut order: Vec<(u32, Option<usize>, Option<usize>)> = groups
+    let fresh: Vec<(u32, Vec<u8>, usize)> = groups
         .iter()
-        .enumerate()
-        .map(|(i, (o, _))| (*o, Some(i), None))
-        .chain(
-            fresh
-                .iter()
-                .enumerate()
-                .map(|(i, (o, _, _))| (*o, None, Some(i))),
-        )
+        .filter_map(|(ordinal, group)| match group {
+            Group::Fresh(entries) => {
+                let mut body = Vec::new();
+                encode_block(entries, &mut body);
+                Some((*ordinal, body, entries.len()))
+            }
+            Group::Carried(_) => None,
+        })
         .collect();
-    order.sort_unstable_by_key(|(o, _, _)| *o);
+    // Chunk `r` takes every group's rank-`r` block, in ascending ordinal.
     let deepest = groups
-        .iter()
-        .map(|(_, blocks)| blocks.len())
+        .values()
+        .map(|g| match g {
+            Group::Carried(blocks) => blocks.len(),
+            Group::Fresh(_) => 1,
+        })
         .max()
-        .unwrap_or(0)
-        .max(usize::from(!fresh.is_empty()));
+        .unwrap_or(0);
     let mut chunks: Vec<EncodedChunk> = Vec::with_capacity(deepest);
     let mut blocks: Vec<SplicedBlock<'_>> = Vec::new();
     for r in 0..deepest {
         blocks.clear();
-        for &(ordinal, carried, made) in &order {
-            if let Some(gi) = carried {
-                if let Some(&(si, cr, b)) = groups[gi].1.get(r) {
-                    // The block names its superfile by the source's
-                    // ordinal; the merged chunk names it by the new one.
-                    let mut block = opened[si][cr].spliced_block(b);
-                    block.ordinal = ordinal;
-                    blocks.push(block);
+        let mut fresh = fresh.iter();
+        for (ordinal, group) in &groups {
+            match group {
+                Group::Carried(carried) => {
+                    if let Some(block) = carried.get(r) {
+                        // The block names its superfile by the source's
+                        // ordinal; the merged chunk names it by the new one.
+                        blocks.push(SplicedBlock {
+                            ordinal: *ordinal,
+                            ..*block
+                        });
+                    }
                 }
-            } else if let Some(fi) = made
-                && r == 0
-            {
-                let (_, body, n) = &fresh[fi];
-                blocks.push(SplicedBlock {
-                    ordinal,
-                    tail: tail_of(ordinal),
-                    n_entries: *n,
-                    crc: crc32c(body),
-                    body,
-                });
+                Group::Fresh(_) => {
+                    let (_, body, n) = fresh.next().expect("one fresh block per fresh group");
+                    if r == 0 {
+                        blocks.push(SplicedBlock {
+                            ordinal: *ordinal,
+                            tail: tail_of(*ordinal),
+                            n_entries: *n,
+                            crc: crc32c(body),
+                            body,
+                        });
+                    }
+                }
             }
         }
         chunks.push(encode_spliced_chunk(&blocks));
     }
     // A superfile with no entry in the tier has nothing in the head its
     // posting's tail would bound: the tail is raised past any key.
-    let mut with_heads: Vec<u32> = order.iter().map(|(o, _, _)| *o).collect();
-    with_heads.sort_unstable();
     for p in &mut term.postings {
-        if with_heads.binary_search(&p.superfile).is_err() {
+        if !groups.contains_key(&p.superfile) {
             p.tail = f32::INFINITY;
         }
     }
@@ -1155,6 +1199,8 @@ struct SegmentWriter {
     /// thread waits on each), in cutting slices, and the terms and tier
     /// entries written: reported per shard by the merge.
     stats: WriterStats,
+    /// Whether terms may splice their sources' tier blocks.
+    splice: bool,
 }
 
 /// What a segment writer spent its time on, for the merge's per-shard
@@ -1189,6 +1235,7 @@ impl SegmentWriter {
             pool: policy.pool.clone(),
             ordinals: Arc::from(Vec::new()),
             stats: WriterStats::default(),
+            splice: policy.splices_tiers(),
         })
     }
 
@@ -1300,6 +1347,7 @@ impl SegmentWriter {
         self.pending_entries = 0;
         let budget = self.tier_entries_per_term;
         let depth = self.head_depth;
+        let splice = self.splice;
         let ordinals = Arc::clone(&self.ordinals);
         let scoring = Arc::clone(&self.scoring);
         let encode = || -> Result<Vec<EncodedTerm>, TermIndexError> {
@@ -1308,9 +1356,14 @@ impl SegmentWriter {
                 .with_min_len(ENCODE_JOB_MIN_TERMS)
                 .map(|term| {
                     let column = FieldId::of_term_key(&term.key).unwrap_or(FieldId(u32::MAX));
-                    encode_term(term, budget, depth, &ordinals, &|ordinal| {
-                        scoring(ordinal, column)
-                    })
+                    encode_term(
+                        term,
+                        budget,
+                        depth,
+                        &ordinals,
+                        &|ordinal| scoring(ordinal, column),
+                        splice,
+                    )
                 })
                 .collect()
         };
@@ -1370,7 +1423,7 @@ impl SegmentWriter {
     }
 
     /// The segment, its slices and their tier objects, each written beside
-    /// the slice that names it.
+    /// the slice that names it, and what the writer spent its time on.
     #[allow(clippy::type_complexity)]
     fn finish(
         mut self,
@@ -1379,6 +1432,7 @@ impl SegmentWriter {
             Segment,
             Vec<(ContentHash, BuiltBytes)>,
             Vec<(ContentHash, BuiltBytes)>,
+            WriterStats,
         ),
         TermIndexError,
     > {
@@ -1390,6 +1444,7 @@ impl SegmentWriter {
             },
             self.slice_bytes,
             self.tier_bytes,
+            self.stats,
         ))
     }
 }
@@ -1554,7 +1609,7 @@ pub(crate) fn build_segment(
             Vec::new(),
         )?;
     }
-    let (segment, slices, tiers) = writer.finish()?;
+    let (segment, slices, tiers, _) = writer.finish()?;
 
     Ok(BuiltSegment {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
@@ -1590,18 +1645,19 @@ struct SegmentCursor {
     files: VecDeque<PathBuf>,
     /// The open slice's bytes; empty before the first file.
     bytes: Vec<u8>,
-    /// The open slice's tier object, opened on the first tier the slice
-    /// yields; `None` until then and after every slice change.
-    tier: Option<File>,
-    /// Bytes of the tier object; `None` until the first read of it.
-    tier_len: Option<u64>,
+    /// The open slice's tier object and its length, opened on the first
+    /// tier the slice yields; `None` until then and after every slice
+    /// change.
+    tier: Option<(File, u64)>,
+    /// Where the open slice's tier object sits (see [`tier_path`]).
+    tier_file: Option<PathBuf>,
     /// The window of the tier object last read, and where it starts. A
     /// slice's chunks lie in key order, so a merge reads the object front
     /// to back and one window serves the terms that fall in it.
     window: Arc<Vec<u8>>,
     window_base: u64,
-    /// Where the open slice's tier object sits (see [`tier_path`]).
-    tier_file: Option<PathBuf>,
+    /// Least bytes a window holds.
+    window_bytes: u64,
     /// Decoded terms not handed out yet.
     batch: VecDeque<(Vec<u8>, Run)>,
     /// The last key decoded from the open slice, where the next batch
@@ -1611,24 +1667,36 @@ struct SegmentCursor {
     /// `end`, when set.
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
+    /// Seconds spent reading slice files and decoding batches, and
+    /// reading tier windows, for the merge's per-shard trace event.
+    decode_secs: f64,
+    read_secs: f64,
 }
 
 impl SegmentCursor {
     /// A cursor over `files` in key order, yielding the keys in
-    /// `start..end` (either bound open when `None`).
-    fn new(files: &[SliceFile], start: Option<&[u8]>, end: Option<&[u8]>) -> Self {
+    /// `start..end` (either bound open when `None`), reading tier objects
+    /// in windows of at least `window_bytes`.
+    fn new(
+        files: &[SliceFile],
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+        window_bytes: u64,
+    ) -> Self {
         Self {
             files: files.iter().map(|f| f.path.clone()).collect(),
             bytes: Vec::new(),
             tier: None,
-            tier_len: None,
+            tier_file: None,
             window: Arc::new(Vec::new()),
             window_base: 0,
-            tier_file: None,
+            window_bytes,
             batch: VecDeque::new(),
             last_key: None,
             start: start.map(<[u8]>::to_vec),
             end: end.map(<[u8]>::to_vec),
+            decode_secs: 0.0,
+            read_secs: 0.0,
         }
     }
 
@@ -1651,12 +1719,14 @@ impl SegmentCursor {
                 }
                 return Ok(Some(term));
             }
+            let started = Instant::now();
             if !self.bytes.is_empty() {
                 let slice = Slice::open(&self.bytes)?;
                 let batch = match (&self.last_key, &self.start) {
                     (None, Some(start)) => slice.terms_from(Some(start), MERGE_BATCH_TERMS)?,
                     _ => slice.terms_after(self.last_key.as_deref(), MERGE_BATCH_TERMS)?,
                 };
+                self.decode_secs += started.elapsed().as_secs_f64();
                 if let Some((key, _)) = batch.last() {
                     self.last_key = Some(key.clone());
                     self.batch = batch.into();
@@ -1667,8 +1737,8 @@ impl SegmentCursor {
                 return Ok(None);
             };
             self.bytes = fs::read(&path)?;
+            self.decode_secs += started.elapsed().as_secs_f64();
             self.tier = None;
-            self.tier_len = None;
             self.window = Arc::new(Vec::new());
             self.window_base = 0;
             self.tier_file = Some(path.with_extension(TIER_FILE_EXTENSION));
@@ -1678,47 +1748,45 @@ impl SegmentCursor {
 
     /// The bytes of the open slice's tier object that `chunks` lie in, and
     /// where they start: served from the window last read when it holds
-    /// them, else from a fresh window of at least
-    /// [`TIER_READ_WINDOW_BYTES`] starting at them. A run with a tier
-    /// always comes from a slice that has one, so a missing file is an
-    /// error, not an empty tier.
+    /// them, else from a fresh window of at least `window_bytes` starting
+    /// at them. A run with a tier always comes from a slice that has one,
+    /// so a missing file is an error, not an empty tier.
     fn tier_span(
         &mut self,
         chunks: &[TierChunkRef],
     ) -> Result<(Arc<Vec<u8>>, u64), TermIndexError> {
+        let base = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
+        let end = chunks
+            .iter()
+            .try_fold(0u64, |end, c| Some(end.max(c.offset.checked_add(c.len)?)))
+            .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
+        let window_end = self.window_base + self.window.len() as u64;
+        if base >= self.window_base && end <= window_end {
+            return Ok((Arc::clone(&self.window), self.window_base));
+        }
+        let started = Instant::now();
         if self.tier.is_none() {
             let path = self
                 .tier_file
                 .as_ref()
                 .ok_or_else(|| TermIndexError::Build("tier read before any slice".into()))?;
             let file = File::open(path)?;
-            self.tier_len = Some(file.metadata()?.len());
-            self.tier = Some(file);
+            let len = file.metadata()?.len();
+            self.tier = Some((file, len));
         }
-        let base = chunks.iter().map(|c| c.offset).min().unwrap_or(0);
-        let end = chunks
-            .iter()
-            .map(|c| c.offset.checked_add(c.len))
-            .max()
-            .flatten()
-            .ok_or_else(|| TermIndexError::Malformed("tier chunk range".into()))?;
-        let window_end = self.window_base + self.window.len() as u64;
-        if base >= self.window_base && end <= window_end {
-            return Ok((Arc::clone(&self.window), self.window_base));
-        }
-        let len = self.tier_len.expect("set with the file");
-        if end > len {
+        let (file, len) = self.tier.as_mut().expect("opened above");
+        if end > *len {
             return Err(TermIndexError::Malformed(
                 "tier chunk past its object".into(),
             ));
         }
-        let want = (end - base).max(TIER_READ_WINDOW_BYTES).min(len - base);
+        let want = (end - base).max(self.window_bytes).min(*len - base);
         let mut bytes = vec![0u8; want as usize];
-        let file = self.tier.as_mut().expect("opened above");
         file.seek(SeekFrom::Start(base))?;
         file.read_exact(&mut bytes)?;
         self.window = Arc::new(bytes);
         self.window_base = base;
+        self.read_secs += started.elapsed().as_secs_f64();
         Ok((Arc::clone(&self.window), base))
     }
 }
@@ -1848,8 +1916,8 @@ pub(crate) fn merge_segments(
 /// Sources of at least this many bytes are merged in key-range shards.
 const MERGE_SHARD_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Shards a merge is cut into at most: each holds a cursor per segment
-/// with a slice's bytes resident, so the width is bounded by memory as
-/// well as by threads.
+/// with a slice's bytes and a few tier windows resident, so the width is
+/// bounded by memory as well as by threads.
 const MERGE_SHARDS_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
@@ -1867,7 +1935,7 @@ fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) ->
 /// block's first key. Cutting by slice count instead left the common
 /// terms' ranges — a few thousand terms carrying most of the tier bytes —
 /// in a handful of shards that took the whole merge's wall time.
-fn shard_ranges(
+pub(crate) fn shard_ranges(
     sources: &[Vec<SliceFile>],
     policy: &BuildPolicy,
 ) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, TermIndexError> {
@@ -1890,11 +1958,15 @@ fn shard_ranges(
                 .clamp(1, MERGE_SHARDS_MAX)
         }
     };
-    if want <= 1 || files.len() < 2 {
+    if want <= 1 {
         return Ok(single);
     }
     // Every dictionary block of every slice, weighed by the bytes of its
-    // runs and tier chunks, read on the pool a slice at a time.
+    // runs and tier chunks, read on the pool a slice at a time: one pass
+    // over the slices before the merge reads them again. A block whose
+    // first run has no chunks is weighed by its runs alone and its chunk
+    // bytes fall to the next block that has them; a few blocks' worth of
+    // tier bytes can shift a cut, which is well within a shard.
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
         let bytes = fs::read(&file.path)?;
         let slice = Slice::open(&bytes)?;
@@ -1935,15 +2007,18 @@ fn shard_ranges(
     if marks.len() < 2 || total == 0 {
         return Ok(single);
     }
-    // Cut where the running weight crosses each shard's share; the first
-    // key is never a cut, and no key is cut twice.
+    // Cut where the running weight crosses each shard's share; the
+    // smallest key is never a cut (every source's first slice may mark
+    // it), and no key is cut twice. One block holding nearly every byte
+    // leaves no cut, and the merge runs in one shard.
     let n = want.min(marks.len());
     let share = total.div_ceil(n as u64);
     let mut cuts: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut acc = 0u64;
     let mut next_at = share;
-    for (i, (key, weight)) in marks.iter().enumerate() {
-        if i > 0 && acc >= next_at && cuts.last().is_none_or(|c| c < key) {
+    let first = &marks[0].0;
+    for (key, weight) in &marks {
+        if key > first && acc >= next_at && cuts.last().is_none_or(|c| c < key) {
             cuts.push(key.clone());
             next_at = (acc / share + 1) * share;
             if cuts.len() + 1 >= n {
@@ -1975,7 +2050,7 @@ fn merge_range(
 ) -> Result<MergedSegment, TermIndexError> {
     let mut cursors: Vec<SegmentCursor> = sources
         .iter()
-        .map(|s| SegmentCursor::new(s, start, end))
+        .map(|s| SegmentCursor::new(s, start, end, policy.tier_read_window_bytes))
         .collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1997,8 +2072,6 @@ fn merge_range(
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
     let started = Instant::now();
-    let mut cursor_secs = 0f64;
-    let mut tier_secs = 0f64;
     let mut tier_bytes = 0u64;
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
@@ -2021,9 +2094,7 @@ fn merge_range(
                         })
                     }));
                 } else {
-                    let t = Instant::now();
                     let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
-                    tier_secs += t.elapsed().as_secs_f64();
                     tier_bytes += tier.chunks.iter().map(|c| c.len).sum::<u64>();
                     sources.push(TierSource {
                         bytes,
@@ -2045,10 +2116,7 @@ fn merge_range(
                 }
                 Some(p)
             }));
-            let t = Instant::now();
-            let advanced = cursors[source as usize].next()?;
-            cursor_secs += t.elapsed().as_secs_f64();
-            if let Some((key, next_run)) = advanced {
+            if let Some((key, next_run)) = cursors[source as usize].next()? {
                 heap.push(Reverse(MergeHead {
                     key,
                     ordinal: source,
@@ -2073,18 +2141,14 @@ fn merge_range(
             mem::take(&mut sources),
         )?;
     }
-    // Flush and cut here so the last batch's time is in the stats.
-    writer.flush_pending()?;
-    writer.cut()?;
-    let stats = writer.stats;
-    let (segment, slices, tiers) = writer.finish()?;
-    tracing::debug!(
+    let (segment, slices, tiers, stats) = writer.finish()?;
+    debug!(
         target: "term_index::fold",
         start = %String::from_utf8_lossy(start.unwrap_or(b"")),
         end = %String::from_utf8_lossy(end.unwrap_or(b"")),
         secs = started.elapsed().as_secs_f64(),
-        cursor_secs,
-        tier_secs,
+        decode_secs = cursors.iter().map(|c| c.decode_secs).sum::<f64>(),
+        read_secs = cursors.iter().map(|c| c.read_secs).sum::<f64>(),
         tier_mib = tier_bytes as f64 / (1024.0 * 1024.0),
         encode_secs = stats.encode_secs,
         cut_secs = stats.cut_secs,
