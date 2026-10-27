@@ -7,6 +7,10 @@
 //! phrase uniformly. Drives both scored phrase search and phrase count.
 //! Scoped `pub(super)` to the `reader/` module.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::mem::take;
+
 use bytes::Bytes;
 
 use super::{
@@ -293,8 +297,37 @@ pub(super) struct PhraseCursor {
     /// Scratch: which candidates a member's filter kept.
     kept: Vec<u32>,
     /// Where the next block refill starts: one past the last block
-    /// batched. `None` once the rarest member's last block is batched.
+    /// batched. `None` once the driver's last block is batched.
     refill_from: Option<u32>,
+    /// Plain terms the phrase is ANDed with ([`Self::filter_by`]): each
+    /// filters the batch alongside the members, before any position work,
+    /// so only docs holding every term are verified. Empty for a phrase on
+    /// its own.
+    filters: Vec<TermCursor>,
+    /// The batch's sources in ascending posting-list length: index `i <
+    /// members.len()` is member `i`, any other is filter `i - members.len()`.
+    /// The first drives the candidates; the rest filter them, rarest first.
+    /// With no filters it is `align_order`.
+    batch_order: Vec<usize>,
+    /// Scratch: a filter's locations, which no verification reads.
+    filter_locs: Vec<(u32, u32)>,
+}
+
+/// The cursor batch source `s` reads from, in [`PhraseCursor::batch_order`]
+/// numbering: a member's walk cursor (or its probe, when the member filters
+/// rather than drives), else a filter term.
+fn source_cursor<'a>(
+    members: &'a mut [PhraseMember],
+    filters: &'a mut [TermCursor],
+    s: usize,
+    drives: bool,
+) -> &'a mut TermCursor {
+    let n = members.len();
+    match members.get_mut(s) {
+        Some(m) if drives => &mut m.cursor,
+        Some(m) => &mut m.probe,
+        None => &mut filters[s - n],
+    }
 }
 
 impl PhraseCursor {
@@ -365,6 +398,7 @@ impl PhraseCursor {
         }
         let mut verify_order: Vec<usize> = (0..member_at.len()).collect();
         verify_order.sort_by_key(|&q| rank[member_at[q]]);
+        let batch_order = align_order.clone();
         let mut cursor = Self {
             idf_weight: idf_sum,
             // An unscored phrase has no idf, so no bound either.
@@ -385,9 +419,51 @@ impl PhraseCursor {
             cand_locs: vec![Vec::new(); n_members],
             kept: Vec::new(),
             refill_from: Some(0),
+            filters: Vec::new(),
+            batch_order,
+            filter_locs: Vec::new(),
         };
         cursor.seek_match_unranked(0)?;
         Ok(cursor)
+    }
+
+    /// Narrow the phrase to the docs that also hold every one of `terms`,
+    /// which then filter each batch with the members, and move to the first
+    /// such match. The rarest of the members and the terms drives the
+    /// batches, so a rare term confines position work to its own docs and a
+    /// rare phrase is not slowed by a common term. Call once, before the
+    /// cursor is walked.
+    pub(super) fn filter_by(&mut self, terms: Vec<TermCursor>) -> Result<(), FtsError> {
+        debug_assert!(self.filters.is_empty(), "filters are attached once");
+        // No match lies before the phrase's first, unfiltered one.
+        let first = self.current_doc;
+        // Back to the start: the first batch moved the driver's cursor and
+        // the other members' probes, and left the driver's probe and the
+        // other members' cursors where they began.
+        let driver = self.align_order[0];
+        for (i, m) in self.members.iter_mut().enumerate() {
+            match i == driver {
+                true => m.cursor = m.probe.clone(),
+                false => m.probe = m.cursor.clone(),
+            }
+        }
+        let n = self.members.len();
+        self.filters = terms;
+        let lens: Vec<usize> = self
+            .members
+            .iter()
+            .map(|m| m.cursor.block_count())
+            .chain(self.filters.iter().map(TermCursor::block_count))
+            .collect();
+        self.batch_order = (0..n + self.filters.len()).collect();
+        self.batch_order.sort_by_key(|&s| lens[s]);
+        self.cands.clear();
+        self.cand_next = 0;
+        self.refill_from = Some(0);
+        if self.is_exhausted() {
+            return Ok(());
+        }
+        self.seek_match_unranked(first)
     }
 
     #[inline]
@@ -487,11 +563,11 @@ impl PhraseCursor {
     }
 
     /// Advance to the first verified phrase match at doc ≥ `from`, a block
-    /// of the rarest member at a time. The rarest member's current block
-    /// is the candidate list; every other member filters it in one pass
-    /// ([`TermCursor::retain_contained_located`]: a rank on a dense block,
-    /// one decode and a merge on a packed block), recording where it holds
-    /// each survivor, and only the survivors are verified, each member's
+    /// of the rarest source (member or filter term) at a time. That source's
+    /// current block is the candidate list; every other source filters it in
+    /// one pass ([`TermCursor::retain_contained_located`]: a rank on a dense
+    /// block, one decode and a merge on a packed block), a member recording
+    /// where it holds each survivor, and only the survivors are verified, each member's
     /// positions read at its recorded location. The candidates left
     /// over after a match are kept for the next call. When `bar` is
     /// finite, a block whose phrase bound is under the bar is skipped
@@ -515,7 +591,8 @@ impl PhraseCursor {
         while self.cand_next < self.cands.len() && self.cands[self.cand_next] < from {
             self.cand_next += 1;
         }
-        let driver = self.align_order[0];
+        let driver = self.batch_order[0];
+        let n_members = self.members.len();
         loop {
             while self.cand_next < self.cands.len() {
                 let c = self.cand_next;
@@ -542,14 +619,14 @@ impl PhraseCursor {
                 }
             }
 
-            // Refill from the rarest member's next block at or after `from`.
+            // Refill from the driver's next block at or after `from`.
             let Some(refill) = self.refill_from else {
                 self.current_doc = u32::MAX;
                 self.current_tf = 0;
                 return Ok(());
             };
             let start = refill.max(from);
-            let d = &mut self.members[driver].cursor;
+            let d = source_cursor(&mut self.members, &mut self.filters, driver, true);
             d.skip_to(start);
             if d.is_exhausted() {
                 self.refill_from = None;
@@ -570,34 +647,42 @@ impl PhraseCursor {
             if bar_norm.is_some() && self.block_max_in_range(first, block_last) < bar {
                 continue;
             }
-            let d = &self.members[driver].cursor;
+            let d = source_cursor(&mut self.members, &mut self.filters, driver, true);
             self.cands.clear();
             self.cands
                 .extend_from_slice(&d.block_doc_ids[d.pos..d.block_n]);
             self.cand_next = 0;
-            // The driver's candidates sit at their own pair indices in its
-            // decoded block; each other member's filter records where it
+            // A driving member's candidates sit at their own pair indices in
+            // its decoded block; each other member's filter records where it
             // holds the survivors, and the earlier members' locations are
-            // compacted to the same survivors.
+            // compacted to the same survivors. A filter term's locations are
+            // not needed: it only removes candidates.
             let (b, pos0) = (d.current_block as u32, d.pos as u32);
             for locs in &mut self.cand_locs {
                 locs.clear();
             }
-            self.cand_locs[driver].extend((0..self.cands.len() as u32).map(|i| (b, pos0 + i)));
-            for oi in 1..self.align_order.len() {
+            if driver < n_members {
+                self.cand_locs[driver].extend((0..self.cands.len() as u32).map(|i| (b, pos0 + i)));
+            }
+            for oi in 1..self.batch_order.len() {
                 if self.cands.is_empty() {
                     break;
                 }
-                let mi = self.align_order[oi];
-                let mut locs = std::mem::take(&mut self.cand_locs[mi]);
-                self.members[mi].probe.retain_contained_located(
-                    &mut self.cands,
-                    &mut locs,
-                    &mut self.kept,
-                );
-                self.cand_locs[mi] = locs;
-                for &pj in &self.align_order[..oi] {
-                    compact_locs(&mut self.cand_locs[pj], &self.kept);
+                let si = self.batch_order[oi];
+                let mut locs = match si < n_members {
+                    true => take(&mut self.cand_locs[si]),
+                    false => take(&mut self.filter_locs),
+                };
+                source_cursor(&mut self.members, &mut self.filters, si, false)
+                    .retain_contained_located(&mut self.cands, &mut locs, &mut self.kept);
+                match si < n_members {
+                    true => self.cand_locs[si] = locs,
+                    false => self.filter_locs = locs,
+                }
+                for &pj in &self.batch_order[..oi] {
+                    if pj < n_members {
+                        compact_locs(&mut self.cand_locs[pj], &self.kept);
+                    }
                 }
             }
         }
@@ -672,6 +757,48 @@ impl PhraseCursor {
             min_scaled = min_scaled.min(b / m.cursor.idf_weight);
         }
         self.idf_weight * min_scaled
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: keep every shape on the two-phase walk, the reference
+    /// the batched walk is graded against bit for bit.
+    pub(super) static TWO_PHASE_ONLY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Hand the AND of exactly one phrase and at least one plain term to the
+/// phrase's batched walk: the terms become the phrase's filters
+/// ([`PhraseCursor::filter_by`]), so the phrase atom alone walks the
+/// intersection, verified, and the term atoms are left in place for scoring.
+/// Returns the phrase atom's index, or `None` for any other shape, which
+/// keeps the two-phase walk.
+pub(super) fn batch_phrase_with_terms(atoms: &mut [AnyCursor]) -> Result<Option<usize>, FtsError> {
+    #[cfg(test)]
+    if TWO_PHASE_ONLY.with(Cell::get) {
+        return Ok(None);
+    }
+    let mut phrases = atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| matches!(a, AnyCursor::Phrase(_)))
+        .map(|(i, _)| i);
+    let (Some(at), None) = (phrases.next(), phrases.next()) else {
+        return Ok(None);
+    };
+    let terms: Vec<TermCursor> = atoms
+        .iter()
+        .filter_map(|a| match a {
+            AnyCursor::Term(c) => Some(c.clone()),
+            AnyCursor::Phrase(_) => None,
+        })
+        .collect();
+    match (terms.is_empty(), &mut atoms[at]) {
+        (false, AnyCursor::Phrase(p)) => {
+            p.filter_by(terms)?;
+            Ok(Some(at))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -813,16 +940,22 @@ impl AnyCursor {
 #[cfg(test)]
 mod tests {
 
-    use std::slice;
+    use std::{slice, sync::Arc};
+
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use roaring::RoaringBitmap;
 
     use super::{super::test_util::*, *};
-    use crate::superfile::{
-        fts::{
-            builder::FtsBuilder,
-            reader::{FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
-            tokenize::Phrase,
+    use crate::{
+        superfile::{
+            fts::{
+                builder::FtsBuilder,
+                reader::{BoolMode, FtsReader, QueryIdf, core::ClauseLists, cursor::CursorUse},
+                tokenize::Phrase,
+            },
+            id_space::{FtsDocId, RowId},
         },
-        id_space::FtsDocId,
+        test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
     };
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
@@ -1763,5 +1896,225 @@ mod tests {
                 .expect("seek");
         }
         assert_eq!(seen, vec![(0, 1), (3, 1)]);
+    }
+
+    /// Docs in the phrase-and-terms corpus: dozens of blocks for the common
+    /// words, several for the mid-frequency ones.
+    const AND_CORPUS_DOCS: u32 = 6_000;
+
+    /// The short-form term of the phrase-and-terms corpus sits in one doc in
+    /// this many.
+    const FEW_EVERY: u32 = 997;
+
+    /// Brute-force score tolerance: the scorers share the formula and the
+    /// inputs, so this absorbs only summation order and f32 rounding.
+    const AND_SCORE_TOLERANCE: f32 = 1e-3;
+
+    /// Docs a pushed-down row set admits: one in this many.
+    const ALLOW_EVERY: u32 = 3;
+
+    /// A doc of the phrase-and-terms corpus: chunks drawn independently and
+    /// shuffled, so a planted phrase stays adjacent while everything else
+    /// lands in a random order. Kept under sixteen tokens, so every length
+    /// norm is stored exactly and the brute-force scores agree to rounding.
+    fn and_corpus_doc(rng: &mut StdRng, i: u32) -> String {
+        let mut chunks: Vec<&str> = Vec::new();
+        // The common phrase, sometimes twice; its words, also often apart or
+        // reversed, so many docs hold both members without the phrase.
+        match rng.random_range(0..8u32) {
+            0 | 1 => chunks.push("the who"),
+            2 => chunks.push("the who the who"),
+            3 => chunks.push("who the"),
+            4 => chunks.extend(["the", "who"]),
+            _ => {}
+        }
+        // The rare phrase, and its words reversed.
+        match rng.random_range(0..300u32) {
+            0..=1 => chunks.push("zephyr onyx"),
+            2 => chunks.push("onyx zephyr"),
+            _ => {}
+        }
+        let mut plant = |word: &'static str, one_in: u32| {
+            if rng.random_range(0..one_in) == 0 {
+                chunks.push(word);
+            }
+        };
+        plant("uk", 150);
+        plant("mid", 10);
+        plant("neg", 7);
+        plant("often", 2);
+        plant("often", 3);
+        // A term in one doc (inline) and one in a handful (short form).
+        if i == AND_CORPUS_DOCS / 2 {
+            chunks.push("solo the who");
+        }
+        if i.is_multiple_of(FEW_EVERY) {
+            chunks.push("few the who");
+        }
+        let fill = rng.random_range(0..4usize);
+        chunks.extend(["a", "b", "c", "d"].into_iter().take(fill));
+        for j in (1..chunks.len()).rev() {
+            chunks.swap(j, rng.random_range(0..=j));
+        }
+        chunks.join(" ")
+    }
+
+    /// Ranked hits as (row, score bits), for exact comparison.
+    fn bits(hits: &[(RowId, f32)]) -> Vec<(u32, u32)> {
+        hits.iter().map(|(d, s)| (d.get(), s.to_bits())).collect()
+    }
+
+    /// One phrase ANDed with plain terms walks the phrase's batched path.
+    /// Over a corpus of thousands of docs, with the phrase common and the
+    /// terms rare, the reverse, members present but not adjacent, inline
+    /// and short-form terms, negations and an allow set, every result must
+    /// match a brute-force scan of the text (count, ids, top-k within
+    /// rounding) and the two-phase walk bit for bit (ids, scores, counts).
+    #[tokio::test]
+    async fn a_phrase_anded_with_terms_matches_brute_force_and_the_two_phase_walk() {
+        let mut rng = StdRng::seed_from_u64(0x5EED_A11D);
+        let texts: Vec<String> = (0..AND_CORPUS_DOCS)
+            .map(|i| and_corpus_doc(&mut rng, i))
+            .collect();
+        let r = open_positional(texts.iter().cloned());
+        let refs: Vec<(u64, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (i as u64, t.as_str()))
+            .collect();
+        let oracle = BruteForceBm25::index(&refs, default_tokenizer().as_ref());
+        let allow: RoaringBitmap = (0..AND_CORPUS_DOCS).step_by(ALLOW_EVERY as usize).collect();
+        let allow = Arc::new(allow);
+
+        type Case = (
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+            &'static [&'static str],
+        );
+        // (must terms, must phrase, negated terms, negated phrase)
+        let cases: &[Case] = &[
+            (&["uk"], &["the", "who"], &[], &[]),
+            (&["often"], &["the", "who"], &[], &[]),
+            (&["often"], &["zephyr", "onyx"], &[], &[]),
+            (&["mid"], &["who", "the"], &[], &[]),
+            (&["uk", "often"], &["the", "who"], &[], &[]),
+            (&["often", "mid"], &["the", "who"], &[], &[]),
+            (&["solo"], &["the", "who"], &[], &[]),
+            (&["few"], &["the", "who"], &[], &[]),
+            (&["few", "often"], &["the", "who"], &[], &[]),
+            (&["often"], &["the", "who"], &["neg"], &[]),
+            (
+                &["mid", "often"],
+                &["the", "who"],
+                &["neg"],
+                &["zephyr", "onyx"],
+            ),
+            (&["uk"], &["the", "who"], &["mid"], &[]),
+        ];
+        let set_two_phase = |on: bool| TWO_PHASE_ONLY.with(|c| c.set(on));
+        for &(terms, members, negs, neg_members) in cases {
+            let label = format!("+{members:?} +{terms:?} -{negs:?} -{neg_members:?}");
+            let musts: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+            let must_phrases = phrase(members);
+            let negatives: Vec<String> = negs.iter().map(|t| t.to_string()).collect();
+            let neg_phrases = match neg_members.is_empty() {
+                true => Vec::new(),
+                false => phrase(neg_members),
+            };
+            let want = oracle.top_k_atoms(
+                &musts,
+                &must_phrases,
+                &[],
+                &[],
+                &negatives,
+                &neg_phrases,
+                AND_CORPUS_DOCS as usize,
+            );
+            assert!(!want.is_empty(), "{label}: premise: the query matches");
+            let mut want_ids: Vec<u32> = want.iter().map(|&(d, _)| d as u32).collect();
+            want_ids.sort_unstable();
+            let want_allowed = want_ids.iter().filter(|&&d| allow.contains(d)).count() as u64;
+
+            for two_phase in [false, true] {
+                set_two_phase(two_phase);
+                let label = format!("{label} two_phase={two_phase}");
+                let (count, _) = r
+                    .atoms_match_count(
+                        "title",
+                        terms,
+                        &must_phrases,
+                        BoolMode::And,
+                        negs,
+                        &neg_phrases,
+                    )
+                    .await
+                    .expect("count");
+                assert_eq!(count, want.len() as u64, "{label}: unranked count");
+                if negs.is_empty() && neg_members.is_empty() {
+                    let (ids, _) = r
+                        .atoms_match_ids("title", terms, &must_phrases, BoolMode::And)
+                        .await
+                        .expect("ids");
+                    let ids: Vec<u32> = ids.iter().map(|d| d.get()).collect();
+                    assert_eq!(ids, want_ids, "{label}: unranked ids");
+                }
+            }
+
+            for allowed in [None, Some(allow.clone())] {
+                let lists = || ClauseLists {
+                    musts: terms,
+                    negatives: negs,
+                    must_phrases: &must_phrases,
+                    negative_phrases: &neg_phrases,
+                    allow: allowed.clone(),
+                    ..ClauseLists::default()
+                };
+                let label = format!("{label} allow={}", allowed.is_some());
+                for k in [1usize, 10, 100, AND_CORPUS_DOCS as usize] {
+                    let mut runs = Vec::new();
+                    for two_phase in [false, true] {
+                        set_two_phase(two_phase);
+                        let ranked = r
+                            .search_excluding("title", lists(), k, f32::NEG_INFINITY)
+                            .await
+                            .expect("ranked");
+                        let (counted, count) = r
+                            .search_excluding_with_count("title", lists(), k)
+                            .await
+                            .expect("exact count");
+                        runs.push((bits(&ranked), bits(&counted), count));
+                    }
+                    set_two_phase(false);
+                    assert_eq!(runs[0], runs[1], "{label} k={k}: batched vs two-phase");
+                    let (ranked, counted, count) = &runs[0];
+                    assert_eq!(ranked, counted, "{label} k={k}: ranked vs exact-count hits");
+                    match allowed.is_some() {
+                        true => {
+                            assert_eq!(*count, want_allowed, "{label} k={k}: allowed count");
+                            assert!(
+                                ranked.iter().all(|&(d, _)| allow.contains(d)),
+                                "{label} k={k}: a hit outside the allow set"
+                            );
+                        }
+                        false => {
+                            assert_eq!(*count, want.len() as u64, "{label} k={k}: exact count");
+                            assert_eq!(ranked.len(), k.min(want.len()), "{label} k={k}: hits");
+                            for (i, (&(_, got), &(_, w))) in ranked.iter().zip(&want).enumerate() {
+                                assert!(
+                                    (f32::from_bits(got) - w).abs() <= AND_SCORE_TOLERANCE,
+                                    "{label} k={k}: rank {i} score vs brute force {w}"
+                                );
+                            }
+                            if k >= want.len() {
+                                let mut got: Vec<u32> = ranked.iter().map(|&(d, _)| d).collect();
+                                got.sort_unstable();
+                                assert_eq!(got, want_ids, "{label} k={k}: full result set");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

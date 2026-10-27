@@ -19,7 +19,7 @@ use super::{
     filter::{AtomExcludeFilter, ExcludeFilter},
     metadata::NormTable,
     options::BoolMode,
-    phrase::AnyCursor,
+    phrase::{AnyCursor, batch_phrase_with_terms},
     scorers::{BUFFERED_TOPK_MIN_K, kth_scored, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
@@ -318,6 +318,11 @@ impl FtsReader {
             let must_ub_total: f32 = musts.iter().map(AnyCursor::term_max_bm25).sum();
             atom_slack(&shoulds, must_ub_total)
         };
+        // One phrase ANDed with terms walks the must intersection itself, a
+        // block at a time, every doc it lands on verified; it prunes by its
+        // own bound against the bar less everything else could add.
+        let batched = batch_phrase_with_terms(&mut musts)?;
+        let must_others_ub = atom_slack(&musts, should_ub);
         let mut target = 0u32;
         'docs: loop {
             let floor_live = floor_now();
@@ -325,24 +330,37 @@ impl FtsReader {
                 true => heap.peek().expect("heap len == k").0.max(floor_live),
                 false => floor_live,
             };
-            // Phase 1 — approximate alignment (phrase = member co-occurrence,
-            // no positions).
-            let mut aligned = target;
-            let mut i = 0usize;
-            while i < musts.len() {
-                let a = &mut musts[i];
-                a.approx_skip_to(aligned);
-                if a.is_exhausted() {
-                    break 'docs;
+            let aligned = match batched {
+                Some(at) => {
+                    let a = &mut musts[at];
+                    a.skip_to_pruned(target, bar - must_others_ub[at], dl_norm_k1)?;
+                    if a.is_exhausted() {
+                        break 'docs;
+                    }
+                    a.current_doc_id()
                 }
-                let here = a.approx_current_doc();
-                if here > aligned {
-                    aligned = here;
-                    i = 0;
-                    continue;
+                None => {
+                    // Phase 1 — approximate alignment (phrase = member
+                    // co-occurrence, no positions).
+                    let mut aligned = target;
+                    let mut i = 0usize;
+                    while i < musts.len() {
+                        let a = &mut musts[i];
+                        a.approx_skip_to(aligned);
+                        if a.is_exhausted() {
+                            break 'docs;
+                        }
+                        let here = a.approx_current_doc();
+                        if here > aligned {
+                            aligned = here;
+                            i = 0;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    aligned
                 }
-                i += 1;
-            }
+            };
             // Bar skip on block-max UBs, before any position work: a candidate
             // whose musts + shoulds can't reach the kth-best is dead without a
             // verify. `>=`, not `>`: a doc exactly at the bar can still displace
@@ -360,10 +378,18 @@ impl FtsReader {
             if scoring_needed {
                 // Phase 2 — verify phrase adjacency at the aligned candidate;
                 // terms match trivially. Only survivors reach the position
-                // decode and scoring.
+                // decode and scoring. The batched walk verified its doc
+                // already, and brings the terms to it only now, to score.
                 let mut matched = true;
                 for a in musts.iter_mut() {
-                    if !a.verify_at(aligned)? {
+                    let holds = match batched {
+                        Some(_) => {
+                            a.skip_to(aligned)?;
+                            true
+                        }
+                        None => a.verify_at(aligned)?,
+                    };
+                    if !holds {
                         matched = false;
                         break;
                     }
