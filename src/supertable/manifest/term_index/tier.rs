@@ -111,7 +111,7 @@ pub(crate) struct ColumnScoring {
     pub(crate) params: Bm25Params,
     /// The superfile's scored document count in the column: what turns a
     /// bound stored by the layout before tiers, a score at the superfile's
-    /// own idf, into a key when such a segment is merged. Zero when not
+    /// own idf, into a key when such a layer is merged. Zero when not
     /// known, which leaves such a bound unbounded.
     pub(crate) scored_docs: u64,
 }

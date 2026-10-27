@@ -58,7 +58,7 @@ use crate::{
             RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
-            term_index::{Contribution as TermContribution, ReservedSegment},
+            term_index::{Contribution as TermContribution, ReservedLayer},
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_compaction_input, vector},
@@ -934,7 +934,7 @@ impl Supertable {
             .iter()
             .map(|s| (s.superfile_id, Arc::new(s.bitmap.clone())))
             .collect();
-        let merged_segment = match self
+        let merged_superfile = match self
             .merge_superfiles_with(
                 &inputs,
                 &sealed_tombstones,
@@ -962,7 +962,7 @@ impl Supertable {
             bytes_for_cache,
             merged_superfile_id,
             term_contributions,
-        ) = match merged_segment {
+        ) = match merged_superfile {
             Some(PreparedSuperfile {
                 entry: merged_prepared,
                 bytes_for_store,
@@ -1107,7 +1107,7 @@ impl Supertable {
         let mut next_id_floor: u64 = 0;
         // The batch's term-index delta, built on the first attempt and
         // appended again by any retry instead of rebuilt.
-        let mut reserved_segment: Option<ReservedSegment> = None;
+        let mut reserved_layer: Option<ReservedLayer> = None;
         // Parts rebuilt for the batch's removals, reused by any retry.
         let mut rebuilt_parts = RebuiltParts::default();
         let started = Instant::now();
@@ -1241,7 +1241,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
-                Some(&mut reserved_segment),
+                Some(&mut reserved_layer),
                 Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )

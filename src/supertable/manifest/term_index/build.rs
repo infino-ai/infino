@@ -15,10 +15,10 @@
 //! target size, so every slice is one contiguous key range and a lookup
 //! fetches exactly one.
 //!
-//! An index can also be rebuilt from its own segments
-//! ([`merge_segments`]) rather than from the superfiles: a posting depends
+//! An index can also be rebuilt from its own layers
+//! ([`merge_layers`]) rather than from the superfiles: a posting depends
 //! only on its superfile, which never changes, so copying it out of an
-//! existing segment gives exactly what walking the superfile again would.
+//! existing layer gives exactly what walking the superfile again would.
 
 use std::{
     cmp::Reverse,
@@ -40,7 +40,7 @@ use uuid::Uuid;
 use super::{
     TermIndexError,
     format::{
-        BlockMark, Location, Posting, Root, Run, Segment, Slice, SliceRef, TierRef, encode_run,
+        BlockMark, Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run,
         encode_slice, legacy_bound_as_key, push_doc_facts, push_posting, read_doc_facts,
         read_posting,
     },
@@ -105,9 +105,9 @@ pub(crate) struct BuildPolicy {
     /// directory, which on a host sized for a large table may be small or
     /// in memory.
     pub(crate) scratch_root: Option<PathBuf>,
-    /// Key ranges a merge of segments is cut into and merged in parallel;
+    /// Key ranges a merge of layers is cut into and merged in parallel;
     /// `None` chooses by the sources' size and the pool's width (see
-    /// [`merge_segments`]).
+    /// [`merge_layers`]).
     pub(crate) merge_ranges: Option<usize>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
@@ -116,8 +116,8 @@ pub(crate) struct BuildPolicy {
     /// keys at [`ColumnScoring::default`].
     pub(crate) scoring_by_ordinal: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>,
     /// The same facts by superfile id, for a commit: its root's ordinals
-    /// are assigned as the commit's segment is reserved, so the fold that
-    /// follows the commit keys the segments it merges by ordinal from this
+    /// are assigned as the commit's layer is reserved, so the fold that
+    /// follows the commit keys the layers it merges by ordinal from this
     /// map and the root it folds. Empty, a fold keys at
     /// [`ColumnScoring::default`] like any merge without the table.
     pub(crate) scoring_by_superfile: Arc<HashMap<Uuid, BTreeMap<FieldId, ColumnScoring>>>,
@@ -145,7 +145,7 @@ impl BuildPolicy {
     }
 }
 
-/// How a segment writer keys an entry: by the superfile ordinal and column
+/// How a layer writer keys an entry: by the superfile ordinal and column
 /// it belongs to.
 type ScoringOf = Arc<dyn Fn(u32, FieldId) -> ColumnScoring + Send + Sync>;
 
@@ -376,7 +376,7 @@ fn encode_term(
             tail,
         });
     }
-    // A superfile with no entry in the tier — its segment kept no heads —
+    // A superfile with no entry in the tier — its layer kept no heads —
     // has nothing in the head its posting's tail would bound: the tail is
     // raised past any key, where zero would read as a head that holds
     // every document and drop the superfile's documents.
@@ -1171,7 +1171,7 @@ impl SliceBuilder {
 /// Cuts a stream of `(key, encoded run)` in key order into slices. The
 /// build and the merge both write through it, so equal input gives equal
 /// bytes.
-struct SegmentWriter {
+struct LayerWriter {
     current: SliceBuilder,
     /// The open slice's tier object so far: its terms' chunks back to back.
     current_tier: Vec<u8>,
@@ -1203,7 +1203,7 @@ struct SegmentWriter {
     splice: bool,
 }
 
-/// What a segment writer spent its time on, for the merge's per-range
+/// What a layer writer spent its time on, for the merge's per-range
 /// trace event.
 #[derive(Debug, Default, Clone, Copy)]
 struct WriterStats {
@@ -1213,7 +1213,7 @@ struct WriterStats {
     entries: u64,
 }
 
-impl SegmentWriter {
+impl LayerWriter {
     fn new(policy: &BuildPolicy, scoring: ScoringOf) -> Result<Self, TermIndexError> {
         let spill = match policy.spill_to_disk {
             true => Some(Arc::new(scratch_dir(policy.scratch_root.as_deref())?)),
@@ -1422,14 +1422,14 @@ impl SegmentWriter {
         Ok(())
     }
 
-    /// The segment, its slices and their tier objects, each written beside
+    /// The layer, its slices and their tier objects, each written beside
     /// the slice that names it, and what the writer spent its time on.
     #[allow(clippy::type_complexity)]
     fn finish(
         mut self,
     ) -> Result<
         (
-            Segment,
+            Layer,
             Vec<(ContentHash, BuiltBytes)>,
             Vec<(ContentHash, BuiltBytes)>,
             WriterStats,
@@ -1439,7 +1439,7 @@ impl SegmentWriter {
         self.flush_pending()?;
         self.cut()?;
         Ok((
-            Segment {
+            Layer {
                 slices: self.slices,
             },
             self.slice_bytes,
@@ -1459,22 +1459,22 @@ pub(crate) struct Built {
     pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
-/// One merged segment: the superfiles it covers (in ordinal order, starting
+/// One merged layer: the superfiles it covers (in ordinal order, starting
 /// at the base the caller passed), its slice list, and the slice bytes.
-pub(crate) struct BuiltSegment {
-    /// Superfiles this segment's postings name, in ordinal order.
+pub(crate) struct BuiltLayer {
+    /// Superfiles this layer's postings name, in ordinal order.
     pub(crate) superfiles: Vec<Uuid>,
     /// Their smallest doc ids, parallel to `superfiles`.
     pub(crate) id_mins: Vec<i128>,
-    /// The segment's slices, in key order.
-    pub(crate) segment: Segment,
+    /// The layer's slices, in key order.
+    pub(crate) layer: Layer,
     /// Slice bytes keyed by content hash, in key order.
     pub(crate) slices: Vec<(ContentHash, BuiltBytes)>,
     /// The slices' tier objects, keyed by content hash.
     pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }
 
-/// Merge contributions into a base root: one segment, ordinals from zero.
+/// Merge contributions into a base root: one layer, ordinals from zero.
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,
@@ -1482,9 +1482,9 @@ pub(crate) fn build(
     build_onto(Root::default(), contributions, policy)
 }
 
-/// `base` with `contributions` merged into one more segment, whose
+/// `base` with `contributions` merged into one more layer, whose
 /// ordinals continue from `base`'s superfile count. Onto an empty root this
-/// is a full build: one segment, ordinals from zero.
+/// is a full build: one layer, ordinals from zero.
 ///
 /// Optimize skips the rebuild when the current index already has a full
 /// build's shape, so a change to what this writes reaches existing tables
@@ -1499,10 +1499,10 @@ pub(crate) fn build_onto(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
-    let built = build_segment(contributions, policy, base.superfiles.len() as u32)?;
+    let built = build_layer(contributions, policy, base.superfiles.len() as u32)?;
     base.superfiles.extend(built.superfiles);
     base.id_mins.extend(built.id_mins);
-    base.segments.push(built.segment);
+    base.layers.push(built.layer);
     Ok(Built {
         root: base,
         slices: built.slices,
@@ -1510,15 +1510,15 @@ pub(crate) fn build_onto(
     })
 }
 
-/// Merge contributions into one segment of slices. Superfile ordinals
+/// Merge contributions into one layer of slices. Superfile ordinals
 /// follow the order of `contributions`, offset by `ordinal_base` — the
-/// number of superfiles the root already names when this segment is a
+/// number of superfiles the root already names when this layer is a
 /// delta appended to it.
-pub(crate) fn build_segment(
+pub(crate) fn build_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
     ordinal_base: u32,
-) -> Result<BuiltSegment, TermIndexError> {
+) -> Result<BuiltLayer, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
     let mut pending: Vec<Option<(Posting, Vec<(u32, u32, u8)>)>> =
@@ -1542,7 +1542,7 @@ pub(crate) fn build_segment(
         Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
         ordinal_base,
     );
-    let mut writer = SegmentWriter::new(policy, scoring)?;
+    let mut writer = LayerWriter::new(policy, scoring)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
 
@@ -1609,12 +1609,12 @@ pub(crate) fn build_segment(
             Vec::new(),
         )?;
     }
-    let (segment, slices, tiers, _) = writer.finish()?;
+    let (layer, slices, tiers, _) = writer.finish()?;
 
-    Ok(BuiltSegment {
+    Ok(BuiltLayer {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
         id_mins: contributions.iter().map(|c| c.id_min).collect(),
-        segment,
+        layer,
         slices,
         tiers,
     })
@@ -1625,7 +1625,7 @@ pub(crate) fn build_segment(
 /// slice decoded.
 const MERGE_BATCH_TERMS: usize = 4096;
 
-/// A slice on local disk, with the key range its segment records for it,
+/// A slice on local disk, with the key range its layer records for it,
 /// so a merge can be range-cut and its sources selected without opening
 /// a slice.
 #[derive(Debug, Clone)]
@@ -1638,9 +1638,9 @@ pub(crate) struct SliceFile {
     pub(crate) last_key: Vec<u8>,
 }
 
-/// Reads one segment's slices, already on local disk, term by term in key
+/// Reads one layer's slices, already on local disk, term by term in key
 /// order.
-struct SegmentCursor {
+struct LayerCursor {
     /// Slice files not opened yet, in key order.
     files: VecDeque<PathBuf>,
     /// The open slice's bytes; empty before the first file.
@@ -1673,7 +1673,7 @@ struct SegmentCursor {
     read_secs: f64,
 }
 
-impl SegmentCursor {
+impl LayerCursor {
     /// A cursor over `files` in key order, yielding the keys in
     /// `start..end` (either bound open when `None`), reading tier objects
     /// in windows of at least `window_bytes`.
@@ -1851,25 +1851,25 @@ fn tier_entries(
     Ok(())
 }
 
-/// Merge segments into one, in key ranges on the pool when the
+/// Merge layers into one, in key ranges on the pool when the
 /// sources are large (see [`key_ranges`]), renumbering every posting through
 /// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
 /// result, and is dropped when that is `None` (a superfile that is gone, or
-/// padding). `sources` holds each segment's slices in key order, each with
+/// padding). `sources` holds each layer's slices in key order, each with
 /// its tier object beside it (see [`tier_path`]). Tiers merge the same way:
 /// their entries are pooled, renumbered and re-cut at the policy's budget.
 ///
 /// Runs come out in ascending new ordinal and are cut into slices as
-/// [`build_segment`] cuts them, with a cut at every range bound as well.
+/// [`build_layer`] cuts them, with a cut at every range bound as well.
 /// A merge in one range whose ordinals follow the order a build would give
 /// its contributions writes the same bytes as that build; a range-cut one
 /// writes the same terms, each with the same postings and tier entries,
 /// in slices cut at the range bounds too.
-pub(crate) fn merge_segments(
+pub(crate) fn merge_layers(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
-) -> Result<MergedSegment, TermIndexError> {
+) -> Result<MergedLayer, TermIndexError> {
     let ranges = key_ranges(sources, policy)?;
     if ranges.len() <= 1 {
         return merge_range(sources, None, None, ordinals, policy);
@@ -1891,23 +1891,23 @@ pub(crate) fn merge_segments(
             .collect();
         merge_range(&in_range, start, end, ordinals, policy)
     };
-    let merge_all = || -> Result<Vec<MergedSegment>, TermIndexError> {
+    let merge_all = || -> Result<Vec<MergedLayer>, TermIndexError> {
         ranges.par_iter().map(merge_one).collect()
     };
     let parts = match policy.pool.as_deref() {
         Some(pool) => pool.install(merge_all)?,
         None => merge_all()?,
     };
-    let mut segment = Segment::default();
+    let mut layer = Layer::default();
     let mut slices = Vec::new();
     let mut tiers = Vec::new();
     for part in parts {
-        segment.slices.extend(part.segment.slices);
+        layer.slices.extend(part.layer.slices);
         slices.extend(part.slices);
         tiers.extend(part.tiers);
     }
-    Ok(MergedSegment {
-        segment,
+    Ok(MergedLayer {
+        layer,
         slices,
         tiers,
     })
@@ -1915,7 +1915,7 @@ pub(crate) fn merge_segments(
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
-/// Ranges a merge is cut into at most: each holds a cursor per segment
+/// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
 const MERGE_RANGES_MAX: usize = 32;
@@ -2047,10 +2047,10 @@ fn merge_range(
     end: Option<&[u8]>,
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
-) -> Result<MergedSegment, TermIndexError> {
-    let mut cursors: Vec<SegmentCursor> = sources
+) -> Result<MergedLayer, TermIndexError> {
+    let mut cursors: Vec<LayerCursor> = sources
         .iter()
-        .map(|s| SegmentCursor::new(s, start, end, policy.tier_read_window_bytes))
+        .map(|s| LayerCursor::new(s, start, end, policy.tier_read_window_bytes))
         .collect();
     let mut pending: Vec<Option<Run>> = Vec::with_capacity(cursors.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -2067,7 +2067,7 @@ fn merge_range(
         }
     }
 
-    let mut writer = SegmentWriter::for_merge(policy, ordinals)?;
+    let mut writer = LayerWriter::for_merge(policy, ordinals)?;
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
@@ -2103,7 +2103,7 @@ fn merge_range(
                     });
                 }
             }
-            // A segment of the layout before tiers bounds a posting by a
+            // A layer of the layout before tiers bounds a posting by a
             // score at the superfile's own idf; it is written on as the
             // key the current layout stores.
             let legacy = source_run.legacy_bound;
@@ -2141,7 +2141,7 @@ fn merge_range(
             mem::take(&mut sources),
         )?;
     }
-    let (segment, slices, tiers, stats) = writer.finish()?;
+    let (layer, slices, tiers, stats) = writer.finish()?;
     debug!(
         target: "term_index::fold",
         start = %String::from_utf8_lossy(start.unwrap_or(b"")),
@@ -2157,16 +2157,16 @@ fn merge_range(
         out_slices = slices.len(),
         "fold range"
     );
-    Ok(MergedSegment {
-        segment,
+    Ok(MergedLayer {
+        layer,
         slices,
         tiers,
     })
 }
 
-/// What [`merge_segments`] produces: the segment and the bytes it names.
-pub(crate) struct MergedSegment {
-    pub(crate) segment: Segment,
+/// What [`merge_layers`] produces: the layer and the bytes it names.
+pub(crate) struct MergedLayer {
+    pub(crate) layer: Layer,
     pub(crate) slices: Vec<(ContentHash, BuiltBytes)>,
     pub(crate) tiers: Vec<(ContentHash, BuiltBytes)>,
 }

@@ -10,7 +10,7 @@
 //! looked into, not loaded.
 //!
 //! **Shape.** A small *root* stays resident: the covered superfiles (postings
-//! name them by ordinal) and, per segment, the key range and content hash of
+//! name them by ordinal) and, per layer, the key range and content hash of
 //! every *slice*. A slice is one contiguous range of `field_id \x1F term`
 //! keys ([`FieldId::term_key`]; columns are named by id so a rename leaves
 //! the index valid),
@@ -22,7 +22,7 @@
 //! **Validity.** A posting is followed only if its superfile is live in the
 //! current manifest; postings for removed superfiles are simply ignored. So
 //! a removal never invalidates the artifact, and the reference carries
-//! forward across every commit. A superfile with no postings in any segment
+//! forward across every commit. A superfile with no postings in any layer
 //! is uncovered and is probed directly.
 //!
 //! **Content addressing.** Root and slices are named by the blake3 of their
@@ -47,15 +47,15 @@ use std::{
     sync::Arc,
 };
 
-use build::build_segment;
+use build::build_layer;
 #[cfg(test)]
 pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
     BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, SliceFile, build, build_onto, merge_segments, scratch_dir, tier_path,
+    HeadSink, SliceFile, build, build_onto, merge_layers, scratch_dir, tier_path,
 };
 use bytes::Bytes;
-use format::Segment;
+use format::Layer;
 #[cfg(test)]
 pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
@@ -128,35 +128,35 @@ const SLICE_FETCH_CONCURRENCY: usize = 8;
 /// client keeps far more warm connections than this. Each task holds one
 /// object at a time, so this many of the largest tier object bounds the
 /// transfer's memory.
-const SEGMENT_FETCH_CONCURRENCY: usize = 16;
+const LAYER_FETCH_CONCURRENCY: usize = 16;
 
 /// Objects one build writes at once; the write-side twin of
-/// [`SEGMENT_FETCH_CONCURRENCY`], with the same memory bound: a spilled
+/// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
 /// object is read back only as its upload starts.
 const SLICE_WRITE_CONCURRENCY: usize = 16;
 
-/// Ordinals a reserved segment leaves free past the root it was built
+/// Ordinals a reserved layer leaves free past the root it was built
 /// against, for the deltas other commits append while its own commit
 /// retries. Ingest commits land a few times a second and a retrying commit
 /// gives up within a minute, so this is rarely outgrown; outgrowing it
-/// costs one rebuild of the segment, never correctness. Each unused slot
+/// costs one rebuild of the layer, never correctness. Each unused slot
 /// is a nil entry (32 bytes) in the root until the next full rebuild.
 const RESERVED_ORDINAL_SLACK: u32 = 256;
 
-/// Fan-out of the tiered fold a commit applies to its root's segments (see
-/// [`fold_tail`]). A lookup opens one slice per segment, so a root that only
+/// Fan-out of the tiered fold a commit applies to its root's layers (see
+/// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
 /// ever appended would cost one slice per commit since the last optimize;
-/// folding every run of this many segments of one size level into one keeps
+/// folding every run of this many layers of one size level into one keeps
 /// fewer than this many per level, a logarithmic number in all, while a
 /// commit pays a fold only once per this many commits at each level. Eight
-/// keeps a 200-commit root to about twenty segments and a 10k-commit root to
+/// keeps a 200-commit root to about twenty layers and a 10k-commit root to
 /// about forty.
 const FOLD_FAN_OUT: usize = 8;
 
-/// How far below the largest segment of a fold's group a segment may lie and
+/// How far below the largest layer of a fold's group a layer may lie and
 /// still fold with it, in levels, a level being a factor of [`FOLD_FAN_OUT`]
 /// in size. Three quarters of a level, the span Lucene's LogMergePolicy
-/// groups its levels by: a fold of [`FOLD_FAN_OUT`] segments of one size
+/// groups its levels by: a fold of [`FOLD_FAN_OUT`] layers of one size
 /// lands a whole level up, past the span, so it does not fold again with the
 /// group it came from.
 const FOLD_LEVEL_SPAN: f64 = 0.75;
@@ -477,14 +477,14 @@ pub(crate) async fn write_built(
     write_root(storage.as_ref(), &built.root).await
 }
 
-/// Publish this commit's superfiles as a delta segment appended to `prior`
+/// Publish this commit's superfiles as a delta layer appended to `prior`
 /// (the root the current manifest references, or none): write the new
-/// slices, then a new root naming the prior segments plus this one, and
+/// slices, then a new root naming the prior layers plus this one, and
 /// return the root's reference for the manifest CAS. Ordinals continue
 /// from the prior root's superfile count, so earlier postings keep their
 /// meaning. Content-addressed throughout: a retry after a lost CAS
 /// re-derives the same slice hashes and re-PUTs them as no-ops. A fold the
-/// root's segments call for merges on `pool` ([`fold_tail`]).
+/// root's layers call for merges on `pool` ([`fold_tail`]).
 pub(crate) async fn append_delta(
     storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
@@ -498,74 +498,74 @@ pub(crate) async fn append_delta(
     publish_root(storage, built.root, policy, pool).await
 }
 
-/// A delta segment built and written once, numbered from a reserved
+/// A delta layer built and written once, numbered from a reserved
 /// ordinal past the root it was built against. A commit that loses its race
-/// appends the same segment to the winner's root, padding up to its first
+/// appends the same layer to the winner's root, padding up to its first
 /// ordinal, instead of building and uploading it again.
-pub(crate) struct ReservedSegment {
+pub(crate) struct ReservedLayer {
     /// The ordinal its first superfile takes. Its postings name
     /// `base + i` for the `i`-th of `superfiles`.
     base: u32,
     superfiles: Vec<Uuid>,
     id_mins: Vec<i128>,
-    segment: Segment,
+    layer: Layer,
     /// Appended only at exactly the root's length, and rebuilt there
     /// otherwise, so the root is never padded on its account.
     exact: bool,
 }
 
-impl ReservedSegment {
-    /// The ordinal just past the segment's last superfile.
+impl ReservedLayer {
+    /// The ordinal just past the layer's last superfile.
     pub(crate) fn end(&self) -> u32 {
         self.base + self.superfiles.len() as u32
     }
 }
 
-/// Build `contributions` into a segment numbered from `base` and write its
+/// Build `contributions` into a layer numbered from `base` and write its
 /// slices, for a later [`append_reserved`].
-pub(crate) async fn reserve_segment(
+pub(crate) async fn reserve_layer(
     storage: &Arc<dyn StorageProvider>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
     base: u32,
     exact: bool,
-) -> Result<ReservedSegment, TermIndexError> {
+) -> Result<ReservedLayer, TermIndexError> {
     let built = detail_span!(
-        "term_index.build_segment",
+        "term_index.build_layer",
         inputs = contributions.len(),
         ordinal_base = base,
     )
-    .in_scope(|| build_segment(contributions, policy, base))?;
+    .in_scope(|| build_layer(contributions, policy, base))?;
     write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
-    Ok(ReservedSegment {
+    Ok(ReservedLayer {
         base,
         superfiles: built.superfiles,
         id_mins: built.id_mins,
-        segment: built.segment,
+        layer: built.layer,
         exact,
     })
 }
 
-/// [`append_delta`] for a commit that may retry: the segment is built once,
+/// [`append_delta`] for a commit that may retry: the layer is built once,
 /// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
 /// `reserved`. Each call pads `prior` with nil entries up to the reserved
-/// ordinal and appends it, writing only the root unless the root's segments
-/// make a run [`fold_tail`] merges, on `pool`. The segment is built
+/// ordinal and appends it, writing only the root unless the root's layers
+/// make a run [`fold_tail`] merges, on `pool`. The layer is built
 /// again only when `prior` has grown past the reserved ordinal, or the
-/// contributions are not the ones it was built from. An `exact` segment is
+/// contributions are not the ones it was built from. An `exact` layer is
 /// never padded: it is reused only at `prior`'s exact length and otherwise
 /// rebuilt there, without the slack.
 ///
 /// Like every delta, it names only ordinals at or past the length of the
-/// root it extends, which `segments_since` relies on. Optimize's rebuild
+/// root it extends, which `layers_since` relies on. Optimize's rebuild
 /// drops the padding.
 pub(crate) async fn append_reserved(
     storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
-    reserved: &mut Option<ReservedSegment>,
+    reserved: &mut Option<ReservedLayer>,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
@@ -582,22 +582,22 @@ pub(crate) async fn append_reserved(
     if !reusable {
         let slack = if exact { 0 } else { RESERVED_ORDINAL_SLACK };
         let base = len as u32 + slack;
-        *reserved = Some(reserve_segment(storage, contributions, policy, base, exact).await?);
+        *reserved = Some(reserve_layer(storage, contributions, policy, base, exact).await?);
     }
-    let segment = reserved.as_ref().expect("reserved above");
-    let padding = segment.base as usize - len;
+    let layer = reserved.as_ref().expect("reserved above");
+    let padding = layer.base as usize - len;
     root.superfiles.extend(repeat_n(Uuid::nil(), padding));
-    root.superfiles.extend_from_slice(&segment.superfiles);
+    root.superfiles.extend_from_slice(&layer.superfiles);
     root.id_mins.extend(repeat_n(0, padding));
-    root.id_mins.extend_from_slice(&segment.id_mins);
-    root.segments.push(segment.segment.clone());
+    root.id_mins.extend_from_slice(&layer.id_mins);
+    root.layers.push(layer.layer.clone());
     publish_root(storage, root, policy, pool).await
 }
 
-/// Fold `root`'s segments where they have piled up, then write it and
+/// Fold `root`'s layers where they have piled up, then write it and
 /// return its reference. What every delta writer ends with. A fold is only
 /// an optimisation, so one that fails is logged and the root published as
-/// far as the folds before it took it, every segment still in it: the
+/// far as the folds before it took it, every layer still in it: the
 /// commit it is part of never fails on its account.
 async fn publish_root(
     storage: &Arc<dyn StorageProvider>,
@@ -628,20 +628,20 @@ async fn publish_root(
         false => policy.clone(),
     };
     if let Err(error) = fold_tail(storage, &mut root, &fold_policy, pool).await {
-        warn!(%error, "term index: folding segments at commit failed; publishing the root unfolded");
+        warn!(%error, "term index: folding layers at commit failed; publishing the root unfolded");
     }
     write_root(storage.as_ref(), &root).await
 }
 
-/// Merge each run of segments [`next_fold`] picks into one, the merge on
+/// Merge each run of layers [`next_fold`] picks into one, the merge on
 /// `pool`, until it picks none. Sizes are the slice bytes the root records,
 /// so no slice is read to decide. Ordinals are unchanged: a fold is the
 /// same postings in fewer slices, and its run is consecutive, so every
 /// reader of the folded root answers as it did, in the same order.
 ///
 /// This is what keeps a lookup cheap on a table taking a stream of
-/// commits: each commit appends one segment, a lookup opens one slice per
-/// segment, and only optimize rebuilds the index whole. Folded this way the
+/// commits: each commit appends one layer, a lookup opens one slice per
+/// layer, and only optimize rebuilds the index whole. Folded this way the
 /// count stays logarithmic in the bytes committed since the last optimize,
 /// whatever mix of sizes the commits come in; the merge work a commit pays
 /// is amortized to the same logarithm, as each posting is rewritten about
@@ -650,10 +650,10 @@ async fn publish_root(
 /// `root` changes only once a fold's merged slices are written, so a fold
 /// that fails leaves it as the last one that succeeded made it.
 ///
-/// A rebuild racing these commits stacks the segments committed since its
-/// prior root (`segments_since`) only while that root is still a prefix of
+/// A rebuild racing these commits stacks the layers committed since its
+/// prior root (`layers_since`) only while that root is still a prefix of
 /// the current one: a fold wholly above it leaves it one and is stacked as
-/// a segment like any other, while a fold that reached into it does not,
+/// a layer like any other, while a fold that reached into it does not,
 /// and the rebuild catches up by reading the superfiles it lacks instead,
 /// its existing fallback.
 pub(crate) async fn fold_tail(
@@ -666,13 +666,12 @@ pub(crate) async fn fold_tail(
         let scratch = TempDirBuilder::new()
             .prefix("infino-term-index-fold-")
             .tempdir()?;
-        let sources =
-            download_segments(storage, &root.segments[run.clone()], scratch.path()).await?;
+        let sources = download_layers(storage, &root.layers[run.clone()], scratch.path()).await?;
         // Every ordinal keeps its place: the fold renumbers nothing.
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
         let policy = policy.clone();
         let merged = run_on_pool(pool, "term-index fold at commit", move || {
-            let merged = merge_segments(&sources, &ordinals, &policy);
+            let merged = merge_layers(&sources, &ordinals, &policy);
             // The slice files are read; the scratch directory can go with
             // the task rather than outlive the fold.
             drop(scratch);
@@ -682,20 +681,20 @@ pub(crate) async fn fold_tail(
         .map_err(|e| TermIndexError::Build(e.to_string()))??;
         write_slices(storage, merged.slices).await?;
         write_tiers(storage, merged.tiers).await?;
-        root.segments.drain(run.clone());
-        root.segments.insert(run.start, merged.segment);
+        root.layers.drain(run.clone());
+        root.layers.insert(run.start, merged.layer);
     }
     Ok(())
 }
 
-/// The run of segments [`fold_tail`] merges next: [`FOLD_FAN_OUT`]
-/// consecutive segments of one size level whose bytes together fit one
+/// The run of layers [`fold_tail`] merges next: [`FOLD_FAN_OUT`]
+/// consecutive layers of one size level whose bytes together fit one
 /// slice of `policy`'s target size. `None` when there is no such run.
 ///
 /// Levels group as Lucene's LogMergePolicy groups them, so a mixed stream
-/// of commit sizes folds as a uniform one does. From the oldest segment on,
-/// the largest level left sets a group that runs to the last segment within
-/// [`FOLD_LEVEL_SPAN`] of it, the smaller segments between included; the
+/// of commit sizes folds as a uniform one does. From the oldest layer on,
+/// the largest level left sets a group that runs to the last layer within
+/// [`FOLD_LEVEL_SPAN`] of it, the smaller layers between included; the
 /// group folds [`FOLD_FAN_OUT`] at a time from its oldest, and the next
 /// group starts after it. Once folded, each group holds fewer than the
 /// fan-out, and the groups fall by more than the span, so the count is
@@ -705,19 +704,19 @@ pub(crate) async fn fold_tail(
 /// commit before its fence check, to the slice a cold lookup reads: a
 /// larger fold would be commit latency and a wider window for a concurrent
 /// writer to win, so a run past it is left to optimize's rebuild, as every
-/// segment was before folding.
+/// layer was before folding.
 ///
-/// The newest segment is never in a run. Its slices were written by the
+/// The newest layer is never in a run. Its slices were written by the
 /// publish that is still under way and no root names them yet; a fold that
 /// retired them would leave objects no root ever named, which the sweep
-/// could not find. Every segment beneath it was named by the root this
+/// could not find. Every layer beneath it was named by the root this
 /// publish replaces, so the slices a fold retires are exactly the ones the
 /// sweep reclaims from that root.
 fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
-    let beneath = root.segments.len().checked_sub(1)?;
-    let segments = &root.segments[..beneath];
-    let sizes: Vec<u64> = segments.iter().map(segment_bytes).collect();
-    let levels: Vec<f64> = segments.iter().map(segment_level).collect();
+    let beneath = root.layers.len().checked_sub(1)?;
+    let layers = &root.layers[..beneath];
+    let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
+    let levels: Vec<f64> = layers.iter().map(layer_level).collect();
     let bound = policy.slice_target_bytes as u64;
     let mut start = 0;
     while start < beneath {
@@ -745,17 +744,17 @@ fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
     None
 }
 
-/// The slice bytes `segment` holds, as the root records them.
-fn segment_bytes(segment: &Segment) -> u64 {
-    segment.slices.iter().map(|slice| slice.len).sum()
+/// The slice bytes `layer` holds, as the root records them.
+fn layer_bytes(layer: &Layer) -> u64 {
+    layer.slices.iter().map(|slice| slice.len).sum()
 }
 
-/// `segment`'s size level: its bytes as a power of [`FOLD_FAN_OUT`].
-fn segment_level(segment: &Segment) -> f64 {
-    (segment_bytes(segment).max(1) as f64).log(FOLD_FAN_OUT as f64)
+/// `layer`'s size level: its bytes as a power of [`FOLD_FAN_OUT`].
+fn layer_level(layer: &Layer) -> f64 {
+    (layer_bytes(layer).max(1) as f64).log(FOLD_FAN_OUT as f64)
 }
 
-/// The delta segments committed on top of `prior` to reach `current`, or
+/// The delta layers committed on top of `prior` to reach `current`, or
 /// `None` when `current` was not built on `prior` (e.g. another rebuild
 /// replaced it).
 ///
@@ -764,25 +763,25 @@ fn segment_level(segment: &Segment) -> f64 {
 /// the delta writers, `append_delta` and `append_reserved`, number from at
 /// or past the length of the root they extend. A new root writer must keep
 /// it.
-pub(crate) fn segments_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a [Segment]> {
+pub(crate) fn layers_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a [Layer]> {
     (current.superfiles.starts_with(&prior.superfiles)
         && current.id_mins.starts_with(&prior.id_mins)
-        && current.segments.starts_with(&prior.segments))
-    .then(|| &current.segments[prior.segments.len()..])
+        && current.layers.starts_with(&prior.layers))
+    .then(|| &current.layers[prior.layers.len()..])
 }
 
-/// `base`, a rebuild made from `prior`, with the delta segments committed on
+/// `base`, a rebuild made from `prior`, with the delta layers committed on
 /// top of `prior` to reach `current` appended as they are. For a rebuild
 /// that lost its publish to those commits: no slice is read or written, so
 /// a retry costs one root however fast commits land.
 ///
 /// The deltas name ordinals at or past `prior`'s length (see
-/// [`segments_since`]), so `base` is padded with nil entries up to that
+/// [`layers_since`]), so `base` is padded with nil entries up to that
 /// length and `current`'s superfiles past it are carried over. `None` when
 /// `current` was not built on `prior`, or when `base` lists more superfiles
 /// than `prior` and its ordinals would collide with the deltas'.
 pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> {
-    let deltas = segments_since(prior, current)?;
+    let deltas = layers_since(prior, current)?;
     let len = prior.superfiles.len();
     if base.superfiles.len() > len {
         return None;
@@ -798,26 +797,26 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
         .extend_from_slice(&current.superfiles[len..]);
     root.id_mins.extend(repeat_n(0, padding));
     root.id_mins.extend_from_slice(&current.id_mins[len..]);
-    root.segments.extend_from_slice(deltas);
+    root.layers.extend_from_slice(deltas);
     Some(root)
 }
 
-/// Download every slice of `segments` into `dir`, verified against its
-/// hash, [`SEGMENT_FETCH_CONCURRENCY`] at a time, and return each segment's
-/// slice files in key order. A slice two segments share is fetched once.
+/// Download every slice of `layers` into `dir`, verified against its
+/// hash, [`LAYER_FETCH_CONCURRENCY`] at a time, and return each layer's
+/// slice files in key order. A slice two layers share is fetched once.
 /// Each slice's tier object lands in `dir` too, named by [`tier_path`],
 /// so a merge finds it beside the slice. The bytes skip the manifest
 /// disk cache: a merge reads each object once, and filling the cache with
 /// the whole index would evict what queries use.
-pub(crate) async fn download_segments(
+pub(crate) async fn download_layers(
     storage: &Arc<dyn StorageProvider>,
-    segments: &[Segment],
+    layers: &[Layer],
     dir: &Path,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let mut unique: HashSet<ContentHash> = HashSet::new();
-    let jobs = segments
+    let jobs = layers
         .iter()
-        .flat_map(|segment| &segment.slices)
+        .flat_map(|layer| &layer.slices)
         .filter(|slice| unique.insert(slice.content_hash))
         .map(|slice| {
             let storage = Arc::clone(storage);
@@ -838,22 +837,22 @@ pub(crate) async fn download_segments(
                 Ok(())
             }
         });
-    run_bounded(SEGMENT_FETCH_CONCURRENCY, "segment fetch", jobs).await?;
-    Ok(slice_files(dir, segments))
+    run_bounded(LAYER_FETCH_CONCURRENCY, "layer fetch", jobs).await?;
+    Ok(slice_files(dir, layers))
 }
 
-/// Where `download_segments` puts the slice named by `hash` under `dir`.
+/// Where `download_layers` puts the slice named by `hash` under `dir`.
 fn slice_file_path(dir: &Path, hash: &ContentHash) -> PathBuf {
     dir.join(format!("{}.slice", hash.to_hex()))
 }
 
-/// `segments`' slices as the files `download_segments` places under
-/// `dir`, each with the key range its segment entry records.
-pub(crate) fn slice_files(dir: &Path, segments: &[Segment]) -> Vec<Vec<SliceFile>> {
-    segments
+/// `layers`' slices as the files `download_layers` places under
+/// `dir`, each with the key range its layer entry records.
+pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
+    layers
         .iter()
-        .map(|segment| {
-            segment
+        .map(|layer| {
+            layer
                 .slices
                 .iter()
                 .map(|slice| SliceFile {
@@ -867,8 +866,8 @@ pub(crate) fn slice_files(dir: &Path, segments: &[Segment]) -> Vec<Vec<SliceFile
 }
 
 /// Write freshly built slices into `dir`, each with the key range its
-/// segment entry in `refs` records, so a merge finds them where
-/// [`download_segments`] would have put them.
+/// layer entry in `refs` records, so a merge finds them where
+/// [`download_layers`] would have put them.
 pub(crate) fn spill_slices(
     dir: &Path,
     refs: &[format::SliceRef],
@@ -887,7 +886,7 @@ pub(crate) fn spill_slices(
         .into_iter()
         .map(|(hash, built)| {
             let (first_key, last_key) = keys_of.get(&hash).ok_or_else(|| {
-                TermIndexError::Build("a built slice its segment does not list".into())
+                TermIndexError::Build("a built slice its layer does not list".into())
             })?;
             let path = dir.join(format!("{}.slice", hash.to_hex()));
             place_built(&path, built)?;
@@ -959,7 +958,7 @@ async fn read_span(
 
 /// Write freshly built tier objects into `dir`, each beside the spilled
 /// slice of `slices` that names it, so a merge finds them where
-/// [`download_segments`] would have put them.
+/// [`download_layers`] would have put them.
 pub(crate) fn spill_tiers(
     dir: &Path,
     slices: &[format::SliceRef],
@@ -1029,7 +1028,7 @@ pub(crate) struct SliceRun {
     pub(crate) run: Run,
 }
 
-/// A term's postings across its runs, in segment order.
+/// A term's postings across its runs, in layer order.
 pub(crate) fn postings_of(runs: &[SliceRun]) -> impl Iterator<Item = &Posting> {
     runs.iter().flat_map(|r| r.run.postings.iter())
 }
@@ -1273,7 +1272,7 @@ impl TermIndex {
         entries: &[Arc<SuperfileEntry>],
         idf_used: &(dyn Fn(&str) -> f32 + Sync),
     ) -> Result<HashMap<Uuid, f32>, TermIndexError> {
-        // A segment of the layout before tiers stores a bound as a score
+        // A layer of the layout before tiers stores a bound as a score
         // at the superfile's own idf: each superfile's scored document
         // count turns it into the key the current layout stores.
         let scored_docs = |id: Uuid| -> u64 {
@@ -1424,8 +1423,8 @@ impl TermIndex {
         Ok(bytes)
     }
 
-    /// Every posting for `term` in `column`, across all segments, in the
-    /// order the segments were written. Empty when no segment holds the
+    /// Every posting for `term` in `column`, across all layers, in the
+    /// order the layers were written. Empty when no layer holds the
     /// term. The caller filters to superfiles live in its manifest.
     pub(crate) async fn postings(
         &self,
@@ -1442,7 +1441,7 @@ impl TermIndex {
     ///
     /// Terms the resident runs do not answer are grouped by the slice that
     /// holds them, and each distinct slice is fetched once, up to
-    /// [`SEGMENT_FETCH_CONCURRENCY`] at a time. Looking terms up one by one
+    /// [`LAYER_FETCH_CONCURRENCY`] at a time. Looking terms up one by one
     /// instead costs one whole-slice fetch per term, back to back: a query
     /// over hundreds of high-cardinality keys spread across a large index
     /// then spends its time waiting on those fetches in series, and refetches
@@ -1459,7 +1458,7 @@ impl TermIndex {
             let mut resident = self.runs.lock().expect("resident runs lock");
             keys.iter().map(|k| resident.get(k)).collect()
         };
-        // Per missing term, the slices that can hold it in segment order,
+        // Per missing term, the slices that can hold it in layer order,
         // each with its tier object; per distinct slice, the missing terms
         // it can hold.
         let mut wanted: Vec<(usize, Vec<ContentHash>)> = Vec::new();
@@ -1667,7 +1666,7 @@ impl TermIndex {
     }
 
     /// Visit every term in `column` with `prefix`, with its postings, until
-    /// `visit` returns `false`. Terms arrive in key order within a segment.
+    /// `visit` returns `false`. Terms arrive in key order within a layer.
     pub(crate) async fn for_each_prefix(
         &self,
         column: FieldId,
@@ -1710,7 +1709,7 @@ mod tests {
 
     use super::{
         build::{TIER_INLINE_MAX, key_ranges},
-        format::{ROOT_MAGIC, Segment, SliceRef},
+        format::{Layer, ROOT_MAGIC, SliceRef},
         *,
     };
     use crate::{
@@ -1829,14 +1828,14 @@ mod tests {
     /// The entries of `tier`: inline, or read from the first slice's tier
     /// object among `built_tiers` (these fixtures build one slice).
     fn tier_entries_of(
-        segment: &Segment,
+        layer: &Layer,
         built_tiers: &[(ContentHash, BuiltBytes)],
         tier: &format::TierRef,
     ) -> Vec<tier::TierEntry> {
         if tier.chunks.is_empty() {
             return tier.inline.clone();
         }
-        let object = segment.slices[0]
+        let object = layer.slices[0]
             .tier
             .as_ref()
             .expect("the slice has a tier object");
@@ -1896,7 +1895,7 @@ mod tests {
             alpha.postings.iter().all(|p| p.tail > 0.0),
             "a truncated tier leaves every superfile a tail"
         );
-        let entries = tier_entries_of(&built.root.segments[0], &built.tiers, &tier);
+        let entries = tier_entries_of(&built.root.layers[0], &built.tiers, &tier);
         let mut ids: Vec<(u32, u32)> = entries.iter().map(|e| (e.superfile, e.doc_id)).collect();
         ids.sort_unstable();
         assert_eq!(ids, vec![(0, 1), (1, 1), (2, 1)], "each superfile's best");
@@ -1922,15 +1921,15 @@ mod tests {
             "one doc under the budget leaves no tail"
         );
         assert_eq!(
-            tier_entries_of(&built.root.segments[0], &built.tiers, &beta_tier).len(),
+            tier_entries_of(&built.root.layers[0], &built.tiers, &beta_tier).len(),
             1
         );
         // Both tiers are a few entries: they ride in their runs, and the
         // slice has no tier object.
         assert!(tier.chunks.is_empty() && beta_tier.chunks.is_empty());
-        let segment = &built.root.segments[0];
-        assert_eq!(segment.slices.len(), 1);
-        assert!(segment.slices[0].tier.is_none(), "nothing to chunk");
+        let layer = &built.root.layers[0];
+        assert_eq!(layer.slices.len(), 1);
+        assert!(layer.slices[0].tier.is_none(), "nothing to chunk");
         assert!(built.tiers.is_empty());
     }
 
@@ -1969,7 +1968,7 @@ mod tests {
 
     /// Every term of a merged output: its postings and its tier's entries.
     fn merged_terms(
-        m: &build::MergedSegment,
+        m: &build::MergedLayer,
     ) -> Vec<(Vec<u8>, Vec<Posting>, Vec<(u32, u32, u32, u8)>)> {
         let mut out = Vec::new();
         for (i, (_, bytes)) in m.slices.iter().enumerate() {
@@ -1980,7 +1979,7 @@ mod tests {
                     None => Vec::new(),
                     Some(t) if t.chunks.is_empty() => t.inline.clone(),
                     Some(t) => {
-                        let object = m.segment.slices[i].tier.expect("a tier object");
+                        let object = m.layer.slices[i].tier.expect("a tier object");
                         let object = bytes_of(
                             &m.tiers
                                 .iter()
@@ -2025,16 +2024,16 @@ mod tests {
                 merge_ranges: Some(ranges),
                 ..policy.clone()
             };
-            merge_segments(sources, ordinals, &policy).expect("merge")
+            merge_layers(sources, ordinals, &policy).expect("merge")
         };
         let (one, many) = (merge(1), merge(4));
         assert!(
-            many.segment.slices.len() >= 4,
+            many.layer.slices.len() >= 4,
             "{} slices from the ranges",
-            many.segment.slices.len()
+            many.layer.slices.len()
         );
         let ranges: Vec<(&[u8], &[u8])> = many
-            .segment
+            .layer
             .slices
             .iter()
             .map(|s| (s.first_key.as_slice(), s.last_key.as_slice()))
@@ -2060,21 +2059,20 @@ mod tests {
             &policy,
         )
         .expect("build");
-        let segment = built.root.segments[0].clone();
-        assert!(segment.slices.len() >= 8, "{} slices", segment.slices.len());
+        let layer = built.root.layers[0].clone();
+        assert!(layer.slices.len() >= 8, "{} slices", layer.slices.len());
         let scratch = TempDir::new().expect("scratch");
-        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
-        let sources = vec![
-            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
-        ];
+        spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
+        let sources =
+            vec![spill_slices(scratch.path(), &layer.slices, built.slices).expect("place slices")];
         assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
-    /// The same over two source segments, a base and a delta built onto
+    /// The same over two source layers, a base and a delta built onto
     /// it, whose slices are cut at different keys: each range takes the
-    /// slices of each segment that reach into it and interleaves them.
+    /// slices of each layer that reach into it and interleaves them.
     #[test]
-    fn a_merge_in_key_ranges_over_two_segments_writes_the_terms_one_writer_writes() {
+    fn a_merge_in_key_ranges_over_two_layers_writes_the_terms_one_writer_writes() {
         let dir = TempDir::new().expect("tempdir");
         let policy = range_policy();
         let base = build(&[range_contribution(&dir, 1)], &policy).expect("base");
@@ -2084,15 +2082,12 @@ mod tests {
             &policy,
         )
         .expect("delta");
-        let (base_refs, delta_refs) = (
-            &base.root.segments[0].slices,
-            &delta.root.segments[1].slices,
-        );
+        let (base_refs, delta_refs) = (&base.root.layers[0].slices, &delta.root.layers[1].slices);
         assert!(base_refs.len() >= 4 && delta_refs.len() >= 4);
         assert_ne!(
             base_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
             delta_refs.iter().map(|s| &s.first_key).collect::<Vec<_>>(),
-            "the segments' slices are cut at different keys"
+            "the layers' slices are cut at different keys"
         );
         let scratch = TempDir::new().expect("scratch");
         spill_tiers(scratch.path(), base_refs, base.tiers).expect("place base tiers");
@@ -2159,14 +2154,14 @@ mod tests {
                 .all(|p| p.tail == 0.0),
             "whole heads leave no tail"
         );
-        let segment = &built.root.segments[0];
+        let layer = &built.root.layers[0];
         assert_eq!(
             built.tiers.len(),
             1,
             "one tier object, for the chunked tier"
         );
         assert_eq!(
-            tier_entries_of(segment, &built.tiers, &common).len(),
+            tier_entries_of(layer, &built.tiers, &common).len(),
             2 * per_file as usize
         );
         let mut inline_ids: Vec<(u32, u32)> = rare
@@ -2180,11 +2175,10 @@ mod tests {
         // A merge that drops the first superfile renumbers the second to
         // ordinal 0 in the inline entries as in the chunked ones.
         let scratch = TempDir::new().expect("scratch");
-        spill_tiers(scratch.path(), &segment.slices, built.tiers).expect("place tiers");
-        let sources = vec![
-            spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
-        ];
-        let merged = merge_segments(&sources, &[None, Some(0)], &policy).expect("merge");
+        spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
+        let sources =
+            vec![spill_slices(scratch.path(), &layer.slices, built.slices).expect("place slices")];
+        let merged = merge_layers(&sources, &[None, Some(0)], &policy).expect("merge");
         let merged_bytes = bytes_of(&merged.slices[0].1);
         let merged_slice = Slice::open(&merged_bytes).expect("open");
         let rare = merged_slice
@@ -2211,7 +2205,7 @@ mod tests {
             per_file as usize <= TIER_INLINE_MAX,
             "the merged tier is placed by its merged size"
         );
-        let entries = tier_entries_of(&merged.segment, &merged.tiers, &common);
+        let entries = tier_entries_of(&merged.layer, &merged.tiers, &common);
         assert!(entries.iter().all(|e| e.superfile == 0));
         assert_eq!(entries.len(), per_file as usize);
     }
@@ -2277,19 +2271,19 @@ mod tests {
         let scratch = TempDir::new().expect("scratch");
         spill_tiers(
             scratch.path(),
-            &spilled.root.segments[0].slices,
+            &spilled.root.layers[0].slices,
             spilled.tiers,
         )
         .expect("place tiers");
         let sources = vec![
             spill_slices(
                 scratch.path(),
-                &spilled.root.segments[0].slices,
+                &spilled.root.layers[0].slices,
                 spilled.slices,
             )
             .expect("place slices"),
         ];
-        let merged = merge_segments(&sources, &[Some(0), Some(1)], &resident).expect("merge");
+        let merged = merge_layers(&sources, &[Some(0), Some(1)], &resident).expect("merge");
         assert_eq!(
             merged.slices, kept.slices,
             "a merge of the spilled files rebuilds the same slices"
@@ -2297,7 +2291,7 @@ mod tests {
     }
 
     #[test]
-    fn merging_segments_with_tiers_writes_what_a_fresh_build_writes() {
+    fn merging_layers_with_tiers_writes_what_a_fresh_build_writes() {
         let dir = TempDir::new().expect("tempdir");
         let docs = |base: f32, n: u32| {
             (0..n)
@@ -2324,33 +2318,28 @@ mod tests {
         };
         let base = build(&[make(1, 60), make(2, 60)], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[make(3, 90)], &policy).expect("delta");
+        spill_tiers(dir.path(), &base.root.layers[0].slices, base.tiers.clone())
+            .expect("spill base tiers");
         spill_tiers(
             dir.path(),
-            &base.root.segments[0].slices,
-            base.tiers.clone(),
-        )
-        .expect("spill base tiers");
-        spill_tiers(
-            dir.path(),
-            &delta.root.segments[1].slices,
+            &delta.root.layers[1].slices,
             delta.tiers.clone(),
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
-                .expect("spill base"),
-            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
                 .expect("spill delta"),
         ];
         // Drop the middle superfile; the merge renumbers the survivors.
-        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let expected = build(&[make(1, 60), make(3, 90)], &policy).expect("survivors");
         assert_eq!(merged.slices, expected.slices, "slices are byte-identical");
         assert_eq!(
             merged.tiers, expected.tiers,
             "the tier objects are byte-identical"
         );
-        assert_eq!(merged.segment, expected.root.segments[0]);
+        assert_eq!(merged.layer, expected.root.layers[0]);
     }
 
     /// A source that already truncated cannot give a merge the entries it
@@ -2378,25 +2367,20 @@ mod tests {
         };
         let base = build(&[make(1), make(2)], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[make(3)], &policy).expect("delta");
+        spill_tiers(dir.path(), &base.root.layers[0].slices, base.tiers.clone())
+            .expect("spill base tiers");
         spill_tiers(
             dir.path(),
-            &base.root.segments[0].slices,
-            base.tiers.clone(),
-        )
-        .expect("spill base tiers");
-        spill_tiers(
-            dir.path(),
-            &delta.root.segments[1].slices,
+            &delta.root.layers[1].slices,
             delta.tiers.clone(),
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
-                .expect("spill base"),
-            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
                 .expect("spill delta"),
         ];
-        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let slice_bytes = bytes_of(&merged.slices[0].1);
         let slice = Slice::open(&slice_bytes).expect("open");
         let run = slice
@@ -2408,7 +2392,7 @@ mod tests {
             run.postings.iter().any(|p| p.tail > 0.0),
             "a truncated tier leaves a tail"
         );
-        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.segment, &merged.tiers, &tier)
+        let held: HashSet<(u32, u32)> = tier_entries_of(&merged.layer, &merged.tiers, &tier)
             .iter()
             .map(|e| (e.superfile, e.doc_id))
             .collect();
@@ -2475,7 +2459,7 @@ mod tests {
             built.root.superfiles,
             vec![Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
         );
-        assert_eq!(built.root.segments.len(), 1);
+        assert_eq!(built.root.layers.len(), 1);
         assert_eq!(built.slices.len(), 1, "everything fits one slice");
         let slice_bytes = bytes_of(&built.slices[0].1);
         let slice = Slice::open(&slice_bytes).expect("open");
@@ -2528,7 +2512,7 @@ mod tests {
             slice.postings(&fid("body").term_key("delta")).expect("ok"),
             None
         );
-        let s = &built.root.segments[0].slices[0];
+        let s = &built.root.layers[0].slices[0];
         let mut all_keys = a_keys;
         all_keys.push(fid("body").term_key("gamma"));
         all_keys.sort();
@@ -2559,7 +2543,7 @@ mod tests {
             ..BuildPolicy::default()
         };
         let built = build(&[a], &policy).expect("build");
-        let slices = &built.root.segments[0].slices;
+        let slices = &built.root.layers[0].slices;
         assert!(
             slices.len() > 3,
             "small target must cut several slices, got {}",
@@ -2586,11 +2570,11 @@ mod tests {
         }
     }
 
-    /// Merging segments while dropping a superfile and renumbering the rest
+    /// Merging layers while dropping a superfile and renumbering the rest
     /// writes exactly what building the survivors directly writes, slice
     /// cuts included.
     #[test]
-    fn merging_segments_matches_building_the_survivors() {
+    fn merging_layers_matches_building_the_survivors() {
         let dir = TempDir::new().expect("tempdir");
         let terms = |range: Range<u64>, step: usize| -> Vec<(String, u64)> {
             range
@@ -2617,13 +2601,12 @@ mod tests {
         let base = build(&[first, gone], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[last], &policy).expect("delta");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
-                .expect("spill base"),
-            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
                 .expect("spill delta"),
         ];
-        let merged = merge_segments(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
-        let (segment, slices) = (merged.segment, merged.slices);
+        let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
+        let (layer, slices) = (merged.layer, merged.slices);
 
         let first = make(1, terms(0..60, 1));
         let last = make(3, terms(0..90, 2));
@@ -2632,7 +2615,7 @@ mod tests {
             expected.slices.len() > 1,
             "the fixture spans several slices"
         );
-        assert_eq!(segment, expected.root.segments[0]);
+        assert_eq!(layer, expected.root.layers[0]);
         assert_eq!(slices, expected.slices);
     }
 
@@ -2655,7 +2638,7 @@ mod tests {
             ..BuildPolicy::default()
         };
         let built = build(&[a, b], &policy).expect("build");
-        let n_slices = built.root.segments[0].slices.len();
+        let n_slices = built.root.layers[0].slices.len();
         assert!(n_slices > 1);
 
         let store_dir = TempDir::new().expect("store dir");
@@ -2722,8 +2705,8 @@ mod tests {
             Err(TermIndexError::HashMismatch)
         ));
     }
-    const DOCS_PER_SEGMENT: usize = 40;
-    const SEGMENTS: usize = 3;
+    const DOCS_PER_LAYER: usize = 40;
+    const LAYERS: usize = 3;
 
     fn title_schema() -> Arc<arrow_schema::Schema> {
         use arrow_schema::{DataType, Field, Schema};
@@ -2792,19 +2775,19 @@ mod tests {
         table_with(|o| o)
     }
 
-    /// Commit one segment: every title holds `shared`; segment `s` holds
+    /// Commit one layer: every title holds `shared`; layer `s` holds
     /// `alpha` in the titles whose index is a multiple of `s + 2`. Returns
-    /// the segment's `alpha` count.
-    fn commit_segment(st: &crate::supertable::Supertable, segment: usize) -> u64 {
+    /// the layer's `alpha` count.
+    fn commit_layer(st: &crate::supertable::Supertable, layer: usize) -> u64 {
         use arrow_array::{ArrayRef, LargeStringArray, RecordBatch};
-        let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
+        let titles: Vec<String> = (0..DOCS_PER_LAYER)
             .map(|i| {
-                let topic = if i % (segment + 2) == 0 {
+                let topic = if i % (layer + 2) == 0 {
                     "alpha"
                 } else {
                     "beta"
                 };
-                format!("{topic} shared s{segment}d{i:02}")
+                format!("{topic} shared s{layer}d{i:02}")
             })
             .collect();
         let alpha = titles.iter().filter(|t| t.starts_with("alpha")).count() as u64;
@@ -2825,8 +2808,8 @@ mod tests {
     #[test]
     fn a_term_index_of_the_layout_before_tiers_serves_ceilings_as_before() {
         let (_dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
-        commit_segment(&st, 1);
+        commit_layer(&st, 0);
+        commit_layer(&st, 1);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let reader = st.reader().expect("reader");
         let entries: Vec<Arc<SuperfileEntry>> = reader.manifest().get_all_superfiles().to_vec();
@@ -2846,7 +2829,7 @@ mod tests {
         let root = Root {
             superfiles: entries.iter().map(|e| e.superfile_id).collect(),
             id_mins: entries.iter().map(|e| e.id_min).collect(),
-            segments: vec![Segment {
+            layers: vec![Layer {
                 slices: vec![format::SliceRef {
                     first_key: key.clone(),
                     last_key: key.clone(),
@@ -2885,11 +2868,11 @@ mod tests {
         assert!(runs.len() == 1 && runs[0].run.legacy_bound && runs[0].tier_object.is_none());
     }
 
-    /// A merge that rewrites a segment of the layout before tiers writes
+    /// A merge that rewrites a layer of the layout before tiers writes
     /// its bounds as the keys the current layout stores, through each
     /// superfile's scored document count.
     #[test]
-    fn a_merge_writes_a_legacy_segments_bounds_as_keys() {
+    fn a_merge_writes_a_legacy_layers_bounds_as_keys() {
         let key = title_id().term_key("shared");
         let slice = format::encode_legacy_slice(&[(
             key.clone(),
@@ -2916,7 +2899,7 @@ mod tests {
             scoring_by_ordinal: Arc::new(vec![scoring(100), scoring(1000)]),
             ..BuildPolicy::default()
         };
-        let merged = merge_segments(&sources, &[Some(0), Some(1)], &policy).expect("merge");
+        let merged = merge_layers(&sources, &[Some(0), Some(1)], &policy).expect("merge");
         let bytes = bytes_of(&merged.slices[0].1);
         let run = Slice::open(&bytes)
             .expect("open")
@@ -2994,9 +2977,9 @@ mod tests {
         (live, root)
     }
 
-    /// A fragmented three-segment FTS table, optimized with compaction
+    /// A fragmented three-layer FTS table, optimized with compaction
     /// disabled so only the maintenance passes run. Returns the storage
-    /// root, the table, and the per-segment `alpha` counts.
+    /// root, the table, and the per-layer `alpha` counts.
     fn optimized_fragmented_table() -> (
         TempDir,
         Arc<dyn StorageProvider>,
@@ -3004,39 +2987,35 @@ mod tests {
         Vec<u64>,
     ) {
         let (dir, storage, st) = fresh_table();
-        let alpha_per_segment: Vec<u64> = (0..SEGMENTS).map(|s| commit_segment(&st, s)).collect();
+        let alpha_per_layer: Vec<u64> = (0..LAYERS).map(|s| commit_layer(&st, s)).collect();
         assert!(
-            st.reader().expect("reader").n_superfiles() >= SEGMENTS,
+            st.reader().expect("reader").n_superfiles() >= LAYERS,
             "fixture must stay fragmented"
         );
         maintenance_only_optimize(&st);
-        (dir, storage, st, alpha_per_segment)
+        (dir, storage, st, alpha_per_layer)
     }
 
     /// Every commit publishes its superfiles' postings in the same manifest
     /// as the entries: after each commit the root covers exactly the live
-    /// set, one delta segment per commit, with per-superfile `df` right —
-    /// and a later optimize folds the deltas into one base segment that
+    /// set, one delta layer per commit, with per-superfile `df` right —
+    /// and a later optimize folds the deltas into one base layer that
     /// answers identically.
     #[test]
     fn commit_publishes_postings_with_the_manifest() {
         let (_dir, storage, st) = fresh_table();
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let mut alphas = Vec::new();
-        for segment in 0..SEGMENTS {
-            alphas.push(commit_segment(&st, segment));
+        for layer in 0..LAYERS {
+            alphas.push(commit_layer(&st, layer));
             let (live, root) = live_and_covered(&st, &storage, &rt);
             let covered: std::collections::HashSet<Uuid> =
                 root.superfiles.iter().copied().collect();
             assert_eq!(
                 covered, live,
-                "after commit {segment}: every visible superfile has postings, and only those"
+                "after commit {layer}: every visible superfile has postings, and only those"
             );
-            assert_eq!(
-                root.segments.len(),
-                segment + 1,
-                "one delta segment per commit"
-            );
+            assert_eq!(root.layers.len(), layer + 1, "one delta layer per commit");
             let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
             let shared = rt
                 .block_on(index.postings(title_id(), "shared"))
@@ -3061,7 +3040,7 @@ mod tests {
                 assert_eq!(p.df, n_docs[&id]);
             }
         }
-        // Optimize folds every delta into one base segment with the same answers.
+        // Optimize folds every delta into one base layer with the same answers.
         let before: Vec<u64> = {
             let (_, root) = live_and_covered(&st, &storage, &rt);
             let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
@@ -3076,7 +3055,7 @@ mod tests {
         };
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1, "optimize rebuilds one base segment");
+        assert_eq!(root.layers.len(), 1, "optimize rebuilds one base layer");
         assert_eq!(
             root.superfiles
                 .iter()
@@ -3103,7 +3082,7 @@ mod tests {
     /// superfile.
     #[test]
     fn optimize_publishes_a_term_index_over_every_superfile() {
-        let (_dir, storage, st, mut alpha_per_segment) = optimized_fragmented_table();
+        let (_dir, storage, st, mut alpha_per_layer) = optimized_fragmented_table();
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         let reference = manifest
@@ -3120,9 +3099,9 @@ mod tests {
             "every live superfile contributes, and nothing else"
         );
         assert_eq!(
-            root.segments.len(),
+            root.layers.len(),
             1,
-            "a maintenance build is one base segment"
+            "a maintenance build is one base layer"
         );
 
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
@@ -3158,9 +3137,9 @@ mod tests {
             .map(|p| p.df)
             .collect();
         alpha.sort_unstable();
-        alpha_per_segment.sort_unstable();
+        alpha_per_layer.sort_unstable();
         assert_eq!(
-            alpha, alpha_per_segment,
+            alpha, alpha_per_layer,
             "per-superfile df for `alpha` matches the fixture"
         );
         assert!(
@@ -3189,7 +3168,7 @@ mod tests {
             .block_on(load_root(storage.as_ref(), &reference))
             .expect("root");
         let slice_paths: Vec<_> = root
-            .segments
+            .layers
             .iter()
             .flat_map(|s| s.slices.iter())
             .map(|s| dir.path().join(slice_uri(&s.content_hash)))
@@ -3227,14 +3206,14 @@ mod tests {
 
         let (_dir, storage, st) = fresh_table();
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let (live_before, root_before) = live_and_covered(&st, &storage, &rt);
-        assert!(live_before.len() >= SEGMENTS);
-        let segments_before = root_before.segments.len();
-        // `s0d00` names one title in segment 0 — a superfile compaction
-        // removes; `alpha` spans every segment.
+        assert!(live_before.len() >= LAYERS);
+        let layers_before = root_before.layers.len();
+        // `s0d00` names one title in layer 0 — a superfile compaction
+        // removes; `alpha` spans every layer.
         let before: Vec<Vec<String>> = ["alpha", "s0d00"]
             .iter()
             .map(|q| ranked_titles(&st, q))
@@ -3264,8 +3243,8 @@ mod tests {
             "removed inputs stay listed; readers filter them by liveness"
         );
         assert_eq!(
-            root_after.segments.len(),
-            segments_before + 1,
+            root_after.layers.len(),
+            layers_before + 1,
             "the compaction commit appended one delta"
         );
 
@@ -3341,7 +3320,7 @@ mod tests {
             .bm25_search(
                 "title",
                 query,
-                DOCS_PER_SEGMENT * SEGMENTS,
+                DOCS_PER_LAYER * LAYERS,
                 Bm25SearchOptions::new(),
                 Some(&["title"]),
             )
@@ -3375,8 +3354,8 @@ mod tests {
             o.with_eager_load_threshold(0)
                 .with_target_superfiles_per_part(1)
         });
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         assert!(
             st.reader()
@@ -3482,7 +3461,7 @@ mod tests {
     #[test]
     fn a_superfile_published_without_postings_marks_the_index_incomplete() {
         let (_dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         assert!(
             st.reader()
                 .expect("reader")
@@ -3512,7 +3491,7 @@ mod tests {
     #[test]
     fn a_rebuild_matching_the_current_root_marks_the_index_complete() {
         let (_dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let reference = st
             .reader()
             .expect("reader")
@@ -3589,7 +3568,7 @@ mod tests {
         rebuilt
     }
 
-    /// A fragmented table, optimized once so its index is one segment over
+    /// A fragmented table, optimized once so its index is one layer over
     /// exactly the live superfiles.
     fn optimized_fault_table() -> (
         TempDir,
@@ -3598,8 +3577,8 @@ mod tests {
         crate::supertable::Supertable,
     ) {
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         maintenance_only_optimize(&st);
         (dir, faults, storage, st)
@@ -3630,22 +3609,22 @@ mod tests {
         );
     }
 
-    /// An append after the last rebuild adds a delta segment, which the next
+    /// An append after the last rebuild adds a delta layer, which the next
     /// optimize folds back in.
     #[test]
-    fn an_appended_delta_segment_triggers_the_rebuild() {
+    fn an_appended_delta_layer_triggers_the_rebuild() {
         let (_dir, faults, storage, st) = optimized_fault_table();
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 2, "the append added a delta");
+        assert_eq!(root.layers.len(), 2, "the append added a delta");
         assert!(optimize_rebuilds_term_index(&st, &faults));
     }
 
     #[test]
-    fn optimize_keeps_the_delta_segment_when_the_refresh_step_is_off() {
+    fn optimize_keeps_the_delta_layer_when_the_refresh_step_is_off() {
         let (_dir, _faults, storage, st) = optimized_fault_table();
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         let steps = OptimizeSteps {
             refresh_term_index: false,
             ..OptimizeSteps::default()
@@ -3654,12 +3633,12 @@ mod tests {
             .expect("optimize");
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 2, "the delta must not be folded in");
+        assert_eq!(root.layers.len(), 2, "the delta must not be folded in");
     }
 
-    /// A one-slice segment, told apart by `tag`.
-    fn tagged_segment(tag: u8) -> Segment {
-        Segment {
+    /// A one-slice layer, told apart by `tag`.
+    fn tagged_layer(tag: u8) -> Layer {
+        Layer {
             slices: vec![SliceRef {
                 first_key: vec![tag],
                 last_key: vec![tag],
@@ -3671,39 +3650,39 @@ mod tests {
     }
 
     /// A root listing `ids` (each its own `id_min`; `0` is padding) over
-    /// one tagged segment per `tags`.
+    /// one tagged layer per `tags`.
     fn tagged_root(ids: &[u128], tags: &[u8]) -> Root {
         Root {
             superfiles: ids.iter().map(|&id| Uuid::from_u128(id)).collect(),
             id_mins: ids.iter().map(|&id| id as i128).collect(),
-            segments: tags.iter().map(|&tag| tagged_segment(tag)).collect(),
+            layers: tags.iter().map(|&tag| tagged_layer(tag)).collect(),
         }
     }
 
-    /// The segments committed on top of `prior` are the ones `current` adds;
+    /// The layers committed on top of `prior` are the ones `current` adds;
     /// none when nothing was committed.
     #[test]
-    fn segments_since_are_the_deltas_committed_on_top_of_prior() {
+    fn layers_since_are_the_deltas_committed_on_top_of_prior() {
         let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
         // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
         let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
         assert_eq!(
-            segments_since(&prior, &current),
-            Some(&[tagged_segment(2), tagged_segment(3)][..])
+            layers_since(&prior, &current),
+            Some(&[tagged_layer(2), tagged_layer(3)][..])
         );
-        assert_eq!(segments_since(&prior, &prior), Some(&[][..]));
+        assert_eq!(layers_since(&prior, &prior), Some(&[][..]));
     }
 
     /// A root not built on `prior` has no deltas on top of it.
     #[test]
-    fn segments_since_refuses_a_root_not_built_on_prior() {
+    fn layers_since_refuses_a_root_not_built_on_prior() {
         let prior = tagged_root(&[1, 2], &[0]);
         let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
-        assert_eq!(segments_since(&prior, &rebuilt_elsewhere), None);
+        assert_eq!(layers_since(&prior, &rebuilt_elsewhere), None);
 
         let mut id_mins_differ = tagged_root(&[1, 2, 4], &[0, 1]);
         id_mins_differ.id_mins[0] += 1;
-        assert_eq!(segments_since(&prior, &id_mins_differ), None);
+        assert_eq!(layers_since(&prior, &id_mins_differ), None);
     }
 
     /// The rebuild is padded to `prior`'s length and the deltas committed
@@ -3752,8 +3731,8 @@ mod tests {
     #[test]
     fn a_commit_during_the_rebuild_is_rebased_onto() {
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         // A removed superfile stays listed, so the rebuild is shorter than
         // the index it replaces.
@@ -3774,7 +3753,7 @@ mod tests {
         let hook_faults = Arc::clone(&faults);
         faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
             let reference = thread::spawn(move || {
-                commit_segment(&other, SEGMENTS);
+                commit_layer(&other, LAYERS);
                 other
                     .reader()
                     .expect("reader")
@@ -3804,11 +3783,7 @@ mod tests {
             live.len() + 1,
             "the removed superfile's ordinal is padded"
         );
-        assert_eq!(
-            root.segments.len(),
-            2,
-            "the rebuild, then the commit's delta"
-        );
+        assert_eq!(root.layers.len(), 2, "the rebuild, then the commit's delta");
         let peer_ref = peer_ref
             .lock()
             .expect("peer ref")
@@ -3818,8 +3793,8 @@ mod tests {
             .block_on(load_root(storage.as_ref(), &peer_ref))
             .expect("peer root");
         assert_eq!(
-            root.segments.last(),
-            peer_root.segments.last(),
+            root.layers.last(),
+            peer_root.layers.last(),
             "the delta is stacked as the peer committed it"
         );
         assert!(
@@ -3840,7 +3815,7 @@ mod tests {
         // its delta's ordinal names the right superfile.
         let peer: HashSet<Uuid> = live.difference(&before).copied().collect();
         assert_eq!(peer.len(), 1, "the peer added one superfile");
-        let peer_term = format!("s{SEGMENTS}d00");
+        let peer_term = format!("s{LAYERS}d00");
         let found: HashSet<Uuid> = rt
             .block_on(index.postings(title_id(), &peer_term))
             .expect("lookup")
@@ -3851,11 +3826,11 @@ mod tests {
 
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1, "the next rebuild is one segment");
+        assert_eq!(root.layers.len(), 1, "the next rebuild is one layer");
         assert_eq!(root.superfiles.len(), live.len());
     }
 
-    /// Arm `faults` so that a peer commits segment `next`, then `next + 1`,
+    /// Arm `faults` so that a peer commits layer `next`, then `next + 1`,
     /// and so on, before each of the next `rounds` root writes: every publish
     /// in that window loses its race. A slice write after the first of them
     /// fails.
@@ -3871,7 +3846,7 @@ mod tests {
         let hook_faults = Arc::clone(faults);
         faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
             let committer = peer.clone();
-            thread::spawn(move || commit_segment(&committer, next))
+            thread::spawn(move || commit_layer(&committer, next))
                 .join()
                 .expect("peer commit");
             hook_faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
@@ -3886,8 +3861,8 @@ mod tests {
     fn a_rebuild_publishes_while_commits_keep_landing() {
         const ROUNDS: usize = 4;
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         // A removed superfile stays listed, so every rebase pads.
         let reader = st.reader().expect("reader");
@@ -3897,7 +3872,7 @@ mod tests {
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
-        commit_before_each_root_write(&faults, other, SEGMENTS, ROUNDS);
+        commit_before_each_root_write(&faults, other, LAYERS, ROUNDS);
         maintenance_only_optimize(&st);
         faults.clear();
         assert_eq!(faults.fired(), 0, "no retry wrote a slice");
@@ -3905,7 +3880,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(
-            root.segments.len(),
+            root.layers.len(),
             1 + ROUNDS,
             "the rebuild, then each commit's delta"
         );
@@ -3933,12 +3908,12 @@ mod tests {
             live,
             "`shared` is in every live superfile"
         );
-        for segment in SEGMENTS..SEGMENTS + ROUNDS {
-            let found = resolve(&format!("s{segment}d00"));
+        for layer in LAYERS..LAYERS + ROUNDS {
+            let found = resolve(&format!("s{layer}d00"));
             assert_eq!(
                 found.len(),
                 1,
-                "segment {segment}'s own term is in one superfile"
+                "layer {layer}'s own term is in one superfile"
             );
             assert!(found.is_subset(&live), "and it is a live one");
         }
@@ -3950,8 +3925,8 @@ mod tests {
     #[test]
     fn a_commit_during_the_rebuild_of_an_incomplete_index_is_caught_up() {
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         // With its root gone, the next commit restarts the index from its
         // own superfile alone.
@@ -3964,7 +3939,7 @@ mod tests {
             .expect("the commits publish a root");
         st.block_on_query(storage.delete(&reference.uri))
             .expect("delete root");
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         assert!(
             !st.reader()
                 .expect("reader")
@@ -3977,7 +3952,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
         faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
-            thread::spawn(move || commit_segment(&other, SEGMENTS + 1))
+            thread::spawn(move || commit_layer(&other, LAYERS + 1))
                 .join()
                 .expect("peer commit");
         });
@@ -3986,7 +3961,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(
-            root.segments.len(),
+            root.layers.len(),
             2,
             "the rebuild, then the caught-up commit"
         );
@@ -4010,14 +3985,14 @@ mod tests {
     /// Superfile objects end with this, whatever their stem.
     const SUPERFILE_SUFFIX: &str = ".sf.parquet";
 
-    /// Optimize rebuilds the index from its own segments and reads no
+    /// Optimize rebuilds the index from its own layers and reads no
     /// superfile: with every superfile read failing, it still publishes one
-    /// segment over exactly the live superfiles.
+    /// layer over exactly the live superfiles.
     #[test]
     fn optimize_rebuilds_the_index_without_reading_superfiles() {
         let (_dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let reader = st.reader().expect("reader");
         let entries = reader.manifest().get_all_superfiles();
@@ -4035,7 +4010,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1);
+        assert_eq!(root.layers.len(), 1);
         assert_eq!(root.superfiles.len(), live.len());
         assert!(
             st.reader()
@@ -4061,8 +4036,8 @@ mod tests {
     #[test]
     fn the_merged_index_is_the_one_walking_every_superfile_builds() {
         let (dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let before = st.reader().expect("reader").n_superfiles();
         st.optimize(&OptimizeOptions::compact(CompactionSettings {
@@ -4075,8 +4050,8 @@ mod tests {
             st.reader().expect("reader").n_superfiles() < before,
             "compaction must have merged"
         );
-        commit_segment(&st, SEGMENTS);
-        commit_segment(&st, SEGMENTS + 1);
+        commit_layer(&st, LAYERS);
+        commit_layer(&st, LAYERS + 1);
         let reader = st.reader().expect("reader");
         let entries = reader.manifest().get_all_superfiles();
         commit_without_postings(&st, &storage, Vec::new(), &entries[entries.len() - 1..]);
@@ -4113,17 +4088,17 @@ mod tests {
     #[test]
     fn a_missing_slice_falls_back_to_walking_every_superfile() {
         let (dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
-        let slice = &root.segments[0].slices[0];
+        let slice = &root.layers[0].slices[0];
         fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
 
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1);
+        assert_eq!(root.layers.len(), 1);
         assert_eq!(root.superfiles.len(), live.len());
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let found: HashSet<Uuid> = rt
@@ -4137,12 +4112,12 @@ mod tests {
 
     /// When the retry cannot read the current root, it falls back to the
     /// last build. If that already lists every live superfile, it is
-    /// published as it is, without an empty segment.
+    /// published as it is, without an empty layer.
     #[test]
-    fn a_retry_with_nothing_to_catch_up_adds_no_segment() {
+    fn a_retry_with_nothing_to_catch_up_adds_no_layer() {
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
 
         // Just before the rebuild publishes, another process removes a
@@ -4169,7 +4144,7 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1, "the build alone, no empty segment");
+        assert_eq!(root.layers.len(), 1, "the build alone, no empty layer");
         let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
         assert!(listed.is_superset(&live), "every live superfile is listed");
         assert!(
@@ -4180,7 +4155,7 @@ mod tests {
         );
     }
 
-    /// A commit that only removes superfiles appends no segment and leaves
+    /// A commit that only removes superfiles appends no layer and leaves
     /// the index complete, but the root still lists the removed superfile.
     /// Only the live-set check sees it.
     #[test]
@@ -4199,7 +4174,7 @@ mod tests {
                 .manifest()
                 .term_index_complete()
         );
-        assert_eq!(root.segments.len(), 1, "a removal appends no delta");
+        assert_eq!(root.layers.len(), 1, "a removal appends no delta");
         assert_eq!(
             root.superfiles.len(),
             live.len() + 1,
@@ -4214,11 +4189,11 @@ mod tests {
     }
 
     /// An index marked incomplete is rebuilt even when its root already has
-    /// one segment over exactly the live superfiles.
+    /// one layer over exactly the live superfiles.
     #[test]
     fn an_incomplete_index_triggers_the_rebuild() {
         let (_dir, faults, storage, st) = fault_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         // Adding then removing an unindexed superfile leaves the root as it
         // was but the index marked incomplete.
         let entry = unindexed_entry();
@@ -4261,8 +4236,8 @@ mod tests {
         use crate::Bm25SearchOptions;
 
         let (_dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
@@ -4327,7 +4302,7 @@ mod tests {
                 .bm25_search(
                     "title",
                     query,
-                    DOCS_PER_SEGMENT * SEGMENTS,
+                    DOCS_PER_LAYER * LAYERS,
                     Bm25SearchOptions::new(),
                     Some(&["_id", "score"]),
                 )
@@ -4479,8 +4454,8 @@ mod tests {
         let mut results: Vec<Vec<(i128, f32)>> = Vec::new();
         for window in [1usize, 2, 64] {
             let (_dir, _storage, st) = fresh_table_with_open_window(window);
-            for segment in 0..SEGMENTS {
-                commit_segment(&st, segment);
+            for layer in 0..LAYERS {
+                commit_layer(&st, layer);
             }
             let reader = st.reader().expect("reader");
             let ordered = reader
@@ -4534,7 +4509,7 @@ mod tests {
         };
 
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
@@ -4576,7 +4551,7 @@ mod tests {
                         allow: None,
                         exact_count: false,
                     },
-                    DOCS_PER_SEGMENT,
+                    DOCS_PER_LAYER,
                     f32::NEG_INFINITY,
                     &ScoringView::default(),
                 ))
@@ -4608,8 +4583,8 @@ mod tests {
             o.with_eager_load_threshold(0)
                 .with_target_superfiles_per_part(1)
         });
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let search = |term: &str| -> usize {
             let reader = st.reader().expect("reader");
@@ -4666,7 +4641,7 @@ mod tests {
         use crate::supertable::manifest::disk_cache::ManifestDiskCache;
 
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let cache_dir = TempDir::new().expect("cache dir");
@@ -4681,7 +4656,7 @@ mod tests {
             .block_on(warm.postings(title_id(), "shared"))
             .expect("fetch through storage");
         assert!(!first.is_empty());
-        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+        for slice in root.layers.iter().flat_map(|s| s.slices.iter()) {
             fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
         }
         let cached = TermIndex::new(
@@ -4724,7 +4699,7 @@ mod tests {
     /// What the current root names: every slice, tier list and tier chunk.
     fn objects_named_by(root: &Root) -> HashSet<String> {
         let mut named: HashSet<String> = root
-            .segments
+            .layers
             .iter()
             .flat_map(|s| s.slices.iter())
             .map(|s| {
@@ -4734,7 +4709,7 @@ mod tests {
             })
             .collect();
         named.extend(
-            root.segments
+            root.layers
                 .iter()
                 .flat_map(|s| s.slices.iter())
                 .filter_map(|s| s.tier.as_ref())
@@ -4743,14 +4718,14 @@ mod tests {
         named
     }
 
-    /// Every commit writes its segment's tier chunks and names them from the
+    /// Every commit writes its layer's tier chunks and names them from the
     /// root; the rebuild carries them into the base; a sweep past the gap
     /// keeps what the current root names and nothing a replaced root named.
     #[test]
     fn commits_write_tiers_the_rebuild_keeps_and_the_sweep_respects() {
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
-        commit_segment(&st, 1);
+        commit_layer(&st, 0);
+        commit_layer(&st, 1);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let current_ref = || {
             st.reader()
@@ -4763,9 +4738,9 @@ mod tests {
         let root = rt
             .block_on(load_root(storage.as_ref(), &current_ref()))
             .expect("root");
-        assert_eq!(root.segments.len(), 2, "two deltas");
+        assert_eq!(root.layers.len(), 2, "two deltas");
         assert!(
-            root.segments
+            root.layers
                 .iter()
                 .all(|s| s.slices.iter().any(|slice| slice.tier.is_some())),
             "each delta has a tier object"
@@ -4773,7 +4748,7 @@ mod tests {
         let after_commits = tier_objects(&dir);
         let named = objects_named_by(&root);
         let with_tier = root
-            .segments
+            .layers
             .iter()
             .flat_map(|s| s.slices.iter())
             .filter(|s| s.tier.is_some())
@@ -4803,7 +4778,7 @@ mod tests {
         }
         assert_eq!(
             held,
-            2 * DOCS_PER_SEGMENT as u64,
+            2 * DOCS_PER_LAYER as u64,
             "the deltas' tiers cover every document"
         );
 
@@ -4811,9 +4786,9 @@ mod tests {
         let rebuilt = rt
             .block_on(load_root(storage.as_ref(), &current_ref()))
             .expect("root");
-        assert_eq!(rebuilt.segments.len(), 1, "the rebuild folds the deltas");
+        assert_eq!(rebuilt.layers.len(), 1, "the rebuild folds the deltas");
         assert!(
-            rebuilt.segments[0]
+            rebuilt.layers[0]
                 .slices
                 .iter()
                 .any(|slice| slice.tier.is_some())
@@ -4835,7 +4810,7 @@ mod tests {
             .expect("tier entries");
         assert_eq!(
             entries.len(),
-            2 * DOCS_PER_SEGMENT,
+            2 * DOCS_PER_LAYER,
             "the base tier covers every document"
         );
         assert!(
@@ -4868,7 +4843,7 @@ mod tests {
         use crate::supertable::manifest::commit::POINTER_PATH;
 
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let objects = |dir: &TempDir| -> usize {
             std::fs::read_dir(dir.path().join(STORAGE_PREFIX))
                 .expect("term-index dir")
@@ -4893,7 +4868,7 @@ mod tests {
     #[test]
     fn an_unreadable_prior_root_restarts_the_index_incomplete() {
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live_before, _) = live_and_covered(&st, &storage, &rt);
         let reference = st
@@ -4905,7 +4880,7 @@ mod tests {
             .expect("reference");
         std::fs::remove_file(dir.path().join(&reference.uri)).expect("remove root");
 
-        commit_segment(&st, 1);
+        commit_layer(&st, 1);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
         assert!(
@@ -4961,7 +4936,7 @@ mod tests {
 
         assert!(st.gc(Duration::ZERO).is_err(), "the sweep refuses");
         assert!(orphan.exists(), "nothing was deleted, the orphan included");
-        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+        for slice in root.layers.iter().flat_map(|s| s.slices.iter()) {
             assert!(dir.path().join(slice_uri(&slice.content_hash)).exists());
         }
     }
@@ -4974,7 +4949,7 @@ mod tests {
         use std::time::Duration;
 
         let (dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let first = st
             .reader()
             .expect("reader")
@@ -4982,7 +4957,7 @@ mod tests {
             .term_index_ref()
             .cloned()
             .expect("first root");
-        commit_segment(&st, 1);
+        commit_layer(&st, 1);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let second = st
@@ -5002,7 +4977,7 @@ mod tests {
         st.gc(Duration::ZERO).expect("gc");
         assert!(!first_path.exists(), "the superseded root is swept");
         assert!(dir.path().join(&second.uri).exists());
-        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+        for slice in root.layers.iter().flat_map(|s| s.slices.iter()) {
             assert!(
                 dir.path().join(slice_uri(&slice.content_hash)).exists(),
                 "a slice the current root names survives"
@@ -5025,7 +5000,7 @@ mod tests {
                 .is_none(),
             "nothing to index"
         );
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         maintenance_only_optimize(&st);
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -5071,8 +5046,8 @@ mod tests {
         };
 
         let (dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
@@ -5132,7 +5107,7 @@ mod tests {
     }
 
     /// On a table wider than sixty-four superfiles whose index one
-    /// maintenance rebuild covers in a single segment, a term in every
+    /// maintenance rebuild covers in a single layer, a term in every
     /// superfile still resolves from the index's locations: each
     /// superfile's memo covers every query term, so the ranked walk never
     /// reads a dictionary.
@@ -5177,7 +5152,7 @@ mod tests {
             .block_on(manifest.term_index())
             .expect("index")
             .expect("indexed");
-        assert_eq!(index.root().segments.len(), 1, "one folded segment");
+        assert_eq!(index.root().layers.len(), 1, "one folded layer");
         let run = rt
             .block_on(index.postings(title_id(), "shared"))
             .expect("postings");
@@ -5219,8 +5194,8 @@ mod tests {
         };
 
         let (dir, _storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let entries = st
@@ -5394,8 +5369,8 @@ mod tests {
         use crate::supertable::query::prune::{PruneLeaf, select_superfiles};
 
         let (_dir, _storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -5424,7 +5399,7 @@ mod tests {
             .iter()
             .map(|e| e.superfile_id)
             .collect();
-        // Every title holds `shared` and `alpha` is in every segment.
+        // Every title holds `shared` and `alpha` is in every layer.
         assert_eq!(select(&["shared"], BoolMode::Or), live);
         assert_eq!(select(&["alpha", "shared"], BoolMode::And), live);
         // A term in no superfile: exact routing returns nothing, where a
@@ -5432,7 +5407,7 @@ mod tests {
         assert!(select(&["absent"], BoolMode::Or).is_empty());
         assert!(select(&["absent", "shared"], BoolMode::And).is_empty());
         assert_eq!(select(&["absent", "shared"], BoolMode::Or), live);
-        // A segment-specific token (`s1d00` is only in segment 1's titles).
+        // A layer-specific token (`s1d00` is only in layer 1's titles).
         let s1: HashSet<Uuid> = select(&["s1d00"], BoolMode::Or);
         assert_eq!(s1.len(), 1, "one superfile holds the token");
         let prefix = PruneLeaf::Prefix {
@@ -5463,8 +5438,8 @@ mod tests {
         use crate::superfile::SuperfileReader;
 
         let (dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
@@ -5514,7 +5489,7 @@ mod tests {
                     .block_on(superfile.bm25_search_pretokenized(
                         "title",
                         &[term],
-                        DOCS_PER_SEGMENT,
+                        DOCS_PER_LAYER,
                         BoolMode::Or,
                     ))
                     .expect("search");
@@ -5615,16 +5590,16 @@ mod tests {
         };
 
         let (_dir, _storage, st) = fresh_table_with_open_window_no_tiers(1);
-        // Segment 0 carries `alpha` three times per title — a clearly higher
-        // ceiling than the single occurrence in segments 1 and 2.
-        for segment in 0..3 {
-            let word = if segment == 0 {
+        // Layer 0 carries `alpha` three times per title — a clearly higher
+        // ceiling than the single occurrence in layers 1 and 2.
+        for layer in 0..3 {
+            let word = if layer == 0 {
                 "alpha alpha alpha"
             } else {
                 "alpha"
             };
-            let titles: Vec<String> = (0..DOCS_PER_SEGMENT)
-                .map(|i| format!("{word} shared s{segment}d{i:02}"))
+            let titles: Vec<String> = (0..DOCS_PER_LAYER)
+                .map(|i| format!("{word} shared s{layer}d{i:02}"))
                 .collect();
             commit_titles(&st, &titles);
         }
@@ -5647,12 +5622,12 @@ mod tests {
             })
             .0
         };
-        let (all, opened_all) = run(3 * DOCS_PER_SEGMENT);
+        let (all, opened_all) = run(3 * DOCS_PER_LAYER);
         assert_eq!(
             opened_all, 3,
             "a k that needs every document opens every superfile"
         );
-        assert_eq!(all.len(), 3 * DOCS_PER_SEGMENT);
+        assert_eq!(all.len(), 3 * DOCS_PER_LAYER);
 
         let (top1, opened_1) = run(1);
         assert_eq!(top1, all[..1].to_vec(), "identical to the full walk");
@@ -5676,8 +5651,8 @@ mod tests {
         use crate::superfile::{SuperfileReader, fts::reader::FetchedTermSlot};
 
         let (dir, storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
@@ -5763,8 +5738,8 @@ mod tests {
         };
 
         let (_dir, _storage, st) = fresh_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -5816,7 +5791,7 @@ mod tests {
     #[test]
     fn open_blob_inlines_the_fts_header_and_directory_but_not_the_dictionary() {
         let (_dir, _storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let reader = st.reader().expect("reader");
         for e in reader.manifest().get_all_superfiles() {
             let offsets = e.subsection_offsets.as_ref().expect("offsets recorded");
@@ -5853,7 +5828,7 @@ mod tests {
     ///
     /// Four states of the same rows must answer every query identically:
     /// the fixture as written (blooms route); the fixture after the current
-    /// writer appends a segment (index present but incomplete, so parts
+    /// writer appends a layer (index present but incomplete, so parts
     /// still route by summaries and only the new superfile is indexed);
     /// the fixture after a maintenance rebuild (index complete, blooms
     /// ignored); and a fresh table holding the same rows written entirely
@@ -5935,7 +5910,7 @@ mod tests {
         assert!(before.schema.is_none());
         assert!(before.commit_token.is_nil());
 
-        commit_segment(&st, 3);
+        commit_layer(&st, 3);
 
         let after = current_list(&storage, &legacy, &rt);
         assert_eq!(after.format_version, list::FORMAT_VERSION);
@@ -5964,8 +5939,8 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         copy_dir_recursive(&fixture, dir.path());
         let (_storage, st) = open_old_format(dir.path(), |o| o.with_eager_load_threshold(0));
-        for segment in 3..6 {
-            commit_segment(&st, segment);
+        for layer in 3..6 {
+            commit_layer(&st, layer);
         }
         // Reopen lazily so part selection is what finds the rows.
         let (_storage, consumer) = open_old_format(dir.path(), |o| o.with_eager_load_threshold(0));
@@ -5997,7 +5972,7 @@ mod tests {
     #[test]
     fn a_transient_read_of_the_prior_root_keeps_the_index_and_marks_it_incomplete() {
         let (_dir, faults, storage, st) = fault_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live_before, root_before) = live_and_covered(&st, &storage, &rt);
         let first = st
@@ -6009,7 +5984,7 @@ mod tests {
             .expect("reference");
 
         faults.fail(FaultOp::Get, "term-index/root-", 1);
-        commit_segment(&st, 1);
+        commit_layer(&st, 1);
         assert_eq!(faults.fired(), 1, "the prior-root read hit the fault");
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -6023,10 +5998,7 @@ mod tests {
             "this commit's superfiles are not listed"
         );
         let (_, root_after) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(
-            root_after, root_before,
-            "the accumulated segments are intact"
-        );
+        assert_eq!(root_after, root_before, "the accumulated layers are intact");
         let covered: std::collections::HashSet<Uuid> =
             root_after.superfiles.iter().copied().collect();
         assert_eq!(covered, live_before);
@@ -6090,7 +6062,7 @@ mod tests {
                         .bm25_search(
                             "title",
                             q,
-                            DOCS_PER_SEGMENT * (SEGMENTS + 1),
+                            DOCS_PER_LAYER * (LAYERS + 1),
                             Bm25SearchOptions::new().with_mode(*mode),
                             Some(&["title", "score"]),
                         )
@@ -6111,7 +6083,7 @@ mod tests {
         {
             let reader = st.reader().expect("reader");
             let manifest = reader.manifest();
-            assert_eq!(manifest.get_all_superfiles().len(), SEGMENTS);
+            assert_eq!(manifest.get_all_superfiles().len(), LAYERS);
             assert!(
                 manifest.term_index_ref().is_none(),
                 "the fixture predates the index"
@@ -6127,19 +6099,19 @@ mod tests {
         }
         let old_answers = answers(&st);
         assert!(
-            old_answers[0].len() == SEGMENTS * DOCS_PER_SEGMENT,
+            old_answers[0].len() == LAYERS * DOCS_PER_LAYER,
             "`shared` hits every row"
         );
         assert!(old_answers[5].is_empty());
 
-        // Cell 2: the current writer appends a segment. An index appears,
+        // Cell 2: the current writer appends a layer. An index appears,
         // covering only the new superfile; the list marks it incomplete;
         // the old superfiles keep routing by their blooms.
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         {
             let reader = st.reader().expect("reader");
             let manifest = reader.manifest();
-            assert_eq!(manifest.get_all_superfiles().len(), SEGMENTS + 1);
+            assert_eq!(manifest.get_all_superfiles().len(), LAYERS + 1);
             assert!(
                 manifest.term_index_ref().is_some(),
                 "the commit published an index"
@@ -6203,13 +6175,13 @@ mod tests {
 
         // Cell 4: the same rows written entirely by the current writer.
         let (_d, _s, fresh) = fresh_table();
-        for segment in 0..=SEGMENTS {
-            commit_segment(&fresh, segment);
+        for layer in 0..=LAYERS {
+            commit_layer(&fresh, layer);
         }
         let fresh_answers = answers(&fresh);
 
-        // The old three segments answer identically in every state; the
-        // four-segment states answer identically to each other and to the
+        // The old three layers answer identically in every state; the
+        // four-layer states answer identically to each other and to the
         // fresh table. Scores compare bitwise: the same rows, the same
         // global statistics, the same arithmetic.
         for (i, (q, _)) in queries.iter().enumerate() {
@@ -6305,7 +6277,7 @@ mod tests {
     #[test]
     fn repeated_postings_lookups_share_one_decoded_run() {
         let (_dir, storage, st) = fresh_table();
-        commit_segment(&st, 0);
+        commit_layer(&st, 0);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
@@ -6346,7 +6318,7 @@ mod tests {
     const RANDOM_KEY_HEX_DIGITS: usize = 64;
 
     /// A batched lookup answers exactly what one-by-one lookups do — runs
-    /// concatenated across segments in segment order, absent terms empty,
+    /// concatenated across layers in layer order, absent terms empty,
     /// a repeated term answered twice — while fetching each slice it needs
     /// once and several at a time. Looked up one by one, a query over many
     /// keys waited on one whole-slice fetch per key in series.
@@ -6356,7 +6328,7 @@ mod tests {
         let terms: Vec<String> = (0..BATCH_TERMS).map(|i| format!("k{i:04}")).collect();
         let base: Vec<(&str, &str, u64)> = terms.iter().map(|t| ("body", t.as_str(), 2)).collect();
         // The delta holds every third term again, so those runs span both
-        // segments.
+        // layers.
         let delta: Vec<(&str, &str, u64)> = terms
             .iter()
             .step_by(3)
@@ -6382,7 +6354,7 @@ mod tests {
         .await
         .expect("append delta");
         let root = load_root(local.as_ref(), &reference).await.expect("load");
-        assert_eq!(root.segments.len(), 2);
+        assert_eq!(root.layers.len(), 2);
 
         // Interleave the terms so neighbours in the ask sit in different
         // slices, and add an absent term and a repeat.
@@ -6460,7 +6432,7 @@ mod tests {
             ..BuildPolicy::default()
         };
         let built = build(&[contribution(&dir, 1, &terms)], &policy).expect("build");
-        let slices = &built.root.segments[0].slices;
+        let slices = &built.root.layers[0].slices;
         assert!(slices.len() > 2, "the keys fill several slices");
         // Every slice but the last was cut when the next term would not
         // fit, so it is within one term of the target, above or below.
@@ -6521,7 +6493,7 @@ mod tests {
             .collect()
     }
 
-    /// A local store with one base segment over superfile 1.
+    /// A local store with one base layer over superfile 1.
     async fn store_with_base(
         dir: &TempDir,
         policy: &BuildPolicy,
@@ -6537,7 +6509,7 @@ mod tests {
     }
 
     /// Terms a large commit holds beyond the shared one and its own: enough
-    /// to make its segment tens of times a small commit's, about two
+    /// to make its layer tens of times a small commit's, about two
     /// levels up.
     const LARGE_COMMIT_TERMS: usize = 200;
     /// Commits in a stream of mixed sizes: past the fan-out squared, so the
@@ -6546,9 +6518,9 @@ mod tests {
     /// A slice target below any slice's size, so the bound on what a commit
     /// folds refuses every run.
     const TINY_SLICE_TARGET_BYTES: usize = 64;
-    /// Large commits that make a prior root's segments a level of their own.
+    /// Large commits that make a prior root's layers a level of their own.
     const LARGE_PRIOR_COMMITS: u128 = 3;
-    /// Commit ids beyond any stream's, for a reserved segment's superfile.
+    /// Commit ids beyond any stream's, for a reserved layer's superfile.
     const RESERVED_ID: u128 = 99;
 
     /// Append superfile `id`'s delta to `root` through `storage` and read
@@ -6584,17 +6556,17 @@ mod tests {
         load_root(storage.as_ref(), &reference).await.expect("root")
     }
 
-    /// The most segments a root folded to rest can hold, as the fold
+    /// The most layers a root folded to rest can hold, as the fold
     /// guarantees it: fewer than the fan-out in each level group beneath the
-    /// newest segment, and each group's largest level more than
+    /// newest layer, and each group's largest level more than
     /// [`FOLD_LEVEL_SPAN`] below the one before, so no more groups than the
-    /// span fits into the levels the segments cover. One segment per commit,
+    /// span fits into the levels the layers cover. One layer per commit,
     /// what appending alone leaves, is far past it.
     fn folded_count_bound(root: &Root) -> usize {
         let (lowest, highest) = root
-            .segments
+            .layers
             .iter()
-            .map(segment_level)
+            .map(layer_level)
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), level| {
                 (lo.min(level), hi.max(level))
             });
@@ -6630,50 +6602,50 @@ mod tests {
         }
     }
 
-    /// A stream of like-sized delta commits folds its segments as they pile
+    /// A stream of like-sized delta commits folds its layers as they pile
     /// up, so the root holds a logarithmic number of them rather than one
     /// per commit, and every term still routes to exactly the superfiles
     /// that hold it, in commit order. Folds happen at the fan-out, so the
     /// count is checked just before and just after one.
     #[tokio::test]
-    async fn delta_commits_fold_their_segments_and_route_the_same() {
+    async fn delta_commits_fold_their_layers_and_route_the_same() {
         /// Enough commits for a fold of folds: past the fan-out squared.
         const COMMITS: u128 = (FOLD_FAN_OUT * FOLD_FAN_OUT + 3) as u128;
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
         let mut root = base;
-        let mut segments_before_first_fold = 0;
+        let mut layers_before_first_fold = 0;
         for id in 2..=COMMITS {
             root = commit_delta(&dir, &local, root, id, false, &policy).await;
-            let appended = id as usize; // segments so far: the base plus the deltas
+            let appended = id as usize; // layers so far: the base plus the deltas
             if appended == FOLD_FAN_OUT {
-                segments_before_first_fold = root.segments.len();
+                layers_before_first_fold = root.layers.len();
             }
             if appended == FOLD_FAN_OUT + 1 {
                 assert_eq!(
-                    segments_before_first_fold, FOLD_FAN_OUT,
-                    "nothing folds before a run of the fan-out lies beneath the newest segment"
+                    layers_before_first_fold, FOLD_FAN_OUT,
+                    "nothing folds before a run of the fan-out lies beneath the newest layer"
                 );
                 assert_eq!(
-                    root.segments.len(),
+                    root.layers.len(),
                     2,
-                    "the first run folds into one segment beneath the newest"
+                    "the first run folds into one layer beneath the newest"
                 );
             }
         }
         assert!(
-            root.segments.len() <= folded_count_bound(&root),
-            "{COMMITS} commits left {} segments",
-            root.segments.len()
+            root.layers.len() <= folded_count_bound(&root),
+            "{COMMITS} commits left {} layers",
+            root.layers.len()
         );
         assert_routes_every_commit(&root, &local, COMMITS).await;
     }
 
     /// A stream of commits of mixed sizes folds as a uniform one does:
     /// small and large commits alternating, and one large commit in four,
-    /// each keep the root to a few segments per level, where folding only
-    /// runs of like-sized neighbours left one segment per commit.
+    /// each keep the root to a few layers per level, where folding only
+    /// runs of like-sized neighbours left one layer per commit.
     #[tokio::test]
     async fn mixed_commit_sizes_fold_as_uniform_ones_do() {
         /// One large commit in this many, for each stream.
@@ -6688,9 +6660,9 @@ mod tests {
                 root = commit_delta(&dir, &local, root, id, large, &policy).await;
             }
             assert!(
-                root.segments.len() <= folded_count_bound(&root),
-                "one large commit in {every}: {MIXED_COMMITS} commits left {} segments, past {}",
-                root.segments.len(),
+                root.layers.len() <= folded_count_bound(&root),
+                "one large commit in {every}: {MIXED_COMMITS} commits left {} layers, past {}",
+                root.layers.len(),
                 folded_count_bound(&root)
             );
             assert_routes_every_commit(&root, &local, MIXED_COMMITS).await;
@@ -6698,7 +6670,7 @@ mod tests {
     }
 
     /// A run whose bytes pass one slice of the build's target size is not
-    /// folded at commit: the commit appends its segment as it did before
+    /// folded at commit: the commit appends its layer as it did before
     /// folding, and the run is left for optimize's rebuild.
     #[tokio::test]
     async fn a_run_past_one_slice_is_left_for_optimize() {
@@ -6714,15 +6686,15 @@ mod tests {
             root = commit_delta(&dir, &local, root, id, false, &policy).await;
         }
         assert_eq!(
-            root.segments.len(),
+            root.layers.len(),
             commits as usize,
-            "no run fits one slice, so every commit keeps its segment"
+            "no run fits one slice, so every commit keeps its layer"
         );
         assert_routes_every_commit(&root, &local, commits).await;
     }
 
     /// A fold that cannot read the slices it would merge does not fail the
-    /// commit: the root is published unfolded, every segment in it, and
+    /// commit: the root is published unfolded, every layer in it, and
     /// routes as before.
     #[tokio::test]
     async fn a_fold_that_fails_publishes_the_root_unfolded() {
@@ -6734,7 +6706,7 @@ mod tests {
         for id in 2..=unfolded {
             root = commit_delta(&dir, &local, root, id, false, &policy).await;
         }
-        assert_eq!(root.segments.len(), FOLD_FAN_OUT, "nothing folded yet");
+        assert_eq!(root.layers.len(), FOLD_FAN_OUT, "nothing folded yet");
         // The next commit makes a run, and every slice read it would merge
         // fails.
         let faults = FaultStorage::wrap(Arc::clone(&local));
@@ -6743,19 +6715,19 @@ mod tests {
         let root = commit_delta(&dir, &faulty, root, unfolded + 1, false, &policy).await;
         assert!(faults.fired() > 0, "the fold tried to read its run");
         assert_eq!(
-            root.segments.len(),
+            root.layers.len(),
             FOLD_FAN_OUT + 1,
-            "the root is published with every segment unfolded"
+            "the root is published with every layer unfolded"
         );
         assert_routes_every_commit(&root, &local, unfolded + 1).await;
     }
 
-    /// A retry that appends its reserved segment onto a winner's root folds
-    /// the run beneath it like any delta: the reserved segment stays as
+    /// A retry that appends its reserved layer onto a winner's root folds
+    /// the run beneath it like any delta: the reserved layer stays as
     /// built and newest, the padding up to its ordinal is kept, and every
     /// term routes to its superfile.
     #[tokio::test]
-    async fn a_fold_on_the_retry_path_keeps_the_reserved_segment_and_padding() {
+    async fn a_fold_on_the_retry_path_keeps_the_reserved_layer_and_padding() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
@@ -6785,11 +6757,7 @@ mod tests {
         .expect("first attempt");
         let winner_id = last_prior + 1;
         let winner = commit_delta(&dir, &local, prior, winner_id, false, &policy).await;
-        assert_eq!(
-            winner.segments.len(),
-            FOLD_FAN_OUT,
-            "the winner did not fold"
-        );
+        assert_eq!(winner.layers.len(), FOLD_FAN_OUT, "the winner did not fold");
 
         let reference = append_reserved(
             &local,
@@ -6802,12 +6770,12 @@ mod tests {
         .await
         .expect("retry");
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let segment = &reserved.as_ref().expect("reserved").segment;
-        assert_eq!(root.segments.len(), 2, "the run beneath the retry folded");
+        let layer = &reserved.as_ref().expect("reserved").layer;
+        assert_eq!(root.layers.len(), 2, "the run beneath the retry folded");
         assert_eq!(
-            root.segments.last(),
-            Some(segment),
-            "the reserved segment is appended as it was built"
+            root.layers.last(),
+            Some(layer),
+            "the reserved layer is appended as it was built"
         );
         let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
         let ordinal = reserved.as_ref().expect("reserved").base as usize;
@@ -6821,7 +6789,7 @@ mod tests {
         );
     }
 
-    /// A rebuild made from a prior root stacks the segments committed since
+    /// A rebuild made from a prior root stacks the layers committed since
     /// it when a fold stayed wholly above it: a prior of large commits is a
     /// level of its own, the small commits after it fold among themselves,
     /// and the prior is still a prefix of the folded root.
@@ -6841,11 +6809,11 @@ mod tests {
             current = commit_delta(&dir, &local, current, id, false, &policy).await;
         }
         assert_eq!(
-            current.segments.len(),
-            prior.segments.len() + 2,
-            "the small commits folded into one segment beneath the newest"
+            current.layers.len(),
+            prior.layers.len() + 2,
+            "the small commits folded into one layer beneath the newest"
         );
-        assert!(segments_since(&prior, &current).is_some());
+        assert!(layers_since(&prior, &current).is_some());
         let stacked = rebase(&prior, &prior, &current).expect("stacked onto the rebuild");
         assert_routes_every_commit(&stacked, &local, last).await;
     }
@@ -6867,21 +6835,17 @@ mod tests {
         for id in last_prior + 1..=last {
             current = commit_delta(&dir, &local, current, id, false, &policy).await;
         }
-        assert_eq!(
-            current.segments.len(),
-            2,
-            "the fold took the prior's segments"
-        );
-        assert_eq!(segments_since(&prior, &current), None);
+        assert_eq!(current.layers.len(), 2, "the fold took the prior's layers");
+        assert_eq!(layers_since(&prior, &current), None);
         assert_eq!(rebase(&prior, &prior, &current), None);
         assert_routes_every_commit(&current, &local, last).await;
     }
 
-    /// A retry appends the segment it already built onto the winner's root:
+    /// A retry appends the layer it already built onto the winner's root:
     /// no slice is written again, the root is padded up to the reserved
     /// ordinal, and every posting names the right superfile.
     #[tokio::test]
-    async fn append_reserved_reuses_its_segment_on_a_longer_root() {
+    async fn append_reserved_reuses_its_layer_on_a_longer_root() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -6942,7 +6906,7 @@ mod tests {
         assert_eq!(
             posted_superfiles(&root, &local, "shared").await,
             [1, 2, 9].map(Uuid::from_u128),
-            "base, winner, then the reserved segment"
+            "base, winner, then the reserved layer"
         );
         assert_eq!(
             posted_superfiles(&root, &local, "merged").await,
@@ -6951,7 +6915,7 @@ mod tests {
     }
 
     /// A root grown past the reserved ordinal, or other contributions, get
-    /// a segment built again; its postings still name the right superfile.
+    /// a layer built again; its postings still name the right superfile.
     #[tokio::test]
     async fn append_reserved_rebuilds_when_it_cannot_reuse() {
         let dir = TempDir::new().expect("tempdir");
@@ -7011,14 +6975,14 @@ mod tests {
     }
 
     /// A compaction that loses its commit to an ingest commit appends the
-    /// term-index segment it already built: every slice on storage is one
+    /// term-index layer it already built: every slice on storage is one
     /// the root names, the index stays complete, and the merged superfile's
     /// terms route to it. Optimize's rebuild then drops the padding.
     #[test]
-    fn a_compaction_retry_reuses_its_term_index_segment() {
+    fn a_compaction_retry_reuses_its_term_index_layer() {
         let (dir, faults, storage, st) = fault_table();
-        for segment in 0..SEGMENTS {
-            commit_segment(&st, segment);
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
         }
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (before, _) = live_and_covered(&st, &storage, &rt);
@@ -7026,7 +6990,7 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let peer = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
         faults.before(FaultOp::PutIfMatch, POINTER_PATH, move || {
-            thread::spawn(move || commit_segment(&peer, SEGMENTS))
+            thread::spawn(move || commit_layer(&peer, LAYERS))
                 .join()
                 .expect("peer commit");
         });
@@ -7044,7 +7008,7 @@ mod tests {
         assert_eq!(live.len(), 2, "the merged superfile and the peer's");
         assert!(live.is_disjoint(&before), "every input was merged");
         let named: HashSet<String> = root
-            .segments
+            .layers
             .iter()
             .flat_map(|s| &s.slices)
             .map(|s| {
@@ -7080,7 +7044,7 @@ mod tests {
 
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.segments.len(), 1);
+        assert_eq!(root.layers.len(), 1);
         assert!(
             root.superfiles.iter().all(|id| !id.is_nil()),
             "the rebuild drops the padding"
@@ -7230,7 +7194,7 @@ mod tests {
         let (_dir, faults, storage, st) = optimized_fault_table();
         // An appended delta, so the next optimize has to load the root to
         // decide whether to rebuild.
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         drop(st);
         let st = Supertable::open(fresh_options(&storage)).expect("open");
         faults.fail(FaultOp::Get, ROOT_URI_FRAGMENT, 1);
@@ -7253,7 +7217,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
         drop(st);
-        for slice in root.segments.iter().flat_map(|s| s.slices.iter()) {
+        for slice in root.layers.iter().flat_map(|s| s.slices.iter()) {
             fs::remove_file(dir.path().join(slice_uri(&slice.content_hash))).expect("remove slice");
         }
         let st = Supertable::open(fresh_options(&storage)).expect("open");
@@ -7275,7 +7239,7 @@ mod tests {
         plant_root_at_version(&st, &storage, OLD_ROOT_VERSION);
         drop(st);
         let st = Supertable::open(fresh_options(&storage)).expect("open");
-        commit_segment(&st, SEGMENTS);
+        commit_layer(&st, LAYERS);
         let reader = st.reader().expect("reader");
         assert!(
             !reader.manifest().term_index_complete(),
@@ -7322,14 +7286,12 @@ mod tests {
             policy,
         )
         .expect("delta");
-        spill_tiers(dir.path(), &base.root.segments[0].slices, base.tiers)
-            .expect("spill base tiers");
-        spill_tiers(dir.path(), &delta.root.segments[1].slices, delta.tiers)
+        spill_tiers(dir.path(), &base.root.layers[0].slices, base.tiers).expect("spill base tiers");
+        spill_tiers(dir.path(), &delta.root.layers[1].slices, delta.tiers)
             .expect("spill delta tiers");
         vec![
-            spill_slices(dir.path(), &base.root.segments[0].slices, base.slices)
-                .expect("spill base"),
-            spill_slices(dir.path(), &delta.root.segments[1].slices, delta.slices)
+            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
                 .expect("spill delta"),
         ]
     }
@@ -7341,9 +7303,9 @@ mod tests {
         sources: &[Vec<SliceFile>],
         ordinals: &[Option<u32>],
         policy: &BuildPolicy,
-    ) -> build::MergedSegment {
-        let spliced = merge_segments(sources, ordinals, policy).expect("spliced merge");
-        let decoding = merge_segments(
+    ) -> build::MergedLayer {
+        let spliced = merge_layers(sources, ordinals, policy).expect("spliced merge");
+        let decoding = merge_layers(
             sources,
             ordinals,
             &BuildPolicy {
@@ -7354,12 +7316,12 @@ mod tests {
         .expect("decoding merge");
         assert_eq!(spliced.slices, decoding.slices, "slices agree");
         assert_eq!(spliced.tiers, decoding.tiers, "tier objects agree");
-        assert_eq!(spliced.segment, decoding.segment, "segments agree");
+        assert_eq!(spliced.layer, decoding.layer, "layers agree");
         spliced
     }
 
     /// The entries of `term` in a merged output.
-    fn entries_of(merged: &build::MergedSegment, term: &str) -> usize {
+    fn entries_of(merged: &build::MergedLayer, term: &str) -> usize {
         merged_terms(merged)
             .iter()
             .find(|(key, _, _)| key == &fid("body").term_key(term))
@@ -7447,9 +7409,9 @@ mod tests {
         };
         let sources = tier_shapes(&dir, &policy);
         let ordinals = [Some(0), None, Some(1)];
-        let wide = merge_segments(&sources, &ordinals, &policy).expect("merge");
+        let wide = merge_layers(&sources, &ordinals, &policy).expect("merge");
         for window in [1u64, 64, 4096] {
-            let narrow = merge_segments(
+            let narrow = merge_layers(
                 &sources,
                 &ordinals,
                 &BuildPolicy {
@@ -7535,9 +7497,9 @@ mod tests {
             contribution_with_heads(&dir, id, &entries, 1000)
         };
         let built = build(&[hot(1), hot(2), hot(3)], &policy).expect("build");
-        spill_tiers(dir.path(), &built.root.segments[0].slices, built.tiers).expect("spill tiers");
+        spill_tiers(dir.path(), &built.root.layers[0].slices, built.tiers).expect("spill tiers");
         let sources = vec![
-            spill_slices(dir.path(), &built.root.segments[0].slices, built.slices)
+            spill_slices(dir.path(), &built.root.layers[0].slices, built.slices)
                 .expect("spill slices"),
         ];
         let ranges = key_ranges(&sources, &policy).expect("ranges");
@@ -7566,8 +7528,8 @@ mod tests {
             "a hot range holds fewer terms than a cold one: {counts:?}"
         );
         let ordinals = [Some(0), Some(1), Some(2)];
-        let many = merge_segments(&sources, &ordinals, &policy).expect("merge");
-        let one = merge_segments(
+        let many = merge_layers(&sources, &ordinals, &policy).expect("merge");
+        let one = merge_layers(
             &sources,
             &ordinals,
             &BuildPolicy {
@@ -7609,10 +7571,10 @@ mod tests {
             .expect("root");
         let scratch = TempDir::new().expect("scratch");
         faults.fail(FaultOp::Get, "term-index/slice-", 1);
-        let got = rt.block_on(download_segments(&faulty, &root.segments, scratch.path()));
+        let got = rt.block_on(download_layers(&faulty, &root.layers, scratch.path()));
         assert!(got.is_err(), "a failed fetch fails the download");
         assert_eq!(faults.fired(), 2);
-        let good = rt.block_on(download_segments(&local, &root.segments, scratch.path()));
+        let good = rt.block_on(download_layers(&local, &root.layers, scratch.path()));
         assert!(good.is_ok(), "the same download succeeds without the fault");
     }
 }

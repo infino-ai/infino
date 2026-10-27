@@ -9,7 +9,7 @@
 //! ```text
 //! magic "INFTIDX1" | version u32 | n_superfiles u32
 //! | per superfile: uuid | smallest doc id i128 LE
-//! | n_segments u32 | per segment: n_slices u32
+//! | n_layers u32 | per layer: n_slices u32
 //!     | per slice: first_key (u32 len + bytes) | last_key (u32 len + bytes)
 //!                | content hash (32 B)
 //!                | tier object content hash (32 B, all zero when no run of the slice has one)
@@ -25,7 +25,7 @@
 //! uuid. Each carries its smallest doc id: a manifest part's list entry
 //! records the id range its superfiles span, so a query that has routed
 //! to a set of superfiles can pick the parts to load without loading any
-//! — the id is the join key between the two. Segments exist so a later
+//! — the id is the join key between the two. Layers exist so a later
 //! commit can append a delta (its own slice list, appending to the
 //! superfile list) without rewriting the base.
 //!
@@ -96,8 +96,8 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// `3` keys terms by the column's field id instead of its name; `4` names
 /// each slice's tier object beside the slice; `5` records each slice's
 /// byte length again beside its tier, which the fold at commit sizes
-/// segments by. A root at version `4` decodes with every length zero, so
-/// its segments fold at the first commit that gathers enough of them; one
+/// layers by. A root at version `4` decodes with every length zero, so
+/// its layers fold at the first commit that gathers enough of them; one
 /// at version `3` still decodes — its slices are at version 1 and serve
 /// ceilings until the next maintenance rebuild writes the current layout;
 /// anything older does not, and the index is rebuilt, not translated.
@@ -302,9 +302,9 @@ pub(crate) struct SliceRef {
     pub(crate) len: u64,
 }
 
-/// One build's slice list. The base is segment 0; deltas append.
+/// One build's slice list. The base is layer 0; deltas append.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct Segment {
+pub(crate) struct Layer {
     /// Slices in ascending key order, non-overlapping.
     pub(crate) slices: Vec<SliceRef>,
 }
@@ -312,14 +312,14 @@ pub(crate) struct Segment {
 /// The resident root.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Root {
-    /// Superfiles with postings in some segment; postings name them by
+    /// Superfiles with postings in some layer; postings name them by
     /// ordinal. Never reordered — a delta appends. May hold nil padding,
     /// which no posting names (see `append_reserved`).
     pub(crate) superfiles: Vec<Uuid>,
     /// Each superfile's smallest doc id, parallel to `superfiles`.
     pub(crate) id_mins: Vec<i128>,
     /// Base first, then deltas in commit order.
-    pub(crate) segments: Vec<Segment>,
+    pub(crate) layers: Vec<Layer>,
 }
 
 fn push_bytes_u32_len(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -392,7 +392,7 @@ impl Root {
             ROOT_HEADER_LEN
                 + self.superfiles.len() * UUID_LEN
                 + U32_LEN
-                + self.segments.len() * U32_LEN,
+                + self.layers.len() * U32_LEN,
         );
         debug_assert_eq!(self.superfiles.len(), self.id_mins.len());
         out.extend_from_slice(ROOT_MAGIC);
@@ -402,8 +402,8 @@ impl Root {
             out.extend_from_slice(id.as_bytes());
             out.extend_from_slice(&id_min.to_le_bytes());
         }
-        out.extend_from_slice(&(self.segments.len() as u32).to_le_bytes());
-        for seg in &self.segments {
+        out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
+        for seg in &self.layers {
             out.extend_from_slice(&(seg.slices.len() as u32).to_le_bytes());
             for s in &seg.slices {
                 push_bytes_u32_len(&mut out, &s.first_key);
@@ -441,10 +441,10 @@ impl Root {
             let raw = c.take(I128_LEN, "root superfile id_min")?;
             id_mins.push(i128::from_le_bytes(raw.try_into().expect("16 bytes")));
         }
-        let n_segments = c.u32("root segment count")? as usize;
-        let mut segments = Vec::with_capacity(n_segments);
-        for _ in 0..n_segments {
-            let n_slices = c.u32("segment slice count")? as usize;
+        let n_layers = c.u32("root layer count")? as usize;
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            let n_slices = c.u32("layer slice count")? as usize;
             let mut slices = Vec::with_capacity(n_slices);
             for _ in 0..n_slices {
                 let first_key = c.bytes_u32_len("slice first key")?.to_vec();
@@ -473,7 +473,7 @@ impl Root {
                     len,
                 });
             }
-            segments.push(Segment { slices });
+            layers.push(Layer { slices });
         }
         if c.at != bytes.len() {
             return Err(malformed("root: trailing bytes"));
@@ -481,14 +481,14 @@ impl Root {
         Ok(Self {
             superfiles,
             id_mins,
-            segments,
+            layers,
         })
     }
 
-    /// The slices that may hold `key`, one per segment at most — the
+    /// The slices that may hold `key`, one per layer at most — the
     /// last slice whose first key is `≤ key`, if `key ≤` its last key.
     pub(crate) fn slices_for_key<'a>(&'a self, key: &[u8]) -> impl Iterator<Item = &'a SliceRef> {
-        self.segments.iter().filter_map(move |seg| {
+        self.layers.iter().filter_map(move |seg| {
             let i = seg
                 .slices
                 .partition_point(|s| s.first_key.as_slice() <= key);
@@ -498,14 +498,14 @@ impl Root {
     }
 
     /// The slices whose key range intersects `[prefix, prefix_upper)`,
-    /// in key order per segment. A prefix with no upper bound (all
+    /// in key order per layer. A prefix with no upper bound (all
     /// `0xFF`) runs to the end.
     pub(crate) fn slices_for_prefix<'a>(
         &'a self,
         prefix: &[u8],
     ) -> impl Iterator<Item = &'a SliceRef> {
         let upper = prefix_upper_bound(prefix);
-        self.segments.iter().flat_map(move |seg| {
+        self.layers.iter().flat_map(move |seg| {
             let start = seg
                 .slices
                 .partition_point(|s| s.last_key.as_slice() < prefix);
@@ -768,7 +768,7 @@ pub(crate) fn encode_unsized_root(root: &Root) -> Vec<u8> {
     let mut at = ROOT_HEADER_LEN + root.superfiles.len() * (UUID_LEN + I128_LEN) + U32_LEN;
     let mut out = sized[..at].to_vec();
     out[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&UNSIZED_ROOT_FORMAT_VERSION.to_le_bytes());
-    for seg in &root.segments {
+    for seg in &root.layers {
         out.extend_from_slice(&sized[at..at + U32_LEN]);
         at += U32_LEN;
         for s in &seg.slices {
@@ -790,9 +790,9 @@ pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
         out.extend_from_slice(id.as_bytes());
         out.extend_from_slice(&id_min.to_le_bytes());
     }
-    out.extend_from_slice(&(root.segments.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(root.layers.len() as u32).to_le_bytes());
     let mut lens = lens.iter();
-    for seg in &root.segments {
+    for seg in &root.layers {
         out.extend_from_slice(&(seg.slices.len() as u32).to_le_bytes());
         for s in &seg.slices {
             push_bytes_u32_len(&mut out, &s.first_key);
@@ -1260,11 +1260,11 @@ mod tests {
         let root = Root {
             superfiles: vec![Uuid::from_u128(1)],
             id_mins: vec![7],
-            segments: vec![
-                Segment {
+            layers: vec![
+                Layer {
                     slices: vec![slice_ref("a", "b", 1), slice_ref("c", "d", 2)],
                 },
-                Segment {
+                Layer {
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1272,14 +1272,14 @@ mod tests {
         let back = Root::decode(&root.encode()).expect("decodes");
         assert_eq!(back, root);
         let lens: Vec<u64> = back
-            .segments
+            .layers
             .iter()
             .flat_map(|s| s.slices.iter().map(|r| r.len))
             .collect();
         assert_eq!(lens, vec![1000, 2000, 3000]);
         let without = Root::decode(&encode_unsized_root(&root)).expect("an unsized root decodes");
         let mut expect = root.clone();
-        for r in expect.segments.iter_mut().flat_map(|s| s.slices.iter_mut()) {
+        for r in expect.layers.iter_mut().flat_map(|s| s.slices.iter_mut()) {
             r.len = 0;
         }
         assert_eq!(
@@ -1293,11 +1293,11 @@ mod tests {
         let root = Root {
             superfiles: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
             id_mins: vec![10, -20],
-            segments: vec![
-                Segment {
+            layers: vec![
+                Layer {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
                 },
-                Segment {
+                Layer {
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1344,14 +1344,14 @@ mod tests {
         trailing.push(0);
         assert!(
             matches!(Root::decode(&trailing), Err(TermIndexError::Malformed(m)) if m.contains("trailing")),
-            "bytes past the last segment are malformed, not ignored"
+            "bytes past the last layer are malformed, not ignored"
         );
     }
 
     /// A prefix with no upper bound (all `0xFF`) runs to the end of each
-    /// segment: every slice from the first that can hold it onward.
+    /// layer: every slice from the first that can hold it onward.
     #[test]
-    fn a_prefix_with_no_upper_bound_scans_to_the_end_of_each_segment() {
+    fn a_prefix_with_no_upper_bound_scans_to_the_end_of_each_layer() {
         let hi = |a: &[u8], b: &[u8], n: u8| SliceRef {
             first_key: a.to_vec(),
             last_key: b.to_vec(),
@@ -1362,7 +1362,7 @@ mod tests {
         let root = Root {
             superfiles: vec![],
             id_mins: vec![],
-            segments: vec![Segment {
+            layers: vec![Layer {
                 slices: vec![
                     slice_ref("a", "m", 1),
                     hi(&[0xFF, 0x01], &[0xFF, 0x05], 2),
@@ -1382,15 +1382,15 @@ mod tests {
     }
 
     #[test]
-    fn root_routes_a_key_to_the_one_slice_per_segment_that_can_hold_it() {
+    fn root_routes_a_key_to_the_one_slice_per_layer_that_can_hold_it() {
         let root = Root {
             superfiles: vec![],
             id_mins: vec![],
-            segments: vec![
-                Segment {
+            layers: vec![
+                Layer {
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
                 },
-                Segment {
+                Layer {
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1420,7 +1420,7 @@ mod tests {
         let root = Root {
             superfiles: vec![],
             id_mins: vec![],
-            segments: vec![Segment {
+            layers: vec![Layer {
                 slices: vec![
                     slice_ref("aa", "ab", 1),
                     slice_ref("ac", "b", 2),
@@ -1537,18 +1537,18 @@ mod tests {
         let root = Root {
             superfiles: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
             id_mins: vec![10, -20],
-            segments: vec![
-                Segment {
+            layers: vec![
+                Layer {
                     slices: vec![untiered("a", "b", 1), untiered("c", "d", 2)],
                 },
-                Segment {
+                Layer {
                     slices: vec![untiered("c", "d", 3)],
                 },
             ],
         };
         let mut root = root;
         for (r, len) in root
-            .segments
+            .layers
             .iter_mut()
             .flat_map(|s| s.slices.iter_mut())
             .zip([100u64, 200, 300])

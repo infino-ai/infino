@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Offline driver for the term index's optimize-time merge: opens an
-//! existing table, fetches its root's segments once into a scratch
-//! directory, and times `merge_segments` over them exactly as optimize's
+//! existing table, fetches its root's layers once into a scratch
+//! directory, and times `merge_layers` over them exactly as optimize's
 //! rebuild merges them — so a change to the merge can be measured in a
 //! minute, without re-ingesting the table or going back to object storage.
 //!
@@ -36,9 +36,9 @@ use rayon::ThreadPoolBuilder;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
-    build::{BuildPolicy, BuiltBytes, SliceFile, merge_segments, tier_path},
-    download_segments,
-    format::Segment,
+    build::{BuildPolicy, BuiltBytes, SliceFile, merge_layers, tier_path},
+    download_layers,
+    format::Layer,
     slice_files, write_slices, write_tiers,
 };
 use crate::{
@@ -53,7 +53,7 @@ use crate::{
 
 /// The text column of the tables this drives (the FineWeb scale tables).
 const COLUMN: &str = "text";
-/// Where the segments go when `FOLD_SCRATCH` is not set.
+/// Where the layers go when `FOLD_SCRATCH` is not set.
 const DEFAULT_SCRATCH: &str = "/tmp/infino-fold-scratch";
 /// The scratch subdirectory a run's merged output is spilled to.
 const OUT_DIR: &str = "out";
@@ -81,12 +81,12 @@ fn storage_for(target: &str) -> Arc<dyn StorageProvider> {
     }
 }
 
-/// `segments`' slices as files under `dir`, when every slice and tier
+/// `layers`' slices as files under `dir`, when every slice and tier
 /// object of the root is already there; `None` otherwise.
-fn present_sources(dir: &Path, segments: &[Segment]) -> Option<Vec<Vec<SliceFile>>> {
-    let files = slice_files(dir, segments);
-    let complete = segments.iter().zip(&files).all(|(segment, files)| {
-        segment.slices.iter().zip(files).all(|(slice, file)| {
+fn present_sources(dir: &Path, layers: &[Layer]) -> Option<Vec<Vec<SliceFile>>> {
+    let files = slice_files(dir, layers);
+    let complete = layers.iter().zip(&files).all(|(layer, files)| {
+        layer.slices.iter().zip(files).all(|(slice, file)| {
             file.path.is_file()
                 && (slice.tier.is_none() || tier_path(dir, &slice.content_hash).is_file())
         })
@@ -155,46 +155,46 @@ fn fold_timing() {
         .expect("load term index")
         .expect("table has a term index");
     let root = index.root().clone();
-    let slices_in: usize = root.segments.iter().map(|s| s.slices.len()).sum();
+    let slices_in: usize = root.layers.iter().map(|s| s.slices.len()).sum();
     let bytes_in: u64 = root
-        .segments
+        .layers
         .iter()
         .flat_map(|s| &s.slices)
         .map(|s| s.len)
         .sum();
     eprintln!(
-        "FOLD open {:.1}s table={table} superfiles={} root_superfiles={} segments={} slices={slices_in} slice_bytes={:.1}MiB complete={}",
+        "FOLD open {:.1}s table={table} superfiles={} root_superfiles={} layers={} slices={slices_in} slice_bytes={:.1}MiB complete={}",
         t_open.elapsed().as_secs_f64(),
         manifest.superfiles.len(),
         root.superfiles.len(),
-        root.segments.len(),
+        root.layers.len(),
         mib(bytes_in),
         manifest.term_index_complete(),
     );
-    for (i, segment) in root.segments.iter().enumerate() {
-        let bytes: u64 = segment.slices.iter().map(|s| s.len).sum();
+    for (i, layer) in root.layers.iter().enumerate() {
+        let bytes: u64 = layer.slices.iter().map(|s| s.len).sum();
         eprintln!(
-            "FOLD segment[{i}] slices={} bytes={:.1}MiB tiers={}",
-            segment.slices.len(),
+            "FOLD layer[{i}] slices={} bytes={:.1}MiB tiers={}",
+            layer.slices.len(),
             mib(bytes),
-            segment.slices.iter().filter(|s| s.tier.is_some()).count()
+            layer.slices.iter().filter(|s| s.tier.is_some()).count()
         );
     }
 
     let t_fetch = Instant::now();
-    let sources = match present_sources(&scratch, &root.segments) {
+    let sources = match present_sources(&scratch, &root.layers) {
         Some(sources) => {
             eprintln!("FOLD sources present in {}", scratch.display());
             sources
         }
         None => {
             let sources = st
-                .block_on_query(download_segments(&storage, &root.segments, &scratch))
-                .expect("download segments");
+                .block_on_query(download_layers(&storage, &root.layers, &scratch))
+                .expect("download layers");
             eprintln!(
                 "FOLD download {:.1}s ({} objects)",
                 t_fetch.elapsed().as_secs_f64(),
-                root.segments
+                root.layers
                     .iter()
                     .flat_map(|s| &s.slices)
                     .map(|s| 1 + usize::from(s.tier.is_some()))
@@ -204,10 +204,10 @@ fn fold_timing() {
         }
     };
     let local_bytes: u64 = root
-        .segments
+        .layers
         .iter()
         .zip(&sources)
-        .flat_map(|(segment, files)| segment.slices.iter().zip(files))
+        .flat_map(|(layer, files)| layer.slices.iter().zip(files))
         .map(|(slice, file)| {
             file_len(&file.path) + file_len(&tier_path(&scratch, &slice.content_hash))
         })
@@ -248,7 +248,7 @@ fn fold_timing() {
     for run in 0..runs {
         let _ = fs::remove_dir_all(scratch.join(OUT_DIR));
         let t = Instant::now();
-        let merged = merge_segments(&sources, &ordinals, &policy).expect("merge");
+        let merged = merge_layers(&sources, &ordinals, &policy).expect("merge");
         let secs = t.elapsed().as_secs_f64();
         let out_bytes: u64 = merged.slices.iter().map(|(_, b)| bytes_of(b)).sum();
         let tier_bytes: u64 = merged.tiers.iter().map(|(_, b)| bytes_of(b)).sum();
