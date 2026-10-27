@@ -506,7 +506,11 @@ fn splice_term(
         for &(ordinal, carried, made) in &order {
             if let Some(gi) = carried {
                 if let Some(&(si, cr, b)) = groups[gi].1.get(r) {
-                    blocks.push(opened[si][cr].spliced_block(b));
+                    // The block names its superfile by the source's
+                    // ordinal; the merged chunk names it by the new one.
+                    let mut block = opened[si][cr].spliced_block(b);
+                    block.ordinal = ordinal;
+                    blocks.push(block);
                 }
             } else if let Some(fi) = made
                 && r == 0
