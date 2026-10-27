@@ -62,7 +62,7 @@ use rayon::ThreadPool;
 use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, task};
+use tokio::{fs as async_fs, sync::Semaphore, task};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -367,7 +367,7 @@ pub(crate) async fn write_root(
     tracing::instrument(skip_all, fields(slices = slices.len()))
 )]
 pub(crate) async fn write_slices(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     slices: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     write_objects(storage, "slice", slices).await
@@ -381,43 +381,56 @@ pub(crate) async fn write_slices(
     tracing::instrument(skip_all, fields(tiers = tiers.len()))
 )]
 pub(crate) async fn write_tiers(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     tiers: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     write_objects(storage, "tier", tiers).await
 }
 
 async fn write_objects(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     kind: &'static str,
     objects: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
     // A spilled object is read back only as its upload starts, so at most
-    // the uploads in flight are resident at once.
-    stream::iter(objects.into_iter().map(|(hash, built)| async move {
-        let bytes = match built {
-            BuiltBytes::Resident(bytes) => bytes,
-            BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
-        };
-        let reference = put_content_addressed(storage, kind, bytes).await?;
-        debug_assert_eq!(reference.content_hash, hash);
-        Ok::<(), TermIndexError>(())
-    }))
-    .buffer_unordered(SLICE_WRITE_CONCURRENCY)
-    .try_collect()
-    .await
+    // the uploads in flight are resident at once. One spawned task per
+    // object, as `download_segments` fetches, for the same reason.
+    let in_flight = Arc::new(Semaphore::new(SLICE_WRITE_CONCURRENCY));
+    let mut tasks = Vec::with_capacity(objects.len());
+    for (hash, built) in objects {
+        let permit = Arc::clone(&in_flight)
+            .acquire_owned()
+            .await
+            .map_err(|_| TermIndexError::Build("object writes closed".into()))?;
+        let storage = Arc::clone(storage);
+        tasks.push(tokio::spawn(async move {
+            let _in_flight = permit;
+            let bytes = match built {
+                BuiltBytes::Resident(bytes) => bytes,
+                BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+            };
+            let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
+            debug_assert_eq!(reference.content_hash, hash);
+            Ok::<(), TermIndexError>(())
+        }));
+    }
+    for task in tasks {
+        task.await
+            .map_err(|e| TermIndexError::Build(format!("object write: {e}")))??;
+    }
+    Ok(())
 }
 
 /// Persist a finished build — slices first, then the root — and return
 /// the root's reference for the manifest.
 #[cfg(test)]
 pub(crate) async fn write_built(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
     write_tiers(storage, built.tiers).await?;
     write_slices(storage, built.slices).await?;
-    write_root(storage, &built.root).await
+    write_root(storage.as_ref(), &built.root).await
 }
 
 /// Publish this commit's superfiles as a delta segment appended to `prior`
@@ -429,7 +442,7 @@ pub(crate) async fn write_built(
 /// re-derives the same slice hashes and re-PUTs them as no-ops. A fold the
 /// root's segments call for merges on `pool` ([`fold_tail`]).
 pub(crate) async fn append_delta(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
@@ -467,7 +480,7 @@ impl ReservedSegment {
 /// Build `contributions` into a segment numbered from `base` and write its
 /// slices, for a later [`append_reserved`].
 pub(crate) async fn reserve_segment(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
     base: u32,
@@ -504,7 +517,7 @@ pub(crate) async fn reserve_segment(
 /// root it extends, which `segments_since` relies on. Optimize's rebuild
 /// drops the padding.
 pub(crate) async fn append_reserved(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
@@ -543,7 +556,7 @@ pub(crate) async fn append_reserved(
 /// far as the folds before it took it, every segment still in it: the
 /// commit it is part of never fails on its account.
 async fn publish_root(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     mut root: Root,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
@@ -573,7 +586,7 @@ async fn publish_root(
     if let Err(error) = fold_tail(storage, &mut root, &fold_policy, pool).await {
         warn!(%error, "term index: folding segments at commit failed; publishing the root unfolded");
     }
-    write_root(storage, &root).await
+    write_root(storage.as_ref(), &root).await
 }
 
 /// Merge each run of segments [`next_fold`] picks into one, the merge on
@@ -600,7 +613,7 @@ async fn publish_root(
 /// and the rebuild catches up by reading the superfiles it lacks instead,
 /// its existing fallback.
 pub(crate) async fn fold_tail(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
@@ -753,39 +766,45 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
 /// disk cache: a merge reads each object once, and filling the cache with
 /// the whole index would evict what queries use.
 pub(crate) async fn download_segments(
-    storage: &dyn StorageProvider,
+    storage: &Arc<dyn StorageProvider>,
     segments: &[Segment],
     dir: &Path,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let path_of = |hash: &ContentHash| dir.join(format!("{}.slice", hash.to_hex()));
+    // One spawned task per slice, so the fetches spread over the runtime's
+    // workers: polled from the one thread that blocks on this future, as
+    // a stream of them would be, they moved bytes at half the rate.
     let mut unique: HashSet<ContentHash> = HashSet::new();
-    let fetches = segments
+    let in_flight = Arc::new(Semaphore::new(SEGMENT_FETCH_CONCURRENCY));
+    let mut tasks = Vec::new();
+    for slice in segments
         .iter()
         .flat_map(|segment| &segment.slices)
         .filter(|slice| unique.insert(slice.content_hash))
-        .map(|slice| {
-            let path = path_of(&slice.content_hash);
-            let tier_file = tier_path(dir, &slice.content_hash);
-            async move {
-                let bytes = fetch_verified(
-                    storage,
-                    None,
-                    &slice_uri(&slice.content_hash),
-                    &slice.content_hash,
-                )
-                .await?;
-                async_fs::write(&path, &bytes).await?;
-                if let Some(tier) = &slice.tier {
-                    let bytes = fetch_verified(storage, None, &tier_uri(tier), tier).await?;
-                    async_fs::write(&tier_file, &bytes).await?;
-                }
-                Ok::<(), TermIndexError>(())
+    {
+        let permit = Arc::clone(&in_flight)
+            .acquire_owned()
+            .await
+            .map_err(|_| TermIndexError::Build("segment fetches closed".into()))?;
+        let storage = Arc::clone(storage);
+        let path = path_of(&slice.content_hash);
+        let tier_file = tier_path(dir, &slice.content_hash);
+        let (hash, tier) = (slice.content_hash, slice.tier);
+        tasks.push(tokio::spawn(async move {
+            let _in_flight = permit;
+            let bytes = fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
+            async_fs::write(&path, &bytes).await?;
+            if let Some(tier) = &tier {
+                let bytes = fetch_verified(storage.as_ref(), None, &tier_uri(tier), tier).await?;
+                async_fs::write(&tier_file, &bytes).await?;
             }
-        });
-    stream::iter(fetches)
-        .buffer_unordered(SEGMENT_FETCH_CONCURRENCY)
-        .try_collect::<()>()
-        .await?;
+            Ok::<(), TermIndexError>(())
+        }));
+    }
+    for task in tasks {
+        task.await
+            .map_err(|e| TermIndexError::Build(format!("segment fetch: {e}")))??;
+    }
     Ok(segments
         .iter()
         .map(|segment| {
@@ -2597,7 +2616,7 @@ mod tests {
         let store_dir = TempDir::new().expect("store dir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
-        let reference = write_built(storage.as_ref(), built).await.expect("write");
+        let reference = write_built(&storage, built).await.expect("write");
         assert!(reference.uri.starts_with("term-index/root-"));
         let root = load_root(storage.as_ref(), &reference).await.expect("load");
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
@@ -4299,9 +4318,7 @@ mod tests {
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let reference = rt
-            .block_on(write_built(storage.as_ref(), built))
-            .expect("write");
+        let reference = rt.block_on(write_built(&storage, built)).expect("write");
         let index = rt
             .block_on(TermIndex::load(Arc::clone(&storage), None, &reference))
             .expect("load");
@@ -5301,7 +5318,7 @@ mod tests {
             let storage: Arc<dyn StorageProvider> =
                 Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
             let rt = tokio::runtime::Runtime::new().expect("runtime");
-            let reference = rt.block_on(write_built(storage.as_ref(), built)).expect("write");
+            let reference = rt.block_on(write_built(&storage, built)).expect("write");
             let index = rt.block_on(TermIndex::load(Arc::clone(&storage), None, &reference)).expect("load");
             let holders = |t: usize| -> HashSet<Uuid> {
                 corpus.iter().enumerate().filter(|(_, s)| s.contains(&t)).map(|(i, _)| Uuid::from_u128(i as u128 + 1)).collect()
@@ -6309,11 +6326,9 @@ mod tests {
             Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("local fs"));
         let built = build(&[contribution(&dir, 1, &base)], &policy).expect("build");
         let prior = built.root.clone();
-        write_built(local.as_ref(), built)
-            .await
-            .expect("write base");
+        write_built(&local, built).await.expect("write base");
         let reference = append_delta(
-            local.as_ref(),
+            &local,
             Some(prior),
             &[contribution(&dir, 2, &delta)],
             &policy,
@@ -6472,9 +6487,7 @@ mod tests {
         let built =
             build(&[contribution(dir, 1, &[("body", "shared", 2)])], policy).expect("build");
         let root = built.root.clone();
-        write_built(local.as_ref(), built)
-            .await
-            .expect("write base");
+        write_built(&local, built).await.expect("write base");
         (store_dir, local, root)
     }
 
@@ -6498,7 +6511,7 @@ mod tests {
     /// term, and a large one [`LARGE_COMMIT_TERMS`] more of its own.
     async fn commit_delta(
         dir: &TempDir,
-        storage: &dyn StorageProvider,
+        storage: &Arc<dyn StorageProvider>,
         root: Root,
         id: u128,
         large: bool,
@@ -6523,7 +6536,7 @@ mod tests {
         )
         .await
         .expect("append");
-        load_root(storage, &reference).await.expect("root")
+        load_root(storage.as_ref(), &reference).await.expect("root")
     }
 
     /// The most segments a root folded to rest can hold, as the fold
@@ -6587,7 +6600,7 @@ mod tests {
         let mut root = base;
         let mut segments_before_first_fold = 0;
         for id in 2..=COMMITS {
-            root = commit_delta(&dir, local.as_ref(), root, id, false, &policy).await;
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
             let appended = id as usize; // segments so far: the base plus the deltas
             if appended == FOLD_FAN_OUT {
                 segments_before_first_fold = root.segments.len();
@@ -6627,7 +6640,7 @@ mod tests {
             let mut root = base;
             for id in 2..=MIXED_COMMITS {
                 let large = id % every == 0;
-                root = commit_delta(&dir, local.as_ref(), root, id, large, &policy).await;
+                root = commit_delta(&dir, &local, root, id, large, &policy).await;
             }
             assert!(
                 root.segments.len() <= folded_count_bound(&root),
@@ -6653,7 +6666,7 @@ mod tests {
         let mut root = base;
         let commits = (2 * FOLD_FAN_OUT) as u128;
         for id in 2..=commits {
-            root = commit_delta(&dir, local.as_ref(), root, id, false, &policy).await;
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
         }
         assert_eq!(
             root.segments.len(),
@@ -6674,14 +6687,15 @@ mod tests {
         let mut root = base;
         let unfolded = FOLD_FAN_OUT as u128;
         for id in 2..=unfolded {
-            root = commit_delta(&dir, local.as_ref(), root, id, false, &policy).await;
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
         }
         assert_eq!(root.segments.len(), FOLD_FAN_OUT, "nothing folded yet");
         // The next commit makes a run, and every slice read it would merge
         // fails.
         let faults = FaultStorage::wrap(Arc::clone(&local));
         faults.fail(FaultOp::Get, "slice-", usize::MAX);
-        let root = commit_delta(&dir, faults.as_ref(), root, unfolded + 1, false, &policy).await;
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let root = commit_delta(&dir, &faulty, root, unfolded + 1, false, &policy).await;
         assert!(faults.fired() > 0, "the fold tried to read its run");
         assert_eq!(
             root.segments.len(),
@@ -6705,7 +6719,7 @@ mod tests {
         let mut prior = base;
         let last_prior = (FOLD_FAN_OUT - 1) as u128;
         for id in 2..=last_prior {
-            prior = commit_delta(&dir, local.as_ref(), prior, id, false, &policy).await;
+            prior = commit_delta(&dir, &local, prior, id, false, &policy).await;
         }
         let reserved_own = format!("own{RESERVED_ID}");
         let retried = [contribution(
@@ -6715,7 +6729,7 @@ mod tests {
         )];
         let mut reserved = None;
         append_reserved(
-            local.as_ref(),
+            &local,
             Some(prior.clone()),
             &retried,
             &policy,
@@ -6725,7 +6739,7 @@ mod tests {
         .await
         .expect("first attempt");
         let winner_id = last_prior + 1;
-        let winner = commit_delta(&dir, local.as_ref(), prior, winner_id, false, &policy).await;
+        let winner = commit_delta(&dir, &local, prior, winner_id, false, &policy).await;
         assert_eq!(
             winner.segments.len(),
             FOLD_FAN_OUT,
@@ -6733,7 +6747,7 @@ mod tests {
         );
 
         let reference = append_reserved(
-            local.as_ref(),
+            &local,
             Some(winner.clone()),
             &retried,
             &policy,
@@ -6774,12 +6788,12 @@ mod tests {
         let mut prior = base;
         let last_prior = 1 + LARGE_PRIOR_COMMITS;
         for id in 2..=last_prior {
-            prior = commit_delta(&dir, local.as_ref(), prior, id, true, &policy).await;
+            prior = commit_delta(&dir, &local, prior, id, true, &policy).await;
         }
         let mut current = prior.clone();
         let last = last_prior + FOLD_FAN_OUT as u128 + 1;
         for id in last_prior + 1..=last {
-            current = commit_delta(&dir, local.as_ref(), current, id, false, &policy).await;
+            current = commit_delta(&dir, &local, current, id, false, &policy).await;
         }
         assert_eq!(
             current.segments.len(),
@@ -6801,12 +6815,12 @@ mod tests {
         let mut prior = base;
         let last_prior = 3;
         for id in 2..=last_prior {
-            prior = commit_delta(&dir, local.as_ref(), prior, id, false, &policy).await;
+            prior = commit_delta(&dir, &local, prior, id, false, &policy).await;
         }
         let mut current = prior.clone();
         let last = FOLD_FAN_OUT as u128 + 1;
         for id in last_prior + 1..=last {
-            current = commit_delta(&dir, local.as_ref(), current, id, false, &policy).await;
+            current = commit_delta(&dir, &local, current, id, false, &policy).await;
         }
         assert_eq!(
             current.segments.len(),
@@ -6833,7 +6847,7 @@ mod tests {
         )];
         let mut reserved = None;
         append_reserved(
-            local.as_ref(),
+            &local,
             Some(prior.clone()),
             &merged,
             &policy,
@@ -6845,7 +6859,7 @@ mod tests {
 
         // Another commit publishes a delta first.
         let winner = append_delta(
-            local.as_ref(),
+            &local,
             Some(prior.clone()),
             &[contribution(&dir, 2, &[("body", "shared", 4)])],
             &policy,
@@ -6859,7 +6873,7 @@ mod tests {
         let slices_before_retry = slice_objects(&store_dir);
 
         let reference = append_reserved(
-            local.as_ref(),
+            &local,
             Some(winner.clone()),
             &merged,
             &policy,
@@ -6901,7 +6915,7 @@ mod tests {
         let merged = [contribution(&dir, 9, &[("body", "merged", 1)])];
         let mut reserved = None;
         append_reserved(
-            local.as_ref(),
+            &local,
             Some(prior.clone()),
             &merged,
             &policy,
@@ -6918,7 +6932,7 @@ mod tests {
         outgrown.id_mins.extend(repeat_n(0, extra));
         let slices_before = slice_objects(&store_dir);
         let reference = append_reserved(
-            local.as_ref(),
+            &local,
             Some(outgrown.clone()),
             &merged,
             &policy,
@@ -6940,16 +6954,9 @@ mod tests {
 
         // A batch that lost a job hands over other contributions.
         let other = [contribution(&dir, 10, &[("body", "other", 1)])];
-        let reference = append_reserved(
-            local.as_ref(),
-            Some(prior),
-            &other,
-            &policy,
-            &mut reserved,
-            None,
-        )
-        .await
-        .expect("other contributions");
+        let reference = append_reserved(&local, Some(prior), &other, &policy, &mut reserved, None)
+            .await
+            .expect("other contributions");
         let root = load_root(local.as_ref(), &reference).await.expect("root");
         assert_eq!(
             posted_superfiles(&root, &local, "other").await,

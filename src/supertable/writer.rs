@@ -2933,7 +2933,7 @@ impl SupertableWriter {
                     segment = Some(
                         bridge_on_runtime(
                             term_index::reserve_segment(
-                                storage.as_ref(),
+                                &storage,
                                 contributions,
                                 &self.inner.options.term_index_build_policy(),
                                 base,
@@ -11148,8 +11148,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
-            term_index::write_tiers(storage.as_ref(), built.tiers).await?;
-            term_index::write_slices(storage.as_ref(), built.slices).await?;
+            term_index::write_tiers(&storage, built.tiers).await?;
+            term_index::write_slices(&storage, built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can
@@ -11232,13 +11232,12 @@ async fn merge_term_index(
         .await
         .map_err(|e| TermIndexError::Build(e.to_string()))?;
     }
-    let mut sources =
-        term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
-            .instrument(detail_span!(
-                "term_index.download",
-                segments = current.segments.len(),
-            ))
-            .await?;
+    let mut sources = term_index::download_segments(storage, &current.segments, scratch.path())
+        .instrument(detail_span!(
+            "term_index.download",
+            segments = current.segments.len(),
+        ))
+        .await?;
     let mut old = Root {
         superfiles: current.superfiles.clone(),
         id_mins: current.id_mins.clone(),
@@ -11356,7 +11355,7 @@ async fn fold_term_index(
         ..policy
     };
     let scratch = term_index_scratch(&policy)?;
-    let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
+    let sources = term_index::download_segments(storage, deltas, scratch.path()).await?;
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
@@ -12601,7 +12600,7 @@ pub(crate) async fn try_commit_attempt(
             scoring_by_superfile: Arc::new(scoring_by_superfile(&new_manifest)),
             ..current_manifest.options.term_index_build_policy()
         };
-        let store = storage.as_ref();
+        let store = &storage;
         // A fold the root calls for is CPU work, merged on the reader pool as
         // optimize's rebuild and fold merge theirs.
         let pool = Some(&*current_manifest.options.reader_pool);

@@ -255,11 +255,7 @@ fn fold_timing() {
         }
         None => {
             let sources = st
-                .block_on_query(download_segments(
-                    storage.as_ref(),
-                    &root.segments,
-                    &scratch,
-                ))
+                .block_on_query(download_segments(&storage, &root.segments, &scratch))
                 .expect("download segments");
             eprintln!(
                 "FOLD download {:.1}s ({} objects)",
@@ -337,9 +333,9 @@ fn fold_timing() {
         if let Ok(upload_to) = env::var("FOLD_UPLOAD") {
             let sink = storage_for(&upload_to);
             let t = Instant::now();
-            st.block_on_query(write_slices(sink.as_ref(), merged.slices))
+            st.block_on_query(write_slices(&sink, merged.slices))
                 .expect("upload slices");
-            st.block_on_query(write_tiers(sink.as_ref(), merged.tiers))
+            st.block_on_query(write_tiers(&sink, merged.tiers))
                 .expect("upload tiers");
             let secs = t.elapsed().as_secs_f64();
             eprintln!(
