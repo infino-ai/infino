@@ -30,7 +30,7 @@ use std::{
 
 use arrow::datatypes::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
-use tokio::{fs as async_fs, spawn, sync::Semaphore};
+use tokio::{fs as async_fs, spawn, sync::Semaphore, task::spawn_blocking};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
@@ -226,9 +226,16 @@ fn fold_timing() {
                 for (uri, path) in objects {
                     let storage = Arc::clone(&storage_arc);
                     let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
+                    let verify = env::var("FOLD_DL_HASH").is_ok();
                     tasks.push(spawn(async move {
                         let _permit = permit;
                         let (bytes, _) = storage.get(&uri).await.expect("get");
+                        if verify {
+                            let to_check = bytes.clone();
+                            spawn_blocking(move || ContentHash::of(to_check.as_ref()))
+                                .await
+                                .expect("hash task");
+                        }
                         async_fs::write(&path, &bytes).await.expect("write");
                         bytes.len() as u64
                     }));
@@ -240,7 +247,8 @@ fn fold_timing() {
                 total
             });
             eprintln!(
-                "FOLD download(spawn x{width}) {:.1}s ({n_objects} objects)",
+                "FOLD download(spawn x{width} hash={}) {:.1}s ({n_objects} objects)",
+                env::var("FOLD_DL_HASH").is_ok(),
                 t_fetch.elapsed().as_secs_f64()
             );
             present_sources(&scratch, &root.segments).expect("downloaded sources present")
