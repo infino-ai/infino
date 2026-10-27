@@ -194,6 +194,9 @@ const ENCODE_BATCH_TERMS: usize = 1 << 13;
 /// Fewest terms one parallel job of a batch takes: a spliced term is
 /// microseconds of work, less than a job's scheduling.
 const ENCODE_JOB_MIN_TERMS: usize = 64;
+/// Bytes a merge cursor reads from a tier object at a time, so the terms
+/// of a window share one read rather than each seeking for its own chunks.
+const TIER_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One term as the merge hands it over: its postings and the tier entries
 /// gathered for it, in any order.
@@ -1152,13 +1155,14 @@ struct SegmentWriter {
     stats: WriterStats,
 }
 
-/// What a segment writer spent its time on.
+/// What a segment writer spent its time on, for the merge's per-shard
+/// trace event.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct WriterStats {
-    pub(crate) encode_secs: f64,
-    pub(crate) cut_secs: f64,
-    pub(crate) terms: u64,
-    pub(crate) entries: u64,
+struct WriterStats {
+    encode_secs: f64,
+    cut_secs: f64,
+    terms: u64,
+    entries: u64,
 }
 
 impl SegmentWriter {
@@ -1717,10 +1721,6 @@ impl SegmentCursor {
     }
 }
 
-/// Bytes a cursor reads from a tier object at a time, so the terms of a
-/// window share one read rather than each seeking for its own chunks.
-const TIER_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
-
 /// Extension of a slice's tier object on local disk, beside the slice file
 /// that shares its stem.
 const TIER_FILE_EXTENSION: &str = "tier";
@@ -2076,7 +2076,7 @@ fn merge_range(
     writer.cut()?;
     let stats = writer.stats;
     let (segment, slices, tiers) = writer.finish()?;
-    tracing::info!(
+    tracing::debug!(
         target: "term_index::fold",
         start = %String::from_utf8_lossy(start.unwrap_or(b"")),
         end = %String::from_utf8_lossy(end.unwrap_or(b"")),

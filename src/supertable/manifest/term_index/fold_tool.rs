@@ -17,8 +17,10 @@
 //! Knobs: `FOLD_THREADS` sizes the writer pool the merge runs on (default:
 //! the engine's own), `FOLD_SHARDS` fixes the merge's shard count (default:
 //! chosen by the engine from the sources and the pool), `FOLD_RUNS` repeats
-//! the merge (default 1). Slices already in the scratch directory are not
-//! fetched again.
+//! the merge (default 1), and `FOLD_UPLOAD=<uri>` also times writing the
+//! merged output to that prefix. Slices already in the scratch directory
+//! are not fetched again. Per-shard timing is logged at debug level under
+//! the `term_index::fold` target.
 
 use std::{
     collections::HashMap,
@@ -30,14 +32,13 @@ use std::{
 
 use arrow::datatypes::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
-use tokio::{fs as async_fs, spawn, sync::Semaphore, task::spawn_blocking};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
     build::{BuildPolicy, BuiltBytes, SliceFile, merge_segments, tier_path},
     download_segments,
     format::Segment,
-    slice_uri, tier_uri, write_slices, write_tiers,
+    write_slices, write_tiers,
 };
 use crate::{
     runtime_metrics::rss::available_memory_bytes,
@@ -128,7 +129,7 @@ fn fold_timing() {
     let runs: usize = env_num("FOLD_RUNS").unwrap_or(1);
 
     let _ = fmt()
-        .with_env_filter(EnvFilter::new("term_index::fold=info"))
+        .with_env_filter(EnvFilter::new("term_index::fold=debug"))
         .with_writer(io::stderr)
         .with_target(false)
         .try_init();
@@ -197,61 +198,6 @@ fn fold_timing() {
         Some(sources) => {
             eprintln!("FOLD sources present in {}", scratch.display());
             sources
-        }
-        None if env::var("FOLD_DL_SPAWN").is_ok() => {
-            // Experiment: one spawned task per object, so the fetches
-            // spread over the runtime's workers instead of being polled
-            // on the one thread that blocks on the future.
-            let width: usize = env_num("FOLD_DL_SPAWN").unwrap_or(32);
-            let objects: Vec<(String, PathBuf)> = root
-                .segments
-                .iter()
-                .flat_map(|s| &s.slices)
-                .flat_map(|s| {
-                    let mut v = vec![(
-                        slice_uri(&s.content_hash),
-                        scratch.join(format!("{}.slice", s.content_hash.to_hex())),
-                    )];
-                    if let Some(t) = &s.tier {
-                        v.push((tier_uri(t), tier_path(&scratch, &s.content_hash)));
-                    }
-                    v
-                })
-                .collect();
-            let n_objects = objects.len();
-            let storage_arc = Arc::clone(&storage);
-            st.block_on_query(async move {
-                let sem = Arc::new(Semaphore::new(width));
-                let mut tasks = Vec::with_capacity(objects.len());
-                for (uri, path) in objects {
-                    let storage = Arc::clone(&storage_arc);
-                    let permit = Arc::clone(&sem).acquire_owned().await.expect("semaphore");
-                    let verify = env::var("FOLD_DL_HASH").is_ok();
-                    tasks.push(spawn(async move {
-                        let _permit = permit;
-                        let (bytes, _) = storage.get(&uri).await.expect("get");
-                        if verify {
-                            let to_check = bytes.clone();
-                            spawn_blocking(move || ContentHash::of(to_check.as_ref()))
-                                .await
-                                .expect("hash task");
-                        }
-                        async_fs::write(&path, &bytes).await.expect("write");
-                        bytes.len() as u64
-                    }));
-                }
-                let mut total = 0u64;
-                for t in tasks {
-                    total += t.await.expect("task");
-                }
-                total
-            });
-            eprintln!(
-                "FOLD download(spawn x{width} hash={}) {:.1}s ({n_objects} objects)",
-                env::var("FOLD_DL_HASH").is_ok(),
-                t_fetch.elapsed().as_secs_f64()
-            );
-            present_sources(&scratch, &root.segments).expect("downloaded sources present")
         }
         None => {
             let sources = st

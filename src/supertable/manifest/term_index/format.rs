@@ -872,7 +872,6 @@ pub(crate) fn encode_slice(dict: &[u8], postings: &[u8]) -> Vec<u8> {
     out
 }
 
-/// An opened slice: its dictionary and postings region, borrowed.
 /// Where one dictionary block of a slice starts; see [`Slice::block_marks`].
 #[derive(Debug, Clone)]
 pub(crate) struct BlockMark {
@@ -885,6 +884,7 @@ pub(crate) struct BlockMark {
     pub(crate) tier_at: Option<u64>,
 }
 
+/// An opened slice: its dictionary and postings region, borrowed.
 pub(crate) struct Slice<'a> {
     dict: TermBlocks<'a>,
     postings: &'a [u8],
