@@ -454,11 +454,11 @@ unsafe fn expand_bitset_avx512(words: &[u8], base: u32, out: &mut [u32]) -> usiz
     let mut j = 0usize;
     for (wi, chunk) in words.chunks_exact(8).enumerate() {
         let word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        // No branch on an empty slice: a dense term's slices are seldom
+        // empty and a sparse one's unpredictably so, and an empty slice
+        // stores nothing through its all-clear mask.
         for quarter in 0..4u32 {
             let mask = (word >> (16 * quarter)) as u16;
-            if mask == 0 {
-                continue;
-            }
             let n = mask.count_ones() as usize;
             assert!(j + n <= out.len(), "bitset holds more docs than its block");
             let at = base.wrapping_add(wi as u32 * 64 + 16 * quarter) as i32;
@@ -467,7 +467,7 @@ unsafe fn expand_bitset_avx512(words: &[u8], base: u32, out: &mut [u32]) -> usiz
             // first `n` lanes: a compress straight to memory is microcoded,
             // and many times slower, on some AVX-512 cores.
             let packed = _mm512_maskz_compress_epi32(mask, ids);
-            let first_n = (u32::MAX >> (32 - n)) as __mmask16;
+            let first_n = ((1u32 << n) - 1) as __mmask16;
             // SAFETY: the target feature is enabled on this function (see the
             // contract above). The masked store writes `n` consecutive u32s
             // from `out[j]`, inside `out` by the assert above; masked-off
