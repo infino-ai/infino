@@ -70,6 +70,14 @@ const PARQUET_FOOTER_SUFFIX_BYTES: usize = PARQUET_FOOTER_LEN_FIELD_BYTES + PARQ
 /// cannot carry a footer, so footer parsing bails early.
 const PARQUET_MIN_FILE_BYTES: usize = PARQUET_MAGIC_LEN + PARQUET_FOOTER_SUFFIX_BYTES;
 
+/// Most rows a data page holds. The page index prunes a selective read
+/// down to whole pages, and every row of a kept page is decompressed and
+/// decoded, so a lookup that matches one row pays for its whole page.
+/// The writer's default (20 000 rows) makes a one-row read decode that
+/// many; 4096 cuts it fivefold while keeping the page count, and with it
+/// the header and page-index overhead a full scan pays, low.
+const DATA_PAGE_ROW_LIMIT: usize = 4096;
+
 /// Output of a successful build.
 pub struct ParquetParts {
     /// The complete superfile bytes (valid Parquet + embedded blobs).
@@ -258,8 +266,9 @@ impl ParquetBodyEncoder {
 }
 
 /// Writer properties for a body: `compression` everywhere, cut every
-/// `row_group_size` rows, with the given per-column page limits and no
-/// dictionary for `plain_columns`.
+/// `row_group_size` rows, pages of at most [`DATA_PAGE_ROW_LIMIT`] rows
+/// within the given per-column page limits, and no dictionary for
+/// `plain_columns`.
 fn writer_properties(
     compression: Compression,
     row_group_size: usize,
@@ -268,7 +277,8 @@ fn writer_properties(
 ) -> WriterProperties {
     let mut props_builder = WriterProperties::builder()
         .set_compression(compression)
-        .set_max_row_group_row_count(Some(row_group_size));
+        .set_max_row_group_row_count(Some(row_group_size))
+        .set_data_page_row_count_limit(DATA_PAGE_ROW_LIMIT);
     for (col, limit) in column_page_size_limits {
         props_builder = props_builder
             .set_column_data_page_size_limit(ColumnPath::from((*col).to_string()), *limit);
@@ -1022,7 +1032,10 @@ mod tests {
 
     use arrow_array::{Float64Array, StringArray, UInt64Array};
     use arrow_schema::{DataType, Field};
-    use parquet::{arrow::arrow_reader::ParquetRecordBatchReaderBuilder, basic::ZstdLevel};
+    use parquet::{
+        arrow::arrow_reader::ParquetRecordBatchReaderBuilder, basic::ZstdLevel,
+        file::metadata::PageIndexPolicy,
+    };
 
     use super::*;
 
@@ -1673,6 +1686,49 @@ mod tests {
             planned.body_len,
             default.body_len
         );
+    }
+
+    /// No data page holds more than `DATA_PAGE_ROW_LIMIT` rows, so a
+    /// selective read that keeps one page decodes at most that many.
+    #[test]
+    fn data_pages_hold_at_most_the_row_limit() {
+        const GROUPS: usize = 3;
+        let rows = GROUPS * TEST_GROUP_ROWS;
+        let (schema, batch) = unique_and_status(rows);
+        let body = encode_parquet_body_planned(
+            &schema,
+            slice::from_ref(&batch),
+            BodyPlan {
+                row_group_size: rows,
+                ..plan(&schema)
+            },
+        )
+        .expect("planned body");
+        let parts = splice_index_blobs(body, &[], &[], &[], &[]).expect("splice");
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&Bytes::from(parts.bytes))
+            .expect("metadata with page index");
+        let offsets = metadata.offset_index().expect("offset index");
+        for (group, columns) in metadata.row_groups().iter().zip(offsets) {
+            let group_rows = group.num_rows();
+            for column in columns {
+                let firsts: Vec<i64> = column
+                    .page_locations()
+                    .iter()
+                    .map(|page| page.first_row_index)
+                    .chain([group_rows])
+                    .collect();
+                assert!(firsts.len() > GROUPS, "pages {firsts:?}");
+                for pair in firsts.windows(2) {
+                    assert!(
+                        pair[1] - pair[0] <= DATA_PAGE_ROW_LIMIT as i64,
+                        "page of {} rows",
+                        pair[1] - pair[0]
+                    );
+                }
+            }
+        }
     }
 
     /// A body that dropped some dictionaries is ordinary Parquet: a standard
