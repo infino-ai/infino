@@ -72,10 +72,8 @@ const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 /// Keys that still load under their old name, as `(old, new)`. The old name
 /// is a serde alias of the new field, so a config using it keeps working;
 /// the loader warns so it gets updated before the alias is retired.
-const RENAMED_CONFIG_KEYS: &[(&str, &str)] = &[(
-    "compaction.max_memory_mb",
-    "compaction.max_merge_input_mb",
-)];
+const RENAMED_CONFIG_KEYS: &[(&str, &str)] =
+    &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")];
 
 const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
@@ -373,7 +371,8 @@ const DEFAULT_COMPACTION_MIN_FILL_PERCENT: u8 = 80;
 const DEFAULT_COMPACTION_MIN_SUPERFILES_FOR_MERGE: u64 = 50;
 /// Default cap on the raw input bytes one merge packs: the target plus room
 /// for a partition of unusually large superfiles.
-const DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB: u64 = DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
+const DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB: u64 =
+    DEFAULT_COMPACTION_TARGET_SUPERFILE_SIZE_MB + 2048;
 
 /// How old a tombstone sidecar seal has to be before compaction treats
 /// its owner as dead and takes over, instead of backing off.
@@ -1875,7 +1874,7 @@ impl Config {
     fn warn_renamed_keys(fig: &Figment) {
         for (old, new) in RENAMED_CONFIG_KEYS {
             if fig.find_value(old).is_ok() {
-                warn!(
+                tracing::warn!(
                     "`{old}` was renamed to `{new}`; the old key still loads but will be \
                      removed in a later release, so update the config file"
                 );
