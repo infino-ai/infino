@@ -1383,6 +1383,11 @@ fn accumulate_segment(
     c.advance_by(to - pos);
 }
 
+/// Slots of the window a run of eight dense postings adds into at a time:
+/// one 16-lane register of scores. The window's width is a multiple of it.
+const ACCUMULATE_TILE: usize = 16;
+const _: () = assert!((OR_WINDOW as usize).is_multiple_of(ACCUMULATE_TILE));
+
 /// The eight-wide loop of [`accumulate_segment`] over one in-window run of
 /// a block's postings, returning how many it consumed (a multiple of eight).
 /// Eight postings of a dense term usually span fewer than 16 documents; their
@@ -1429,7 +1434,7 @@ unsafe fn accumulate_run_avx512(
             .expect("invariant: an 8-wide slice");
         let first = (dids[0] - base) as usize;
         if dids[7] - dids[0] < 16
-            && first + 16 <= OR_WINDOW as usize
+            && ((dids[7] - base) as usize) < OR_WINDOW as usize
             && dids[0] as usize + 16 <= buckets.len()
         {
             let mut mask = 0u32;
@@ -1453,23 +1458,50 @@ unsafe fn accumulate_run_avx512(
                 norms
             };
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, norms);
-            // SAFETY: as above for the target features. The 16-lane load and
-            // store cover `[first, first + 16)`, inside the window slice by the
-            // check above; both are unaligned forms. The expand reads only the
-            // low eight source lanes (the mask has eight bits set), all of them
-            // defined by the 256-bit load.
+            // The eight docs land in the 16-slot tile holding the first and,
+            // when they cross its end, the next: tiles aligned to 16 slots, so
+            // the next run reads either a tile this one wrote whole, which the
+            // store forwards, or one it did not touch. An unaligned 16 slots
+            // from the first doc overlapped the previous run's store only in
+            // part, which stalled every run until that store drained.
+            let tile = first & !(ACCUMULATE_TILE - 1);
+            let wide = mask << (first - tile);
+            let (low, high) = (wide as u16, (wide >> ACCUMULATE_TILE) as u16);
+            // SAFETY: as above for the target features. The last doc's slot is
+            // inside the window by the check above, and tiles are aligned to a
+            // divisor of the window's width, so each tile written — the first's,
+            // and the next only when a doc falls in it — lies inside the window
+            // slice; the loads and stores are unaligned forms. Each expand
+            // reads only as many low source lanes as its mask has bits, at most
+            // the eight the 256-bit load defined; the second takes the lanes
+            // past the first tile's, moved down by the permute.
             unsafe {
                 let src = _mm512_castps256_ps512(_mm256_loadu_ps(contributions.as_ptr()));
-                let add = _mm512_maskz_expand_ps(mask as u16, src);
-                let slot = scores.as_mut_ptr().add(first);
+                let slot = scores.as_mut_ptr().add(tile);
+                let add = _mm512_maskz_expand_ps(low, src);
                 _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), add));
+                if high != 0 {
+                    let past = _mm512_set1_epi32(low.count_ones() as i32);
+                    let lanes = _mm512_add_epi32(
+                        _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                        past,
+                    );
+                    let rest = _mm512_permutexvar_ps(lanes, src);
+                    let add = _mm512_maskz_expand_ps(high, rest);
+                    let slot = slot.add(ACCUMULATE_TILE);
+                    _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), add));
+                }
             }
             let (word, bit) = (first >> 6, first & 63);
             present[word] |= u64::from(mask) << bit;
-            // A mask starting past bit 48 reaches into the next word, which
-            // exists: the run ends inside the window.
-            if bit > 48 {
-                present[word + 1] |= u64::from(mask) >> (64 - bit);
+            // A mask starting past bit 48 may reach into the next word; when
+            // it does, that word holds one of the run's docs, so it exists.
+            let spill = match bit {
+                0 => 0,
+                _ => u64::from(mask) >> (64 - bit),
+            };
+            if spill != 0 {
+                present[word + 1] |= spill;
             }
         } else {
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
