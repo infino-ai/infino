@@ -1709,7 +1709,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        build::{TIER_INLINE_MAX, shard_ranges},
+        build::{TIER_INLINE_MAX, key_ranges},
         format::{ROOT_MAGIC, Segment, SliceRef},
         *,
     };
@@ -1935,9 +1935,9 @@ mod tests {
     }
 
     /// Six hundred terms in one contribution, docs scored off `id`: with
-    /// slices cut small there are many boundaries to shard at, and heads
+    /// slices cut small there are many boundaries to range at, and heads
     /// both inline and chunked.
-    fn shard_contribution(dir: &TempDir, id: u128) -> Contribution {
+    fn range_contribution(dir: &TempDir, id: u128) -> Contribution {
         let terms: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
         let docs = |base: f32, n: u32| {
             (0..n)
@@ -1958,8 +1958,8 @@ mod tests {
         contribution_with_heads(dir, id, &entries, 64)
     }
 
-    /// The policy the shard tests build and merge under: slices cut small.
-    fn shard_policy() -> BuildPolicy {
+    /// The policy the range tests build and merge under: slices cut small.
+    fn range_policy() -> BuildPolicy {
         BuildPolicy {
             slice_target_bytes: 2048,
             tier_entries_per_term: 100_000,
@@ -2012,17 +2012,17 @@ mod tests {
         out
     }
 
-    /// A merge of `sources` in four shards writes the terms the one-writer
+    /// A merge of `sources` in four ranges writes the terms the one-writer
     /// merge writes, each with the same postings and tier entries, in
     /// slices that follow each other in key order.
-    fn assert_shards_match_one_writer(
+    fn assert_ranges_match_one_writer(
         sources: &[Vec<SliceFile>],
         ordinals: &[Option<u32>],
         policy: &BuildPolicy,
     ) {
-        let merge = |shards: usize| {
+        let merge = |ranges: usize| {
             let policy = BuildPolicy {
-                merge_shards: Some(shards),
+                merge_ranges: Some(ranges),
                 ..policy.clone()
             };
             merge_segments(sources, ordinals, &policy).expect("merge")
@@ -2030,7 +2030,7 @@ mod tests {
         let (one, many) = (merge(1), merge(4));
         assert!(
             many.segment.slices.len() >= 4,
-            "{} slices from the shards",
+            "{} slices from the ranges",
             many.segment.slices.len()
         );
         let ranges: Vec<(&[u8], &[u8])> = many
@@ -2041,22 +2041,22 @@ mod tests {
             .collect();
         assert!(
             ranges.windows(2).all(|w| w[0].1 < w[1].0),
-            "the shards' slices follow each other in key order"
+            "the ranges' slices follow each other in key order"
         );
         let (a, b) = (merged_terms(&one), merged_terms(&many));
         assert_eq!(a.len(), b.len(), "the same terms");
         assert_eq!(a, b, "the same postings and entries per term");
     }
 
-    /// A merge cut into key-range shards writes the terms one writer over
+    /// A merge cut into key ranges writes the terms one writer over
     /// everything writes: every key's postings and tier entries agree, and
-    /// the shards' slices follow each other in key order.
+    /// the ranges' slices follow each other in key order.
     #[test]
-    fn a_sharded_merge_writes_the_terms_one_writer_writes() {
+    fn a_merge_in_key_ranges_writes_the_terms_one_writer_writes() {
         let dir = TempDir::new().expect("tempdir");
-        let policy = shard_policy();
+        let policy = range_policy();
         let built = build(
-            &[shard_contribution(&dir, 1), shard_contribution(&dir, 2)],
+            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
             &policy,
         )
         .expect("build");
@@ -2067,20 +2067,20 @@ mod tests {
         let sources = vec![
             spill_slices(scratch.path(), &segment.slices, built.slices).expect("place slices"),
         ];
-        assert_shards_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
+        assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
     /// The same over two source segments, a base and a delta built onto
-    /// it, whose slices are cut at different keys: each shard takes the
+    /// it, whose slices are cut at different keys: each range takes the
     /// slices of each segment that reach into it and interleaves them.
     #[test]
-    fn a_sharded_merge_over_two_segments_writes_the_terms_one_writer_writes() {
+    fn a_merge_in_key_ranges_over_two_segments_writes_the_terms_one_writer_writes() {
         let dir = TempDir::new().expect("tempdir");
-        let policy = shard_policy();
-        let base = build(&[shard_contribution(&dir, 1)], &policy).expect("base");
+        let policy = range_policy();
+        let base = build(&[range_contribution(&dir, 1)], &policy).expect("base");
         let delta = build_onto(
             base.root.clone(),
-            &[shard_contribution(&dir, 2), shard_contribution(&dir, 3)],
+            &[range_contribution(&dir, 2), range_contribution(&dir, 3)],
             &policy,
         )
         .expect("delta");
@@ -2101,7 +2101,7 @@ mod tests {
             spill_slices(scratch.path(), base_refs, base.slices).expect("place base"),
             spill_slices(scratch.path(), delta_refs, delta.slices).expect("place delta"),
         ];
-        assert_shards_match_one_writer(&sources, &[Some(0), Some(1), Some(2)], &policy);
+        assert_ranges_match_one_writer(&sources, &[Some(0), Some(1), Some(2)], &policy);
     }
 
     /// A tier of more than a few entries is chunked into the slice's tier
@@ -7472,7 +7472,7 @@ mod tests {
             tier_entries_per_term: 100_000,
             ..BuildPolicy::default()
         };
-        let built = build(&[shard_contribution(&dir, 1)], &policy).expect("build");
+        let built = build(&[range_contribution(&dir, 1)], &policy).expect("build");
         assert_eq!(built.slices.len(), 1, "one slice at the default target");
         let bytes = bytes_of(&built.slices[0].1);
         let slice = Slice::open(&bytes).expect("open");
@@ -7505,17 +7505,17 @@ mod tests {
         );
     }
 
-    /// Shards are cut by the bytes they would merge, so a hot key range —
-    /// terms carrying most of the tier bytes — is spread over shards that
-    /// hold fewer terms each, cut inside a slice, and the sharded merge
+    /// Ranges are cut by the bytes they would merge, so a hot key range —
+    /// terms carrying most of the tier bytes — is spread over ranges that
+    /// hold fewer terms each, cut inside a slice, and the merge in key ranges
     /// still writes the terms the one-writer merge writes.
     #[test]
-    fn shard_cuts_fall_by_weight_not_by_slice() {
+    fn range_cuts_fall_by_weight_not_by_slice() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy {
             slice_target_bytes: 1 << 20,
             tier_entries_per_term: 100_000,
-            merge_shards: Some(4),
+            merge_ranges: Some(4),
             ..BuildPolicy::default()
         };
         let names: Vec<String> = (0..600).map(|i| format!("t{i:04}")).collect();
@@ -7540,8 +7540,8 @@ mod tests {
             spill_slices(dir.path(), &built.root.segments[0].slices, built.slices)
                 .expect("spill slices"),
         ];
-        let ranges = shard_ranges(&sources, &policy).expect("ranges");
-        assert_eq!(ranges.len(), 4, "four shards: {ranges:?}");
+        let ranges = key_ranges(&sources, &policy).expect("ranges");
+        assert_eq!(ranges.len(), 4, "four ranges: {ranges:?}");
         let slice_starts: Vec<&[u8]> = sources[0].iter().map(|f| f.first_key.as_slice()).collect();
         let cuts: Vec<&[u8]> = ranges.iter().filter_map(|(s, _)| s.as_deref()).collect();
         assert!(
@@ -7556,14 +7556,14 @@ mod tests {
             .iter()
             .map(|r| names.iter().filter(|t| in_range(t, r)).count())
             .collect();
-        let hot_shard = ranges
+        let hot_range = ranges
             .iter()
             .position(|r| in_range("t0300", r))
-            .expect("the hot range is in a shard");
+            .expect("the hot range is in a range");
         let most = counts.iter().copied().max().unwrap_or(0);
         assert!(
-            counts[hot_shard] < most && counts[hot_shard] * 2 < names.len(),
-            "a hot shard holds fewer terms than a cold one: {counts:?}"
+            counts[hot_range] < most && counts[hot_range] * 2 < names.len(),
+            "a hot range holds fewer terms than a cold one: {counts:?}"
         );
         let ordinals = [Some(0), Some(1), Some(2)];
         let many = merge_segments(&sources, &ordinals, &policy).expect("merge");
@@ -7571,7 +7571,7 @@ mod tests {
             &sources,
             &ordinals,
             &BuildPolicy {
-                merge_shards: Some(1),
+                merge_ranges: Some(1),
                 ..policy.clone()
             },
         )
@@ -7589,7 +7589,7 @@ mod tests {
             tier_entries_per_term: 100_000,
             ..BuildPolicy::default()
         };
-        let built = build(&[shard_contribution(&dir, 1)], &policy).expect("build");
+        let built = build(&[range_contribution(&dir, 1)], &policy).expect("build");
         assert!(built.slices.len() >= 4, "{} slices", built.slices.len());
         let store_dir = TempDir::new().expect("store");
         let local: Arc<dyn StorageProvider> =

@@ -15,11 +15,11 @@
 //! ```
 //!
 //! Knobs: `FOLD_THREADS` sizes the writer pool the merge runs on (default:
-//! the engine's own), `FOLD_SHARDS` fixes the merge's shard count (default:
+//! the engine's own), `FOLD_RANGES` fixes how many key ranges the merge is cut into (default:
 //! chosen by the engine from the sources and the pool), `FOLD_RUNS` repeats
 //! the merge (default 1), and `FOLD_UPLOAD=<uri>` also times writing the
 //! merged output to that prefix. Slices already in the scratch directory
-//! are not fetched again. Per-shard timing is logged at debug level under
+//! are not fetched again. Per-range timing is logged at debug level under
 //! the `term_index::fold` target.
 
 use std::{
@@ -113,7 +113,7 @@ fn fold_timing() {
         PathBuf::from(env::var("FOLD_SCRATCH").unwrap_or_else(|_| DEFAULT_SCRATCH.to_owned()));
     fs::create_dir_all(&scratch).expect("scratch dir");
     let threads: Option<usize> = env_num("FOLD_THREADS");
-    let shards: Option<usize> = env_num("FOLD_SHARDS");
+    let n_ranges: Option<usize> = env_num("FOLD_RANGES");
     let runs: usize = env_num("FOLD_RUNS").unwrap_or(1);
     let _ = fmt()
         .with_env_filter(EnvFilter::new("term_index::fold=debug"))
@@ -230,7 +230,7 @@ fn fold_timing() {
     let new_superfiles: Vec<_> = manifest.superfiles.iter().map(|e| e.superfile_id).collect();
     let policy = BuildPolicy {
         scoring_by_ordinal: Arc::new(scoring_by_ordinal(&manifest, &new_superfiles)),
-        merge_shards: shards,
+        merge_ranges: n_ranges,
         scratch_root: Some(scratch.join(OUT_DIR)),
         ..manifest.options.term_index_build_policy()
     };
@@ -239,7 +239,7 @@ fn fold_timing() {
         .as_deref()
         .map_or(rayon::current_num_threads(), |p| p.current_num_threads());
     eprintln!(
-        "FOLD inputs local_bytes={:.1}MiB ordinals={} dropped={dropped} pool_threads={pool_threads} shards={shards:?} avail_mem={:.1}GiB",
+        "FOLD inputs local_bytes={:.1}MiB ordinals={} dropped={dropped} pool_threads={pool_threads} ranges={n_ranges:?} avail_mem={:.1}GiB",
         mib(local_bytes),
         ordinals.len(),
         available_memory_bytes().unwrap_or(0) as f64 / (MIB * 1024.0),

@@ -949,7 +949,7 @@ impl<'a> Slice<'a> {
     /// offset of that key's run, and the offset of its first tier chunk when
     /// the run has chunks. Runs and chunks sit in key order, so the bytes
     /// between two consecutive marks are the bytes of the terms between
-    /// them: what a merge weighs when it cuts the key space into shards.
+    /// them: what a merge weighs when it cuts the key space into ranges.
     pub(crate) fn block_marks(&self) -> Result<Vec<BlockMark>, TermIndexError> {
         let mut out = Vec::with_capacity(self.dict.n_blocks());
         for b in 0..self.dict.n_blocks() {

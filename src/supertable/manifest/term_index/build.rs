@@ -108,7 +108,7 @@ pub(crate) struct BuildPolicy {
     /// Key ranges a merge of segments is cut into and merged in parallel;
     /// `None` chooses by the sources' size and the pool's width (see
     /// [`merge_segments`]).
-    pub(crate) merge_shards: Option<usize>,
+    pub(crate) merge_ranges: Option<usize>,
     /// For a merge: per superfile of the merged root, by ordinal, the
     /// average length and parameters its tier keys are computed at — the
     /// superfile's own, as the manifest records them. A build takes these
@@ -201,7 +201,7 @@ impl Default for BuildPolicy {
             pool: None,
             spill_to_disk: false,
             scratch_root: None,
-            merge_shards: None,
+            merge_ranges: None,
             scoring_by_ordinal: Arc::new(Vec::new()),
             scoring_by_superfile: Arc::new(HashMap::new()),
             tier_read_window_bytes: TIER_READ_WINDOW_BYTES,
@@ -1197,13 +1197,13 @@ struct SegmentWriter {
     ordinals: Arc<[Option<u32>]>,
     /// Seconds spent in the parallel encoding of batches (the writer's
     /// thread waits on each), in cutting slices, and the terms and tier
-    /// entries written: reported per shard by the merge.
+    /// entries written: reported per range by the merge.
     stats: WriterStats,
     /// Whether terms may splice their sources' tier blocks.
     splice: bool,
 }
 
-/// What a segment writer spent its time on, for the merge's per-shard
+/// What a segment writer spent its time on, for the merge's per-range
 /// trace event.
 #[derive(Debug, Default, Clone, Copy)]
 struct WriterStats {
@@ -1626,7 +1626,7 @@ pub(crate) fn build_segment(
 const MERGE_BATCH_TERMS: usize = 4096;
 
 /// A slice on local disk, with the key range its segment records for it,
-/// so a merge can be sharded and its sources selected without opening
+/// so a merge can be range-cut and its sources selected without opening
 /// a slice.
 #[derive(Debug, Clone)]
 pub(crate) struct SliceFile {
@@ -1668,7 +1668,7 @@ struct SegmentCursor {
     start: Option<Vec<u8>>,
     end: Option<Vec<u8>>,
     /// Seconds spent reading slice files and decoding batches, and
-    /// reading tier windows, for the merge's per-shard trace event.
+    /// reading tier windows, for the merge's per-range trace event.
     decode_secs: f64,
     read_secs: f64,
 }
@@ -1851,8 +1851,8 @@ fn tier_entries(
     Ok(())
 }
 
-/// Merge segments into one, in key-range shards on the pool when the
-/// sources are large (see [`shard_ranges`]), renumbering every posting through
+/// Merge segments into one, in key ranges on the pool when the
+/// sources are large (see [`key_ranges`]), renumbering every posting through
 /// `ordinals`: a posting naming old ordinal `i` names `ordinals[i]` in the
 /// result, and is dropped when that is `None` (a superfile that is gone, or
 /// padding). `sources` holds each segment's slices in key order, each with
@@ -1860,17 +1860,17 @@ fn tier_entries(
 /// their entries are pooled, renumbered and re-cut at the policy's budget.
 ///
 /// Runs come out in ascending new ordinal and are cut into slices as
-/// [`build_segment`] cuts them, with a cut at every shard bound as well.
-/// A merge in one shard whose ordinals follow the order a build would give
-/// its contributions writes the same bytes as that build; a sharded one
+/// [`build_segment`] cuts them, with a cut at every range bound as well.
+/// A merge in one range whose ordinals follow the order a build would give
+/// its contributions writes the same bytes as that build; a range-cut one
 /// writes the same terms, each with the same postings and tier entries,
-/// in slices cut at the shard bounds too.
+/// in slices cut at the range bounds too.
 pub(crate) fn merge_segments(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedSegment, TermIndexError> {
-    let ranges = shard_ranges(sources, policy)?;
+    let ranges = key_ranges(sources, policy)?;
     if ranges.len() <= 1 {
         return merge_range(sources, None, None, ordinals, policy);
     }
@@ -1913,12 +1913,12 @@ pub(crate) fn merge_segments(
     })
 }
 
-/// Sources of at least this many bytes are merged in key-range shards.
-const MERGE_SHARD_MIN_BYTES: u64 = 64 * 1024 * 1024;
-/// Shards a merge is cut into at most: each holds a cursor per segment
+/// Sources of at least this many bytes are merged in key ranges.
+const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+/// Ranges a merge is cut into at most: each holds a cursor per segment
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
-const MERGE_SHARDS_MAX: usize = 32;
+const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
 fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
@@ -1928,34 +1928,34 @@ fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) ->
 
 /// The key ranges a merge of `sources` is cut into: one when the sources
 /// are small or the policy says so, else up to the pool's width (at most
-/// [`MERGE_SHARDS_MAX`]), cut so that each range holds about the same
+/// [`MERGE_RANGES_MAX`]), cut so that each range holds about the same
 /// bytes of runs and tier chunks. The weights come from the slices'
 /// dictionary block marks (see [`Slice::block_marks`]): a block's bytes
 /// are what lies between its mark and the next, and a cut falls on a
 /// block's first key. Cutting by slice count instead left the common
 /// terms' ranges — a few thousand terms carrying most of the tier bytes —
-/// in a handful of shards that took the whole merge's wall time.
-pub(crate) fn shard_ranges(
+/// in a handful of ranges that took the whole merge's wall time.
+pub(crate) fn key_ranges(
     sources: &[Vec<SliceFile>],
     policy: &BuildPolicy,
 ) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, TermIndexError> {
     let single = vec![(None, None)];
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
-    let want = match policy.merge_shards {
+    let want = match policy.merge_ranges {
         Some(n) => n.max(1),
         None => {
             let mut bytes = 0u64;
             for file in &files {
                 bytes += fs::metadata(&file.path)?.len();
             }
-            if bytes < MERGE_SHARD_MIN_BYTES {
+            if bytes < MERGE_RANGE_MIN_BYTES {
                 return Ok(single);
             }
             policy
                 .pool
                 .as_deref()
                 .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
-                .clamp(1, MERGE_SHARDS_MAX)
+                .clamp(1, MERGE_RANGES_MAX)
         }
     };
     if want <= 1 {
@@ -1966,7 +1966,7 @@ pub(crate) fn shard_ranges(
     // over the slices before the merge reads them again. A block whose
     // first run has no chunks is weighed by its runs alone and its chunk
     // bytes fall to the next block that has them; a few blocks' worth of
-    // tier bytes can shift a cut, which is well within a shard.
+    // tier bytes can shift a cut, which is well within a range.
     let weigh = |file: &SliceFile| -> Result<Vec<(Vec<u8>, u64)>, TermIndexError> {
         let bytes = fs::read(&file.path)?;
         let slice = Slice::open(&bytes)?;
@@ -2007,10 +2007,10 @@ pub(crate) fn shard_ranges(
     if marks.len() < 2 || total == 0 {
         return Ok(single);
     }
-    // Cut where the running weight crosses each shard's share; the
+    // Cut where the running weight crosses each range's share; the
     // smallest key is never a cut (every source's first slice may mark
     // it), and no key is cut twice. One block holding nearly every byte
-    // leaves no cut, and the merge runs in one shard.
+    // leaves no cut, and the merge runs in one range.
     let n = want.min(marks.len());
     let share = total.div_ceil(n as u64);
     let mut cuts: Vec<Vec<u8>> = Vec::with_capacity(n);
@@ -2155,7 +2155,7 @@ fn merge_range(
         terms = stats.terms,
         entries = stats.entries,
         out_slices = slices.len(),
-        "fold shard"
+        "fold range"
     );
     Ok(MergedSegment {
         segment,
