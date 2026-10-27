@@ -1352,7 +1352,9 @@ impl SupertableReader {
                     required,
                     scoring,
                     phrases: tier_phrases,
-                    negated: !negatives.is_empty(),
+                    // A negated phrase excludes as a negated term does: the
+                    // heads cannot see the adjacency that unmakes a match.
+                    negated: !negatives.is_empty() || !negative_phrases.is_empty(),
                     k,
                     deny,
                     table_avgdl,

@@ -314,9 +314,9 @@ pub(crate) struct TierQuery<'a> {
     /// counted, as the kernel weights it — times the smallest member key
     /// of the document, the bound the ceiling path uses.
     pub(crate) phrases: Vec<(Vec<usize>, bool)>,
-    /// Whether the query negates terms: a document the heads show cannot
-    /// then be taken as a match, so the merge bounds and orders but seeds
-    /// no threshold and answers for nothing.
+    /// Whether the query negates terms or phrases: a document the heads
+    /// show cannot then be taken as a match, so the merge bounds and
+    /// orders but seeds no threshold and answers for nothing.
     pub(crate) negated: bool,
     pub(crate) k: usize,
     /// Per kept superfile, the rows deleted since it was written, when

@@ -202,6 +202,17 @@ pub fn queries() -> Vec<(String, BoolMode)> {
         out.push((q.to_owned(), BoolMode::Or));
         out.push((q.to_owned(), BoolMode::And));
     }
+    // A negated phrase: the heads cannot verify the adjacency that unmakes
+    // a match, so the merge must not settle a superfile from them. The
+    // planted pair makes the exclusion bite.
+    for q in [
+        "quokka -\"quokka tensor\"",
+        "+the -\"quokka tensor\"",
+        "tensor -\"the data\"",
+    ] {
+        out.push((q.to_owned(), BoolMode::Or));
+        out.push((q.to_owned(), BoolMode::And));
+    }
     out
 }
 
