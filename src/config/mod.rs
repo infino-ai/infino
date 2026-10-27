@@ -69,12 +69,6 @@ const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 /// would otherwise be handed that default back with nothing to indicate their
 /// setting had stopped applying — resident memory and per-open cost changing
 /// under them on an upgrade. Failing the load is the loud version.
-/// Keys that still load under their old name, as `(old, new)`. The old name
-/// is a serde alias of the new field, so a config using it keeps working;
-/// the loader warns so it gets updated before the alias is retired.
-const RENAMED_CONFIG_KEYS: &[(&str, &str)] =
-    &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")];
-
 const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
     (
         "vector.hnsw_recall_slack",
@@ -87,6 +81,15 @@ const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
         "vector.hnsw_plane — `sq8` is the old `true`, `sq16` the old `false`",
     ),
 ];
+
+/// Keys that still load under their old name, as `(old, new)`. The old name
+/// is a serde alias of the new field, so a config using it keeps working;
+/// the loader warns so it gets updated before the alias is retired. The
+/// embedded default must not set a renamed key under its new name: the alias
+/// makes old and new the same field, and a file layered over such a default
+/// with the old name would then set it twice and be rejected.
+const RENAMED_CONFIG_KEYS: &[(&str, &str)] =
+    &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")];
 
 /// Engine default connection budget when none is configured; used by both
 /// [`MemorySettings`] and the connect path. `0` is the deliberate measure-only
@@ -431,8 +434,10 @@ pub struct CompactionSettings {
     /// the host's free memory.
     ///
     /// The YAML key `max_memory_mb` is the deprecated name of this setting;
-    /// it still loads, with a warning, and is listed in
-    /// [`RENAMED_CONFIG_KEYS`]. A file that sets both is rejected.
+    /// it still loads, with a warning, as the one entry of the loader's
+    /// renamed-keys list. A file that sets both names is rejected. The
+    /// embedded default leaves this key unset for that reason: a value there
+    /// would clash with every config still using the old name.
     #[serde(alias = "max_memory_mb")]
     pub max_merge_input_mb: u64,
     /// How many of a pass's merge jobs may be in flight at once.
@@ -2621,6 +2626,30 @@ supertable:
             RENAMED_CONFIG_KEYS,
             &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")],
             "the legacy key is the one the loader warns about"
+        );
+    }
+
+    /// The embedded default leaves every renamed key unset under its new
+    /// name, or a config still using the old name would clash with it.
+    #[test]
+    fn embedded_default_leaves_renamed_keys_unset() {
+        let fig = Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT));
+        for (old, new) in RENAMED_CONFIG_KEYS {
+            assert!(
+                fig.find_value(new).is_err(),
+                "`{new}` is set in the embedded default, which would reject every \
+                 config that still sets `{old}`"
+            );
+            assert!(
+                fig.find_value(old).is_err(),
+                "`{old}` in the embedded default"
+            );
+        }
+        // The value still comes from the struct default, not from nowhere.
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(
+            cfg.compaction.max_merge_input_mb,
+            DEFAULT_COMPACTION_MAX_MERGE_INPUT_MB
         );
     }
 

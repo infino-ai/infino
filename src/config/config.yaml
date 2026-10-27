@@ -145,9 +145,14 @@ compaction:
   # Cap on the raw input bytes one merge packs, in MiB: the packer stops
   # adding superfiles to a job once it would cross this. Not a bound on the
   # merge's resident memory, and not the number of merges in flight (the
-  # runner admits those against the host's free memory).
-  # `max_memory_mb` is the old name of this key; it still loads, with a warning.
-  max_merge_input_mb: 3072
+  # runner admits those against the host's free memory). Defaults to the
+  # target plus 2048 (3072 with the shipped target).
+  #
+  # The default is left unset here on purpose: `max_memory_mb` is the old
+  # name of this key and still loads, with a warning, but a file layered over
+  # a default that already names the key would set the same value twice and
+  # be rejected. Setting both names in one file is rejected for that reason.
+  # max_merge_input_mb: 3072
 
 # Vector-index build / search / drain tuning. Every value below
 # defaults to the engine's built-in behavior — a fresh install never
