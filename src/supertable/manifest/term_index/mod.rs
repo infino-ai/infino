@@ -120,10 +120,15 @@ const RESIDENT_RUNS: usize = 4096;
 /// beyond the resident set while their terms decode.
 const SLICE_FETCH_CONCURRENCY: usize = 8;
 
-/// Slices one build writes at once. A full rebuild writes hundreds of
-/// slices of several MB each, and one after another the upload alone took
-/// minutes; this overlaps them while bounding the requests in flight.
-const SLICE_WRITE_CONCURRENCY: usize = 8;
+/// Objects a merge downloads at once. A rebuild at a billion documents
+/// reads over a hundred gigabytes of slices and tier objects, and at eight
+/// in flight the transfer alone took minutes at a fraction of the host's
+/// bandwidth; the client keeps far more warm connections than this.
+const SEGMENT_FETCH_CONCURRENCY: usize = 32;
+
+/// Objects one build writes at once; the write-side twin of
+/// [`SEGMENT_FETCH_CONCURRENCY`].
+const SLICE_WRITE_CONCURRENCY: usize = 32;
 
 /// Ordinals a reserved segment leaves free past the root it was built
 /// against, for the deltas other commits append while its own commit
@@ -778,7 +783,7 @@ pub(crate) async fn download_segments(
             }
         });
     stream::iter(fetches)
-        .buffer_unordered(SLICE_FETCH_CONCURRENCY)
+        .buffer_unordered(SEGMENT_FETCH_CONCURRENCY)
         .try_collect::<()>()
         .await?;
     Ok(segments
