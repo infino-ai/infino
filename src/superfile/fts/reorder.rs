@@ -38,7 +38,7 @@ use std::{
     fmt, mem,
     sync::{
         Mutex, PoisonError,
-        atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed},
     },
     time::Instant,
 };
@@ -967,7 +967,7 @@ impl BisectState {
                 }
                 let step = timed.then(Instant::now);
                 let cpu = timed.then(thread_cpu_ns).flatten();
-                self.compute_move_gains(n_left, n_right);
+                self.compute_move_gains(n_left, n_right, parallel);
                 if let Some(step) = step {
                     level.gains_ns += ns_since(step);
                     level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -1012,6 +1012,10 @@ impl BisectState {
                     }
                     swaps += 1;
                     gain += f64::from(l.0 + r.0);
+                    if parallel {
+                        // Applied below, once the round knows its swaps.
+                        continue;
+                    }
                     let (li, ri) = (l.1 as usize, r.1 as usize);
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
@@ -1025,6 +1029,34 @@ impl BisectState {
                     }
                     left[li] = rd;
                     right[ri] = ld;
+                }
+                if parallel && swaps > 0 {
+                    // Which pairs swap depends only on the ranked gains, and
+                    // every pair names its own two positions, so the swaps can
+                    // land in any order. Degrees are counts, so adding them up
+                    // in parallel ends at the same tables.
+                    let (deg_left, deg_right) = (
+                        as_atomic(&mut self.deg_left),
+                        as_atomic(&mut self.deg_right),
+                    );
+                    let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
+                    let (left_docs, right_docs) = (&*left, &*right);
+                    lefts.par_iter().zip(rights).for_each(|(l, r)| {
+                        for &t in fwd.doc(left_docs[l.1 as usize]) {
+                            deg_left[t as usize].fetch_sub(1, Relaxed);
+                            deg_right[t as usize].fetch_add(1, Relaxed);
+                        }
+                        for &t in fwd.doc(right_docs[r.1 as usize]) {
+                            deg_right[t as usize].fetch_sub(1, Relaxed);
+                            deg_left[t as usize].fetch_add(1, Relaxed);
+                        }
+                    });
+                    for (l, r) in lefts.iter().zip(rights) {
+                        let (li, ri) = (l.1 as usize, r.1 as usize);
+                        let (ld, rd) = (left[li], right[ri]);
+                        left[li] = rd;
+                        right[ri] = ld;
+                    }
                 }
                 if let Some(step) = step {
                     level.swap_ns += ns_since(step);
@@ -1113,7 +1145,45 @@ impl BisectState {
     /// Fill the move gains of every term in the partition from its
     /// current degrees. A side's gain is only read by documents on that
     /// side carrying the term, so a side with no such document is skipped.
-    fn compute_move_gains(&mut self, n_left: f32, n_right: f32) {
+    fn compute_move_gains(&mut self, n_left: f32, n_right: f32, parallel: bool) {
+        if parallel {
+            // Each term's gains read only its own degrees and write only its
+            // own entries, so the terms can be done in any order.
+            let Self {
+                deg_left,
+                deg_right,
+                move_gain_left,
+                move_gain_right,
+                cost_left,
+                cost_right,
+                touched,
+                ..
+            } = self;
+            let (gain_left, gain_right) = (as_atomic(move_gain_left), as_atomic(move_gain_right));
+            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
+            let (cost_left, cost_right) = (cost_left.as_slice(), cost_right.as_slice());
+            touched.par_iter().for_each(|&t| {
+                let t = t as usize;
+                let (dl, dr) = (deg_left[t], deg_right[t]);
+                let left = Side {
+                    deg: dl,
+                    size: n_left,
+                    costs: cost_left,
+                };
+                let right = Side {
+                    deg: dr,
+                    size: n_right,
+                    costs: cost_right,
+                };
+                if dl > 0 {
+                    gain_left[t].store(move_gain(&left, &right).to_bits(), Relaxed);
+                }
+                if dr > 0 {
+                    gain_right[t].store(move_gain(&right, &left).to_bits(), Relaxed);
+                }
+            });
+            return;
+        }
         for &t in &self.touched {
             let t = t as usize;
             let (dl, dr) = (self.deg_left[t], self.deg_right[t]);
@@ -1218,6 +1288,21 @@ fn order_leading_gains(gains: &mut [(f32, u32)], want: usize, parallel: bool) {
         false => head.sort_by(by),
     }
 }
+
+/// A table of 32-bit words viewed as atomics, so threads that each update
+/// their own entries, or add to shared counts, can share it.
+fn as_atomic<T: Word32>(table: &mut [T]) -> &[AtomicU32] {
+    const { assert!(size_of::<T>() == 4 && align_of::<T>() == align_of::<AtomicU32>()) };
+    // SAFETY: `T` is a plain 32-bit word with `AtomicU32`'s size and alignment,
+    // and the exclusive borrow keeps every other access out while the view
+    // lives.
+    unsafe { &*(table as *mut [T] as *const [AtomicU32]) }
+}
+
+/// The word types [`as_atomic`] views.
+trait Word32: Copy {}
+impl Word32 for u32 {}
+impl Word32 for f32 {}
 
 /// One half of a split, as a term's move gain sees it.
 struct Side<'a> {
