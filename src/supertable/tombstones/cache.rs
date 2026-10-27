@@ -569,7 +569,9 @@ mod tests {
         cache.reconcile(view(1, &[(mapped, 1)]));
 
         let now = Instant::now();
-        cache.prefetch_seals(&[unmapped, mapped, untouched], now).await;
+        cache
+            .prefetch_seals(&[unmapped, mapped, untouched], now)
+            .await;
         assert_eq!(cache.len(), 3, "one entry per prefetched id, sealed or not");
         for id in [unmapped, mapped] {
             let seal = cache.seal_for(id, now).expect("seal");

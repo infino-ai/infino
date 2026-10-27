@@ -4191,7 +4191,10 @@ mod tests {
             .expect("the pass succeeds around the held input");
         let after = listed_ids(&st);
         assert!(after.len() < 10, "the free inputs merged");
-        assert!(after.contains(&held), "the held input was left to its holder");
+        assert!(
+            after.contains(&held),
+            "the held input was left to its holder"
+        );
 
         // Past the threshold the seal is abandoned and the input is fair
         // game. Two files are left, too few bytes for the size trigger, so
