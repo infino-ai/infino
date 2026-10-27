@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashMap,
-    env, fs,
+    env, fs, io,
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
@@ -30,6 +30,7 @@ use std::{
 
 use arrow::datatypes::{DataType, Field, Schema};
 use rayon::ThreadPoolBuilder;
+use tracing_subscriber::{EnvFilter, fmt};
 
 use super::{
     build::{BuildPolicy, BuiltBytes, SliceFile, merge_segments, tier_path},
@@ -124,6 +125,11 @@ fn fold_timing() {
     let shards: Option<usize> = env_num("FOLD_SHARDS");
     let runs: usize = env_num("FOLD_RUNS").unwrap_or(1);
 
+    let _ = fmt()
+        .with_env_filter(EnvFilter::new("term_index::fold=info"))
+        .with_writer(io::stderr)
+        .with_target(false)
+        .try_init();
     let storage = storage_for(&table);
     let schema = Arc::new(Schema::new(vec![Field::new(
         COLUMN,

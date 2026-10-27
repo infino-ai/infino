@@ -29,6 +29,7 @@ use std::{
     mem,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    time::Instant,
 };
 
 use rayon::{ThreadPool, prelude::*};
@@ -956,6 +957,19 @@ struct SegmentWriter {
     /// How a merge renumbers the ordinals of the tiers it decodes; empty for
     /// a build, whose entries arrive numbered.
     ordinals: Arc<[Option<u32>]>,
+    /// Seconds spent in the parallel encoding of batches (the writer's
+    /// thread waits on each), in cutting slices, and the terms and tier
+    /// entries written: reported per shard by the merge.
+    stats: WriterStats,
+}
+
+/// What a segment writer spent its time on.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct WriterStats {
+    pub(crate) encode_secs: f64,
+    pub(crate) cut_secs: f64,
+    pub(crate) terms: u64,
+    pub(crate) entries: u64,
 }
 
 impl SegmentWriter {
@@ -979,6 +993,7 @@ impl SegmentWriter {
             pending_entries: 0,
             pool: policy.pool.clone(),
             ordinals: Arc::from(Vec::new()),
+            stats: WriterStats::default(),
         })
     }
 
@@ -1059,6 +1074,7 @@ impl SegmentWriter {
         entries: Vec<TierEntry>,
         sources: Vec<TierSource>,
     ) -> Result<(), TermIndexError> {
+        self.stats.terms += 1;
         self.pending_entries += entries.len();
         for source in &sources {
             self.pending_entries += source
@@ -1083,7 +1099,9 @@ impl SegmentWriter {
     /// Decode and encode the queued terms' tiers in parallel, then write
     /// each in order.
     fn flush_pending(&mut self) -> Result<(), TermIndexError> {
+        let started = Instant::now();
         let batch = mem::take(&mut self.pending);
+        self.stats.entries += self.pending_entries as u64;
         self.pending_entries = 0;
         let budget = self.tier_entries_per_term;
         let depth = self.head_depth;
@@ -1104,6 +1122,7 @@ impl SegmentWriter {
             Some(pool) => pool.install(encode),
             None => encode(),
         }?;
+        self.stats.encode_secs += started.elapsed().as_secs_f64();
         for term in encoded {
             self.add_encoded(term)?;
         }
@@ -1135,6 +1154,7 @@ impl SegmentWriter {
     /// slice is named by its hash and its tier object beside it by the same
     /// hash, as [`tier_path`] places them for a merge.
     fn cut(&mut self) -> Result<(), TermIndexError> {
+        let started = Instant::now();
         let tier_bytes = (!self.current_tier.is_empty()).then(|| mem::take(&mut self.current_tier));
         let tier = tier_bytes.as_ref().map(|bytes| ContentHash::of(bytes));
         if let Some((reference, bytes)) =
@@ -1149,6 +1169,7 @@ impl SegmentWriter {
             self.slice_bytes.push((reference.content_hash, kept));
             self.slices.push(reference);
         }
+        self.stats.cut_secs += started.elapsed().as_secs_f64();
         Ok(())
     }
 
@@ -1693,6 +1714,10 @@ fn merge_range(
     let mut run: Vec<Posting> = Vec::new();
     let mut sources: Vec<TierSource> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
+    let started = Instant::now();
+    let mut cursor_secs = 0f64;
+    let mut tier_secs = 0f64;
+    let mut tier_bytes = 0u64;
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
         run.clear();
@@ -1714,7 +1739,10 @@ fn merge_range(
                         })
                     }));
                 } else {
+                    let t = Instant::now();
                     let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
+                    tier_secs += t.elapsed().as_secs_f64();
+                    tier_bytes += bytes.len() as u64;
                     sources.push(TierSource {
                         bytes,
                         base,
@@ -1735,7 +1763,10 @@ fn merge_range(
                 }
                 Some(p)
             }));
-            if let Some((key, next_run)) = cursors[source as usize].next()? {
+            let t = Instant::now();
+            let advanced = cursors[source as usize].next()?;
+            cursor_secs += t.elapsed().as_secs_f64();
+            if let Some((key, next_run)) = advanced {
                 heap.push(Reverse(MergeHead {
                     key,
                     ordinal: source,
@@ -1760,7 +1791,26 @@ fn merge_range(
             mem::take(&mut sources),
         )?;
     }
+    // Flush and cut here so the last batch's time is in the stats.
+    writer.flush_pending()?;
+    writer.cut()?;
+    let stats = writer.stats;
     let (segment, slices, tiers) = writer.finish()?;
+    tracing::info!(
+        target: "term_index::fold",
+        start = %String::from_utf8_lossy(start.unwrap_or(b"")),
+        end = %String::from_utf8_lossy(end.unwrap_or(b"")),
+        secs = started.elapsed().as_secs_f64(),
+        cursor_secs,
+        tier_secs,
+        tier_mib = tier_bytes as f64 / (1024.0 * 1024.0),
+        encode_secs = stats.encode_secs,
+        cut_secs = stats.cut_secs,
+        terms = stats.terms,
+        entries = stats.entries,
+        out_slices = slices.len(),
+        "fold shard"
+    );
     Ok(MergedSegment {
         segment,
         slices,
