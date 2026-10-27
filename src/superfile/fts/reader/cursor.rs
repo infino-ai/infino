@@ -23,6 +23,8 @@ use super::{
     core::{TermIdf, read_u32_le, read_u64_le},
     metadata::ColumnMeta,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::superfile::fts::posting::ENCODING_BITSET;
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -1596,6 +1598,25 @@ impl TermCursor {
     /// Whether the current block's doc ids and tfs are all decoded in the
     /// buffers (not a lazily held bitset block showing one doc).
     #[inline]
+    /// The current block's presence bitset when the cursor holds the block
+    /// whole and it is stored as one: the doc its first bit stands for, and
+    /// where its bytes sit in [`Self::bytes`].
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn whole_bitset(&mut self) -> Option<(u32, Range<usize>)> {
+        if self.predecoded || !self.holds_whole_block() {
+            return None;
+        }
+        let hdr = self.current_header();
+        if hdr.encoding != ENCODING_BITSET {
+            return None;
+        }
+        let block = self.blocks[self.current_block];
+        Some((
+            hdr.base,
+            block.block_byte_offset + hdr.payload()..block.block_byte_end - hdr.tfs_size(),
+        ))
+    }
+
     pub(super) fn holds_whole_block(&self) -> bool {
         !self.is_exhausted()
             && !self.is_lazy()
