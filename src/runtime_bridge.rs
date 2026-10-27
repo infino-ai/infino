@@ -42,7 +42,7 @@ use rayon::ThreadPool;
 use tokio::{
     runtime::{self, Handle, Runtime},
     sync::oneshot,
-    task::block_in_place,
+    task::{self, block_in_place},
 };
 use tracing::{Instrument, Span};
 
@@ -194,6 +194,29 @@ where
     rx.await.map_err(|_| PoolDropped(what))
 }
 
+/// [`run_on_pool`], unless the caller is blocking on this future itself:
+/// one driven by a `block_on` on the caller's own thread rather than run as
+/// a spawned task runs `f` inline, as no runtime worker waits under it and
+/// the hop to a pool thread and back would only add a wake-up to the
+/// caller's latency. A spawned task still hands `f` to the pool, so no
+/// runtime worker ever blocks under the compute. Futures joined under one
+/// `block_on` share its thread, so their kernels run one after another
+/// there; a caller wanting them in parallel spawns them.
+pub(crate) async fn run_on_pool_unless_blocking<R, F>(
+    pool: Option<&ThreadPool>,
+    what: &'static str,
+    f: F,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if task::try_id().is_none() {
+        return Ok(f());
+    }
+    run_on_pool(pool, what, f).await
+}
+
 /// Process-wide query runtime, shared by every `Connection` and
 /// `Supertable` so open handles add zero tokio workers. Never shut
 /// down — the static keeps a reference until process exit, so handle
@@ -288,6 +311,43 @@ mod tests {
         assert_eq!(
             thread::spawn(observe).join().expect("thread ran"),
             scheduler
+        );
+    }
+
+    /// A caller blocking on the future runs the work on its own thread; a
+    /// spawned task hands it to the pool, so no runtime worker computes.
+    #[test]
+    fn work_runs_inline_only_for_a_caller_blocking_on_it() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let rt = build_current_thread_runtime();
+        let caller = thread::current().id();
+        let ran_on = rt.block_on(run_on_pool_unless_blocking(Some(&pool), "inline", || {
+            thread::current().id()
+        }));
+        assert_eq!(
+            ran_on.expect("ran"),
+            caller,
+            "a blocking caller runs it inline"
+        );
+
+        let pool = Arc::new(pool);
+        let (task_thread, ran_on) = rt.block_on(async move {
+            tokio::spawn(async move {
+                let ran_on =
+                    run_on_pool_unless_blocking(Some(&pool), "pooled", || thread::current().id())
+                        .await;
+                (thread::current().id(), ran_on)
+            })
+            .await
+            .expect("task ran")
+        });
+        assert_ne!(
+            ran_on.expect("ran"),
+            task_thread,
+            "a spawned task hands it to the pool"
         );
     }
 

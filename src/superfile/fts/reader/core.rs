@@ -16,8 +16,10 @@
 //! then it's a borrowed view).
 
 use std::{
+    cell::RefCell,
     cmp::Reverse,
     collections::{BinaryHeap, HashMap},
+    mem,
     ops::Range,
     sync::{Arc, OnceLock},
 };
@@ -2252,12 +2254,6 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         let both = cursors[0].df.saturating_add(cursors[1].df);
         return both.saturating_sub(count_and_planned(cursors));
     }
-    // Fast path: when one term's list dwarfs the rest, count it as
-    // `df(dominant) + |others \ dominant|` instead of walking the
-    // dominant term's whole posting list. See `or_count_anchored`.
-    if let Some(anchor) = dominant_anchor_index(&cursors) {
-        return or_count_anchored(cursors, anchor);
-    }
     // Dense union (no dominant term, but the terms together cover a large
     // fraction of the corpus — e.g. a 3-4 common-word title): OR all doc
     // ids into one doc-space bitset and popcount. Avoids the per-window
@@ -2271,6 +2267,12 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
         .unwrap_or(0);
     if total_df.saturating_mul(OR_COUNT_BITSET_DENSITY_DIVISOR) >= u64::from(max_doc) {
         return or_count_bitset(cursors, max_doc);
+    }
+    // Fast path: when one term's list dwarfs the rest, count it as
+    // `df(dominant) + |others \ dominant|` instead of walking the
+    // dominant term's whole posting list. See `or_count_anchored`.
+    if let Some(anchor) = dominant_anchor_index(&cursors) {
+        return or_count_anchored(cursors, anchor);
     }
     if or_count_prefers_heap(cursors.len(), total_df, max_doc) {
         let mut n = 0u64;
@@ -2364,12 +2366,85 @@ fn or_count_prefers_heap(terms: usize, total_df: u64, max_doc: u32) -> bool {
 /// full-corpus alloc + popcount would dominate on a sparse one.
 fn or_count_bitset(cursors: Vec<TermCursor>, max_doc: u32) -> u64 {
     let words = max_doc as usize / 64 + 1;
-    let mut union = vec![0u64; words];
-    let mut scratch = [0u32; BLOCK_LEN];
-    for c in &cursors {
-        or_cursor_into_bitset(&mut union, c, &mut scratch);
+    with_fold_bitset(words, |union| {
+        or_cursors_into_bitset(union, &cursors);
+        popcount_and_clear(union)
+    })
+}
+
+/// The set bits of `words`, which are left all zero.
+pub(super) fn popcount_and_clear(words: &mut [u64]) -> u64 {
+    words
+        .iter_mut()
+        .map(|w| u64::from(mem::take(w).count_ones()))
+        .sum()
+}
+
+/// Doc-space bitsets the counting folds reuse from query to query, all zero
+/// between uses unless `dirty`.
+struct FoldBitsets {
+    a: Vec<u64>,
+    b: Vec<u64>,
+    dirty: bool,
+}
+
+thread_local! {
+    static FOLD_BITSETS: RefCell<FoldBitsets> = const {
+        RefCell::new(FoldBitsets { a: Vec::new(), b: Vec::new(), dirty: false })
+    };
+}
+
+/// Most words of fold bitsets a thread keeps between queries. A thread keeps
+/// only what the largest superfile it counted needed — an eighth of a byte
+/// per doc — so this bounds the rare outsized one: 64M docs, 8 MiB a bitset,
+/// covers a default-sized superfile of docs down to about 16 bytes each. A
+/// superfile past it allocates its bitsets per count instead.
+const FOLD_BITSETS_KEEP_WORDS: usize = 1 << 20;
+
+/// Run `f` over one all-zero doc-space bitset of `words` words, which it must
+/// leave all zero, as [`with_fold_bitsets`] does for two.
+fn with_fold_bitset<R>(words: usize, f: impl FnOnce(&mut [u64]) -> R) -> R {
+    with_fold_sets(words, false, |a, _| f(a))
+}
+
+/// Run `f` over two all-zero doc-space bitsets of `words` words, which it
+/// must leave all zero (a fold reads its result with
+/// [`popcount_and_clear`]). They are kept per thread, so a count neither
+/// allocates nor clears a corpus-sized bitset before it starts; a count that
+/// panicked part-way leaves them marked, and the next clears them first.
+pub(super) fn with_fold_bitsets<R>(words: usize, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
+    with_fold_sets(words, true, f)
+}
+
+/// The per-thread bitsets behind [`with_fold_bitset`] and
+/// [`with_fold_bitsets`]; the second is empty, and never grown, unless
+/// `both`.
+fn with_fold_sets<R>(words: usize, both: bool, f: impl FnOnce(&mut [u64], &mut [u64]) -> R) -> R {
+    if words > FOLD_BITSETS_KEEP_WORDS {
+        let mut b = if both { vec![0u64; words] } else { Vec::new() };
+        return f(&mut vec![0u64; words], &mut b);
     }
-    union.iter().map(|w| w.count_ones() as u64).sum()
+    FOLD_BITSETS.with_borrow_mut(|fb| {
+        if fb.dirty {
+            fb.a.fill(0);
+            fb.b.fill(0);
+        }
+        if fb.a.len() < words {
+            fb.a.resize(words, 0);
+        }
+        if both && fb.b.len() < words {
+            fb.b.resize(words, 0);
+        }
+        fb.dirty = true;
+        let b: &mut [u64] = if both { &mut fb.b[..words] } else { &mut [] };
+        let out = f(&mut fb.a[..words], b);
+        debug_assert!(
+            fb.a.iter().chain(&fb.b).all(|&w| w == 0),
+            "a fold must leave its bitsets clear"
+        );
+        fb.dirty = false;
+        out
+    })
 }
 
 /// OR one cursor's doc presence into `dest` (a doc-space bitset spanning at
@@ -2395,6 +2470,14 @@ pub(super) fn or_cursor_into_bitset(
     }
     for b in 0..c.blocks.len() {
         or_block_into(dest, c, b, 0, scratch);
+    }
+}
+
+/// [`or_cursor_into_bitset`] for each of `cursors`.
+pub(super) fn or_cursors_into_bitset(dest: &mut [u64], cursors: &[TermCursor]) {
+    let mut scratch = [0u32; BLOCK_LEN];
+    for c in cursors {
+        or_cursor_into_bitset(dest, c, &mut scratch);
     }
 }
 
@@ -2554,7 +2637,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
                 &mut scratch,
             );
             for (w, a) in present.iter_mut().zip(&anchor_win) {
-                n += u64::from((std::mem::take(w) & !a).count_ones());
+                n += u64::from((mem::take(w) & !a).count_ones());
             }
             continue;
         }
@@ -2563,7 +2646,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         // in one word-load; `skip_to` would decode each block — expanding its
         // ~128 doc ids — as the frontier drags the anchor across its whole list.
         for (word_idx, word) in present.iter_mut().enumerate() {
-            let mut bits = std::mem::take(word);
+            let mut bits = mem::take(word);
             while bits != 0 {
                 let doc = base + ((word_idx as u32) << 6) + bits.trailing_zeros();
                 bits &= bits - 1;
@@ -2643,6 +2726,42 @@ fn check_version(version: u32) -> Result<(), FtsError> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A fold that panics part-way leaves its per-thread bitsets marked, and
+    /// the next fold on the thread still starts from all zero, for one
+    /// bitset or two and whatever size each asks for.
+    #[test]
+    fn a_fold_after_a_panicked_one_starts_from_clear_bitsets() {
+        const WORDS: usize = 64;
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            with_fold_bitsets(WORDS, |a, b| {
+                a.fill(u64::MAX);
+                b.fill(u64::MAX);
+                panic!("a fold fails part-way");
+            })
+        }));
+        assert!(panicked.is_err());
+        with_fold_bitset(WORDS / 2, |a| {
+            assert!(a.iter().all(|&w| w == 0), "the first bitset is cleared");
+        });
+        with_fold_bitsets(WORDS, |a, b| {
+            assert!(
+                a.iter().chain(b.iter()).all(|&w| w == 0),
+                "both bitsets are cleared at their full size"
+            );
+        });
+        // A superfile past what a thread keeps folds over bitsets of its own,
+        // as clear, and the thread's stay at the size they were.
+        with_fold_bitsets(FOLD_BITSETS_KEEP_WORDS + 1, |a, b| {
+            assert_eq!(
+                (a.len(), b.len()),
+                (FOLD_BITSETS_KEEP_WORDS + 1, FOLD_BITSETS_KEEP_WORDS + 1)
+            );
+            assert!(a.iter().chain(b.iter()).all(|&w| w == 0));
+        });
+        FOLD_BITSETS
+            .with_borrow(|fb| assert_eq!(fb.a.len(), WORDS, "the kept bitsets did not grow"));
+    }
 
     /// What the writer stores for a column's norms must be exactly what the
     /// reader used to derive from its lengths. The scorer indexes the buckets
@@ -2820,6 +2939,7 @@ mod tests {
     }
     use std::{
         collections::{HashMap, HashSet},
+        panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Mutex,
             atomic::{AtomicBool, AtomicU32, Ordering},

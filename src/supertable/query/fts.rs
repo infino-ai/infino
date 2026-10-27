@@ -114,7 +114,7 @@ pub use crate::superfile::fts::reader::BoolMode;
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError, config,
-    runtime_bridge::run_on_pool,
+    runtime_bridge::run_on_pool_unless_blocking,
     runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
@@ -1716,13 +1716,15 @@ impl SupertableReader {
                             .await?;
                         // Heavy kernels go to the reader pool; trivial ones
                         // run inline where the oneshot round-trip would cost
-                        // more than the scan — see the gate's doc comment.
+                        // more than the scan — see the gate's doc comment. A
+                        // caller blocking on the query runs even a heavy one
+                        // inline, as no runtime worker waits under it.
                         if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
                             let kernel_column = column_arc.clone();
-                            run_on_pool(
+                            run_on_pool_unless_blocking(
                                 Some(&reader_pool),
                                 "ranged fts kernel: reader pool dropped result",
                                 move || {
@@ -1794,7 +1796,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
-                                    run_on_pool(
+                                    run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "exact-count fts kernel: reader pool dropped result",
                                         move || {
@@ -1838,7 +1840,7 @@ impl SupertableReader {
                                     let kernel_reader = Arc::clone(&r);
                                     let kernel_stats = op_stats.clone();
                                     let kernel_column = column_arc.clone();
-                                    run_on_pool(
+                                    run_on_pool_unless_blocking(
                                         Some(&reader_pool),
                                         "un-ranged fts kernel: reader pool dropped result",
                                         move || {
