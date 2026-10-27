@@ -7400,6 +7400,38 @@ mod tests {
         }
     }
 
+    /// A term chunked in its sources can hold eight entries or fewer once
+    /// the merge drops superfiles; the decoding path then keeps the tier
+    /// inline in the run, and the splice must step aside rather than write
+    /// chunks for it.
+    #[test]
+    fn a_splice_declines_a_tier_that_shrinks_to_inline() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 4096,
+            tier_entries_per_term: 1_000,
+            ..BuildPolicy::default()
+        };
+        let sources = tier_shapes(&dir, &policy);
+        // Only superfile 2 survives: `delta` falls from 64 + 2 entries,
+        // chunked in the base layer, to its 2.
+        let merged = assert_splice_matches_decoding(&sources, &[None, Some(0), None], &policy);
+        assert_eq!(entries_of(&merged, "delta"), 2);
+        let bytes = bytes_of(&merged.slices[0].1);
+        let run = Slice::open(&bytes)
+            .expect("open")
+            .run(&fid("body").term_key("delta"))
+            .expect("run")
+            .expect("delta is in the merge");
+        assert!(
+            run.tier
+                .as_ref()
+                .is_some_and(|t| t.chunks.is_empty() && t.inline.len() == 2),
+            "the merged tier sits inline in the run: {:?}",
+            run.tier
+        );
+    }
+
     /// A tier read in windows smaller than a chunk crosses a window on
     /// nearly every term and writes what the default window writes.
     #[test]
