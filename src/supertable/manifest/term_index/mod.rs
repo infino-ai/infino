@@ -31,6 +31,8 @@
 //! object a manifest inside the safety gap still names.
 
 pub(crate) mod build;
+#[cfg(test)]
+mod fold_tool;
 pub(crate) mod format;
 pub(crate) mod tier;
 

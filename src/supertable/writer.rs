@@ -11401,7 +11401,7 @@ async fn collect_and_build_term_index(
 /// what a merge keys the superfile's tier entries at. A superfile the
 /// manifest does not list, or a column it records no average for, is left
 /// out and keys at the default.
-fn scoring_by_ordinal(
+pub(in crate::supertable) fn scoring_by_ordinal(
     manifest: &ManifestSnapshot,
     superfiles: &[Uuid],
 ) -> Vec<BTreeMap<FieldId, term_index::ColumnScoring>> {
