@@ -20,6 +20,7 @@ mod score_tolerance;
 pub mod skip_pruning;
 mod stats_fold;
 mod stored_fields;
+mod superfiles_in_flight;
 pub mod tier_harness;
 mod tier_selection;
 pub mod tombstone_filter;

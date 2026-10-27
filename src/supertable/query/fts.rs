@@ -2026,7 +2026,7 @@ impl SupertableReader {
             if prepared.is_none() {
                 declined.store(true, AtomicOrdering::Relaxed);
             }
-            let window = manifest.options.bound_ordered_open_window.max(1);
+            let window = manifest.options.ordered_open_window();
             match prepared {
                 Some(prepared) if prepared.resident => {
                     let selection = prepared.run().await.unwrap_or_else(|e| {
@@ -2071,7 +2071,7 @@ impl SupertableReader {
             // can only tie, and is not opened either once every document
             // at the floor precedes its own in `_id` order.
             true => {
-                let window = manifest.options.bound_ordered_open_window.max(1);
+                let window = manifest.options.ordered_open_window();
                 // A superfile whose ceiling only ties the running k-th score
                 // is skipped once the tie is settled by `_id` order: every
                 // `_id` it holds is past the tied document's. That needs

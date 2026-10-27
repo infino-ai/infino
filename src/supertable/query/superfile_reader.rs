@@ -149,6 +149,27 @@ pub async fn superfile_reader_tiered(
     Err(ReaderCacheError::NotFound { uri: *uri })
 }
 
+/// The in-memory tiers of [`superfile_reader_tiered`] alone, with nothing to
+/// await: `uri`'s reader when this process already holds it, from the reader
+/// cache or as a whole file in the disk cache, served as the full walk serves
+/// it. `None` when an open would have to read or map the file, or when the
+/// reader cache fails, which the full walk then reports.
+pub(crate) fn superfile_reader_in_memory(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    storage: Option<&Arc<dyn StorageProvider>>,
+    uri: &SuperfileUri,
+    storage_key: &str,
+    intent: ReadIntent,
+) -> Option<Arc<SuperfileReader>> {
+    match store.reader(uri) {
+        Ok(reader) => return Some(reader),
+        Err(ReaderCacheError::NotFound { .. }) => {}
+        Err(_) => return None,
+    }
+    disk_cache?.reader_in_memory(uri, storage_key, intent, storage)
+}
+
 /// How many of a read's opens each cache tier served. One line of counts on the
 /// span that opened them instead of a span per file: enough for a trace to say
 /// whether a slow read was a cold one, at a cost that does not grow with the

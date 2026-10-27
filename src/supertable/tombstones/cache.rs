@@ -68,7 +68,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::future::join_all;
+use futures::{StreamExt, stream};
 use roaring::RoaringBitmap;
 use uuid::Uuid;
 
@@ -131,6 +131,8 @@ pub struct SidecarCache {
     /// allocates nothing.
     empty_bitmap: Arc<RoaringBitmap>,
     wal_store: WalStore,
+    /// Sidecar reads a [`Self::prefetch`] keeps in flight.
+    prefetch_limit: usize,
 }
 
 /// One cached entry. `etag` is the storage-layer etag returned
@@ -170,11 +172,14 @@ enum Freshness {
 impl SidecarCache {
     /// Construct a cache backed by the supplied [`WalStore`],
     /// born with `initial_view` (the tombstone-seq view of the
-    /// manifest the owning supertable handle was opened with).
+    /// manifest the owning supertable handle was opened with). A
+    /// [`Self::prefetch`] keeps at most `prefetch_limit` reads in
+    /// flight; zero means one.
     pub fn new(
         wal_store: WalStore,
         seal_ttl: Duration,
         initial_view: Arc<TombstoneSeqView>,
+        prefetch_limit: usize,
     ) -> Self {
         Self {
             inner: DashMap::new(),
@@ -182,6 +187,7 @@ impl SidecarCache {
             seq_view: ArcSwap::new(initial_view),
             empty_bitmap: Arc::new(RoaringBitmap::new()),
             wal_store,
+            prefetch_limit: prefetch_limit.max(1),
         }
     }
 
@@ -208,19 +214,6 @@ impl SidecarCache {
         self.seq_view.load().manifest_id
     }
 
-    /// Concurrently refresh every id whose cached view is missing or
-    /// seq-stale, so a subsequent per-superfile [`Self::bitmap_for`]
-    /// sweep is all cache hits.
-    ///
-    /// This is the hot-path entry point for a wide fan-out: it
-    /// replaces N *serial* blocking storage GETs (one per superfile,
-    /// each a sync→async bridge) with a single *concurrent* batch
-    /// whose wall cost is ≈ one round trip rather than N. Ids absent
-    /// from the seq map have no sidecar and ids whose entry matches
-    /// the map are already fresh, so in the no-new-deletes steady
-    /// state this issues zero GETs. A per-id refresh error is left
-    /// for the later [`Self::bitmap_for`] call to surface; the batch
-    /// never fails as a whole.
     /// Whether the manifest this cache follows records tombstones for
     /// `superfile_id` at all, from the sequence view alone: no sidecar is
     /// read. A superfile without them has every row live.
@@ -228,6 +221,22 @@ impl SidecarCache {
         self.seq_view.load().seqs.contains_key(&superfile_id)
     }
 
+    /// Concurrently refresh every id whose cached view is missing or
+    /// seq-stale, so a subsequent per-superfile [`Self::bitmap_for`]
+    /// sweep is all cache hits.
+    ///
+    /// This is the hot-path entry point for a wide fan-out: it
+    /// replaces N *serial* blocking storage GETs (one per superfile,
+    /// each a sync→async bridge) with one concurrent batch, whose wall
+    /// cost is ≈ one round trip per `prefetch_limit` stale superfiles
+    /// rather than one each. The batch keeps at most `prefetch_limit`
+    /// reads in flight, so a fan-out over thousands of superfiles that
+    /// all carry deletes does not start thousands of requests together.
+    /// Ids absent from the seq map have no sidecar and ids whose entry
+    /// matches the map are already fresh, so in the no-new-deletes
+    /// steady state this issues zero GETs. A per-id refresh error is
+    /// left for the later [`Self::bitmap_for`] call to surface; the
+    /// batch never fails as a whole.
     pub async fn prefetch(&self, superfile_ids: &[Uuid], now: Instant) {
         let view = self.seq_view.load();
         let stale: Vec<(Uuid, u64)> = superfile_ids
@@ -247,7 +256,10 @@ impl SidecarCache {
             let wal_store = self.wal_store.clone();
             async move { (id, expected, wal_store.get_tombstones(id).await) }
         });
-        let results = join_all(fetches).await;
+        let results: Vec<_> = stream::iter(fetches)
+            .buffer_unordered(self.prefetch_limit)
+            .collect()
+            .await;
         for (id, expected, result) in results {
             let (bitmap, seal, etag) = match result {
                 Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
@@ -416,7 +428,43 @@ mod tests {
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::wal::tombstones_codec::TombstonesSidecar,
+        test_helpers::slow_storage::SlowStorage,
     };
+
+    /// How long each sidecar read takes, so reads in flight overlap.
+    const READ_LATENCY: Duration = Duration::from_millis(5);
+    /// Sidecar reads a prefetch in these tests keeps in flight.
+    const PREFETCH_LIMIT: usize = 64;
+
+    /// A prefetch over more superfiles with deletes than it keeps in flight
+    /// reads at most its limit of sidecars at once, and reaches that many, so
+    /// the limit is what bounds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefetch_keeps_at_most_its_limit_of_reads_in_flight() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let storage = SlowStorage::wrap(local, READ_LATENCY);
+        let cache = SidecarCache::new(
+            WalStore::new(storage.clone()),
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
+        );
+        let ids: Vec<Uuid> = (0..2 * PREFETCH_LIMIT)
+            .map(|i| Uuid::from_u128(i as u128))
+            .collect();
+        let mapped: Vec<(Uuid, u64)> = ids.iter().map(|&id| (id, 1)).collect();
+        cache.reconcile(view(1, &mapped));
+
+        cache.prefetch(&ids, Instant::now()).await;
+        assert_eq!(
+            storage.max_in_flight(),
+            PREFETCH_LIMIT,
+            "at most the limit of sidecar reads at once, and the prefetch reaches it"
+        );
+        assert_eq!(cache.len(), ids.len(), "every mapped id was read");
+    }
 
     fn fixture() -> (TempDir, WalStore, SidecarCache) {
         let dir = TempDir::new().expect("tempdir");
@@ -427,6 +475,7 @@ mod tests {
             ws.clone(),
             DEFAULT_SEAL_TTL,
             Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
         );
         (dir, ws, cache)
     }
@@ -637,6 +686,7 @@ mod tests {
             ws.clone(),
             Duration::ZERO,
             Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
         );
         let sf_id = Uuid::from_u128(0x5EA1);
         let mut bitmap = RoaringBitmap::new();

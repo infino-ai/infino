@@ -6483,6 +6483,24 @@ mod tests {
         assert_cache_ledger_settles(&conn, &stores);
     }
 
+    /// A query cancelled while its scan opens the files returns at once, and
+    /// the opens stop with it. Each open runs on a task of its own; one left
+    /// running would read on after the call returned.
+    #[test]
+    fn a_query_cancelled_while_opening_files_stops_reading() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", LARGE_FILES, ROWS_PER_LARGE_FILE);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("the scan opens a file", || stores.reads_of(SUPERFILE) > 0);
+        cancel_and_expect_cancelled(&cancel, &running);
+        assert_no_foreground_read_follows(&conn);
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
     /// Cancelling the query that started reading the files does not disturb
     /// another that joined it on the same files: the other answers in full,
     /// and the cache's ledger balances once both are done.

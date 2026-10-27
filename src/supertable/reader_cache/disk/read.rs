@@ -178,8 +178,7 @@ impl DiskCacheStore {
         storage: Option<&Arc<dyn StorageProvider>>,
     ) -> Result<(Arc<SuperfileReader>, OpenTier), DiskCacheError> {
         // Tier 1, memory: the whole file is already mmapped or buffered in this process. No I/O.
-        if let Some(entry) = self.whole_file_in_memory(uri) {
-            let reader = self.serve(uri, storage_key, &entry, intent, storage);
+        if let Some(reader) = self.reader_in_memory(uri, storage_key, intent, storage) {
             return Ok((reader, OpenTier::Memory));
         }
 
@@ -196,6 +195,20 @@ impl DiskCacheStore {
             .await?;
 
         Ok((self.serve(uri, storage_key, &entry, intent, storage), tier))
+    }
+
+    /// Tier 1 alone, with nothing to await: `uri`'s reader when the whole file is already in
+    /// memory, served as [`Self::open_for_query_tiered`] serves it (its access time and any
+    /// background fill included). `None` when an open would have to read or map the file.
+    pub(crate) fn reader_in_memory(
+        self: &Arc<Self>,
+        uri: &SuperfileUri,
+        storage_key: &str,
+        intent: ReadIntent,
+        storage: Option<&Arc<dyn StorageProvider>>,
+    ) -> Option<Arc<SuperfileReader>> {
+        let entry = self.whole_file_in_memory(uri)?;
+        Some(self.serve(uri, storage_key, &entry, intent, storage))
     }
 
     /// Tier 1: a cached entry holding the whole file (mmapped or buffered). It serves any read
