@@ -514,6 +514,25 @@ impl FtsReader {
         k: usize,
         floor: f32,
     ) -> Result<PreparedClauses, FtsError> {
+        let prep = self.build_clauses(column, lists, k, floor).await?;
+        // The scoring that follows may run on the reader pool and translates
+        // its hits there, so the map is read now, on this runtime, when there
+        // can be a hit; a superfile without the terms never reads it.
+        if prep.may_hit() {
+            self.ensure_doc_map().await?;
+        }
+        Ok(prep)
+    }
+
+    /// [`Self::prepare_clauses`] before the doc-id map: the cursors, or the
+    /// final hits in blob ids.
+    async fn build_clauses(
+        &self,
+        column: &str,
+        lists: ClauseLists<'_>,
+        k: usize,
+        floor: f32,
+    ) -> Result<PreparedClauses, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         if k == 0 {
             return Ok(PreparedClauses::Done {
@@ -606,7 +625,7 @@ impl FtsReader {
                 (_, allow) => Some(AtomExcludeFilter::with_allow(
                     negative_atoms,
                     allow.map(RowSet::new),
-                    self.doc_map.clone(),
+                    self.ensure_doc_map().await?.clone(),
                 )),
             };
             // The atom walk is the whole kernel for phrase shapes —
@@ -661,7 +680,7 @@ impl FtsReader {
             (_, allow) => Some(ExcludeFilter::with_allow(
                 neg_cursors,
                 allow.map(RowSet::new),
-                self.doc_map.clone(),
+                self.ensure_doc_map().await?.clone(),
             )),
         };
 
@@ -841,11 +860,20 @@ impl FtsReader {
     /// translating ids does not disturb that. The unranked siblings
     /// promise ascending ids instead, which translation *does* disturb,
     /// so they use [`Self::ids_to_rows`].
-    #[inline]
-    pub(super) fn hits_to_rows(&self, hits: Vec<(FtsDocId, f32)>) -> Vec<(RowId, f32)> {
-        hits.into_iter()
-            .map(|(doc, score)| (self.row_of(doc), score))
-            .collect()
+    ///
+    /// No hits read no map.
+    pub(super) fn hits_to_rows(
+        &self,
+        hits: Vec<(FtsDocId, f32)>,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let map = self.doc_map()?;
+        Ok(hits
+            .into_iter()
+            .map(|(doc, score)| (map.row_of(doc), score))
+            .collect())
     }
 
     /// Translate an unranked kernel's doc ids into Parquet rows, kept
@@ -857,13 +885,18 @@ impl FtsReader {
     /// pass decodes them in order. On a blob storing its documents in an
     /// order of its own those are different orders, so this re-sorts;
     /// there is nothing to re-sort when there is no map.
-    #[inline]
-    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Vec<RowId> {
-        let mut rows: Vec<RowId> = ids.into_iter().map(|id| self.row_of(id)).collect();
+    ///
+    /// No ids read no map.
+    pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Result<Vec<RowId>, FtsError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let map = self.doc_map()?;
+        let mut rows: Vec<RowId> = ids.into_iter().map(|id| map.row_of(id)).collect();
         if self.has_doc_map() {
             rows.sort_unstable();
         }
-        rows
+        Ok(rows)
     }
 
     pub(crate) fn run_prepared(
@@ -871,7 +904,7 @@ impl FtsReader {
         prep: PreparedClauses,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         self.run_prepared_in_blob_ids(prep)
-            .map(|h| self.hits_to_rows(h))
+            .and_then(|h| self.hits_to_rows(h))
     }
 
     /// [`Self::search_excluding`] scoring every match in one pass: the
@@ -956,7 +989,7 @@ impl FtsReader {
                 ..
             } => self.run_windowed_union_counted(column_id, cursors, k, filter.as_mut())?,
         };
-        Ok((self.hits_to_rows(hits), count))
+        Ok((self.hits_to_rows(hits)?, count))
     }
 
     /// [`Self::run_prepared`] without the translation, for the one caller
@@ -1088,6 +1121,10 @@ impl FtsReader {
             self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
                 .await?
         };
+        // Each slice's search translates its hits off this runtime.
+        if !cursors.is_empty() {
+            self.ensure_doc_map().await?;
+        }
         Ok(OrCursorSet { column_id, cursors })
     }
 
@@ -1124,7 +1161,7 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
-        .map(|h| self.hits_to_rows(h))
+        .and_then(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each

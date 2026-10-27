@@ -239,7 +239,11 @@ impl FtsReader {
                 .map(|()| out)
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(walk?), work))
+        let docs = walk?;
+        if !docs.is_empty() {
+            self.ensure_doc_map().await?;
+        }
+        Ok((self.ids_to_rows(docs)?, work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -423,7 +427,10 @@ impl FtsReader {
                 .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        Ok((self.ids_to_rows(docs), work))
+        if !docs.is_empty() {
+            self.ensure_doc_map().await?;
+        }
+        Ok((self.ids_to_rows(docs)?, work))
     }
 
     /// Unranked token-match **count** — the cardinality

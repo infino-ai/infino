@@ -25,6 +25,7 @@ use std::{
 use bytes::Bytes;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
+use tokio::sync::OnceCell;
 
 use super::{
     cursor::{BlockTableCache, CursorUse, TermCursor, TermMeta},
@@ -260,6 +261,17 @@ pub(crate) enum PreparedClauses {
 }
 
 impl PreparedClauses {
+    /// Whether scoring these clauses can return a hit, which whoever runs
+    /// them translates to a row through the doc-id map.
+    pub(crate) fn may_hit(&self) -> bool {
+        match self {
+            PreparedClauses::Done { hits, .. } => !hits.is_empty(),
+            PreparedClauses::Must { must_cursors, .. } => !must_cursors.is_empty(),
+            PreparedClauses::MustShould { .. } => true,
+            PreparedClauses::Or { cursors, .. } => !cursors.is_empty(),
+        }
+    }
+
     /// Whether the clauses were prepared for the exact-count walk.
     pub(crate) fn exact_count(&self) -> bool {
         match self {
@@ -559,7 +571,20 @@ pub struct FtsReader {
     /// blob's own id space from end to end, and the ids they return are
     /// translated once here. That is what lets the writer group
     /// documents by the terms they share without a Parquet row moving.
-    pub(super) doc_map: DocMap,
+    ///
+    /// Set at open when the blob is in memory or keeps row order, or when
+    /// the bytes the open read already hold it. Otherwise a query reads it
+    /// whole before it translates a doc id ([`Self::ensure_doc_map`]): at 4
+    /// bytes a document it is hundreds of megabytes on a large file, which an
+    /// open, and so a SQL scan that matches no text, should not pay for.
+    /// Shared by every view cloned from this reader ([`Self::with_scoring`]),
+    /// so one read serves them all.
+    doc_map: Arc<OnceCell<DocMap>>,
+    /// Where the map's body lies, with its CRC right after it; `None` on a
+    /// blob in row order.
+    doc_map_region: Option<Range<usize>>,
+    /// Whether a read after open checks its CRC, as the open's reads did.
+    verify_crc: bool,
 }
 
 impl FtsReader {
@@ -1044,10 +1069,15 @@ impl FtsReader {
             column_id_by_name.insert(col_cfg.name.clone(), i as u32);
         }
 
-        // The map is read whole at open, beside the doc-lengths tail it
-        // sits next to, because every query that returns a hit needs it.
-        let doc_map: DocMap = match doc_map_offset {
-            None => DocMap::Identity,
+        // From memory the map is a slice of the blob, taken now; a lazy source
+        // that does not hold it yet leaves it to the first query that needs
+        // it (see the field).
+        let doc_map = Arc::new(OnceCell::new());
+        let doc_map_region = match doc_map_offset {
+            None => {
+                let _ = doc_map.set(DocMap::Identity);
+                None
+            }
             Some(mo) => {
                 let body_end = doc_lengths_table_offset
                     .saturating_sub(format::fts::doc_map_len_trailer(version))
@@ -1064,34 +1094,12 @@ impl FtsReader {
                          below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
                 }
-                let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
-                if opts.verify_crc {
-                    let crc_bytes = fetch_source_range(
-                        &source,
-                        body_end..body_end + format::CRC_BYTES,
-                        "fts/doc-map crc",
-                    )?;
-                    if read_u32_le(&crc_bytes) != crc32c(&body) {
-                        return Err(FtsError::Read(ReadError::ChecksumMismatch {
-                            section: "fts/doc-map",
-                            column: String::new(),
-                        }));
-                    }
+                let region = mo..body_end;
+                let span = doc_map_span(&region, opts.verify_crc);
+                if let Some(bytes) = source.try_get_range_sync(span) {
+                    let _ = doc_map.set(read_doc_map(&source, &region, bytes, opts.verify_crc)?);
                 }
-                // Held as bytes rather than decoded. On a blob opened from a
-                // memory mapping the region is the mapping itself, so the map
-                // costs no heap at open and its pages stay evictable, where a
-                // decoded copy would sit on the heap for the life of the
-                // reader. A lazy source may answer a read this large with a
-                // window onto a bigger fetch, and keeping the window would keep
-                // that whole fetch alive for as long; the map is the one read
-                // of the open the reader holds on to, so over such a source it
-                // takes a copy of the map alone.
-                let region = match &source {
-                    Source::InMemory(_) => body,
-                    Source::Lazy(_) => Bytes::copy_from_slice(&body),
-                };
-                DocMap::permuted(region)
+                Some(region)
             }
         };
 
@@ -1107,29 +1115,71 @@ impl FtsReader {
             columns,
             column_id_by_name,
             doc_map,
+            doc_map_region,
+            verify_crc: opts.verify_crc,
         })
     }
 
-    /// The Parquet row a doc id of this blob stands for.
+    /// The doc-id map, read on the caller's runtime if no query has read it
+    /// yet. Concurrent first callers share one read, and a failed read is not
+    /// kept: the error goes to this query and the next one reads again.
     ///
-    /// The identity on a `V7` blob, where the two are the same number,
-    /// and a lookup on a `V8` blob whose documents are
-    /// stored under an ordering of their own.
+    /// Every query path awaits this before it translates a doc id, so the
+    /// read never goes through [`Self::doc_map`]'s blocking one.
+    pub(super) async fn ensure_doc_map(&self) -> Result<&DocMap, FtsError> {
+        self.doc_map
+            .get_or_try_init(|| async {
+                let region = self
+                    .doc_map_region
+                    .as_ref()
+                    .expect("invariant: a blob without a map has it set at open");
+                let bytes = self
+                    .source
+                    .range_async(doc_map_span(region, self.verify_crc))
+                    .await
+                    .map_err(|e| FtsError::RangeFetch {
+                        what: "fts/doc-map",
+                        source: e,
+                    })?;
+                read_doc_map(&self.source, region, bytes, self.verify_crc)
+            })
+            .await
+    }
+
+    /// The doc-id map, for a translation that runs off the async path.
     ///
-    /// An id past the end of the map is a bug in the caller or a blob
-    /// the CRC over the region should already have rejected, so it trips
-    /// an assertion where assertions run. In a release build it passes
-    /// through unchanged instead of panicking, because a corrupt map
-    /// should not take down a query.
-    #[inline]
-    pub(crate) fn row_of(&self, doc_id: FtsDocId) -> RowId {
-        self.doc_map.row_of(doc_id)
+    /// A query has read it by then ([`Self::ensure_doc_map`]), and a
+    /// compaction input holds its whole file from open, so this reads only
+    /// when neither did, through the source's blocking read. A failed read
+    /// is an error: taking blob ids as rows would silently answer with the
+    /// wrong rows.
+    pub(crate) fn doc_map(&self) -> Result<DocMap, FtsError> {
+        if let Some(map) = self.doc_map.get() {
+            return Ok(map.clone());
+        }
+        let region = self
+            .doc_map_region
+            .as_ref()
+            .expect("invariant: a blob without a map has it set at open");
+        let span = doc_map_span(region, self.verify_crc);
+        let bytes = fetch_source_range(&self.source, span, "fts/doc-map")?;
+        let map = read_doc_map(&self.source, region, bytes, self.verify_crc)?;
+        // A concurrent first read may have set it meanwhile; both are the
+        // same map.
+        let _ = self.doc_map.set(map.clone());
+        Ok(map)
+    }
+
+    /// Whether a query has read the doc-id map yet.
+    #[cfg(test)]
+    pub(crate) fn doc_map_is_read(&self) -> bool {
+        self.doc_map.initialized()
     }
 
     /// Whether this blob stores its documents under an ordering of its
     /// own rather than in row order.
     pub(crate) fn has_doc_map(&self) -> bool {
-        self.doc_map.is_permuted()
+        self.doc_map_region.is_some()
     }
 
     pub fn n_docs(&self) -> u32 {
@@ -1964,6 +2014,53 @@ pub(super) fn top_k(scores: FxHashMap<RowId, f32>, k: usize) -> Vec<(RowId, f32)
     drain_top_k_desc(heap)
 }
 
+/// The bytes to read for the doc-id map at `region`: its body, and the CRC
+/// stored right after it when the reader verifies.
+fn doc_map_span(region: &Range<usize>, verify_crc: bool) -> Range<usize> {
+    match verify_crc {
+        true => region.start..region.end + format::CRC_BYTES,
+        false => region.clone(),
+    }
+}
+
+/// The doc-id map from `bytes`, read at [`doc_map_span`]: checked against its
+/// CRC when `verify_crc`, and owned as the reader keeps it.
+///
+/// From memory the body is a slice of the blob, so the map costs no heap and
+/// its pages stay evictable. A lazy source may answer a read this large with
+/// a window onto a bigger fetch, and keeping the window would keep that whole
+/// fetch alive; the map is the one read the reader holds on to, so over such
+/// a source it takes a copy of the body alone.
+fn read_doc_map(
+    source: &Source,
+    region: &Range<usize>,
+    bytes: Bytes,
+    verify_crc: bool,
+) -> Result<DocMap, FtsError> {
+    if bytes.len() < region.len() {
+        return Err(FtsError::Read(ReadError::Malformed(format!(
+            "fts doc-map read {} of its {} bytes",
+            bytes.len(),
+            region.len()
+        ))));
+    }
+    let body = bytes.slice(..region.len());
+    if verify_crc {
+        let crc = &bytes[region.len()..];
+        if crc.len() < format::CRC_BYTES || read_u32_le(crc) != crc32c(&body) {
+            return Err(FtsError::Read(ReadError::ChecksumMismatch {
+                section: "fts/doc-map",
+                column: String::new(),
+            }));
+        }
+    }
+    let body = match source {
+        Source::InMemory(_) => body,
+        Source::Lazy(_) => Bytes::copy_from_slice(&body),
+    };
+    Ok(DocMap::permuted(body))
+}
+
 pub(super) fn fetch_source_range(
     source: &Source,
     range: Range<usize>,
@@ -2646,17 +2743,18 @@ mod tests {
         collections::{HashMap, HashSet},
         sync::{
             Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU32, Ordering},
         },
+        thread::{self, ThreadId},
         time::Duration,
     };
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use tokio::{
-        spawn,
+        join, spawn,
         sync::Notify,
-        task::spawn_blocking,
+        task::{spawn_blocking, yield_now},
         time::{sleep, timeout},
     };
 
@@ -3073,9 +3171,10 @@ mod tests {
             let r = FtsReader::open(blob, json).expect("open");
 
             assert!(r.has_doc_map(), "n_docs {n_docs}: the map must survive");
+            let doc_map = r.doc_map().expect("an in-memory map is read at open");
             for (id, &row) in map.iter().enumerate() {
                 assert_eq!(
-                    r.row_of(FtsDocId::new(id as u32)),
+                    doc_map.row_of(FtsDocId::new(id as u32)),
                     RowId::new(row),
                     "n_docs {n_docs}: doc id {id} must name row {row}"
                 );
@@ -3195,9 +3294,10 @@ mod tests {
             .expect("open_lazy");
 
         assert!(reader.has_doc_map(), "the map must survive a lazy open");
+        let doc_map = reader.ensure_doc_map().await.expect("doc-id map");
         for (id, &row) in map.iter().enumerate() {
             assert_eq!(
-                reader.row_of(FtsDocId::new(id as u32)),
+                doc_map.row_of(FtsDocId::new(id as u32)),
                 RowId::new(row),
                 "doc id {id} must name row {row}"
             );
@@ -4441,10 +4541,9 @@ mod tests {
     /// Opening a blob that stores its documents in an order of its own
     /// must work on a source that cannot be read synchronously.
     ///
-    /// The map is read whole at open, and the open runs against the
-    /// prefetch overlay alone, so the map has to be inside it. Placing
-    /// the region outside the prefetched tail to keep that fetch small
-    /// makes every in-memory test pass and every object-store open fail.
+    /// The open runs against the prefetch overlay alone, and the map is
+    /// not in it: the first query that needs the map reads it, so a search
+    /// over an async-only source must still name the right rows.
     #[tokio::test]
     async fn open_lazy_serves_a_reordered_blob_from_an_async_only_source() {
         const N_DOCS: u32 = 400;
@@ -4482,6 +4581,283 @@ mod tests {
             vec![7],
             "the map must survive the lazy open"
         );
+    }
+
+    /// A source that serves bytes asynchronously only, the way an object
+    /// store does, and records which thread each read ran on. Each read
+    /// yields once before it returns, so concurrent first readers interleave
+    /// as they do over a network. Once a test names the doc-id map's region,
+    /// the next `fail_map_reads` reads of it fail.
+    struct MapProbeSource {
+        blob: Bytes,
+        reads: Mutex<Vec<(ThreadId, Range<usize>)>>,
+        map: OnceLock<Range<usize>>,
+        fail_map_reads: AtomicU32,
+    }
+
+    impl MapProbeSource {
+        /// The threads of the reads that overlapped the doc-id map.
+        fn map_reads(&self) -> Vec<ThreadId> {
+            let map = self.map.get().expect("the test names the map's region");
+            self.reads
+                .lock()
+                .expect("reads")
+                .iter()
+                .filter(|(_, read)| read.start < map.end && read.end > map.start)
+                .map(|(thread, _)| *thread)
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl LazyByteSource for MapProbeSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let read = start as usize..(start + len) as usize;
+            yield_now().await;
+            self.reads
+                .lock()
+                .expect("reads")
+                .push((thread::current().id(), read.clone()));
+            let of_map = self
+                .map
+                .get()
+                .is_some_and(|map| read.start < map.end && read.end > map.start);
+            if of_map
+                && self
+                    .fail_map_reads
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+            {
+                return Err(LazyByteSourceError::OutOfBounds {
+                    start,
+                    len,
+                    size: 0,
+                });
+            }
+            Ok(self.blob.slice(read))
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// Rows of [`probed_reader`]'s blob that hold [`PROBE_TERM`].
+    const PROBE_ROWS: [u32; 2] = [0, 2];
+    /// The term [`probed_reader`]'s blob holds in [`PROBE_ROWS`].
+    const PROBE_TERM: &str = "alpha";
+
+    /// A lazy reader over a blob that stores its four documents in reverse,
+    /// on a [`MapProbeSource`] that knows where the map lies. `verify_crc`
+    /// is the reader's.
+    async fn probed_reader(verify_crc: bool) -> (Arc<MapProbeSource>, FtsReader) {
+        let docs = ["alpha one", "beta two", "alpha three", "gamma four"];
+        let order: Vec<u32> = (0..docs.len() as u32).rev().collect();
+        let (blob, json) = build_standard_blob_with(&docs, Some(&order));
+        let source = Arc::new(MapProbeSource {
+            blob,
+            reads: Mutex::new(Vec::new()),
+            map: OnceLock::new(),
+            fail_map_reads: AtomicU32::new(0),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let r = FtsReader::open_lazy(src, &json, OpenOptions { verify_crc })
+            .await
+            .expect("open_lazy");
+        let map = r
+            .doc_map_region
+            .clone()
+            .expect("a reordered blob has a map");
+        source.map.set(map).expect("named once");
+        (source, r)
+    }
+
+    /// The rows a search for [`PROBE_TERM`] returns, filtered to an allow set
+    /// of every row: the filter checks rows, so it needs the map before any
+    /// cursor does.
+    async fn filtered_search(r: &FtsReader) -> Result<Vec<u32>, FtsError> {
+        let allow: Arc<RoaringBitmap> = Arc::new((0..r.n_docs()).collect());
+        let hits = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &[PROBE_TERM],
+                    allow: Some(allow),
+                    ..Default::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await?;
+        let mut rows: Vec<u32> = hits.into_iter().map(|(row, _)| row.get()).collect();
+        rows.sort_unstable();
+        Ok(rows)
+    }
+
+    /// A lazy open reads none of the doc-id map, and a contains that
+    /// matches nothing never reads it. One that matches reads it on the
+    /// query's own runtime, not through the sync bridge: under a
+    /// current-thread runtime the bridge reads on a thread of its own, so
+    /// a map read on any other thread than this one went through it.
+    #[tokio::test]
+    async fn a_lazy_reader_reads_its_doc_map_on_the_query_runtime_and_only_for_a_hit() {
+        let (source, r) = probed_reader(false).await;
+        assert!(source.map_reads().is_empty(), "the open read the map");
+
+        let (rows, _) = r
+            .contains_rows("body", &["zzq"], None, None)
+            .await
+            .expect("contains");
+        assert!(
+            rows[0].proven.is_empty() && rows[0].doubtful.is_empty(),
+            "no row holds the needle"
+        );
+        assert!(
+            source.map_reads().is_empty(),
+            "a contains that matched nothing read the map"
+        );
+
+        let (rows, _) = r
+            .contains_rows("body", &[PROBE_TERM], None, None)
+            .await
+            .expect("contains");
+        assert_eq!(rows[0].proven, RoaringBitmap::from_iter(PROBE_ROWS));
+        let here = thread::current().id();
+        assert_eq!(
+            source.map_reads(),
+            [here],
+            "one read of the map, on this runtime and not through the sync bridge"
+        );
+    }
+
+    /// A ranked search and an unranked match read the map only once they
+    /// have a hit to translate, and then on the query's runtime: a term
+    /// this superfile lacks reads none of it.
+    #[tokio::test]
+    async fn a_search_reads_the_doc_map_only_for_a_hit_to_translate() {
+        let (source, r) = probed_reader(false).await;
+        let (rows, _) = r
+            .token_match("body", &["zzq"], BoolMode::Or)
+            .await
+            .expect("token_match");
+        assert!(rows.is_empty(), "no row holds the term");
+        let hits = r
+            .search_excluding(
+                "body",
+                ClauseLists {
+                    shoulds: &["zzq"],
+                    ..Default::default()
+                },
+                10,
+                f32::NEG_INFINITY,
+            )
+            .await
+            .expect("search");
+        assert!(hits.is_empty(), "no row holds the term");
+        assert!(
+            source.map_reads().is_empty(),
+            "a search without a hit read the map"
+        );
+
+        let (rows, _) = r
+            .token_match("body", &[PROBE_TERM], BoolMode::Or)
+            .await
+            .expect("token_match");
+        let mut rows: Vec<u32> = rows.into_iter().map(|row| row.get()).collect();
+        rows.sort_unstable();
+        assert_eq!(rows, PROBE_ROWS);
+        assert_eq!(source.map_reads(), [thread::current().id()]);
+    }
+
+    /// A search filtered to an allow set checks rows before any cursor
+    /// reads the map, so the filter reads it first, on the query's runtime.
+    #[tokio::test]
+    async fn a_filtered_search_reads_the_doc_map_on_the_query_runtime() {
+        let (source, r) = probed_reader(true).await;
+        assert_eq!(filtered_search(&r).await.expect("search"), PROBE_ROWS);
+        assert_eq!(source.map_reads(), [thread::current().id()]);
+    }
+
+    /// A failed read of the map fails the query that needed it, and is not
+    /// kept: taking blob ids as rows would answer every later query on this
+    /// reader with the wrong rows. The next query reads it again.
+    #[tokio::test]
+    async fn a_failed_doc_map_read_fails_its_query_and_the_next_one_reads_again() {
+        let (source, r) = probed_reader(true).await;
+        source.fail_map_reads.store(1, Ordering::SeqCst);
+        assert!(
+            matches!(
+                filtered_search(&r).await,
+                Err(FtsError::RangeFetch {
+                    what: "fts/doc-map",
+                    ..
+                })
+            ),
+            "a failed map read must fail the query"
+        );
+        assert_eq!(filtered_search(&r).await.expect("search"), PROBE_ROWS);
+        assert_eq!(source.map_reads().len(), 2, "the second query read again");
+    }
+
+    /// A damaged map read lazily is refused, as it is at an in-memory open.
+    #[tokio::test]
+    async fn a_damaged_doc_map_read_lazily_is_refused() {
+        let (source, _) = probed_reader(true).await;
+        let map = source.map.get().expect("map").clone();
+        let mut damaged = source.blob.to_vec();
+        damaged[map.start] ^= 0xFF;
+        let damaged = Arc::new(MapProbeSource {
+            blob: Bytes::from(damaged),
+            reads: Mutex::new(Vec::new()),
+            map: OnceLock::new(),
+            fail_map_reads: AtomicU32::new(0),
+        });
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let src: Arc<dyn LazyByteSource> = damaged;
+        let r = FtsReader::open_lazy(src, json, OpenOptions::default())
+            .await
+            .expect("the open reads none of the map");
+        assert!(matches!(
+            r.ensure_doc_map().await,
+            Err(FtsError::Read(ReadError::ChecksumMismatch {
+                section: "fts/doc-map",
+                ..
+            }))
+        ));
+        assert!(!r.doc_map_is_read(), "a refused map is not kept");
+    }
+
+    /// Scored views of one reader and concurrent first queries share one
+    /// read of the map: on a large file it is hundreds of megabytes, and a
+    /// table-wide average length moves with every commit, so views come and
+    /// go while the reader stays cached.
+    #[tokio::test]
+    async fn views_and_concurrent_queries_share_one_read_of_the_doc_map() {
+        let (source, r) = probed_reader(false).await;
+        let views: Vec<FtsReader> = [3.0, 4.0, 5.0]
+            .into_iter()
+            .map(|avgdl| {
+                r.with_scoring(&ScoringView {
+                    params: None,
+                    avgdl: Some(("body", avgdl)),
+                })
+                .expect("a view at a new average length")
+            })
+            .collect();
+        let (a, b, c) = join!(
+            views[0].ensure_doc_map(),
+            views[1].ensure_doc_map(),
+            r.ensure_doc_map()
+        );
+        for map in [a, b, c] {
+            map.expect("doc-id map");
+        }
+        views[2].ensure_doc_map().await.expect("doc-id map");
+        assert_eq!(source.map_reads().len(), 1, "one read serves them all");
     }
 
     #[tokio::test]

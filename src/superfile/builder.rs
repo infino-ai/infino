@@ -307,16 +307,24 @@ pub(crate) fn survivor_rows(
 /// they are not, and reading a posting's id as a row silently files it
 /// under a different document, so the input's own map composes in: a
 /// blob id goes wherever the row it stands for goes.
-fn remap_by_blob_id<T: Copy>(fts: &FtsReader, remap_by_row: &[Option<T>]) -> Vec<Option<T>> {
+fn remap_by_blob_id<T: Copy>(
+    fts: &FtsReader,
+    remap_by_row: &[Option<T>],
+) -> Result<Vec<Option<T>>, BuildError> {
     if !fts.has_doc_map() {
-        return remap_by_row.to_vec();
+        return Ok(remap_by_row.to_vec());
     }
-    (0..fts.n_docs())
+    let map = fts.doc_map().map_err(|e| {
+        BuildError::Io(Error::other(format!(
+            "fts merge input: read doc-id map failed: {e}"
+        )))
+    })?;
+    Ok((0..fts.n_docs())
         .map(|b| {
-            let row = fts.row_of(FtsDocId::new(b));
+            let row = map.row_of(FtsDocId::new(b));
             remap_by_row.get(row.get() as usize).copied().flatten()
         })
-        .collect()
+        .collect())
 }
 
 /// Place one input's stored document lengths at the output positions its
@@ -1616,7 +1624,7 @@ impl SuperfileBuilder {
         let (remap_by_row, n_kept) = survivor_rows(fts.n_docs(), deleted, base);
         // Postings and lengths are keyed by the input's doc ids, which are
         // its rows only when it kept arrival order.
-        let remap = remap_by_blob_id(fts, &remap_by_row);
+        let remap = remap_by_blob_id(fts, &remap_by_row)?;
         // This carry appends in arrival order, so an output row is the
         // doc id the output blob stores it under. The reordering merge
         // is the path where the two part company, and it converts
@@ -2635,7 +2643,7 @@ impl SuperfileBuilder {
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
-            .collect();
+            .collect::<Result<_, _>>()?;
         for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
             let fts = reader.fts().expect("checked above");
             for column_id in 0..n_fts_columns {
@@ -3046,7 +3054,7 @@ impl SuperfileBuilder {
                                 .iter()
                                 .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
                                 .collect();
-                            let remap = remap_by_blob_id(fts, &remap_by_row);
+                            let remap = remap_by_blob_id(fts, &remap_by_row)?;
                             scatter_doc_lengths(
                                 fts,
                                 &remap,
@@ -6055,7 +6063,8 @@ mod tests {
     ) -> (Vec<(Vec<u8>, u32, u32, Vec<u32>)>, Vec<u32>) {
         let fts = reader.fts().expect("merged superfile has an FTS blob");
         let n_cols = fts.fts_columns().count() as u32;
-        let row_of = |doc_id: u32| fts.row_of(FtsDocId::new(doc_id)).get();
+        let map = fts.doc_map().expect("doc-id map");
+        let row_of = |doc_id: u32| map.row_of(FtsDocId::new(doc_id)).get();
         let mut postings: Vec<(Vec<u8>, u32, u32, Vec<u32>)> = Vec::new();
         let mut doc_lengths: Vec<u32> = Vec::new();
         for column_id in 0..n_cols {
@@ -6829,7 +6838,7 @@ mod tests {
 
         let mapped = reader_over(Some(MAP.to_vec()));
         assert!(mapped.has_doc_map());
-        let by_blob = remap_by_blob_id(&mapped, &remap_by_row);
+        let by_blob = remap_by_blob_id(&mapped, &remap_by_row).expect("remap");
         assert_eq!(by_blob.len(), MAP.len());
         for (blob_id, &row) in MAP.iter().enumerate() {
             assert_eq!(
@@ -6850,7 +6859,10 @@ mod tests {
         // An input that kept arrival order asks nothing of the map.
         let plain = reader_over(None);
         assert!(!plain.has_doc_map());
-        assert_eq!(remap_by_blob_id(&plain, &remap_by_row), remap_by_row);
+        assert_eq!(
+            remap_by_blob_id(&plain, &remap_by_row).expect("remap"),
+            remap_by_row
+        );
     }
 
     #[test]
