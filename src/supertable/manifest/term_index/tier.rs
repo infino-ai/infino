@@ -269,21 +269,25 @@ pub(crate) struct SplicedBlock<'a> {
 /// blocks carry.
 pub(crate) fn encode_spliced_chunk(blocks: &[SplicedBlock<'_>]) -> EncodedChunk {
     debug_assert!(blocks.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
-    let mut bodies: Vec<u8> = Vec::with_capacity(blocks.iter().map(|b| b.body.len()).sum());
-    let mut dirs: Vec<BlockDir> = Vec::with_capacity(blocks.len());
+    let dir_len = TierDirectory::len_for(blocks.len() as u32);
+    let mut out = Vec::with_capacity(dir_len + blocks.iter().map(|b| b.body.len()).sum::<usize>());
+    out.extend_from_slice(&0u32.to_le_bytes());
     for b in blocks {
-        let start = bodies.len();
-        bodies.extend_from_slice(b.body);
-        dirs.push(BlockDir {
-            ordinal: b.ordinal,
-            tail: b.tail,
-            n_entries: b.n_entries,
-            offset: start,
-            len: b.body.len(),
-            crc: b.crc,
-        });
+        out.extend_from_slice(&b.ordinal.to_le_bytes());
+        out.extend_from_slice(&b.tail.to_le_bytes());
+        out.push(b.n_entries as u8);
+        out.extend_from_slice(&(b.body.len() as u16).to_le_bytes());
+        out.extend_from_slice(&b.crc.to_le_bytes());
     }
-    encode_chunk(&dirs, &bodies)
+    let crc = crc32c(&out[CHUNK_HEADER_LEN..dir_len]);
+    out[..CHUNK_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+    for b in blocks {
+        out.extend_from_slice(b.body);
+    }
+    EncodedChunk {
+        n_blocks: blocks.len() as u32,
+        bytes: out,
+    }
 }
 
 /// What a chunk's directory records about one block.

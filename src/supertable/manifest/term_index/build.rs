@@ -191,6 +191,9 @@ impl Default for BuildPolicy {
 const ENCODE_BATCH_ENTRIES: usize = 1 << 21;
 /// Most terms in one encoding batch.
 const ENCODE_BATCH_TERMS: usize = 1 << 13;
+/// Fewest terms one parallel job of a batch takes: a spliced term is
+/// microseconds of work, less than a job's scheduling.
+const ENCODE_JOB_MIN_TERMS: usize = 64;
 
 /// One term as the merge hands it over: its postings and the tier entries
 /// gathered for it, in any order.
@@ -403,32 +406,28 @@ fn splice_term(
         }
         opened.push(chunks);
     }
-    // One group per superfile: its blocks in rank order, each as
-    // (source, chunk, block). A source's chunk `r` holds the rank-`r`
-    // block of each of its groups.
-    let mut groups: Vec<(u32, Vec<(usize, usize, usize)>)> = Vec::new();
+    // Every block as (new ordinal, rank, source, block), then one group
+    // per superfile with its blocks in rank order: a source's chunk `r`
+    // holds the rank-`r` block of each of its groups.
+    let mut placed: Vec<(u32, usize, usize, usize)> = Vec::new();
     for (si, chunks) in opened.iter().enumerate() {
         for (r, chunk) in chunks.iter().enumerate() {
             for b in 0..chunk.n_blocks() {
                 let facts = chunk.spliced_block(b);
-                let Some(ordinal) = renumber(ordinals, facts.ordinal) else {
-                    continue;
-                };
-                let group = match groups.iter_mut().find(|(o, _)| *o == ordinal) {
-                    Some(g) => g,
-                    None => {
-                        groups.push((ordinal, Vec::new()));
-                        groups.last_mut().expect("just pushed")
-                    }
-                };
-                // Ranks arrive in order within a source; a group split
-                // across sources, or out of rank order, is not spliced.
-                if group.1.len() != r {
-                    return Ok(None);
+                if let Some(ordinal) = renumber(ordinals, facts.ordinal) {
+                    placed.push((ordinal, r, si, b));
                 }
-                group.1.push((si, r, b));
             }
         }
+    }
+    placed.sort_unstable_by_key(|&(o, r, _, _)| (o, r));
+    let mut groups: Vec<(u32, Vec<(usize, usize, usize)>)> = Vec::new();
+    for g in placed.chunk_by(|a, b| a.0 == b.0) {
+        // A group split across sources, or missing a rank, is not spliced.
+        if g.iter().enumerate().any(|(i, &(_, r, _, _))| r != i) {
+            return Ok(None);
+        }
+        groups.push((g[0].0, g.iter().map(|&(_, r, si, b)| (si, r, b)).collect()));
     }
     // Inline entries (from sources whose tier was small enough to sit in
     // the run) form groups of their own, encoded fresh; a superfile with
@@ -1300,6 +1299,7 @@ impl SegmentWriter {
         let encode = || -> Result<Vec<EncodedTerm>, TermIndexError> {
             batch
                 .into_par_iter()
+                .with_min_len(ENCODE_JOB_MIN_TERMS)
                 .map(|term| {
                     let column = FieldId::of_term_key(&term.key).unwrap_or(FieldId(u32::MAX));
                     encode_term(term, budget, depth, &ordinals, &|ordinal| {
@@ -2010,7 +2010,7 @@ fn merge_range(
                 .expect("pending run for heap head");
             // A run without a tier contributes no entries; its postings
             // stand on their bounds in the merged term (see `encode_term`).
-            if let Some(tier) = &source_run.tier {
+            if let Some(tier) = source_run.tier {
                 if tier.chunks.is_empty() {
                     entries.extend(tier.inline.iter().filter_map(|e| {
                         Some(TierEntry {
@@ -2022,11 +2022,11 @@ fn merge_range(
                     let t = Instant::now();
                     let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
                     tier_secs += t.elapsed().as_secs_f64();
-                    tier_bytes += bytes.len() as u64;
+                    tier_bytes += tier.chunks.iter().map(|c| c.len).sum::<u64>();
                     sources.push(TierSource {
                         bytes,
                         base,
-                        chunks: tier.chunks.clone(),
+                        chunks: tier.chunks,
                     });
                 }
             }

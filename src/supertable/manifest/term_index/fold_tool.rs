@@ -36,6 +36,7 @@ use super::{
     build::{BuildPolicy, BuiltBytes, SliceFile, merge_segments, tier_path},
     download_segments,
     format::Segment,
+    write_slices, write_tiers,
 };
 use crate::{
     runtime_metrics::rss::available_memory_bytes,
@@ -275,6 +276,23 @@ fn fold_timing() {
             local_bytes as f64 / (1024.0 * 1024.0) / secs,
             rss_peak_mb(),
         );
+        // Time the upload of the merged output to a scratch prefix, never
+        // the table's own, so the fixture keeps no unreferenced objects.
+        if let Ok(upload_to) = env::var("FOLD_UPLOAD") {
+            let sink = storage_for(&upload_to);
+            let t = Instant::now();
+            st.block_on_query(write_slices(sink.as_ref(), merged.slices))
+                .expect("upload slices");
+            st.block_on_query(write_tiers(sink.as_ref(), merged.tiers))
+                .expect("upload tiers");
+            let secs = t.elapsed().as_secs_f64();
+            eprintln!(
+                "FOLD run[{run}] upload {secs:.1}s {:.1}MiB to {upload_to} ({:.1}MiB/s)",
+                (out_bytes + tier_bytes) as f64 / (1024.0 * 1024.0),
+                (out_bytes + tier_bytes) as f64 / (1024.0 * 1024.0) / secs,
+            );
+            continue;
+        }
         drop(merged);
     }
 }
