@@ -559,8 +559,25 @@ pub(super) fn replace_worst(heap: &mut BinaryHeap<TopKEntry>, entry: TopKEntry) 
 /// below where it was, so a floor the caller seeded is kept. Returns whether
 /// the bar was set or rose, for callers that re-plan on a higher bar. A
 /// `k` of zero admits nothing.
-#[inline]
+///
+/// Most offers lose to a full heap's bar, so that test is inlined into every
+/// caller and only an admission pays for a call.
+#[inline(always)]
 pub(super) fn offer_top_k(
+    heap: &mut BinaryHeap<TopKEntry>,
+    k: usize,
+    threshold: &mut f32,
+    score: f32,
+    doc: u32,
+) -> bool {
+    if heap.len() >= k && score <= *threshold {
+        return false;
+    }
+    admit_top_k(heap, k, threshold, score, doc)
+}
+
+/// The admitting half of [`offer_top_k`], out of line.
+fn admit_top_k(
     heap: &mut BinaryHeap<TopKEntry>,
     k: usize,
     threshold: &mut f32,
@@ -575,10 +592,9 @@ pub(super) fn offer_top_k(
         if heap.len() < k {
             return false;
         }
-    } else if score > *threshold {
-        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
     } else {
-        return false;
+        debug_assert!(score > *threshold, "the caller rejected a score at the bar");
+        replace_worst(heap, TopKEntry(score, FtsDocId::new(doc)));
     }
     *threshold = heap.peek().expect("a full heap").0.max(*threshold);
     true

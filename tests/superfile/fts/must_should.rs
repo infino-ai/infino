@@ -372,7 +372,9 @@ async fn one_must_with_shoulds_pruned_matches_unpruned() {
                 query.push_str(" -filler");
             }
             let full = search_hits(&reader, &query, n_docs as usize + 1, BoolMode::Or).await;
-            for k in [1usize, 5, 10, 100] {
+            // Small `k` probes the optional terms strongest first; a `k` past
+            // the top-k buffer's threshold probes them in query order.
+            for k in [1usize, 5, 10, 100, 1_000] {
                 let pruned = search_hits(&reader, &query, k, BoolMode::Or).await;
                 let want = &full[..k.min(full.len())];
                 assert_eq!(

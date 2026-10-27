@@ -21,6 +21,13 @@ const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 
 // ── score-floor pruning ───────────────────────────────────────────────
 
+/// The `k` the floor tests rank to.
+const FLOOR_K: usize = 16;
+
+/// A `k` at which the union's top k collect into a buffer, under the
+/// corpus's 600-odd `alpha | beta | gamma` matches.
+const FLOOR_LARGE_K: usize = 512;
+
 /// Verify the score floor's load-bearing contract: **top-k preservation
 /// under a floor at the kth-best score**. The supertable fan-out seeds
 /// each segment's floor with the global kth-best so segments skip work
@@ -36,24 +43,28 @@ const SCORE_ABS_TOLERANCE: f32 = 1e-3;
 /// scores). A floor that drops a top-k doc, or that treats "equal to the
 /// floor" as pruned, backfills with a lower-scoring doc and diverges.
 /// `terms` is pre-tokenized; `mode` selects the kernel family.
-async fn assert_floor_preserves_topk(reader: &SuperfileReader, terms: &[&str], mode: BoolMode) {
-    const K: usize = 16;
+async fn assert_floor_preserves_topk(
+    reader: &SuperfileReader,
+    terms: &[&str],
+    mode: BoolMode,
+    k: usize,
+) {
     let full = reader
-        .bm25_search_pretokenized_with_floor("title", terms, K, mode, f32::NEG_INFINITY)
+        .bm25_search_pretokenized_with_floor("title", terms, k, mode, f32::NEG_INFINITY)
         .await
         .expect("unfloored top-k");
     assert_eq!(
         full.len(),
-        K,
-        "corpus must supply more than K matches for {terms:?} {mode:?}"
+        k,
+        "corpus must supply more than k matches for {terms:?} {mode:?}"
     );
 
     // Floor at the kth-best score — an active, load-bearing value: the
     // kernels prune every block whose max can't reach it, yet the full
-    // top-k must still come back because all K docs are at or above it.
+    // top-k must still come back because all k docs are at or above it.
     let kth = full.last().expect("k>0").1;
     let floored = reader
-        .bm25_search_pretokenized_with_floor("title", terms, K, mode, kth)
+        .bm25_search_pretokenized_with_floor("title", terms, k, mode, kth)
         .await
         .expect("floored top-k");
 
@@ -82,16 +93,20 @@ async fn floor_single_term_bmw_preserves_topk() {
     let owned = build_multi_block_corpus();
     let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
     let reader = build_infino_superfile(&refs);
-    assert_floor_preserves_topk(&reader, &["alpha"], BoolMode::Or).await;
+    assert_floor_preserves_topk(&reader, &["alpha"], BoolMode::Or, FLOOR_K).await;
 }
 
 #[tokio::test]
 async fn floor_multi_term_maxscore_preserves_topk() {
-    // Multi-term OR ⇒ MaxScore+BMM; the floor lifts the initial bar.
+    // Multi-term OR ⇒ the windowed kernel; the floor lifts the initial bar
+    // and prunes from the first window. At a large `k` the top k collect
+    // into a buffer rather than a heap.
     let owned = build_multi_block_corpus();
     let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
     let reader = build_infino_superfile(&refs);
-    assert_floor_preserves_topk(&reader, &["alpha", "beta", "gamma"], BoolMode::Or).await;
+    for k in [FLOOR_K, FLOOR_LARGE_K] {
+        assert_floor_preserves_topk(&reader, &["alpha", "beta", "gamma"], BoolMode::Or, k).await;
+    }
 }
 
 #[tokio::test]
@@ -100,5 +115,5 @@ async fn floor_and_intersection_preserves_topk() {
     let owned = build_multi_block_corpus();
     let refs: Vec<(u64, &str)> = owned.iter().map(|(i, s)| (*i, s.as_str())).collect();
     let reader = build_infino_superfile(&refs);
-    assert_floor_preserves_topk(&reader, &["alpha", "beta"], BoolMode::And).await;
+    assert_floor_preserves_topk(&reader, &["alpha", "beta"], BoolMode::And, FLOOR_K).await;
 }
