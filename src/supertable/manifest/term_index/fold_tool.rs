@@ -259,7 +259,7 @@ fn fold_timing() {
             merged.tiers.len(),
             mib(tier_bytes),
             mib(local_bytes) / secs,
-            mib(status_field_bytes("VmHWM").unwrap_or(0)),
+            mib(status_field_bytes("VmHWM:").unwrap_or(0)),
         );
         // Time the upload of the merged output to a scratch prefix, never
         // the table's own, so the fixture keeps no unreferenced objects.
