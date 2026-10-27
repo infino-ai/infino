@@ -284,7 +284,7 @@ manifest's bytes; the term index keeps both out of the manifest.
 
 The index is looked into, not loaded. A small *root* stays resident: the
 superfiles it covers, each with its smallest document id, and per
-*segment* the key range and content hash of every *slice*. A slice is a
+*layer* the key range and content hash of every *slice*. A slice is a
 few megabytes covering one contiguous range of `column`-and-term keys —
 a front-coded block dictionary over a postings region — so a lookup
 binary-searches the root for the one slice that can hold the key,
@@ -296,13 +296,13 @@ collection for as long as a manifest names them.
 Every commit publishes its superfiles' postings in the same atomic
 step as their entries: the writer already holds each new superfile's
 terms in memory when it finishes building it, spills them, merges the
-batch into a *delta* segment, writes the slices and a new root, and
+batch into a *delta* layer, writes the slices and a new root, and
 stamps the root's reference on the manifest before the pointer swap.
 So a visible superfile always has postings, a crash between the writes
 and the swap leaves only orphans for garbage collection, and a lost
 race is retried against the winner with re-puts of already-written
 slices as no-ops. A maintenance pass folds every delta into one base
-segment. Deltas committed while it runs stay after that base, padded so
+layer. Deltas committed while it runs stay after that base, padded so
 their ordinals hold; when they cannot (an incomplete or replaced prior
 index, or one that cannot be read), their superfiles are re-indexed on
 top of the base instead. The next pass folds either. A posting is
@@ -383,8 +383,8 @@ writes a superfile hands each term's best documents to a sink as it
 writes the term's postings, and the sink spills them as the superfile's
 contribution; a superfile built without the sink has its heads read
 from its own index with the single-term kernel instead, which gives the
-same bytes. The delta segment pools the contributions into tiers, and
-the maintenance rebuild re-pools every segment's tiers table-wide. A
+same bytes. The delta layer pools the contributions into tiers, and
+the maintenance rebuild re-pools every layer's tiers table-wide. A
 superfile's bytes are not changed by any of this. An index written by
 the layout before tiers is still read: its bounds, scores at each
 superfile's own idf, serve ceilings as they did, and the next

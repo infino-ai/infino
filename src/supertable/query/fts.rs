@@ -1300,7 +1300,7 @@ impl SupertableReader {
         // learns from, timing aside.
         let pruned = AtomicBool::new(false);
         // Whether the merge declined before any read — a term with
-        // postings in a segment without a tier, a superfile the root does
+        // postings in a layer without a tier, a superfile the root does
         // not list: the class learns there is nothing to merge here.
         let declined = AtomicBool::new(false);
         let merge_terms: Vec<String> = all_terms.iter().map(|t| (*t).to_owned()).collect();

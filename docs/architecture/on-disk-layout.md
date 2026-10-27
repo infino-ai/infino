@@ -60,7 +60,7 @@ mydb/                                     database root (the connect() path)
 │   │   ├── root-<blake3>.bin             binary · magic "INFTIDX1", immutable,
 │   │   │                                 content-addressed; the manifest names one
 │   │   │       ├ stores : the covered superfiles (uuid + smallest doc id) and,
-│   │   │       │          per segment, every slice's key range, hash and the
+│   │   │       │          per layer, every slice's key range, hash and the
 │   │   │       │          hash of its tier object
 │   │   │       └ used   : resident; binary-searched to find the slice for a term
 │   │   ├── slice-<blake3>.bin            binary · magic "INFTSLC1", immutable,
@@ -161,7 +161,7 @@ Every hop below the two pointer files is content-addressed with a blake3 hash, s
 - `data/` holds the superfiles; `superfiles/` holds only their tombstones. The directory name is misleading.
 - The live set is whatever the current manifest names. An update writes a new superfile and tombstones the old one, so `data/` accumulates more `.sf.parquet` files than the table's live row count until GC removes the dead ones.
 - `wal/mutations/` is normally empty. A `<walid>.json` (and, for UPDATE, its `.arrow` sidecar) exists only while a mutation is in flight or was interrupted; the next recovery sweep drains it.
-- `term-index/` is derived, not source data: every posting can be recomputed from its superfile's own dictionary, and a reader that cannot load the root or a slice routes by the manifest summaries instead. Every commit that adds a superfile appends a delta segment and a new root; a maintenance pass (`optimize`) folds the deltas into one base, keeping any deltas committed while it ran after that base (or re-indexing their superfiles on top of it), for the next pass to fold. A removal never invalidates it: a posting is followed only if its superfile is still listed by the reader's manifest, so a stale index is incomplete, never wrong. Superseded roots and slices age out through GC like every other derived artifact.
+- `term-index/` is derived, not source data: every posting can be recomputed from its superfile's own dictionary, and a reader that cannot load the root or a slice routes by the manifest summaries instead. Every commit that adds a superfile appends a delta layer and a new root; a maintenance pass (`optimize`) folds the deltas into one base, keeping any deltas committed while it ran after that base (or re-indexing their superfiles on top of it), for the next pass to fold. A removal never invalidates it: a posting is followed only if its superfile is still listed by the reader's manifest, so a stale index is incomplete, never wrong. Superseded roots and slices age out through GC like every other derived artifact.
 
 ## Source references
 
@@ -181,4 +181,4 @@ Anchored by symbol so they survive line moves:
 | tombstone binary format (`INFTOMB\0` + RoaringBitmap) | `MAGIC`, layout doc | [src/supertable/wal/tombstones_codec.rs](../../src/supertable/wal/tombstones_codec.rs) |
 | `term-index/root-<hash>.bin`, `slice-<hash>.bin` and `tier-<hash>.bin` names, root and slice binary layouts, posting and run encoding, the layout before tiers still read | `STORAGE_PREFIX`, `ROOT_MAGIC`, `SLICE_MAGIC`, `Root`, `Slice`, `Posting`, `Run` | [src/supertable/manifest/term_index/format.rs](../../src/supertable/manifest/term_index/format.rs) |
 | tier object layout: chunks of a directory and blocks of 64 entries, region-major, a CRC per directory and per block | `TierChunk`, `TierDirectory`, `BLOCK_ENTRIES`, `encode_tier` | [src/supertable/manifest/term_index/tier.rs](../../src/supertable/manifest/term_index/tier.rs) |
-| term-index build: per-superfile contributions, k-way merge into slices, delta segments | `ContributionWriter`, `build_segment`, `append_delta` | [src/supertable/manifest/term_index/build.rs](../../src/supertable/manifest/term_index/build.rs), [mod.rs](../../src/supertable/manifest/term_index/mod.rs) |
+| term-index build: per-superfile contributions, k-way merge into slices, delta layers | `ContributionWriter`, `build_layer`, `append_delta` | [src/supertable/manifest/term_index/build.rs](../../src/supertable/manifest/term_index/build.rs), [mod.rs](../../src/supertable/manifest/term_index/mod.rs) |
