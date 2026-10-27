@@ -635,7 +635,17 @@ pub(crate) fn timed_section<R>(f: impl FnOnce() -> R) -> (R, u64) {
 /// detached, so a long-lived cache can never bill later queries into this
 /// scope.
 pub(crate) fn suppressed<T>(f: impl FnOnce() -> T) -> T {
-    let previous = CURRENT.with(|slot| slot.borrow_mut().take());
+    attached(None, f)
+}
+
+/// Run `f` with `collector` installed on this thread, restoring the previous
+/// one after. For work a query hands to another thread that captures
+/// [`current`] there, so it still bills the query's scope. Like
+/// [`suppressed`], it leaves the live-scope count alone: that belongs to the
+/// thread that opened the scope. Work that outlives the scope adds to a
+/// collector nobody reads again.
+pub(crate) fn attached<T>(collector: Option<Arc<OpStatsCollector>>, f: impl FnOnce() -> T) -> T {
+    let previous = CURRENT.with(|slot| slot.replace(collector));
     let _guard = ScopeGuard { previous };
     f()
 }

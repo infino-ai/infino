@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
     future::Future,
-    sync::{Arc, Mutex, OnceLock, Weak, atomic::AtomicBool},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, atomic::AtomicBool},
     time::{Duration, Instant},
 };
 
@@ -956,33 +956,46 @@ impl Supertable {
     }
 
     /// Decide whether this handle's consistency policy requires a pointer read
-    /// now. Bounded-staleness callers share the timestamp so concurrent query
+    /// now, and claim it. Callers share the timestamp, so concurrent query
     /// paths cannot stampede storage.
     fn pointer_refresh_due(&self) -> bool {
-        if self.inner.options.storage.is_none() {
+        let Some(bound) = self.staleness_bound() else {
             return false;
+        };
+        // Decide and stamp under one lock, then release it before the read.
+        let mut last = self.last_pointer_check();
+        let due = past_bound(*last, bound);
+        if due {
+            *last = Some(Instant::now());
         }
+        due
+    }
+
+    /// Whether a reader minted now would read the pointer first, without
+    /// claiming that check: the next [`Self::ensure_fresh`] still makes it.
+    pub(crate) fn pointer_refresh_pending(&self) -> bool {
+        self.staleness_bound()
+            .is_some_and(|bound| past_bound(*self.last_pointer_check(), bound))
+    }
+
+    /// How long this handle may serve its snapshot before it checks the
+    /// pointer again: `None` when it never checks (no storage, or
+    /// `Snapshot`), zero under `Strong` (it checks before every read), and
+    /// the window under `BoundedStaleness`.
+    fn staleness_bound(&self) -> Option<Duration> {
+        self.inner.options.storage.as_ref()?;
         match self.inner.options.read_consistency {
-            Consistency::Snapshot => false,
-            Consistency::Strong => true,
-            Consistency::BoundedStaleness(window) => {
-                // Decide whether a check is due under the lock, stamp
-                // "now" optimistically so concurrent queries don't all
-                // stampede the pointer, then release the lock before I/O.
-                {
-                    let mut last = self
-                        .inner
-                        .last_pointer_check
-                        .lock()
-                        .expect("last_pointer_check mutex poisoned");
-                    let due = last.map(|t| t.elapsed() >= window).unwrap_or(true);
-                    if due {
-                        *last = Some(Instant::now());
-                    }
-                    due
-                }
-            }
+            Consistency::Snapshot => None,
+            Consistency::Strong => Some(Duration::ZERO),
+            Consistency::BoundedStaleness(window) => Some(window),
         }
+    }
+
+    fn last_pointer_check(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.inner
+            .last_pointer_check
+            .lock()
+            .expect("last_pointer_check mutex poisoned")
     }
 
     /// Async form used when freshness is one branch of a query I/O wave.
@@ -1896,6 +1909,12 @@ pub(crate) fn train_global_centroids(
 
 pub(crate) fn legacy_vector_index_storage_prefix() -> &'static str {
     super::manifest::DEFAULT_VECTOR_INDEX_PREFIX
+}
+
+/// Whether a pointer last read at `last` (never, if `None`) is older than
+/// `bound`.
+fn past_bound(last: Option<Instant>, bound: Duration) -> bool {
+    last.is_none_or(|at| at.elapsed() >= bound)
 }
 
 fn generate_vector_index_storage_prefix() -> String {

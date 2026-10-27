@@ -6,6 +6,8 @@
 
 use tokio_util::sync::CancellationToken;
 
+use crate::InfinoError;
+
 /// Stops a running SQL query from another thread.
 ///
 /// Pass it to [`Connection::query_sql_cancellable`](crate::Connection::query_sql_cancellable)
@@ -37,8 +39,30 @@ impl QueryCancel {
         self.token.is_cancelled()
     }
 
-    /// Resolves once the handle fires.
-    pub(crate) async fn cancelled(&self) {
-        self.token.cancelled().await;
+    /// `Cancelled` once the handle has fired.
+    pub(crate) fn check(&self) -> Result<(), InfinoError> {
+        if self.is_cancelled() {
+            return Err(cancelled());
+        }
+        Ok(())
     }
+
+    /// Run `work` unless the handle fires first, in which case `work` is
+    /// dropped and the answer is `Cancelled`. The handle is polled first, so
+    /// once it has fired no result is taken, even one about to land.
+    pub(crate) async fn unless_cancelled<T>(
+        &self,
+        work: impl Future<Output = Result<T, InfinoError>>,
+    ) -> Result<T, InfinoError> {
+        tokio::select! {
+            biased;
+            () = self.token.cancelled() => Err(cancelled()),
+            result = work => result,
+        }
+    }
+}
+
+/// The error a cancelled query returns.
+fn cancelled() -> InfinoError {
+    InfinoError::Cancelled("the query was cancelled".to_string())
 }
