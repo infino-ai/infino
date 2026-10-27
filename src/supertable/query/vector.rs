@@ -135,7 +135,7 @@ use crate::{
             exec::common::{
                 SCORE_COLUMN, id_score_batch, resolve_hits_named, take_rows_byte_source,
             },
-            fts::{memo_from_locations, memos_from_plan_locations},
+            fts::{memo_from_locations, memos_from_plan_locations, no_fts_index_message},
             provider::prune_leaves_for_filters,
             prune::{PruneLeaf, select_superfiles},
             superfile_reader::OpenTierCounts,
@@ -6481,7 +6481,8 @@ impl SupertableReader {
     /// fan-out. Superfiles whose predicate matches nothing are skipped.
     ///
     /// An empty `filter_query` (tokenizes to nothing) or a predicate
-    /// that matches no row anywhere returns an empty `Vec`.
+    /// that matches no row anywhere returns an empty `Vec`; a filter column
+    /// with no full-text index is `QueryError::InvalidQuery`.
     ///
     /// `pub(crate)` async kernel — the public surface is the sync
     /// `vector_search` with a filter; this drives the cross-superfile fan-out.
@@ -6503,11 +6504,15 @@ impl SupertableReader {
         let manifest = self.manifest();
         // Tokenize the predicate once with the FILTER COLUMN's analyzer
         // (the same one used at build time, so the terms match the
-        // postings AND the manifest term blooms). A non-FTS filter column
-        // matches nothing; no tokens (empty / punctuation-only) ⇒
+        // postings AND the manifest term blooms). A filter column with no
+        // full-text index is rejected as `token_match` rejects it, so it never
+        // looks like an empty match; no tokens (empty / punctuation-only) ⇒
         // nothing matches.
         let Some(tokenizer) = manifest.try_fts_tokenizer_for(filter.column) else {
-            return Ok(Vec::new());
+            return Err(QueryError::InvalidQuery(no_fts_index_message(
+                filter.column,
+                &manifest.fts_configs(),
+            )));
         };
         let tokens: Vec<String> = tokenizer.tokenize(filter.query).collect();
         if tokens.is_empty() {

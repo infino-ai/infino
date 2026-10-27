@@ -416,7 +416,7 @@ const NEGATION_ONLY_QUERY_MSG: &str = "only negated terms; at least one positive
 /// caller can correct the request, rather than failing deep in the scan with
 /// an opaque "missing full-text section" error once a candidate superfile is
 /// opened.
-fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
+pub(crate) fn no_fts_index_message(column: &str, fts_columns: &[FtsConfig]) -> String {
     if fts_columns.is_empty() {
         return format!(
             "no full-text index for column {column:?}: this table has no \

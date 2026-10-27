@@ -327,6 +327,32 @@ fn vector_filter_restricts_hits_to_the_predicate_match_set() {
     );
 }
 
+/// A filter on a column with no full-text index is rejected with the same
+/// error `token_match` returns, so a caller can tell it from a predicate
+/// that matched nothing.
+#[test]
+fn vector_filter_on_unindexed_column_errors_like_token_match() {
+    let st = demo_two_superfiles();
+    let reader = st.reader().expect("reader");
+    let token_err = reader
+        .token_match("emb", "rust", BoolMode::Or)
+        .expect_err("token_match rejects a column without a full-text index");
+    let vector_err = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "emb",
+                query: "rust",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect_err("filtered vector search rejects the same column");
+    assert_eq!(vector_err.to_string(), token_err.to_string());
+}
+
 /// UNDRAINED table, rare predicate whose matches sit far from the query's
 /// nearest cells, `k` covering the whole match set: the selectivity-widened
 /// probe must return every match.
