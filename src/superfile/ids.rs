@@ -387,13 +387,13 @@ fn decode_docs(
 
 /// A packed id sidecar over borrowed bytes.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PackedIdOutput<'a> {
+pub(crate) struct PackedIds<'a> {
     bytes: &'a [u8],
     n_docs: usize,
     n_blocks: usize,
 }
 
-impl<'a> PackedIdOutput<'a> {
+impl<'a> PackedIds<'a> {
     /// Opens a sidecar by checking only its header. Checking every block here
     /// would read the whole sidecar from disk on a cold open, even for a query
     /// that never asks for an `_id`. A bad block shows up as `None` on read.
@@ -576,7 +576,7 @@ test_visible! {
     fn check_id_sidecar(superfile: &[u8]) -> Result<(), String> {
         let sidecar = &superfile[id_sidecar_range(superfile)];
         let n_docs = u32_le_at(sidecar, 0).ok_or("packed id sidecar shorter than its header")?;
-        PackedIdOutput::open(sidecar, n_docs as usize)?.check_blocks()
+        PackedIds::open(sidecar, n_docs as usize)?.check_blocks()
     }
 }
 
@@ -594,7 +594,7 @@ mod tests {
 
     fn round_trip(ids: &[i128]) -> Vec<u8> {
         let packed = encode_packed(&raw(ids));
-        let p = PackedIdOutput::open(&packed, ids.len()).expect("valid");
+        let p = PackedIds::open(&packed, ids.len()).expect("valid");
         for (d, &id) in ids.iter().enumerate() {
             assert_eq!(p.get(d as u32), Some(id), "doc {d}");
         }
@@ -680,7 +680,7 @@ mod tests {
             .map(|i| (i * 7919) ^ (i << 40))
             .collect();
         let packed = round_trip(&ids);
-        let p = PackedIdOutput::open(&packed, ids.len()).expect("opens");
+        let p = PackedIds::open(&packed, ids.len()).expect("opens");
         let n = ids.len() as u32;
         let cases: Vec<Vec<u32>> = vec![
             (0..n).collect(),               // every doc, ascending
@@ -734,12 +734,12 @@ mod tests {
             [0, (last_block * BLOCK_DOCS - 1) as u32],
         );
 
-        assert!(PackedIdOutput::open(&packed, n - 1).is_err(), "n_docs mismatch");
+        assert!(PackedIds::open(&packed, n - 1).is_err(), "n_docs mismatch");
         for cut in [0, 8, HEADER_BYTES + 3, HEADER_BYTES + DIR_ENTRY_BYTES] {
-            assert!(PackedIdOutput::open(&packed[..cut], n).is_err(), "cut {cut}");
+            assert!(PackedIds::open(&packed[..cut], n).is_err(), "cut {cut}");
         }
         assert_eq!(
-            PackedIdOutput::open(&packed, n).expect("intact").check_blocks(),
+            PackedIds::open(&packed, n).expect("intact").check_blocks(),
             Ok(()),
             "an intact sidecar passes the full check"
         );
@@ -771,7 +771,7 @@ mod tests {
             ),
         ];
         for (what, bytes) in &cases {
-            let p = PackedIdOutput::open(bytes, n).expect("header intact");
+            let p = PackedIds::open(bytes, n).expect("header intact");
             assert_eq!(p.get(bad_doc), None, "{what}");
             assert_eq!(
                 p.check_blocks(),
@@ -810,7 +810,7 @@ mod block_tests {
     fn a_block_decodes_alone_as_in_the_whole_sidecar() {
         let raw = raw_ids();
         let packed = encode_packed(&raw);
-        let whole = PackedIdOutput::open(&packed, ROWS).expect("whole sidecar");
+        let whole = PackedIds::open(&packed, ROWS).expect("whole sidecar");
         let dir = PackedDirectory::open(&packed[..directory_len(ROWS)], ROWS).expect("directory");
         assert_eq!(dir.n_blocks(), ROWS.div_ceil(BLOCK_DOCS));
         for b in 0..dir.n_blocks() {
