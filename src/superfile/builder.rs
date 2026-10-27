@@ -3525,9 +3525,10 @@ impl SuperfileBuilder {
                 let blocks = blocks
                     .into_inner()
                     .map_err(|e| BuildError::Io(e.into_error()))?;
-                Box::new(Cursor::new(directory).chain(BufReader::new(
-                    blocks.reopen().map_err(BuildError::Io)?,
-                )))
+                Box::new(
+                    Cursor::new(directory)
+                        .chain(BufReader::new(blocks.reopen().map_err(BuildError::Io)?)),
+                )
             }
             None => Box::new(Cursor::new(Vec::new())),
         };

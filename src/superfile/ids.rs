@@ -659,7 +659,10 @@ mod tests {
         assert_eq!(streamed.len() as usize, whole.len());
         let mut joined = streamed.directory.clone();
         joined.extend_from_slice(&streamed.blocks);
-        assert_eq!(joined, whole, "streamed and whole-buffer encodes agree byte for byte");
+        assert_eq!(
+            joined, whole,
+            "streamed and whole-buffer encodes agree byte for byte"
+        );
 
         let empty = PackedIdEncoder::new(Vec::new()).finish().expect("vec sink");
         assert!(empty.is_empty(), "no ids pushed is no sidecar");
