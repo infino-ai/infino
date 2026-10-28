@@ -2378,6 +2378,55 @@ pub(crate) fn id_score_projection_indices(
         .collect()
 }
 
+/// SQL table-function projection policy: positions into the synthesized
+/// `_id` + `score` batch for the columns `projection` asks of
+/// `output_schema` (`None` asks for all of them), or `None` when one of
+/// them needs the general path.
+///
+/// Same rule as the public API, classified through the same function
+/// ([`free_column_slot`]): each requested DataFusion column index is mapped
+/// back to its name. Empty stays `Some([])` here: DataFusion emits an empty
+/// projection for `COUNT(*)`-shaped plans, where a zero-column batch is the
+/// wanted output (the public API sends empty down the general path instead).
+///
+/// Arrow permits duplicate field names, so a user column literally named
+/// `score` (or matching the id column) would make the name lookup
+/// ambiguous; the fast path is declined outright in that case.
+pub(crate) fn sql_id_score_projection(
+    output_schema: &Schema,
+    projection: Option<&[usize]>,
+    id_column: &str,
+) -> Option<Vec<usize>> {
+    let ambiguous = |name: &str| {
+        output_schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() == name)
+            .count()
+            > 1
+    };
+    if ambiguous(id_column) || ambiguous(SCORE_COLUMN) {
+        return None;
+    }
+    let all: Vec<usize>;
+    let requested = match projection {
+        Some(requested) => requested,
+        None => {
+            all = (0..output_schema.fields().len()).collect();
+            &all
+        }
+    };
+    requested
+        .iter()
+        .map(|&idx| {
+            output_schema
+                .fields()
+                .get(idx)
+                .and_then(|f| free_column_slot(f.name(), id_column))
+        })
+        .collect()
+}
+
 fn is_hidden_vector_manifest(manifest: &ManifestSnapshot) -> bool {
     matches!(
         manifest.partition_strategy(),
@@ -7357,7 +7406,9 @@ impl SupertableReader {
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect())
     }
-    pub(crate) async fn vector_search_user_table_async(
+    /// kNN over every user superfile: the search before the first drain,
+    /// when the hidden vector index holds nothing yet.
+    async fn vector_search_user_table_async(
         &self,
         column: &str,
         query: &[f32],
@@ -7615,12 +7666,11 @@ impl SupertableReader {
                 }
             };
             let id_column = self.options().id_column.as_str();
-            // GUARDED on every hit carrying a stamp, exactly as the hybrid
-            // path guards its own fast path (`hybrid_exec.rs`): a superfile
-            // entry with no row-id base stamps `stable_id: None`
-            // (`dispatch.rs`), and `hits_id_score_batch` treats that as an
-            // upstream bug. Falling through resolves the id by placement
-            // instead of failing the query.
+            // Guarded on every hit carrying a stamp: a superfile entry with
+            // no row-id base stamps `stable_id: None` (`dispatch.rs`), and
+            // `hits_id_score_batch` treats that as an upstream bug. Falling
+            // through resolves the id by placement instead of failing the
+            // query.
             if free_columns_unambiguous(&self.options().schema, id_column)
                 && let Some(indices) = id_score_projection_indices(projection, id_column)
                 && hits.iter().all(|hit| hit.stable_id.is_some())
@@ -11218,8 +11268,12 @@ mod tests {
         });
     }
 
+    /// Before the first drain the hidden index holds nothing, so hybrid's
+    /// vector leg, which is `vector_search`'s, falls back to the user
+    /// superfiles; once drained it searches the hidden index (see the
+    /// `hybrid_hidden_index` integration tests).
     #[test]
-    fn hybrid_vector_leg_uses_user_superfiles_not_hidden() {
+    fn hybrid_vector_leg_falls_back_to_user_superfiles_before_the_first_drain() {
         let dim = 16usize;
         let schema = schema_with_vector(dim);
         let opts = options_one_superfile_per_commit(dim);
@@ -11257,7 +11311,7 @@ mod tests {
         for hit in &hits {
             assert!(
                 user_uris.contains(&hit.superfile),
-                "hybrid vector leg must fan out on user superfiles, got {:?}",
+                "an undrained table's hybrid hits must be user superfile hits, got {:?}",
                 hit.superfile
             );
         }

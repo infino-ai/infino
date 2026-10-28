@@ -7,6 +7,7 @@ mod covered_agg;
 pub mod fanout_concurrency;
 pub mod fanout_floor;
 pub mod hierarchical;
+mod hybrid_hidden_index;
 pub mod hybrid_search;
 mod id_resolve;
 pub mod match_search;
