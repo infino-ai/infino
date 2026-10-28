@@ -44,8 +44,25 @@ fn options_cat_rating() -> SupertableOptions {
     let schema = Arc::new(Schema::new(vec![
         Field::new("category", DataType::LargeUtf8, false),
         Field::new("rating", DataType::Int64, false),
+        Field::new("bonus", DataType::Int64, true),
     ]));
     SupertableOptions::new(schema, vec![], vec![]).expect("valid options")
+}
+
+/// Row `r` of commit `idx`: its rating, and its bonus — the rating on an
+/// even row, NULL on an odd one, so every commit's bonus column holds nulls
+/// inside bounds that a range can cover.
+fn fixture_row(idx: usize, r: usize) -> (i64, Option<i64>) {
+    let rating = (idx * 1000 + r) as i64;
+    (rating, r.is_multiple_of(2).then_some(rating))
+}
+
+/// Every row of the fixture as `(rating, bonus)`, the oracle for the
+/// nullable-column gates.
+fn fixture_rows() -> Vec<(i64, Option<i64>)> {
+    (0..COMMITS)
+        .flat_map(|idx| (0..ROWS_PER_COMMIT).map(move |r| fixture_row(idx, r)))
+        .collect()
 }
 
 /// Commit `idx`: ratings `idx*1000 .. idx*1000 + ROWS_PER_COMMIT`.
@@ -53,9 +70,8 @@ fn build_batch(idx: usize, schema: Arc<Schema>) -> RecordBatch {
     let cats: Vec<String> = (0..ROWS_PER_COMMIT)
         .map(|r| format!("cat{idx}_{r:03}"))
         .collect();
-    let ratings: Vec<i64> = (0..ROWS_PER_COMMIT)
-        .map(|r| (idx * 1000 + r) as i64)
-        .collect();
+    let (ratings, bonuses): (Vec<i64>, Vec<Option<i64>>) =
+        (0..ROWS_PER_COMMIT).map(|r| fixture_row(idx, r)).unzip();
     RecordBatch::try_new(
         schema,
         vec![
@@ -63,6 +79,7 @@ fn build_batch(idx: usize, schema: Arc<Schema>) -> RecordBatch {
                 cats.iter().map(String::as_str).collect::<Vec<_>>(),
             )),
             Arc::new(Int64Array::from(ratings)),
+            Arc::new(Int64Array::from(bonuses)),
         ],
     )
     .expect("batch")
@@ -103,14 +120,24 @@ fn explain(st: &Supertable, sql: &str) -> String {
 }
 
 fn scalar_i64(st: &Supertable, sql: &str) -> i64 {
+    row_i64s(st, sql)[0]
+}
+
+/// Every column of a one-row result of `Int64` columns.
+fn row_i64s(st: &Supertable, sql: &str) -> Vec<i64> {
     let batches = st.reader().expect("reader").query_sql(sql).expect("sql");
     let batch = batches.iter().find(|b| b.num_rows() > 0).expect("one row");
     batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("i64 result")
-        .value(0)
+        .columns()
+        .iter()
+        .map(|column| {
+            column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i64 result")
+                .value(0)
+        })
+        .collect()
 }
 
 /// First-row string result. The provider serves non-FTS string columns
@@ -266,6 +293,46 @@ fn boundary_cutting_range_mixes_covered_and_residual_exactly() {
         sum_plan.contains("__resid_0"),
         "SUM still needs the covered/residual boundary scan; plan was:\n{sum_plan}"
     );
+
+    // COUNT of a column with nulls: the covered commits from their null
+    // counts, the boundary commits from the residual's count(bonus).
+    let count_bonus_sql = format!("SELECT COUNT(bonus) FROM supertable WHERE {where_range}");
+    let expected_bonus = fixture_rows()
+        .into_iter()
+        .filter(|(rating, bonus)| (25..=3025).contains(rating) && bonus.is_some())
+        .count() as i64;
+    assert_eq!(scalar_i64(&st, &count_bonus_sql), expected_bonus);
+    let count_bonus_plan = explain(&st, &count_bonus_sql);
+    assert!(
+        count_bonus_plan.contains("__resid_0"),
+        "COUNT(bonus) takes the covered/residual path; plan was:\n{count_bonus_plan}"
+    );
+}
+
+/// A range over a column with nulls never answers a segment from its
+/// statistics: a NULL never matches the range, but the segment's row count
+/// and its other columns' statistics include that row. Covered by bounds
+/// alone, commits 1 and 2 would count their odd rows (NULL bonus) too.
+#[test]
+fn range_over_a_nullable_column_never_counts_its_null_rows() {
+    let st = build_table();
+    for (lo, hi) in [(1000, 2999), (25, 3025)] {
+        let sql = format!(
+            "SELECT COUNT(*), COUNT(rating), SUM(rating) FROM supertable \
+             WHERE bonus >= {lo} AND bonus <= {hi}"
+        );
+        let matching: Vec<i64> = fixture_rows()
+            .into_iter()
+            .filter(|(_, bonus)| bonus.is_some_and(|b| (lo..=hi).contains(&b)))
+            .map(|(rating, _)| rating)
+            .collect();
+        let count = matching.len() as i64;
+        assert_eq!(
+            row_i64s(&st, &sql),
+            vec![count, count, matching.iter().sum::<i64>()],
+            "{sql}"
+        );
+    }
 }
 
 #[test]
@@ -336,6 +403,12 @@ fn tombstoned_covered_segment_demotes_to_residual() {
     // truth.
     assert_eq!(scalar_i64(&st, &count_sql), commit_range_count(1, 2) - 1);
     assert_eq!(scalar_i64(&st, &sum_sql), commit_range_sum(1, 2) - 1005);
+    // A column's count from its null count would still hold the deleted row.
+    let count_column_sql = format!("SELECT COUNT(category) FROM supertable WHERE {where_range}");
+    assert_eq!(
+        scalar_i64(&st, &count_column_sql),
+        commit_range_count(1, 2) - 1
+    );
 }
 
 /// `IN`-list scalar pruning must keep every superfile holding a listed

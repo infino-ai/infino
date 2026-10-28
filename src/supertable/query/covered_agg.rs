@@ -39,6 +39,9 @@
 //!     — partial predicate coverage would answer the wrong query);
 //!   * a segment with any (or unknown) tombstones demotes to
 //!     boundary;
+//!   * a segment whose range column holds any (or an unknown number of)
+//!     nulls is boundary: a NULL never matches the range, but the
+//!     segment's statistics count its row;
 //!   * a covered segment missing a required stat demotes to boundary;
 //!   * only `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` over bare
 //!     columns, no DISTINCT / FILTER / ORDER BY; the sole grouped shape is
@@ -830,25 +833,36 @@ fn collect_range_leaves(expr: &Expr, out: &mut Vec<(String, Operator, ScalarValu
 
 /// Classify one segment's `[seg_min, seg_max]` for `range.column`
 /// against the range. Missing bounds → `Boundary` (conservative).
+///
+/// A NULL never matches a range, so a segment whose range column holds
+/// nulls (or an unknown number of them) is never covered: its row count,
+/// and every other column's statistics, include rows the filter drops.
+/// `_id` is never null.
 fn classify(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     id_column: &str,
     range: &RangeFilter,
 ) -> Class {
-    let bounds = if range.column == id_column {
-        Some((
-            ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            ScalarValue::Decimal128(Some(entry.id_max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
-        ))
+    let (bounds, null_free) = if range.column == id_column {
+        (
+            Some((
+                ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+                ScalarValue::Decimal128(Some(entry.id_max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+            )),
+            true,
+        )
     } else {
-        manifest
+        let stats = manifest
             .field_id(&range.column)
-            .and_then(|id| entry.scalar_stats.column(id))
-            .and_then(|stats| {
+            .and_then(|id| entry.scalar_stats.column(id));
+        (
+            stats.and_then(|stats| {
                 let (mn, mx) = stats.min_max_values()?;
                 (!mn.is_null() && !mx.is_null()).then_some((mn, mx))
-            })
+            }),
+            stats.is_some_and(|stats| stats.null_count() == Some(0)),
+        )
     };
     let Some((seg_min, seg_max)) = bounds else {
         return Class::Boundary;
@@ -893,7 +907,7 @@ fn classify(
             _ => false,
         },
     };
-    if lo_ok && hi_ok {
+    if lo_ok && hi_ok && null_free {
         Class::Covered
     } else {
         Class::Boundary

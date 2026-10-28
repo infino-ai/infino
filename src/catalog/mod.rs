@@ -4505,6 +4505,59 @@ mod tests {
         assert!(scans(&plan), "the null group is not in the value counts");
     }
 
+    /// `(group, count)` rows of a grouped count whose group column may be null, sorted.
+    fn nullable_grouped_counts(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 group");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count");
+            for i in 0..batch.num_rows() {
+                let group = (!groups.is_null(i)).then(|| groups.value(i).to_string());
+                rows.push((group, counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Only `IS NOT NULL` on the grouping column itself, alone, is answered from its value
+    /// counts. A filter on another column keeps the null group the value counts lack, and a
+    /// conjunction narrows the rows below them; both are scanned.
+    #[test]
+    fn query_sql_scans_grouped_counts_under_any_other_filter() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let other_column =
+            "SELECT title, count(*) FROM fares WHERE fare IS NOT NULL GROUP BY title";
+        assert_eq!(
+            nullable_grouped_counts(&conn.query_sql(other_column).expect("grouped")),
+            vec![
+                (None, 2),
+                (Some("fhv".to_string()), 1),
+                (Some("yellow".to_string()), 1)
+            ]
+        );
+        let conjunction = "SELECT title, count(*) FROM fares \
+                           WHERE title IS NOT NULL AND fare IS NOT NULL GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(conjunction).expect("grouped")),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 1)]
+        );
+        for sql in [other_column, conjunction] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(scans(&plan), "must scan: {sql}");
+        }
+    }
+
     /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
     /// two tables still scans both and counts the joined rows.
     #[test]
