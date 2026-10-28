@@ -101,6 +101,10 @@ const RENAMED_CONFIG_KEYS: &[(&str, &str)] =
 /// letting the config field distinguish "unset" from an explicit `0`.
 pub(crate) const DEFAULT_CONNECTION_BUDGET_BYTES: u64 = 0;
 
+/// Default `memory.decoded_column_cache_bytes`: `0`, no decoded columns kept.
+/// How much memory a host gives the scan's decoded columns is its choice.
+pub(crate) const DEFAULT_DECODED_COLUMN_CACHE_BYTES: u64 = 0;
+
 /// Errors from config load + validation.
 ///
 /// `figment::Error` is ~200 bytes; boxing keeps the `Result` size
@@ -173,6 +177,12 @@ pub struct MemorySettings {
     /// limit where there is none; `0` sets no limit; a positive value is the
     /// limit. Read once per process.
     pub process_limit_bytes: Option<u64>,
+    /// Bytes of decoded columns the SQL scan keeps across statements, for
+    /// the whole process: a scan of a column it has kept reads the arrays
+    /// instead of decoding the file's pages again. Least recently used
+    /// columns leave first. `0` (the default) keeps none. Read once per
+    /// process.
+    pub decoded_column_cache_bytes: u64,
 }
 
 impl Default for MemorySettings {
@@ -180,6 +190,7 @@ impl Default for MemorySettings {
         Self {
             connection_budget_bytes: DEFAULT_CONNECTION_BUDGET_BYTES,
             process_limit_bytes: None,
+            decoded_column_cache_bytes: DEFAULT_DECODED_COLUMN_CACHE_BYTES,
         }
     }
 }
@@ -2488,6 +2499,16 @@ storage:
         let cfg =
             Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
         assert_eq!(cfg.memory.process_limit_bytes, Some(1000));
+    }
+
+    #[test]
+    fn decoded_column_cache_defaults_to_none_and_parses_a_value() {
+        let cfg = Config::defaults().expect("embedded default must parse");
+        assert_eq!(cfg.memory.decoded_column_cache_bytes, 0);
+        let yaml = "memory:\n  decoded_column_cache_bytes: 1000\n";
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        assert_eq!(cfg.memory.decoded_column_cache_bytes, 1000);
     }
 
     #[test]

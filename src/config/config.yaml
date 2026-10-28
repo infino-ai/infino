@@ -607,3 +607,9 @@ memory:
   # its cgroup v2 hierarchy), and no limit where there is none. 0 sets no
   # limit; a positive value is the limit.
   # process_limit_bytes: 6442450944
+
+  # Bytes of decoded columns the SQL scan keeps across statements, for the
+  # whole process. A scan of a column it has kept reads the decoded arrays
+  # instead of decompressing and decoding the file's pages again; least
+  # recently used columns leave first. 0 (default) keeps none.
+  decoded_column_cache_bytes: 0

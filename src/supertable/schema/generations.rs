@@ -20,6 +20,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
+use datafusion::prelude::{col, lit};
 use tempfile::TempDir;
 
 use super::{FieldId, map::FileSchemaMap, with_field_id};
@@ -32,7 +33,11 @@ use crate::{
         fts::reader::{Bm25SearchOptions, BoolMode},
         vector::{builder::VectorConfig, distance::Metric},
     },
-    supertable::{Supertable, SupertableOptions, writer::commit_built_superfile},
+    supertable::{
+        Supertable, SupertableOptions, SupertableReader,
+        query::{column_cache::DecodedColumnCache, scalar_cache::ByteLru},
+        writer::commit_built_superfile,
+    },
     test_helpers::{decimal128_id_field, decimal128_ids},
 };
 
@@ -46,6 +51,13 @@ const TAG: FieldId = FieldId(4);
 /// The id of a column the table never had: a file carrying it was written
 /// under a schema that has since dropped the column.
 const DROPPED: FieldId = FieldId(9);
+/// Budget for the decoded columns the kept-column test reads back: room for
+/// every column of every generation.
+const KEPT_COLUMN_BYTES: usize = 16 << 20;
+/// A score of a current-shape file the kept-column test deletes.
+const DELETED_SCORE: i64 = 42;
+/// A tag of the file holding `tag` as a narrow string, deleted in the same test.
+const DELETED_TAG: &str = "h";
 
 /// One logical row as the table reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -66,12 +78,14 @@ fn table_schema() -> Arc<Schema> {
     ]))
 }
 
-fn table(dir: &TempDir) -> Supertable {
+/// The table, its SQL scans keeping decoded columns in `kept` when given.
+fn table(dir: &TempDir, kept: Option<Arc<DecodedColumnCache>>) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-    let options = SupertableOptions::new(table_schema(), vec![FtsConfig::new("title")], vec![])
+    let mut options = SupertableOptions::new(table_schema(), vec![FtsConfig::new("title")], vec![])
         .expect("options")
         .with_storage(storage);
+    options.decoded_columns = kept;
     Supertable::create(options).expect("create")
 }
 
@@ -376,7 +390,15 @@ fn generations() -> Vec<(Bytes, Vec<Row>)> {
 
 /// The table with every generation committed, and the rows it holds.
 fn mixed_table(dir: &TempDir) -> (Supertable, Vec<Row>) {
-    let st = table(dir);
+    mixed_table_with(dir, None)
+}
+
+/// [`mixed_table`], its SQL scans keeping decoded columns in `kept`.
+fn mixed_table_with(
+    dir: &TempDir,
+    kept: Option<Arc<DecodedColumnCache>>,
+) -> (Supertable, Vec<Row>) {
+    let st = table(dir, kept);
     let mut rows = Vec::new();
     for (bytes, generation_rows) in generations() {
         commit_built_superfile(&st, bytes).expect("commit generation");
@@ -459,6 +481,67 @@ fn sql_reads_every_generation_as_the_table_sees_it() {
         .cloned()
         .collect();
     assert_eq!(rows_of_batches(&batches), want);
+}
+
+#[test]
+fn sql_reads_every_generation_from_kept_columns() {
+    // The same reads with the scan keeping decoded columns. The first pass
+    // decodes every generation's columns through its map and keeps them.
+    // Rows are then deleted — one of a current-shape file and one of a file
+    // holding `tag` as a narrow string — and the reads that follow come from
+    // the kept columns, which still hold the deleted rows: the scan must
+    // leave them out.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, all) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
+    let scans: [(&str, Box<dyn Fn(&Row) -> bool>); 3] = [
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable ORDER BY _id",
+            Box::new(|_| true),
+        ),
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable WHERE score > 20 ORDER BY _id",
+            Box::new(|r| r.score.is_some_and(|s| s > 20)),
+        ),
+        (
+            "SELECT _id, title, score, rating, tag FROM supertable WHERE tag = 'i' OR rating < 3.5 ORDER BY _id",
+            Box::new(|r| r.tag.as_deref() == Some("i") || r.rating.is_some_and(|x| x < 3.5)),
+        ),
+    ];
+    let check = |pass: &str, reader: &SupertableReader, expected: &[Row]| {
+        for (sql, keep) in &scans {
+            let batches = reader.query_sql(sql).expect("sql");
+            let want: Vec<Row> = expected.iter().filter(|r| keep(r)).cloned().collect();
+            assert_eq!(rows_of_batches(&batches), want, "{pass}: {sql}");
+        }
+    };
+    check("decoded", &st.reader().expect("reader"), &all);
+    st.delete(col("score").eq(lit(DELETED_SCORE)))
+        .expect("delete by score");
+    st.delete(col("tag").eq(lit(DELETED_TAG)))
+        .expect("delete by tag");
+    let expected: Vec<Row> = all
+        .into_iter()
+        .filter(|r| r.score != Some(DELETED_SCORE) && r.tag.as_deref() != Some(DELETED_TAG))
+        .collect();
+    let reader = st.reader().expect("reader");
+    check("kept, after deletes", &reader, &expected);
+    check("kept again", &reader, &expected);
+    let plan: String = reader
+        .query_sql(&format!("EXPLAIN {}", scans[1].0))
+        .expect("explain")
+        .iter()
+        .flat_map(|b| {
+            let plans = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan column")
+                .clone();
+            (0..plans.len()).map(move |i| plans.value(i).to_owned())
+        })
+        .collect();
+    assert!(plan.contains("CachedScanExec"), "{plan}");
 }
 
 #[test]

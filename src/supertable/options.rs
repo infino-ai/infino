@@ -63,6 +63,7 @@ use tokio::sync::{Mutex as TokioMutex, OnceCell};
 
 use super::{
     error::BuildError,
+    query::column_cache::{DecodedColumnCache, process_decoded_column_cache},
     reader_cache::{
         ColdFetchMode, DiskCacheConfig, DiskCacheStore, InMemoryReaderCache, LruPolicy,
         SuperfileReaderCache,
@@ -436,6 +437,10 @@ pub struct SupertableOptions {
     /// that bounds the mmap resident set, this bounds anonymous heap. See
     /// [`crate::memory`].
     pub(crate) connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    /// The SQL scan's decoded columns, kept across statements: the process's
+    /// cache (`memory.decoded_column_cache_bytes`), shared by every table, or
+    /// `None` when it keeps none.
+    pub(crate) decoded_columns: Option<Arc<DecodedColumnCache>>,
     /// Single-slot cache for the slow-CAS centroid-section spill, shared by
     /// every manifest snapshot of this table handle and keyed by the
     /// section's content-addressed URI (a new drain generation replaces
@@ -826,6 +831,7 @@ impl SupertableOptions {
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
             // `apply_config` replaces it from `config.yaml`.
             connection_memory_budget: ConnectionMemoryBudget::measured(),
+            decoded_columns: process_decoded_column_cache(),
             centroid_section_cache: Arc::new(TokioMutex::new(None)),
             resident_index_cache: Arc::new(TokioMutex::new(None)),
             graph_hydration_lock: Arc::new(TokioMutex::new(())),

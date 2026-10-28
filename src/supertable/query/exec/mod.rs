@@ -12,6 +12,7 @@
 //! supertable's `_id` + projected scalar columns via
 //! [`SuperfileReader::take_by_local_doc_ids`](crate::superfile::SuperfileReader::take_by_local_doc_ids).
 
+pub(crate) mod cached_scan_exec;
 pub mod common;
 pub mod fts_exec;
 #[cfg(feature = "graph-index")]

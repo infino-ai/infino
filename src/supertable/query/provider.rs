@@ -114,6 +114,7 @@ use crate::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::{
+                cached_scan_exec::{CachedFile, CachedScanExec, has_columns, projected_schema},
                 common::{BoundPredicate, PushedPredicate, take_rows},
                 metered_exec::MeteredExec,
             },
@@ -1534,6 +1535,45 @@ impl TableProvider for SupertableProvider {
                 stats.to_inexact()
             }
         };
+
+        // With decoded columns kept across statements, the scan reads them
+        // rather than the files' pages. Not for a scan the index narrowed to
+        // a few rows (the Parquet scan decodes just their pages), nor for a
+        // scan of no column, nor for a column the files don't store in a type
+        // that converts (the Parquet scan's schema adapter serves those).
+        let output = projected_schema(&self.schema, projection)?;
+        if let Some(cache) = self.manifest.options.decoded_columns.as_ref()
+            && has_columns(&output)
+            && superfiles.iter().all(|seg| seg.candidates.is_none())
+        {
+            let files = superfiles
+                .iter()
+                .zip(&survivor_entries)
+                .map(|(seg, entry)| CachedFile {
+                    uri: entry.uri,
+                    reader: Arc::clone(&seg.prepared.reader),
+                    row_counts: Arc::clone(&seg.prepared.row_counts),
+                    tombstones: Arc::clone(&seg.tombstones),
+                })
+                .collect();
+            if let Some(scan) = CachedScanExec::try_new(
+                output,
+                files,
+                Arc::clone(&self.manifest),
+                self.scan_store.op_stats(),
+                Arc::clone(cache),
+                state.config().target_partitions(),
+                scan_stats.clone().project(projection),
+            ) {
+                let scan: Arc<dyn ExecutionPlan> = Arc::new(scan);
+                let op_stats = self.scan_store.op_stats();
+                return Ok(Arc::new(if filters.is_empty() {
+                    MeteredExec::new(scan, op_stats)
+                } else {
+                    MeteredExec::without_limit_pushdown(scan, op_stats)
+                }));
+            }
+        }
 
         let url = self.store_url.clone();
         state
