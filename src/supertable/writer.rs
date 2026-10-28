@@ -4930,9 +4930,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
     let shard_count = packed_cell_shard_count(&hidden_inner.options);
-    // Drain runs only under `optimize()`, so its CPU waves (placement, cell
-    // build) ride the maintenance pool with the rest of optimize's work, not
-    // the half-width writer pool that foreground ingest uses.
     let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
     let budget = if batch_cfg < 0 {
