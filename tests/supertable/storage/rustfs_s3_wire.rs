@@ -13,8 +13,15 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use infino::supertable::storage::{StorageError, StorageProvider};
+use infino::supertable::storage::{S3StorageProvider, StorageError, StorageProvider};
 use infino_bench_utils::rustfs_server;
+use object_store::{Attribute, GetOptions, ObjectStore, path::Path as ObjPath};
+use tokio::task;
+
+/// The user-metadata key `put_atomic` stamps its create id under. A store or
+/// proxy that dropped it would quietly turn a create that met its own landed
+/// write back into a lost race, so it is asserted on the wire.
+const CREATE_ID_KEY: &str = "infinocreateid";
 
 async fn harness_storage() -> Arc<dyn StorageProvider> {
     let fixture = rustfs_server::open_test_fixture_async("")
@@ -56,6 +63,39 @@ async fn put_atomic_twice_is_precondition_failed() {
         matches!(err, StorageError::PreconditionFailed { .. }),
         "expected PreconditionFailed; got {err:?}"
     );
+}
+
+/// A `put_atomic` object's HEAD carries the create id, so a create that
+/// meets its own landed write can recognise it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn put_atomic_stamps_a_create_id_a_head_reads_back() {
+    if !rustfs_server::begin_rustfs_test("put_atomic_stamps_a_create_id_a_head_reads_back") {
+        return;
+    }
+    let (store, bucket) = task::spawn_blocking(rustfs_server::open_wire_test_store)
+        .await
+        .expect("join")
+        .expect("wire test store");
+    let provider = S3StorageProvider::from_object_store(bucket, store.clone());
+    provider
+        .put_atomic("k/stamped", Bytes::from_static(b"stamped"))
+        .await
+        .expect("put_atomic");
+    let head = store
+        .get_opts(
+            &ObjPath::from("k/stamped"),
+            GetOptions {
+                head: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("head");
+    let id = head
+        .attributes
+        .get(&Attribute::Metadata(CREATE_ID_KEY.into()))
+        .expect("the store kept the create id");
+    assert!(!id.as_ref().is_empty(), "an empty create id");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

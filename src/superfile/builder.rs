@@ -68,7 +68,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
-    io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     ops::Range,
     str::from_utf8,
     sync::{Arc, mpsc::sync_channel},
@@ -114,7 +114,7 @@ use crate::{
             tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId, StableId},
-        ids,
+        ids::{self, PackedIdEncoder, PackedIdOutput},
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -812,10 +812,7 @@ pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 /// Parquet id column. Used by both the whole-corpus and streaming-merge build
 /// paths so the two produce a byte-identical sidecar.
 fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &str) -> bool {
-    let Ok(idx) = batch.schema().index_of(id_column) else {
-        return false;
-    };
-    let Some(col) = batch.column(idx).as_any().downcast_ref::<Decimal128Array>() else {
+    let Some(col) = stable_id_column(batch, id_column) else {
         return false;
     };
     out.reserve(col.len() * format::ID_SIDECAR_ENTRY_BYTES);
@@ -823,6 +820,48 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
         out.extend_from_slice(&col.value(i).to_le_bytes());
     }
     true
+}
+
+/// `batch`'s `id_column` as the `Decimal128` array a sidecar is built from;
+/// `None` when the column is absent or of another type.
+fn stable_id_column<'a>(batch: &'a RecordBatch, id_column: &str) -> Option<&'a Decimal128Array> {
+    let idx = batch.schema().index_of(id_column).ok()?;
+    batch.column(idx).as_any().downcast_ref::<Decimal128Array>()
+}
+
+/// Feed `batch`'s ids to the streaming sidecar encoder, in row order. The
+/// first batch without a `Decimal128` id column ends the sidecar for good
+/// (`encoder` becomes `None`): the reader then falls back to the Parquet id
+/// column, as it does for a file built with no sidecar at all.
+fn push_stable_ids(
+    encoder: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
+    batch: &RecordBatch,
+    id_column: &str,
+) -> Result<(), BuildError> {
+    let Some(active) = encoder.as_mut() else {
+        return Ok(());
+    };
+    let Some(col) = stable_id_column(batch, id_column) else {
+        *encoder = None;
+        return Ok(());
+    };
+    for i in 0..col.len() {
+        active.push(col.value(i)).map_err(BuildError::Io)?;
+    }
+    Ok(())
+}
+
+/// Pack a raw sidecar that is already in memory, for the build paths whose
+/// rows are resident anyway. Empty when `raw` is.
+fn pack_ids_in_memory(raw: &[u8]) -> PackedIdOutput<Cursor<Vec<u8>>> {
+    let mut encoder = PackedIdEncoder::new(Vec::new());
+    encoder
+        .push_raw(raw)
+        .expect("a Vec sink never fails to write");
+    encoder
+        .finish()
+        .expect("a Vec sink never fails to write")
+        .map_blocks(Cursor::new)
 }
 
 /// A packed id sidecar for `source`, rebuilt from its Parquet `_id` column.
@@ -3096,11 +3135,15 @@ impl SuperfileBuilder {
 
         // Stream the stable-id sidecar from the merged rows as they are written
         // to the body, in the same order — so the compacted superfile resolves
-        // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
+        // `_id` from the sidecar just like a fresh build. It is packed block by
+        // block into a scratch file as the rows go by, so a merge over a
+        // hundred million rows holds the open block and a directory entry per
+        // block for it, not sixteen bytes a row. The encoder is dropped on the
         // first batch missing the id column, falling the whole file back to the
         // Parquet id column.
-        let mut id_sidecar_bytes: Vec<u8> = Vec::new();
-        let mut ids_ok = true;
+        let mut id_sidecar = Some(PackedIdEncoder::new(BufWriter::new(
+            NamedTempFile::new_in(scratch_root()).map_err(BuildError::Io)?,
+        )));
         let id_column = superfile_builder.opts.id_column.clone();
 
         // The output row every input document becomes, numbered once and
@@ -3335,16 +3378,7 @@ impl SuperfileBuilder {
                         body_encoder.write_batch(&record_batch)?;
                         timings.write_parquet += start.elapsed();
 
-                        if ids_ok
-                            && !append_stable_id_sidecar(
-                                &mut id_sidecar_bytes,
-                                &record_batch,
-                                &id_column,
-                            )
-                        {
-                            ids_ok = false;
-                            id_sidecar_bytes = Vec::new();
-                        }
+                        push_stable_ids(&mut id_sidecar, &record_batch, &id_column)?;
 
                         let rows = record_batch.num_rows() as u32;
                         // A re-analyzed merge indexes the rows as they go by,
@@ -3391,10 +3425,7 @@ impl SuperfileBuilder {
             for batch in &batches {
                 body_encoder.write_batch(batch)?;
 
-                if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, batch, &id_column) {
-                    ids_ok = false;
-                    id_sidecar_bytes = Vec::new();
-                }
+                push_stable_ids(&mut id_sidecar, batch, &id_column)?;
 
                 let rows = batch.num_rows() as u32;
                 // The ordered rows are the output's; a re-analyzed merge
@@ -3418,9 +3449,28 @@ impl SuperfileBuilder {
         let body = body_encoder.finish()?;
         drop(finish_span);
 
-        let ids = ids_ok.then_some(id_sidecar_bytes);
+        // The sidecar's blocks come back off scratch through an independent
+        // read handle at offset 0, once the write handle is flushed.
+        let ids: PackedIdOutput<Box<dyn Read>> = match id_sidecar {
+            Some(encoder) => {
+                let PackedIdOutput {
+                    directory,
+                    blocks,
+                    blocks_len,
+                } = encoder.finish().map_err(BuildError::Io)?;
+                let blocks = blocks
+                    .into_inner()
+                    .map_err(|e| BuildError::Io(e.into_error()))?;
+                PackedIdOutput {
+                    directory,
+                    blocks: Box::new(BufReader::new(blocks.reopen().map_err(BuildError::Io)?)),
+                    blocks_len,
+                }
+            }
+            None => pack_ids_in_memory(&[]).map_blocks(|blocks| Box::new(blocks) as Box<dyn Read>),
+        };
 
-        superfile_builder.finish_to_with_body(body, ids.as_deref().unwrap_or(&[]), output)?;
+        superfile_builder.finish_to_with_packed_ids(body, ids, output)?;
 
         Ok(stats)
     }
@@ -3567,8 +3617,11 @@ impl SuperfileBuilder {
             let (fts_file, vec_file) = blobs_res?;
             (body_res?, fts_file, vec_file)
         };
-        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
-        splice_body_and_blobs_to(body, fts_file, vec_file, &ids_bytes, &kvs, output)
+        let ids = pack_ids_in_memory(&stable_id_sidecar_bytes(
+            &self.batches,
+            &self.opts.id_column,
+        ));
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -3579,11 +3632,24 @@ impl SuperfileBuilder {
     ///
     /// The caller must have advanced `next_local_doc_id` to the number of rows
     /// written into `body`.
-    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn finish_to_with_body<W: Write>(
-        mut self,
+        self,
         body: EncodedBody,
         ids_bytes: &[u8],
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        self.finish_to_with_packed_ids(body, pack_ids_in_memory(ids_bytes), output)
+    }
+
+    /// [`Self::finish_to_with_body`] with the sidecar already packed — in
+    /// memory, or streamed to scratch by a [`PackedIdEncoder`] as a merge's
+    /// rows went by. An empty sidecar means no sidecar (the reader falls
+    /// back to the Parquet id column).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
+    pub(crate) fn finish_to_with_packed_ids<W: Write, R: Read>(
+        mut self,
+        body: EncodedBody,
+        ids: PackedIdOutput<R>,
         output: W,
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs = self.next_local_doc_id as u64;
@@ -3601,10 +3667,7 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        // The caller streams the sidecar from the merged rows as it writes the
-        // body (empty ⇒ the id column wasn't available; reader falls back to
-        // the Parquet id column).
-        splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
 
     /// Rebuild the FTS index from `source`'s stored text, touching nothing
@@ -3820,16 +3883,23 @@ impl SuperfileBuilder {
         vector_file
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
-        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
-        let (packed_ids, kvs) = pack_id_sidecar(&ids_bytes, &kvs);
+        let ids = pack_ids_in_memory(&stable_id_sidecar_bytes(
+            &self.batches,
+            &self.opts.id_column,
+        ));
+        let kvs = kvs_naming_id_layout(&kvs, &ids);
+        let ids_length = ids.len();
+        let PackedIdOutput {
+            directory, blocks, ..
+        } = ids;
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
-            Cursor::new(&packed_ids),
-            packed_ids.len() as u64,
+            Cursor::new(directory).chain(blocks),
+            ids_length,
             &kvs,
             &mut output,
         )?;
@@ -4058,44 +4128,51 @@ fn stream_index_blobs_to_scratch(
     Ok((fts_file, vec_file))
 }
 
-/// Splice an encoded body + the two on-disk blobs to `output`, streaming both
-/// blobs off disk so neither is ever resident. Cheap relative to the encode —
-/// byte appends + a footer rewrite.
-/// Pack the raw stable-id sidecar (one `i128` per row) into the
-/// frame-of-reference layout and name that layout in the footer KVs. An
-/// empty sidecar stays empty and adds no key (no sidecar, Parquet
-/// fallback), the shape older readers already handle.
-fn pack_id_sidecar(raw_ids: &[u8], kvs: &[(String, String)]) -> (Vec<u8>, Vec<(String, String)>) {
-    let packed = ids::encode_packed(raw_ids);
+/// `kvs` plus the key naming the packed sidecar's layout. An empty sidecar
+/// adds no key (no sidecar, Parquet fallback), the shape older readers
+/// already handle.
+fn kvs_naming_id_layout<R>(
+    kvs: &[(String, String)],
+    ids: &PackedIdOutput<R>,
+) -> Vec<(String, String)> {
     let mut kvs = kvs.to_vec();
-    if !packed.is_empty() {
+    if !ids.is_empty() {
         kvs.push((
             kv::IDS_LAYOUT.to_string(),
             kv::IDS_LAYOUT_PACKED.to_string(),
         ));
     }
-    (packed, kvs)
+    kvs
 }
 
-fn splice_body_and_blobs_to<W: Write>(
+/// Splice an encoded body, the two on-disk blobs and the packed stable-id
+/// sidecar to `output`, streaming the blobs off disk so neither is ever
+/// resident. Cheap relative to the encode — byte appends + a footer
+/// rewrite.
+fn splice_body_and_blobs_to<W: Write, R: Read>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
-    ids_bytes: &[u8],
+    ids: PackedIdOutput<R>,
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
     let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
     let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
-    let (packed_ids, kvs) = pack_id_sidecar(ids_bytes, kvs);
+    let kvs = kvs_naming_id_layout(kvs, &ids);
+    let ids_length = ids.len();
+    let PackedIdOutput {
+        directory, blocks, ..
+    } = ids;
+    // The directory first, then the blocks from wherever they were packed to.
     let layout = splice_index_streams_to(
         body,
         BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
-        Cursor::new(&packed_ids),
-        packed_ids.len() as u64,
+        Cursor::new(directory).chain(blocks),
+        ids_length,
         &kvs,
         output,
     )?;

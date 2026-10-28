@@ -492,6 +492,16 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// `x-goog-if-generation-match: 0` on GCS, `O_EXCL` on
     /// LocalFS.
     ///
+    /// A request the store accepted can still come back failed (a
+    /// timeout this layer re-issues, a 5xx the store client retries),
+    /// and its next issue then fails the precondition against its own
+    /// object. S3, Azure and GCS stamp every issue of one call with
+    /// the same create id in the object's metadata and settle a
+    /// `PreconditionFailed` with one HEAD: a target carrying that id is
+    /// this call's own write, reported as created with its etag;
+    /// anything else, a peer's identical bytes included, surfaces as
+    /// `PreconditionFailed`.
+    ///
     /// Returns the new object's etag when the backend surfaces
     /// one (S3 always, LocalFs via mtime). `Ok(None)` is legal
     /// and means the write succeeded but no etag was reported;
