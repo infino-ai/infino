@@ -2,7 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Where a `WHERE` runs: as a Parquet row filter in a scan under
-//! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else.
+//! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else. A
+//! filtered scan under a plain `LIMIT` is read as one partition.
 //!
 //! `EXPLAIN ANALYZE` tells which. A row filter counts the rows it checks in
 //! `pushdown_rows_matched` and `pushdown_rows_pruned`; without one both are 0.
@@ -33,6 +34,12 @@ const PAD: &str =
     "--------------------------------------------------------------------------------";
 /// The metrics `EXPLAIN ANALYZE` prints for rows a row filter kept and dropped.
 const ROW_FILTER_METRICS: [&str; 2] = ["pushdown_rows_matched=", "pushdown_rows_pruned="];
+/// How `EXPLAIN` shows a scan kept whole for a plain `LIMIT`.
+const UNSPLIT: &str = "MeteredExec: unsplit";
+/// How `EXPLAIN` shows a scan read as one partition.
+const ONE_PARTITION: &str = "file_groups={1 group";
+/// The largest `LIMIT` the rule handles.
+const MAX_FETCH: usize = 10_000;
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -114,6 +121,13 @@ fn expected(descending: bool, deleted: &[i64]) -> Vec<i64> {
     }
     n.truncate(FETCH);
     n
+}
+
+/// Every `n` whose `s` has `DIGIT`, ascending, skipping `deleted`.
+fn matching(deleted: &[i64]) -> Vec<i64> {
+    (0..2 * ROWS_PER_APPEND)
+        .filter(|v| format!("r{v}").contains(DIGIT) && !deleted.contains(v))
+        .collect()
 }
 
 /// The plan text `EXPLAIN <options> sql` prints.
@@ -363,6 +377,109 @@ fn a_scan_with_little_to_skip_gets_no_row_filter() {
         let got = n_values(&db.query_sql(&sql).expect("sql"));
         assert_eq!(got, want, "{sql}");
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+    }
+}
+
+/// Asserts `sql` returns `FETCH` distinct rows, each in `all`.
+fn assert_fetch_of(db: &Connection, sql: &str, all: &[i64]) {
+    let mut got = n_values(&db.query_sql(sql).expect("sql"));
+    assert_eq!(got.len(), FETCH, "{sql}");
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), FETCH, "{sql}: distinct rows");
+    assert!(got.iter().all(|n| all.contains(n)), "{sql}: {got:?}");
+}
+
+#[test]
+fn a_plain_limit_reads_its_filtered_scan_as_one_partition() {
+    // `WHERE s LIKE '%7%' LIMIT 5`, no `ORDER BY`, and the same with an offset.
+    //  - the scan is read as one partition, so the first rows to pass end it.
+    //  - the `WHERE` stays in a `FilterExec`; no row filter.
+    // This test pins the plan shape and that every row returned matches.
+    let (_dir, db, _table) = fixture();
+    let all = matching(&[]);
+    for offset in ["", " OFFSET 3"] {
+        let sql = format!("SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {FETCH}{offset}");
+        assert_fetch_of(&db, &sql, &all);
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+        let plan = explain(&db, "", &sql);
+        assert!(plan.contains("FilterExec"), "{plan}");
+        assert!(plan.contains(UNSPLIT), "{plan}");
+        assert!(plan.contains(ONE_PARTITION), "{plan}");
+        // No exchange next to the scan: none below its meter, and the node
+        // right above it is the filter.
+        let (above, below) = plan.split_once(UNSPLIT).expect("an unsplit scan");
+        assert!(!below.contains("RepartitionExec"), "{plan}");
+        let parent = above.lines().rev().find(|line| !line.trim().is_empty());
+        assert!(
+            parent.is_some_and(|line| line.contains("FilterExec")),
+            "{plan}"
+        );
+    }
+}
+
+#[test]
+fn an_index_answered_where_under_a_plain_limit_reads_one_partition() {
+    // `s ILIKE '%7%' LIMIT 5` on a full-text column.
+    //  - the index picks the rows, so there is no `FilterExec`, and the scan
+    //    still takes no fetch: it is kept whole all the same.
+    // This test pins the rows and the plan shape.
+    let (_dir, db, _table) = fixture_with(IndexSpec::new().fts("s"));
+    let sql = format!("SELECT n, s FROM t WHERE s ILIKE '%{DIGIT}%' LIMIT {FETCH}");
+    assert_fetch_of(&db, &sql, &matching(&[]));
+    let plan = explain(&db, "", &sql);
+    assert!(plan.contains(UNSPLIT), "{plan}");
+    assert!(plan.contains(ONE_PARTITION), "{plan}");
+}
+
+#[test]
+fn deleted_rows_stay_out_under_a_plain_limit() {
+    // Delete matching rows, then `WHERE s LIKE '%7%' LIMIT <every match>`.
+    //  - the scan skips deleted rows; one partition reads every range.
+    // This test pins that every live match comes back and no deleted one does.
+    let (_dir, db, table) = fixture();
+    let deleted: Vec<i64> = matching(&[]).into_iter().step_by(3).collect();
+    for n in &deleted {
+        table.delete(col("n").eq(lit(*n))).expect("delete");
+    }
+    let want = matching(&deleted);
+    assert!(
+        want.len() <= MAX_FETCH,
+        "the limit must stay under the rule's"
+    );
+    let sql = format!(
+        "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {}",
+        want.len()
+    );
+    let mut got = n_values(&db.query_sql(&sql).expect("sql"));
+    got.sort_unstable();
+    assert_eq!(got, want);
+    assert!(explain(&db, "", &sql).contains(UNSPLIT), "{sql}");
+}
+
+#[test]
+fn a_plain_limit_is_left_alone_without_a_where_or_past_the_largest_limit() {
+    // `SELECT n, s LIMIT 5` has no `WHERE`: its fetch already reaches the scan.
+    // `WHERE ... LIMIT 10001` is one past the largest limit the rule handles.
+    // This test pins the row counts and that neither scan is kept whole.
+    let (_dir, db, _table) = fixture();
+    for (sql, rows) in [
+        (format!("SELECT n, s FROM t LIMIT {FETCH}"), FETCH),
+        (
+            format!(
+                "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {}",
+                MAX_FETCH + 1
+            ),
+            matching(&[]).len().min(MAX_FETCH + 1),
+        ),
+    ] {
+        assert_eq!(
+            n_values(&db.query_sql(&sql).expect("sql")).len(),
+            rows,
+            "{sql}"
+        );
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+        assert!(!explain(&db, "", &sql).contains(UNSPLIT), "{sql}");
     }
 }
 

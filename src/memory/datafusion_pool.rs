@@ -48,7 +48,7 @@ use crate::{
     supertable::query::{
         read_ahead_rule::ReadAheadOff,
         sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
-        topk_row_filter::RowFilterUnderTopK,
+        topk_row_filter::{RowFilterUnderTopK, UnsplitLimitScans},
         values_subquery::ValuesSubqueryRewrite,
     },
 };
@@ -166,12 +166,16 @@ pub(crate) fn budgeted_session_context(
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
+    //  - `UnsplitLimitScans` after DataFusion's rules, to read a scan that
+    //    `RowFilterUnderTopK` kept whole for a plain `LIMIT` as one partition
+    //    again, after `EnforceDistribution` split it.
     //  - `ReadAheadOff` last, once DataFusion has placed every limit, to turn
     //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.insert(1, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(UnsplitLimitScans));
     rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)
