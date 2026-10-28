@@ -102,7 +102,7 @@ pub struct CompactionJob {
     ///
     /// `None` for a job no compaction run planned, which takes the
     /// configured value because there is no other.
-    pub merge_memory_mb: Option<u64>,
+    pub merge_input_mb: Option<u64>,
 }
 
 /// Plan compaction: pack each partition's small superfiles into
@@ -128,7 +128,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
     // Clamped to >= 2 — merging fewer than two inputs is a no-op rewrite, so a
     // misconfigured smaller value is raised rather than rejected.
     let min_superfiles_for_merge = cfg.min_superfiles_for_merge.max(2) as usize;
-    let max_memory_bytes = cfg.max_memory_mb.saturating_mul(MIB);
+    let max_input_bytes = cfg.max_merge_input_mb.saturating_mul(MIB);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
     for s in superfiles {
@@ -143,7 +143,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
             target_bytes,
             min_output_bytes,
             min_superfiles_for_merge,
-            max_memory_bytes,
+            max_input_bytes,
             &mut jobs,
         );
     }
@@ -162,7 +162,7 @@ fn pack_partition(
     target_bytes: u64,
     min_output_bytes: u64,
     min_superfiles_for_merge: usize,
-    max_memory_bytes: u64,
+    max_input_bytes: u64,
     jobs: &mut Vec<CompactionJob>,
 ) {
     // Exclude superfiles already at target size — they are done and
@@ -190,15 +190,15 @@ fn pack_partition(
 
     // The same setting the packing limit was built from, back in the unit
     // the merge states it in.
-    let merge_memory_mb = Some(max_memory_bytes / MIB);
+    let merge_input_mb = Some(max_input_bytes / MIB);
     let mut pending = PendingJob::default();
     for s in candidates {
-        if !pending.fits(s, target_bytes, max_memory_bytes) {
+        if !pending.fits(s, target_bytes, max_input_bytes) {
             pending.emit(
                 key,
                 min_output_bytes,
                 min_superfiles_for_merge,
-                merge_memory_mb,
+                merge_input_mb,
                 jobs,
             );
         }
@@ -208,7 +208,7 @@ fn pack_partition(
         key,
         min_output_bytes,
         min_superfiles_for_merge,
-        merge_memory_mb,
+        merge_input_mb,
         jobs,
     );
 }
@@ -236,9 +236,9 @@ struct PendingJob {
 }
 
 impl PendingJob {
-    fn fits(&self, s: &SuperfileStats, target_bytes: u64, max_memory_bytes: u64) -> bool {
+    fn fits(&self, s: &SuperfileStats, target_bytes: u64, max_input_bytes: u64) -> bool {
         self.live_bytes + s.live_bytes() <= target_bytes
-            && self.raw_bytes + s.size_bytes <= max_memory_bytes
+            && self.raw_bytes + s.size_bytes <= max_input_bytes
     }
 
     fn push(&mut self, s: &SuperfileStats) {
@@ -270,7 +270,7 @@ impl PendingJob {
         key: &[u8],
         min_output_bytes: u64,
         min_superfiles_for_merge: usize,
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
         jobs: &mut Vec<CompactionJob>,
     ) {
         let size_ready = self.members.len() >= 2 && self.live_bytes >= min_output_bytes;
@@ -301,7 +301,7 @@ impl PendingJob {
                 partition_key: key.to_vec(),
                 inputs: members.into_iter().map(|m| m.id).collect(),
                 estimated_output_bytes: self.live_bytes,
-                merge_memory_mb,
+                merge_input_mb,
             });
         }
         *self = PendingJob::default();
@@ -349,7 +349,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
         let stats = vec![seg(1, 1, 1000, 0), seg(2, 1, 1000, 0)];
         for mb in [512u64, 3072, 16_384] {
             let cfg = CompactionSettings {
-                max_memory_mb: mb,
+                max_merge_input_mb: mb,
                 // Two fragments are enough to plan on, so the job exists to
                 // be inspected whatever the budget is.
                 min_superfiles_for_merge: 2,
@@ -359,7 +359,7 @@ pub(in crate::supertable::optimize::compact) mod tests {
             assert!(!jobs.is_empty(), "{mb} MiB should still plan a job");
             for job in &jobs {
                 assert_eq!(
-                    job.merge_memory_mb,
+                    job.merge_input_mb,
                     Some(mb),
                     "a job planned at {mb} MiB should carry it"
                 );
@@ -684,13 +684,13 @@ pub(in crate::supertable::optimize::compact) mod tests {
             target_superfile_size_mb in 1u64..4096,
             min_fill_percent in 0u8..=100,
             min_superfiles_for_merge in 0u64..12,
-            max_memory_mb in 1u64..8192,
+            max_merge_input_mb in 1u64..8192,
         ) -> CompactionSettings {
             CompactionSettings {
                 target_superfile_size_mb,
                 min_fill_percent,
                 min_superfiles_for_merge,
-                max_memory_mb,
+                max_merge_input_mb,
                 ..CompactionSettings::default()
             }
         }

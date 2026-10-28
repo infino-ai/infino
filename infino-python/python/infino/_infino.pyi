@@ -255,11 +255,12 @@ class OptimizeOptions:
     def __init__(
         self,
         *,
-        max_memory_mb: int | None = ...,
+        max_merge_input_mb: int | None = ...,
         min_fill_percent: int | None = ...,
         target_superfile_size_mb: int | None = ...,
         stale_seal_timeout_ms: int | None = ...,
         recalibrate: Literal["auto", "force", "skip"] | None = ...,
+        max_memory_mb: int | None = ...,
     ) -> None: ...
 
 class ReindexOptions:

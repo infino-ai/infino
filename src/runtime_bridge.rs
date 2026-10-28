@@ -217,6 +217,40 @@ where
     run_on_pool(pool, what, f).await
 }
 
+/// As [`run_on_pool`], on a pool of `threads` made for this one job and
+/// dropped with it, so the job's nested parallel work never steals, or is
+/// stolen by, anyone else's.
+pub(crate) async fn run_on_own_pool<R, F>(
+    threads: usize,
+    what: &'static str,
+    f: F,
+) -> Result<R, PoolDropped>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+    let f = carry_span(f);
+    let spawned = std::thread::Builder::new()
+        .name(format!("{what} driver"))
+        .spawn(move || {
+            let pool = match rayon::ThreadPoolBuilder::new()
+                .num_threads(threads.max(1))
+                .thread_name(move |i| format!("merge-{i}"))
+                .build()
+            {
+                Ok(pool) => pool,
+                // No pool, no result: the receiver reports the job as dropped.
+                Err(_) => return,
+            };
+            let _ = tx.send(pool.install(f));
+        });
+    if spawned.is_err() {
+        return Err(PoolDropped(what));
+    }
+    rx.await.map_err(|_| PoolDropped(what))
+}
+
 /// Process-wide query runtime, shared by every `Connection` and
 /// `Supertable` so open handles add zero tokio workers. Never shut
 /// down — the static keeps a reference until process exit, so handle

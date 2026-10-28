@@ -685,8 +685,9 @@ fn shape_pinned_compaction(table: &Supertable) -> CompactionSettings {
         // Keep the merge's memory ceiling the same distance above the target
         // as the defaults keep it, so a denser table's smaller target never
         // tightens it and a larger one is never capped below a full output.
-        max_memory_mb: defaults.max_memory_mb.max(
-            target_superfile_size_mb + (defaults.max_memory_mb - defaults.target_superfile_size_mb),
+        max_merge_input_mb: defaults.max_merge_input_mb.max(
+            target_superfile_size_mb
+                + (defaults.max_merge_input_mb - defaults.target_superfile_size_mb),
         ),
         ..defaults
     }

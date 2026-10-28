@@ -174,7 +174,7 @@ fn build(b: &BuildArgs) -> Result<(), Box<dyn std::error::Error>> {
         &OptimizeOptions::compact(CompactionSettings {
             target_superfile_size_mb: COMPACT_TARGET_MB,
             min_fill_percent: 1,
-            max_memory_mb: COMPACT_TARGET_MB + COMPACT_MEMORY_HEADROOM_MB,
+            max_merge_input_mb: COMPACT_TARGET_MB + COMPACT_MEMORY_HEADROOM_MB,
             ..Default::default()
         })
         .with_gc(GcSettings {

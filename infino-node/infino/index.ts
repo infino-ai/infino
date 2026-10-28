@@ -159,7 +159,9 @@ export interface GcReport {
 
 /** Tuning for `optimize`; all fields optional (omitted ⇒ engine default). */
 export interface OptimizeOptions {
-  /** Build-time memory budget, in MB. */
+  /** Cap on the raw input bytes one merge packs, in MB. */
+  maxMergeInputMb?: number;
+  /** @deprecated Old name of `maxMergeInputMb`; honoured when that is absent. */
   maxMemoryMb?: number;
   /** Only compact superfiles below this fill percent (0–100). */
   minFillPercent?: number;

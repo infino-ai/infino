@@ -238,10 +238,6 @@ const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
-/// Default user-superfile batch size for the hidden-index drain. `1` streams
-/// one source superfile at a time to keep drain RAM bounded on large corpora.
-/// `-1` = unbounded (single merge), `0` = skip the drain.
-const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default target buffered bytes per commit shard (in MiB units).
@@ -550,9 +546,9 @@ pub struct SupertableOptions {
     ///
     /// `-1` = unbounded (all user superfiles in one merge: lowest cell
     /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
-    /// skip the drain entirely. Default [`DEFAULT_DRAIN_BATCH_SUPERFILES`].
-    /// [`SupertableOptions::apply_config`] copies `vector.drain_batch_superfiles`
-    /// into this field; [`Self::with_drain_batch_superfiles`] overrides per table.
+    /// skip the drain entirely. Defaults to `vector.drain_batch_superfiles`
+    /// from config (64 when unset); [`Self::with_drain_batch_superfiles`]
+    /// overrides per table.
     pub drain_batch_superfiles: i64,
     /// Recall the drain calibration targets when it stamps this table's
     /// probe laws — the recall/latency lever. Width crosses at this
@@ -845,7 +841,7 @@ impl SupertableOptions {
             vector_layout: VectorLayout::Ivf,
             target_superfiles_per_part: DEFAULT_TARGET_SUPERFILES_PER_PART,
             part_size_threshold_bytes: DEFAULT_PART_SIZE_THRESHOLD_BYTES,
-            drain_batch_superfiles: DEFAULT_DRAIN_BATCH_SUPERFILES,
+            drain_batch_superfiles: crate::config::global().vector.drain_batch_superfiles,
             target_recall: crate::config::global().vector.target_recall,
             drain_consolidate: DrainConsolidate::Kmeans,
             eager_load_threshold_parts: DEFAULT_EAGER_LOAD_THRESHOLD_PARTS,

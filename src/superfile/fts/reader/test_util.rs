@@ -100,3 +100,14 @@ pub(super) fn build_phrase_blob() -> (Bytes, &'static str) {
         r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#,
     )
 }
+
+/// A deterministic xorshift64 stream from `seed`, for tests that draw
+/// reproducible inputs.
+pub(super) fn xorshift(mut x: u64) -> impl FnMut() -> u64 {
+    move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    }
+}
