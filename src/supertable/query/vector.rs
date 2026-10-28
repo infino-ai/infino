@@ -6685,6 +6685,38 @@ impl SupertableReader {
             .await
     }
 
+    /// Filtered vector kNN within a row-bounded [`CandidateScope`]: the
+    /// `vector_search` table function's arm for a scope narrowed to exactly
+    /// the rows its `WHERE` keeps
+    /// ([`exact_scope`](crate::supertable::query::exec::common::exact_scope)).
+    /// The allow-sets go to the same filtered kernel a bounded plan's do,
+    /// so the search ranks distance among those rows alone, however far
+    /// from the query they sit. A scope that bounds no row is a caller
+    /// bug: it would search the whole table as if filtered.
+    pub(crate) async fn vector_hits_within_scope(
+        &self,
+        column: &str,
+        query: &[f32],
+        k: usize,
+        options: VectorSearchOptions,
+        scope: &CandidateScope,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        let Some(allow) = scope.allow.as_ref() else {
+            return Err(QueryError::Internal(
+                "a vector search within a scope needs the scope's rows bounded".into(),
+            ));
+        };
+        if k == 0 || allow.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The SQL exec's exact-scope arm enters here, not through
+        // `vector_hits_filtered_by_plan`: apply the cosine calibration (#512).
+        let query = calibrated_query(self, column, query);
+        let superfiles: Vec<Arc<SuperfileEntry>> = scope.admitted_superfiles().cloned().collect();
+        self.route_filtered_vector_hits_async(superfiles, allow.clone(), column, &query, k, options)
+            .await
+    }
+
     /// Resolve what a SQL `WHERE` pushed into a search table function
     /// admits — the superfiles that may hold a match and, under a bounded
     /// `plan`, the candidate rows in each. See [`CandidateScope`].
@@ -7557,7 +7589,8 @@ impl SupertableReader {
 /// through untouched; unit queries are a fp-noise no-op. The seams are
 /// chosen so every caller path crosses exactly one: the sync wrappers
 /// (`vector_search`/`vector_hits`), the SQL exec arms
-/// (`vector_search_async`, `vector_hits_filtered_by_plan`), the hybrid
+/// (`vector_search_async`, `vector_hits_filtered_by_plan`,
+/// `vector_hits_within_scope`), the hybrid
 /// path (`hybrid_search_async`), and the test-helpers allow-set entry.
 pub(crate) fn calibrated_query<'q>(
     reader: &SupertableReader,

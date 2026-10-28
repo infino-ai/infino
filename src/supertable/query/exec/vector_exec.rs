@@ -65,8 +65,8 @@ use crate::{
             candidate::CandidatePlan,
             exec::common::{
                 PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
-                candidate_plan_for_filters, fill_top_k, live_reader, output_schema_with_score,
-                resolve_hits, scope_to_call, traced_tvf,
+                candidate_plan_for_filters, exact_scope, fill_top_k, fill_top_k_within,
+                live_reader, output_schema_with_score, resolve_hits, scope_to_call, traced_tvf,
             },
             vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
         },
@@ -213,15 +213,13 @@ impl TableProvider for VectorSearchTable {
     /// (keyword / categorical values) the pushdown is exact and the
     /// `FilterExec` drops nothing. Where it is not — a literal that is a
     /// sub-token of larger text, or a predicate no index bounds at all —
-    /// the exec applies the exact predicate to its own rows and widens the
-    /// kNN until `k` survive (`fill_top_k`). That fill is best-effort, not
-    /// a guarantee: it widens `k`, while the probe count comes from
-    /// `VectorSearchOptions::resolve` and does not move with it, so the
-    /// candidates stay those of the probed cells. A predicate satisfied
-    /// only by rows in cells the query never probes can still come out
-    /// short, and the fill is bounded in any case (see `fill_top_k`). The
-    /// exact, no-`FilterExec` path is the Rust
-    /// `Supertable::vector_search_filtered` API.
+    /// the exec applies the exact predicate to its own rows. When a round
+    /// at `k` leaves fewer than `k`, it evaluates the predicate over the
+    /// scope's rows (`exact_scope`) and runs one filtered search within
+    /// exactly the rows it keeps, so matching rows are found however many
+    /// nearer rows the predicate rejects. A predicate it cannot evaluate
+    /// before ranking (one on `score`) falls back to widening the kNN until
+    /// `k` survive (`fill_top_k`), which is bounded and best-effort.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -407,9 +405,10 @@ impl ExecutionPlan for VectorSearchExec {
             // distance only among matching rows); `Unbounded` (no
             // FTS-resolvable predicate, or none pushed) runs the plain kNN.
             // Either way the exact predicate is then applied to the
-            // resolved rows and the search widened until `k` survive
-            // (`fill_top_k`), so a superset bound or a scalar predicate
-            // never leaves the function short of `k`.
+            // resolved rows; when that leaves fewer than `k`, the function
+            // evaluates the predicate over the scope's rows itself and
+            // searches within exactly those (`exact_scope`), so a superset
+            // bound or a scalar predicate never leaves it short of `k`.
             let plan = candidate_plan_for_filters(reader.manifest(), &filters);
             let search = |want: usize| {
                 let reader = &reader;
@@ -464,14 +463,72 @@ impl ExecutionPlan for VectorSearchExec {
                     user_placement_for_scalar_resolve(reader, &hits).await
                 }
             };
-            fill_top_k(
+            let Some(predicate) = predicate.as_ref() else {
+                return fill_top_k(
+                    &reader,
+                    k,
+                    predicate.as_ref(),
+                    &scalar_schema,
+                    &output_schema,
+                    projection.as_deref(),
+                    placed,
+                )
+                .await;
+            };
+            // One round at `k` first: a predicate most rows near the query
+            // satisfy fills `k` here, at the cost of the search alone.
+            let first = fill_top_k_within(
                 &reader,
                 k,
-                predicate.as_ref(),
+                Some(predicate),
                 &scalar_schema,
                 &output_schema,
                 projection.as_deref(),
-                placed,
+                k,
+                &placed,
+            )
+            .await?;
+            if first.num_rows() >= k {
+                return Ok(first);
+            }
+            // Short: the rows the predicate keeps sit past the kernel's `k`
+            // nearest, or fewer than `k` exist. Rank within exactly those rows,
+            // which one filtered search returns, where widening stops at its
+            // ceiling with matching rows still beyond it.
+            let scope = reader.candidate_scope(&filters, &plan).await?;
+            let Some(exact) = exact_scope(&reader, &scope, predicate, &output_schema).await? else {
+                return fill_top_k(
+                    &reader,
+                    k,
+                    Some(predicate),
+                    &scalar_schema,
+                    &output_schema,
+                    projection.as_deref(),
+                    placed,
+                )
+                .await;
+            };
+            let within = |want: usize| {
+                let reader = &reader;
+                let column = &column;
+                let query = &query;
+                let exact = &exact;
+                async move {
+                    let hits = reader
+                        .vector_hits_within_scope(column, query, want, options, exact)
+                        .await?;
+                    user_placement_for_scalar_resolve(reader, &hits).await
+                }
+            };
+            fill_top_k_within(
+                &reader,
+                k,
+                Some(predicate),
+                &scalar_schema,
+                &output_schema,
+                projection.as_deref(),
+                k,
+                within,
             )
             .await
         };
@@ -596,8 +653,8 @@ mod tests {
     use std::collections::HashSet;
 
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Int32Array, LargeStringArray, RecordBatch,
-        StringArray,
+        Array, Decimal128Array, FixedSizeListArray, Int32Array, Int64Array, LargeStringArray,
+        RecordBatch, StringArray,
         types::{Float32Type, Int32Type},
     };
     use arrow_schema::{Field, Schema};
@@ -611,8 +668,9 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            Supertable, SupertableOptions, manifest::ManifestSnapshot,
-            query::candidate::LIKE_MAX_TERMS,
+            Supertable, SupertableOptions,
+            manifest::ManifestSnapshot,
+            query::{candidate::LIKE_MAX_TERMS, exec::common::OVER_FETCH_MIN_CEILING},
         },
     };
 
@@ -1019,6 +1077,71 @@ mod tests {
                 assert!(s.value(i - 1) <= s.value(i), "still nearest-first");
             }
         }
+    }
+
+    /// Rows nearer the query than every matching one in the test below: more
+    /// than the widening's ceiling lets a small `k` look at, so a fill that
+    /// only widens stops with every matching row still beyond it.
+    const N_NEAR_PAST_THE_CEILING: usize = OVER_FETCH_MIN_CEILING + 100;
+
+    /// Matching rows, all farther from the query than the
+    /// [`N_NEAR_PAST_THE_CEILING`] rows the predicate rejects.
+    const N_FAR_PAST_THE_CEILING: usize = 5;
+
+    /// A predicate no index bounds, whose rows all sit past the widening's
+    /// ceiling: the function still finds them, because a short first round
+    /// makes it evaluate the predicate over the scope's rows and search
+    /// within exactly those. Returns `k` when `k` match, every one when
+    /// fewer do, and an aggregate counts all of them.
+    #[test]
+    fn vector_search_tvf_where_unbounded_predicate_reaches_rows_past_the_fill_ceiling() {
+        let dim = 16;
+        let titles: Vec<String> = (0..N_NEAR_PAST_THE_CEILING + N_FAR_PAST_THE_CEILING)
+            .map(|i| {
+                if i < N_NEAR_PAST_THE_CEILING {
+                    "common"
+                } else {
+                    "rare"
+                }
+                .to_owned()
+            })
+            .collect();
+        let st = supertable_ranked_by_index(dim, &titles);
+        let q = csv_one_hot(dim, 0);
+        let query = |k: usize, select: &str| {
+            st.reader()
+                .expect("reader")
+                .query_sql(&format!(
+                    "SELECT {select} FROM vector_search('emb', '{q}', {k}) WHERE title <> 'common'"
+                ))
+                .expect("filtered query_sql")
+        };
+
+        let k = 3;
+        let rows = query(k, "title, score");
+        assert_eq!(titles_of(&rows), vec!["rare"; k], "the k nearest rare rows");
+        for b in &rows {
+            let s = col_f32(b, "score");
+            for i in 1..s.len() {
+                assert!(s.value(i - 1) <= s.value(i), "still nearest-first");
+            }
+        }
+
+        let all = query(10, "title");
+        assert_eq!(
+            count_title(&all, "rare"),
+            N_FAR_PAST_THE_CEILING,
+            "fewer than k match: every one of them, no more"
+        );
+
+        let count = query(10, "COUNT(*) AS n");
+        let n = count[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64")
+            .value(0);
+        assert_eq!(n, N_FAR_PAST_THE_CEILING as i64);
     }
 
     /// Titles across `batches`, in hit order.
