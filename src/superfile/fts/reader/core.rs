@@ -416,9 +416,9 @@ pub enum OrAlgo {
 /// window base is a cheap mask. At 8192 the per-window state — an
 /// `8192 × f32` score accumulator (32 KiB) plus an `8192`-bit presence
 /// bitset (1 KiB) — stays L1/L2-resident across the accumulate + drain
-/// passes, and a union of common terms pays its per-window costs (the
+/// passes, while a union of common terms pays its per-window costs (the
 /// smallest-doc scan, a cursor's step into and out of the window, the
-/// drain's pass over the presence words) half as often as at 4096.
+/// drain's pass over the presence words) seldom.
 pub(super) const OR_WINDOW: u32 = 8192;
 /// Number of 64-bit words in the window presence bitset.
 pub(super) const OR_WINDOW_WORDS: usize = (OR_WINDOW as usize).div_ceil(64);
@@ -1476,8 +1476,6 @@ impl FtsReader {
             }
         }
         for phrase in phrases {
-            // One cursor per distinct term: a repeated term is fetched,
-            // aligned and decoded once and read at each of its offsets.
             let (member_refs, member_at) = distinct_members(phrase);
             // A phrase's score is Σ member idf (see `PhraseCursor::new`), so
             // globalizing the members' idf globalizes the phrase — the

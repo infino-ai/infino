@@ -16,7 +16,7 @@ use super::{
     filter::AtomExcludeFilter,
     metadata::NormTable,
     options::BoolMode,
-    phrase::{AnyCursor, batch_phrase_with_terms},
+    phrase::{AnyCursor, approx_align, batch_phrase_with_terms},
     scorers::{count_and_planned, count_excluding},
     search::FetchedTermMemo,
     sink::{TopKEntry, finish_head},
@@ -178,31 +178,13 @@ impl FtsReader {
                             }
                             a.current_doc_id()
                         }
-                        None => {
-                            // Phase 1 — align every atom by its cheap
-                            // *approximation*: a term atom is exact; a phrase
-                            // atom advances only to a doc holding all its
-                            // members, without decoding positions. So a rare
-                            // co-clause prunes the candidate set here, before
-                            // any phrase pays for adjacency.
-                            let mut aligned = target;
-                            let mut i = 0usize;
-                            while i < atoms.len() {
-                                let a = &mut atoms[i];
-                                a.approx_skip_to(aligned);
-                                if a.is_exhausted() {
-                                    break 'docs;
-                                }
-                                let here = a.approx_current_doc();
-                                if here > aligned {
-                                    aligned = here;
-                                    i = 0;
-                                    continue;
-                                }
-                                i += 1;
-                            }
-                            aligned
-                        }
+                        // Phase 1 — every atom aligned by its cheap
+                        // approximation, so a rare co-clause prunes the
+                        // candidates before any phrase pays for adjacency.
+                        None => match approx_align(&mut atoms, target) {
+                            Some(aligned) => aligned,
+                            None => break 'docs,
+                        },
                     };
                     // Phase 2 — every approximation agrees on `aligned`. Verify
                     // the phrase atoms' positions here only: the intersection is

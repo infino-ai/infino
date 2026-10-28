@@ -1598,12 +1598,21 @@ impl TermCursor {
     /// Whether the current block's doc ids and tfs are all decoded in the
     /// buffers (not a lazily held bitset block showing one doc).
     #[inline]
-    /// The current block's presence bitset when the cursor holds the block
-    /// whole and it is stored as one: the doc its first bit stands for, and
-    /// where its bytes sit in [`Self::bytes`].
+    pub(super) fn holds_whole_block(&self) -> bool {
+        !self.is_exhausted()
+            && !self.is_lazy()
+            && self.decoded_block == self.current_block
+            && self.purpose.decodes_tfs()
+    }
+
+    /// The current block's presence bitset when it is stored as one: the
+    /// doc its first bit stands for, and where its bytes sit in
+    /// [`Self::bytes`]. The cursor must hold the block whole
+    /// ([`Self::holds_whole_block`]).
     #[cfg(target_arch = "x86_64")]
     pub(super) fn whole_bitset(&mut self) -> Option<(u32, Range<usize>)> {
-        if self.predecoded || !self.holds_whole_block() {
+        debug_assert!(self.holds_whole_block(), "the block is held whole");
+        if self.predecoded {
             return None;
         }
         let hdr = self.current_header();
@@ -1615,13 +1624,6 @@ impl TermCursor {
             hdr.base,
             block.block_byte_offset + hdr.payload()..block.block_byte_end - hdr.tfs_size(),
         ))
-    }
-
-    pub(super) fn holds_whole_block(&self) -> bool {
-        !self.is_exhausted()
-            && !self.is_lazy()
-            && self.decoded_block == self.current_block
-            && self.purpose.decodes_tfs()
     }
 
     pub(super) fn is_exhausted(&self) -> bool {

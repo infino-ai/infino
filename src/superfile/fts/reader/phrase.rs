@@ -23,10 +23,9 @@ use crate::superfile::{
     fts::{bm25, positions::GroupIndex},
 };
 
-/// One distinct term of a [`PhraseCursor`]: its posting cursor, its
-/// fetched position groups, and the current block's group located for
-/// per-pair access. A term the phrase names more than once is one member,
-/// aligned and decoded once, that every query position naming it reads.
+/// One distinct term of a [`PhraseCursor`] ([`distinct_members`]): its
+/// posting cursor, its fetched position groups, and the current block's
+/// group located for per-pair access.
 pub(super) struct PhraseMember {
     pub(super) cursor: TermCursor,
     /// A second cursor over the same postings for the block-at-a-time
@@ -157,9 +156,8 @@ impl PhraseMember {
 /// fills its `pos_scratch`) once some start survives every rarer member, so
 /// on the many docs a rare member rejects the common members' runs are
 /// never decoded. `order` lists the query positions of one member
-/// consecutively, so a repeated term's positions are read once and checked
-/// at each of its offsets. Returns the surviving starts: the phrase's tf at
-/// the doc.
+/// consecutively, so its positions are read once. Returns the surviving
+/// starts: the phrase's tf at the doc.
 fn verify_members(
     members: &mut [PhraseMember],
     member_at: &[usize],
@@ -247,7 +245,7 @@ pub(super) struct PhraseCursor {
     pub(super) members: Vec<PhraseMember>,
     /// For each query position, the index in `members` of its term: the
     /// identity unless the phrase repeats a term.
-    pub(super) member_at: Vec<usize>,
+    member_at: Vec<usize>,
     /// Each query position's **token-position** offset from the phrase's
     /// first term, in query order — strictly ascending, first entry `0`.
     ///
@@ -567,8 +565,8 @@ impl PhraseCursor {
     /// current block is the candidate list; every other source filters it in
     /// one pass ([`TermCursor::retain_contained_located`]: a rank on a dense
     /// block, one decode and a merge on a packed block), a member recording
-    /// where it holds each survivor, and only the survivors are verified, each member's
-    /// positions read at its recorded location. The candidates left
+    /// where it holds each survivor, and only the survivors are verified,
+    /// each member's positions read at its recorded location. The candidates left
     /// over after a match are kept for the next call. When `bar` is
     /// finite, a block whose phrase bound is under the bar is skipped
     /// before it is filtered, and a survivor is pre-screened without
@@ -764,7 +762,31 @@ impl PhraseCursor {
 thread_local! {
     /// Test switch: keep every shape on the two-phase walk, the reference
     /// the batched walk is graded against bit for bit.
-    pub(super) static TWO_PHASE_ONLY: Cell<bool> = const { Cell::new(false) };
+    static TWO_PHASE_ONLY: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Align every atom of an AND by its approximation, from `target`: a term
+/// atom is exact, a phrase atom advances only to a doc holding all its
+/// members, without decoding positions. The first doc every approximation
+/// agrees on, or `None` once an atom is exhausted.
+pub(super) fn approx_align(atoms: &mut [AnyCursor], target: u32) -> Option<u32> {
+    let mut aligned = target;
+    let mut i = 0usize;
+    while i < atoms.len() {
+        let a = &mut atoms[i];
+        a.approx_skip_to(aligned);
+        if a.is_exhausted() {
+            return None;
+        }
+        let here = a.approx_current_doc();
+        if here > aligned {
+            aligned = here;
+            i = 0;
+            continue;
+        }
+        i += 1;
+    }
+    Some(aligned)
 }
 
 /// Hand the AND of exactly one phrase and at least one plain term to the
@@ -957,6 +979,24 @@ mod tests {
         },
         test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
     };
+
+    /// [`TWO_PHASE_ONLY`] set while it lives, and cleared when it drops,
+    /// so a failed assertion cannot leave it set for the next test on the
+    /// thread.
+    struct TwoPhaseOnly;
+
+    impl TwoPhaseOnly {
+        fn set(on: bool) -> Self {
+            TWO_PHASE_ONLY.with(|c| c.set(on));
+            Self
+        }
+    }
+
+    impl Drop for TwoPhaseOnly {
+        fn drop(&mut self) {
+            TWO_PHASE_ONLY.with(|c| c.set(false));
+        }
+    }
 
     fn phrase(terms: &[&str]) -> Vec<Phrase<String>> {
         vec![Phrase::adjacent(
@@ -1717,7 +1757,6 @@ mod tests {
     /// position, a repeated term once per occurrence.
     #[tokio::test]
     async fn repeated_terms_share_a_member_and_match_a_token_scan() {
-        use crate::superfile::fts::reader::BoolMode;
         const N_DOCS: usize = 900;
         const PLANTED: [&str; 7] = [
             "to be or not to be",
@@ -2012,7 +2051,6 @@ mod tests {
             ),
             (&["uk"], &["the", "who"], &["mid"], &[]),
         ];
-        let set_two_phase = |on: bool| TWO_PHASE_ONLY.with(|c| c.set(on));
         for &(terms, members, negs, neg_members) in cases {
             let label = format!("+{members:?} +{terms:?} -{negs:?} -{neg_members:?}");
             let musts: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
@@ -2037,7 +2075,7 @@ mod tests {
             let want_allowed = want_ids.iter().filter(|&&d| allow.contains(d)).count() as u64;
 
             for two_phase in [false, true] {
-                set_two_phase(two_phase);
+                let _walk = TwoPhaseOnly::set(two_phase);
                 let label = format!("{label} two_phase={two_phase}");
                 let (count, _) = r
                     .atoms_match_count(
@@ -2074,7 +2112,7 @@ mod tests {
                 for k in [1usize, 10, 100, AND_CORPUS_DOCS as usize] {
                     let mut runs = Vec::new();
                     for two_phase in [false, true] {
-                        set_two_phase(two_phase);
+                        let _walk = TwoPhaseOnly::set(two_phase);
                         let ranked = r
                             .search_excluding("title", lists(), k, f32::NEG_INFINITY)
                             .await
@@ -2085,7 +2123,6 @@ mod tests {
                             .expect("exact count");
                         runs.push((bits(&ranked), bits(&counted), count));
                     }
-                    set_two_phase(false);
                     assert_eq!(runs[0], runs[1], "{label} k={k}: batched vs two-phase");
                     let (ranked, counted, count) = &runs[0];
                     assert_eq!(ranked, counted, "{label} k={k}: ranked vs exact-count hits");

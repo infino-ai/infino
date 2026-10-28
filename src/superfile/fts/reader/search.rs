@@ -19,7 +19,7 @@ use super::{
     filter::{AtomExcludeFilter, ExcludeFilter},
     metadata::NormTable,
     options::BoolMode,
-    phrase::{AnyCursor, batch_phrase_with_terms},
+    phrase::{AnyCursor, approx_align, batch_phrase_with_terms},
     scorers::{BUFFERED_TOPK_MIN_K, kth_scored, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
@@ -339,27 +339,12 @@ impl FtsReader {
                     }
                     a.current_doc_id()
                 }
-                None => {
-                    // Phase 1 — approximate alignment (phrase = member
-                    // co-occurrence, no positions).
-                    let mut aligned = target;
-                    let mut i = 0usize;
-                    while i < musts.len() {
-                        let a = &mut musts[i];
-                        a.approx_skip_to(aligned);
-                        if a.is_exhausted() {
-                            break 'docs;
-                        }
-                        let here = a.approx_current_doc();
-                        if here > aligned {
-                            aligned = here;
-                            i = 0;
-                            continue;
-                        }
-                        i += 1;
-                    }
-                    aligned
-                }
+                // Phase 1 — approximate alignment (phrase = member
+                // co-occurrence, no positions).
+                None => match approx_align(&mut musts, target) {
+                    Some(aligned) => aligned,
+                    None => break 'docs,
+                },
             };
             // Bar skip on block-max UBs, before any position work: a candidate
             // whose musts + shoulds can't reach the kth-best is dead without a

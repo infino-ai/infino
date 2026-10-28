@@ -18,7 +18,10 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use super::{FtsReader, core::ClauseLists};
+use super::{
+    FtsReader,
+    core::{ClauseLists, OR_WINDOW},
+};
 use crate::{
     superfile::fts::{builder::FtsBuilder, reader::BoolMode, tokenize::Phrase},
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
@@ -38,12 +41,16 @@ const WEIGHTS: [u32; 16] = [400, 200, 120, 80, 60, 45, 35, 25, 18, 12, 8, 5, 3, 
 /// Longest document. Under 16 tokens every length norm is stored exactly.
 const MAX_DOC_LEN: u64 = 15;
 
-/// Union window width the kernels use, mirrored so the corpus sizes below
-/// read against it.
-const WINDOW: u32 = 4096;
+/// Union window width the kernels use, so the corpus sizes below read
+/// against it.
+const WINDOW: u32 = OR_WINDOW;
 
 /// Corpus sizes: a window and a half, under three windows, four and more.
-const CORPUS_SIZES: [u32; 3] = [WINDOW + WINDOW / 2, 11_000, 17_000];
+const CORPUS_SIZES: [u32; 3] = [
+    WINDOW + WINDOW / 2,
+    WINDOW * 2 + WINDOW * 2 / 3,
+    WINDOW * 4 + WINDOW / 5,
+];
 
 /// Queries per corpus.
 const QUERIES: usize = 96;

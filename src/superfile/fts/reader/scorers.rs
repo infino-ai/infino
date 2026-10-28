@@ -1319,7 +1319,7 @@ fn accumulate_one(
 }
 
 /// Add the rest of the cursor's block inside the window at once: the
-/// postings before `window_end` found once, scored and marked eight at a
+/// postings before `window_end` found once, scored and marked a run at a
 /// time with no per-posting bound or block checks, the cursor moved past
 /// them once. Each posting gets the same operations as scored alone, so the
 /// same bits. A lazily held block, whose buffer shows a single doc, adds
@@ -1337,67 +1337,52 @@ fn accumulate_segment(
         accumulate_one(c, base, scores, present, dl_norm_k1);
         return;
     }
-    #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx512f")
-        && std::arch::is_x86_feature_detected!("avx2")
-        && let Some((bit_base, bitset)) = c.whole_bitset()
-    {
-        let (pos, n) = (c.pos, c.block_n);
-        let ids = &c.block_doc_ids[..n];
-        // The cursor's doc is inside the window, so at least it is added.
-        let to = match ids[n - 1] < window_end {
-            true => n,
-            false => pos + ids[pos..].partition_point(|&d| d < window_end),
-        };
-        // SAFETY: both features the kernel enables are present (checked
-        // above).
-        let added = unsafe {
-            accumulate_bitset_avx512(
-                c.idf_weight,
-                BitsetRun {
-                    words: &c.bytes[bitset],
-                    bit_base,
-                    docs: ids[pos]..ids[to - 1] + 1,
-                    tfs: &c.block_tfs[pos..to],
-                },
-                base,
-                scores,
-                present,
-                dl_norm_k1,
-            )
-        };
-        debug_assert_eq!(added, to - pos, "one tf per doc of the bitset");
-        c.advance_by(to - pos);
-        return;
-    }
     let (pos, n) = (c.pos, c.block_n);
-    let ids = &c.block_doc_ids[..n];
-    let to = match ids[n - 1] < window_end {
+    // The cursor's doc is inside the window, so at least it is added.
+    let to = match c.block_doc_ids[n - 1] < window_end {
         true => n,
-        false => pos + ids[pos..].partition_point(|&d| d < window_end),
+        false => pos + c.block_doc_ids[pos..n].partition_point(|&d| d < window_end),
     };
-    let tfs = &c.block_tfs[..n];
     let mut i = pos;
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx2")
-        {
+    if avx512_kernels() {
+        if let Some((bit_base, bitset)) = c.whole_bitset() {
+            let ids = &c.block_doc_ids[..n];
             // SAFETY: both features the kernel enables are present (checked
-            // above).
-            i += unsafe {
-                accumulate_run_avx512(
+            // by `avx512_kernels`).
+            let added = unsafe {
+                accumulate_bitset_avx512(
                     c.idf_weight,
-                    &ids[pos..to],
-                    &tfs[pos..to],
+                    BitsetRun {
+                        words: &c.bytes[bitset],
+                        bit_base,
+                        docs: ids[pos]..ids[to - 1] + 1,
+                        tfs: &c.block_tfs[pos..to],
+                    },
                     base,
                     scores,
                     present,
                     dl_norm_k1,
                 )
             };
+            debug_assert_eq!(added, to - pos, "one tf per doc of the bitset");
+            c.advance_by(to - pos);
+            return;
         }
+        // SAFETY: as above.
+        i += unsafe {
+            accumulate_run_avx512(
+                c.idf_weight,
+                &c.block_doc_ids[pos..to],
+                &c.block_tfs[pos..to],
+                base,
+                scores,
+                present,
+                dl_norm_k1,
+            )
+        };
     }
+    let (ids, tfs) = (&c.block_doc_ids[..n], &c.block_tfs[..n]);
     while i + 8 <= to {
         let dids: [u32; 8] = ids[i..i + 8]
             .try_into()
@@ -1418,17 +1403,37 @@ fn accumulate_segment(
     c.advance_by(to - pos);
 }
 
-/// Slots of the window a run of eight dense postings adds into at a time:
-/// one 16-lane register of scores. The window's width is a multiple of it.
+#[cfg(test)]
+thread_local! {
+    /// Run the union window's portable accumulate even where the AVX-512
+    /// kernels could, so a test can compare the two paths' windows.
+    pub(super) static PORTABLE_ACCUMULATE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the union window's AVX-512 kernels run here: the CPU has both
+/// features they enable.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn avx512_kernels() -> bool {
+    #[cfg(test)]
+    if PORTABLE_ACCUMULATE.with(Cell::get) {
+        return false;
+    }
+    std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// The aligned unit both AVX-512 window kernels add into: one 16-lane
+/// register of scores. The window's width is a multiple of it.
 const ACCUMULATE_TILE: usize = 16;
 const _: () = assert!((OR_WINDOW as usize).is_multiple_of(ACCUMULATE_TILE));
 
 /// The eight-wide loop of [`accumulate_segment`] over one in-window run of
 /// a block's postings, returning how many it consumed (a multiple of eight).
 /// Eight postings of a dense term usually span fewer than 16 documents; their
-/// contributions are then expanded into those 16 slots under a bit mask and
-/// added with one 16-wide read-modify-write, in place of eight scalar ones,
-/// and the same mask marks them present. Their norms' buckets are then 16
+/// contributions are then expanded under a bit mask into the aligned tile
+/// ([`ACCUMULATE_TILE`]) holding the first, and the next when they cross its
+/// end, each added with one 16-wide read-modify-write in place of eight
+/// scalar ones, and the same mask marks them present. Their norms' buckets are then 16
 /// contiguous bytes too: one load, compressed under the mask to the eight
 /// docs' buckets, and one gather from the decode table, in place of eight
 /// dependent loads of each. Every slot still receives exactly its own
@@ -1439,9 +1444,11 @@ const _: () = assert!((OR_WINDOW as usize).is_multiple_of(ACCUMULATE_TILE));
 /// # Safety
 ///
 /// The caller must have detected both AVX-512F and AVX2 at runtime. Given
-/// that, every access is bounds-checked before it is made: a 16-slot
-/// read-modify-write only when the run's first slot plus 16 fits the window,
-/// and a 16-byte bucket load only when it fits the norm table; gather indices
+/// that, every access is bounds-checked before it is made: a tile's
+/// read-modify-write only when the run's last doc is inside the window (a
+/// tile is aligned to a divisor of the window's width, so every tile the run
+/// touches is inside it), and a 16-byte bucket load only when it fits the
+/// norm table; gather indices
 /// are bytes into a 256-entry table. Ids that are not ascending give wrong
 /// sums or a panic, never an out-of-bounds access.
 #[cfg(target_arch = "x86_64")]
@@ -1496,9 +1503,8 @@ unsafe fn accumulate_run_avx512(
             // The eight docs land in the 16-slot tile holding the first and,
             // when they cross its end, the next: tiles aligned to 16 slots, so
             // the next run reads either a tile this one wrote whole, which the
-            // store forwards, or one it did not touch. An unaligned 16 slots
-            // from the first doc overlapped the previous run's store only in
-            // part, which stalled every run until that store drained.
+            // store forwards, or one it did not touch, never a partial overlap
+            // that would wait for the store to drain.
             let tile = first & !(ACCUMULATE_TILE - 1);
             let wide = mask << (first - tile);
             let (low, high) = (wide as u16, (wide >> ACCUMULATE_TILE) as u16);
@@ -1571,7 +1577,7 @@ impl BitsetRun<'_> {
             .ok()
             .and_then(|at| self.words.get(at..at + 4))
         {
-            Some(four) => u32::from_le_bytes(four.try_into().expect("four bytes")),
+            Some(four) => u32::from_le_bytes(four.try_into().expect("invariant: four bytes")),
             None => {
                 let byte = |i: i64| match usize::try_from(i) {
                     Ok(i) => self.words.get(i).map_or(0, |&b| u32::from(b)),
@@ -1582,8 +1588,9 @@ impl BitsetRun<'_> {
         };
         let mut mask = (bits >> shift) as u16;
         // Lanes before the run's first doc or past its last are dropped.
-        let lo = self.docs.start.saturating_sub(tile).min(16);
-        let hi = self.docs.end.saturating_sub(tile).min(16);
+        let width = ACCUMULATE_TILE as u32;
+        let lo = self.docs.start.saturating_sub(tile).min(width);
+        let hi = self.docs.end.saturating_sub(tile).min(width);
         mask &= ((1u32 << hi) - 1) as u16 & !(((1u32 << lo) - 1) as u16);
         mask
     }
@@ -1622,7 +1629,7 @@ unsafe fn accumulate_bitset_avx512(
     let scores = &mut scores[..OR_WINDOW as usize];
     let present = &mut present[..OR_WINDOW_WORDS];
     let (buckets, lut) = dl_norm_k1.parts();
-    debug_assert!(run.docs.start >= base && run.docs.end <= base + OR_WINDOW);
+    debug_assert!(run.docs.start >= base && run.docs.end <= base.saturating_add(OR_WINDOW));
     let first = (run.docs.start - base) as usize & !(ACCUMULATE_TILE - 1);
     let mut j = 0usize;
     for slot in (first..(run.docs.end - base) as usize).step_by(ACCUMULATE_TILE) {
