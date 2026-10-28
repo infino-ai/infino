@@ -29,7 +29,7 @@ use datafusion::{
 };
 use futures::{FutureExt, StreamExt};
 use tempfile::TempDir;
-use tokio::{runtime::Runtime, time::sleep};
+use tokio::{runtime::Builder, time::sleep};
 
 use super::{FieldId, map::FileSchemaMap, with_field_id};
 use crate::{
@@ -576,7 +576,14 @@ fn a_read_dropped_halfway_still_keeps_its_columns() {
     let (st, _) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
     let reader = st.reader().expect("reader");
     let ctx = reader.sql_session_context().expect("session");
-    let runtime = Runtime::new().expect("tokio runtime");
+    // One thread: the decode the first poll spawns cannot start until this
+    // task yields, and polling once does not yield, so the stream is always
+    // dropped with the decode still to run. On a multi-thread runtime another
+    // worker can run it to the end inside that one poll.
+    let runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     runtime.block_on(async {
         let plan = ctx
             .sql("SELECT title, score FROM supertable")
@@ -587,8 +594,8 @@ fn a_read_dropped_halfway_still_keeps_its_columns() {
             .expect("physical plan");
         let scan = cached_scan(&plan).expect("a CachedScanExec in the plan");
         let mut batches = scan.execute(0, ctx.task_ctx()).expect("execute");
-        // One poll starts the first row group's decode; the stream is then
-        // dropped before the decode can answer.
+        // One poll spawns the first row group's decode; the stream is then
+        // dropped before the decode has run.
         assert!(
             batches.next().now_or_never().is_none(),
             "the decode answered within one poll"
