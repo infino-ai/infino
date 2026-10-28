@@ -961,6 +961,25 @@ impl TermCursor {
         (hdr, block.block_byte_offset..block.block_byte_end)
     }
 
+    /// Decode block `b` into `ids` and `tfs` without moving the cursor, and
+    /// return its doc count. For a term on the long form only.
+    pub(super) fn decode_block_into(
+        &self,
+        b: usize,
+        ids: &mut [u32; BLOCK_LEN],
+        tfs: &mut [u32; BLOCK_LEN],
+    ) -> usize {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
+        let block = self.blocks[b];
+        let hdr = self.block_header(b);
+        decode_block(
+            &self.bytes[block.block_byte_offset..block.block_byte_end],
+            &hdr,
+            ids,
+            tfs,
+        )
+    }
+
     #[inline]
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
@@ -1205,6 +1224,22 @@ impl TermCursor {
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
             self.pos += 1;
         }
+    }
+
+    /// Put a cursor that was only probed back into iteration at its first
+    /// doc at or after `target`: a probe may have left the buffers on another
+    /// block, so the block holding `target` is found from the block table,
+    /// decoded whole, and `pos` set in it. For a term on the long form only.
+    pub(super) fn reseek(&mut self, target: u32) {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor needs no reseek");
+        if !self.advance_current_block_to(target) {
+            return;
+        }
+        if self.current_block > self.inspect_block {
+            self.inspect_block = self.current_block;
+        }
+        self.decode_current_block();
+        self.pos = self.block_doc_ids[..self.block_n].partition_point(|&d| d < target);
     }
 
     /// Make the buffers hold the whole current block with the cursor still

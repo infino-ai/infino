@@ -20,7 +20,7 @@ use super::{
     metadata::NormTable,
     options::BoolMode,
     phrase::AnyCursor,
-    scorers::{BUFFERED_TOPK_MIN_K, score_postings},
+    scorers::{BUFFERED_TOPK_MIN_K, kth_scored, score_postings},
     sink::{Collector, LiveFloor, TopKBuffer, TopKEntry, and_heap_push, drain_top_k_desc},
     work::{
         MatchWork, atom_cursor_bytes, atom_planned_ranges, term_cursor_bytes, term_cursor_ranges,
@@ -141,15 +141,15 @@ mod seed {
     pub const MAX_BLOCKS_SEED: usize = 2048;
 }
 
-/// Seed-block count for top-k `k`: `~1.25·k`, clamped. The top-k spreads
-/// roughly one doc per high-block-max block, so the decoded count reaches
-/// its irreducible floor when the seed covers about one block per top-k
-/// doc; decoding past that is pure cost, so target just enough (the `k/4`
-/// slack absorbs blocks that hold more than one top doc). Saturating so a
-/// merge caller's huge `k` clamps to the cap rather than overflowing.
-fn seed_blocks_for(k: usize) -> usize {
-    k.saturating_add(k / 4)
-        .clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
+/// Seed-block count for top-k `k`: `(k + k/4) / 2`, a little over half a
+/// block per top-k doc, clamped. The best blocks often hold more than one
+/// top-k doc each, so about half a block per doc already puts the seed's
+/// k-th close to the final one; the blocks past that cost more to decode
+/// than the walk saves (measured: a block per doc, or a quarter of one, both
+/// decode more in total than half). Saturating so a merge caller's huge `k`
+/// clamps to the cap rather than overflowing.
+pub(super) fn seed_blocks_for(k: usize) -> usize {
+    (k.saturating_add(k / 4) / 2).clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
 }
 
 impl FtsReader {
@@ -1435,12 +1435,6 @@ impl FtsReader {
         let bounds = BoundDecoder::new(col_meta, idf_t, local_idf);
         let dl_norm_k1 = col_meta.dl_norm_k1();
 
-        // Stack-resident decode scratch for the seed below: `BLOCK_LEN` is a
-        // compile-time const and these never cross an await, so they stay off
-        // the heap.
-        let mut buf_d = [0u32; BLOCK_LEN];
-        let mut buf_t = [0u32; BLOCK_LEN];
-
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         // Every long-form term carries a coarse block-max table.
         let coarse_enabled = term_meta.has_coarse;
@@ -1461,73 +1455,60 @@ impl FtsReader {
         // is bit-identical to the un-seeded walk. Only applied without a
         // negation filter (so the seed's admitted set matches the final one)
         // and on lists long enough to have waste to prune.
-        let seed_threshold: f32 = if coarse_enabled
-            && filter.is_none()
-            && term_meta.num_blocks >= seed::MIN_BLOCKS
-        {
-            let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
-            // Seed depth scales with k: a fixed handful of blocks gives a
-            // tight k-th only at small k; at k=100/1000 the top-k spreads
-            // across more blocks, so decode more to raise the threshold.
-            let m_want = seed_blocks_for(k);
-            // Gather enough top spans to contain the top `m_want` blocks
-            // (over-cover: worst case each is in its own span).
-            let mut spans: Vec<(f32, usize)> = (0..num_coarse)
-                .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
-                .collect();
-            let s = m_want.max(seed::TOP_SPANS).min(spans.len());
-            spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Candidate blocks from those spans, then the top blocks by
-            // block-max across them.
-            let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
-            for &(_, g) in &spans[..s] {
-                let start = g * coarse_span;
-                let end = (start + coarse_span).min(term_meta.num_blocks);
-                for bi in start..end {
-                    let (_, raw) = term_meta.skip_entry(postings, bi);
-                    cand.push((bounds.bound(raw), bi));
-                }
-            }
-            let m = m_want.min(cand.len());
-            cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
-            // Decode those blocks, score, keep a k-sized seed heap. Clamp the
-            // preallocation to the corpus size: `k` is caller-controlled and may
-            // be `usize::MAX` (an unbounded "return everything" request), which
-            // would overflow `with_capacity`. The heap never holds more than the
-            // docs in scope anyway.
-            let mut seed_heap: BinaryHeap<TopKEntry> =
-                BinaryHeap::with_capacity(top_k_initial_capacity(k, u64::from(self.n_docs), None));
-            for &(_, bi) in &cand[..m] {
-                let range = term_meta.block_range_in_term(postings, bi, None);
-                let bytes = &postings[range.start..range.end];
-                let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
-                let n = decode_block(bytes, &hdr, &mut buf_d, &mut buf_t);
-                for j in 0..n {
-                    let score =
-                        bm25::score_with_dl_norm_k1(idf_weight, buf_t[j], dl_norm_k1.get(buf_d[j]));
-                    if score <= floor_eff {
-                        continue;
-                    }
-                    if seed_heap.len() < k {
-                        seed_heap.push(TopKEntry(score, FtsDocId::new(buf_d[j])));
-                    } else if let Some(mut worst) = seed_heap.peek_mut()
-                        && score > worst.0
-                    {
-                        *worst = TopKEntry(score, FtsDocId::new(buf_d[j]));
+        let seed_threshold: f32 =
+            if coarse_enabled && filter.is_none() && term_meta.num_blocks >= seed::MIN_BLOCKS {
+                let num_coarse = term_meta.num_blocks.div_ceil(coarse_span);
+                // Seed depth scales with k: a fixed handful of blocks gives a
+                // tight k-th only at small k; at k=100/1000 the top-k spreads
+                // across more blocks, so decode more to raise the threshold.
+                let m_want = seed_blocks_for(k);
+                // Gather enough top spans to contain the top `m_want` blocks
+                // (over-cover: worst case each is in its own span).
+                let mut spans: Vec<(f32, usize)> = (0..num_coarse)
+                    .map(|g| (bounds.bound(term_meta.coarse_slot(postings, g)), g))
+                    .collect();
+                let s = m_want.max(seed::TOP_SPANS).min(spans.len());
+                spans.select_nth_unstable_by(s.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+                // Candidate blocks from those spans, then the top blocks by
+                // block-max across them.
+                let mut cand: Vec<(f32, usize)> = Vec::with_capacity(s * coarse_span);
+                for &(_, g) in &spans[..s] {
+                    let start = g * coarse_span;
+                    let end = (start + coarse_span).min(term_meta.num_blocks);
+                    for bi in start..end {
+                        let (_, raw) = term_meta.skip_entry(postings, bi);
+                        cand.push((bounds.bound(raw), bi));
                     }
                 }
-            }
-            // Only a *full* seed heap gives a valid k-th lower bound.
-            match seed_heap.len() >= k {
-                true => seed_heap
-                    .peek()
-                    .map(|TopKEntry(s, _)| *s)
-                    .unwrap_or(f32::NEG_INFINITY),
-                false => f32::NEG_INFINITY,
-            }
-        } else {
-            f32::NEG_INFINITY
-        };
+                let m = m_want.min(cand.len());
+                cand.select_nth_unstable_by(m.saturating_sub(1), |a, b| b.0.total_cmp(&a.0));
+                // Decode those blocks, score each whole, and take the k-th best of
+                // those scores: a heap at a small `k`, a buffer cut by selection
+                // at a large one, where a sift per admission would cost more than
+                // the walk the seed saves. Clamp the preallocation to the corpus
+                // size: `k` is caller-controlled and may be `usize::MAX`.
+                let mut blocks = cand[..m].iter();
+                let decode = |ids: &mut [u32; BLOCK_LEN], tfs: &mut [u32; BLOCK_LEN]| {
+                    let &(_, bi) = blocks.next()?;
+                    let range = term_meta.block_range_in_term(postings, bi, None);
+                    let bytes = &postings[range.start..range.end];
+                    let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
+                    Some(decode_block(bytes, &hdr, ids, tfs))
+                };
+                let cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
+                match k >= BUFFERED_TOPK_MIN_K {
+                    true => {
+                        let buffer = <TopKBuffer as Collector>::with_capacity(k, cap);
+                        kth_scored(buffer, k, floor_eff, idf_weight, dl_norm_k1, decode)
+                    }
+                    false => {
+                        let heap = <BinaryHeap<TopKEntry> as Collector>::with_capacity(k, cap);
+                        kth_scored(heap, k, floor_eff, idf_weight, dl_norm_k1, decode)
+                    }
+                }
+            } else {
+                f32::NEG_INFINITY
+            };
 
         let capacity = k.min(term_meta.num_blocks * BLOCK_LEN).max(1);
         let walk = SingleTermWalk {
@@ -2338,6 +2319,156 @@ mod tests {
             .expect("counted search");
         assert_same_top_k(&hits, &pruned, "allow-set");
         assert_eq!(count, 2, "docs 0 and 2 are allowed and match");
+    }
+
+    /// A counted single-term search with a negation folds the negated list
+    /// into a bitset; under a row-set filter it must not, as that bitset
+    /// knows nothing of the rows. Every doc holds `w`, so the fold's density
+    /// gate passes: only the row set keeps it off. The count and the hits are
+    /// those of the allowed, unnegated docs.
+    #[tokio::test]
+    async fn a_counted_single_term_with_a_negation_honours_the_allow_set() {
+        const N_DOCS: u32 = 2_000;
+        /// `x`, the negated term, is in one doc in this many.
+        const X_STRIDE: u32 = 7;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let text = match i.is_multiple_of(X_STRIDE) {
+                true => format!("w x {}", ["pad "].repeat((i % 5) as usize).concat()),
+                false => format!("w {}", ["pad "].repeat((i % 5) as usize).concat()),
+            };
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let allow: Arc<RoaringBitmap> = Arc::new((0..N_DOCS).step_by(2).collect());
+        let lists = || ClauseLists {
+            shoulds: &["w"],
+            negatives: &["x"],
+            allow: Some(Arc::clone(&allow)),
+            ..ClauseLists::default()
+        };
+        let want = (0..N_DOCS)
+            .filter(|i| i.is_multiple_of(2) && !i.is_multiple_of(X_STRIDE))
+            .count() as u64;
+        for k in [1, 10, 100] {
+            let (hits, count) = r
+                .search_excluding_with_count("body", lists(), k)
+                .await
+                .expect("counted search");
+            let pruned = r
+                .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned search");
+            assert_eq!(count, want, "k {k}");
+            assert!(
+                hits.iter().all(|(d, _)| d.get() % 2 == 0),
+                "k {k}: {hits:?}"
+            );
+            assert_same_top_k(&hits, &pruned, "allow-set with a negation");
+        }
+    }
+
+    /// A counted single-term search passes over a block none of whose scores
+    /// can enter the top `k`, testing its scores eight at a time and the rest
+    /// one by one. The best doc here sits in the term's last block, a few
+    /// docs too short for a group of eight: passing over that block would
+    /// lose it.
+    #[tokio::test]
+    async fn a_counted_single_term_finds_the_best_doc_in_a_short_last_block() {
+        /// Docs holding `x`: three full blocks and a short fourth.
+        const N_DOCS: u32 = 3 * BLOCK_LEN as u32 + 5;
+        /// Tokens per doc, so tf alone orders the scores.
+        const DOC_LEN: usize = 12;
+        const BEST_TF: usize = 10;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let tf = if i == N_DOCS - 1 { BEST_TF } else { 1 };
+            let text = ["x "].repeat(tf).concat() + &["pad "].repeat(DOC_LEN - tf).concat();
+            b.add_doc(0, i, text.trim()).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let lists = || ClauseLists {
+            shoulds: &["x"],
+            ..ClauseLists::default()
+        };
+        for k in [1, 3] {
+            let (hits, count) = r
+                .search_excluding_with_count("body", lists(), k)
+                .await
+                .expect("counted search");
+            let pruned = r
+                .search_excluding("body", lists(), k, f32::NEG_INFINITY)
+                .await
+                .expect("pruned search");
+            assert_eq!(count, u64::from(N_DOCS), "k {k}");
+            assert_eq!(hits[0].0.get(), N_DOCS - 1, "k {k}");
+            assert_same_top_k(&hits, &pruned, "short last block");
+        }
+    }
+
+    /// A single-term search long enough to seed its bar does not seed it
+    /// under a negation: a seed over docs the negation drops would set the
+    /// bar too high. Here the term's best docs all carry the negated term,
+    /// and the docs that do answer sit in blocks whose best score is under
+    /// theirs, so a bar seeded from them would skip every answer. Every doc
+    /// has one length, so tf alone orders the scores. The answer is the term
+    /// ranked alone with the negated docs dropped, compared doc for doc and
+    /// bit for bit, with the heap collector and the buffer.
+    #[tokio::test]
+    async fn a_single_term_seed_is_not_taken_over_negated_docs() {
+        /// Enough docs for the single-term walk to seed (`seed::MIN_BLOCKS`
+        /// blocks of `BLOCK_LEN`), every one holding `x`.
+        const N_DOCS: u32 = 34_000;
+        /// Tokens per doc.
+        const DOC_LEN: usize = 5;
+        for k in [64, BUFFERED_TOPK_MIN_K + 100] {
+            // The best `k` (tf 3) lead the list and are all negated; the `k`
+            // that answer (tf 2) sit together at the middle.
+            let answer = N_DOCS / 2..N_DOCS / 2 + k as u32;
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..N_DOCS {
+                let (tf, neg) = match i {
+                    _ if i < k as u32 => (3, 1),
+                    _ if answer.contains(&i) => (2, 0),
+                    _ => (1, 0),
+                };
+                let text = ["x "].repeat(tf).concat()
+                    + &["neg "].repeat(neg).concat()
+                    + &["pad "].repeat(DOC_LEN - tf - neg).concat();
+                b.add_doc(0, i, text.trim()).expect("add doc");
+            }
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            let bits = |hits: Vec<(RowId, f32)>| -> Vec<(u32, u32)> {
+                hits.into_iter()
+                    .map(|(d, s)| (d.get(), s.to_bits()))
+                    .collect()
+            };
+            let lists = ClauseLists {
+                shoulds: &["x"],
+                negatives: &["neg"],
+                ..ClauseLists::default()
+            };
+            let got = bits(
+                r.search_excluding("body", lists, k, f32::NEG_INFINITY)
+                    .await
+                    .expect("search"),
+            );
+            let mut want = bits(
+                r.search("body", &["x"], N_DOCS as usize, BoolMode::Or)
+                    .await
+                    .expect("ranked alone"),
+            );
+            want.retain(|&(d, _)| d >= k as u32);
+            want.truncate(k);
+            assert!(want.iter().all(|&(d, _)| answer.contains(&d)), "k {k}");
+            assert_eq!(got, want, "k {k}");
+        }
     }
 
     /// A table-wide search scores with its map's idf alone: a scored term

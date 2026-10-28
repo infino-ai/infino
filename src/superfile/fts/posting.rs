@@ -82,7 +82,10 @@ use bitpacking::{BitPacker, BitPacker4x};
 use wide::u32x8;
 
 use crate::{
-    superfile::bits::{ExceptionPlan, PackScratch, plan_exceptions},
+    superfile::bits::{
+        EXPAND_SLACK, ExceptionPlan, PackScratch, expand_bitset, expand_bitset_scalar,
+        plan_exceptions,
+    },
     utils::varint::{CONTINUATION_BIT, push_varint, read_varint, varint_len},
 };
 
@@ -946,18 +949,18 @@ pub fn decode_block_doc_ids(bytes: &[u8], hdr: &BlockHeader, dest_doc_ids: &mut 
         //      any block is decoded, so a corrupted bitmap — which could carry
         //      extra set bits — is rejected at open and never reaches here.
         // The `debug_assert_eq!(j, count)` below is the test/debug tripwire that
-        // fires if a future builder change ever breaks invariant 1. This bound
-        // depends on invariant 2: if a path is ever added that decodes blocks
-        // before validating their CRC, a `j < BLOCK_LEN` bound becomes mandatory.
-        let mut j = 0usize;
-        for (wi, chunk) in words.chunks_exact(8).enumerate() {
-            let mut word = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
-            while word != 0 {
-                dest_doc_ids[j] = hdr.base + (wi as u32 * 64 + word.trailing_zeros());
-                j += 1;
-                word &= word - 1;
+        // fires if a future builder change ever breaks invariant 1. Both
+        // expansions bound their writes themselves (a corrupt block panics
+        // rather than overruns), so invariant 2 keeps that panic unreachable.
+        let j = match expand_bitset(words, hdr.base, dest_doc_ids) {
+            Some(j) => j,
+            None => {
+                let mut out = [0u32; BLOCK_LEN + EXPAND_SLACK];
+                let j = expand_bitset_scalar(words, hdr.base, &mut out);
+                dest_doc_ids[..count].copy_from_slice(&out[..count]);
+                j
             }
-        }
+        };
         debug_assert_eq!(j, count, "bitset set-bit count must equal doc_count");
         return count;
     }
