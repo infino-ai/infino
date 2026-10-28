@@ -118,10 +118,11 @@ const READ_AHEAD_ROW_GROUPS: usize = 2;
 /// downloading, so each batch is sized to half the reader's cap.
 const READ_AHEAD_BATCHES_IN_FLIGHT: usize = 2;
 
-/// Most bytes one reader (one file in one partition) may hold, and so how
-/// many row groups a batch takes: as many as fit, which on a file of small
-/// row groups is what turns a round trip per row group into one per batch.
-/// A row group bigger than this is left to the scan.
+/// Most bytes one reader (one file in one partition) may hold. A batch
+/// takes as many row groups as fit half of it, which on a file of small row
+/// groups is what turns a round trip per row group into one per batch; a
+/// row group bigger than half of it is read ahead on its own, as long as it
+/// fits the whole. A row group bigger than this is left to the scan.
 const READ_AHEAD_MAX_BYTES: usize = 16 << 20;
 
 /// Most bytes all readers of one scan may hold, so a scan stays bounded even
@@ -919,20 +920,22 @@ impl ReadAhead {
         // batch can download while the scan decodes this one, and as many
         // row groups as fit that, with at least the minimum: a batch of small
         // row groups then costs one round trip rather than one per row group.
-        // Counted by the projected chunks alone; the spans they merge into
-        // are measured below, and a batch that overshoots there is trimmed
-        // from the end.
+        // The walk is bounded by the row groups it looks at, local ones
+        // included, so a run of row groups already local is not walked to
+        // its end on every read. Counted by the projected chunks alone; the
+        // spans they merge into are measured below, and a batch that
+        // overshoots there is trimmed from the end.
         let batch_cap = cap / READ_AHEAD_BATCHES_IN_FLIGHT;
         let mut row_groups: Vec<(usize, Vec<Range<u64>>)> = Vec::new();
         let mut planned = 0usize;
-        for rg in order.after(after) {
+        for (walked, rg) in order.after(after).enumerate() {
             let meta = self.meta.row_group(rg);
             if !order.reads_whole(rg, meta.num_rows() as usize) {
                 break;
             }
             let ranges: Vec<Range<u64>> = columns.iter().map(|&c| chunk_range(meta, c)).collect();
             let bytes: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
-            if row_groups.len() >= READ_AHEAD_ROW_GROUPS && planned + bytes > batch_cap {
+            if walked >= READ_AHEAD_ROW_GROUPS && planned + bytes > batch_cap {
                 break;
             }
             planned += bytes;
@@ -941,7 +944,9 @@ impl ReadAhead {
             }
         }
         // The batch holds whole spans, gaps included, so reserve those. Drop row
-        // groups from the end until it fits its share and the reader's cap.
+        // groups from the end until it fits its share and the reader's cap. A
+        // batch of one row group may take the reader's whole cap: a row group
+        // over half the cap is still worth downloading while the scan decodes.
         let blocks = self.scan.store.cache_blocks(location);
         let (clusters, charge) = loop {
             if row_groups.is_empty() {
@@ -960,7 +965,7 @@ impl ReadAhead {
                 .flatten()
                 .map(|span| (span.end - span.start) as usize)
                 .sum();
-            if charge <= batch_cap && held + charge <= cap {
+            if (charge <= batch_cap || row_groups.len() == 1) && held + charge <= cap {
                 break (clusters, charge);
             }
             row_groups.pop();
@@ -1737,6 +1742,32 @@ mod tests {
         for rg in 2..GROUPS {
             assert!(touched(&reads, &meta, rg), "row group {rg} fetched ahead");
         }
+    }
+
+    /// A row group over half the reader's cap, but under the cap, is read
+    /// ahead on its own: the next one does not fit beside it.
+    #[tokio::test]
+    async fn a_row_group_over_half_the_cap_is_read_ahead_alone() {
+        let (superfile, store, path, meta) = setup(false);
+        let budget = ConnectionMemoryBudget::measured();
+        // Two row groups do not fit the cap, one does, and a batch's share
+        // (half the cap) is one byte short of one row group.
+        let cap = charge(&meta, &[2]) * READ_AHEAD_BATCHES_IN_FLIGHT - 1;
+        let scan = Arc::new(
+            ScanReadAhead::new(Arc::clone(&store), Arc::clone(&budget), schema())
+                .with_reader_cap(cap),
+        );
+        let mut reader = reader_of(&scan, &path, &meta);
+        read_row_groups(&mut reader, &meta, &[0, 1]).await;
+        settle(&reader).await;
+        let reads = superfile.reads();
+        assert!(touched(&reads, &meta, 2), "row group 2 fetched ahead alone");
+        assert!(
+            !touched(&reads, &meta, 3),
+            "row group 3 does not fit beside it"
+        );
+        let batch = reader.batches.first().expect("a batch");
+        assert_eq!(batch.row_groups.len(), 1);
     }
 
     #[tokio::test]
