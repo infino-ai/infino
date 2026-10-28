@@ -186,7 +186,7 @@ use crate::{
         options::SupertableOptions,
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::{IndexOutcome, stable_ids_by_local_for_routing},
+            vector::{IndexOutcome, serves_via_graph, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
         schema::{
@@ -5170,7 +5170,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
-    let mut width_law = clean_uncheckpointed_drain.then(|| {
+    // A table already served by the centroid graph keeps the laws it has:
+    // compaction skips recalibrating it for the same reason, and scoring
+    // every new cell here costs more CPU than building it. The first drain
+    // still measures, so filtered queries always have laws to read.
+    let graph_served = hidden_bootstrapped && serves_via_graph(&hidden_manifest, &column);
+    let mut width_law = (clean_uncheckpointed_drain && !graph_served).then(|| {
         opann::WidthLawCalibration::new(
             running_clusters.dim as usize,
             metric,
