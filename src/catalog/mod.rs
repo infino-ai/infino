@@ -2107,6 +2107,7 @@ mod tests {
     use crate::{
         Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
+        runtime_metrics::io::UriClass,
         supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
         test_helpers::{
             build_title_batch,
@@ -2213,19 +2214,19 @@ mod tests {
     // one of the three ops that lock it (open / drop / create) and asserts the
     // op does not panic and still produces a correct result.
 
-    /// Rows per superfile in the cacheless-read test, and how many superfiles.
+    /// Rows per superfile in the cacheless tests, and how many superfiles.
     const CACHELESS_ROWS: i64 = 2_000;
     const CACHELESS_SUPERFILES: i64 = 3;
-    /// Payload bytes per row, incompressible, so each superfile is far
-    /// larger than its footer.
-    const CACHELESS_PAYLOAD_BYTES: usize = 400;
+    /// Payload bytes per row, incompressible, so a superfile is far larger
+    /// than its footer and than its `n` column.
+    const CACHELESS_PAYLOAD_BYTES: usize = 1_000;
 
-    /// A storage-backed connection with no disk cache opens superfiles by
-    /// range: a query that prunes to one of three superfiles fetches that
-    /// one and the others' footers, not every object whole. Measured through
-    /// the connection's usage ledger against the bytes on disk.
-    #[test]
-    fn a_cacheless_query_fetches_only_the_superfiles_it_reads() {
+    /// A storage-backed table `wide` of `CACHELESS_SUPERFILES` superfiles of
+    /// incompressible rows under a connection with no cache dir, and the
+    /// bytes its superfiles take on disk. The connection that wrote it is
+    /// dropped: a test reopens the directory, so the in-memory tier is
+    /// empty and every byte a query needs is fetched from storage.
+    fn cacheless_wide_table() -> (tempfile::TempDir, u64) {
         let (conn, dir) = storage_conn();
         let schema = Arc::new(Schema::new(vec![
             Field::new("n", DataType::Int64, false),
@@ -2261,14 +2262,32 @@ mod tests {
             .expect("batch");
             table.append(&batch).expect("append");
         }
-        let on_disk: u64 = walkdir_parquet_bytes(dir.path());
+        let on_disk = walkdir_parquet_bytes(dir.path());
         assert!(on_disk > 0, "the table wrote superfiles");
+        (dir, on_disk)
+    }
 
+    /// Reopen the directory `cacheless_wide_table` wrote.
+    fn reopen(dir: &tempfile::TempDir) -> Connection {
+        connect(dir.path().to_str().expect("utf8 path")).expect("reopen")
+    }
+
+    /// A connection with no disk cache opens superfiles by range. Measured on
+    /// a reopened connection, whose in-memory tier is empty, with a question
+    /// the manifest cannot answer from its statistics: a count under a
+    /// residual predicate on `n` reads the one superfile the manifest keeps,
+    /// and of it the footer and the `n` column, so it fetches less than that
+    /// superfile holds. An open that fetched the object whole would fetch
+    /// more.
+    #[test]
+    fn a_cacheless_query_fetches_less_than_the_superfile_it_reads() {
+        let (dir, on_disk) = cacheless_wide_table();
+        let conn = reopen(&dir);
         let before = conn.usage_snapshot();
         let last_file_from = (CACHELESS_SUPERFILES - 1) * CACHELESS_ROWS;
         let out = conn
             .query_sql(&format!(
-                "SELECT COUNT(*) FROM wide WHERE n >= {last_file_from}"
+                "SELECT COUNT(*) FROM wide WHERE n >= {last_file_from} AND n % 2 = 0"
             ))
             .expect("query");
         let count = out[0]
@@ -2277,11 +2296,16 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("count")
             .value(0);
-        assert_eq!(count, CACHELESS_ROWS);
-        let fetched = conn.usage_snapshot().since(&before).get_bytes;
+        assert_eq!(count, CACHELESS_ROWS / 2);
+        let data = conn
+            .usage_snapshot()
+            .since(&before)
+            .class_io(UriClass::UserData);
+        let one_superfile = on_disk / CACHELESS_SUPERFILES as u64;
         assert!(
-            fetched * 2 < on_disk,
-            "a query over one superfile of {CACHELESS_SUPERFILES} fetched {fetched} of {on_disk} bytes"
+            data.get_bytes < one_superfile,
+            "a query over the footer and one column of a {one_superfile}-byte superfile fetched {} bytes",
+            data.get_bytes
         );
     }
 
