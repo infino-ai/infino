@@ -5472,6 +5472,11 @@ mod tests {
             self.released.store(true, Ordering::Release);
             self.let_go.notify_waiters();
         }
+
+        /// Lets go only the range that has held longest; the others hold on.
+        fn release_first(&self) {
+            self.let_go.notify_one();
+        }
     }
 
     /// A [`HeldSource`] over an `obj`-byte blob that holds its first range.
@@ -5948,9 +5953,9 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A prefetch whose GET lands after a read registered a run at the GET's
-    /// first block does not take its chunk as done: it waits for that run, then
-    /// fetches what is still missing.
+    /// A prefetch whose GET lands while a read's run at the GET's first block is
+    /// still in flight does not take its chunk as done: it waits for that run,
+    /// then fetches what is still missing.
     #[tokio::test]
     async fn a_prefetch_beaten_to_its_first_block_still_fills_its_chunk() {
         let b = CACHE_BLOCK_BYTES;
@@ -5962,23 +5967,41 @@ mod tests {
             &store,
             Arc::clone(&inner) as Arc<dyn LazyByteSource>,
         );
-        let bf = src.block_file().expect("block file");
 
-        let mut chunk = pin!(src.prefetch_chunk(bf, 0, 15));
-        assert!(
-            poll!(chunk.as_mut()).is_pending(),
-            "the prefetch GETs [0, 15]"
-        );
-        wait_until(|| inner.held.load(Ordering::Acquire) == 1, "its GET holds").await;
+        let prefetching = Arc::clone(&src);
+        let chunk = tokio::spawn(async move {
+            let bf = prefetching.block_file().expect("block file");
+            prefetching.prefetch_chunk(bf, 0, 15).await
+        });
+        wait_until(
+            || inner.held.load(Ordering::Acquire) == 1,
+            "the prefetch's GET of [0, 15] holds",
+        )
+        .await;
         let mut read = pin!(src.range(0, 64));
         assert!(poll!(read.as_mut()).is_pending(), "a read registers [0, 7]");
-        wait_until(|| inner.held.load(Ordering::Acquire) == 2, "its GET holds").await;
+        wait_until(
+            || inner.held.load(Ordering::Acquire) == 2,
+            "the read's GET holds",
+        )
+        .await;
+
+        // The prefetch's GET lands first; the read's run still holds block 0.
+        inner.release_first();
+        wait_until(|| inner.inner.calls() == 1, "the prefetch's GET lands").await;
+        assert_eq!(get_blocks(&inner.inner.ranges()), vec![(0, 15)]);
+        sleep(STAYS_PUT).await;
+        assert!(
+            !chunk.is_finished(),
+            "the prefetch waits for the read's run"
+        );
 
         inner.release();
-        let (chunk, read) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(chunk, read) })
+        read.await.expect("the read");
+        let chunk = timeout(NO_WAIT_DEADLINE, chunk)
             .await
-            .expect("both finish");
-        read.expect("the read");
+            .expect("the prefetch finishes")
+            .expect("and does not panic");
         assert!(chunk.expect("the prefetch"), "the prefetch goes on");
         assert_eq!(
             get_blocks(&inner.inner.ranges()),
