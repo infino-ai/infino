@@ -1130,7 +1130,8 @@ mod fanout_tier_tests {
         //  - the writer leaves what it commits in the in-memory reader
         //    cache, so the table that wrote them opens all three from memory.
         //  - a table reopened on the same storage has nothing cached and no
-        //    disk cache, so all three come from the source.
+        //    disk cache, so all three are opened from storage by range: the
+        //    lazy tier.
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -1144,7 +1145,7 @@ mod fanout_tier_tests {
         assert_eq!(fanout_tiers(&table).await, [COMMITS, 0, 0, 0, 0, 0]);
 
         let reopened = Supertable::open(options()).expect("reopen");
-        assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
+        assert_eq!(fanout_tiers(&reopened).await, [0, 0, COMMITS, 0, 0, 0]);
     }
 
     /// Superfiles in the plan fixture: more than four windows of them, so the
