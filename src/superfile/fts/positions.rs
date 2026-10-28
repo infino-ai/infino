@@ -532,7 +532,23 @@ impl GroupIndex {
     /// truncated or malformed group, after which the index must be
     /// relocated before use.
     pub(crate) fn locate(&mut self, bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<()> {
-        let n: usize = tfs.iter().map(|&t| t as usize).sum();
+        // Where each pair's values begin, as a running sum over the tfs, and
+        // the group's value count as that sum's end: one pass over the tfs,
+        // in a register, into a buffer sized once. (The per-encoding lane
+        // rule — a packed pair's lanes are its gaps alone — is applied to the
+        // sums below once the header says which encoding the group has.)
+        self.starts.clear();
+        self.starts.resize(tfs.len() + 1, 0);
+        let mut acc = 0u32;
+        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
+            acc = acc.wrapping_add(tf);
+            *slot = acc;
+        }
+        // Every partial sum is at most the total, so one check that the
+        // total did not wrap covers them all.
+        let total: u64 = tfs.iter().map(|&t| u64::from(t)).sum();
+        let n = usize::try_from(total).ok()?;
+        u32::try_from(total).ok()?;
         self.served = 0;
         let header = *bytes.get(*at)?;
         *at += 1;
@@ -568,22 +584,14 @@ impl GroupIndex {
             }
             _ => return None,
         }
-        // Every partial sum is at most `n`, so one check that `n` fits makes
-        // the prefix sum overflow-free; the per-encoding lane rule is chosen
-        // once, not called per pair.
-        u32::try_from(n).ok()?;
-        // Sized once and filled with the running sum in a register: pushing
-        // grew the vector through memory for every pair of every block.
-        self.starts.clear();
-        self.starts.resize(tfs.len() + 1, 0);
-        let mut acc = 0u32;
-        let lanes_per_pair = |tf: u32| match self.kind {
-            GroupKind::Packed => tf.saturating_sub(1),
-            _ => tf,
-        };
-        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
-            acc += lanes_per_pair(tf);
-            *slot = acc;
+        // A packed pair's lanes are its gaps: its first position sits in the
+        // other stream, so pair `p` starts `p` lanes earlier than its value
+        // sum says. A pair with no occurrences cannot exist, so the sums
+        // stay ascending.
+        if self.kind == GroupKind::Packed {
+            for (p, slot) in self.starts.iter_mut().enumerate() {
+                *slot -= p as u32;
+            }
         }
         Some(())
     }
