@@ -5,7 +5,8 @@
 //! manifest-statistics "aggregation tree".
 //!
 //! Exact low-cardinality frequencies answer `COUNT(*)` over a
-//! single-column equality/range and `GROUP BY column, COUNT(*)` directly.
+//! single-column equality/range and `GROUP BY column, COUNT(*)` directly,
+//! unfiltered or filtered to the column's non-null values.
 //! Other ungrouped aggregates whose `WHERE` clause is a single-column range
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
@@ -38,10 +39,14 @@
 //!     — partial predicate coverage would answer the wrong query);
 //!   * a segment with any (or unknown) tombstones demotes to
 //!     boundary;
+//!   * a segment whose range column holds any (or an unknown number of)
+//!     nulls is boundary: a NULL never matches the range, but the
+//!     segment's statistics count its row;
 //!   * a covered segment missing a required stat demotes to boundary;
-//!   * only `COUNT(*)`, `SUM`, `MIN`, `MAX`, `AVG` over bare columns,
-//!     no DISTINCT / FILTER / ORDER BY; the sole grouped shape is one
-//!     low-cardinality column plus `COUNT(*)`;
+//!   * only `COUNT(*)`, `COUNT`, `SUM`, `MIN`, `MAX`, `AVG` over bare
+//!     columns, no DISTINCT / FILTER / ORDER BY; the sole grouped shape is
+//!     one low-cardinality column plus `COUNT(*)`, over the whole table or
+//!     filtered by `column IS NOT NULL` alone;
 //!   * a provider already restricted to a segment subset is the
 //!     rewrite's own residual — never rewritten again (idempotency);
 //!   * a scan carrying a filter the provider answers exactly (which
@@ -107,8 +112,11 @@ impl OptimizerRule for CoveredAggregateRewrite {
 }
 
 /// One supported aggregate output.
+#[derive(Debug, PartialEq)]
 enum AggKind {
     CountStar,
+    /// `COUNT(column)`: the column's non-null rows.
+    Count(String),
     Sum(String),
     Min(String),
     Max(String),
@@ -181,7 +189,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         for (i, (kind, partial)) in kinds.iter().zip(&partials).enumerate() {
             let field = agg.schema.field(i);
             let expression = match (kind, partial) {
-                (AggKind::CountStar, Partial::Count(count)) => lit(*count),
+                (AggKind::CountStar | AggKind::Count(_), Partial::Count(count)) => lit(*count),
                 (AggKind::Sum(_), Partial::Sum(value))
                 | (AggKind::Min(_), Partial::Bound(value))
                 | (AggKind::Max(_), Partial::Bound(value)) => {
@@ -299,6 +307,9 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
             AggKind::CountStar => {
                 partial_exprs.push(count(lit(1i64)).alias(format!("__resid_{i}_cnt")));
             }
+            AggKind::Count(column) => {
+                partial_exprs.push(count(col(column)).alias(format!("__resid_{i}_cnt")));
+            }
             AggKind::Sum(column) => {
                 partial_exprs.push(sum(col(column)).alias(format!("__resid_{i}_sum")));
             }
@@ -331,7 +342,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         let field = agg.schema.field(i);
         let name = field.name().clone();
         let expr = match (kind, partial) {
-            (AggKind::CountStar, Partial::Count(n)) => {
+            (AggKind::CountStar | AggKind::Count(_), Partial::Count(n)) => {
                 // COUNT over an empty residual is 0, never NULL.
                 (col(format!("__resid_{i}_cnt")) + lit(*n)).alias(name)
             }
@@ -395,8 +406,16 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
         return Ok(None);
     }
-    let Some(scan) = peel_unfiltered_scan(aggregate.input.as_ref()) else {
-        return Ok(None);
+    // The value counts are exact counts of the column's non-null values. Over
+    // the whole table they answer the grouped count only when the column holds
+    // no nulls (a null group would be missing); filtered to the non-null
+    // values, they answer it whatever the column holds.
+    let (scan, nulls_filtered) = match peel_unfiltered_scan(aggregate.input.as_ref()) {
+        Some(scan) => (scan, false),
+        None => match peel_not_null_filter(aggregate.input.as_ref(), &group_column.name) {
+            Some(scan) => (scan, true),
+            None => return Ok(None),
+        },
     };
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
@@ -412,11 +431,12 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     }
     if !superfiles.iter().all(|entry| {
         provider.entry_is_clean(entry)
-            && provider
-                .manifest()
-                .field_id(&group_column.name)
-                .and_then(|id| entry.scalar_stats.column(id))
-                .is_some_and(|stats| stats.null_count() == Some(0))
+            && (nulls_filtered
+                || provider
+                    .manifest()
+                    .field_id(&group_column.name)
+                    .and_then(|id| entry.scalar_stats.column(id))
+                    .is_some_and(|stats| stats.null_count() == Some(0)))
     }) {
         return Ok(None);
     }
@@ -500,6 +520,10 @@ fn accumulate_partial(
             }
             Some(Partial::Count(total))
         }
+        AggKind::Count(col) => Some(Partial::Count(non_null_count(
+            covered,
+            manifest.field_id(col)?,
+        )?)),
         AggKind::Sum(col) => Some(Partial::Sum(fold_sums(covered, manifest.field_id(col)?)?)),
         AggKind::Min(col) => {
             let (min, _) = fold_bounds(covered, manifest.field_id(col)?)?;
@@ -512,12 +536,7 @@ fn accumulate_partial(
         AggKind::Avg(col) => {
             let col = manifest.field_id(col)?;
             let sum = fold_sums(covered, col)?;
-            let mut count: i64 = 0;
-            for entry in covered {
-                let nulls = entry.scalar_stats.column(col)?.null_count()?;
-                let non_null = entry.n_docs.checked_sub(nulls)?;
-                count = count.checked_add(i64::try_from(non_null).ok()?)?;
-            }
+            let count = non_null_count(covered, col)?;
             if count == 0 {
                 // All covered values NULL: AVG semantics get fiddly
                 // (0/0); decline and let the scan answer.
@@ -526,6 +545,18 @@ fn accumulate_partial(
             Some(Partial::Avg { sum, count })
         }
     }
+}
+
+/// The non-null rows of `col` across `covered`: each superfile's row count
+/// less its recorded null count. `None` when a superfile lacks the null count.
+fn non_null_count(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<i64> {
+    let mut count: i64 = 0;
+    for entry in covered {
+        let nulls = entry.scalar_stats.column(col)?.null_count()?;
+        let non_null = entry.n_docs.checked_sub(nulls)?;
+        count = count.checked_add(i64::try_from(non_null).ok()?)?;
+    }
+    Some(count)
 }
 
 fn fold_sums(covered: &[&Arc<SuperfileEntry>], col: FieldId) -> Option<ScalarValue> {
@@ -602,6 +633,7 @@ fn parse_aggregates(exprs: &[Expr]) -> Option<Vec<AggKind>> {
         let kind = match (agg.func.name(), params.args.as_slice()) {
             ("count", []) => AggKind::CountStar,
             ("count", [Expr::Literal(value, _)]) if !value.is_null() => AggKind::CountStar,
+            ("count", [Expr::Column(c)]) => AggKind::Count(c.name.clone()),
             ("sum", [Expr::Column(c)]) => AggKind::Sum(c.name.clone()),
             ("min", [Expr::Column(c)]) => AggKind::Min(c.name.clone()),
             ("max", [Expr::Column(c)]) => AggKind::Max(c.name.clone()),
@@ -672,6 +704,20 @@ fn peel_unfiltered_scan(input: &LogicalPlan) -> Option<&TableScan> {
     }
     match node {
         LogicalPlan::TableScan(scan) => Some(scan),
+        _ => None,
+    }
+}
+
+/// Peel a grouped count's input down to its table scan when its one filter is
+/// `column IS NOT NULL` on the grouping column, looking through the same
+/// pure-column projection [`peel_input`] admits. `None` for any other filter.
+fn peel_not_null_filter<'a>(input: &'a LogicalPlan, column: &str) -> Option<&'a TableScan> {
+    let (predicate, scan) = peel_input(input)?;
+    match predicate {
+        Expr::IsNotNull(inner) => match inner.as_ref() {
+            Expr::Column(c) if c.name == column => Some(scan),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -787,25 +833,36 @@ fn collect_range_leaves(expr: &Expr, out: &mut Vec<(String, Operator, ScalarValu
 
 /// Classify one segment's `[seg_min, seg_max]` for `range.column`
 /// against the range. Missing bounds → `Boundary` (conservative).
+///
+/// A NULL never matches a range, so a segment whose range column holds
+/// nulls (or an unknown number of them) is never covered: its row count,
+/// and every other column's statistics, include rows the filter drops.
+/// `_id` is never null.
 fn classify(
     manifest: &ManifestSnapshot,
     entry: &SuperfileEntry,
     id_column: &str,
     range: &RangeFilter,
 ) -> Class {
-    let bounds = if range.column == id_column {
-        Some((
-            ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
-            ScalarValue::Decimal128(Some(entry.id_max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
-        ))
+    let (bounds, null_free) = if range.column == id_column {
+        (
+            Some((
+                ScalarValue::Decimal128(Some(entry.id_min), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+                ScalarValue::Decimal128(Some(entry.id_max), DECIMAL128_PRECISION, DECIMAL128_SCALE),
+            )),
+            true,
+        )
     } else {
-        manifest
+        let stats = manifest
             .field_id(&range.column)
-            .and_then(|id| entry.scalar_stats.column(id))
-            .and_then(|stats| {
+            .and_then(|id| entry.scalar_stats.column(id));
+        (
+            stats.and_then(|stats| {
                 let (mn, mx) = stats.min_max_values()?;
                 (!mn.is_null() && !mx.is_null()).then_some((mn, mx))
-            })
+            }),
+            stats.is_some_and(|stats| stats.null_count() == Some(0)),
+        )
     };
     let Some((seg_min, seg_max)) = bounds else {
         return Class::Boundary;
@@ -850,7 +907,7 @@ fn classify(
             _ => false,
         },
     };
-    if lo_ok && hi_ok {
+    if lo_ok && hi_ok && null_free {
         Class::Covered
     } else {
         Class::Boundary
@@ -908,6 +965,7 @@ fn has_required_stats(
     };
     kinds.iter().all(|kind| match kind {
         AggKind::CountStar => true,
+        AggKind::Count(col) => usable(col).is_some_and(|a| a.null_count().is_some()),
         AggKind::Sum(col) => usable(col).is_some_and(|a| a.sum().is_some()),
         AggKind::Min(col) | AggKind::Max(col) => usable(col).is_some(),
         AggKind::Avg(col) => {
@@ -1042,6 +1100,22 @@ mod tests {
         let casted = Expr::Cast(Cast::new(Box::new(col("price")), DataType::Float64));
         assert_eq!(avg_column(&casted), Some("price".to_string()));
         assert_eq!(avg_column(&lit(1.0)), None);
+    }
+
+    /// `parse_aggregates` reads `COUNT(column)` as that column's non-null
+    /// count, and still reads `COUNT(1)` as a row count.
+    #[test]
+    fn parse_aggregates_reads_count_of_a_column() {
+        let kinds = parse_aggregates(&[count(col("fare")), count(lit(1i64)), sum(col("fare"))])
+            .expect("every aggregate is supported");
+        assert_eq!(
+            kinds,
+            vec![
+                AggKind::Count("fare".to_string()),
+                AggKind::CountStar,
+                AggKind::Sum("fare".to_string()),
+            ]
+        );
     }
 
     #[test]
