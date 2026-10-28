@@ -92,7 +92,10 @@ use datafusion::{
 };
 use rustc_hash::FxHashSet;
 
-use crate::supertable::query::{exec::metered_exec::MeteredExec, provider::ScanFooters};
+use crate::supertable::query::{
+    exec::{cached_scan_exec::CachedScanExec, metered_exec::MeteredExec},
+    provider::ScanFooters,
+};
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "RowFilterUnderTopK";
@@ -188,7 +191,15 @@ impl PhysicalOptimizerRule for UnsplitLimitScans {
                 .downcast_ref::<DataSourceExec>()
                 .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
             else {
-                return Ok(Transformed::no(node));
+                // A scan already in one partition (the scan of kept columns):
+                // only an exchange below the meter goes.
+                return if Arc::ptr_eq(input, meter.input()) {
+                    Ok(Transformed::no(node))
+                } else {
+                    Ok(Transformed::yes(
+                        Arc::clone(&node).with_new_children(vec![Arc::clone(input)])?,
+                    ))
+                };
             };
             if config.file_groups.len() <= 1 && Arc::ptr_eq(input, meter.input()) {
                 return Ok(Transformed::no(node));
@@ -264,6 +275,17 @@ fn row_filtered(
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     // Reached our table scan: the meter and the Parquet scan it wraps.
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
+        // A scan of kept columns has no row filter to turn on; under a plain
+        // `LIMIT` it is read as one partition, row group by row group, like
+        // the Parquet scan below.
+        if let Some(cached) = meter.input().downcast_ref::<CachedScanExec>() {
+            return Ok(match under {
+                Under::Limit if !meter.supports_limit_pushdown() => {
+                    Some(meter.unsplit(cached.in_one_partition()))
+                }
+                _ => None,
+            });
+        }
         let (Some(scan), Some(footers)) = (
             meter.input().downcast_ref::<DataSourceExec>(),
             meter.footers(),

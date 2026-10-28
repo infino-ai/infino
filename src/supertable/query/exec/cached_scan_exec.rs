@@ -146,12 +146,7 @@ impl CachedScanExec {
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
         let schema_id = manifest.table_schema().schema_id();
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(Arc::clone(&schema)),
-            Partitioning::UnknownPartitioning(partitions),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        ));
+        let properties = plan_properties(&schema, partitions);
         Some(Self {
             context: Arc::new(ScanContext {
                 schema,
@@ -168,6 +163,40 @@ impl CachedScanExec {
             properties,
         })
     }
+
+    /// This scan read as one partition, its row groups in file order: under a
+    /// `LIMIT` whose first rows end the query, a row group after them is never
+    /// read.
+    pub(crate) fn in_one_partition(&self) -> Arc<dyn ExecutionPlan> {
+        Arc::new(Self {
+            context: Arc::clone(&self.context),
+            units: Arc::clone(&self.units),
+            partitions: 1,
+            fetch: self.fetch,
+            statistics: Arc::clone(&self.statistics),
+            properties: plan_properties(&self.context.schema, 1),
+        })
+    }
+}
+
+/// The plan properties of a scan of `schema` read as `partitions` partitions.
+fn plan_properties(schema: &SchemaRef, partitions: usize) -> Arc<PlanProperties> {
+    Arc::new(PlanProperties::new(
+        EquivalenceProperties::new(Arc::clone(schema)),
+        Partitioning::UnknownPartitioning(partitions),
+        EmissionType::Incremental,
+        Boundedness::Bounded,
+    ))
+}
+
+/// `batch` as slices of at most `rows` rows each, sharing its buffers.
+fn sliced(batch: RecordBatch, rows: usize) -> Vec<RecordBatch> {
+    let rows = rows.max(1);
+    let n = batch.num_rows();
+    (0..n)
+        .step_by(rows)
+        .map(|at| batch.slice(at, rows.min(n - at)))
+        .collect()
 }
 
 impl ScanContext {
@@ -343,7 +372,7 @@ impl ExecutionPlan for CachedScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        task: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         if partition >= self.partitions {
             return Err(DataFusionError::Internal(format!(
@@ -359,11 +388,17 @@ impl ExecutionPlan for CachedScanExec {
             .cloned()
             .collect();
         let context = Arc::clone(&self.context);
+        // A row group goes out in batch-size slices, as the Parquet scan's
+        // rows do: the filter above then works a batch at a time, and a
+        // `LIMIT` met in the first slice leaves the rest of the row group.
+        let batch_size = task.session_config().batch_size();
         let batches = stream::iter(units)
             .then(move |unit| {
                 let context = Arc::clone(&context);
                 async move { context.read(&unit).await }
             })
+            .map_ok(move |batch| stream::iter(sliced(batch, batch_size).into_iter().map(Ok)))
+            .try_flatten()
             .try_filter(|batch| future::ready(batch.num_rows() > 0))
             // A partition stops once it has the scan's fetch: the limit above
             // takes at most that many rows from any one of them.
@@ -400,4 +435,46 @@ pub(crate) fn projected_schema(
 /// (`COUNT(*)`) has nothing to decode, so the Parquet scan serves it.
 pub(crate) fn has_columns(schema: &Schema) -> bool {
     !schema.fields().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::{Array, Int64Array};
+    use arrow_schema::{DataType, Field};
+
+    use super::*;
+
+    /// Rows in the batch the slicing test cuts.
+    const ROWS: i64 = 10;
+    /// Rows per slice in the slicing test: not a divisor of [`ROWS`].
+    const SLICE: usize = 4;
+
+    #[test]
+    fn a_batch_is_cut_into_slices_of_the_batch_size_in_order() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let values: ArrayRef = Arc::new(Int64Array::from((0..ROWS).collect::<Vec<_>>()));
+        let batch = RecordBatch::try_new(schema, vec![values]).expect("batch");
+        let slices = sliced(batch, SLICE);
+        let sizes: Vec<usize> = slices.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, vec![4, 4, 2]);
+        let back: Vec<i64> = slices
+            .iter()
+            .flat_map(|s| {
+                let n = s
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ints")
+                    .clone();
+                (0..n.len()).map(move |i| n.value(i))
+            })
+            .collect();
+        assert_eq!(back, (0..ROWS).collect::<Vec<_>>());
+        let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "n",
+            DataType::Int64,
+            false,
+        )])));
+        assert!(sliced(empty, SLICE).is_empty());
+    }
 }

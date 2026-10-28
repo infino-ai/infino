@@ -66,6 +66,9 @@ const KEPT_COLUMN_BYTES: usize = 16 << 20;
 const DELETED_SCORE: i64 = 42;
 /// A tag of the file holding `tag` as a narrow string, deleted in the same test.
 const DELETED_TAG: &str = "h";
+/// Rows the plain-LIMIT test asks for: fewer than pass its filter, more than
+/// one file holds.
+const LIMITED_ROWS: usize = 5;
 /// Columns one row group keeps for `SELECT title, score`.
 const KEPT_PER_ROW_GROUP: usize = 2;
 /// How long a dropped read is given to finish its decode and keep it.
@@ -556,6 +559,49 @@ fn sql_reads_every_generation_from_kept_columns() {
         })
         .collect();
     assert!(plan.contains("CachedScanExec"), "{plan}");
+}
+
+#[test]
+fn a_plain_limit_reads_kept_columns_as_one_partition_in_file_order() {
+    // A filtered scan under a plain LIMIT: the kept columns are read as one
+    // partition, file by file, so the first rows to pass end the query. Every
+    // row returned passes the filter, and they are the first that pass in
+    // file order, as the Parquet scan returns them.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, expected) = mixed_table_with(&dir, Some(kept));
+    let reader = st.reader().expect("reader");
+    let sql = format!(
+        "SELECT _id, title, score, rating, tag FROM supertable WHERE score > 20 LIMIT {LIMITED_ROWS}"
+    );
+    let plan: String = reader
+        .query_sql(&format!("EXPLAIN {sql}"))
+        .expect("explain")
+        .iter()
+        .flat_map(|b| {
+            let plans = b
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("plan column")
+                .clone();
+            (0..plans.len()).map(move |i| plans.value(i).to_owned())
+        })
+        .collect();
+    // Below the filter: the meter kept whole over one partition, with no
+    // exchange pulling batches ahead of the limit. (An exchange above the
+    // limit, for the projection, reads only the rows the limit lets out.)
+    let below_filter = plan.split_once("FilterExec").map_or("", |(_, rest)| rest);
+    assert!(below_filter.contains("MeteredExec: unsplit"), "{plan}");
+    assert!(below_filter.contains("partitions=1"), "{plan}");
+    assert!(!below_filter.contains("RoundRobinBatch"), "{plan}");
+    let want: Vec<Row> = expected
+        .into_iter()
+        .filter(|r| r.score.is_some_and(|s| s > 20))
+        .take(LIMITED_ROWS)
+        .collect();
+    let batches = reader.query_sql(&sql).expect("sql");
+    assert_eq!(rows_of_batches(&batches), want);
 }
 
 /// The plan's `CachedScanExec`, wherever it sits.
