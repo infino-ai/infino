@@ -2097,7 +2097,9 @@ mod tests {
             assert!(beta * ROW_ORDER_BITSET_MIN_DENSITY >= rows);
 
             for (term, every) in [("alpha", 1), ("beta", BETA_EVERY), ("rare", RARE_EVERY)] {
-                let want: Vec<u32> = (0..n_rows).filter(|row| row.is_multiple_of(every)).collect();
+                let want: Vec<u32> = (0..n_rows)
+                    .filter(|row| row.is_multiple_of(every))
+                    .collect();
                 let got: Vec<u32> = r
                     .token_match("body", &[term], BoolMode::Or)
                     .await
