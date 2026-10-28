@@ -68,10 +68,11 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
-    io::{BufReader, BufWriter, Cursor, Error, Seek, SeekFrom, Write},
+    io::{BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     ops::Range,
     str::from_utf8,
-    sync::Arc,
+    sync::{Arc, mpsc::sync_channel},
+    thread,
     time::Duration,
 };
 
@@ -81,7 +82,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
-#[cfg(feature = "detailed-tracing")]
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
@@ -114,7 +114,7 @@ use crate::{
             tokenize::STANDARD_TOKENIZER,
         },
         id_space::{FtsDocId, RowId, StableId},
-        ids,
+        ids::{self, PackedIdEncoder, PackedIdOutput},
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -144,6 +144,10 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
+/// Batches a merge decodes ahead of the one it is encoding: enough to keep
+/// decoding through a row group's encode, which takes many batches at once.
+const DECODED_BATCHES_AHEAD: usize = 64;
+
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
 
@@ -172,19 +176,20 @@ const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bytes the bisection's forward index may take.
 ///
-/// `merge_memory_mb` is what the compaction run was configured with, which is
-/// what a per-deployment override sets; the global configuration is the
-/// fallback for a merge with no run behind it.
+/// Derived from the merge input cap: `merge_input_mb` is the cap the
+/// compaction run was configured with, which is what a per-deployment
+/// override sets; the global configuration's cap is the fallback for a merge
+/// with no run behind it.
 ///
 /// A merge large enough to be split at the real budget is far larger than a
 /// test can build, so tests narrow this instead of the corpus.
-fn reorder_budget_bytes(merge_memory_mb: Option<u64>) -> u64 {
+fn reorder_budget_bytes(merge_input_mb: Option<u64>) -> u64 {
     #[cfg(test)]
     if let Some(bytes) = tests::reorder_budget_override() {
         return bytes;
     }
-    merge_memory_mb
-        .unwrap_or(global().compaction.max_memory_mb)
+    merge_input_mb
+        .unwrap_or(global().compaction.max_merge_input_mb)
         .saturating_mul(BYTES_PER_MIB)
         / REORDER_FORWARD_INDEX_BUDGET_SHARE
 }
@@ -257,6 +262,88 @@ fn reorder_plan(
         terms_per_doc,
         chunk_docs: n_docs.div_ceil(runs.max(1)),
     })
+}
+
+/// Keeps each document's most selective terms for the bisection: what the
+/// second pass of `merge_doc_order` does for one input over one stretch of
+/// output rows.
+struct TermPicker<'a, E: Fn(u32) -> bool> {
+    n_fts_columns: u32,
+    terms_per_doc: usize,
+    df: &'a [u32],
+    eligible: &'a E,
+}
+
+impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
+    /// Fill the slots of output rows `first_row..past_row` from `reader`'s
+    /// terms. `slots`, `filled` and `worst` cover exactly those rows. A slot
+    /// list holds the terms carried by the fewest documents; `worst` points
+    /// at its most common one, so a term that cannot displace it costs one
+    /// comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn pick(
+        &self,
+        reader: &SuperfileReader,
+        rows: &[Option<RowId>],
+        first_row: usize,
+        past_row: usize,
+        slots: &mut [u32],
+        filled: &mut [u8],
+        worst: &mut [u8],
+    ) -> Result<(), BuildError> {
+        let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let fts = reader.fts().expect("checked by the caller");
+        for column_id in 0..self.n_fts_columns {
+            // An ineligible term is skipped before its postings are read.
+            let on_term = |term: &[u8]| {
+                let t = term_bucket(term);
+                (self.eligible)(t).then_some(t)
+            };
+            fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                let Some(row) = rows[local_doc as usize] else {
+                    return;
+                };
+                let row = row.get() as usize;
+                if row < first_row || row >= past_row {
+                    return;
+                }
+                let row = row - first_row;
+                let slot_base = row * terms_per_doc;
+                let used = filled[row] as usize;
+                if used < terms_per_doc {
+                    slots[slot_base + used] = t;
+                    if used == 0
+                        || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
+                    {
+                        worst[row] = used as u8;
+                    }
+                    filled[row] = (used + 1) as u8;
+                    return;
+                }
+                let worst_slot = slot_base + worst[row] as usize;
+                if df[t as usize] >= df[slots[worst_slot] as usize] {
+                    return;
+                }
+                slots[worst_slot] = t;
+
+                // The worst moved; find it again over the fixed, small slot
+                // count.
+                let mut w = 0usize;
+                for i in 1..terms_per_doc {
+                    if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
+                        w = i;
+                    }
+                }
+                worst[row] = w as u8;
+            })
+            .map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "fts merge: reading terms for the document order failed: {e}"
+                )))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -699,11 +786,11 @@ pub struct BuilderOptions {
     /// Memory this merge may use, in MiB, taken from the compaction settings
     /// the run was given rather than from the global configuration. The
     /// reordering sizes its forward index from a share of it, so a deployment
-    /// that raises the merge budget reorders more documents together.
+    /// that raises the merge input cap reorders more documents together.
     ///
     /// `None` outside compaction, where there is no run to honour and the
     /// configured value is the only one there is.
-    pub(crate) merge_memory_mb: Option<u64>,
+    pub(crate) merge_input_mb: Option<u64>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -725,10 +812,7 @@ pub const DEFAULT_ID_PAGE_SIZE_LIMIT: usize = 8 * 1024;
 /// Parquet id column. Used by both the whole-corpus and streaming-merge build
 /// paths so the two produce a byte-identical sidecar.
 fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &str) -> bool {
-    let Ok(idx) = batch.schema().index_of(id_column) else {
-        return false;
-    };
-    let Some(col) = batch.column(idx).as_any().downcast_ref::<Decimal128Array>() else {
+    let Some(col) = stable_id_column(batch, id_column) else {
         return false;
     };
     out.reserve(col.len() * format::ID_SIDECAR_ENTRY_BYTES);
@@ -736,6 +820,48 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
         out.extend_from_slice(&col.value(i).to_le_bytes());
     }
     true
+}
+
+/// `batch`'s `id_column` as the `Decimal128` array a sidecar is built from;
+/// `None` when the column is absent or of another type.
+fn stable_id_column<'a>(batch: &'a RecordBatch, id_column: &str) -> Option<&'a Decimal128Array> {
+    let idx = batch.schema().index_of(id_column).ok()?;
+    batch.column(idx).as_any().downcast_ref::<Decimal128Array>()
+}
+
+/// Feed `batch`'s ids to the streaming sidecar encoder, in row order. The
+/// first batch without a `Decimal128` id column ends the sidecar for good
+/// (`encoder` becomes `None`): the reader then falls back to the Parquet id
+/// column, as it does for a file built with no sidecar at all.
+fn push_stable_ids(
+    encoder: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
+    batch: &RecordBatch,
+    id_column: &str,
+) -> Result<(), BuildError> {
+    let Some(active) = encoder.as_mut() else {
+        return Ok(());
+    };
+    let Some(col) = stable_id_column(batch, id_column) else {
+        *encoder = None;
+        return Ok(());
+    };
+    for i in 0..col.len() {
+        active.push(col.value(i)).map_err(BuildError::Io)?;
+    }
+    Ok(())
+}
+
+/// Pack a raw sidecar that is already in memory, for the build paths whose
+/// rows are resident anyway. Empty when `raw` is.
+fn pack_ids_in_memory(raw: &[u8]) -> PackedIdOutput<Cursor<Vec<u8>>> {
+    let mut encoder = PackedIdEncoder::new(Vec::new());
+    encoder
+        .push_raw(raw)
+        .expect("a Vec sink never fails to write");
+    encoder
+        .finish()
+        .expect("a Vec sink never fails to write")
+        .map_blocks(Cursor::new)
 }
 
 /// A packed id sidecar for `source`, rebuilt from its Parquet `_id` column.
@@ -811,15 +937,15 @@ impl BuilderOptions {
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
-            merge_memory_mb: None,
+            merge_input_mb: None,
         }
     }
 
-    /// Give the merge the memory budget its compaction run was configured
-    /// with (see [`BuilderOptions::merge_memory_mb`]). `None` leaves it on
-    /// the configured value.
-    pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
-        self.merge_memory_mb = mb;
+    /// Give the merge the input cap its compaction run was configured with
+    /// (see [`BuilderOptions::merge_input_mb`]). `None` leaves it on the
+    /// configured value.
+    pub(crate) fn with_merge_input_mb(mut self, mb: Option<u64>) -> Self {
+        self.merge_input_mb = mb;
         self
     }
 
@@ -2657,7 +2783,7 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
         rows_of: &[Vec<Option<RowId>>],
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -2674,31 +2800,48 @@ impl SuperfileBuilder {
         // eligible it is what makes one more informative than another.
         let count_span = detail_span!("merge_order_count_terms").entered();
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
-        let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
             .collect::<Result<_, _>>()?;
-        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
-            let fts = reader.fts().expect("checked above");
-            for column_id in 0..n_fts_columns {
-                fts.for_each_term_doc(
-                    column_id,
-                    |term| Some(term_bucket(term)),
-                    |&t, local_doc| {
-                        if rows[local_doc as usize].is_some() {
-                            df[t as usize] += 1;
-                        }
-                    },
-                )
-                .map_err(|e| {
-                    BuildError::Io(Error::other(format!(
-                        "fts merge: counting terms for the document order failed: {e}"
-                    )))
-                })?;
-            }
-        }
+        // The inputs are counted side by side, each thread into its own table,
+        // and the tables summed: counts come out the same in any order.
+        let df: Vec<u32> = readers
+            .par_iter()
+            .zip(rows_by_blob.par_iter())
+            .try_fold(
+                || vec![0u32; n_buckets],
+                |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
+                    let fts = reader.fts().expect("checked above");
+                    for column_id in 0..n_fts_columns {
+                        fts.for_each_term_doc(
+                            column_id,
+                            |term| Some(term_bucket(term)),
+                            |&t, local_doc| {
+                                if rows[local_doc as usize].is_some() {
+                                    df[t as usize] += 1;
+                                }
+                            },
+                        )
+                        .map_err(|e| {
+                            BuildError::Io(Error::other(format!(
+                                "fts merge: counting terms for the document order failed: {e}"
+                            )))
+                        })?;
+                    }
+                    Ok(df)
+                },
+            )
+            .try_reduce(
+                || vec![0u32; n_buckets],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )?;
         drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
@@ -2715,7 +2858,7 @@ impl SuperfileBuilder {
             .filter(|&(t, _)| eligible(t as u32))
             .map(|(_, &d)| u64::from(d))
             .sum();
-        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_memory_mb)
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_input_mb)
         else {
             // No term groups anything; arrival order it is.
             return Ok(None);
@@ -2765,64 +2908,64 @@ impl SuperfileBuilder {
             let mut filled: Vec<u8> = vec![0; run];
             let mut worst: Vec<u8> = vec![0; run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
-            for (((reader, _), rows), span) in
-                readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
-            {
-                match *span {
-                    Some((lo, hi)) if lo < past_row && hi >= first_row => {}
-                    _ => continue,
+            let picker = TermPicker {
+                n_fts_columns,
+                terms_per_doc,
+                df: &df,
+                eligible: &eligible,
+            };
+            // The inputs this run holds, with the rows of it each covers.
+            let mut covering: Vec<(usize, usize, usize)> = span_of
+                .iter()
+                .enumerate()
+                .filter_map(|(i, span)| match *span {
+                    Some((lo, hi)) if lo < past_row && hi >= first_row => {
+                        Some((i, lo.max(first_row), (hi + 1).min(past_row)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            covering.sort_unstable_by_key(|&(_, start, _)| start);
+            let apart = covering.windows(2).all(|pair| pair[0].2 <= pair[1].1);
+            if apart {
+                // Every row belongs to one input, so inputs whose rows do not
+                // interleave fill disjoint stretches of the slots, side by side;
+                // each still reads its own terms in the order it always did.
+                let (mut slots_rest, mut filled_rest, mut worst_rest) =
+                    (&mut slots[..], &mut filled[..], &mut worst[..]);
+                let mut at = first_row;
+                let mut windows = Vec::with_capacity(covering.len());
+                for &(i, start, end) in &covering {
+                    let skip = start - at;
+                    let take = end - start;
+                    let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
+                    let (s, rest) = rest.split_at_mut(take * terms_per_doc);
+                    slots_rest = rest;
+                    let (_, rest) = filled_rest.split_at_mut(skip);
+                    let (f, rest) = rest.split_at_mut(take);
+                    filled_rest = rest;
+                    let (_, rest) = worst_rest.split_at_mut(skip);
+                    let (w, rest) = rest.split_at_mut(take);
+                    worst_rest = rest;
+                    windows.push((i, start, end, s, f, w));
+                    at = end;
                 }
-                let fts = reader.fts().expect("checked above");
-                for column_id in 0..n_fts_columns {
-                    let on_term = |term: &[u8]| {
-                        let t = term_bucket(term);
-                        let keep = eligible(t);
-                        keep.then_some(t)
-                    };
-                    fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
-                        let Some(row) = rows[local_doc as usize] else {
-                            return;
-                        };
-                        let row = row.get() as usize;
-                        if row < first_row || row >= past_row {
-                            return;
-                        }
-                        let row = row - first_row;
-                        let slot_base = row * terms_per_doc;
-                        let used = filled[row] as usize;
-                        if used < terms_per_doc {
-                            slots[slot_base + used] = t;
-                            if used == 0
-                                || df[t as usize]
-                                    > df[slots[slot_base + worst[row] as usize] as usize]
-                            {
-                                worst[row] = used as u8;
-                            }
-                            filled[row] = (used + 1) as u8;
-                            return;
-                        }
-                        let worst_slot = slot_base + worst[row] as usize;
-                        if df[t as usize] >= df[slots[worst_slot] as usize] {
-                            return;
-                        }
-                        slots[worst_slot] = t;
-
-                        // The worst moved; find it again over the fixed,
-                        // small slot count.
-                        let mut w = 0usize;
-                        for i in 1..terms_per_doc {
-                            if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize]
-                            {
-                                w = i;
-                            }
-                        }
-                        worst[row] = w as u8;
-                    })
-                    .map_err(|e| {
-                        BuildError::Io(Error::other(format!(
-                            "fts merge: reading terms for the document order failed: {e}"
-                        )))
+                windows
+                    .into_par_iter()
+                    .try_for_each(|(i, start, end, s, f, w)| {
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, f, w)
                     })?;
+            } else {
+                for &(i, _, _) in &covering {
+                    picker.pick(
+                        &readers[i].0,
+                        &rows_by_blob[i],
+                        first_row,
+                        past_row,
+                        &mut slots,
+                        &mut filled,
+                        &mut worst,
+                    )?;
                 }
             }
 
@@ -2992,11 +3135,15 @@ impl SuperfileBuilder {
 
         // Stream the stable-id sidecar from the merged rows as they are written
         // to the body, in the same order — so the compacted superfile resolves
-        // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
+        // `_id` from the sidecar just like a fresh build. It is packed block by
+        // block into a scratch file as the rows go by, so a merge over a
+        // hundred million rows holds the open block and a directory entry per
+        // block for it, not sixteen bytes a row. The encoder is dropped on the
         // first batch missing the id column, falling the whole file back to the
         // Parquet id column.
-        let mut id_sidecar_bytes: Vec<u8> = Vec::new();
-        let mut ids_ok = true;
+        let mut id_sidecar = Some(PackedIdEncoder::new(BufWriter::new(
+            NamedTempFile::new_in(scratch_root()).map_err(BuildError::Io)?,
+        )));
         let id_column = superfile_builder.opts.id_column.clone();
 
         // The output row every input document becomes, numbered once and
@@ -3047,7 +3194,7 @@ impl SuperfileBuilder {
                     n_fts_columns,
                     n_out_docs,
                     &rows_of,
-                    superfile_builder.opts.merge_memory_mb,
+                    superfile_builder.opts.merge_input_mb,
                 )?
             }
             false => None,
@@ -3177,45 +3324,72 @@ impl SuperfileBuilder {
             timings.fts += start.elapsed();
             if ordered_batches.is_none() {
                 // Stream surviving rows batch by batch. Do not decode and retain an
-                // entire input in memory.
-                let mut batches = input.batches(&superfile_builder.opts)?;
+                // entire input in memory. A thread of its own decodes the next
+                // few batches and computes their stats while this one encodes
+                // the last; they arrive in the order they were read, so the
+                // output is the same.
+                let opts = superfile_builder.opts.clone();
+                let (sender, decoded) = sync_channel::<
+                    Result<(RecordBatch, SuperfileStats), BuildError>,
+                >(DECODED_BATCHES_AHEAD);
+                thread::scope(|scope| -> Result<(), BuildError> {
+                    // Owned here, so an encode that fails drops it on the
+                    // way out and the decoder's next send fails, instead of
+                    // the scope waiting on a decoder blocked on a full
+                    // channel.
+                    let decoded = decoded;
+                    scope.spawn(move || {
+                        let batches = match input.batches(&opts) {
+                            Ok(batches) => batches,
+                            Err(e) => {
+                                let _ = sender.send(Err(e));
+                                return;
+                            }
+                        };
+                        for batch in batches {
+                            let decoded = batch.and_then(|batch| {
+                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                                Ok((batch, stats))
+                            });
+                            let failed = decoded.is_err();
+                            // The receiver is gone once the merge has failed.
+                            if sender.send(decoded).is_err() || failed {
+                                return;
+                            }
+                        }
+                    });
+                    loop {
+                        let start = std::time::Instant::now();
+                        let Ok(next) = decoded.recv() else {
+                            break;
+                        };
+                        let (record_batch, stats) = next?;
+                        #[cfg(test)]
+                        if tests::encode_fault() {
+                            return Err(BuildError::Io(Error::other(
+                                "test fault: the encode failed",
+                            )));
+                        }
+                        // Time spent waiting on the decoder, not decoding.
+                        timings.read_parquet += start.elapsed();
+                        stats_collector.push(stats);
 
-                loop {
-                    let start = std::time::Instant::now();
-                    let Some(record_batch) = batches.next().transpose()? else {
-                        break;
-                    };
-                    timings.read_parquet += start.elapsed();
+                        let start = std::time::Instant::now();
+                        body_encoder.write_batch(&record_batch)?;
+                        timings.write_parquet += start.elapsed();
 
-                    let start = std::time::Instant::now();
-                    stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                        &record_batch,
-                    )?);
-                    timings.stats_compute += start.elapsed();
+                        push_stable_ids(&mut id_sidecar, &record_batch, &id_column)?;
 
-                    let start = std::time::Instant::now();
-                    body_encoder.write_batch(&record_batch)?;
-                    timings.write_parquet += start.elapsed();
-
-                    if ids_ok
-                        && !append_stable_id_sidecar(
-                            &mut id_sidecar_bytes,
-                            &record_batch,
-                            &id_column,
-                        )
-                    {
-                        ids_ok = false;
-                        id_sidecar_bytes = Vec::new();
+                        let rows = record_batch.num_rows() as u32;
+                        // A re-analyzed merge indexes the rows as they go by,
+                        // under the doc ids they are written at.
+                        if reanalyze {
+                            superfile_builder.index_fts_batch(&record_batch, rows)?;
+                        }
+                        superfile_builder.next_local_doc_id += rows;
                     }
-
-                    let rows = record_batch.num_rows() as u32;
-                    // A re-analyzed merge indexes the rows as they go by,
-                    // under the doc ids they are written at.
-                    if reanalyze {
-                        superfile_builder.index_fts_batch(&record_batch, rows)?;
-                    }
-                    superfile_builder.next_local_doc_id += rows;
-                }
+                    Ok(())
+                })?;
             }
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
@@ -3251,10 +3425,7 @@ impl SuperfileBuilder {
             for batch in &batches {
                 body_encoder.write_batch(batch)?;
 
-                if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, batch, &id_column) {
-                    ids_ok = false;
-                    id_sidecar_bytes = Vec::new();
-                }
+                push_stable_ids(&mut id_sidecar, batch, &id_column)?;
 
                 let rows = batch.num_rows() as u32;
                 // The ordered rows are the output's; a re-analyzed merge
@@ -3278,9 +3449,28 @@ impl SuperfileBuilder {
         let body = body_encoder.finish()?;
         drop(finish_span);
 
-        let ids = ids_ok.then_some(id_sidecar_bytes);
+        // The sidecar's blocks come back off scratch through an independent
+        // read handle at offset 0, once the write handle is flushed.
+        let ids: PackedIdOutput<Box<dyn Read>> = match id_sidecar {
+            Some(encoder) => {
+                let PackedIdOutput {
+                    directory,
+                    blocks,
+                    blocks_len,
+                } = encoder.finish().map_err(BuildError::Io)?;
+                let blocks = blocks
+                    .into_inner()
+                    .map_err(|e| BuildError::Io(e.into_error()))?;
+                PackedIdOutput {
+                    directory,
+                    blocks: Box::new(BufReader::new(blocks.reopen().map_err(BuildError::Io)?)),
+                    blocks_len,
+                }
+            }
+            None => pack_ids_in_memory(&[]).map_blocks(|blocks| Box::new(blocks) as Box<dyn Read>),
+        };
 
-        superfile_builder.finish_to_with_body(body, ids.as_deref().unwrap_or(&[]), output)?;
+        superfile_builder.finish_to_with_packed_ids(body, ids, output)?;
 
         Ok(stats)
     }
@@ -3427,8 +3617,11 @@ impl SuperfileBuilder {
             let (fts_file, vec_file) = blobs_res?;
             (body_res?, fts_file, vec_file)
         };
-        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
-        splice_body_and_blobs_to(body, fts_file, vec_file, &ids_bytes, &kvs, output)
+        let ids = pack_ids_in_memory(&stable_id_sidecar_bytes(
+            &self.batches,
+            &self.opts.id_column,
+        ));
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -3439,11 +3632,24 @@ impl SuperfileBuilder {
     ///
     /// The caller must have advanced `next_local_doc_id` to the number of rows
     /// written into `body`.
-    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
     pub(crate) fn finish_to_with_body<W: Write>(
-        mut self,
+        self,
         body: EncodedBody,
         ids_bytes: &[u8],
+        output: W,
+    ) -> Result<ParquetLayout, BuildError> {
+        self.finish_to_with_packed_ids(body, pack_ids_in_memory(ids_bytes), output)
+    }
+
+    /// [`Self::finish_to_with_body`] with the sidecar already packed — in
+    /// memory, or streamed to scratch by a [`PackedIdEncoder`] as a merge's
+    /// rows went by. An empty sidecar means no sidecar (the reader falls
+    /// back to the Parquet id column).
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
+    pub(crate) fn finish_to_with_packed_ids<W: Write, R: Read>(
+        mut self,
+        body: EncodedBody,
+        ids: PackedIdOutput<R>,
         output: W,
     ) -> Result<ParquetLayout, BuildError> {
         let n_docs = self.next_local_doc_id as u64;
@@ -3461,10 +3667,7 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        // The caller streams the sidecar from the merged rows as it writes the
-        // body (empty ⇒ the id column wasn't available; reader falls back to
-        // the Parquet id column).
-        splice_body_and_blobs_to(body, fts_file, vec_file, ids_bytes, &kvs, output)
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
 
     /// Rebuild the FTS index from `source`'s stored text, touching nothing
@@ -3680,16 +3883,23 @@ impl SuperfileBuilder {
         vector_file
             .seek(SeekFrom::Start(0))
             .map_err(BuildError::Io)?;
-        let ids_bytes = stable_id_sidecar_bytes(&self.batches, &self.opts.id_column);
-        let (packed_ids, kvs) = pack_id_sidecar(&ids_bytes, &kvs);
+        let ids = pack_ids_in_memory(&stable_id_sidecar_bytes(
+            &self.batches,
+            &self.opts.id_column,
+        ));
+        let kvs = kvs_naming_id_layout(&kvs, &ids);
+        let ids_length = ids.len();
+        let PackedIdOutput {
+            directory, blocks, ..
+        } = ids;
         splice_index_streams_to(
             body,
             BufReader::new(Cursor::new(Vec::<u8>::new())),
             0,
             BufReader::new(vector_file),
             vector_length,
-            Cursor::new(&packed_ids),
-            packed_ids.len() as u64,
+            Cursor::new(directory).chain(blocks),
+            ids_length,
             &kvs,
             &mut output,
         )?;
@@ -3918,44 +4128,51 @@ fn stream_index_blobs_to_scratch(
     Ok((fts_file, vec_file))
 }
 
-/// Splice an encoded body + the two on-disk blobs to `output`, streaming both
-/// blobs off disk so neither is ever resident. Cheap relative to the encode —
-/// byte appends + a footer rewrite.
-/// Pack the raw stable-id sidecar (one `i128` per row) into the
-/// frame-of-reference layout and name that layout in the footer KVs. An
-/// empty sidecar stays empty and adds no key (no sidecar, Parquet
-/// fallback), the shape older readers already handle.
-fn pack_id_sidecar(raw_ids: &[u8], kvs: &[(String, String)]) -> (Vec<u8>, Vec<(String, String)>) {
-    let packed = ids::encode_packed(raw_ids);
+/// `kvs` plus the key naming the packed sidecar's layout. An empty sidecar
+/// adds no key (no sidecar, Parquet fallback), the shape older readers
+/// already handle.
+fn kvs_naming_id_layout<R>(
+    kvs: &[(String, String)],
+    ids: &PackedIdOutput<R>,
+) -> Vec<(String, String)> {
     let mut kvs = kvs.to_vec();
-    if !packed.is_empty() {
+    if !ids.is_empty() {
         kvs.push((
             kv::IDS_LAYOUT.to_string(),
             kv::IDS_LAYOUT_PACKED.to_string(),
         ));
     }
-    (packed, kvs)
+    kvs
 }
 
-fn splice_body_and_blobs_to<W: Write>(
+/// Splice an encoded body, the two on-disk blobs and the packed stable-id
+/// sidecar to `output`, streaming the blobs off disk so neither is ever
+/// resident. Cheap relative to the encode — byte appends + a footer
+/// rewrite.
+fn splice_body_and_blobs_to<W: Write, R: Read>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
-    ids_bytes: &[u8],
+    ids: PackedIdOutput<R>,
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
     let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
     let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
-    let (packed_ids, kvs) = pack_id_sidecar(ids_bytes, kvs);
+    let kvs = kvs_naming_id_layout(kvs, &ids);
+    let ids_length = ids.len();
+    let PackedIdOutput {
+        directory, blocks, ..
+    } = ids;
+    // The directory first, then the blocks from wherever they were packed to.
     let layout = splice_index_streams_to(
         body,
         BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
         fts_length,
         BufReader::new(vec_file.reopen().map_err(BuildError::Io)?),
         vec_length,
-        Cursor::new(&packed_ids),
-        packed_ids.len() as u64,
+        Cursor::new(directory).chain(blocks),
+        ids_length,
         &kvs,
         output,
     )?;
@@ -4358,6 +4575,14 @@ mod tests {
     thread_local! {
         /// Set by [`with_reorder_budget`] for the thread running a merge.
         static REORDER_BUDGET: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Set by a test whose merge's encode loop must fail on its first
+        /// batch.
+        static ENCODE_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether this thread's merge fails its encode on the first batch.
+    pub(super) fn encode_fault() -> bool {
+        ENCODE_FAULT.with(Cell::get)
     }
 
     /// The narrowed forward-index budget, if this thread is inside
@@ -6499,10 +6724,10 @@ mod tests {
             vec![FtsConfig::new("title").positions(true)],
             vec![],
         );
-        assert_eq!(opts.merge_memory_mb, None, "no run behind a plain build");
+        assert_eq!(opts.merge_input_mb, None, "no run behind a plain build");
 
-        let given = opts.clone().with_merge_memory_mb(Some(16_384));
-        assert_eq!(given.merge_memory_mb, Some(16_384));
+        let given = opts.clone().with_merge_input_mb(Some(16_384));
+        assert_eq!(given.merge_input_mb, Some(16_384));
 
         // The merge rebuilds its options from the inputs before it runs, and
         // that reshaping must not drop the budget on the way.
@@ -6515,7 +6740,7 @@ mod tests {
         }];
         let reshaped = merge_builder_opts(&inputs, given).expect("merge options");
         assert_eq!(
-            reshaped.merge_memory_mb,
+            reshaped.merge_input_mb,
             Some(16_384),
             "the budget must reach the builder the merge actually runs with"
         );
@@ -6830,6 +7055,38 @@ mod tests {
                 &format!("atoms_match_ids (deletes={deletes:?})"),
             );
         }
+    }
+
+    /// An encode that fails part way through returns its error. The decoder
+    /// a step ahead must not keep the merge waiting on a full channel.
+    #[test]
+    fn a_merge_whose_encode_fails_returns_instead_of_hanging() {
+        // More batches per input than the decoder may run ahead.
+        const PER_INPUT: u64 = 80_000;
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let schema = opts.schema.clone();
+        let input = |lo, hi| {
+            SuperfileReader::open(Bytes::from(reorder_corpus_input(&opts, &schema, lo, hi)))
+                .expect("open input")
+        };
+        let inputs = vec![
+            (Arc::new(input(0, PER_INPUT)), tombstones(&[])),
+            (Arc::new(input(PER_INPUT, PER_INPUT * 2)), tombstones(&[])),
+        ];
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ENCODE_FAULT.with(|f| f.set(true));
+            let _ = done.send(SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err());
+        });
+        let failed = finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("merge hung after the encode failed");
+        assert!(failed, "the encode's error comes back");
     }
 
     #[tokio::test]

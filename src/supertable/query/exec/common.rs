@@ -1070,11 +1070,17 @@ fn resolve_ids_arithmetic(
     )
 }
 
-/// Fill each hit's `stable_id` in place using the cheap, cache-backed
-/// resolution path: inline id / contiguous-span arithmetic where they
-/// apply, else a `_id`-column read routed through `resolve_columns` (and
+/// Fill the `stable_id` of each hit that lacks one, in place, using the
+/// cheap, cache-backed resolution path: contiguous-span arithmetic where it
+/// applies, else a `_id`-column read routed through `resolve_columns` (and
 /// thus `decoded_scalar_cache`), so a warm reader decodes each superfile's
 /// `_id` column at most once and later queries hit the cache.
+///
+/// A hit that already has an id is never read again. Its local may not
+/// address a Parquet row: a vector hit in a cell-packed file carries the
+/// position in its cell's postings (boundary stubs included), stamped from
+/// the inline id region at search time, so reading `_id` at that local would
+/// overwrite a right id with another row's.
 ///
 /// This is the resolution `resolve_hits` already uses for an id-only
 /// projection. The scored fan-out uses it to stamp its final top-k instead
@@ -1086,9 +1092,39 @@ pub(crate) async fn stamp_stable_ids(
     reader: &SupertableReader,
     hits: &mut [SuperfileHit],
 ) -> DfResult<()> {
-    if hits.is_empty() || hits.iter().all(|h| h.stable_id.is_some()) {
+    let unstamped = hits.iter().filter(|h| h.stable_id.is_none()).count();
+    if unstamped == 0 {
         return Ok(());
     }
+    // No hit has an id: resolve the slice as it is. An FTS hit set over
+    // cell-packed files arrives this way and can hold every row of the
+    // table, so copying it out first would cost a pass over all of them.
+    if unstamped == hits.len() {
+        let ids = resolve_hit_ids(reader, hits).await?;
+        for (hit, id) in hits.iter_mut().zip(ids.values()) {
+            hit.stable_id = Some(*id);
+        }
+        return Ok(());
+    }
+    // Some hits have one (hybrid fuses stamped vector hits with unstamped
+    // FTS hits): resolve only the rest, a set no larger than the fused k.
+    let missing: Vec<usize> = (0..hits.len())
+        .filter(|&i| hits[i].stable_id.is_none())
+        .collect();
+    let subset: Vec<SuperfileHit> = missing.iter().map(|&i| hits[i]).collect();
+    let ids = resolve_hit_ids(reader, &subset).await?;
+    for (&i, id) in missing.iter().zip(ids.values()) {
+        hits[i].stable_id = Some(*id);
+    }
+    Ok(())
+}
+
+/// The `_id` of each hit in `hits`, in order: span arithmetic where it
+/// applies, else a cache-backed `_id`-column read.
+async fn resolve_hit_ids(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+) -> DfResult<Decimal128Array> {
     let id_batch = match resolve_ids_arithmetic(reader, hits) {
         Some(batch) => batch?,
         None => {
@@ -1100,13 +1136,9 @@ pub(crate) async fn stamp_stable_ids(
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| {
-            QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into())
-        })?;
-    for (hit, id) in hits.iter_mut().zip(ids.values()) {
-        hit.stable_id = Some(*id);
-    }
-    Ok(())
+        .ok_or_else(|| QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into()))?
+        .clone();
+    Ok(ids)
 }
 
 /// Build the engine-native `_id` + `score` batch directly from already-resolved
@@ -2611,6 +2643,132 @@ mod tests {
         assert!(
             row_id_from_manifest_entry(entry, 0).is_none(),
             "fixture must force a gapped id span"
+        );
+    }
+
+    /// A hit set spanning a gapped file and a contiguous one arrives part
+    /// stamped (the contiguous file's hits get their id by arithmetic when
+    /// tagged), so stamping reads `_id` for the gapped file's hits alone.
+    /// Every hit must still end up with its own row's id: the term's ids
+    /// equal a scan's.
+    #[test]
+    fn stamp_stable_ids_over_gapped_and_contiguous_files_matches_a_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        commit_titles_to(&storage);
+        let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("open");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["rust tooling", "java beans"]))
+            .expect("append");
+        w.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        let spans: Vec<bool> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| row_id_from_manifest_entry(e, 0).is_some())
+            .collect();
+        assert_eq!(
+            spans.len(),
+            2,
+            "one gapped file and one contiguous file, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&true) && spans.contains(&false),
+            "one gapped file and one contiguous file, got {spans:?}"
+        );
+
+        // Each hit's title is read at its own (superfile, local), which the
+        // stamp does not touch, so a pair holds only if the id is that row's.
+        let hits = reader
+            .token_match("title", "rust", BoolMode::And)
+            .expect("token_match");
+        let titles = reader
+            .block_on(resolve_columns(&reader, &hits, &["title"]))
+            .expect("read titles");
+        let titles = titles
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title");
+        let mut matched: Vec<(String, i128)> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (titles.value(i).to_string(), h.stable_id.expect("stamped")))
+            .collect();
+        matched.sort_unstable();
+        let mut scanned: Vec<(String, i128)> = reader
+            .query_sql("SELECT title, _id FROM supertable WHERE title LIKE '%rust%'")
+            .expect("scan")
+            .iter()
+            .flat_map(|b| {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title");
+                let ids = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal `_id`");
+                (0..b.num_rows())
+                    .map(|i| (titles.value(i).to_string(), ids.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        scanned.sort_unstable();
+        assert_eq!(scanned.len(), 3, "rust is in three rows");
+        assert_eq!(matched, scanned, "each hit carries its own row's `_id`");
+    }
+
+    /// Stamping reads `_id` only for the hits that lack one. A hit that has
+    /// one keeps it even when the call must read the `_id` column for another
+    /// hit: its local can be a cell-postings position rather than a Parquet
+    /// row, so reading `_id` there would replace a right id with a wrong one.
+    #[test]
+    fn stamp_stable_ids_reads_only_the_hits_without_an_id() {
+        /// An id no row holds, so a hit still carrying it was left alone.
+        const KEPT_ID: i128 = -7;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        commit_titles_to(&storage);
+        let st =
+            Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+        let reader = st.reader().expect("reader");
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        let hit = |local_doc_id, stable_id| SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id,
+            score: 0.0,
+            stable_id,
+        };
+        let mut hits = [hit(0, None), hit(1, Some(KEPT_ID))];
+        reader
+            .block_on(stamp_stable_ids(&reader, &mut hits))
+            .expect("stamp");
+        assert_eq!(
+            hits[1].stable_id,
+            Some(KEPT_ID),
+            "a stamped hit is not read again"
+        );
+
+        let row_0 = reader
+            .block_on(resolve_columns(&reader, &[hit(0, None)], &["_id"]))
+            .expect("read row 0's `_id`");
+        let row_0 = row_0
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal `_id`")
+            .value(0);
+        assert_eq!(
+            hits[0].stable_id,
+            Some(row_0),
+            "an unstamped hit gets its own row's id"
         );
     }
 
