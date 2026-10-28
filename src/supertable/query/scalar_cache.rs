@@ -95,6 +95,16 @@ impl<K: Clone + Eq + Hash, V: Clone> ByteLru<K, V> {
             },
         );
     }
+
+    /// How many values are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("decoded cache poisoned")
+            .entries
+            .len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

@@ -12,7 +12,10 @@
 //! logically hold, and compaction is checked to converge every file to the
 //! table's current shape.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
@@ -20,8 +23,13 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use bytes::Bytes;
-use datafusion::prelude::{col, lit};
+use datafusion::{
+    physical_plan::ExecutionPlan,
+    prelude::{col, lit},
+};
+use futures::{FutureExt, StreamExt};
 use tempfile::TempDir;
+use tokio::{runtime::Runtime, time::sleep};
 
 use super::{FieldId, map::FileSchemaMap, with_field_id};
 use crate::{
@@ -58,6 +66,12 @@ const KEPT_COLUMN_BYTES: usize = 16 << 20;
 const DELETED_SCORE: i64 = 42;
 /// A tag of the file holding `tag` as a narrow string, deleted in the same test.
 const DELETED_TAG: &str = "h";
+/// Columns one row group keeps for `SELECT title, score`.
+const KEPT_PER_ROW_GROUP: usize = 2;
+/// How long a dropped read is given to finish its decode and keep it.
+const KEEP_WAIT: Duration = Duration::from_secs(10);
+/// How often the test looks for the kept columns meanwhile.
+const KEEP_POLL: Duration = Duration::from_millis(10);
 
 /// One logical row as the table reads it.
 #[derive(Debug, Clone, PartialEq)]
@@ -542,6 +556,50 @@ fn sql_reads_every_generation_from_kept_columns() {
         })
         .collect();
     assert!(plan.contains("CachedScanExec"), "{plan}");
+}
+
+/// The plan's `CachedScanExec`, wherever it sits.
+fn cached_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
+    if plan.name() == "CachedScanExec" {
+        return Some(Arc::clone(plan));
+    }
+    plan.children().into_iter().find_map(cached_scan)
+}
+
+#[test]
+fn a_read_dropped_halfway_still_keeps_its_columns() {
+    // A `LIMIT` drops a partition's stream once it has its rows, often with a
+    // row group's decode still in flight. That decode must run to the end and
+    // keep its columns, or every such statement decodes them again.
+    let dir = TempDir::new().expect("tempdir");
+    let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
+    let (st, _) = mixed_table_with(&dir, Some(Arc::clone(&kept)));
+    let reader = st.reader().expect("reader");
+    let ctx = reader.sql_session_context().expect("session");
+    let runtime = Runtime::new().expect("tokio runtime");
+    runtime.block_on(async {
+        let plan = ctx
+            .sql("SELECT title, score FROM supertable")
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let scan = cached_scan(&plan).expect("a CachedScanExec in the plan");
+        let mut batches = scan.execute(0, ctx.task_ctx()).expect("execute");
+        // One poll starts the first row group's decode; the stream is then
+        // dropped before the decode can answer.
+        assert!(
+            batches.next().now_or_never().is_none(),
+            "the decode answered within one poll"
+        );
+        drop(batches);
+        let deadline = Instant::now() + KEEP_WAIT;
+        while kept.len() < KEPT_PER_ROW_GROUP && Instant::now() < deadline {
+            sleep(KEEP_POLL).await;
+        }
+    });
+    assert_eq!(kept.len(), KEPT_PER_ROW_GROUP);
 }
 
 #[test]

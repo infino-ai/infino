@@ -41,6 +41,8 @@ use datafusion::{
 };
 use futures::{StreamExt, TryStreamExt, future, stream};
 use roaring::RoaringBitmap;
+use tokio::spawn;
+use tracing::Instrument;
 
 use crate::{
     runtime_metrics::op_stats::OpStatsCollector,
@@ -179,8 +181,49 @@ impl ScanContext {
         }
     }
 
+    /// The `missing` projected columns of `unit`'s row group, decoded, typed
+    /// as the scan schema types them, and kept in the cache.
+    async fn decode_and_keep(
+        self: Arc<Self>,
+        unit: RowGroupUnit,
+        missing: Vec<usize>,
+    ) -> DfResult<Vec<ArrayRef>> {
+        let fields = self.schema.fields();
+        let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
+        let stored = Arc::new(
+            self.stored
+                .project(&missing)
+                .map_err(QueryError::internal)?,
+        );
+        let read = take_file_columns(
+            &self.manifest,
+            &unit.file.reader,
+            unit.rows.clone().collect(),
+            &names,
+            &stored,
+            &self.op_stats,
+        )
+        .await?;
+        let mut decoded = Vec::with_capacity(missing.len());
+        for (&i, array) in missing.iter().zip(read.columns()) {
+            let target = fields[i].data_type();
+            let array = if array.data_type() == target {
+                Arc::clone(array)
+            } else {
+                cast_with_options(array, target, &CAST_OPTIONS)?
+            };
+            self.cache.insert(
+                self.key(&unit, fields[i].name()),
+                Arc::clone(&array),
+                array.get_array_memory_size(),
+            );
+            decoded.push(array);
+        }
+        Ok(decoded)
+    }
+
     /// `unit`'s row group, every projected column, without its deleted rows.
-    async fn read(&self, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
+    async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
             .iter()
@@ -190,33 +233,18 @@ impl ScanContext {
             .filter(|&i| columns[i].is_none())
             .collect();
         if !missing.is_empty() {
-            let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
-            let stored = Arc::new(
-                self.stored
-                    .project(&missing)
-                    .map_err(QueryError::internal)?,
-            );
-            let read = take_file_columns(
-                &self.manifest,
-                &unit.file.reader,
-                unit.rows.clone().collect(),
-                &names,
-                &stored,
-                &self.op_stats,
+            // The decode runs as its own task: a `LIMIT` above drops this
+            // partition's stream once it has its rows, and a decode dropped
+            // halfway would have spent its CPU without keeping the columns.
+            // Run to the end, it keeps them for the next statement.
+            let decoded = spawn(
+                Arc::clone(self)
+                    .decode_and_keep(unit.clone(), missing.clone())
+                    .in_current_span(),
             )
-            .await?;
-            for (&i, array) in missing.iter().zip(read.columns()) {
-                let target = fields[i].data_type();
-                let array = if array.data_type() == target {
-                    Arc::clone(array)
-                } else {
-                    cast_with_options(array, target, &CAST_OPTIONS)?
-                };
-                self.cache.insert(
-                    self.key(unit, fields[i].name()),
-                    Arc::clone(&array),
-                    array.get_array_memory_size(),
-                );
+            .await
+            .map_err(QueryError::internal)??;
+            for (i, array) in missing.into_iter().zip(decoded) {
                 columns[i] = Some(array);
             }
         }
