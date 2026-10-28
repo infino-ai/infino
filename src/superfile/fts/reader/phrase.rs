@@ -1768,13 +1768,8 @@ mod tests {
             "be or to be or x",
         ];
         const WORDS: [&str; 5] = ["to", "be", "to", "be", "or"];
-        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
-        let mut rng = move |m: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % m
-        };
+        let mut next = xorshift(0x2545_F491_4F6C_DD1D);
+        let mut rng = move |m: u64| next() % m;
         let docs: Vec<Vec<&str>> = (0..N_DOCS)
             .map(|_| {
                 let mut d: Vec<&str> = (0..1 + rng(12))
@@ -2050,6 +2045,10 @@ mod tests {
                 &["zephyr", "onyx"],
             ),
             (&["uk"], &["the", "who"], &["mid"], &[]),
+            // A term that is also a member, and members named twice.
+            (&["the"], &["the", "who"], &[], &[]),
+            (&["often"], &["the", "who", "the"], &[], &[]),
+            (&["mid"], &["who", "the", "who"], &["neg"], &[]),
         ];
         for &(terms, members, negs, neg_members) in cases {
             let label = format!("+{members:?} +{terms:?} -{negs:?} -{neg_members:?}");
@@ -2148,6 +2147,60 @@ mod tests {
                                 got.sort_unstable();
                                 assert_eq!(got, want_ids, "{label} k={k}: full result set");
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Batched musts scored with optional words, unfloored and floored at
+        // the k-th best score, so the batched walk prunes against a finite
+        // bar less what the other atoms could add.
+        let shoulds = ["a", "b"];
+        let should_words: Vec<String> = shoulds.iter().map(|t| t.to_string()).collect();
+        for (terms, members) in [
+            (&["often"][..], &["the", "who"][..]),
+            (&["the"], &["the", "who", "the"]),
+        ] {
+            let label = format!("+{members:?} +{terms:?} {shoulds:?}");
+            let musts: Vec<String> = terms.iter().map(|t| t.to_string()).collect();
+            let must_phrases = phrase(members);
+            let want = oracle.top_k_atoms(
+                &musts,
+                &must_phrases,
+                &should_words,
+                &[],
+                &[],
+                &[],
+                AND_CORPUS_DOCS as usize,
+            );
+            assert!(want.len() > 100, "{label}: premise: many matches");
+            let lists = || ClauseLists {
+                musts: terms,
+                shoulds: &shoulds,
+                must_phrases: &must_phrases,
+                ..ClauseLists::default()
+            };
+            for k in [10usize, 100] {
+                for floor in [f32::NEG_INFINITY, want[k - 1].1] {
+                    let label = format!("{label} k={k} floor={floor}");
+                    let mut runs = Vec::new();
+                    for two_phase in [false, true] {
+                        let _walk = TwoPhaseOnly::set(two_phase);
+                        let ranked = r
+                            .search_excluding("title", lists(), k, floor)
+                            .await
+                            .expect("ranked");
+                        runs.push(bits(&ranked));
+                    }
+                    assert_eq!(runs[0], runs[1], "{label}: batched vs two-phase");
+                    if floor == f32::NEG_INFINITY {
+                        assert_eq!(runs[0].len(), k, "{label}: hits");
+                        for (i, (&(_, got), &(_, w))) in runs[0].iter().zip(&want).enumerate() {
+                            assert!(
+                                (f32::from_bits(got) - w).abs() <= AND_SCORE_TOLERANCE,
+                                "{label}: rank {i} score vs brute force {w}"
+                            );
                         }
                     }
                 }

@@ -14,13 +14,14 @@
 //! [`MAX_DOC_LEN`] tokens long, which keeps every stored length norm exact,
 //! so the two scorers agree to rounding.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 
 use super::{
     FtsReader,
     core::{ClauseLists, OR_WINDOW},
+    scorers::PORTABLE_ACCUMULATE,
 };
 use crate::{
     superfile::fts::{builder::FtsBuilder, reader::BoolMode, tokenize::Phrase},
@@ -400,6 +401,47 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                 });
             }
         }
+        // Phrases naming a word twice, one member read at each of its
+        // offsets: required (alone, and batched with required words, with
+        // and without an exclusion), optional, and excluded.
+        for members in [
+            &["the", "of", "the"][..],
+            &["and", "and"],
+            &["of", "the", "of", "the"],
+        ] {
+            let phrase = || {
+                vec![Phrase::adjacent(
+                    members.iter().map(|w| w.to_string()).collect(),
+                )]
+            };
+            for (musts, negatives) in [
+                (&[][..], &[][..]),
+                (&["music"][..], &[][..]),
+                (&["city", "the"][..], &["quartz"][..]),
+            ] {
+                for k in [10, 1000] {
+                    queries.push(Query {
+                        musts: musts.iter().map(|w| w.to_string()).collect(),
+                        negatives: negatives.iter().map(|w| w.to_string()).collect(),
+                        must_phrases: phrase(),
+                        k,
+                        ..Query::default()
+                    });
+                }
+            }
+            queries.push(Query {
+                shoulds: vec!["band".to_string()],
+                should_phrases: phrase(),
+                k: 100,
+                ..Query::default()
+            });
+            queries.push(Query {
+                musts: vec!["of".to_string()],
+                negative_phrases: phrase(),
+                k: 100,
+                ..Query::default()
+            });
+        }
         for (qi, q) in queries.into_iter().enumerate() {
             let label = format!("corpus {ci} ({n_docs} docs) query {qi}: {q:?}");
             let want = oracle.top_k_atoms(
@@ -477,6 +519,122 @@ async fn pruned_kernels_match_brute_force_bm25_across_windows() {
                     .expect("term count");
                 assert_eq!(by_terms, want.len() as u64, "{label}: term count");
             }
+        }
+    }
+}
+
+/// Docs in the dense-union oracle: three windows and a few, so the last
+/// window holds a partial tile at the end of the norm table.
+const DENSE_DOCS: u32 = 3 * OR_WINDOW + 37;
+
+/// The dense-union oracle's words and the share of docs (per thousand) each
+/// is drawn into: dense enough for presence-bitset blocks, then packed.
+const DENSE_TERMS: [(&str, u64); 4] = [("w95", 950), ("w60", 600), ("w40", 400), ("w15", 150)];
+
+/// In every doc of the dense-union oracle but one in this many: run blocks,
+/// a bitset block wherever a gap falls.
+const DENSE_EVERY_GAP: u32 = 1000;
+
+/// A corpus of [`DENSE_DOCS`] docs for the dense-union oracle: each word
+/// drawn in at its share with a tf of one to three, padded to a varied
+/// length under [`MAX_DOC_LEN`].
+fn dense_corpus(seed: u64) -> Vec<String> {
+    let mut rng = Rng(seed);
+    (0..DENSE_DOCS)
+        .map(|i| {
+            let mut words: Vec<&str> = Vec::new();
+            if i % DENSE_EVERY_GAP != DENSE_EVERY_GAP - 1 {
+                words.push(EVERY);
+            }
+            for &(word, share) in &DENSE_TERMS {
+                if rng.below(1000) < share {
+                    words.extend(std::iter::repeat_n(word, 1 + rng.below(3) as usize));
+                }
+            }
+            let room = MAX_DOC_LEN.saturating_sub(words.len() as u64);
+            words.extend((0..rng.below(room + 1)).map(|_| "pad"));
+            words.join(" ")
+        })
+        .collect()
+}
+
+/// Every doc of a union over dense words scores as brute-force BM25 does
+/// and is counted, through the union window's exact-count walk across
+/// several windows, presence-bitset and run blocks, and the norm table's
+/// end; and the window's AVX-512 kernels, where the CPU has them, leave
+/// the same bits as its portable accumulate.
+#[tokio::test]
+async fn a_dense_union_scores_every_doc_as_brute_force_does() {
+    let tokenizer = default_tokenizer();
+    let texts = dense_corpus(0xD5E5_0A1C);
+    let mut b = FtsBuilder::new();
+    b.register_column("body".into(), true).expect("register");
+    for (i, t) in texts.iter().enumerate() {
+        b.add_doc(0, i as u32, t).expect("add doc");
+    }
+    let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true}]"#;
+    let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+    let refs: Vec<(u64, &str)> = texts
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i as u64, t.as_str()))
+        .collect();
+    let oracle = BruteForceBm25::index(&refs, tokenizer.as_ref());
+    let words = |w: &[&str]| -> Vec<String> { w.iter().map(|x| x.to_string()).collect() };
+    let shapes: [(Vec<String>, Vec<String>, Vec<String>); 6] = [
+        (vec![], words(&["w95", "w60", "w40"]), vec![]),
+        (vec![], words(&["w95", "w60", "w40", "w15"]), vec![]),
+        (
+            vec![],
+            words(&["every", "w95", "w60", "w40", "w15"]),
+            vec![],
+        ),
+        (vec![], words(&["w95", "w60", "w40"]), words(&["w15"])),
+        (words(&["w95"]), vec![], vec![]),
+        (words(&["every"]), words(&["w40", "w15"]), words(&["w60"])),
+    ];
+    let k = DENSE_DOCS as usize;
+    for (musts, shoulds, negatives) in shapes {
+        let label = format!("+{musts:?} {shoulds:?} -{negatives:?}");
+        let want = oracle.top_k_atoms(&musts, &[], &shoulds, &[], &negatives, &[], k);
+        assert!(
+            want.len() > OR_WINDOW as usize,
+            "{label}: premise: spans windows"
+        );
+        let (m, sh, neg) = (as_strs(&musts), as_strs(&shoulds), as_strs(&negatives));
+        let lists = || ClauseLists {
+            musts: &m,
+            shoulds: &sh,
+            negatives: &neg,
+            ..ClauseLists::default()
+        };
+        let mut runs = Vec::new();
+        for portable in [false, true] {
+            PORTABLE_ACCUMULATE.with(|c| c.set(portable));
+            let got = r.search_excluding_with_count("body", lists(), k).await;
+            PORTABLE_ACCUMULATE.with(|c| c.set(false));
+            let (hits, count) = got.expect("exact-count search");
+            let mut hits: Vec<(u32, u32)> = hits
+                .into_iter()
+                .map(|(d, s)| (d.get(), s.to_bits()))
+                .collect();
+            hits.sort_unstable();
+            runs.push((hits, count));
+        }
+        assert_eq!(runs[0], runs[1], "{label}: AVX-512 vs portable window");
+        let (hits, count) = &runs[0];
+        assert_eq!(*count, want.len() as u64, "{label}: count");
+        let want: HashMap<u64, f32> = want.into_iter().collect();
+        assert_eq!(hits.len(), want.len(), "{label}: every match scored");
+        for &(d, bits) in hits {
+            let got = f32::from_bits(bits);
+            let w = want
+                .get(&u64::from(d))
+                .unwrap_or_else(|| panic!("{label}: doc {d} does not match"));
+            assert!(
+                (got - w).abs() <= SCORE_TOLERANCE,
+                "{label}: doc {d} scores {got}, brute force {w}"
+            );
         }
     }
 }

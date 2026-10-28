@@ -3112,9 +3112,9 @@ mod tests {
     /// un-ranged — uniform broad ORs degraded 11-24x post-compaction.
     #[tokio::test]
     async fn search_or_range_partitions_agree_with_unranged() {
-        /// Docs in the planted corpus — spans several 4096-doc OR windows
-        /// and many 128-doc posting blocks.
-        const N_DOCS: u32 = 6_000;
+        /// Docs in the planted corpus — spans several OR windows and many
+        /// posting blocks.
+        const N_DOCS: u32 = 2 * OR_WINDOW + OR_WINDOW / 3;
         /// Ask for every match so partition union == full result set.
         const K_ALL: usize = N_DOCS as usize;
         /// Top-k size for the truncated comparison.
