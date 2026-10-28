@@ -1571,20 +1571,29 @@ fn lookup_ids_in_superfile(
     // where neither cache layer has the bytes pinned. The
     // recovery sweep on `Supertable::open` lands here when
     // the freshly-opened handle's in-memory tier is empty
-    // and no disk cache is attached.
-    let reader = match bridge_sync_to_async(superfile_reader(
-        &inner.options.store,
-        inner.options.disk_cache.as_ref(),
-        inner.options.storage.as_ref(),
-        &entry.uri,
-        &entry.storage_path(),
-        entry.subsection_offsets.as_ref(),
-        ReadIntent::Warm,
-    )) {
+    // and no disk cache is attached. Without a disk cache the
+    // tiered path can only serve storage as a range reader,
+    // which the id scan below cannot use, so it is asked for
+    // the in-memory tier alone and storage is fetched whole
+    // once, not after a range open of the same object.
+    let opened = if inner.options.disk_cache.is_some() {
+        bridge_sync_to_async(superfile_reader(
+            &inner.options.store,
+            inner.options.disk_cache.as_ref(),
+            inner.options.storage.as_ref(),
+            &entry.uri,
+            &entry.storage_path(),
+            entry.subsection_offsets.as_ref(),
+            ReadIntent::Warm,
+        ))
+    } else {
+        inner.options.store.reader(&entry.uri)
+    };
+    let reader = match opened {
         Ok(r) => r,
         Err(e) => {
             tracing::debug!(
-                "tiered open of superfile {} failed ({e}); falling back to a direct \
+                "cached open of superfile {} missed ({e}); falling back to a direct \
                  storage fetch for the id scan",
                 entry.uri.0
             );
@@ -1725,6 +1734,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime_metrics::io::{UriClass, UsageMeter},
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             Supertable,
@@ -3047,6 +3057,45 @@ mod tests {
             !resolved.contains_key(&absent),
             "an unclaimed id is absent from the map"
         );
+    }
+
+    /// A handle with storage but no disk cache and an empty in-memory tier,
+    /// as `Supertable::open` in another process has, resolves an id with one
+    /// GET of its superfile, whole: the id scan needs the whole file, so the
+    /// open does not read the object by range first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cacheless_id_resolve_fetches_the_superfile_whole_once() {
+        const FIRST_IDS: i128 = 72_000;
+        let (dir, st, _ws, sf, _id_min, _id_max) =
+            published_superfile_fixture(&["aa", "bb", "cc"], FIRST_IDS).await;
+        drop(st);
+        let meter = UsageMeter::new();
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("provider"),
+        );
+        let fresh =
+            Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+        let size = fresh
+            .inner()
+            .manifest
+            .load_full()
+            .superfiles
+            .iter()
+            .find(|e| e.superfile_id == sf)
+            .expect("the published superfile")
+            .subsection_offsets
+            .as_ref()
+            .expect("offsets")
+            .total_size;
+
+        let before = meter.snapshot();
+        let target = RowId(FIRST_IDS + 1);
+        let resolved = resolve_all(fresh.inner(), &[target]).expect("resolve");
+        assert_eq!(resolved.get(&target), Some(&(sf, 1u32)));
+        let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
+        assert_eq!(data.get_count, 1, "one GET of the superfile");
+        assert_eq!(data.get_bytes, size, "fetched whole");
     }
 
     /// Batched resolution agrees with resolving the same ids one at a
