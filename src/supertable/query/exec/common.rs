@@ -75,7 +75,7 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        reader::{rank_back_indices, row_selection_for_ids},
+        reader::{WHOLE_COLUMN_TAKE_DIVISOR, rank_back_indices, row_selection_for_ids},
     },
     supertable::{
         error::QueryError,
@@ -163,7 +163,10 @@ pub(crate) const OVER_FETCH_MIN_CEILING: usize = 10_000;
 /// still gets its `k`: [`over_fetch_ceiling`] never returns less.
 const OVER_FETCH_MAX_HITS: usize = 100_000;
 
-/// Rows of one superfile [`exact_scope`] decodes and checks at a time, so
+/// Rows of one superfile [`exact_scope`] decodes and checks at a time, when
+/// the superfile is too large to take its rows in one read: past
+/// `EXACT_SCOPE_TAKE_ROWS` × [`WHOLE_COLUMN_TAKE_DIVISOR`] rows a chunk this
+/// size is a sparse take, which decodes only the pages its rows land on, so
 /// the predicate's columns over a large superfile never sit in memory whole.
 const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
 
@@ -171,7 +174,7 @@ const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
 /// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
 /// [`OVER_FETCH_MAX_HITS`], never below the `k` actually asked for, and
 /// never above the table's row count.
-fn over_fetch_ceiling(k: usize, total: usize) -> usize {
+pub(crate) fn over_fetch_ceiling(k: usize, total: usize) -> usize {
     k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
         .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
@@ -729,21 +732,29 @@ where
 }
 
 /// `scope` narrowed to exactly the rows its pushed-down `predicate` keeps:
-/// each admitted superfile's candidate rows (all of its rows when the scope
-/// bounds none), less tombstones, decoded on the predicate's columns and
-/// kept where it holds. A kernel gated on the result admits only rows the
-/// `WHERE` keeps, so one round at `k` returns the `k` best of them, or every
-/// one when fewer exist: no widening, and no ceiling to come up short at.
+/// each admitted superfile's candidate rows, decoded on the predicate's
+/// columns and kept where it holds. A bounded scope's sets are read as they
+/// are, already free of tombstones; an unbounded one stands for every row
+/// of each superfile, less its tombstones. A kernel gated on the result
+/// admits only rows the `WHERE` keeps, so one round at `k` returns the `k`
+/// best of them, or every one when fewer exist: no widening, and no
+/// ceiling to come up short at.
 ///
 /// This is how a predicate the index cannot bound — a scalar equality, a
 /// range — still means the top `k` among the rows satisfying it. The cost
-/// is a decode of the predicate's columns over the scope's rows, which is
-/// why a caller asks for it only once a round at `k` came back short: an
-/// unselective predicate fills `k` from that round and never gets here.
+/// is a decode of the predicate's columns over the scope's rows, so a
+/// caller narrows the scope to the rows its search can return first (a
+/// text search, to the rows its terms match) and asks for this only once
+/// widening has stopped short at its ceiling.
+///
+/// A superfile small enough that its rows are a dense take
+/// ([`WHOLE_COLUMN_TAKE_DIVISOR`]) is read in one take, which reads each
+/// fixed-width column once; a larger one in sparse chunks of
+/// [`EXACT_SCOPE_TAKE_ROWS`], pulled off the candidate set one at a time.
 ///
 /// `None` when the predicate reads no column or one no superfile stores —
 /// the score, the id column, an index-only text column — so it cannot be
-/// evaluated before ranking; the caller then widens as [`fill_top_k`] does.
+/// evaluated before ranking; the caller then keeps what widening found.
 pub(crate) async fn exact_scope(
     reader: &SupertableReader,
     scope: &CandidateScope,
@@ -769,8 +780,8 @@ pub(crate) async fn exact_scope(
     let bound = Arc::new(predicate.bind(&out_schema)?);
     let names = Arc::new(names);
     let op_stats = reader.op_stats.clone();
-    // A bounded scope's sets already have tombstones subtracted; an
-    // unbounded one hands each superfile `None`, read as all of its rows.
+    // A bounded scope hands each superfile its set, tombstones already
+    // subtracted; an unbounded one hands `None`, read as all of its rows.
     let units: Vec<(Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>)> = scope
         .admitted_superfiles()
         .map(|entry| {
@@ -792,45 +803,60 @@ pub(crate) async fn exact_scope(
         let bound = Arc::clone(&bound);
         let op_stats = op_stats.clone();
         async move {
-            let mut candidates = match rows {
-                Some(rows) => rows.as_ref().clone(),
+            let candidates = match rows {
+                Some(rows) => rows,
                 None => {
                     let n_docs = u32::try_from(r.n_docs()).map_err(QueryError::internal)?;
                     let mut all = RoaringBitmap::new();
                     all.insert_range(0..n_docs);
-                    all
+                    if let Some(cache) = cache.as_ref()
+                        && let Some(deny) = tombstone_deny_set(cache, entry.superfile_id, now)?
+                    {
+                        all -= deny.as_ref();
+                    }
+                    Arc::new(all)
                 }
             };
-            if let Some(cache) = cache.as_ref()
-                && let Some(deny) = tombstone_deny_set(cache, entry.superfile_id, now)?
-            {
-                candidates -= deny.as_ref();
-            }
-            let locals: Vec<u32> = candidates.iter().collect();
+            // A superfile whose every row a chunk could cover is read in one
+            // take; past that, chunks small enough to stay sparse takes.
+            let n_docs = usize::try_from(r.n_docs()).map_err(QueryError::internal)?;
+            let whole_file_rows =
+                EXACT_SCOPE_TAKE_ROWS.saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR as usize);
+            let take_rows = if n_docs <= whole_file_rows {
+                n_docs.max(1)
+            } else {
+                EXACT_SCOPE_TAKE_ROWS
+            };
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
             let mut kept = RoaringBitmap::new();
-            for chunk in locals.chunks(EXACT_SCOPE_TAKE_ROWS) {
+            let mut remaining = candidates.iter();
+            loop {
+                let chunk: Vec<u32> = remaining.by_ref().take(take_rows).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(chunk.len() as u64);
+                }
                 let batch =
-                    take_file_columns(&manifest, &r, chunk.to_vec(), &refs, &out_schema, &op_stats)
+                    take_file_columns(&manifest, &r, chunk.clone(), &refs, &out_schema, &op_stats)
                         .await
                         .map_err(QueryError::DataFusion)?;
-                let chunk = chunk.to_vec();
                 let bound = Arc::clone(&bound);
                 // The predicate runs over up to a chunk of rows: compute, so
-                // the reader pool takes it rather than the tokio worker.
+                // the reader pool takes it rather than the tokio worker. It
+                // hands back the positions it holds at; the chunk maps them
+                // to rows here.
                 let (held, ns) = run_on_pool(
                     Some(&manifest.options.reader_pool),
                     "exact scope check: reader pool dropped result",
                     move || {
                         timed_section(|| {
                             bound.mask(&batch).map(|mask| {
-                                chunk
-                                    .iter()
-                                    .zip(mask.iter())
-                                    .filter_map(|(local, holds)| {
-                                        (holds == Some(true)).then_some(*local)
-                                    })
-                                    .collect::<Vec<u32>>()
+                                mask.iter()
+                                    .enumerate()
+                                    .filter_map(|(at, holds)| (holds == Some(true)).then_some(at))
+                                    .collect::<Vec<usize>>()
                             })
                         })
                     },
@@ -840,7 +866,11 @@ pub(crate) async fn exact_scope(
                 if let Some(stats) = &op_stats {
                     stats.add_kernel_cpu_ns(ns);
                 }
-                kept.extend(held.map_err(QueryError::DataFusion)?);
+                kept.extend(
+                    held.map_err(QueryError::DataFusion)?
+                        .into_iter()
+                        .map(|at| chunk[at]),
+                );
             }
             Ok((entry.uri, kept))
         }
