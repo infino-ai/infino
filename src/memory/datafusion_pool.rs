@@ -166,9 +166,9 @@ pub(crate) fn budgeted_session_context(
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
-    //  - `UnsplitLimitScans` after DataFusion's rules, to read a scan that
-    //    `RowFilterUnderTopK` kept whole for a plain `LIMIT` as one partition
-    //    again, after `EnforceDistribution` split it.
+    //  - `UnsplitLimitScans` after DataFusion's rules, to join each file's byte
+    //    ranges back into one partition for a scan `RowFilterUnderTopK` marked
+    //    under a plain `LIMIT`, after `EnforceDistribution` split its files.
     //  - `ReadAheadOff` last, once DataFusion has placed every limit, to turn
     //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;

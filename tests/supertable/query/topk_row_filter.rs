@@ -3,7 +3,8 @@
 
 //! Where a `WHERE` runs: as a Parquet row filter in a scan under
 //! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else. A
-//! filtered scan under a plain `LIMIT` is read as one partition.
+//! filtered scan under a plain `LIMIT` reads each file whole, one partition to
+//! a file, so separate files still read in parallel.
 //!
 //! `EXPLAIN ANALYZE` tells which. A row filter counts the rows it checks in
 //! `pushdown_rows_matched` and `pushdown_rows_pruned`; without one both are 0.
@@ -34,10 +35,11 @@ const PAD: &str =
     "--------------------------------------------------------------------------------";
 /// The metrics `EXPLAIN ANALYZE` prints for rows a row filter kept and dropped.
 const ROW_FILTER_METRICS: [&str; 2] = ["pushdown_rows_matched=", "pushdown_rows_pruned="];
-/// How `EXPLAIN` shows a scan kept whole for a plain `LIMIT`.
-const UNSPLIT: &str = "MeteredExec: unsplit";
-/// How `EXPLAIN` shows a scan read as one partition.
-const ONE_PARTITION: &str = "file_groups={1 group";
+/// How `EXPLAIN` shows a scan that reads each file whole for a plain `LIMIT`.
+const FILES_WHOLE: &str = "MeteredExec: files whole";
+/// How `EXPLAIN` shows the fixture's two superfiles each read by a partition of
+/// its own, side by side.
+const A_GROUP_PER_SUPERFILE: &str = "file_groups={2 groups";
 /// The largest `LIMIT` the rule handles.
 const MAX_FETCH: usize = 10_000;
 
@@ -391,9 +393,10 @@ fn assert_fetch_of(db: &Connection, sql: &str, all: &[i64]) {
 }
 
 #[test]
-fn a_plain_limit_reads_its_filtered_scan_as_one_partition() {
+fn a_plain_limit_reads_each_file_of_its_filtered_scan_whole() {
     // `WHERE s LIKE '%7%' LIMIT 5`, no `ORDER BY`, and the same with an offset.
-    //  - the scan is read as one partition, so the first rows to pass end it.
+    //  - each superfile is read whole by a partition of its own, so the first
+    //    rows to pass end it, and the two superfiles still read side by side.
     //  - the `WHERE` stays in a `FilterExec`; no row filter.
     // This test pins the plan shape and that every row returned matches.
     let (_dir, db, _table) = fixture();
@@ -404,11 +407,13 @@ fn a_plain_limit_reads_its_filtered_scan_as_one_partition() {
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
         let plan = explain(&db, "", &sql);
         assert!(plan.contains("FilterExec"), "{plan}");
-        assert!(plan.contains(UNSPLIT), "{plan}");
-        assert!(plan.contains(ONE_PARTITION), "{plan}");
+        assert!(plan.contains(FILES_WHOLE), "{plan}");
+        assert!(plan.contains(A_GROUP_PER_SUPERFILE), "{plan}");
         // No exchange next to the scan: none below its meter, and the node
         // right above it is the filter.
-        let (above, below) = plan.split_once(UNSPLIT).expect("an unsplit scan");
+        let (above, below) = plan
+            .split_once(FILES_WHOLE)
+            .expect("a scan reading its files whole");
         assert!(!below.contains("RepartitionExec"), "{plan}");
         let parent = above.lines().rev().find(|line| !line.trim().is_empty());
         assert!(
@@ -419,23 +424,23 @@ fn a_plain_limit_reads_its_filtered_scan_as_one_partition() {
 }
 
 #[test]
-fn an_index_answered_where_under_a_plain_limit_reads_one_partition() {
+fn an_index_answered_where_under_a_plain_limit_reads_each_file_whole() {
     // `s ILIKE '%7%' LIMIT 5` on a full-text column.
     //  - the index picks the rows, so there is no `FilterExec`, and the scan
-    //    still takes no fetch: it is kept whole all the same.
+    //    still takes no fetch: it reads each file whole all the same.
     // This test pins the rows and the plan shape.
     let (_dir, db, _table) = fixture_with(IndexSpec::new().fts("s"));
     let sql = format!("SELECT n, s FROM t WHERE s ILIKE '%{DIGIT}%' LIMIT {FETCH}");
     assert_fetch_of(&db, &sql, &matching(&[]));
     let plan = explain(&db, "", &sql);
-    assert!(plan.contains(UNSPLIT), "{plan}");
-    assert!(plan.contains(ONE_PARTITION), "{plan}");
+    assert!(plan.contains(FILES_WHOLE), "{plan}");
+    assert!(plan.contains(A_GROUP_PER_SUPERFILE), "{plan}");
 }
 
 #[test]
 fn deleted_rows_stay_out_under_a_plain_limit() {
     // Delete matching rows, then `WHERE s LIKE '%7%' LIMIT <every match>`.
-    //  - the scan skips deleted rows; one partition reads every range.
+    //  - the scan skips deleted rows; each file is read whole, in order.
     // This test pins that every live match comes back and no deleted one does.
     let (_dir, db, table) = fixture();
     let deleted: Vec<i64> = matching(&[]).into_iter().step_by(3).collect();
@@ -454,7 +459,7 @@ fn deleted_rows_stay_out_under_a_plain_limit() {
     let mut got = n_values(&db.query_sql(&sql).expect("sql"));
     got.sort_unstable();
     assert_eq!(got, want);
-    assert!(explain(&db, "", &sql).contains(UNSPLIT), "{sql}");
+    assert!(explain(&db, "", &sql).contains(FILES_WHOLE), "{sql}");
 }
 
 #[test]
@@ -479,7 +484,7 @@ fn a_plain_limit_is_left_alone_without_a_where_or_past_the_largest_limit() {
             "{sql}"
         );
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
-        assert!(!explain(&db, "", &sql).contains(UNSPLIT), "{sql}");
+        assert!(!explain(&db, "", &sql).contains(FILES_WHOLE), "{sql}");
     }
 }
 

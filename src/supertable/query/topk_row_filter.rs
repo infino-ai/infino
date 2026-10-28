@@ -40,13 +40,15 @@
 //!     compressed bytes, so if the skipped columns compress well, the ratio
 //!     overstates what we save.
 //!
-//! A filtered scan under a plain `LIMIT`, with no `ORDER BY`, is read as one
-//! partition instead. Its fetch can't reach the scan (see
-//! `MeteredExec::without_limit_pushdown`), so a scan split into byte ranges
-//! decodes a batch of every column in every range at once, and the first rows
-//! to pass end the query:
+//! A filtered scan under a plain `LIMIT`, with no `ORDER BY`, reads each of
+//! its files whole instead: one partition reads a file's byte ranges front to
+//! back, and separate files are still read by separate partitions. Its fetch
+//! can't reach the scan (see `MeteredExec::without_limit_pushdown`), so a file
+//! split into byte ranges decodes a batch of every column in every range at
+//! once, and the first rows to pass end the query:
 //!
 //! ```text
+//!   one compacted superfile
 //!   CoalescePartitionsExec(fetch=10)          CoalescePartitionsExec(fetch=10)
 //!     FilterExec  price > 500                   FilterExec  price > 500
 //!       DataSourceExec  16 byte ranges            DataSourceExec  1 partition
@@ -56,17 +58,23 @@
 //! The `WHERE` stays in the `FilterExec`. A row filter would decode only the
 //! `WHERE`'s columns for rows that fail, but a filter keeping rows at random
 //! leaves a selection of thousands of fragments per row group, which measured
-//! slower than decoding the batch whole. A filter that keeps almost nothing is
-//! read by one core instead of many, so it ends a little later while using
-//! many times less CPU. `UnsplitLimitScans` does the joining, after
-//! DataFusion's `EnforceDistribution` has split the scan.
+//! slower than decoding the batch whole.
+//!
+//! The trade: a filter that keeps almost nothing decodes every row either way,
+//! so it uses the same CPU, but a file's ranges are now read one after another
+//! instead of side by side, so on a table of a few large files it ends later,
+//! by up to the number of ranges a file was split into. Separate files keep
+//! their own partitions, so that cost is bounded by one file's ranges and
+//! never grows with the table. `UnsplitLimitScans` does the joining, after
+//! DataFusion's `EnforceDistribution` has split the files.
 
-use std::sync::Arc;
+use std::{mem::take, sync::Arc};
 
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     datasource::{
+        listing::PartitionedFile,
         physical_plan::{
             FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
             parquet::can_expr_be_pushed_down_with_schemas,
@@ -90,7 +98,7 @@ use datafusion::{
         sorts::sort::SortExec,
     },
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::supertable::query::{exec::metered_exec::MeteredExec, provider::ScanFooters};
 
@@ -100,9 +108,16 @@ const RULE_NAME: &str = "RowFilterUnderTopK";
 /// [`UnsplitLimitScans`]'s name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const UNSPLIT_RULE_NAME: &str = "UnsplitLimitScans";
 
-/// Largest `LIMIT` the rule turns the row filter on for, or keeps a scan whole
-/// for.
+/// Largest `LIMIT` the rule turns the row filter on for.
 const MAX_FETCH: usize = 10_000;
+
+/// Largest plain `LIMIT` a filtered scan reads its files whole for. A limit
+/// this small is met by the first batch or so of rows that pass, so the
+/// batches a file's other byte ranges decode at the same time are mostly thrown
+/// away; a larger limit needs rows from more of the file, where reading its
+/// ranges side by side pays. Set a little over one decode batch (DataFusion's
+/// 8,192 rows) at the row filter's limit, not measured on its own.
+const MAX_WHOLE_FILE_FETCH: usize = 10_000;
 
 /// Least ratio of the bytes the row filter can skip to the bytes of the sort's
 /// columns for the rule to turn it on.
@@ -125,9 +140,9 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
                 .filter(|sort| sort.fetch().is_some_and(|fetch| fetch <= MAX_FETCH))
             {
                 let sort_columns = column_names(sort.expr().iter().map(|e| &e.expr));
-                row_filtered(sort.input(), sort_columns, Vec::new(), Under::TopK)?
+                row_filtered(sort.input(), sort_columns, Vec::new())?
             } else if let Some(input) = small_limit_input(&node) {
-                row_filtered(input, FxHashSet::default(), Vec::new(), Under::Limit)?
+                files_whole_under_limit(input)?
             } else {
                 None
             };
@@ -150,16 +165,18 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
     }
 }
 
-/// Reads a scan [`RowFilterUnderTopK`] kept whole for a plain `LIMIT` as one
-/// partition again, once DataFusion's `EnforceDistribution` has split it into
-/// byte ranges: that rule splits a scan without asking the node above it. The
-/// ranges keep their order and their access plans, all in one partition, so
-/// the scan reads the file front to back and stops when the limit is met.
+/// Joins each file's byte ranges back into one partition for a scan
+/// [`RowFilterUnderTopK`] marked under a plain `LIMIT`, once DataFusion's
+/// `EnforceDistribution` has split its files into ranges: that rule splits a
+/// scan without asking the node above it. A file's ranges go to the group its
+/// first range is in, in byte order with their access plans, so one partition
+/// reads the file front to back and stops when the limit is met; separate
+/// files stay in the groups they were in and are still read in parallel.
 ///
 /// A round-robin exchange `EnforceDistribution` put next to the scan goes
 /// too, above the meter or below it (below when the scan's files are too
 /// small to split, so the meter declined): it would keep pulling batches out
-/// of the scan ahead of the limit, or read its files in parallel.
+/// of the scan ahead of the limit.
 #[derive(Debug, Default)]
 pub(crate) struct UnsplitLimitScans;
 
@@ -173,13 +190,13 @@ impl PhysicalOptimizerRule for UnsplitLimitScans {
             if let Some(input) = round_robin_input(&node)
                 && input
                     .downcast_ref::<MeteredExec>()
-                    .is_some_and(MeteredExec::is_unsplit)
+                    .is_some_and(MeteredExec::reads_files_whole)
             {
                 return Ok(Transformed::yes(Arc::clone(input)));
             }
             let Some(meter) = node
                 .downcast_ref::<MeteredExec>()
-                .filter(|meter| meter.is_unsplit())
+                .filter(|meter| meter.reads_files_whole())
             else {
                 return Ok(Transformed::no(node));
             };
@@ -190,16 +207,15 @@ impl PhysicalOptimizerRule for UnsplitLimitScans {
             else {
                 return Ok(Transformed::no(node));
             };
-            if config.file_groups.len() <= 1 && Arc::ptr_eq(input, meter.input()) {
+            // No file split across groups and no exchange to drop: nothing to join.
+            if !split_across_groups(&config.file_groups) && Arc::ptr_eq(input, meter.input()) {
                 return Ok(Transformed::no(node));
             }
-            let files = config
-                .file_groups
-                .iter()
-                .flat_map(|group| group.iter().cloned())
-                .collect();
-            let config = FileScanConfigBuilder::from(config.clone())
-                .with_file_groups(vec![FileGroup::new(files)])
+            // One clone of the config; its groups are moved out and rejoined.
+            let mut config = config.clone();
+            let groups = files_whole(take(&mut config.file_groups));
+            let config = FileScanConfigBuilder::from(config)
+                .with_file_groups(groups)
                 .build();
             let scan = DataSourceExec::from_data_source(config);
             Ok(Transformed::yes(
@@ -225,15 +241,54 @@ fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Execution
         .map(RepartitionExec::input)
 }
 
-/// What the scan feeds: an `ORDER BY ... LIMIT`, or a plain `LIMIT`.
-#[derive(Clone, Copy)]
-enum Under {
-    TopK,
-    Limit,
+/// Whether any file of `groups` is split into byte ranges in more than one
+/// group.
+fn split_across_groups(groups: &[FileGroup]) -> bool {
+    let mut home: FxHashMap<&ObjPath, usize> = FxHashMap::default();
+    for (at, group) in groups.iter().enumerate() {
+        for file in group.iter() {
+            if *home.entry(&file.object_meta.location).or_insert(at) != at {
+                return true;
+            }
+        }
+    }
+    false
 }
 
-/// The input of a `LIMIT` of at most [`MAX_FETCH`] rows (its skip included),
-/// or `None` for any other node.
+/// `groups` with each file's byte ranges joined into the group its first
+/// range is in, in byte order; the groups left empty are dropped. A file
+/// whole in one group stays where it is, so files keep their own partitions
+/// and only a file split into ranges loses the parallelism within it.
+fn files_whole(groups: Vec<FileGroup>) -> Vec<FileGroup> {
+    let n_groups = groups.len();
+    // Each file's ranges with the group it goes to, in the order files first
+    // appear.
+    let mut files: Vec<(usize, Vec<PartitionedFile>)> = Vec::new();
+    let mut index: FxHashMap<ObjPath, usize> = FxHashMap::default();
+    for (at, group) in groups.into_iter().enumerate() {
+        for file in group.into_inner() {
+            let slot = *index
+                .entry(file.object_meta.location.clone())
+                .or_insert_with(|| {
+                    files.push((at, Vec::new()));
+                    files.len() - 1
+                });
+            files[slot].1.push(file);
+        }
+    }
+    let mut out: Vec<Vec<PartitionedFile>> = (0..n_groups).map(|_| Vec::new()).collect();
+    for (at, mut ranges) in files {
+        ranges.sort_by_key(|file| file.range.as_ref().map_or(0, |range| range.start));
+        out[at].extend(ranges);
+    }
+    out.into_iter()
+        .filter(|group| !group.is_empty())
+        .map(FileGroup::new)
+        .collect()
+}
+
+/// The input of a `LIMIT` of at most [`MAX_WHOLE_FILE_FETCH`] rows (its skip
+/// included), or `None` for any other node.
 fn small_limit_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
     let (input, rows) = if let Some(limit) = node.downcast_ref::<GlobalLimitExec>() {
         (
@@ -245,22 +300,40 @@ fn small_limit_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn Execution
     } else {
         return None;
     };
-    rows.filter(|&rows| rows <= MAX_FETCH).map(|_| input)
+    rows.filter(|&rows| rows <= MAX_WHOLE_FILE_FETCH)
+        .map(|_| input)
 }
 
-/// `plan` with the scan at the bottom marked, or `None` if the walk stops
-/// first or leaves it alone: under `ORDER BY ... LIMIT` the row filter turned
-/// on, under a plain `LIMIT` the scan kept whole. `sort_columns` are the sort's
-/// columns as `plan` names them (none under a plain `LIMIT`); `filters` are the
-/// `WHERE` parts seen on the way down.
-///
-/// A plain `LIMIT` over a scan whose meter takes its fetch, a scan with no
-/// filter, is left alone: the fetch already stops it.
+/// `plan` with the meter at the bottom marked to read each file whole, under a
+/// plain `LIMIT`: the walk goes down through filters and projections, and
+/// `None` when it meets anything else, or a meter that takes the fetch itself
+/// (a scan with no filter, which the fetch already stops).
+fn files_whole_under_limit(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
+    if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
+        return Ok((!meter.supports_limit_pushdown()).then(|| meter.with_files_whole()));
+    }
+    if plan.downcast_ref::<FilterExec>().is_none()
+        && plan.downcast_ref::<ProjectionExec>().is_none()
+    {
+        return Ok(None);
+    }
+    let [child] = plan.children()[..] else {
+        return Ok(None);
+    };
+    files_whole_under_limit(child)?
+        .map(|child| Arc::clone(plan).with_new_children(vec![child]))
+        .transpose()
+}
+
+/// `plan` with the row filter turned on in the scan at the bottom, or `None`
+/// if the walk stops first. `sort_columns` are the sort's columns as `plan`
+/// names them; `filters` are the `WHERE` parts seen on the way down.
 fn row_filtered(
     plan: &Arc<dyn ExecutionPlan>,
     mut sort_columns: FxHashSet<String>,
     mut filters: Vec<Arc<dyn PhysicalExpr>>,
-    under: Under,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     // Reached our table scan: the meter and the Parquet scan it wraps.
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
@@ -270,14 +343,9 @@ fn row_filtered(
         ) else {
             return Ok(None);
         };
-        return Ok(match under {
-            Under::TopK => with_row_filter(scan, footers, &sort_columns, &filters)
-                .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
-                .transpose()?,
-            // The fetch reaches a scan with no filter, so it stops on its own.
-            Under::Limit if meter.supports_limit_pushdown() => None,
-            Under::Limit => Some(meter.unsplit(Arc::clone(meter.input()))),
-        });
+        return with_row_filter(scan, footers, &sort_columns, &filters)
+            .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
+            .transpose();
     }
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
         // Collect the `WHERE` parts; the scan checks they can all move into it.
@@ -306,7 +374,7 @@ fn row_filtered(
         return Ok(None);
     };
     // Rebuild this node over the marked scan below it.
-    row_filtered(child, sort_columns, filters, under)?
+    row_filtered(child, sort_columns, filters)?
         .map(|child| Arc::clone(plan).with_new_children(vec![child]))
         .transpose()
 }
@@ -388,4 +456,94 @@ fn column_bytes(
         }
     }
     Some((sort_bytes, skippable_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file's size in the grouping cases below.
+    const FILE_BYTES: u64 = 30;
+    /// Bytes in each range a split file is cut into: three to a file.
+    const RANGE_BYTES: i64 = 10;
+    /// How [`layout`] shows a file that sits whole in its group.
+    const WHOLE: i64 = -1;
+
+    /// The `at`-th range of file `path`.
+    fn range(path: &str, at: i64) -> PartitionedFile {
+        PartitionedFile::new_with_range(
+            path.to_string(),
+            FILE_BYTES,
+            at * RANGE_BYTES,
+            (at + 1) * RANGE_BYTES,
+        )
+    }
+
+    /// File `path`, whole.
+    fn whole(path: &str) -> PartitionedFile {
+        PartitionedFile::new(path.to_string(), FILE_BYTES)
+    }
+
+    /// Each group's files as (path, range start), [`WHOLE`] for a whole file.
+    fn layout(groups: &[FileGroup]) -> Vec<Vec<(String, i64)>> {
+        groups
+            .iter()
+            .map(|group| {
+                group
+                    .iter()
+                    .map(|file| {
+                        let start = file.range.as_ref().map_or(WHOLE, |range| range.start);
+                        (file.object_meta.location.to_string(), start)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_split_files_ranges_join_and_other_files_keep_their_groups() {
+        // `a` split in three over every group, out of byte order; `b` and `c`
+        // whole in groups 1 and 2, as `EnforceDistribution` leaves a scan of
+        // one large file and two small ones.
+        //  - `a`'s ranges join the group its first one was in, in byte order.
+        //  - `b` and `c` keep their own groups, so they still read in parallel.
+        let groups = vec![
+            FileGroup::new(vec![range("a", 2)]),
+            FileGroup::new(vec![range("a", 0), whole("b")]),
+            FileGroup::new(vec![range("a", 1), whole("c")]),
+        ];
+        assert!(split_across_groups(&groups));
+        let joined = files_whole(groups);
+        assert!(!split_across_groups(&joined));
+        assert_eq!(
+            layout(&joined),
+            vec![
+                vec![
+                    ("a".to_string(), 0),
+                    ("a".to_string(), RANGE_BYTES),
+                    ("a".to_string(), 2 * RANGE_BYTES),
+                ],
+                vec![("b".to_string(), WHOLE)],
+                vec![("c".to_string(), WHOLE)],
+            ]
+        );
+    }
+
+    #[test]
+    fn whole_files_in_groups_of_their_own_stay_as_they_are() {
+        // Files too small to split, one to a group: nothing to join, and each
+        // file keeps its partition.
+        let groups = vec![
+            FileGroup::new(vec![whole("a")]),
+            FileGroup::new(vec![whole("b")]),
+        ];
+        assert!(!split_across_groups(&groups));
+        assert_eq!(
+            layout(&files_whole(groups)),
+            vec![
+                vec![("a".to_string(), WHOLE)],
+                vec![("b".to_string(), WHOLE)],
+            ]
+        );
+    }
 }
