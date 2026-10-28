@@ -54,7 +54,10 @@
 use std::collections::HashSet;
 
 use infino::{
-    superfile::{SuperfileReader, fts::reader::BoolMode},
+    superfile::{
+        SuperfileReader,
+        fts::{posting::BLOCK_LEN, reader::BoolMode},
+    },
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -649,11 +652,21 @@ async fn tiered_vocabulary_spans_the_posting_forms() {
             dense.bitset_blocks + dense.run_blocks > 0,
             "sample {sample}: the densest drawn tier should store presence bits or runs, got {dense:?}"
         );
+        // A block holds up to twice the lanes the packer fills at once, so
+        // a lone partial block of more than one sub-block pads to the second
+        // and the presence bitset can come out smaller: only a tier long
+        // enough for a full block is held to the packed form.
         let packed = layout(TIER_PACKED).await;
         assert!(
-            packed.packed_blocks > 0 && !packed.short,
-            "sample {sample}: the strided tier should pack its deltas, got {packed:?}"
+            !packed.short,
+            "sample {sample}: the strided tier is long, got {packed:?}"
         );
+        if packed.df >= BLOCK_LEN as u64 {
+            assert!(
+                packed.packed_blocks > 0,
+                "sample {sample}: the strided tier should pack its deltas, got {packed:?}"
+            );
+        }
         let short = layout(TIER_SHORT).await;
         assert!(
             short.short,

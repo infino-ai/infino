@@ -33,7 +33,10 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::FtsConfig,
-        fts::{posting::BLOCK_LEN, reader::BoolMode},
+        fts::{
+            posting::{BLOCK_LEN, SUB_BLOCK_LEN},
+            reader::BoolMode,
+        },
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
@@ -113,7 +116,7 @@ const UNALIGNED_BITSET_DOCS: u64 = 600;
 /// pair).
 const UNALIGNED_BITSET_SKIPPED: [u64; 2] = [0, BLOCK_LEN as u64];
 /// The rare driver's documents, chosen around word and block edges.
-const UNALIGNED_DRIVER_DOCS: [u64; 6] = [1, 64, 65, 128, 129, 300];
+const UNALIGNED_DRIVER_DOCS: [u64; 6] = [1, 64, 65, BLOCK_LEN as u64, BLOCK_LEN as u64 + 1, 300];
 
 /// Documents in the density-transition corpus.
 const DENSITY_DOCS: u64 = 6_000;
@@ -158,7 +161,15 @@ const NEGATION_EDGE_DOCS: u64 = 1_000;
 /// blocks' last documents are 127 and 427.
 const NEGATION_EDGE_SECOND_BLOCK_START: u64 = 300;
 /// `pos` sits on and just past each edge, and past the list's end.
-const NEGATION_EDGE_POS: [u64; 7] = [127, 128, 299, 300, 427, 428, 600];
+const NEGATION_EDGE_POS: [u64; 7] = [
+    BLOCK_LEN as u64 - 1,
+    BLOCK_LEN as u64,
+    NEGATION_EDGE_SECOND_BLOCK_START - 1,
+    NEGATION_EDGE_SECOND_BLOCK_START,
+    NEGATION_EDGE_SECOND_BLOCK_START + BLOCK_LEN as u64 - 1,
+    NEGATION_EDGE_SECOND_BLOCK_START + BLOCK_LEN as u64,
+    600,
+];
 /// `neg2` is one short-form list, documents `0..=99`.
 const NEGATION_EDGE_SHORT_END: u64 = 99;
 const NEGATION_EDGE_POS2: [u64; 3] = [99, 100, 700];
@@ -229,9 +240,9 @@ async fn ordered_hits(reader: &SuperfileReader, query: &str, k: usize) -> Vec<u6
 async fn short_form_cap_terms_agree_with_the_oracle() {
     let corpus = planted(SHORT_FORM_DOCS, |d| {
         let mut t = vec!["every"];
-        let s128 = d % SHORT_FORM_STRIDE == 0 && d / SHORT_FORM_STRIDE < BLOCK_LEN as u64;
+        let s128 = d % SHORT_FORM_STRIDE == 0 && d / SHORT_FORM_STRIDE < SUB_BLOCK_LEN as u64;
         let s129 = d % SHORT_FORM_STRIDE == SHORT_FORM_OFFSET
-            && d / SHORT_FORM_STRIDE < BLOCK_LEN as u64 + 1;
+            && d / SHORT_FORM_STRIDE < SUB_BLOCK_LEN as u64 + 1;
         if s128 {
             t.push("s128");
         }
@@ -243,8 +254,8 @@ async fn short_form_cap_terms_agree_with_the_oracle() {
         }
         t
     });
-    assert_eq!(docs_with(&corpus, "s128").len(), BLOCK_LEN);
-    assert_eq!(docs_with(&corpus, "s129").len(), BLOCK_LEN + 1);
+    assert_eq!(docs_with(&corpus, "s128").len(), SUB_BLOCK_LEN);
+    assert_eq!(docs_with(&corpus, "s129").len(), SUB_BLOCK_LEN + 1);
     let (reader, oracle) = fixture(&corpus, true);
     let k = corpus.len();
     assert_all(
@@ -462,7 +473,8 @@ async fn lists_at_the_patched_df_cap_agree_with_the_oracle() {
 
 // ── bitset blocks ─────────────────────────────────────────────────────
 
-/// `dense`'s first block holds documents 1..=127 and 129: its presence
+/// `dense`'s first block holds documents 1 to one below the block length
+/// and the one past it: its presence
 /// bitset starts at the word-aligned origin 0, one below its first
 /// document, and spans three words (24 bytes) against 32 bytes of
 /// two-bit deltas, so the encoder stores it as a bitset. Every walk
@@ -478,9 +490,11 @@ async fn bitset_block_with_an_unaligned_origin_agrees_with_the_oracle() {
         let mut t = vec!["filler"];
         let dense = !UNALIGNED_BITSET_SKIPPED.contains(&d);
         if driver.contains(&d) {
-            // In order at 1, 65 and 129; reversed at 64 and 300; alone at 128.
+            // In order at 1, 65 and one past the block's last doc;
+            // reversed at 64 and 300; alone at the skipped doc.
             match d {
-                1 | 65 | 129 => t.extend(["drv", "dense"]),
+                1 | 65 => t.extend(["drv", "dense"]),
+                d if d == BLOCK_LEN as u64 + 1 => t.extend(["drv", "dense"]),
                 64 | 300 => t.extend(["dense", "drv"]),
                 _ => t.push("drv"),
             }
@@ -701,7 +715,15 @@ async fn negation_probes_at_block_edges_agree_with_the_oracle() {
     .await;
     let mut got = ordered_hits(&reader, "pos -neg", k).await;
     got.sort_unstable();
-    assert_eq!(got, vec![128, 299, 428, 600]);
+    assert_eq!(
+        got,
+        vec![
+            BLOCK_LEN as u64,
+            NEGATION_EDGE_SECOND_BLOCK_START - 1,
+            NEGATION_EDGE_SECOND_BLOCK_START + BLOCK_LEN as u64,
+            600
+        ]
+    );
     let mut got = ordered_hits(&reader, "pos2 -neg2", k).await;
     got.sort_unstable();
     assert_eq!(got, vec![100, 700]);
