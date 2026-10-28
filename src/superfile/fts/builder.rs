@@ -281,8 +281,14 @@ const PATCHED_MAX_DF: usize = 16 * 1024;
 /// block halves the per-block work a reader pays per document, and
 /// coarsens the block maxima a ranked walk prunes by; the range is the
 /// writer's policy for that trade, stated as a density so it carries
-/// across corpora. The whole range: every long term is written wide.
-const WIDE_BLOCK_MIN_DENSITY: f64 = 0.0;
+/// across corpora. Measured on a 5M-document corpus over five shapes and
+/// two query sets: the gain is in the terms a reader meets in every
+/// block it walks — the common ones — and leaving the rarer terms narrow
+/// costs nothing, keeps their pruning at the finer grain, and spares a
+/// short list the second sub-block's padding. One document in a thousand
+/// is the floor that kept the whole gain; one in a hundred already gave
+/// some back.
+const WIDE_BLOCK_MIN_DENSITY: f64 = 0.001;
 const WIDE_BLOCK_MAX_DENSITY: f64 = 1.0;
 
 /// The block length a term of `df` postings gets in a column of `n_docs`
