@@ -32,10 +32,13 @@ use std::{
 };
 
 use arrow::{compute::concat_batches, record_batch::RecordBatch};
-use arrow_schema::Schema;
+use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
 use parquet::{
-    arrow::ArrowWriter,
+    arrow::{
+        ArrowWriter,
+        arrow_writer::{ArrowLeafColumn, ArrowRowGroupWriterFactory, compute_leaves},
+    },
     basic::Compression,
     file::{
         metadata::{
@@ -43,9 +46,11 @@ use parquet::{
             ParquetMetaDataWriter,
         },
         properties::WriterProperties,
+        writer::SerializedFileWriter,
     },
     schema::types::ColumnPath,
 };
+use rayon::prelude::*;
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -192,12 +197,24 @@ pub fn encode_parquet_body(
 /// compaction merge that streams many inputs then never holds more than the
 /// in-flight input batch plus the writer's current row-group buffer.
 ///
-/// Because `ArrowWriter` cuts row groups purely on accumulated row count (not
-/// on `write` boundaries), streaming batches yields byte-identical output to
+/// Because row groups are cut purely on accumulated row count (not on
+/// `write` boundaries), streaming batches yields byte-identical output to
 /// one `encode_parquet_body` over the same batches in the same order.
+///
+/// It cuts and feeds row groups exactly as `ArrowWriter` would, but holds
+/// each row group's slices until it is full and then encodes its columns in
+/// parallel. Every column writer sees the same slices in the same order it
+/// would under `ArrowWriter`, and the chunks are appended in column order,
+/// so the bytes are the same; only the column encodes overlap.
 pub(crate) struct ParquetBodyEncoder {
     body_file: NamedTempFile,
-    writer: ArrowWriter<File>,
+    writer: SerializedFileWriter<File>,
+    columns: ArrowRowGroupWriterFactory,
+    schema: SchemaRef,
+    row_group_size: usize,
+    /// The current row group's slices, in arrival order.
+    held: Vec<RecordBatch>,
+    held_rows: usize,
 }
 
 impl ParquetBodyEncoder {
@@ -239,19 +256,79 @@ impl ParquetBodyEncoder {
         let scratch_root = scratch_root();
         let body_file = NamedTempFile::new_in(&scratch_root)?;
         let write_handle = body_file.reopen()?;
-        let writer = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?;
-        Ok(Self { body_file, writer })
+        // Built through `ArrowWriter` so the file starts, and its footer
+        // carries the Arrow schema, exactly as before.
+        let (writer, columns) = ArrowWriter::try_new(write_handle, schema.clone(), Some(props))?
+            .into_serialized_writer()?;
+        Ok(Self {
+            body_file,
+            writer,
+            columns,
+            schema: Arc::clone(schema),
+            row_group_size: row_group_size.max(1),
+            held: Vec::new(),
+            held_rows: 0,
+        })
     }
 
+    /// Add `batch`, cutting it where a row group fills as `ArrowWriter` does.
     pub(crate) fn write_batch(&mut self, batch: &RecordBatch) -> Result<(), FooterError> {
-        self.writer.write(batch)?;
+        let mut rest = batch.clone();
+        while rest.num_rows() > 0 {
+            let room = self.row_group_size - self.held_rows;
+            let take = room.min(rest.num_rows());
+            self.held.push(rest.slice(0, take));
+            self.held_rows += take;
+            rest = rest.slice(take, rest.num_rows() - take);
+            if self.held_rows >= self.row_group_size {
+                self.flush_row_group()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode the held row group, one task per leaf column.
+    fn flush_row_group(&mut self) -> Result<(), FooterError> {
+        if self.held.is_empty() {
+            return Ok(());
+        }
+        let mut writers = self
+            .columns
+            .create_column_writers(self.writer.flushed_row_groups().len())?;
+        // Each leaf column's slices, in the order its writer would get them.
+        let mut leaves: Vec<Vec<ArrowLeafColumn>> = writers.iter().map(|_| Vec::new()).collect();
+        for batch in &self.held {
+            let mut leaf_index = 0;
+            for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
+                for leaf in compute_leaves(field.as_ref(), column)? {
+                    leaves[leaf_index].push(leaf);
+                    leaf_index += 1;
+                }
+            }
+        }
+        self.held.clear();
+        self.held_rows = 0;
+        writers
+            .par_iter_mut()
+            .zip(leaves.par_iter())
+            .try_for_each(|(writer, leaves)| {
+                leaves.iter().try_for_each(|leaf| writer.write(leaf))
+            })?;
+        let mut row_group = self.writer.next_row_group()?;
+        for writer in writers {
+            writer.close()?.append_to_row_group(&mut row_group)?;
+        }
+        row_group.close()?;
         Ok(())
     }
 
     /// Close the writer and strip the Parquet footer, yielding the same
     /// [`EncodedBody`] as [`encode_parquet_body`].
-    pub(crate) fn finish(self) -> Result<EncodedBody, FooterError> {
-        let Self { body_file, writer } = self;
+    pub(crate) fn finish(mut self) -> Result<EncodedBody, FooterError> {
+        self.flush_row_group()?;
+        let Self {
+            body_file, writer, ..
+        } = self;
         writer.close()?;
         strip_parquet_footer(body_file)
     }

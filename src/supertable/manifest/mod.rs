@@ -1549,7 +1549,7 @@ impl ManifestSnapshot {
     }
 
     /// Whether a term-index rebuild would change anything: false when the
-    /// table is empty, or when the index is complete, has one segment, and
+    /// table is empty, or when the index is complete, has one layer, and
     /// lists exactly the live superfiles. An index that will never load is
     /// rebuilt; one that failed to load for now is an error.
     pub(crate) async fn needs_term_index_rebuild(
@@ -1569,11 +1569,11 @@ impl ManifestSnapshot {
             Err(e) => return Err(e),
         };
         let root = index.root();
-        // Every commit since the last rebuild appends a segment.
-        if root.segments.len() != 1 {
+        // Every commit since the last rebuild appends a layer.
+        if root.layers.len() != 1 {
             return Ok(true);
         }
-        // A commit that only removes superfiles appends no segment, so the
+        // A commit that only removes superfiles appends no layer, so the
         // root can still list superfiles that are gone.
         Ok(root.superfiles.len() != entries.len()
             || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))

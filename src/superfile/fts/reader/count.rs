@@ -16,7 +16,7 @@ use super::{
     filter::AtomExcludeFilter,
     metadata::NormTable,
     options::BoolMode,
-    phrase::AnyCursor,
+    phrase::{AnyCursor, approx_align, batch_phrase_with_terms},
     scorers::{count_and_planned, count_excluding},
     search::FetchedTermMemo,
     sink::{TopKEntry, finish_head},
@@ -164,39 +164,40 @@ impl FtsReader {
                 Ok(())
             }
             BoolMode::And => {
+                // One phrase ANDed with terms walks the intersection itself, a
+                // block at a time, every doc it lands on verified.
+                let batched = batch_phrase_with_terms(&mut atoms)?;
                 let mut target = 0u32;
                 'docs: loop {
-                    // Phase 1 — align every atom by its cheap *approximation*: a
-                    // term atom is exact; a phrase atom advances only to a doc
-                    // holding all its members, without decoding positions. So a
-                    // rare co-clause (e.g. a term AND'd with a common-word
-                    // phrase) prunes the candidate set here, before any phrase
-                    // pays for adjacency.
-                    let mut aligned = target;
-                    let mut i = 0usize;
-                    while i < atoms.len() {
-                        let a = &mut atoms[i];
-                        a.approx_skip_to(aligned);
-                        if a.is_exhausted() {
-                            break 'docs;
+                    let aligned = match batched {
+                        Some(at) => {
+                            let a = &mut atoms[at];
+                            a.skip_to(target)?;
+                            if a.is_exhausted() {
+                                break 'docs;
+                            }
+                            a.current_doc_id()
                         }
-                        let here = a.approx_current_doc();
-                        if here > aligned {
-                            aligned = here;
-                            i = 0;
-                            continue;
-                        }
-                        i += 1;
-                    }
+                        // Phase 1 — every atom aligned by its cheap
+                        // approximation, so a rare co-clause prunes the
+                        // candidates before any phrase pays for adjacency.
+                        None => match approx_align(&mut atoms, target) {
+                            Some(aligned) => aligned,
+                            None => break 'docs,
+                        },
+                    };
                     // Phase 2 — every approximation agrees on `aligned`. Verify
                     // the phrase atoms' positions here only: the intersection is
                     // already down to the co-occurring docs, so position decode
                     // runs on that handful, not on a phrase's whole match set.
+                    // The batched walk verified its doc already.
                     let mut matched = true;
-                    for a in atoms.iter_mut() {
-                        if !a.verify_at(aligned)? {
-                            matched = false;
-                            break;
+                    if batched.is_none() {
+                        for a in atoms.iter_mut() {
+                            if !a.verify_at(aligned)? {
+                                matched = false;
+                                break;
+                            }
                         }
                     }
                     if matched {
@@ -1537,68 +1538,81 @@ mod tests {
 
     #[tokio::test]
     async fn or_count_anchored_matches_merge_on_dominant_term() {
-        // When one term's df dwarfs the rest, the OR count takes the
-        // df-anchored path (`df(dominant) + |others \ dominant|`) instead
-        // of walking the dominant list. It must return the identical
-        // cardinality as the independent naive ascending merge
-        // (`token_match` length). The corpus spans several OR_WINDOW
-        // windows and — crucially — leaves gaps where the dominant term
-        // is *absent* but a rare term is present, so the "doc not in the
-        // anchor" branch is exercised, not just `df(dominant)`.
-        const N_DOCS: u32 = OR_WINDOW * 2 + 137;
-        const RARE_STRIDE: u32 = 250; // rare term hits ~1/250 docs
-        const RAREB_STRIDE: u32 = 400;
-        const HOLE_STRIDE: u32 = 300; // docs missing the dominant term
-        let mut b = FtsBuilder::new();
-        b.register_column("body".into(), false).expect("register");
-        for i in 0..N_DOCS {
-            let mut text = String::new();
-            // `common` is in almost every doc (the dominant term) — but
-            // not the holes, so the anchor genuinely lacks some docs the
-            // rare terms supply.
-            if !i.is_multiple_of(HOLE_STRIDE) {
-                text.push_str("common ");
+        // When one term's df dwarfs the rest, the OR count of three or more
+        // terms takes the df-anchored path (`df(dominant) + |others \
+        // dominant|`) instead of walking the dominant list, unless the terms
+        // together are dense enough to fold into one bitset first. Both
+        // corpora below must give the identical cardinality to the
+        // independent naive ascending merge (`token_match` length).
+        //
+        // The dense corpus (`common` in nearly every doc) takes the bitset
+        // fold. The sparse one (`common` in one doc in twenty, under the
+        // fold's density) takes the anchored path, through both of its
+        // window shapes: windows with a few rare docs probe the anchor per
+        // doc, and the window holding the `burst` run folds it. Gaps where
+        // `common` is absent but a rarer term is present exercise the "doc
+        // not in the anchor" branch, not just `df(dominant)`.
+        const RARE_STRIDE: u32 = 500;
+        const RAREB_STRIDE: u32 = 800;
+        const HOLE_STRIDE: u32 = 300; // dense corpus: docs missing `common`
+        const SPARSE_COMMON_STRIDE: u32 = 20;
+        const BURST_DOCS: u32 = 70; // past the anchored walk's fold cutoff
+        let corpora: [(u32, bool); 2] = [(OR_WINDOW * 2 + 137, true), (OR_WINDOW * 8, false)];
+        for (n_docs, dense) in corpora {
+            let mut b = FtsBuilder::new();
+            b.register_column("body".into(), false).expect("register");
+            for i in 0..n_docs {
+                let mut text = String::new();
+                let common = match dense {
+                    true => !i.is_multiple_of(HOLE_STRIDE),
+                    false => i.is_multiple_of(SPARSE_COMMON_STRIDE),
+                };
+                if common {
+                    text.push_str("common ");
+                }
+                if i.is_multiple_of(RARE_STRIDE) {
+                    text.push_str("rare ");
+                }
+                if i.is_multiple_of(RAREB_STRIDE) {
+                    text.push_str("rareb ");
+                }
+                if (OR_WINDOW + 1..OR_WINDOW + 1 + BURST_DOCS).contains(&i) {
+                    text.push_str("burst ");
+                }
+                // Guarantee no empty doc.
+                if text.is_empty() {
+                    text.push_str("filler ");
+                }
+                b.add_doc(0, i, text.trim()).expect("add doc");
             }
-            if i.is_multiple_of(RARE_STRIDE) {
-                text.push_str("rare ");
-            }
-            if i.is_multiple_of(RAREB_STRIDE) {
-                text.push_str("rareb ");
-            }
-            // Guarantee no empty doc (a hole that hits neither rare term).
-            if text.is_empty() {
-                text.push_str("filler ");
-            }
-            b.add_doc(0, i, text.trim()).expect("add doc");
-        }
-        let blob = Bytes::from(b.finish().expect("finish"));
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(blob, json).expect("open");
+            let blob = Bytes::from(b.finish().expect("finish"));
+            let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+            let r = FtsReader::open(blob, json).expect("open");
 
-        // `common` alone is far more than 4× `rare` + `rareb` combined, so
-        // these shapes drive the anchored path; `filler` never dominates.
-        let shapes: &[&[&str]] = &[
-            &["common", "rare"],
-            &["common", "rare", "rareb"],
-            &["common", "rareb", "zzz_absent"],
-            &["common", "filler"],
-        ];
-        for terms in shapes {
-            let merge_len = r
-                .token_match("body", terms, BoolMode::Or)
-                .await
-                .expect("token_match")
-                .0
-                .len() as u64;
-            let count = r
-                .token_match_count("body", terms, BoolMode::Or)
-                .await
-                .expect("token_match_count")
-                .0;
-            assert_eq!(
-                count, merge_len,
-                "anchored count vs merge len for {terms:?}"
-            );
+            let shapes: &[&[&str]] = &[
+                &["common", "rare"],
+                &["common", "rare", "rareb"],
+                &["common", "rare", "burst"],
+                &["common", "rareb", "zzz_absent"],
+                &["common", "filler"],
+            ];
+            for terms in shapes {
+                let merge_len = r
+                    .token_match("body", terms, BoolMode::Or)
+                    .await
+                    .expect("token_match")
+                    .0
+                    .len() as u64;
+                let count = r
+                    .token_match_count("body", terms, BoolMode::Or)
+                    .await
+                    .expect("token_match_count")
+                    .0;
+                assert_eq!(
+                    count, merge_len,
+                    "OR count vs merge len for {terms:?}, dense = {dense}"
+                );
+            }
         }
     }
 

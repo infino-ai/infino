@@ -102,15 +102,16 @@ pub(crate) struct TierEntry {
 }
 
 /// The average length and parameters a column's tier keys are computed
-/// at: recorded by the slice, so a reader and a merge compute the same
-/// key for the same entry.
+/// at: a superfile's own, as the manifest records them, so a reader and a
+/// merge compute the same key for the same entry. A slice records no
+/// scoring; a merge takes each superfile's from the manifest.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ColumnScoring {
     pub(crate) avgdl: f32,
     pub(crate) params: Bm25Params,
     /// The superfile's scored document count in the column: what turns a
     /// bound stored by the layout before tiers, a score at the superfile's
-    /// own idf, into a key when such a segment is merged. Zero when not
+    /// own idf, into a key when such a layer is merged. Zero when not
     /// known, which leaves such a bound unbounded.
     pub(crate) scored_docs: u64,
 }
@@ -234,27 +235,60 @@ pub(crate) fn encode_tier(groups: &[HeadGroup]) -> Vec<EncodedChunk> {
 
 /// One region: its directory, then its bodies.
 fn encode_chunk(dirs: &[BlockDir], bodies: &[u8]) -> EncodedChunk {
-    let mut out = Vec::with_capacity(TierDirectory::len_for(dirs.len() as u32) + bodies.len());
+    let blocks: Vec<SplicedBlock<'_>> = dirs
+        .iter()
+        .map(|d| SplicedBlock {
+            ordinal: d.ordinal,
+            tail: d.tail,
+            n_entries: d.n_entries,
+            crc: d.crc,
+            body: &bodies[d.offset..d.offset + d.len],
+        })
+        .collect();
+    encode_spliced_chunk(&blocks)
+}
+
+/// One block carried from an existing chunk, or freshly encoded, into a
+/// chunk a merge writes without decoding its entries: its directory facts
+/// and its body bytes, which do not depend on where the block sits.
+pub(crate) struct SplicedBlock<'a> {
+    pub(crate) ordinal: u32,
+    pub(crate) tail: f32,
+    pub(crate) n_entries: usize,
+    pub(crate) crc: u32,
+    pub(crate) body: &'a [u8],
+}
+
+/// A chunk of `blocks`, in ascending ordinal: the one writer of the chunk
+/// layout, for a fresh tier ([`encode_tier`]) and for blocks a merge
+/// carries over alike, since a block's body is a function of its entries
+/// alone and the directory records what the blocks carry.
+pub(crate) fn encode_spliced_chunk(blocks: &[SplicedBlock<'_>]) -> EncodedChunk {
+    debug_assert!(blocks.windows(2).all(|w| w[0].ordinal < w[1].ordinal));
+    let dir_len = TierDirectory::len_for(blocks.len() as u32);
+    let mut out = Vec::with_capacity(dir_len + blocks.iter().map(|b| b.body.len()).sum::<usize>());
     out.extend_from_slice(&0u32.to_le_bytes());
-    for d in dirs {
-        out.extend_from_slice(&d.ordinal.to_le_bytes());
-        out.extend_from_slice(&d.tail.to_le_bytes());
-        out.push(d.n_entries as u8);
-        out.extend_from_slice(&(d.len as u16).to_le_bytes());
-        out.extend_from_slice(&d.crc.to_le_bytes());
+    for b in blocks {
+        out.extend_from_slice(&b.ordinal.to_le_bytes());
+        out.extend_from_slice(&b.tail.to_le_bytes());
+        out.push(b.n_entries as u8);
+        out.extend_from_slice(&(b.body.len() as u16).to_le_bytes());
+        out.extend_from_slice(&b.crc.to_le_bytes());
     }
-    let crc = crc32c(&out[CHUNK_HEADER_LEN..]);
+    let crc = crc32c(&out[CHUNK_HEADER_LEN..dir_len]);
     out[..CHUNK_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-    out.extend_from_slice(bodies);
+    for b in blocks {
+        out.extend_from_slice(b.body);
+    }
     EncodedChunk {
-        n_blocks: dirs.len() as u32,
+        n_blocks: blocks.len() as u32,
         bytes: out,
     }
 }
 
 /// Append one block's body — the entries of one superfile, sorted by local
 /// id, as three packed streams — to `out`.
-fn encode_block(block: &[TierEntry], out: &mut Vec<u8>) {
+pub(crate) fn encode_block(block: &[TierEntry], out: &mut Vec<u8>) {
     debug_assert!(!block.is_empty() && block.len() <= BLOCK_ENTRIES);
     let n = block.len();
     let mut sorted = [TierEntry {
@@ -358,6 +392,19 @@ impl TierDirectory {
     #[cfg(test)]
     pub(crate) fn block_ordinal(&self, i: usize) -> u32 {
         self.blocks[i].ordinal
+    }
+
+    /// Block `i`'s body carried as it stands, with what the directory
+    /// records about it, into a chunk another merge writes.
+    pub(crate) fn spliced_block<'b>(&self, i: usize, chunk: &'b [u8]) -> SplicedBlock<'b> {
+        let d = &self.blocks[i];
+        SplicedBlock {
+            ordinal: d.ordinal,
+            tail: d.tail,
+            n_entries: d.n_entries,
+            crc: d.crc,
+            body: &chunk[d.offset..d.offset + d.len],
+        }
     }
 
     /// Bound on every entry of block `i`'s superfile past the block.
@@ -484,6 +531,12 @@ impl<'a> TierChunk<'a> {
 
     pub(crate) fn n_blocks(&self) -> usize {
         self.directory.n_blocks()
+    }
+
+    /// Block `i` as it can be carried into another chunk: its directory
+    /// facts and its body bytes, which do not depend on the chunk.
+    pub(crate) fn spliced_block(&self, i: usize) -> SplicedBlock<'a> {
+        self.directory.spliced_block(i, self.bytes)
     }
 
     /// Decode block `i` into `out` (cleared first).

@@ -158,9 +158,9 @@ async fn term_index_slices(
     // Every slice and, beside it, its tier object: all named by the root,
     // so nothing but the root is read.
     let uris: Vec<String> = loaded
-        .segments
+        .layers
         .iter()
-        .flat_map(|segment| &segment.slices)
+        .flat_map(|layer| &layer.slices)
         .flat_map(|slice| {
             [Some(term_index::slice_uri(&slice.content_hash))]
                 .into_iter()

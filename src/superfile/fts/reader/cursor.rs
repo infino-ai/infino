@@ -23,6 +23,8 @@ use super::{
     core::{TermIdf, read_u32_le, read_u64_le},
     metadata::ColumnMeta,
 };
+#[cfg(target_arch = "x86_64")]
+use crate::superfile::fts::posting::ENCODING_BITSET;
 use crate::superfile::{
     ReadError,
     error::FtsError,
@@ -961,6 +963,25 @@ impl TermCursor {
         (hdr, block.block_byte_offset..block.block_byte_end)
     }
 
+    /// Decode block `b` into `ids` and `tfs` without moving the cursor, and
+    /// return its doc count. For a term on the long form only.
+    pub(super) fn decode_block_into(
+        &self,
+        b: usize,
+        ids: &mut [u32; BLOCK_LEN],
+        tfs: &mut [u32; BLOCK_LEN],
+    ) -> usize {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor has no block bytes");
+        let block = self.blocks[b];
+        let hdr = self.block_header(b);
+        decode_block(
+            &self.bytes[block.block_byte_offset..block.block_byte_end],
+            &hdr,
+            ids,
+            tfs,
+        )
+    }
+
     #[inline]
     fn current_header(&mut self) -> BlockHeader {
         let b = self.current_block;
@@ -1205,6 +1226,22 @@ impl TermCursor {
         while self.pos < self.block_n && self.block_doc_ids[self.pos] < doc {
             self.pos += 1;
         }
+    }
+
+    /// Put a cursor that was only probed back into iteration at its first
+    /// doc at or after `target`: a probe may have left the buffers on another
+    /// block, so the block holding `target` is found from the block table,
+    /// decoded whole, and `pos` set in it. For a term on the long form only.
+    pub(super) fn reseek(&mut self, target: u32) {
+        debug_assert!(!self.predecoded, "a pre-decoded cursor needs no reseek");
+        if !self.advance_current_block_to(target) {
+            return;
+        }
+        if self.current_block > self.inspect_block {
+            self.inspect_block = self.current_block;
+        }
+        self.decode_current_block();
+        self.pos = self.block_doc_ids[..self.block_n].partition_point(|&d| d < target);
     }
 
     /// Make the buffers hold the whole current block with the cursor still
@@ -1566,6 +1603,27 @@ impl TermCursor {
             && !self.is_lazy()
             && self.decoded_block == self.current_block
             && self.purpose.decodes_tfs()
+    }
+
+    /// The current block's presence bitset when it is stored as one: the
+    /// doc its first bit stands for, and where its bytes sit in
+    /// [`Self::bytes`]. The cursor must hold the block whole
+    /// ([`Self::holds_whole_block`]).
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn whole_bitset(&mut self) -> Option<(u32, Range<usize>)> {
+        debug_assert!(self.holds_whole_block(), "the block is held whole");
+        if self.predecoded {
+            return None;
+        }
+        let hdr = self.current_header();
+        if hdr.encoding != ENCODING_BITSET {
+            return None;
+        }
+        let block = self.blocks[self.current_block];
+        Some((
+            hdr.base,
+            block.block_byte_offset + hdr.payload()..block.block_byte_end - hdr.tfs_size(),
+        ))
     }
 
     pub(super) fn is_exhausted(&self) -> bool {
