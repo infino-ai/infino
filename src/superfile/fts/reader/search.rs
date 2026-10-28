@@ -160,25 +160,53 @@ pub(super) fn seed_blocks_for(k: usize) -> usize {
     (k.saturating_add(k / 4) / 2).clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
 }
 
-/// `rows`, `count` distinct rows below `n_rows` in any order, ascending:
-/// each is marked in a bitset of the `n_rows` rows and the set bits are
-/// read back in order, the expansion the posting decoder uses for a
-/// presence block.
-fn rows_in_order(rows: impl Iterator<Item = RowId>, count: usize, n_rows: usize) -> Vec<RowId> {
+/// Returns `rows` in ascending order. Rows a doc-id map already left in
+/// order come back as they are; a set dense enough
+/// ([`ROW_ORDER_BITSET_MIN_DENSITY`]) is put in order through a bitset of
+/// the blob's `n_rows` rows ([`rows_in_order`]); anything else, and a set
+/// the bitset refuses, is sorted.
+fn into_row_order(mut rows: Vec<RowId>, n_rows: usize) -> Vec<RowId> {
+    if rows.is_sorted() {
+        return rows;
+    }
+    if rows.len().saturating_mul(ROW_ORDER_BITSET_MIN_DENSITY) >= n_rows
+        && let Some(ordered) = rows_in_order(&rows, n_rows)
+    {
+        return ordered;
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// Returns `rows` in ascending order, read back from a bitset of the
+/// `n_rows` rows in which each is marked: the expansion the posting
+/// decoder uses for a presence block.
+///
+/// Each row must be distinct and below `n_rows`. `None` when one is not,
+/// which only a corrupt doc-id map produces (its length is checked at
+/// open, its values are not, and a lazy open skips the CRC): the caller
+/// then sorts, which returns such a row rather than failing the query.
+fn rows_in_order(rows: &[RowId], n_rows: usize) -> Option<Vec<RowId>> {
     let word_bytes = (u64::BITS / u8::BITS) as usize;
     let mut bits = vec![0u8; n_rows.div_ceil(u64::BITS as usize) * word_bytes];
     for row in rows {
         let r = row.get() as usize;
+        if r >= n_rows {
+            return None;
+        }
         bits[r / u8::BITS as usize] |= 1 << (r % u8::BITS as usize);
     }
-    let mut out = vec![0u32; count + EXPAND_SLACK];
+    let mut out = vec![0u32; rows.len() + EXPAND_SLACK];
     let n = match expand_bitset(&bits, 0, &mut out) {
         Some(n) => n,
         None => expand_bitset_scalar(&bits, 0, &mut out),
     };
-    debug_assert_eq!(n, count, "a doc-id map names each row once");
+    // A row named twice sets one bit: fewer rows come back than went in.
+    if n != rows.len() {
+        return None;
+    }
     out.truncate(n);
-    out.into_iter().map(RowId::new).collect()
+    Some(out.into_iter().map(RowId::new).collect())
 }
 
 impl FtsReader {
@@ -961,9 +989,9 @@ impl FtsReader {
     /// ascending row order: a row-keyed bitmap is built from them, a
     /// membership filter is probed with them, and the exact-match second
     /// pass decodes them in order. On a blob storing its documents in an
-    /// order of its own those are different orders, so this re-orders:
-    /// a dense match through a bitset of the blob's rows, a sparse one by
-    /// sorting. There is nothing to re-order when there is no map.
+    /// order of its own those are different orders, so this re-orders
+    /// ([`into_row_order`]). There is nothing to re-order when there is no
+    /// map.
     ///
     /// No ids read no map.
     pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Result<Vec<RowId>, FtsError> {
@@ -971,20 +999,11 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let map = self.doc_map()?;
+        let rows = ids.iter().map(|&id| map.row_of(id));
         if !self.has_doc_map() {
-            return Ok(ids.into_iter().map(|id| map.row_of(id)).collect());
+            return Ok(rows.collect());
         }
-        let n_rows = self.n_docs() as usize;
-        if ids.len().saturating_mul(ROW_ORDER_BITSET_MIN_DENSITY) >= n_rows {
-            return Ok(rows_in_order(
-                ids.iter().map(|&id| map.row_of(id)),
-                ids.len(),
-                n_rows,
-            ));
-        }
-        let mut rows: Vec<RowId> = ids.into_iter().map(|id| map.row_of(id)).collect();
-        rows.sort_unstable();
-        Ok(rows)
+        Ok(into_row_order(rows.collect(), self.n_docs() as usize))
     }
 
     pub(crate) fn run_prepared(
@@ -2111,6 +2130,55 @@ mod tests {
                 assert_eq!(got, want, "{n_rows} rows, `{term}`");
             }
         }
+    }
+
+    /// Rows of the blob the row-order cases below are put in order over.
+    const ORDER_CASE_ROWS: usize = 8;
+
+    fn row_ids(rows: &[u32]) -> Vec<RowId> {
+        rows.iter().copied().map(RowId::new).collect()
+    }
+
+    /// Rows the map already left ascending come back as they are; out of
+    /// order, dense rows go through the bitset and sparse ones are sorted,
+    /// to the same answer.
+    #[test]
+    fn rows_come_back_ascending_down_every_path() {
+        let ascending = row_ids(&[1, 3, 4, 6]);
+        assert_eq!(
+            into_row_order(ascending.clone(), ORDER_CASE_ROWS),
+            ascending
+        );
+        // Dense enough for the bitset at this blob size.
+        assert!(ascending.len() * ROW_ORDER_BITSET_MIN_DENSITY >= ORDER_CASE_ROWS);
+        assert_eq!(
+            into_row_order(row_ids(&[6, 1, 4, 3]), ORDER_CASE_ROWS),
+            ascending
+        );
+        // Too sparse for the bitset over a blob this many times larger.
+        let large = ORDER_CASE_ROWS * ROW_ORDER_BITSET_MIN_DENSITY * ROW_ORDER_BITSET_MIN_DENSITY;
+        assert!(ascending.len() * ROW_ORDER_BITSET_MIN_DENSITY < large);
+        assert_eq!(into_row_order(row_ids(&[6, 1, 4, 3]), large), ascending);
+    }
+
+    /// A corrupt doc-id map, naming a row past the blob's end or one row
+    /// twice, is refused by the bitset rather than indexed past it or
+    /// silently shortened; the caller's sort returns the rows as they are,
+    /// as the sort path always did, instead of failing the query.
+    #[test]
+    fn a_corrupt_map_falls_back_to_the_sort() {
+        let past_the_end = row_ids(&[6, 1, ORDER_CASE_ROWS as u32 + 1, 3]);
+        assert_eq!(rows_in_order(&past_the_end, ORDER_CASE_ROWS), None);
+        assert_eq!(
+            into_row_order(past_the_end, ORDER_CASE_ROWS),
+            row_ids(&[1, 3, 6, ORDER_CASE_ROWS as u32 + 1])
+        );
+        let twice = row_ids(&[6, 1, 6, 3]);
+        assert_eq!(rows_in_order(&twice, ORDER_CASE_ROWS), None);
+        assert_eq!(
+            into_row_order(twice, ORDER_CASE_ROWS),
+            row_ids(&[1, 3, 6, 6])
+        );
     }
 
     /// The two walks return the same top-k up to float summation order:
