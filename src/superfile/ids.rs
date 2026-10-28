@@ -122,6 +122,17 @@ impl<W> PackedIdOutput<W> {
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// The same sidecar with its blocks behind another handle: a scratch
+    /// file's write handle swapped for a read handle, or a `Vec` for a
+    /// cursor over it.
+    pub(crate) fn map_blocks<R>(self, f: impl FnOnce(W) -> R) -> PackedIdOutput<R> {
+        PackedIdOutput {
+            directory: self.directory,
+            blocks: f(self.blocks),
+            blocks_len: self.blocks_len,
+        }
+    }
 }
 
 impl<W: Write> PackedIdEncoder<W> {
@@ -137,18 +148,24 @@ impl<W: Write> PackedIdEncoder<W> {
         }
     }
 
+    /// Append the next doc's id. A block that fills is encoded and written
+    /// out at once.
+    pub(crate) fn push(&mut self, id: i128) -> io::Result<()> {
+        let v = id as u128;
+        self.his.push((v >> 64) as u64);
+        self.los.push(v as u64);
+        self.n_docs += 1;
+        if self.his.len() == BLOCK_DOCS {
+            self.flush_block()?;
+        }
+        Ok(())
+    }
+
     /// Append `raw` ids (whole little-endian `i128`s, in local doc order).
-    /// Every block that fills is encoded and written out at once.
     pub(crate) fn push_raw(&mut self, raw: &[u8]) -> io::Result<()> {
         debug_assert!(raw.len().is_multiple_of(ID_SIDECAR_ENTRY_BYTES));
         for id in raw.chunks_exact(ID_SIDECAR_ENTRY_BYTES) {
-            let v = u128::from_le_bytes(id.try_into().expect("16-byte id"));
-            self.his.push((v >> 64) as u64);
-            self.los.push(v as u64);
-            self.n_docs += 1;
-            if self.his.len() == BLOCK_DOCS {
-                self.flush_block()?;
-            }
+            self.push(i128::from_le_bytes(id.try_into().expect("16-byte id")))?;
         }
         Ok(())
     }
@@ -634,10 +651,52 @@ mod tests {
         assert!(packed.len() <= ids.len() * ID_SIDECAR_ENTRY_BYTES + headers);
     }
 
+    /// The packed layout byte by byte, for ids that cross one block
+    /// boundary, built by hand from the module's layout comment: pins the
+    /// header, the directory's sidecar-relative offsets, the block header and
+    /// the bit-packed payload independently of the encoder, so a rewrite of
+    /// the encoder cannot move the format without failing here.
+    #[test]
+    fn a_packed_sidecar_is_the_documented_bytes() {
+        const HI: u64 = 0x1122_3344_5566_7788;
+        const LO: u64 = 0x99AA_BBCC_DDEE_FF00;
+        let id = |lo: u64| (((HI as u128) << 64) | lo as u128) as i128;
+        // Block 0: one id repeated, so both halves pack at width 0 and the
+        // block is its header alone. Block 1: three ids whose low halves
+        // are base + 0, 1, 2, width 2.
+        let mut ids = vec![id(LO); BLOCK_DOCS];
+        ids.extend((0..3).map(|i| id(LO + i)));
+        let n_blocks = 2usize;
+        let block0_at = HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES;
+        let block1_at = block0_at + BLOCK_HEADER_BYTES;
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&(BLOCK_DOCS as u32).to_le_bytes());
+        expected.extend_from_slice(&(n_blocks as u32).to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&(block0_at as u64).to_le_bytes());
+        expected.extend_from_slice(&(block1_at as u64).to_le_bytes());
+        expected.extend_from_slice(&HI.to_le_bytes());
+        expected.extend_from_slice(&LO.to_le_bytes());
+        expected.extend_from_slice(&[0u8, 0]);
+        expected.extend_from_slice(&(BLOCK_DOCS as u16).to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&HI.to_le_bytes());
+        expected.extend_from_slice(&LO.to_le_bytes());
+        expected.extend_from_slice(&[0u8, 2]);
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        // Offsets 0, 1, 2 at two bits each, as a little-endian bit stream.
+        expected.push(0b10_01_00);
+
+        assert_eq!(encode_packed(&raw(&ids)), expected);
+        assert_eq!(expected.len(), block1_at + BLOCK_HEADER_BYTES + 1);
+    }
+
     /// The streaming encoder, fed in uneven pieces and writing its blocks to
-    /// a separate sink, produces the bytes the whole-buffer encode does, so
-    /// a merge that packs its sidecar as the rows go by writes the sidecar a
-    /// fresh build would.
+    /// a separate sink, produces the bytes the one-shot encode does: where a
+    /// piece ends has no bearing on the sidecar.
     #[test]
     fn a_streamed_encode_matches_the_whole_buffer_encode() {
         let ids: Vec<i128> = (0..BLOCK_DOCS as i128 * 3 + 17)
