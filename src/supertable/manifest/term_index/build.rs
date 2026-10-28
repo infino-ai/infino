@@ -32,6 +32,8 @@ use std::{
     time::Instant,
 };
 
+use bytes::Bytes;
+use memmap2::Mmap;
 use rayon::{ThreadPool, prelude::*};
 use tempfile::TempDir;
 use tracing::debug;
@@ -1638,13 +1640,29 @@ pub(crate) struct SliceFile {
     pub(crate) last_key: Vec<u8>,
 }
 
+/// `path`'s bytes, mapped read-only; empty for an empty file, which cannot
+/// be mapped.
+fn map_file(path: &Path) -> io::Result<Bytes> {
+    let file = File::open(path)?;
+    if file.metadata()?.len() == 0 {
+        return Ok(Bytes::new());
+    }
+    // SAFETY: the slice files are this merge's own scratch copies, written
+    // before the merge starts and not changed or removed while it reads them.
+    let map = unsafe { Mmap::map(&file)? };
+    Ok(Bytes::from_owner(map))
+}
+
 /// Reads one layer's slices, already on local disk, term by term in key
 /// order.
 struct LayerCursor {
     /// Slice files not opened yet, in key order.
     files: VecDeque<PathBuf>,
-    /// The open slice's bytes; empty before the first file.
-    bytes: Vec<u8>,
+    /// The open slice's bytes, mapped rather than read, so the many cursors
+    /// a merge of many layers keeps open hold their slices in page cache,
+    /// which the kernel can drop and read back, not in the heap; empty
+    /// before the first file.
+    bytes: Bytes,
     /// The open slice's tier object and its length, opened on the first
     /// tier the slice yields; `None` until then and after every slice
     /// change.
@@ -1685,7 +1703,7 @@ impl LayerCursor {
     ) -> Self {
         Self {
             files: files.iter().map(|f| f.path.clone()).collect(),
-            bytes: Vec::new(),
+            bytes: Bytes::new(),
             tier: None,
             tier_file: None,
             window: Arc::new(Vec::new()),
@@ -1714,7 +1732,7 @@ impl LayerCursor {
                     // files after it belongs to it.
                     self.batch.clear();
                     self.files.clear();
-                    self.bytes.clear();
+                    self.bytes = Bytes::new();
                     return Ok(None);
                 }
                 return Ok(Some(term));
@@ -1736,7 +1754,7 @@ impl LayerCursor {
             let Some(path) = self.files.pop_front() else {
                 return Ok(None);
             };
-            self.bytes = fs::read(&path)?;
+            self.bytes = map_file(&path)?;
             self.decode_secs += started.elapsed().as_secs_f64();
             self.tier = None;
             self.window = Arc::new(Vec::new());
