@@ -71,15 +71,16 @@
 //! bump the seq.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::future::join_all;
+use futures::stream::{self, StreamExt};
 use roaring::RoaringBitmap;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -94,6 +95,12 @@ use crate::{
 /// re-GET entries older than this. Coarse enough to amortize
 /// across compaction's selection sweeps.
 pub const DEFAULT_SEAL_TTL: Duration = Duration::from_secs(1);
+
+/// Sidecar GETs in flight at once from a batch prefetch. The compaction
+/// planner prefetches every superfile the manifest lists, so an unbounded
+/// fan-out would put a whole table's worth of requests on the provider at
+/// once and trade the ids it throttles for serial re-reads.
+const SIDECAR_FETCH_MAX_IN_FLIGHT: usize = 32;
 
 /// Reader-side snapshot of the manifest's per-superfile tombstone
 /// versions. Built from
@@ -260,7 +267,17 @@ impl SidecarCache {
     /// learning of it, and every entry older than [`DEFAULT_SEAL_TTL`] is
     /// refreshed. In the steady state of a table with no seals in place
     /// this is one GET per superfile per seal TTL.
+    ///
+    /// `superfile_ids` is every id the caller may consult. An entry that
+    /// only a seal lookup created (the seq map does not name it) for an id
+    /// not in that set belongs to a superfile the table no longer lists,
+    /// and is dropped here: nothing else evicts, and without this the
+    /// cache would grow with everything the table ever listed rather than
+    /// with what it lists now.
     pub async fn prefetch_seals(&self, superfile_ids: &[Uuid], now: Instant) {
+        let listed: HashSet<Uuid> = superfile_ids.iter().copied().collect();
+        self.inner
+            .retain(|id, entry| entry.seq.is_some() || listed.contains(id));
         let view = self.seq_view.load();
         let stale: Vec<(Uuid, Option<u64>)> = superfile_ids
             .iter()
@@ -288,16 +305,26 @@ impl SidecarCache {
         if stale.is_empty() {
             return;
         }
-        let fetches = stale.into_iter().map(|(id, expected)| {
-            let wal_store = self.wal_store.clone();
-            async move { (id, expected, wal_store.get_tombstones(id).await) }
-        });
-        let results = join_all(fetches).await;
+        let results: Vec<_> = stream::iter(stale)
+            .map(|(id, expected)| {
+                let wal_store = self.wal_store.clone();
+                async move { (id, expected, wal_store.get_tombstones(id).await) }
+            })
+            .buffer_unordered(SIDECAR_FETCH_MAX_IN_FLIGHT)
+            .collect()
+            .await;
         for (id, expected, result) in results {
             let (bitmap, seal, etag) = match result {
                 Ok(Some((sidecar, etag))) => (Arc::new(sidecar.bitmap), sidecar.seal, Some(etag)),
                 Ok(None) => (Arc::clone(&self.empty_bitmap), None, None),
-                Err(_) => continue,
+                Err(e) => {
+                    debug!(
+                        superfile_id = %id,
+                        error = %e,
+                        "sidecar prefetch failed; the lookup that consults it re-reads"
+                    );
+                    continue;
+                }
             };
             self.inner.insert(
                 id,
@@ -405,7 +432,8 @@ impl SidecarCache {
 
     /// Number of cached entries. Exposed for tests and for the
     /// overhead bench to confirm the cache reaches the expected
-    /// shape (e.g., one entry per tombstoned superfile post-warmup).
+    /// shape (e.g., one entry per tombstoned superfile post-warmup, plus
+    /// one per listed superfile once a compaction planner has read seals).
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -578,6 +606,16 @@ mod tests {
             assert_eq!(seal.map(|s| s.compaction_id), Some(id));
         }
         assert!(cache.seal_for(untouched, now).expect("seal").is_none());
+
+        // A later prefetch that no longer lists the unmapped ids drops the
+        // entries only their seal lookups created; the mapped one stays.
+        cache.prefetch_seals(&[mapped], now).await;
+        assert_eq!(
+            cache.len(),
+            1,
+            "seal-only entries of unlisted ids are dropped"
+        );
+        assert!(cache.seal_for(mapped, now).expect("seal").is_some());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

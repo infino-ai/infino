@@ -31,7 +31,7 @@ use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tokio::{
     sync::Semaphore,
-    task::{JoinError, JoinSet},
+    task::{Id as TaskId, JoinError, JoinSet},
     time,
 };
 #[cfg(feature = "detailed-tracing")]
@@ -439,13 +439,28 @@ impl Supertable {
 
                     // Build a map of superfile_id → (bitmap, seal) by checking the cache.
                     // Cache hits are O(1); any misses are already prefetched above.
-                    superfile_ids
+                    let mut unread = 0usize;
+                    let sidecars: HashMap<_, _> = superfile_ids
                         .iter()
                         .filter_map(|id| match cache.sidecar_for(*id, now) {
                             Ok((bitmap, seal)) => Some((*id, (bitmap, seal))),
-                            Err(_) => None,
+                            Err(_) => {
+                                unread += 1;
+                                None
+                            }
                         })
-                        .collect()
+                        .collect();
+                    if unread > 0 {
+                        // Planned as unsealed with no tombstones. A seal that
+                        // was there stops the merge at its own seal instead,
+                        // and that job is dropped; the pass is not failed for
+                        // a read the next pass will retry.
+                        warn!(
+                            unread,
+                            "sidecars the planner could not read are planned as unsealed"
+                        );
+                    }
+                    sidecars
                 } else {
                     // Fallback for in-memory-only tables (no storage, no tombstone cache).
                     HashMap::new()
@@ -1442,7 +1457,8 @@ impl Supertable {
     /// A merge that fails, or a batch whose commit is dropped, does not cost
     /// the others their work: the rest still merge and commit. The first
     /// failed merge, lost input, or the dropped batch that stopped the pass
-    /// surfaces after. Otherwise returns how many jobs were dropped at commit.
+    /// surfaces after. Otherwise returns how many jobs were dropped, at
+    /// commit or to an input another compactor sealed after planning.
     async fn run_compaction_jobs(
         &self,
         jobs: Vec<CompactionJob>,
@@ -1478,6 +1494,9 @@ impl Supertable {
         // host's free memory before any of them started. Together they say
         // how much of the reading has yet to materialize.
         let mut charges: HashMap<usize, u64> = HashMap::new();
+        // Which plan index each merge task carries, so a task that panics,
+        // which hands back no index, still releases its charge.
+        let mut task_indices: HashMap<TaskId, usize> = HashMap::new();
         let mut committing_indices: Vec<usize> = Vec::new();
         let mut baseline: Option<u64> = None;
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
@@ -1535,6 +1554,7 @@ impl Supertable {
                 held_back = 0;
                 self.spawn_merge(
                     &mut merging,
+                    &mut task_indices,
                     plan_index,
                     job,
                     stale_seal_timeout,
@@ -1602,7 +1622,7 @@ impl Supertable {
                 }
                 // A merge that has finished should join the next batch and
                 // free its slot rather than wait behind an admission.
-                joined = merging.join_next(), if has_merges => joined,
+                joined = merging.join_next_with_id(), if has_merges => joined,
                 // The settle runs with every admitted merge in flight, so the
                 // reading that follows it sees their allocations rather than
                 // an idle host. That is the whole feedback loop: admit, let it
@@ -1620,7 +1640,14 @@ impl Supertable {
                         charges.insert(plan_index, expected_merge_footprint(&job, indexed));
                         log_merge_admitted(merging.len(), queued.len(), held_back, &charges);
                         held_back = 0;
-                        self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout, merge_threads);
+                        self.spawn_merge(
+                            &mut merging,
+                            &mut task_indices,
+                            plan_index,
+                            job,
+                            stale_seal_timeout,
+                            merge_threads,
+                        );
                     } else {
                         held_back += 1;
                     }
@@ -1635,15 +1662,15 @@ impl Supertable {
                 continue;
             };
 
-            release_failed_merge(&joined, &mut charges);
+            let joined = settle_merge_charge(joined, &mut task_indices, &mut charges);
             if collect_merge(joined, &mut ready, &mut first_error, &mut dropped) {
                 failures_in_a_row += 1;
             }
             // Whatever else has already finished rides along in the same CAS.
             // Polling once never waits, so committing early costs a sibling
             // nothing and merges that land together still batch.
-            while let Some(next) = merging.try_join_next() {
-                release_failed_merge(&next, &mut charges);
+            while let Some(next) = merging.try_join_next_with_id() {
+                let next = settle_merge_charge(next, &mut task_indices, &mut charges);
                 if collect_merge(next, &mut ready, &mut first_error, &mut dropped) {
                     failures_in_a_row += 1;
                 }
@@ -1691,6 +1718,7 @@ impl Supertable {
     fn spawn_merge(
         &self,
         merging: &mut JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
+        task_indices: &mut HashMap<TaskId, usize>,
         plan_index: usize,
         job: CompactionJob,
         stale_seal_timeout: Duration,
@@ -1698,7 +1726,7 @@ impl Supertable {
     ) {
         let table = self.clone();
         let pass = Span::current();
-        merging.spawn(async move {
+        let task = merging.spawn(async move {
             // Each merge is a trace of its own, linked back to the pass, so
             // a pass of many merges does not grow into one huge trace.
             let span = detail_span!("compaction_merge", plan_index = plan_index);
@@ -1722,6 +1750,7 @@ impl Supertable {
             .instrument(span)
             .await
         });
+        task_indices.insert(task.id(), plan_index);
     }
 
     /// Put this job's merged bytes in storage, inside its own task.
@@ -1829,15 +1858,29 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
         .saturating_add(rows)
 }
 
-/// A merge that failed holds nothing any more; its charge goes with it. A
-/// task that panicked carries no plan index, so its charge stays until the
-/// pass ends, which only makes the rest of the pass more careful.
-fn release_failed_merge(
-    joined: &Result<(usize, Result<PreparedJob, CompactionError>), JoinError>,
+/// Settle a merge task's charge as it joins: a merge that failed, or a task
+/// that panicked, holds nothing any more, so its charge goes with it. A
+/// panicked task hands back no plan index; its task id finds it. Hands the
+/// outcome on without the task id.
+fn settle_merge_charge(
+    joined: Result<(TaskId, (usize, Result<PreparedJob, CompactionError>)), JoinError>,
+    task_indices: &mut HashMap<TaskId, usize>,
     charges: &mut HashMap<usize, u64>,
-) {
-    if let Ok((plan_index, Err(_))) = joined {
-        charges.remove(plan_index);
+) -> Result<(usize, Result<PreparedJob, CompactionError>), JoinError> {
+    match joined {
+        Ok((task, (plan_index, outcome))) => {
+            task_indices.remove(&task);
+            if outcome.is_err() {
+                charges.remove(&plan_index);
+            }
+            Ok((plan_index, outcome))
+        }
+        Err(e) => {
+            if let Some(plan_index) = task_indices.remove(&e.id()) {
+                charges.remove(&plan_index);
+            }
+            Err(e)
+        }
     }
 }
 
@@ -2022,7 +2065,7 @@ fn collect_merge(
         // streak nor the pass's result: the table is not sick, and the
         // holder's pass is doing this job's work.
         Ok((_, Err(e @ CompactionError::SidecarConflict { .. }))) => {
-            dropped.record(1, e);
+            dropped.record_held(&e);
             return false;
         }
         Ok((_, Err(e))) => e,
@@ -2049,6 +2092,14 @@ impl DroppedJobs {
         warn!(jobs, error = %e, "compaction jobs dropped, the pass goes on");
         self.jobs += jobs;
         self.last = Some(e);
+    }
+
+    /// A job that left its input to another compactor: counted with the
+    /// dropped jobs, but not a reason for the pass to fail, so it never
+    /// becomes `last`, which a pass that stopped admitting surfaces.
+    fn record_held(&mut self, e: &CompactionError) {
+        warn!(error = %e, "compaction job left its input to another compactor");
+        self.jobs += 1;
     }
 }
 
@@ -7661,6 +7712,35 @@ mod tests {
                 "a systemic failure must end the pass"
             );
         }
+    }
+
+    /// A job that left its input to another compactor is counted with the
+    /// dropped jobs but is not a reason for the pass to fail: it does not
+    /// become the dropped jobs' last error, which a pass that stopped
+    /// admitting on dropped batches surfaces as its own.
+    #[test]
+    fn a_held_input_is_counted_but_does_not_fail_the_pass() {
+        let mut ready = Vec::new();
+        let mut first_error = None;
+        let mut dropped = DroppedJobs::default();
+        let conflict = CompactionError::SidecarConflict {
+            superfile_id: Uuid::new_v4(),
+            existing_compaction_id: Uuid::new_v4(),
+        };
+        let counts = collect_merge(
+            Ok((0, Err(conflict))),
+            &mut ready,
+            &mut first_error,
+            &mut dropped,
+        );
+        assert!(!counts, "a held input is not part of a failure streak");
+        assert_eq!(dropped.jobs, 1, "the job is counted as dropped");
+        assert!(
+            dropped.last.is_none(),
+            "it is not a reason to fail the pass"
+        );
+        assert!(first_error.is_none());
+        assert!(ready.is_empty());
     }
 
     /// A sidecar re-stamp keeps its storage error's kind on the way to the

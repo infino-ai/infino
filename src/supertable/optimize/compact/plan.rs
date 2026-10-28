@@ -57,7 +57,7 @@ pub struct SuperfileStats {
 }
 
 impl SuperfileStats {
-    pub(crate) fn live_docs(&self) -> u64 {
+    fn live_docs(&self) -> u64 {
         self.n_docs.saturating_sub(self.tombstoned_docs)
     }
 
