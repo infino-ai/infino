@@ -552,7 +552,10 @@ pub struct ConnectOptions {
 /// Tuning for `optimize`; all fields optional (omitted ⇒ engine default).
 #[napi(object)]
 pub struct OptimizeOptions {
-    /// Build-time memory budget, in MB.
+    /// Cap on the raw input bytes one merge packs, in MB.
+    pub max_merge_input_mb: Option<u32>,
+    /// Deprecated name of `maxMergeInputMb`; still honoured when the new
+    /// field is absent.
     pub max_memory_mb: Option<u32>,
     /// Only compact superfiles below this fill percent (0–100).
     pub min_fill_percent: Option<u32>,
@@ -1326,8 +1329,8 @@ impl Table {
     pub fn optimize(&self, settings: Option<OptimizeOptions>) -> Result<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
-            if let Some(v) = o.max_memory_mb {
-                s.max_memory_mb = v as u64;
+            if let Some(v) = o.max_merge_input_mb.or(o.max_memory_mb) {
+                s.max_merge_input_mb = v as u64;
             }
             if let Some(v) = o.min_fill_percent {
                 s.min_fill_percent = v as u8;

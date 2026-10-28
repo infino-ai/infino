@@ -20,10 +20,11 @@ use std::{
     collections::BinaryHeap,
     io::Error,
     iter::once,
+    mem,
     ops::Range,
     str::from_utf8,
-    sync::{Arc, Mutex, PoisonError},
-    vec,
+    sync::{Arc, Mutex, PoisonError, mpsc::sync_channel},
+    thread, vec,
 };
 
 use bytes::Bytes;
@@ -40,6 +41,9 @@ use crate::{
 
 /// Terms each input cursor reads from its dictionary at a time.
 pub(crate) const TERMS_PER_CHUNK: usize = 4096;
+
+/// Batches the dictionary walk gathers ahead of the one being merged.
+const BATCHES_AHEAD: usize = 1;
 
 /// Most terms in one parallel batch. Tiny under test, so the merge tests
 /// cross a batch boundary at every kind of term they build.
@@ -121,6 +125,46 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         new_state: &new_state,
         encode: &encode,
     };
+    // The walk over the dictionaries runs a batch ahead on a thread of its
+    // own, so the next batch is gathered while this one is merged and
+    // written. Batches arrive in the order they were walked, so the terms are
+    // written in the same order.
+    let (sender, walked) = sync_channel::<Result<Batch, BuildError>>(BATCHES_AHEAD);
+    thread::scope(|scope| -> Result<(), BuildError> {
+        let readers = &readers;
+        scope.spawn(move || {
+            let walk = walk_batches(readers, &mut cursors, &mut heap, &mut values, |batch| {
+                sender.send(Ok(batch)).is_ok()
+            });
+            if let Err(e) = walk {
+                let _ = sender.send(Err(e));
+            }
+        });
+        for batch in walked {
+            work.run(&batch?, &mut write)?;
+        }
+        Ok(())
+    })?;
+
+    Ok(work
+        .workers
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect())
+}
+
+/// Walk the inputs' dictionaries in term order, gathering terms into
+/// batches and handing each to `emit` in order; the last, possibly empty,
+/// batch too. Stops early once `emit` returns false.
+fn walk_batches(
+    readers: &[&FtsReader],
+    cursors: &mut [TermChunks<'_>],
+    heap: &mut BinaryHeap<Reverse<(Vec<u8>, usize)>>,
+    values: &mut [Option<DictEntry>],
+    mut emit: impl FnMut(Batch) -> bool,
+) -> Result<(), BuildError> {
     let mut batch = Batch::default();
     // The current term's inputs, gathered before it joins a batch.
     let mut term_inputs: Vec<(usize, DictEntry)> = Vec::new();
@@ -147,9 +191,11 @@ pub(crate) fn merge_column<S: Send, T: Send>(
             };
         }
         // A term that would take the batch past its postings starts a new one.
-        if !batch.terms.is_empty() && batch.postings + term_postings > BATCH_POSTINGS {
-            work.run(&batch, &mut write)?;
-            batch.clear();
+        if !batch.terms.is_empty()
+            && batch.postings + term_postings > BATCH_POSTINGS
+            && !emit(mem::take(&mut batch))
+        {
+            return Ok(());
         }
         let term_start = batch.term_bytes.len();
         batch.term_bytes.extend_from_slice(&term);
@@ -160,20 +206,14 @@ pub(crate) fn merge_column<S: Send, T: Send>(
             term: term_start..batch.term_bytes.len(),
             inputs: inputs_start..batch.inputs.len(),
         });
-        if batch.terms.len() >= BATCH_TERMS || batch.postings >= BATCH_POSTINGS {
-            work.run(&batch, &mut write)?;
-            batch.clear();
+        if (batch.terms.len() >= BATCH_TERMS || batch.postings >= BATCH_POSTINGS)
+            && !emit(mem::take(&mut batch))
+        {
+            return Ok(());
         }
     }
-    work.run(&batch, &mut write)?;
-
-    Ok(work
-        .workers
-        .into_inner()
-        .unwrap_or_else(PoisonError::into_inner)
-        .into_iter()
-        .map(|(_, s)| s)
-        .collect())
+    emit(batch);
+    Ok(())
 }
 
 /// Terms per task for a batch of `n_terms`.
@@ -196,15 +236,6 @@ struct Batch {
     /// `(input, that input's dictionary value)` for every term's inputs.
     inputs: Vec<(usize, DictEntry)>,
     postings: u64,
-}
-
-impl Batch {
-    fn clear(&mut self) {
-        self.terms.clear();
-        self.term_bytes.clear();
-        self.inputs.clear();
-        self.postings = 0;
-    }
 }
 
 /// One worker's buffers for merging a term.

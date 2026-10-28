@@ -281,7 +281,7 @@ test("optimize merges superfiles, data intact (localfs)", () => {
   docs.append([{ title: "beta" }]);
   docs.append([{ title: "gamma" }]);
 
-  docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMemoryMb: 512 });
+  docs.optimize({ targetSuperfileSizeMb: 256, minFillPercent: 50, maxMergeInputMb: 512 });
   // data is intact after compaction
   assert.equal(docs.tokenMatch("title", "beta").length, 1);
   assert.equal(docs.tokenMatch("title", "alpha").length, 1);

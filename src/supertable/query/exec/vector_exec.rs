@@ -64,11 +64,13 @@ use crate::{
         query::{
             candidate::CandidatePlan,
             exec::common::{
-                PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
-                candidate_plan_for_filters, exact_scope, fill_top_k, fill_top_k_within,
-                live_reader, output_schema_with_score, resolve_hits, scope_to_call, traced_tvf,
+                PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                exact_scope, fill_top_k, fill_top_k_within, live_reader, output_schema_with_score,
+                over_fetch_ceiling, resolve_hits, scope_to_call, traced_tvf,
             },
-            vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
+            vector::{
+                hits_id_score_batch, sql_id_score_projection, user_placement_for_scalar_resolve,
+            },
         },
     },
     utils::trace::detail_span,
@@ -213,13 +215,13 @@ impl TableProvider for VectorSearchTable {
     /// (keyword / categorical values) the pushdown is exact and the
     /// `FilterExec` drops nothing. Where it is not — a literal that is a
     /// sub-token of larger text, or a predicate no index bounds at all —
-    /// the exec applies the exact predicate to its own rows. When a round
-    /// at `k` leaves fewer than `k`, it evaluates the predicate over the
-    /// scope's rows (`exact_scope`) and runs one filtered search within
+    /// the exec applies the exact predicate to its own rows and widens the
+    /// kNN until `k` survive (`fill_top_k`). When that widening ends short
+    /// at a ceiling below the table's size, it evaluates the predicate over
+    /// the scope's rows (`exact_scope`) and runs one filtered search within
     /// exactly the rows it keeps, so matching rows are found however many
     /// nearer rows the predicate rejects. A predicate it cannot evaluate
-    /// before ranking (one on `score`) falls back to widening the kNN until
-    /// `k` survive (`fill_top_k`), which is bounded and best-effort.
+    /// before ranking (one on `score`) keeps what the widening found.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -358,46 +360,11 @@ impl ExecutionPlan for VectorSearchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
-        let requested: Vec<usize> = projection
-            .clone()
-            .unwrap_or_else(|| (0..output_schema.fields().len()).collect());
-        // Same rule as the public API, classified through the same
-        // function ([`free_column_slot`]) rather than a second copy of
-        // it: map each requested DataFusion column index back to its
-        // name and ask whether that column comes free with the search
-        // wave. Empty stays `Some([])` here — DataFusion emits an empty
-        // projection for `COUNT(*)`-shaped plans, where a zero-column
-        // batch is the wanted output (the public API sends empty down
-        // the general path instead; each policy lives at its own call
-        // site).
-        //
-        // Arrow permits duplicate field names, so a user column
-        // literally named `score` (or matching the id column) would
-        // make the name lookup ambiguous where the old index compare
-        // could not be. Decline the fast path outright in that case.
-        let id_column = reader.options().id_column.as_str();
-        let ambiguous = |name: &str| {
-            output_schema
-                .fields()
-                .iter()
-                .filter(|f| f.name() == name)
-                .count()
-                > 1
-        };
-        let id_score_projection: Option<Vec<usize>> =
-            if ambiguous(id_column) || ambiguous(SCORE_COLUMN) {
-                None
-            } else {
-                requested
-                    .iter()
-                    .map(|&idx| {
-                        output_schema
-                            .fields()
-                            .get(idx)
-                            .and_then(|f| free_column_slot(f.name(), id_column))
-                    })
-                    .collect()
-            };
+        let id_score_projection = sql_id_score_projection(
+            &output_schema,
+            projection.as_deref(),
+            reader.options().id_column.as_str(),
+        );
 
         let fut = async move {
             // Lower the pushed-down `WHERE` filters to an FTS candidate
@@ -405,10 +372,11 @@ impl ExecutionPlan for VectorSearchExec {
             // distance only among matching rows); `Unbounded` (no
             // FTS-resolvable predicate, or none pushed) runs the plain kNN.
             // Either way the exact predicate is then applied to the
-            // resolved rows; when that leaves fewer than `k`, the function
-            // evaluates the predicate over the scope's rows itself and
-            // searches within exactly those (`exact_scope`), so a superset
-            // bound or a scalar predicate never leaves it short of `k`.
+            // resolved rows and the search widened until `k` survive; when
+            // the widening ends short at a ceiling below the table's size,
+            // the function evaluates the predicate over the scope's rows
+            // itself and searches within exactly those (`exact_scope`), so
+            // a superset bound or a scalar predicate never leaves it short.
             let plan = candidate_plan_for_filters(reader.manifest(), &filters);
             let search = |want: usize| {
                 let reader = &reader;
@@ -431,10 +399,9 @@ impl ExecutionPlan for VectorSearchExec {
                     Ok::<_, QueryError>(hits)
                 }
             };
-            // Same stamp guard as the hybrid exec path: unstamped hits fall
-            // through to placement rather than failing the query. The
-            // free-column fast path decodes nothing, so it can only serve
-            // a query with no predicate to check.
+            // Unstamped hits fall through to placement rather than failing
+            // the query. The free-column fast path decodes nothing, so it
+            // can only serve a query with no predicate to check.
             if filters.is_empty()
                 && let Some(indices) = id_score_projection
             {
@@ -463,50 +430,34 @@ impl ExecutionPlan for VectorSearchExec {
                     user_placement_for_scalar_resolve(reader, &hits).await
                 }
             };
-            let Some(predicate) = predicate.as_ref() else {
-                return fill_top_k(
-                    &reader,
-                    k,
-                    predicate.as_ref(),
-                    &scalar_schema,
-                    &output_schema,
-                    projection.as_deref(),
-                    placed,
-                )
-                .await;
-            };
-            // One round at `k` first: a predicate most rows near the query
-            // satisfy fills `k` here, at the cost of the search alone.
-            let first = fill_top_k_within(
+            // Widen first, up to the fill's ceiling: the rounds stop as soon
+            // as `k` of the nearest pass the predicate, which for a predicate
+            // most rows near the query satisfy is a round or two.
+            let widened = fill_top_k(
                 &reader,
                 k,
-                Some(predicate),
+                predicate.as_ref(),
                 &scalar_schema,
                 &output_schema,
                 projection.as_deref(),
-                k,
-                &placed,
+                placed,
             )
             .await?;
-            if first.num_rows() >= k {
-                return Ok(first);
+            let Some(predicate) = predicate.as_ref() else {
+                return Ok(widened);
+            };
+            let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+            if widened.num_rows() >= k || over_fetch_ceiling(k, total) >= total {
+                // Either `k` passed, or the ceiling let the search reach every
+                // row and the rows it returned are all there are.
+                return Ok(widened);
             }
-            // Short: the rows the predicate keeps sit past the kernel's `k`
-            // nearest, or fewer than `k` exist. Rank within exactly those rows,
-            // which one filtered search returns, where widening stops at its
-            // ceiling with matching rows still beyond it.
+            // Short at the ceiling: rows the predicate keeps may sit farther
+            // than every hit the widening looked at. Check the predicate on
+            // the scope's rows, and search within exactly the ones it keeps.
             let scope = reader.candidate_scope(&filters, &plan).await?;
             let Some(exact) = exact_scope(&reader, &scope, predicate, &output_schema).await? else {
-                return fill_top_k(
-                    &reader,
-                    k,
-                    Some(predicate),
-                    &scalar_schema,
-                    &output_schema,
-                    projection.as_deref(),
-                    placed,
-                )
-                .await;
+                return Ok(widened);
             };
             let within = |want: usize| {
                 let reader = &reader;

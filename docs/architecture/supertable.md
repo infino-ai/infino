@@ -603,18 +603,20 @@ to both of its retrievers, so they rank within the same rows before
 fusion. Whatever the index could not bound (a scalar column, a
 negation, a token superset that the exact predicate trims), the
 function makes up by applying the exact predicate to its own resolved
-rows. `bm25_search` and `vector_search` rank one round of k and check
-it; when fewer than k rows survive, they evaluate the predicate over
-the scope's rows themselves, keep exactly the rows it holds on, and
-rank once more within those (`vector_search` through its filtered
+rows and widening the search — doubling k each round — until k rows
+survive or a bounded ceiling is reached. `bm25_search` and
+`vector_search` go one step further when that widening ends short at a
+ceiling below the table's size: they evaluate the predicate over the
+rows they can return (`bm25_search` the rows the query's terms match,
+`vector_search` the scope's rows), keep exactly the rows it holds on,
+and rank once more within those (`vector_search` through its filtered
 kernel, over those rows' allow-sets), so the answer is the top k among
 matching rows however far below the unfiltered top-k they rank. The
-cost of that pass is a decode of the predicate's columns over the
-scope's rows, paid only by a predicate that left the first round
-short. `hybrid_search` and prefix search instead widen the search —
-doubling k each round — until k rows survive or a bounded ceiling is
-reached, and prefix search takes only that tier: its term set is known
-per superfile, not per query.
+cost of that pass is a decode of the predicate's columns over those
+rows, paid only by a predicate the widening could not fill.
+`hybrid_search` and prefix search stop at the widening, and prefix
+search takes only that tier: its term set is known per superfile, not
+per query.
 
 ## Concurrency
 

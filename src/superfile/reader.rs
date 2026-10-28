@@ -116,7 +116,7 @@ const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 /// selection skips cost more than its bookkeeping saves, most of all when
 /// the rows cluster (matches close in time, as a log's are) and whole
 /// pages hold none of them.
-const WHOLE_COLUMN_TAKE_DIVISOR: u64 = 16;
+pub(crate) const WHOLE_COLUMN_TAKE_DIVISOR: u64 = 16;
 
 pub(crate) fn vector_layout_from_kv(kv_map: &HashMap<String, String>) -> VectorLayout {
     kv_map

@@ -21,7 +21,7 @@
 //! `crc-fast` exposes this as `CrcAlgorithm::Crc32Iscsi` /
 //! `crc32_iscsi(...)`.
 
-use crc_fast::CrcAlgorithm;
+use crc_fast::{CrcAlgorithm, Digest};
 
 /// Compute CRC32C over `bytes`. Hardware-accelerated when the crate's
 /// runtime feature detection finds SSE4.2 (x86) or v8.1 CRC (ARM); falls
@@ -31,19 +31,20 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
     crc_fast::crc32_iscsi(bytes) as u32
 }
 
-/// Streaming variant — extend a prior `prev` CRC by `bytes`. Implemented
-/// via `checksum_combine` polynomial math (`crc-fast` doesn't expose a
-/// seed-from-prev API on its `Digest`). Used by streaming builders and
-/// kept here so callers don't reach for the upstream crate directly.
+/// Streaming variant — extend a prior `prev` CRC by `bytes`. Used by
+/// streaming builders and kept here so callers don't reach for the
+/// upstream crate directly.
+///
+/// CRC32C's finished value is its register with every bit flipped, so the
+/// register `prev` left off at is `!prev`, and resuming from it costs only
+/// the bytes. Combining a separate CRC of `bytes` into `prev` gives the same
+/// value but pays a polynomial combine per call, which dominated writing an
+/// index of many short terms.
 #[inline]
 pub fn crc32c_append(prev: u32, bytes: &[u8]) -> u32 {
-    let suffix = crc_fast::crc32_iscsi(bytes) as u64;
-    crc_fast::checksum_combine(
-        CrcAlgorithm::Crc32Iscsi,
-        prev as u64,
-        suffix,
-        bytes.len() as u64,
-    ) as u32
+    let mut digest = Digest::new_with_init_state(CrcAlgorithm::Crc32Iscsi, u64::from(!prev));
+    digest.update(bytes);
+    digest.finalize() as u32
 }
 
 #[cfg(test)]
@@ -91,6 +92,40 @@ mod tests {
             acc2 = crc32c_append(acc2, chunk);
         }
         assert_eq!(acc2, one_shot);
+    }
+
+    #[test]
+    fn append_matches_combining_a_separate_crc() {
+        // What `crc32c_append` computed before resuming the register: a CRC
+        // of the suffix combined into the prefix's. Every split of a buffer,
+        // across lengths that cross the crate's small-input and folding paths.
+        let combine = |prev: u32, bytes: &[u8]| {
+            crc_fast::checksum_combine(
+                CrcAlgorithm::Crc32Iscsi,
+                u64::from(prev),
+                u64::from(crc32c(bytes)),
+                bytes.len() as u64,
+            ) as u32
+        };
+        let buf: Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        for len in [0, 1, 2, 3, 7, 8, 15, 16, 31, 63, 64, 255, 256, 1000, 4096] {
+            let data = &buf[..len];
+            for cut in 0..=len.min(70) {
+                let prev = crc32c(&data[..cut]);
+                assert_eq!(
+                    crc32c_append(prev, &data[cut..]),
+                    combine(prev, &data[cut..]),
+                    "len {len} cut {cut}"
+                );
+                assert_eq!(
+                    crc32c_append(prev, &data[cut..]),
+                    crc32c(data),
+                    "len {len} cut {cut}"
+                );
+            }
+        }
     }
 
     #[test]

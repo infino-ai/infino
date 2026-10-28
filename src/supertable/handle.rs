@@ -1854,7 +1854,7 @@ pub(crate) fn hidden_vector_index_compaction_settings(
         // it here (a cell merges on any two shards regardless of the floor).
         min_fill_percent: cfg.compaction.min_fill_percent,
         min_superfiles_for_merge: vector.compaction_min_superfiles_for_merge,
-        max_memory_mb: vector.compaction_max_memory_mb,
+        max_merge_input_mb: vector.compaction_max_memory_mb,
         // The width the user table's pass runs at, so an operator who asked for
         // one merge at a time gets one here too: this pass runs on the same
         // machine, out of the same pools, and a setting that only made half the
@@ -4825,7 +4825,7 @@ mod tests {
             target_superfile_size_mb: 1,
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
-            max_memory_mb: 64,
+            max_merge_input_mb: 64,
             max_concurrent_jobs: Some(1),
             ..Default::default()
         }

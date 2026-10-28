@@ -2702,6 +2702,79 @@ impl SupertableReader {
             .await
     }
 
+    /// `scope` narrowed to the rows `query`'s terms match under `mode`: the
+    /// rows a BM25 search of the same query can return, which is all a
+    /// `WHERE` on that search ever needs checked. A superfile the term
+    /// bloom rules out, or that the scope does not admit, is not opened;
+    /// in the rest the match is intersected with the scope's set when it
+    /// bounds one (already free of tombstones) and has the superfile's
+    /// tombstones taken out when it does not. The result is bounded, its
+    /// sets free of tombstones, and holds only superfiles with a row left.
+    pub(crate) async fn match_scope(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        scope: &CandidateScope,
+    ) -> Result<CandidateScope, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(CandidateScope::empty());
+        };
+        let admitted: HashSet<SuperfileUri> =
+            scope.admitted_superfiles().map(|entry| entry.uri).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<Arc<RoaringBitmap>>))> = units
+            .into_iter()
+            .filter(|(entry, _)| admitted.contains(&entry.uri))
+            .map(|(entry, suid)| {
+                let within = scope
+                    .allow
+                    .as_ref()
+                    .and_then(|allow| allow.get(&entry.uri).cloned());
+                (entry, (suid, within))
+            })
+            .collect();
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
+            let kernel = Arc::clone(&kernel);
+            async move {
+                let mut rows: RoaringBitmap = kernel
+                    .docs(&r, suid)
+                    .await?
+                    .into_iter()
+                    .map(RowId::get)
+                    .collect();
+                match within {
+                    Some(within) => rows &= within.as_ref(),
+                    None => {
+                        if let Some(cache) = cache.as_ref()
+                            && let Some(deny) =
+                                dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                        {
+                            rows -= deny.as_ref();
+                        }
+                    }
+                }
+                Ok((entry, rows))
+            }
+        };
+        let matched = dispatch::fanout_with(self, units, true, self.open_intent(), body).await?;
+        let mut superfiles = Vec::with_capacity(matched.len());
+        let mut allow = HashMap::with_capacity(matched.len());
+        for (entry, rows) in matched {
+            if !rows.is_empty() {
+                allow.insert(entry.uri, Arc::new(rows));
+                superfiles.push(entry);
+            }
+        }
+        Ok(CandidateScope {
+            superfiles,
+            allow: Some(allow),
+        })
+    }
+
     /// What every unranked match walk starts from: the superfiles the
     /// query's terms can match (`None` when there are none) and the kernel
     /// that finds the matching rows in any one of them.

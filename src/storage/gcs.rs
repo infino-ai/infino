@@ -381,23 +381,35 @@ impl StorageProvider for GcsStorageProvider {
         let path = self.path(uri)?;
         let n = bytes.len() as u64;
         // PutMode::Create maps to `x-goog-if-generation-match: 0` (native
-        // create-if-absent). Re-issue only transient failures. Return the
-        // new *generation* (r.version) — the CAS token callers chain forward
-        // — not the HTTP etag (r.e_tag).
-        let out = retry::with_reissue(|| {
-            let bytes = bytes.clone();
-            async {
-                let opts = PutOptions {
-                    mode: PutMode::Create,
-                    ..Default::default()
-                };
-                self.store
-                    .put_opts(&path, PutPayload::from_bytes(bytes), opts)
+        // create-if-absent). Re-issue only transient failures; every issue
+        // carries this call's id, and a `PreconditionFailed` is settled with
+        // one HEAD (see `create_with_reissue`). Return the new *generation*
+        // (r.version) — the CAS token callers chain forward — not the HTTP
+        // etag (r.e_tag); the HEAD's token is the generation too.
+        let id = retry::CreateId::new();
+        let out = retry::create_with_reissue(
+            uri,
+            &id,
+            || {
+                let bytes = bytes.clone();
+                async {
+                    self.store
+                        .put_opts(&path, PutPayload::from_bytes(bytes), id.put_options())
+                        .await
+                        .map(|r| r.version)
+                        .map_err(|e| translate(uri, e))
+                }
+            },
+            || async {
+                let head = self
+                    .store
+                    .get_opts(&path, retry::head_options())
                     .await
-                    .map(|r| r.version)
-                    .map_err(|e| translate(uri, e))
-            }
-        })
+                    .map_err(|e| translate(uri, e))?;
+                self.meter.record_head();
+                Ok((head.attributes, version_token(&head.meta)))
+            },
+        )
         .await;
         if out.is_ok() {
             self.meter.record_put(n);

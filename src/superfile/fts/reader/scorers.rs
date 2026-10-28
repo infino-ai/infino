@@ -8,6 +8,8 @@
 
 #[cfg(test)]
 use std::cell::{Cell, RefCell};
+#[cfg(target_arch = "x86_64")]
+use std::ops::Range;
 use std::{cmp::Ordering, collections::BinaryHeap, mem, slice::from_mut};
 
 use wide::f32x8;
@@ -1317,7 +1319,7 @@ fn accumulate_one(
 }
 
 /// Add the rest of the cursor's block inside the window at once: the
-/// postings before `window_end` found once, scored and marked eight at a
+/// postings before `window_end` found once, scored and marked a run at a
 /// time with no per-posting bound or block checks, the cursor moved past
 /// them once. Each posting gets the same operations as scored alone, so the
 /// same bits. A lazily held block, whose buffer shows a single doc, adds
@@ -1336,33 +1338,51 @@ fn accumulate_segment(
         return;
     }
     let (pos, n) = (c.pos, c.block_n);
-    let ids = &c.block_doc_ids[..n];
-    let to = match ids[n - 1] < window_end {
+    // The cursor's doc is inside the window, so at least it is added.
+    let to = match c.block_doc_ids[n - 1] < window_end {
         true => n,
-        false => pos + ids[pos..].partition_point(|&d| d < window_end),
+        false => pos + c.block_doc_ids[pos..n].partition_point(|&d| d < window_end),
     };
-    let tfs = &c.block_tfs[..n];
     let mut i = pos;
     #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx2")
-        {
+    if avx512_kernels() {
+        if let Some((bit_base, bitset)) = c.whole_bitset() {
+            let ids = &c.block_doc_ids[..n];
             // SAFETY: both features the kernel enables are present (checked
-            // above).
-            i += unsafe {
-                accumulate_run_avx512(
+            // by `avx512_kernels`).
+            let added = unsafe {
+                accumulate_bitset_avx512(
                     c.idf_weight,
-                    &ids[pos..to],
-                    &tfs[pos..to],
+                    BitsetRun {
+                        words: &c.bytes[bitset],
+                        bit_base,
+                        docs: ids[pos]..ids[to - 1] + 1,
+                        tfs: &c.block_tfs[pos..to],
+                    },
                     base,
                     scores,
                     present,
                     dl_norm_k1,
                 )
             };
+            debug_assert_eq!(added, to - pos, "one tf per doc of the bitset");
+            c.advance_by(to - pos);
+            return;
         }
+        // SAFETY: as above.
+        i += unsafe {
+            accumulate_run_avx512(
+                c.idf_weight,
+                &c.block_doc_ids[pos..to],
+                &c.block_tfs[pos..to],
+                base,
+                scores,
+                present,
+                dl_norm_k1,
+            )
+        };
     }
+    let (ids, tfs) = (&c.block_doc_ids[..n], &c.block_tfs[..n]);
     while i + 8 <= to {
         let dids: [u32; 8] = ids[i..i + 8]
             .try_into()
@@ -1383,12 +1403,37 @@ fn accumulate_segment(
     c.advance_by(to - pos);
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Run the union window's portable accumulate even where the AVX-512
+    /// kernels could, so a test can compare the two paths' windows.
+    pub(super) static PORTABLE_ACCUMULATE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the union window's AVX-512 kernels run here: the CPU has both
+/// features they enable.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn avx512_kernels() -> bool {
+    #[cfg(test)]
+    if PORTABLE_ACCUMULATE.with(Cell::get) {
+        return false;
+    }
+    std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx2")
+}
+
+/// The aligned unit both AVX-512 window kernels add into: one 16-lane
+/// register of scores. The window's width is a multiple of it.
+const ACCUMULATE_TILE: usize = 16;
+const _: () = assert!((OR_WINDOW as usize).is_multiple_of(ACCUMULATE_TILE));
+
 /// The eight-wide loop of [`accumulate_segment`] over one in-window run of
 /// a block's postings, returning how many it consumed (a multiple of eight).
 /// Eight postings of a dense term usually span fewer than 16 documents; their
-/// contributions are then expanded into those 16 slots under a bit mask and
-/// added with one 16-wide read-modify-write, in place of eight scalar ones,
-/// and the same mask marks them present. Their norms' buckets are then 16
+/// contributions are then expanded under a bit mask into the aligned tile
+/// ([`ACCUMULATE_TILE`]) holding the first, and the next when they cross its
+/// end, each added with one 16-wide read-modify-write in place of eight
+/// scalar ones, and the same mask marks them present. Their norms' buckets are then 16
 /// contiguous bytes too: one load, compressed under the mask to the eight
 /// docs' buckets, and one gather from the decode table, in place of eight
 /// dependent loads of each. Every slot still receives exactly its own
@@ -1399,9 +1444,11 @@ fn accumulate_segment(
 /// # Safety
 ///
 /// The caller must have detected both AVX-512F and AVX2 at runtime. Given
-/// that, every access is bounds-checked before it is made: a 16-slot
-/// read-modify-write only when the run's first slot plus 16 fits the window,
-/// and a 16-byte bucket load only when it fits the norm table; gather indices
+/// that, every access is bounds-checked before it is made: a tile's
+/// read-modify-write only when the run's last doc is inside the window (a
+/// tile is aligned to a divisor of the window's width, so every tile the run
+/// touches is inside it), and a 16-byte bucket load only when it fits the
+/// norm table; gather indices
 /// are bytes into a 256-entry table. Ids that are not ascending give wrong
 /// sums or a panic, never an out-of-bounds access.
 #[cfg(target_arch = "x86_64")]
@@ -1429,7 +1476,7 @@ unsafe fn accumulate_run_avx512(
             .expect("invariant: an 8-wide slice");
         let first = (dids[0] - base) as usize;
         if dids[7] - dids[0] < 16
-            && first + 16 <= OR_WINDOW as usize
+            && ((dids[7] - base) as usize) < OR_WINDOW as usize
             && dids[0] as usize + 16 <= buckets.len()
         {
             let mut mask = 0u32;
@@ -1453,23 +1500,49 @@ unsafe fn accumulate_run_avx512(
                 norms
             };
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, norms);
-            // SAFETY: as above for the target features. The 16-lane load and
-            // store cover `[first, first + 16)`, inside the window slice by the
-            // check above; both are unaligned forms. The expand reads only the
-            // low eight source lanes (the mask has eight bits set), all of them
-            // defined by the 256-bit load.
+            // The eight docs land in the 16-slot tile holding the first and,
+            // when they cross its end, the next: tiles aligned to 16 slots, so
+            // the next run reads either a tile this one wrote whole, which the
+            // store forwards, or one it did not touch, never a partial overlap
+            // that would wait for the store to drain.
+            let tile = first & !(ACCUMULATE_TILE - 1);
+            let wide = mask << (first - tile);
+            let (low, high) = (wide as u16, (wide >> ACCUMULATE_TILE) as u16);
+            // SAFETY: as above for the target features. The last doc's slot is
+            // inside the window by the check above, and tiles are aligned to a
+            // divisor of the window's width, so each tile written — the first's,
+            // and the next only when a doc falls in it — lies inside the window
+            // slice; the loads and stores are unaligned forms. Each expand
+            // reads only as many low source lanes as its mask has bits, at most
+            // the eight the 256-bit load defined; the second takes the lanes
+            // past the first tile's, moved down by the permute.
             unsafe {
                 let src = _mm512_castps256_ps512(_mm256_loadu_ps(contributions.as_ptr()));
-                let add = _mm512_maskz_expand_ps(mask as u16, src);
-                let slot = scores.as_mut_ptr().add(first);
+                let slot = scores.as_mut_ptr().add(tile);
+                let add = _mm512_maskz_expand_ps(low, src);
                 _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), add));
+                if high != 0 {
+                    let past = _mm512_set1_epi32(low.count_ones() as i32);
+                    let lanes = _mm512_add_epi32(
+                        _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+                        past,
+                    );
+                    let rest = _mm512_permutexvar_ps(lanes, src);
+                    let add = _mm512_maskz_expand_ps(high, rest);
+                    let slot = slot.add(ACCUMULATE_TILE);
+                    _mm512_storeu_ps(slot, _mm512_add_ps(_mm512_loadu_ps(slot), add));
+                }
             }
             let (word, bit) = (first >> 6, first & 63);
             present[word] |= u64::from(mask) << bit;
-            // A mask starting past bit 48 reaches into the next word, which
-            // exists: the run ends inside the window.
-            if bit > 48 {
-                present[word + 1] |= u64::from(mask) >> (64 - bit);
+            // A mask starting past bit 48 may reach into the next word; when
+            // it does, that word holds one of the run's docs, so it exists.
+            let spill = match bit {
+                0 => 0,
+                _ => u64::from(mask) >> (64 - bit),
+            };
+            if spill != 0 {
+                present[word + 1] |= spill;
             }
         } else {
             let contributions = bm25::score_one_term_x8(idf_weight, tf8, dl_norm_k1.get8(dids));
@@ -1478,6 +1551,133 @@ unsafe fn accumulate_run_avx512(
         i += 8;
     }
     i
+}
+
+/// The docs of a bitset block one window adds: bit `i` of `words` stands
+/// for doc `bit_base + i`; the docs in `docs` are added, each with the next
+/// of `tfs` in doc order.
+#[cfg(target_arch = "x86_64")]
+struct BitsetRun<'a> {
+    words: &'a [u8],
+    bit_base: u32,
+    docs: Range<u32>,
+    tfs: &'a [u32],
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BitsetRun<'_> {
+    /// The run's docs among `[tile, tile + 16)`, as a mask of lanes.
+    #[inline(always)]
+    fn tile_mask(&self, tile: u32) -> u16 {
+        let off = i64::from(tile) - i64::from(self.bit_base);
+        let (at, shift) = (off.div_euclid(8), off.rem_euclid(8));
+        // Inside the bitset, one four-byte read holds the tile's bits; at
+        // its edges, the bytes past it read as empty.
+        let bits = match usize::try_from(at)
+            .ok()
+            .and_then(|at| self.words.get(at..at + 4))
+        {
+            Some(four) => u32::from_le_bytes(four.try_into().expect("invariant: four bytes")),
+            None => {
+                let byte = |i: i64| match usize::try_from(i) {
+                    Ok(i) => self.words.get(i).map_or(0, |&b| u32::from(b)),
+                    Err(_) => 0,
+                };
+                byte(at) | byte(at + 1) << 8 | byte(at + 2) << 16
+            }
+        };
+        let mut mask = (bits >> shift) as u16;
+        // Lanes before the run's first doc or past its last are dropped.
+        let width = ACCUMULATE_TILE as u32;
+        let lo = self.docs.start.saturating_sub(tile).min(width);
+        let hi = self.docs.end.saturating_sub(tile).min(width);
+        mask &= ((1u32 << hi) - 1) as u16 & !(((1u32 << lo) - 1) as u16);
+        mask
+    }
+}
+
+/// [`accumulate_run_avx512`] for a block stored as a presence bitset, which
+/// a common term's dense blocks are: the window is walked in its aligned
+/// 16-slot tiles, and a tile's docs are read off the bitset as a lane mask
+/// rather than rebuilt from expanded ids. A tile's tfs are expanded into
+/// its lanes from the block's tfs in one load, its docs' length buckets are
+/// 16 contiguous bytes, and its lanes are scored and added at once: lanes
+/// without a doc score `0 / (0 + 1)`, exactly `0.0`, which leaves a
+/// non-negative slot as it was. A doc's contribution takes the operations
+/// [`bm25::score_one_term_x8`] gives it, so the window holds the same bits.
+/// Returns how many docs it added.
+///
+/// # Safety
+///
+/// The caller must have detected AVX-512F and AVX2 at runtime. Every access
+/// is bounds-checked: a tile is inside the window (it is aligned to a
+/// divisor of the window's width and holds an in-window doc), the tf load
+/// reads one tf per doc and is checked against `tfs`, the 16-byte bucket
+/// load is taken only when it fits the norm table, and gather indices are
+/// bytes into a 256-entry table.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx2")]
+unsafe fn accumulate_bitset_avx512(
+    idf_weight: f32,
+    run: BitsetRun<'_>,
+    base: u32,
+    scores: &mut [f32],
+    present: &mut [u64],
+    dl_norm_k1: &NormTable,
+) -> usize {
+    use std::arch::x86_64::*;
+    let scores = &mut scores[..OR_WINDOW as usize];
+    let present = &mut present[..OR_WINDOW_WORDS];
+    let (buckets, lut) = dl_norm_k1.parts();
+    debug_assert!(run.docs.start >= base && run.docs.end <= base.saturating_add(OR_WINDOW));
+    let first = (run.docs.start - base) as usize & !(ACCUMULATE_TILE - 1);
+    let mut j = 0usize;
+    for slot in (first..(run.docs.end - base) as usize).step_by(ACCUMULATE_TILE) {
+        let tile = base + slot as u32;
+        let mask = run.tile_mask(tile);
+        if mask == 0 {
+            continue;
+        }
+        let n = mask.count_ones() as usize;
+        assert!(j + n <= run.tfs.len(), "a bitset doc without a tf");
+        let mut bytes = [0u8; ACCUMULATE_TILE];
+        match buckets.get(tile as usize..tile as usize + ACCUMULATE_TILE) {
+            Some(tile_buckets) => bytes.copy_from_slice(tile_buckets),
+            None => {
+                for (lane, b) in bytes.iter_mut().enumerate() {
+                    if mask >> lane & 1 == 1 {
+                        *b = buckets[tile as usize + lane];
+                    }
+                }
+            }
+        }
+        // SAFETY: the target features are enabled on this function (see the
+        // contract above). The expand-load reads `n` consecutive tfs from
+        // `tfs[j]`, inside `tfs` by the assert above. The gather reads only
+        // the lanes `mask` selects, at byte indices into the 256-entry
+        // table. The tile's 16 slots lie inside the window slice: `slot` is a
+        // multiple of the tile width, which divides the window's, and below
+        // it. The presence bits land in one word: a tile's slots start at a
+        // multiple of 16 within it.
+        unsafe {
+            let tf = _mm512_cvtepi32_ps(_mm512_maskz_expandloadu_epi32(
+                mask,
+                run.tfs.as_ptr().add(j).cast(),
+            ));
+            let idx = _mm512_cvtepu8_epi32(_mm_loadu_si128(bytes.as_ptr().cast()));
+            let norm =
+                _mm512_mask_i32gather_ps::<4>(_mm512_set1_ps(1.0), mask, idx, lut.as_ptr().cast());
+            let add = _mm512_div_ps(
+                _mm512_mul_ps(_mm512_set1_ps(idf_weight), tf),
+                _mm512_add_ps(tf, norm),
+            );
+            let at = scores.as_mut_ptr().add(slot);
+            _mm512_storeu_ps(at, _mm512_add_ps(_mm512_loadu_ps(at), add));
+        }
+        present[slot >> 6] |= u64::from(mask) << (slot & 63);
+        j += n;
+    }
+    j
 }
 
 /// Bitset words the negation fold of a counted single-term walk may clear
@@ -4671,8 +4871,8 @@ mod tests {
         };
         let vocab = ["a", "b", "c", "d", "e", "f", "g", "h"];
         for trial in 0..12u32 {
-            // Sometimes span more than one OR_WINDOW (4096 docs).
-            let n_docs = 500 + (rng() % 5000) as u32;
+            // Sometimes span more than one OR_WINDOW.
+            let n_docs = 500 + (rng() % u64::from(OR_WINDOW + OR_WINDOW / 4)) as u32;
             // Per-term inclusion probability (out of 8) — varied densities.
             let probs: Vec<u64> = (0..vocab.len()).map(|_| 1 + rng() % 8).collect();
             let mut b = FtsBuilder::new();
@@ -5283,42 +5483,82 @@ mod tests {
         assert_eq!(&d3[..], &docs0[..], "all-pass leaves order untouched");
     }
 
-    /// The AVX-512 window accumulate leaves the same bits in the window as the
-    /// scalar one over the postings it consumes: dense runs (expanded into a
-    /// 16-slot read-modify-write) and sparse ones, onto a window that already
-    /// holds scores, at norms spread across the table's buckets.
+    /// Docs in the window-kernel tests' norm table: three windows, less a
+    /// few, so a tile of the last window reaches past the table's end.
     #[cfg(target_arch = "x86_64")]
-    #[test]
-    fn accumulate_run_avx512_matches_scalar() {
-        if !(std::arch::is_x86_feature_detected!("avx512f")
-            && std::arch::is_x86_feature_detected!("avx2"))
-        {
-            return;
-        }
+    const KERNEL_DOCS: u32 = 3 * OR_WINDOW - 5;
+
+    /// A reader of [`KERNEL_DOCS`] docs whose lengths spread across the norm
+    /// table's buckets.
+    #[cfg(target_arch = "x86_64")]
+    fn kernel_norms_reader() -> FtsReader {
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), false).expect("register");
-        for i in 0..2_000u32 {
+        for i in 0..KERNEL_DOCS {
             b.add_doc(0, i, &"w ".repeat(1 + (i as usize * 7919) % 300))
                 .expect("add doc");
         }
         let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
+    }
+
+    /// The window `start` with each of `ids` (with `tfs`) scored alone and
+    /// added, and their presence bits.
+    #[cfg(target_arch = "x86_64")]
+    fn scored_alone(
+        mut start: Vec<f32>,
+        (ids, tfs): (&[u32], &[u32]),
+        idf: f32,
+        base: u32,
+        norms: &NormTable,
+    ) -> (Vec<f32>, [u64; OR_WINDOW_WORDS]) {
+        let mut present = [0u64; OR_WINDOW_WORDS];
+        for (&d, &tf) in ids.iter().zip(tfs) {
+            let local = (d - base) as usize;
+            start[local] += bm25::score_with_dl_norm_k1(idf, tf, norms.get(d));
+            present[local >> 6] |= 1u64 << (local & 63);
+        }
+        (start, present)
+    }
+
+    /// Two windows hold the same bits and presence.
+    #[cfg(target_arch = "x86_64")]
+    fn assert_same_window(got: (&[f32], &[u64]), want: (&[f32], &[u64]), trial: usize) {
+        assert_eq!(got.1, want.1, "trial {trial}: presence");
+        for (slot, (a, b)) in got.0.iter().zip(want.0).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "trial {trial}: slot {slot}");
+        }
+    }
+
+    /// The AVX-512 window accumulate leaves the same bits in the window as
+    /// the scalar one over the postings it consumes: dense runs (one or two
+    /// aligned tiles) and sparse ones, anywhere in any window of the doc
+    /// space, up to the window's last slot and the norm table's last doc,
+    /// onto a window that already holds scores.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn accumulate_run_avx512_matches_scalar() {
+        if !avx512_kernels() {
+            return;
+        }
+        let r = kernel_norms_reader();
         let norms = r.columns[0].dl_norm_k1();
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
-        for trial in 0..200 {
-            let base = 64 * (next() % 8) as u32;
+        let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
+        let mut at_window_end = 0;
+        for trial in 0..600 {
+            let base = OR_WINDOW * (next() % 3) as u32;
             let n = 8 + (next() % 120) as usize;
             let max_gap = [1u64, 2, 3, 40][trial % 4];
+            // Half the runs start at the window's front, half close to its
+            // end, where a run's last tiles are the window's last.
+            let lead = (next() % 64) as u32;
+            let mut d = match trial % 2 {
+                0 => base + lead,
+                _ => (base + OR_WINDOW).saturating_sub(lead + 8),
+            };
             let mut ids = Vec::with_capacity(n);
-            let mut d = base + (next() % 16) as u32;
             for _ in 0..n {
-                if d >= base + OR_WINDOW || d >= 2_000 {
+                if d >= base + OR_WINDOW || d >= KERNEL_DOCS {
                     break;
                 }
                 ids.push(d);
@@ -5328,28 +5568,103 @@ mod tests {
             let start: Vec<f32> = (0..OR_WINDOW)
                 .map(|_| (next() % 1000) as f32 / 97.0)
                 .collect();
-            let (mut simd, mut scalar) = (start.clone(), start);
-            let mut simd_present = [0u64; OR_WINDOW_WORDS];
-            let mut scalar_present = [0u64; OR_WINDOW_WORDS];
+            let mut got = start.clone();
+            let mut got_present = [0u64; OR_WINDOW_WORDS];
             let idf = 1.7f32;
-            // SAFETY: avx512f is present (checked above).
+            // SAFETY: both features are present (checked above).
             let used = unsafe {
-                accumulate_run_avx512(idf, &ids, &tfs, base, &mut simd, &mut simd_present, norms)
+                accumulate_run_avx512(idf, &ids, &tfs, base, &mut got, &mut got_present, norms)
             };
             assert!(
                 used <= ids.len() && used.is_multiple_of(8),
                 "trial {trial}: used {used}"
             );
-            for (&d, &tf) in ids[..used].iter().zip(&tfs[..used]) {
-                let local = (d - base) as usize;
-                scalar[local] += bm25::score_with_dl_norm_k1(idf, tf, norms.get(d));
-                scalar_present[local >> 6] |= 1u64 << (local & 63);
+            if used > 0 && ids[used - 1] + ACCUMULATE_TILE as u32 > base + OR_WINDOW {
+                at_window_end += 1;
             }
-            assert_eq!(simd_present, scalar_present, "trial {trial}: presence");
-            for (slot, (a, b)) in simd.iter().zip(&scalar).enumerate() {
-                assert_eq!(a.to_bits(), b.to_bits(), "trial {trial}: slot {slot}");
-            }
+            let want = scored_alone(start, (&ids[..used], &tfs[..used]), idf, base, norms);
+            assert_same_window((&got, &got_present), (&want.0, &want.1), trial);
         }
+        assert!(at_window_end > 0, "some run reached the window's last tile");
+    }
+
+    /// The bitset kernel adds exactly what scoring each doc alone adds, and
+    /// marks the same docs present: bitsets of any density whose first bit
+    /// sits before the window, inside it, or anywhere relative to a tile,
+    /// and whose last runs past the window's end or the norm table's,
+    /// cut to the docs a window holds, onto a window that already holds
+    /// scores.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn accumulate_bitset_avx512_matches_scalar() {
+        if !avx512_kernels() {
+            return;
+        }
+        let r = kernel_norms_reader();
+        let norms = r.columns[0].dl_norm_k1();
+        let mut next = xorshift(0x2545_F491_4F6C_DD1D);
+        let (mut before_window, mut past_window, mut past_table) = (0, 0, 0);
+        for trial in 0..600 {
+            let base = OR_WINDOW * (next() % 3) as u32;
+            let n_words = 1 + (next() % 40) as usize;
+            let span = n_words as u32 * 64;
+            // The block starts up to 512 docs before the window, or inside
+            // it; some on a word boundary, most not.
+            let lowest = base.saturating_sub(512);
+            let highest = base + OR_WINDOW - 64;
+            let mut bit_base = lowest + (next() % u64::from(highest - lowest)) as u32;
+            if trial % 4 == 0 {
+                bit_base &= !63;
+            }
+            // One doc in `odds` is absent, or (negative) one in `-odds` present.
+            let odds = [2i64, 8, 64, -4][trial % 4];
+            let words: Vec<u8> = (0..n_words * 8)
+                .map(|_| {
+                    (0..8).fold(0u8, |w, bit| {
+                        let roll = next() % odds.unsigned_abs();
+                        w | u8::from((roll != 0) == (odds > 0)) << bit
+                    })
+                })
+                .collect();
+            let all: Vec<u32> = (0..span)
+                .filter(|&k| words[k as usize / 8] >> (k % 8) & 1 == 1)
+                .map(|k| bit_base + k)
+                .filter(|&d| d >= base && d < base + OR_WINDOW && d < KERNEL_DOCS)
+                .collect();
+            if all.is_empty() {
+                continue;
+            }
+            before_window += usize::from(bit_base < base);
+            past_window += usize::from(bit_base + span > base + OR_WINDOW);
+            let last = all[all.len() - 1];
+            past_table += usize::from((last & !15) + ACCUMULATE_TILE as u32 > KERNEL_DOCS);
+            // A window takes the docs from the cursor's to the window's end.
+            let from = (next() % all.len() as u64) as usize;
+            let ids = &all[from..];
+            let tfs: Vec<u32> = ids.iter().map(|_| 1 + (next() % 20) as u32).collect();
+            let start: Vec<f32> = (0..OR_WINDOW)
+                .map(|_| (next() % 1000) as f32 / 97.0)
+                .collect();
+            let mut got = start.clone();
+            let mut got_present = [0u64; OR_WINDOW_WORDS];
+            let idf = 1.7f32;
+            let run = BitsetRun {
+                words: &words,
+                bit_base,
+                docs: ids[0]..ids[ids.len() - 1] + 1,
+                tfs: &tfs,
+            };
+            // SAFETY: both features are present (checked above).
+            let added = unsafe {
+                accumulate_bitset_avx512(idf, run, base, &mut got, &mut got_present, norms)
+            };
+            assert_eq!(added, ids.len(), "trial {trial}: docs added");
+            let want = scored_alone(start, (ids, &tfs), idf, base, norms);
+            assert_same_window((&got, &got_present), (&want.0, &want.1), trial);
+        }
+        assert!(before_window > 0, "some bitset began before the window");
+        assert!(past_window > 0, "some bitset ran past the window");
+        assert!(past_table > 0, "some tile reached past the norm table");
     }
 
     /// Pruning tests a bound summed in one order against a bar that a score
@@ -5358,13 +5673,7 @@ mod tests {
     /// other's pruning bar.
     #[test]
     fn pruning_bar_covers_summing_in_another_order() {
-        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut next = move || {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x
-        };
+        let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
         for _ in 0..20_000 {
             let n = 2 + (next() % (MAX_SHOULDS_LED as u64)) as usize;
             let terms: Vec<f32> = (0..n)
