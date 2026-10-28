@@ -45,7 +45,7 @@ use std::{
 
 use figment::{
     Figment,
-    providers::{Format, Yaml},
+    providers::{Format, Serialized, Yaml},
 };
 use serde::{
     Deserialize, Serialize,
@@ -82,12 +82,13 @@ const RETIRED_CONFIG_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Keys that still load under their old name, as `(old, new)`. The old name
-/// is a serde alias of the new field, so a config using it keeps working;
-/// the loader warns so it gets updated before the alias is retired. The
-/// embedded default must not set a renamed key under its new name: the alias
-/// makes old and new the same field, and a file layered over such a default
-/// with the old name would then set it twice and be rejected.
+/// Keys that still load under their old name, as `(old, new)`. The loader
+/// folds a value found under the old name into the new one and warns, so a
+/// config using it keeps working until the old name is retired; a config
+/// that sets both names is refused by name, since the two could disagree.
+/// The fold runs over the layered files as one map, so the embedded default
+/// must not set a renamed key under its new name: every config still using
+/// the old name would then read as setting both.
 const RENAMED_CONFIG_KEYS: &[(&str, &str)] =
     &[("compaction.max_memory_mb", "compaction.max_merge_input_mb")];
 
@@ -434,11 +435,11 @@ pub struct CompactionSettings {
     /// the host's free memory.
     ///
     /// The YAML key `max_memory_mb` is the deprecated name of this setting;
-    /// it still loads, with a warning, as the one entry of the loader's
-    /// renamed-keys list. A file that sets both names is rejected. The
-    /// embedded default leaves this key unset for that reason: a value there
-    /// would clash with every config still using the old name.
-    #[serde(alias = "max_memory_mb")]
+    /// the loader folds it into this field with a warning, as the one entry
+    /// of its renamed-keys list, and refuses a config that sets both names.
+    /// The embedded default leaves this key unset for that reason: a value
+    /// there would read as the second name beside every config still using
+    /// the old one.
     pub max_merge_input_mb: u64,
     /// How many of a pass's merge jobs may be in flight at once.
     ///
@@ -1806,7 +1807,7 @@ impl Config {
         // would vanish without trace, and where a renamed one is folded into
         // its new field.
         Self::reject_retired_keys(&fig)?;
-        Self::warn_renamed_keys(&fig);
+        let fig = Self::fold_renamed_keys(fig)?;
         let mut cfg: Config = fig.extract()?;
         cfg.clamp_vector_autotuning();
         cfg.validate()?;
@@ -1874,17 +1875,34 @@ impl Config {
         }
     }
 
-    /// Warn for every [`RENAMED_CONFIG_KEYS`] entry present under its old
-    /// name. The value still loads through the alias; only the name is stale.
-    fn warn_renamed_keys(fig: &Figment) {
+    /// Fold every [`RENAMED_CONFIG_KEYS`] entry found under its old name into
+    /// its new one, with a warning, and refuse a config that sets both.
+    ///
+    /// Over the layered files rather than per file: the layers fold into one
+    /// map before extraction, so a serde alias on the field would have read
+    /// a later file's old key beside an earlier file's new key as one field
+    /// set twice, and failed the whole load on figment's duplicate-field
+    /// error. Here the two names are seen as two keys, and the refusal says
+    /// which one to rename.
+    fn fold_renamed_keys(mut fig: Figment) -> Result<Figment, ConfigError> {
         for (old, new) in RENAMED_CONFIG_KEYS {
-            if fig.find_value(old).is_ok() {
-                tracing::warn!(
-                    "`{old}` was renamed to `{new}`; the old key still loads but will be \
-                     removed in a later release, so update the config file"
-                );
+            let Ok(value) = fig.find_value(old) else {
+                continue;
+            };
+            if fig.find_value(new).is_ok() {
+                return Err(ConfigError::Invalid(format!(
+                    "`{old}` and `{new}` are both set, and `{old}` is the old name of \
+                     `{new}`: remove `{old}` (it may be in another of the layered \
+                     config files) so one value is in force"
+                )));
             }
+            tracing::warn!(
+                "`{old}` was renamed to `{new}`; the old key still loads but will be \
+                 removed in a later release, so update the config file"
+            );
+            fig = fig.merge(Serialized::default(new, value));
         }
+        Ok(fig)
     }
 
     /// Fail the load if any [`RETIRED_CONFIG_KEYS`] entry is present, naming
@@ -2630,7 +2648,8 @@ supertable:
     }
 
     /// The embedded default leaves every renamed key unset under its new
-    /// name, or a config still using the old name would clash with it.
+    /// name, or every config still using the old name would read as setting
+    /// both and be refused.
     #[test]
     fn embedded_default_leaves_renamed_keys_unset() {
         let fig = Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT));
@@ -2654,7 +2673,7 @@ supertable:
     }
 
     /// Both names in one file is a contradiction waiting to happen, so the
-    /// load fails rather than picking one.
+    /// load fails rather than picking one, and says which key to remove.
     #[test]
     fn compaction_max_memory_mb_beside_max_merge_input_mb_is_rejected() {
         let yaml = r#"
@@ -2666,10 +2685,41 @@ supertable:
             .merge(Yaml::string(EMBEDDED_DEFAULT))
             .merge(Yaml::string(yaml));
         let err = Config::from_figment(fig).expect_err("both keys at once");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("max_merge_input_mb"),
-            "the error names the field: {err}"
+            msg.contains("remove `compaction.max_memory_mb`"),
+            "the error says which key to remove: {msg}"
         );
+    }
+
+    /// The names clash across files too: a file updated to the new name
+    /// under a later one still using the old name. The loader sees the
+    /// layered files as one map, so this is refused by name rather than
+    /// failing on a duplicate field, and a legacy key in a later file alone
+    /// still wins over an earlier file that never set the new one.
+    #[test]
+    fn a_legacy_key_in_a_later_file_is_refused_beside_the_new_one_and_folded_alone() {
+        let updated = "compaction:\n  max_merge_input_mb: 6144\n";
+        let legacy = "compaction:\n  max_memory_mb: 4096\n";
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(updated))
+            .merge(Yaml::string(legacy));
+        let err = Config::from_figment(fig).expect_err("both names across files");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("remove `compaction.max_memory_mb`") && !msg.contains("duplicate"),
+            "refused by name, not as a duplicate field: {msg}"
+        );
+
+        let unrelated = "compaction:\n  min_fill_percent: 40\n";
+        let fig = Figment::new()
+            .merge(Yaml::string(EMBEDDED_DEFAULT))
+            .merge(Yaml::string(unrelated))
+            .merge(Yaml::string(legacy));
+        let cfg = Config::from_figment(fig).expect("the legacy key alone folds in");
+        assert_eq!(cfg.compaction.max_merge_input_mb, 4096);
+        assert_eq!(cfg.compaction.min_fill_percent, 40);
     }
 
     #[test]

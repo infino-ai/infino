@@ -146,12 +146,13 @@ compaction:
   # adding superfiles to a job once it would cross this. Not a bound on the
   # merge's resident memory, and not the number of merges in flight (the
   # runner admits those against the host's free memory). Defaults to the
-  # target plus 2048 (3072 with the shipped target).
+  # shipped target plus 2048 (3072), a constant: it does not follow a
+  # target_superfile_size_mb set here.
   #
   # The default is left unset here on purpose: `max_memory_mb` is the old
-  # name of this key and still loads, with a warning, but a file layered over
-  # a default that already names the key would set the same value twice and
-  # be rejected. Setting both names in one file is rejected for that reason.
+  # name of this key and still loads, with a warning, but the loader refuses
+  # a config that sets both names, and a value here would be the second name
+  # beside every config still using the old one.
   # max_merge_input_mb: 3072
 
 # Vector-index build / search / drain tuning. Every value below
