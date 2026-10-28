@@ -1255,6 +1255,16 @@ impl Table {
         Ok(n as i64)
     }
 
+    /// `column`'s rows counted per value, read from the table's statistics
+    /// without running a query: Arrow rows of each value and its `count`,
+    /// with a null value for the rows that hold none. `null` when the
+    /// statistics can't answer exactly; a `GROUP BY` answers then.
+    #[napi]
+    pub fn value_counts(&self, column: String) -> Result<Option<Buffer>> {
+        let batch = self.inner.value_counts(&column).map_err(map_err)?;
+        batch.map(|b| batches_to_ipc(&[b])).transpose()
+    }
+
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.
     /// `text_column`/`text_query` (under `mode`) drive BM25; `vector_column`/
     /// `vector_query` (a `Float32Array`) drive vector kNN — probe width and

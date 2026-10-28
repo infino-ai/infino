@@ -56,9 +56,10 @@
 use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use arrow::record_batch::RecordBatch;
-use arrow_array::{Array, Decimal128Array};
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, Decimal128Array, UInt64Array, new_empty_array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
+    common::ScalarValue,
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
@@ -66,10 +67,12 @@ use datafusion::{
     logical_expr::{Expr, LogicalPlan},
 };
 use tokio::runtime::Handle;
+use uuid::Uuid;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
+    InfinoError,
     memory::{ConnectionMemoryBudget, budgeted_session_context},
     runtime_metrics::op_stats::{self, OpStatsCollector},
     supertable::{
@@ -77,7 +80,7 @@ use crate::{
         handle::{Supertable, SupertableReader},
         manifest::ManifestSnapshot,
         query::{
-            covered_agg::CoveredAggregateRewrite,
+            covered_agg::{CoveredAggregateRewrite, manifest_value_counts},
             exec::{
                 common::collect_plan_metered, fts_exec::register_bm25,
                 hybrid_exec::register_hybrid_search, match_exec::register_match,
@@ -86,6 +89,7 @@ use crate::{
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
         },
         reader_cache::disk::ForegroundQueryGuard,
+        tombstones::SidecarCache,
     },
 };
 
@@ -126,6 +130,9 @@ pub(crate) fn build_sql_schemas(manifest: &ManifestSnapshot) -> SqlSchemas {
     let scan = view_string_schema(&scalar, &fts);
     SqlSchemas { scalar, scan }
 }
+
+/// Name of the count column in [`SupertableReader::value_counts`]'s rows.
+pub(crate) const VALUE_COUNT_COLUMN: &str = "count";
 
 /// Maximum distinct scalar SQL statements cached per manifest snapshot.
 const SQL_LOGICAL_PLAN_CACHE_ENTRIES: usize = 64;
@@ -241,11 +248,7 @@ impl SupertableReader {
         // snapshot — the pushdown-aware SupertableProvider plus the
         // search TVFs. See [`SupertableReader::sql_session_context`].
         let ctx = self.sql_session_context()?;
-        let tombstone_prefetch = self.tombstone_cache.as_ref().and_then(|cache| {
-            let entries = self.manifest().complete_flat_superfiles()?;
-            let ids: Vec<_> = entries.iter().map(|entry| entry.superfile_id).collect();
-            Some((Arc::clone(cache), ids))
-        });
+        let tombstone_prefetch = self.tombstone_prefetch();
         let cached_plan = self.cached_sql_logical_plan(sql);
         let cache_reader = self.clone();
         // Picked up on the caller's thread, like reader mint: the drive
@@ -294,6 +297,78 @@ impl SupertableReader {
         // the lazily-built owned query_runtime. See
         // [`SupertableReader::block_on`].
         self.block_on(drive)
+    }
+
+    /// The tombstone cache and every superfile of a fully loaded snapshot,
+    /// for a prefetch of their delete views before planning: manifest
+    /// statistics answer only for files whose delete view is known clean.
+    fn tombstone_prefetch(&self) -> Option<(Arc<SidecarCache>, Vec<Uuid>)> {
+        let cache = self.tombstone_cache.as_ref()?;
+        let entries = self.manifest().complete_flat_superfiles()?;
+        let ids = entries.iter().map(|entry| entry.superfile_id).collect();
+        Some((Arc::clone(cache), ids))
+    }
+
+    /// `column`'s live rows grouped by value, read from the manifest's
+    /// per-file value counts with no statement planned: one row per distinct
+    /// value and its count, plus a null-keyed row counting the rows that
+    /// hold no value. `None` when those counts don't describe every live
+    /// row (a file with deletes, a column without recorded counts, a column
+    /// mid-retype, a manifest not fully loaded); a `GROUP BY` over the
+    /// column answers it then. Rows come in no particular order.
+    pub(crate) fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
+        let value_type = self
+            .sql_schemas()
+            .scalar()
+            .field_with_name(column)
+            .map_err(|_| QueryError::InvalidQuery(format!("no column `{column}` to count")))?
+            .data_type()
+            .clone();
+        // The cached context's provider keeps the merged counts across calls
+        // on one snapshot.
+        let ctx = self.sql_session_context()?;
+        let tombstone_prefetch = self.tombstone_prefetch();
+        let counted = column.to_owned();
+        let drive = async move {
+            if let Some((cache, ids)) = tombstone_prefetch {
+                cache.prefetch(&ids, Instant::now()).await;
+            }
+            let provider = ctx
+                .table_provider(TABLE_NAME)
+                .await
+                .map_err(QueryError::DataFusion)?;
+            let provider = provider
+                .downcast_ref::<SupertableProvider>()
+                .ok_or_else(|| QueryError::Internal("table provider is not ours".into()))?;
+            Ok::<_, QueryError>(manifest_value_counts(provider, &counted))
+        };
+        let Some((counts, Some(nulls))) = self.block_on(drive)? else {
+            return Ok(None);
+        };
+        let mut values = Vec::with_capacity(counts.entries().len() + 1);
+        let mut tallies = Vec::with_capacity(counts.entries().len() + 1);
+        for (value, count) in counts.entries() {
+            values.push(value.cast_to(&value_type).map_err(QueryError::DataFusion)?);
+            tallies.push(*count);
+        }
+        if nulls > 0 {
+            values.push(ScalarValue::try_from(&value_type).map_err(QueryError::DataFusion)?);
+            tallies.push(nulls);
+        }
+        let values = if values.is_empty() {
+            new_empty_array(&value_type)
+        } else {
+            ScalarValue::iter_to_array(values).map_err(QueryError::DataFusion)?
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(column, value_type, true),
+            Field::new(VALUE_COUNT_COLUMN, DataType::UInt64, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(schema, vec![values, Arc::new(UInt64Array::from(tallies))])
+                .map_err(QueryError::internal)?;
+        Ok(Some(batch))
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the
@@ -518,6 +593,16 @@ impl Supertable {
         ctx.register_table(name, Arc::new(provider))
             .map_err(QueryError::internal)?;
         Ok(reader)
+    }
+
+    /// `column`'s live rows grouped by value over the current snapshot,
+    /// from manifest statistics alone, or `None` when those don't cover it
+    /// — see [`SupertableReader::value_counts`].
+    pub fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+        self.reader()?
+            .value_counts(column)
+            .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("value_counts", None))
     }
 }
 

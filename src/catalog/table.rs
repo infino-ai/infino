@@ -68,6 +68,7 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
+    fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError>;
     fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError>;
     fn vector_search(
         &self,
@@ -172,6 +173,9 @@ impl Table for SupertableHandle {
     }
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
+    }
+    fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+        SupertableHandle::value_counts(self, column)
     }
     fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
         SupertableHandle::tokenize(self, column, text)
@@ -401,6 +405,20 @@ impl Supertable {
     /// Count rows matching a token query over one FTS column.
     pub fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         self.inner.count(column, query, mode)
+    }
+
+    /// `column`'s rows grouped by value, read from the table's statistics
+    /// without running a query: one row per distinct value with its count
+    /// (`UInt64`, in a column named `count`), plus a null-keyed row for the
+    /// rows that hold no value. Deleted rows are not counted. Rows come in
+    /// no particular order.
+    ///
+    /// `Ok(None)` when the statistics can't answer exactly — a file with
+    /// deletes, a column whose distinct values were not recorded, a hosted
+    /// table — and `SELECT column, COUNT(*) ... GROUP BY column` is the
+    /// way to get the counts then. An unknown column is an error.
+    pub fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+        self.inner.value_counts(column)
     }
 
     /// `text` as the full-text index on `column` tokenizes it: the terms the

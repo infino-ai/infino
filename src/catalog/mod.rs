@@ -2093,10 +2093,13 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use arrow::util::pretty::pretty_format_batches;
+    use arrow::{
+        compute::cast,
+        util::{display::array_value_to_string, pretty::pretty_format_batches},
+    };
     use arrow_array::{
         Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-        LargeStringArray, StringViewArray,
+        LargeStringArray, StringViewArray, cast::AsArray, types::UInt64Type,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -4309,6 +4312,80 @@ mod tests {
                 "answered from manifest stats, no scan: {sql}"
             );
         }
+    }
+
+    /// `(value, count)` pairs of any two-column grouped count, the value as text (`None` for
+    /// the null group), sorted.
+    fn value_count_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, u64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let counts = cast(batch.column(1), &DataType::UInt64).expect("count as UInt64");
+            let counts = counts.as_primitive::<UInt64Type>();
+            for i in 0..batch.num_rows() {
+                let value = batch
+                    .column(0)
+                    .is_valid(i)
+                    .then(|| array_value_to_string(batch.column(0), i).expect("value as text"));
+                rows.push((value, counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// `table.value_counts(column)`, which must answer, against the `GROUP BY` it stands for.
+    fn assert_value_counts_match_group_by(conn: &Connection, table: &str, column: &str) {
+        let direct = conn
+            .open_table(table)
+            .expect("open")
+            .value_counts(column)
+            .expect("value counts")
+            .expect("answered from statistics");
+        let grouped = conn
+            .query_sql(&format!(
+                "SELECT {column}, count(*) FROM {table} GROUP BY {column}"
+            ))
+            .expect("grouped");
+        assert_eq!(value_count_rows(&[direct]), value_count_rows(&grouped));
+    }
+
+    /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
+    #[test]
+    fn value_counts_match_the_grouped_count() {
+        let conn = connect("memory://").expect("connect");
+        create_cab_types(&conn, "cabs");
+        assert_value_counts_match_group_by(&conn, "cabs", "title");
+    }
+
+    /// Rows without a value count under a null key, as `GROUP BY` puts them in a null group.
+    #[test]
+    fn value_counts_count_missing_values_under_a_null_key() {
+        let conn = connect("memory://").expect("connect");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "tag",
+            DataType::LargeUtf8,
+            true,
+        )]));
+        let table = conn
+            .create_table("tags", Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        let tags = LargeStringArray::from(vec![Some("a"), None, Some("a"), None, Some("b")]);
+        table
+            .append(&RecordBatch::try_new(schema, vec![Arc::new(tags)]).expect("batch"))
+            .expect("append");
+        assert_value_counts_match_group_by(&conn, "tags", "tag");
+    }
+
+    /// After a delete the per-file counts still hold the deleted row, so the call declines and
+    /// the `GROUP BY` answers; an unknown column is an error.
+    #[test]
+    fn value_counts_decline_over_deletes_and_refuse_unknown_columns() {
+        let (conn, _dir) = storage_conn();
+        create_cab_types(&conn, "cabs");
+        let table = conn.open_table("cabs").expect("open");
+        table.delete(col("title").eq(lit("green"))).expect("delete");
+        assert!(table.value_counts("title").expect("value counts").is_none());
+        assert!(table.value_counts("no_such_column").is_err());
     }
 
     /// The catalog and a table's reader plan the same aggregate the same way: same rows, and

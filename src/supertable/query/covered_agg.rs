@@ -420,30 +420,12 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
-    if provider.is_segment_restricted() {
-        return Ok(None);
-    }
-    let Some(superfiles) = provider.manifest().complete_flat_superfiles() else {
+    let Some((value_counts, nulls)) = manifest_value_counts(provider, &group_column.name) else {
         return Ok(None);
     };
-    if !counts_describe_column(provider.manifest(), &group_column.name, superfiles) {
+    if !nulls_filtered && nulls != Some(0) {
         return Ok(None);
     }
-    if !superfiles.iter().all(|entry| {
-        provider.entry_is_clean(entry)
-            && (nulls_filtered
-                || provider
-                    .manifest()
-                    .field_id(&group_column.name)
-                    .and_then(|id| entry.scalar_stats.column(id))
-                    .is_some_and(|stats| stats.null_count() == Some(0)))
-    }) {
-        return Ok(None);
-    }
-
-    let Some(value_counts) = provider.exact_value_counts(&group_column.name) else {
-        return Ok(None);
-    };
     let mut rows = Vec::with_capacity(value_counts.entries().len());
     for (value, count) in value_counts.entries() {
         let Ok(count) = i64::try_from(*count) else {
@@ -464,6 +446,39 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
             .alias(scan.table_name.clone())?
             .build()?,
     ))
+}
+
+/// `column`'s exact table-wide value counts, when they describe every live
+/// row's value, with the number of rows that hold no value (`None` when a
+/// file doesn't record it). `None` when the counts can't be trusted: a
+/// segment-restricted provider (the rewrite's own residual), a manifest
+/// not fully loaded, a column mid-retype, a file with deletes, or a column
+/// without recorded counts.
+pub(crate) fn manifest_value_counts(
+    provider: &SupertableProvider,
+    column: &str,
+) -> Option<(Arc<ScalarValueCounts>, Option<u64>)> {
+    if provider.is_segment_restricted() {
+        return None;
+    }
+    let manifest = provider.manifest();
+    let superfiles = manifest.complete_flat_superfiles()?;
+    if !counts_describe_column(manifest, column, superfiles) {
+        return None;
+    }
+    let id = manifest.field_id(column)?;
+    let mut nulls = Some(0u64);
+    for entry in superfiles {
+        if !provider.entry_is_clean(entry) {
+            return None;
+        }
+        let file_nulls = entry
+            .scalar_stats
+            .column(id)
+            .and_then(|stats| stats.null_count());
+        nulls = nulls.zip(file_nulls).and_then(|(a, b)| a.checked_add(b));
+    }
+    Some((provider.exact_value_counts(column)?, nulls))
 }
 
 fn count_range_from_value_counts(

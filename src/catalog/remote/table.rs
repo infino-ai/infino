@@ -228,6 +228,12 @@ impl Table for RemoteTable {
         read_arrow("exact_match", response)
     }
 
+    /// The wire has no value-count call, and `None` is an answer the
+    /// contract allows: the caller runs its `GROUP BY` instead.
+    fn value_counts(&self, _column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+        Ok(None)
+    }
+
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         let body = json!({
             "table_name": self.table_name,

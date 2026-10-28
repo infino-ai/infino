@@ -161,6 +161,16 @@ test("tokenMatch and exactMatch return unranked rows", () => {
   assert.equal(docs.count("title", "fox dog", { mode: "and" }), 0);
 });
 
+test("valueCounts counts each value from the table's statistics", () => {
+  const db = connect("memory://");
+  const docs = db.createTable("docs", titleSchema(), new IndexSpec());
+  docs.append([{ title: "yellow" }, { title: "green" }, { title: "yellow" }]);
+
+  const counts = docs.valueCounts("title");
+  const byValue = Object.fromEntries(counts.map((r) => [r.title, Number(r.count)]));
+  assert.deepEqual(byValue, { yellow: 2, green: 1 });
+});
+
 test("BUILDER_ID is a non-empty string", () => {
   assert.equal(typeof BUILDER_ID, "string");
   assert.ok(BUILDER_ID.length > 0);

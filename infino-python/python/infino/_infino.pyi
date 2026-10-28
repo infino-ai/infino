@@ -205,6 +205,7 @@ class Table:
         query: str,
         mode: BoolMode | None = ...,
     ) -> int: ...
+    def value_counts(self, column: str) -> ArrowTable | None: ...
     def hybrid_search(
         self,
         text_column: str,

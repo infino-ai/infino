@@ -537,6 +537,16 @@ def test_count_matches_predicate():
     assert t.count("title", "fox dog", mode="and") == 0
 
 
+def test_value_counts_count_each_value():
+    db = infino.connect("memory://")
+    t = db.create_table("docs", _title_schema(), infino.IndexSpec())
+    t.append(_title_batch(["yellow", "green", "yellow"]))
+
+    # Read from the table's statistics, without running a query.
+    counts = t.value_counts("title").to_pylist()
+    assert {row["title"]: row["count"] for row in counts} == {"yellow": 2, "green": 1}
+
+
 def test_gc_reclaims_orphans(tmp_path):
     db = infino.connect(str(tmp_path / "catalog"))  # gc needs durable storage
     t = db.create_table("docs", _title_schema(), infino.IndexSpec().fts("title"))
