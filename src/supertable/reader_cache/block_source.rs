@@ -108,8 +108,9 @@
 #[cfg(test)]
 use std::sync::Condvar;
 use std::{
+    any::Any,
     array,
-    collections::{BTreeMap, btree_map::Entry},
+    collections::BTreeMap,
     fs,
     os::unix::fs::FileExt,
     panic::resume_unwind,
@@ -427,10 +428,12 @@ impl Future for FetchTask {
         Pin::new(&mut self.0).poll(cx).map(|ended| match ended {
             Ok(fetched) => fetched,
             // A fetch that panicked panics its reads, as it would have in the
-            // read that ran it. One cancelled (the runtime shutting down) has
-            // nothing for them.
+            // read that ran it, but each read raises it outside the `Shared`: a
+            // panic inside it poisons the `Shared` and wakes nobody, so a read
+            // that polled it meanwhile would wait forever. One cancelled (the
+            // runtime shutting down) has nothing for them.
             Err(ended) => match ended.try_into_panic() {
-                Ok(panic) => resume_unwind(panic),
+                Ok(panic) => Fetched::Panicked(FetchPanic::new(panic)),
                 Err(_) => Fetched::Elsewhere,
             },
         })
@@ -454,6 +457,8 @@ enum Fetched {
     Elsewhere,
     /// The GET failed.
     Failed(FetchError),
+    /// The fetch panicked.
+    Panicked(FetchPanic),
 }
 
 /// A failed GET, shared by every read of the run: the first read to take it
@@ -482,6 +487,25 @@ impl FetchError {
             .expect("fetch error mutex poisoned")
             .take()
             .unwrap_or_else(|| copy_error(&self.0.copy))
+    }
+}
+
+/// A panicked fetch, shared by every read of the run: the first read to take it
+/// raises the panic itself, the others a panic saying so.
+#[derive(Clone)]
+struct FetchPanic(Arc<Mutex<Option<Box<dyn Any + Send>>>>);
+
+impl FetchPanic {
+    fn new(panic: Box<dyn Any + Send>) -> Self {
+        Self(Arc::new(Mutex::new(Some(panic))))
+    }
+
+    fn resume(&self) -> ! {
+        let panic = self.0.lock().expect("fetch panic mutex poisoned").take();
+        match panic {
+            Some(panic) => resume_unwind(panic),
+            None => panic!("a block fetch shared with another read panicked"),
+        }
     }
 }
 
@@ -533,6 +557,13 @@ struct MemoryRun {
     /// Last block of the run (inclusive).
     last: u32,
     bytes: RunBytes,
+}
+
+impl MemoryRun {
+    /// Whether this is a fetch every read dropped, its entry not taken out yet.
+    fn dropped(&self) -> bool {
+        matches!(&self.bytes, RunBytes::Fetching(fetch) if fetch.upgrade().is_none())
+    }
 }
 
 /// Where a run's bytes are. `runs` holds a weak handle to a fetch, so it never
@@ -1509,6 +1540,7 @@ impl BlockCachedSource {
             match segment {
                 Ok(segment) => segments.push(segment),
                 Err(Fetched::Failed(error)) => return Err(error.take()),
+                Err(Fetched::Panicked(panic)) => panic.resume(),
                 Err(_) => return Ok(None),
             }
         }
@@ -1715,7 +1747,8 @@ impl BlockCachedSource {
     ///   source is no longer the live entry, no budget is left, or the GET
     ///   returned another length (the object is not the one this reader opened);
     /// - the bytes and no run when they are fetched but not queued: the cap on
-    ///   unwritten runs is full, or a run starting at the same block is queued.
+    ///   unwritten runs is full, or another run starting at the same block is in
+    ///   memory.
     ///
     /// If the caller is dropped mid-GET, the reservation gives its bytes back.
     /// `claim` is the run's entry in `runs` when a read registered it; see
@@ -1796,23 +1829,26 @@ impl BlockCachedSource {
                 }
                 id
             }
-            None => match runs.entry(first) {
-                // That run owns this key until it is written, so this one is
-                // served but not cached.
-                Entry::Occupied(_) => {
+            None => {
+                // Another run owns this key until it is written, so this one is
+                // served but not cached. A run every read dropped is no run: its
+                // claim, when it drops, finds another id here and leaves this
+                // one alone.
+                if runs.get(&first).is_some_and(|run| !run.dropped()) {
                     store.release_write_behind(run_len);
                     return None;
                 }
-                Entry::Vacant(slot) => {
-                    let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
-                    slot.insert(MemoryRun {
+                let id = self.next_run_id.fetch_add(1, Ordering::Relaxed);
+                runs.insert(
+                    first,
+                    MemoryRun {
                         id,
                         last,
                         bytes: RunBytes::Fetched(bytes.clone()),
-                    });
-                    id
-                }
-            },
+                    },
+                );
+                id
+            }
         };
         drop(runs);
 
@@ -1903,8 +1939,8 @@ impl BlockCachedSource {
     /// only free budget, so a prefetch never evicts what queries use. It first
     /// waits for the runs reads are fetching (driving their GETs) until none is
     /// left, then fetches what is still missing, so a run a read did not cache
-    /// is filled too. A run another fill queued is left to it. `false` stops the
-    /// prefetch, when:
+    /// is filled too, and looks again until nothing is. A run another fill
+    /// queued is left to it. `false` stops the prefetch, when:
     /// - the budget is full,
     /// - this source is no longer the live entry, or the store is gone,
     /// - the GET came back short, or the write failed.
@@ -1914,41 +1950,56 @@ impl BlockCachedSource {
         b0: u32,
         b1: u32,
     ) -> Result<bool, LazyByteSourceError> {
-        let segments = loop {
-            let segments = self.segments(b0, b1);
-            let fetching: Vec<RunFetch> = segments
+        // Until no block is missing: a read can register a run at the first
+        // block of one of this chunk's GETs while it is out. That run keeps the
+        // GET's bytes from being cached, and its own fetch can end without
+        // caching them either.
+        loop {
+            let segments = loop {
+                let segments = self.segments(b0, b1);
+                let fetching: Vec<RunFetch> = segments
+                    .iter()
+                    .filter_map(|segment| match segment {
+                        Segment::Fetching { fetch, .. } => Some(fetch.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if fetching.is_empty() {
+                    break segments;
+                }
+                for fetched in join_all(fetching).await {
+                    if let Fetched::Panicked(panic) = fetched {
+                        panic.resume();
+                    }
+                }
+            };
+
+            let missing: Vec<(u32, u32)> = segments
                 .iter()
-                .filter_map(|segment| match segment {
-                    Segment::Fetching { fetch, .. } => Some(fetch.clone()),
+                .filter_map(|segment| match *segment {
+                    Segment::Missing { first, last } => Some((first, last)),
                     _ => None,
                 })
                 .collect();
-            if fetching.is_empty() {
-                break segments;
+            if missing.is_empty() {
+                return Ok(true);
             }
-            join_all(fetching).await;
-        };
 
-        for segment in segments {
-            let Segment::Missing { first, last } = segment else {
-                continue;
-            };
+            for (first, last) in missing {
+                let Some((_, run)) = self
+                    .fetch_missing(bf, first, last, Fill::Prefetch, None)
+                    .await?
+                else {
+                    return Ok(false);
+                };
 
-            let Some((_, run)) = self
-                .fetch_missing(bf, first, last, Fill::Prefetch, None)
-                .await?
-            else {
-                return Ok(false);
-            };
-
-            if let Some(run) = run
-                && !run.spawn_write().await.unwrap_or(false)
-            {
-                return Ok(false);
+                if let Some(run) = run
+                    && !run.spawn_write().await.unwrap_or(false)
+                {
+                    return Ok(false);
+                }
             }
         }
-
-        Ok(true)
     }
 }
 
@@ -2180,6 +2231,7 @@ mod tests {
         collections::BTreeSet,
         future::pending,
         ops::Range,
+        panic::{AssertUnwindSafe, panic_any},
         path::Path,
         pin::pin,
         sync::{atomic::AtomicUsize, mpsc},
@@ -5408,7 +5460,12 @@ mod tests {
         /// Comes back one byte short, as if the object were replaced by a
         /// shorter one.
         Short,
+        /// Panics with [`GET_PANIC`], as a bug in the GET would.
+        Panics,
     }
+
+    /// What a [`HeldEnd::Panics`] range panics with.
+    const GET_PANIC: &str = "the held GET panicked";
 
     impl HeldSource {
         fn release(&self) {
@@ -5473,6 +5530,7 @@ mod tests {
                         let bytes = self.inner.range(start, len).await?;
                         return Ok(bytes.slice(..bytes.len().saturating_sub(1)));
                     }
+                    HeldEnd::Panics => panic_any(GET_PANIC),
                 }
             }
             self.inner.range(start, len).await
@@ -5686,7 +5744,8 @@ mod tests {
     }
 
     /// Ranges sleep `delay` on the timer of the runtime that polls them, like an
-    /// HTTP request's timeout.
+    /// HTTP request's timeout. A range is counted when it starts, so one cancelled
+    /// mid-sleep still counts.
     struct SlowSource {
         inner: CountingSource,
         delay: Duration,
@@ -5699,8 +5758,9 @@ mod tests {
         }
 
         async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let bytes = self.inner.range(start, len).await;
             sleep(self.delay).await;
-            self.inner.range(start, len).await
+            bytes
         }
     }
 
@@ -5742,6 +5802,191 @@ mod tests {
         assert_eq!(got, inner.inner.blob.slice(10..74));
         assert_eq!(inner.inner.calls(), 1, "from the one GET");
         store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A GET that panics panics every read on it, and still ends their shared
+    /// fetch: a panic inside the `Shared` would poison it without waking the
+    /// reads that polled it meanwhile, and they would wait forever.
+    #[tokio::test]
+    async fn a_get_that_panics_panics_every_read_on_it() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_ending(2 * CACHE_BLOCK_BYTES as usize, 1, HeldEnd::Panics);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+
+        let mut sent = pin!(src.range(0, 64));
+        assert!(poll!(sent.as_mut()).is_pending(), "its GET holds");
+        let fetch = match src.segments(0, 0).as_slice() {
+            [Segment::Fetching { fetch, .. }] => fetch.clone(),
+            _ => panic!("the read's run is in flight"),
+        };
+        let mut waiting = pin!(src.range(10, 64));
+        assert!(
+            poll!(waiting.as_mut()).is_pending(),
+            "a read waits on that GET"
+        );
+
+        inner.release();
+        let panic = AssertUnwindSafe(sent)
+            .catch_unwind()
+            .await
+            .expect_err("the read that sent the GET panics");
+        assert_eq!(
+            panic.downcast_ref::<&str>(),
+            Some(&GET_PANIC),
+            "with the GET's panic"
+        );
+        assert!(
+            AssertUnwindSafe(waiting).catch_unwind().await.is_err(),
+            "so does the read waiting on it"
+        );
+        assert!(fetch.peek().is_some(), "and their fetch ended");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// The claim of a run every read dropped, dropping only once a new run took
+    /// its first block, leaves the new run alone: reads still find it in flight
+    /// and share its GET.
+    #[tokio::test]
+    async fn a_stale_claim_leaves_a_new_run_at_its_block_alone() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(2 * CACHE_BLOCK_BYTES as usize);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let stale = Claim {
+            source: Arc::clone(&src),
+            first: 0,
+            id: src.next_run_id.fetch_add(1, Ordering::Relaxed),
+            handed_on: false,
+        };
+
+        let mut sent = pin!(src.range(0, 64));
+        assert!(
+            poll!(sent.as_mut()).is_pending(),
+            "a new run at block 0 is in flight"
+        );
+        drop(stale);
+        let mut waiting = pin!(src.range(10, 64));
+        assert!(
+            poll!(waiting.as_mut()).is_pending(),
+            "a read still finds it in flight"
+        );
+
+        inner.release();
+        let (sent, waiting) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(sent, waiting) })
+            .await
+            .expect("both reads finish");
+        sent.expect("the read that sent the GET");
+        assert_eq!(
+            waiting.expect("the read waiting on it"),
+            inner.inner.blob.slice(10..74)
+        );
+        assert_eq!(inner.inner.calls(), 1, "one GET for both");
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A block on the block file inside another read's window in flight is read
+    /// from the file: nothing waits on that GET for it.
+    #[tokio::test]
+    async fn a_filled_block_inside_a_window_in_flight_is_not_waited_for() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(16 * b as usize);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        fill_blocks(&src, &inner.inner.blob, 1, 1);
+
+        let mut held = pin!(src.range(10, 10));
+        assert!(
+            poll!(held.as_mut()).is_pending(),
+            "window [0, 7] is in flight"
+        );
+        wait_until(|| inner.held.load(Ordering::Acquire) == 1, "its GET holds").await;
+
+        assert!(
+            matches!(
+                src.segments(1, 2).as_slice(),
+                [
+                    Segment::Filled { first: 1, last: 1 },
+                    Segment::Fetching {
+                        first: 2,
+                        last: 2,
+                        ..
+                    }
+                ]
+            ),
+            "block 1 is on the file, block 2 in flight"
+        );
+        let bf = src.block_file().expect("block file");
+        let prefetched = timeout(STAYS_PUT, src.prefetch_chunk(bf, 1, 1))
+            .await
+            .expect("a prefetch of block 1 does not wait for the GET");
+        assert!(prefetched.expect("the prefetch"), "and finds it filled");
+
+        inner.release();
+        held.await.expect("the held read");
+        assert_eq!(
+            get_blocks(&inner.inner.ranges()),
+            vec![(0, 7)],
+            "the window ran through filled block 1"
+        );
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A prefetch whose GET lands after a read registered a run at the GET's
+    /// first block does not take its chunk as done: it waits for that run, then
+    /// fetches what is still missing.
+    #[tokio::test]
+    async fn a_prefetch_beaten_to_its_first_block_still_fills_its_chunk() {
+        let b = CACHE_BLOCK_BYTES;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_sources(32 * b as usize, 2);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        let bf = src.block_file().expect("block file");
+
+        let mut chunk = pin!(src.prefetch_chunk(bf, 0, 15));
+        assert!(
+            poll!(chunk.as_mut()).is_pending(),
+            "the prefetch GETs [0, 15]"
+        );
+        wait_until(|| inner.held.load(Ordering::Acquire) == 1, "its GET holds").await;
+        let mut read = pin!(src.range(0, 64));
+        assert!(poll!(read.as_mut()).is_pending(), "a read registers [0, 7]");
+        wait_until(|| inner.held.load(Ordering::Acquire) == 2, "its GET holds").await;
+
+        inner.release();
+        let (chunk, read) = timeout(NO_WAIT_DEADLINE, async { tokio::join!(chunk, read) })
+            .await
+            .expect("both finish");
+        read.expect("the read");
+        assert!(chunk.expect("the prefetch"), "the prefetch goes on");
+        assert_eq!(
+            get_blocks(&inner.inner.ranges()),
+            vec![(0, 7), (0, 15), (8, 15)],
+            "and fetches what the read's run left missing"
+        );
+        store.block_writes_settled().await;
+        assert!(src.all_filled(0, 15), "every block of the chunk is cached");
         store.remove_block_entry_for_test(&uri);
     }
 
