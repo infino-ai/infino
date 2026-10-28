@@ -957,7 +957,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+        posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
     };
 
     #[tokio::test]
@@ -1333,8 +1333,8 @@ mod tests {
         // each pick the right branch block by block. Uniform-stride corpora
         // never produce this, so drive it explicitly and cross-check every count
         // kernel against `token_match`'s independent flat-merge length.
-        const RUN_END: u32 = 128; // docs 0..128 all hold `mix` → one RUN block
-        const DENSE_END: u32 = 512; // then all but every 11th → BITSET
+        const RUN_END: u32 = BLOCK_LEN as u32; // the first block's docs all hold `mix` → RUN
+        const DENSE_END: u32 = 4 * BLOCK_LEN as u32; // then all but every 11th → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
         let mut b = FtsBuilder::new();

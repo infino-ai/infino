@@ -1534,7 +1534,7 @@ mod tests {
     // ── Cursor-level phrase seeks ─────────────────────────────────────
 
     /// Rows in the seek corpus: the common member spans a dozen blocks.
-    const SEEK_DOCS: u32 = 1500;
+    const SEEK_DOCS: u32 = 3000;
     /// Rows holding the rare member. The first holds the words reversed;
     /// the other two hold the phrase, hundreds of docs (several of the
     /// common member's blocks) apart.

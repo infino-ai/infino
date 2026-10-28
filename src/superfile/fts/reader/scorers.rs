@@ -674,19 +674,23 @@ const PROMOTE_DENSITY: f32 = 0.5;
 /// collect theirs and score only the required docs among them.
 const OPTIONAL_FIRST_RATIO: f32 = 2.0;
 
-/// Bit `p` set for each position `p` of `ids` (ascending, at most 128) whose
-/// doc is in `docs` (ascending).
-fn positions_held(ids: &[u32], docs: &[u32]) -> u128 {
-    debug_assert!(ids.len() <= 128);
+/// Words of the mask [`positions_held`] returns: one bit per lane of a
+/// block.
+const HELD_WORDS: usize = BLOCK_LEN / 64;
+
+/// Bit `p` set for each position `p` of `ids` (ascending, at most a
+/// block) whose doc is in `docs` (ascending), as little-endian words.
+fn positions_held(ids: &[u32], docs: &[u32]) -> [u64; HELD_WORDS] {
+    debug_assert!(ids.len() <= BLOCK_LEN);
     // `docs` is the shorter list (the caller collects it only when it is):
     // walk it and search forward in `ids`, rather than stepping both.
-    let (mut p, mut bits) = (0usize, 0u128);
+    let (mut p, mut bits) = (0usize, [0u64; HELD_WORDS]);
     for &d in docs {
         p = seek_sorted::<true>(ids, p, d);
         if p >= ids.len() {
             break;
         }
-        bits |= u128::from(ids[p] == d) << p;
+        bits[p / 64] |= u64::from(ids[p] == d) << (p % 64);
     }
     bits
 }
@@ -859,23 +863,27 @@ fn must_lead_should_walk<C: Collector>(
                     .sum();
                 if optional_docs * OPTIONAL_FIRST_RATIO < (to - from) as f32 {
                     let ids = &lead.block_doc_ids[from..to];
-                    let mut held = 0u128;
+                    let mut held = [0u64; HELD_WORDS];
                     for (si, c) in shoulds.iter_mut().enumerate() {
                         opt_docs[si].clear();
                         opt_tfs[si].clear();
                         if driver[si] {
                             c.collect_range(start, range_end, &mut opt_docs[si], &mut opt_tfs[si]);
-                            held |= positions_held(ids, &opt_docs[si]);
+                            for (h, w) in held.iter_mut().zip(positions_held(ids, &opt_docs[si])) {
+                                *h |= w;
+                            }
                         }
                     }
                     cand_docs.clear();
                     cand_tfs.clear();
-                    let mut bits = held;
-                    while bits != 0 {
-                        let p = bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        cand_docs.push(ids[p]);
-                        cand_tfs.push(lead.block_tfs[from + p]);
+                    for (wi, &word) in held.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            let p = wi * 64 + bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            cand_docs.push(ids[p]);
+                            cand_tfs.push(lead.block_tfs[from + p]);
+                        }
                     }
                     score_postings(
                         lead.idf_weight,
@@ -6772,7 +6780,9 @@ mod tests {
     #[tokio::test]
     async fn reused_block_tables_answer_as_fresh_ones() {
         let mut x: u64 = 0x1234_5678_9ABC_DEF1;
-        let docs: Vec<String> = (0..40_000)
+        // Enough docs that the common term's block table is long enough
+        // to be cached.
+        let docs: Vec<String> = (0..80_000)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;

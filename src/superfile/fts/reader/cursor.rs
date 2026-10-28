@@ -36,8 +36,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_RUN, decode_block, decode_block_doc_ids,
-            decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
+            BLOCK_LEN, BlockHeader, ENCODING_RUN, SUB_BLOCK_LEN, decode_block,
+            decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
     },
@@ -468,6 +468,9 @@ pub(crate) struct TermCursor {
     /// [`decode_block_doc_ids`]) and leaves `block_tfs` stale, so it must
     /// not be used where tfs are read.
     pub(super) purpose: CursorUse,
+    /// The file's header reading: wide blocks (two sub-blocks, count's top
+    /// bit in header bit 31) or the one-sub-block form before it.
+    pub(super) wide_blocks: bool,
     /// Which block index is currently decoded into `block_doc_ids`
     /// ([`NO_BLOCK`] = none). Lets [`Self::contains`] skip re-decoding a
     /// PACKED block it already holds while probing membership across a
@@ -752,6 +755,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: term_bytes,
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: NO_BLOCK,
             tf_decoded_block: NO_BLOCK,
             predecoded: false,
@@ -850,6 +854,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: body,
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -924,6 +929,7 @@ impl TermCursor {
             // never call `decode_current_block`, so no block decode reads
             // `purpose` here.
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -949,6 +955,7 @@ impl TermCursor {
         BlockHeader::parse(
             &self.bytes[block.block_byte_offset..block.block_byte_end],
             prev,
+            self.wide_blocks,
         )
     }
 
@@ -1630,6 +1637,17 @@ impl TermCursor {
         self.current_block >= self.blocks.len()
     }
 
+    /// Docs a full block of this term holds: two sub-blocks in a wide
+    /// file, one before it. An estimate's unit, not a decoded block's
+    /// count, which the header gives.
+    #[inline]
+    pub(super) fn block_len(&self) -> usize {
+        match self.wide_blocks {
+            true => BLOCK_LEN,
+            false => SUB_BLOCK_LEN,
+        }
+    }
+
     /// Block count, used as a cheap proxy for df when AND intersection
     /// picks the rarest cursor as the leader. Block count is an exact
     /// upper bound on df: a term's df is `(blocks - 1) * BLOCK_LEN +
@@ -1785,7 +1803,7 @@ impl TermCursor {
         };
         let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
         let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
-        let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
+        let docs = (i - first) as f64 * self.block_len() as f64 * (range / span).clamp(0.0, 1.0);
         (max, docs as f32)
     }
 
@@ -2491,7 +2509,7 @@ mod tests {
                 .await
                 .expect("cursors");
             let cursor = &cursors[0];
-            assert!(cursor.blocks.len() > 40, "{} blocks", cursor.blocks.len());
+            assert!(cursor.blocks.len() > 20, "{} blocks", cursor.blocks.len());
             let postings: &[u8] = cursor.bytes.as_ref();
             let meta = TermMeta::parse(postings, 0, positional).expect("meta");
             assert_eq!(meta.num_blocks, cursor.blocks.len());
@@ -2533,7 +2551,7 @@ mod tests {
             let mut d = vec![0u32; BLOCK_LEN];
             for i in 0..meta.num_blocks {
                 let range = meta.block_range_in_term(postings, i, None);
-                let hdr = BlockHeader::parse(&postings[range.clone()], prev_last);
+                let hdr = BlockHeader::parse(&postings[range.clone()], prev_last, true);
                 let n = decode_block_doc_ids(&postings[range], &hdr, &mut d);
                 assert!(
                     prev_last.is_none_or(|p| p < d[0]),
@@ -2595,7 +2613,7 @@ mod tests {
     /// admits most of the blocks a tight bound would skip.
     #[tokio::test]
     async fn bounds_are_exact_at_the_declared_statistics_and_sound_under_an_override() {
-        let reader = realistic_reader(6_000);
+        let reader = realistic_reader(12_000);
         assert_eq!(reader.columns[0].bound_scale(), 1.0);
         let baked = block_bounds_and_maxima(&reader).await;
         assert!(baked.len() > 30, "need a long posting list to say anything");
@@ -2894,15 +2912,18 @@ mod tests {
     #[tokio::test]
     async fn seeks_land_on_the_first_doc_at_every_block_edge_of_every_encoding() {
         let mut list: Planted = Vec::new();
-        // Dense: 300 consecutive docs from 10.
-        for d in 10..310u32 {
-            list.push((d, 1 + d % 3));
+        // Dense: two blocks' worth of docs from 10 with every seventh
+        // missing, so the blocks are bitsets rather than runs.
+        for d in 10..(10 + 2 * BLOCK_LEN as u32 + 40) {
+            if d % 7 != 3 {
+                list.push((d, 1 + d % 3));
+            }
         }
-        // Patched: 4 blocks of 128 docs two apart, each with one gap and
-        // one tf outlier.
-        let mut d = 312u32;
+        // Patched: 4 blocks of docs two apart, each with one gap and one
+        // tf outlier.
+        let mut d = 10 + 2 * BLOCK_LEN as u32 + 42;
         for blk in 0..4u32 {
-            for lane in 0..128u32 {
+            for lane in 0..BLOCK_LEN as u32 {
                 let tf = if lane == 40 + blk {
                     OUTLIER_TF
                 } else {
@@ -2913,7 +2934,7 @@ mod tests {
             }
         }
         // Packed: 3 blocks at a uniform gap of 37.
-        for _ in 0..(3 * 128) {
+        for _ in 0..(3 * BLOCK_LEN) {
             list.push((d, 2));
             d += 37;
         }
@@ -3119,7 +3140,8 @@ mod tests {
         // built in later blocks: a third skip into the same bitset block
         // expands it, and two such expansions in a row make the cursor
         // eager.
-        for t in [130u32, 131, 132, 260, 261, 262] {
+        let b = BLOCK_LEN as u32;
+        for t in [b + 2, b + 3, b + 4, 2 * b + 4, 2 * b + 5, 2 * b + 6] {
             c.skip_to(t);
             let (d, tf) = expect_at(t).expect("in range");
             assert_eq!(c.current_doc_id(), d, "target {t}");
