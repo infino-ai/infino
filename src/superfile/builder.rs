@@ -3290,6 +3290,11 @@ impl SuperfileBuilder {
                     Result<(RecordBatch, SuperfileStats), BuildError>,
                 >(DECODED_BATCHES_AHEAD);
                 thread::scope(|scope| -> Result<(), BuildError> {
+                    // Owned here, so an encode that fails drops it on the
+                    // way out and the decoder's next send fails, instead of
+                    // the scope waiting on a decoder blocked on a full
+                    // channel.
+                    let decoded = decoded;
                     scope.spawn(move || {
                         let batches = match input.batches(&opts) {
                             Ok(batches) => batches,
@@ -3316,6 +3321,12 @@ impl SuperfileBuilder {
                             break;
                         };
                         let (record_batch, stats) = next?;
+                        #[cfg(test)]
+                        if tests::encode_fault() {
+                            return Err(BuildError::Io(Error::other(
+                                "test fault: the encode failed",
+                            )));
+                        }
                         // Time spent waiting on the decoder, not decoding.
                         timings.read_parquet += start.elapsed();
                         stats_collector.push(stats);
@@ -4487,6 +4498,14 @@ mod tests {
     thread_local! {
         /// Set by [`with_reorder_budget`] for the thread running a merge.
         static REORDER_BUDGET: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Set by a test whose merge's encode loop must fail on its first
+        /// batch.
+        static ENCODE_FAULT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Whether this thread's merge fails its encode on the first batch.
+    pub(super) fn encode_fault() -> bool {
+        ENCODE_FAULT.with(Cell::get)
     }
 
     /// The narrowed forward-index budget, if this thread is inside
@@ -6959,6 +6978,38 @@ mod tests {
                 &format!("atoms_match_ids (deletes={deletes:?})"),
             );
         }
+    }
+
+    /// An encode that fails part way through returns its error. The decoder
+    /// a step ahead must not keep the merge waiting on a full channel.
+    #[test]
+    fn a_merge_whose_encode_fails_returns_instead_of_hanging() {
+        // More batches per input than the decoder may run ahead.
+        const PER_INPUT: u64 = 80_000;
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let schema = opts.schema.clone();
+        let input = |lo, hi| {
+            SuperfileReader::open(Bytes::from(reorder_corpus_input(&opts, &schema, lo, hi)))
+                .expect("open input")
+        };
+        let inputs = vec![
+            (Arc::new(input(0, PER_INPUT)), tombstones(&[])),
+            (Arc::new(input(PER_INPUT, PER_INPUT * 2)), tombstones(&[])),
+        ];
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            ENCODE_FAULT.with(|f| f.set(true));
+            let _ = done.send(SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err());
+        });
+        let failed = finished
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("merge hung after the encode failed");
+        assert!(failed, "the encode's error comes back");
     }
 
     #[tokio::test]
