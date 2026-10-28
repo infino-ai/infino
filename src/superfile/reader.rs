@@ -91,7 +91,7 @@ use crate::{
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
-const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+pub(crate) const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 
 /// A cold `_id` read takes the whole stable-id sidecar once it asks for at
 /// least one distinct row in this many. At half the rows nearly every page of

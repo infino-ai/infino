@@ -49,8 +49,8 @@ use tracing::Span;
 use crate::{
     storage::StorageProvider,
     superfile::{
-        LazyByteSource, ReadError,
-        reader::{OpenOptions, SuperfileReader},
+        LazyByteSource, PrefetchedSource, ReadError,
+        reader::{DEFAULT_TAIL_SPECULATIVE_BYTES, OpenOptions, SuperfileReader},
     },
     supertable::{
         lazy_source::StorageRangeSource,
@@ -140,22 +140,31 @@ pub async fn superfile_reader_tiered(
     // cost a one-hour query over a 1 GiB superfile the whole gigabyte, and a
     // scan over many files that many gigabytes resident at once.
     if let Some(storage) = storage {
-        let source: Arc<dyn LazyByteSource> = match offsets {
-            Some(o) if o.total_size > 0 => Arc::new(StorageRangeSource::with_known_size(
-                Arc::clone(storage),
-                storage_key.to_owned(),
-                o.total_size,
-            )),
-            _ => Arc::new(StorageRangeSource::with_unknown_size(
-                Arc::clone(storage),
-                storage_key.to_owned(),
-            )),
-        };
+        // One suffix GET learns the object's size and its parquet tail. The
+        // tail stays in an overlay in front of the range source, so the
+        // open's footer read, the page-index read and the end of the last
+        // row group, which lies in it, are served from it rather than
+        // fetched a second time. With nothing caching the object, the
+        // overlay is the only thing that remembers the tail.
+        let (tail, total) = storage
+            .tail(storage_key, DEFAULT_TAIL_SPECULATIVE_BYTES)
+            .await
+            .map_err(|e| ReaderCacheError::OpenFailed {
+                source: fetch_failed(format!("storage tail {storage_key}"), e),
+            })?;
+        let ranges: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
+            Arc::clone(storage),
+            storage_key.to_owned(),
+            total,
+        ));
+        let mut source = PrefetchedSource::new(ranges);
+        source.install(total - tail.len() as u64, tail);
         // No CRC check: it reads the whole file, and this path reads only
         // the ranges a query touches.
-        let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
-            .await
-            .map_err(|source| ReaderCacheError::OpenFailed { source })?;
+        let reader =
+            SuperfileReader::open_lazy_with(Arc::new(source), OpenOptions { verify_crc: false })
+                .await
+                .map_err(|source| ReaderCacheError::OpenFailed { source })?;
         return Ok((Arc::new(reader), OpenTier::Lazy));
     }
 
