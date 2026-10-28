@@ -693,6 +693,31 @@ impl PrefetchedSource {
         self.prefetched.push((start, bytes));
     }
 
+    /// The installed range that covers one end of `[start, start + len)`
+    /// but not the other: what to fetch from the inner source, the covered
+    /// bytes, and whether they come last. A read that runs into bytes the
+    /// open already fetched (the last row group's end lies in the parquet
+    /// tail) then fetches only the rest. A request an installed range
+    /// covers whole is [`Self::lookup`]'s; one covered at both ends is
+    /// served at the end whose range was installed first; one overlapped
+    /// only in the middle fetches whole.
+    fn covered_end(&self, start: u64, len: u64) -> Option<(Range<u64>, Bytes, bool)> {
+        let req_end = start.checked_add(len)?;
+        for (p_start, p_bytes) in &self.prefetched {
+            let p_start = *p_start;
+            let p_end = p_start + p_bytes.len() as u64;
+            if start < p_start && p_start < req_end && req_end <= p_end {
+                let covered = p_bytes.slice(0..(req_end - p_start) as usize);
+                return Some((start..p_start, covered, true));
+            }
+            if p_start <= start && start < p_end && p_end < req_end {
+                let covered = p_bytes.slice((start - p_start) as usize..p_bytes.len());
+                return Some((p_end..req_end, covered, false));
+            }
+        }
+        None
+    }
+
     /// Lookup helper — returns a zero-copy slice if any
     /// installed range covers the request.
     fn lookup(&self, start: u64, len: u64) -> Option<Bytes> {
@@ -731,6 +756,13 @@ impl LazyByteSource for PrefetchedSource {
         if let Some(b) = self.lookup(start, len) {
             return Ok(b);
         }
+        if let Some((fetch, covered, covered_last)) = self.covered_end(start, len) {
+            let fetched = self
+                .inner
+                .range(fetch.start, fetch.end - fetch.start)
+                .await?;
+            return Ok(join_ends(fetched, covered, covered_last));
+        }
         self.inner.range(start, len).await
     }
 
@@ -749,6 +781,13 @@ impl LazyByteSource for PrefetchedSource {
         if let Some(b) = self.lookup(start, len) {
             return Ok(b);
         }
+        if let Some((fetch, covered, covered_last)) = self.covered_end(start, len) {
+            let fetched = self
+                .inner
+                .range_ahead(fetch.start, fetch.end - fetch.start)
+                .await?;
+            return Ok(join_ends(fetched, covered, covered_last));
+        }
         self.inner.range_ahead(start, len).await
     }
 
@@ -765,9 +804,112 @@ impl LazyByteSource for PrefetchedSource {
     }
 }
 
+/// `fetched` and `covered` in request order: the covered bytes last when
+/// they end the request, first when they start it.
+fn join_ends(fetched: Bytes, covered: Bytes, covered_last: bool) -> Bytes {
+    let (first, second) = if covered_last {
+        (fetched, covered)
+    } else {
+        (covered, fetched)
+    };
+    let mut joined = Vec::with_capacity(first.len() + second.len());
+    joined.extend_from_slice(&first);
+    joined.extend_from_slice(&second);
+    Bytes::from(joined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes in the overlap tests' object.
+    const OVERLAP_OBJECT_BYTES: u8 = 128;
+    /// Where the installed tail of that object starts.
+    const OVERLAP_TAIL_START: u64 = 96;
+
+    /// A source over `0..OVERLAP_OBJECT_BYTES` that records every range it
+    /// is asked for.
+    struct RecordingSource {
+        inner: BytesLazyByteSource,
+        ranges: std::sync::Mutex<Vec<Range<u64>>>,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.ranges.lock().expect("ranges").push(start..start + len);
+            self.inner.range(start, len).await
+        }
+        fn try_get_range_sync(&self, _: u64, _: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// The object, its recording source, and an overlay holding its tail
+    /// from `OVERLAP_TAIL_START`.
+    fn overlay_with_tail() -> (Bytes, Arc<RecordingSource>, PrefetchedSource) {
+        let payload = Bytes::from((0..OVERLAP_OBJECT_BYTES).collect::<Vec<u8>>());
+        let source = Arc::new(RecordingSource {
+            inner: BytesLazyByteSource::new(payload.clone()),
+            ranges: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut overlay = PrefetchedSource::new(Arc::clone(&source) as Arc<dyn LazyByteSource>);
+        overlay.install(
+            OVERLAP_TAIL_START,
+            payload.slice(OVERLAP_TAIL_START as usize..),
+        );
+        (payload, source, overlay)
+    }
+
+    /// A request that runs into the installed tail fetches only the bytes
+    /// before it, and the result is the object's bytes in order.
+    #[tokio::test]
+    async fn a_request_ending_in_an_installed_range_fetches_only_the_rest() {
+        let (payload, source, overlay) = overlay_with_tail();
+        let got = overlay.range(64, 48).await.expect("range");
+        assert_eq!(got.as_ref(), &payload[64..112]);
+        assert_eq!(
+            *source.ranges.lock().expect("ranges"),
+            vec![64..OVERLAP_TAIL_START],
+            "only the bytes before the tail are fetched"
+        );
+        let ahead = overlay.range_ahead(80, 40).await.expect("range_ahead");
+        assert_eq!(ahead.as_ref(), &payload[80..120]);
+        assert_eq!(source.ranges.lock().expect("ranges").len(), 2);
+    }
+
+    /// A request that starts inside an installed range fetches only the
+    /// bytes after it; one covered at both ends is served at the end whose
+    /// range was installed first, the tail here; one that overlaps an
+    /// installed range only in its middle is fetched whole.
+    #[tokio::test]
+    async fn a_request_starting_in_an_installed_range_fetches_only_the_rest() {
+        let (payload, source, mut overlay) = overlay_with_tail();
+        overlay.install(0, payload.slice(0..16));
+        let got = overlay.range(8, 24).await.expect("range");
+        assert_eq!(got.as_ref(), &payload[8..32]);
+        assert_eq!(*source.ranges.lock().expect("ranges"), vec![16..32]);
+
+        let both = overlay.range(8, 100).await.expect("range");
+        assert_eq!(both.as_ref(), &payload[8..108]);
+        assert_eq!(
+            source.ranges.lock().expect("ranges").last(),
+            Some(&(8..OVERLAP_TAIL_START)),
+            "a request covered at both ends is served at the end installed first"
+        );
+
+        overlay.install(48, payload.slice(48..56));
+        let middle = overlay.range(40, 24).await.expect("range");
+        assert_eq!(middle.as_ref(), &payload[40..64]);
+        assert_eq!(
+            source.ranges.lock().expect("ranges").last(),
+            Some(&(40..64)),
+            "a request overlapped only in its middle is fetched whole"
+        );
+    }
 
     #[tokio::test]
     async fn bytes_lazy_source_size_and_range() {
