@@ -603,11 +603,17 @@ to both of its retrievers, so they rank within the same rows before
 fusion. Whatever the index could not bound (a scalar column, a
 negation, a token superset that the exact predicate trims), the
 function makes up by applying the exact predicate to its own resolved
-rows and widening the search — doubling k each round — until k rows
-survive or the table is exhausted; the cost is proportional to the
-predicate's selectivity, never to a fixed over-fetch. Prefix search
-takes only that last tier: its term set is known per superfile, not
-per query.
+rows. `bm25_search` ranks one round of k and checks it; when fewer
+than k rows survive, it evaluates the predicate over the scope's rows
+itself, keeps exactly the rows it holds on, and ranks once more within
+those, so the answer is the top k among matching rows however far
+below the unfiltered top-k they rank. The cost of that pass is a
+decode of the predicate's columns over the scope's rows, paid only by
+a predicate that left the first round short. `vector_search`,
+`hybrid_search` and prefix search instead widen the search — doubling
+k each round — until k rows survive or a bounded ceiling is reached,
+and prefix search takes only that tier: its term set is known per
+superfile, not per query.
 
 ## Concurrency
 
