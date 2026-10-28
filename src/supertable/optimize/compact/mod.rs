@@ -127,6 +127,14 @@ impl Supertable {
     }
 }
 
+/// Threads in each merge's own pool: the maintenance width shared out among
+/// the merges that can run at once. A pass of fewer jobs than its width gives
+/// each the larger share, and rounding down keeps the pool's width a ceiling
+/// on all of them together.
+fn merge_pool_width(maintenance_threads: usize, concurrency: usize, jobs: usize) -> usize {
+    (maintenance_threads / concurrency.min(jobs).max(1)).max(1)
+}
+
 /// What running a job actually did.
 ///
 /// A job whose inputs have already been replaced by another writer is not
@@ -1454,11 +1462,8 @@ impl Supertable {
         host_check: fn() -> bool,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        // The maintenance width shared out among the merges in flight.
-        let merge_threads = maint_pool()?
-            .current_num_threads()
-            .div_ceil(concurrency)
-            .max(1);
+        let merge_threads =
+            merge_pool_width(maint_pool()?.current_num_threads(), concurrency, jobs.len());
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         // Finished merges waiting for the next commit.
@@ -4140,6 +4145,19 @@ mod tests {
             min_fill_percent: 1,
             ..CompactionSettings::default()
         }
+    }
+
+    #[test]
+    fn a_merge_pool_shares_the_maintenance_width_among_the_merges_that_run() {
+        // One job takes the whole pool, whatever the configured width.
+        assert_eq!(merge_pool_width(10, 10, 1), 10);
+        assert_eq!(merge_pool_width(10, 10, 2), 5);
+        // Many jobs never take more threads together than the pool has.
+        assert_eq!(merge_pool_width(88, 60, 1_000), 1);
+        assert_eq!(merge_pool_width(88, 32, 1_000), 2);
+        // Never fewer than one.
+        assert_eq!(merge_pool_width(4, 16, 1_000), 1);
+        assert_eq!(merge_pool_width(4, 16, 0), 4);
     }
 
     fn commit_titles(st: &Supertable, titles: &[&str]) {
