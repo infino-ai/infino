@@ -33,6 +33,7 @@ use crate::{
     },
     superfile::{
         ReadError,
+        bits::{EXPAND_SLACK, expand_bitset, expand_bitset_scalar},
         error::FtsError,
         format,
         fts::{
@@ -44,6 +45,13 @@ use crate::{
     },
     utils::terms::{DictEntry, make_key},
 };
+
+/// An unranked match holding at least one row in this many of its blob's
+/// rows is put back in row order through a bitset of the blob's rows
+/// instead of a sort. At that density reading the bitset's words back
+/// costs no more than touching the rows themselves, and the sort's
+/// `n log n` was most of a dense match's time on a reordered blob.
+const ROW_ORDER_BITSET_MIN_DENSITY: usize = 64;
 
 /// One scored term's open-wave fetch result: the dictionary resolution
 /// plus, for a PFOR term, its full postings range and header df.
@@ -150,6 +158,27 @@ mod seed {
 /// clamps to the cap rather than overflowing.
 pub(super) fn seed_blocks_for(k: usize) -> usize {
     (k.saturating_add(k / 4) / 2).clamp(seed::MIN_BLOCKS_SEED, seed::MAX_BLOCKS_SEED)
+}
+
+/// `rows`, `count` distinct rows below `n_rows` in any order, ascending:
+/// each is marked in a bitset of the `n_rows` rows and the set bits are
+/// read back in order, the expansion the posting decoder uses for a
+/// presence block.
+fn rows_in_order(rows: impl Iterator<Item = RowId>, count: usize, n_rows: usize) -> Vec<RowId> {
+    let word_bytes = (u64::BITS / u8::BITS) as usize;
+    let mut bits = vec![0u8; n_rows.div_ceil(u64::BITS as usize) * word_bytes];
+    for row in rows {
+        let r = row.get() as usize;
+        bits[r / u8::BITS as usize] |= 1 << (r % u8::BITS as usize);
+    }
+    let mut out = vec![0u32; count + EXPAND_SLACK];
+    let n = match expand_bitset(&bits, 0, &mut out) {
+        Some(n) => n,
+        None => expand_bitset_scalar(&bits, 0, &mut out),
+    };
+    debug_assert_eq!(n, count, "a doc-id map names each row once");
+    out.truncate(n);
+    out.into_iter().map(RowId::new).collect()
 }
 
 impl FtsReader {
@@ -932,8 +961,9 @@ impl FtsReader {
     /// ascending row order: a row-keyed bitmap is built from them, a
     /// membership filter is probed with them, and the exact-match second
     /// pass decodes them in order. On a blob storing its documents in an
-    /// order of its own those are different orders, so this re-sorts;
-    /// there is nothing to re-sort when there is no map.
+    /// order of its own those are different orders, so this re-orders:
+    /// a dense match through a bitset of the blob's rows, a sparse one by
+    /// sorting. There is nothing to re-order when there is no map.
     ///
     /// No ids read no map.
     pub(super) fn ids_to_rows(&self, ids: Vec<FtsDocId>) -> Result<Vec<RowId>, FtsError> {
@@ -941,10 +971,19 @@ impl FtsReader {
             return Ok(Vec::new());
         }
         let map = self.doc_map()?;
-        let mut rows: Vec<RowId> = ids.into_iter().map(|id| map.row_of(id)).collect();
-        if self.has_doc_map() {
-            rows.sort_unstable();
+        if !self.has_doc_map() {
+            return Ok(ids.into_iter().map(|id| map.row_of(id)).collect());
         }
+        let n_rows = self.n_docs() as usize;
+        if ids.len().saturating_mul(ROW_ORDER_BITSET_MIN_DENSITY) >= n_rows {
+            return Ok(rows_in_order(
+                ids.iter().map(|&id| map.row_of(id)),
+                ids.len(),
+                n_rows,
+            ));
+        }
+        let mut rows: Vec<RowId> = ids.into_iter().map(|id| map.row_of(id)).collect();
+        rows.sort_unstable();
         Ok(rows)
     }
 
@@ -2011,6 +2050,66 @@ mod tests {
     /// Score slack between the ranked and the exact-count walks: they add
     /// a doc's term scores in different orders.
     const SUM_ORDER_EPS: f32 = 1e-4;
+    /// Rows in the reordered fixture: a whole number of bitset words, and a
+    /// count that leaves the last word part full.
+    const ORDER_FIXTURE_ROWS: [u32; 2] = [4096, 4101];
+    /// Every this many rows carry `beta`: a match dense enough for the bitset.
+    const BETA_EVERY: u32 = 3;
+    /// Every this many rows carry `rare`: a match sparse enough to be sorted.
+    const RARE_EVERY: u32 = 128;
+
+    /// An unranked match on a reordered blob comes back as its rows,
+    /// ascending, whether it is dense enough to be put in order through a
+    /// bitset or sparse enough to be sorted, at a row count that fills the
+    /// bitset's last word and at one that does not.
+    #[tokio::test]
+    async fn unranked_rows_come_back_ascending_at_any_density() {
+        for n_rows in ORDER_FIXTURE_ROWS {
+            let docs: Vec<String> = (0..n_rows)
+                .map(|row| {
+                    let mut text = String::from("alpha");
+                    if row.is_multiple_of(BETA_EVERY) {
+                        text.push_str(" beta");
+                    }
+                    if row.is_multiple_of(RARE_EVERY) {
+                        text.push_str(" rare");
+                    }
+                    text
+                })
+                .collect();
+            let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+            // Fisher-Yates, so the blob's order is a genuine permutation.
+            let mut next = xorshift(u64::from(n_rows));
+            let mut order: Vec<u32> = (0..n_rows).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+            let r = FtsReader::open(blob, &json).expect("open");
+            assert!(r.has_doc_map(), "the fixture must be reordered");
+
+            // The fixture takes both paths: `rare` is sorted, `beta` and
+            // `alpha` go through the bitset.
+            let rows = n_rows as usize;
+            let rare = n_rows.div_ceil(RARE_EVERY) as usize;
+            let beta = n_rows.div_ceil(BETA_EVERY) as usize;
+            assert!(rare * ROW_ORDER_BITSET_MIN_DENSITY < rows);
+            assert!(beta * ROW_ORDER_BITSET_MIN_DENSITY >= rows);
+
+            for (term, every) in [("alpha", 1), ("beta", BETA_EVERY), ("rare", RARE_EVERY)] {
+                let want: Vec<u32> = (0..n_rows).filter(|row| row.is_multiple_of(every)).collect();
+                let got: Vec<u32> = r
+                    .token_match("body", &[term], BoolMode::Or)
+                    .await
+                    .expect("token match")
+                    .0
+                    .into_iter()
+                    .map(RowId::get)
+                    .collect();
+                assert_eq!(got, want, "{n_rows} rows, `{term}`");
+            }
+        }
+    }
 
     /// The two walks return the same top-k up to float summation order:
     /// every doc's score agrees within `SUM_ORDER_EPS`, and a doc may be
