@@ -238,10 +238,12 @@ const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
 const MANIFEST_CACHE_SUBDIR: &str = "manifest-parts";
 /// Default optimistic-commit retry budget under contention.
 const DEFAULT_MAX_COMMIT_RETRIES: u32 = 10;
-/// Default user-superfile batch size for the hidden-index drain. `1` streams
-/// one source superfile at a time to keep drain RAM bounded on large corpora.
-/// `-1` = unbounded (single merge), `0` = skip the drain.
-const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 1;
+/// Default user-superfile batch size for the hidden-index drain, matching
+/// `vector.drain_batch_superfiles` in `config.yaml`. A batch takes whole
+/// commits until it holds this many superfiles, so drain RAM stays bounded
+/// while the per-batch fixed costs (opens, checkpoint) amortize over many
+/// superfiles. `-1` = unbounded (single merge), `0` = skip the drain.
+const DEFAULT_DRAIN_BATCH_SUPERFILES: i64 = 64;
 /// Default writer auto-flush threshold (1 GiB, in MiB units).
 const DEFAULT_COMMIT_THRESHOLD_SIZE_MB: u64 = 1024;
 /// Default target buffered bytes per commit shard (in MiB units).
