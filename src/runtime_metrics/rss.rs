@@ -84,7 +84,7 @@ pub(crate) fn status_anon_rss_bytes() -> Option<u64> {
 }
 
 /// A `/proc/self/status` field that the kernel reports in kB, in bytes.
-fn status_field_bytes(field: &str) -> Option<u64> {
+pub(crate) fn status_field_bytes(field: &str) -> Option<u64> {
     let s = fs::read_to_string(PROC_SELF_STATUS).ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix(field) {

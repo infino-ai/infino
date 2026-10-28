@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::{
     config::{CompactionSettings, RecalibratePolicy, global},
-    runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, run_on_own_pool, run_on_pool},
     runtime_metrics::rss::{available_memory_bytes, memory_budget},
     storage::StorageError,
     superfile::{
@@ -58,7 +58,7 @@ use crate::{
             RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
-            term_index::{Contribution as TermContribution, ReservedSegment},
+            term_index::{Contribution as TermContribution, ReservedLayer},
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_compaction_input, vector},
@@ -627,8 +627,14 @@ impl Supertable {
         superfiles: &[Arc<SuperfileEntry>],
         tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
     ) -> Result<PreparedSuperfile, BuildError> {
-        self.merge_superfiles_with(superfiles, tombstones, Arc::new(CompactionMerge), None)
-            .await
+        self.merge_superfiles_with(
+            superfiles,
+            tombstones,
+            Arc::new(CompactionMerge),
+            None,
+            None,
+        )
+        .await
     }
 
     /// As [`Self::merge_superfiles`], with the build injected.
@@ -642,7 +648,8 @@ impl Supertable {
         superfiles: &[Arc<SuperfileEntry>],
         tombstones: &HashMap<Uuid, Arc<RoaringBitmap>>,
         merge: Arc<dyn SuperfileMerge>,
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
+        merge_threads: Option<usize>,
     ) -> Result<PreparedSuperfile, BuildError> {
         debug_assert!(
             tombstones.is_empty()
@@ -666,7 +673,7 @@ impl Supertable {
         // a pass could be refused for a budget a serial pass fit inside, on a
         // machine with the memory to spare. What bounds a merge is the host:
         // the runner admits one at a time against free memory, and
-        // `max_memory_mb` caps the input bytes a single job may pack.
+        // `max_merge_input_mb` caps the input bytes a single job may pack.
 
         let semaphore = input_open_permits();
         let mut superfile_readers_tasks = JoinSet::new();
@@ -745,7 +752,7 @@ impl Supertable {
         let builder_options = manifest
             .builder_options()
             .with_fts_corpus_stats(manifest.fts_corpus_stats(superfiles))
-            .with_merge_memory_mb(merge_memory_mb);
+            .with_merge_input_mb(merge_input_mb);
         // The build is long, synchronous CPU work, so it runs on the
         // maintenance pool rather than the thread driving this future.
         // `run_on_pool` needs a `'static` closure, so everything it reads —
@@ -758,55 +765,59 @@ impl Supertable {
         let mut term_heads: Option<(Box<dyn TermHeadSink>, usize)> = head_sink
             .as_ref()
             .map(|(sink, depth)| (Box::new(sink.clone()) as Box<dyn TermHeadSink>, *depth));
-        let (merged_bytes, superfile_stats) = run_on_pool(
-            Some(maint_pool()?),
-            "compaction merge",
-            move || -> Result<(Bytes, _), BuildError> {
-                let _span = detail_span!(
-                    "merge_build",
-                    output_bytes = tracing::field::Empty,
-                    cpu_ms = tracing::field::Empty,
-                    rss_anon_mb_before = tracing::field::Empty,
-                    rss_anon_mb_after = tracing::field::Empty,
-                    mem_available_mb_before = tracing::field::Empty,
-                    mem_available_mb_after = tracing::field::Empty,
-                )
-                .entered();
-                let usage = RegionUsage::begin();
-                // Every merge kind streams its output to a temp file and mmaps it
-                // back, so the corpus-sized merge output is never held as an anon
-                // Vec — the allocation that OOMs compaction on a memory-tight host.
-                // Mapped pages are file-backed and reclaimable; downstream publish
-                // takes `Bytes` unchanged (large superfiles already stream via
-                // put_multipart).
-                let mut output = NamedTempFile::new()
-                    .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
-                let stats = {
-                    let mut writer = BufWriter::new(output.as_file_mut());
-                    let stats = merge.build(
-                        MergeInputs {
-                            inputs: &inputs,
-                            entries: &entries,
-                            term_heads: Some(&mut term_heads),
-                            superseded: &superseded_per_reader,
-                            builder_options,
-                        },
-                        &mut writer,
-                    )?;
-                    writer
-                        .flush()
-                        .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
-                    stats
-                };
-                let bytes = mmap_readonly_bytes(output.path())
-                    .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
-                record("output_bytes", bytes.len() as u64);
-                usage.finish();
-                Ok((bytes, stats))
-            },
-        )
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))??;
+        let build = move || -> Result<(Bytes, _), BuildError> {
+            let _span = detail_span!(
+                "merge_build",
+                output_bytes = tracing::field::Empty,
+                cpu_ms = tracing::field::Empty,
+                rss_anon_mb_before = tracing::field::Empty,
+                rss_anon_mb_after = tracing::field::Empty,
+                mem_available_mb_before = tracing::field::Empty,
+                mem_available_mb_after = tracing::field::Empty,
+            )
+            .entered();
+            let usage = RegionUsage::begin();
+            // Every merge kind streams its output to a temp file and mmaps it
+            // back, so the corpus-sized merge output is never held as an anon
+            // Vec — the allocation that OOMs compaction on a memory-tight host.
+            // Mapped pages are file-backed and reclaimable; downstream publish
+            // takes `Bytes` unchanged (large superfiles already stream via
+            // put_multipart).
+            let mut output = NamedTempFile::new()
+                .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
+            let stats = {
+                let mut writer = BufWriter::new(output.as_file_mut());
+                let stats = merge.build(
+                    MergeInputs {
+                        inputs: &inputs,
+                        entries: &entries,
+                        term_heads: Some(&mut term_heads),
+                        superseded: &superseded_per_reader,
+                        builder_options,
+                    },
+                    &mut writer,
+                )?;
+                writer
+                    .flush()
+                    .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
+                stats
+            };
+            let bytes = mmap_readonly_bytes(output.path())
+                .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
+            record("output_bytes", bytes.len() as u64);
+            usage.finish();
+            Ok((bytes, stats))
+        };
+        // A merge sharing the maintenance pool with other merges can, while
+        // it waits on its own nested parallel work, steal one of theirs and
+        // run it to the end on top of itself, so concurrent merges stack on a
+        // few threads. A pass running several gives each its own pool.
+        let built = match merge_threads {
+            Some(threads) => run_on_own_pool(threads, "compaction merge", build).await,
+            None => run_on_pool(Some(maint_pool()?), "compaction merge", build).await,
+        };
+        let (merged_bytes, superfile_stats) =
+            built.map_err(|e| BuildError::Store(e.to_string()))??;
 
         let mut shard = ShardOutput::new_with_params(
             merged_bytes,
@@ -866,12 +877,13 @@ impl Supertable {
             )
         )
     )]
+    #[cfg(test)]
     pub(crate) async fn prepare_compaction_job(
         &self,
         job: CompactionJob,
         stale_seal_timeout: Duration,
     ) -> Result<PreparedJob, CompactionError> {
-        self.prepare_compaction_job_with(job, stale_seal_timeout, Arc::new(CompactionMerge))
+        self.prepare_compaction_job_with(job, stale_seal_timeout, Arc::new(CompactionMerge), None)
             .await
     }
 
@@ -882,6 +894,7 @@ impl Supertable {
         job: CompactionJob,
         stale_seal_timeout: Duration,
         merge: Arc<dyn SuperfileMerge>,
+        merge_threads: Option<usize>,
     ) -> Result<PreparedJob, CompactionError> {
         let inner = self.inner();
         let manifest = inner.manifest.load_full();
@@ -934,12 +947,13 @@ impl Supertable {
             .iter()
             .map(|s| (s.superfile_id, Arc::new(s.bitmap.clone())))
             .collect();
-        let merged_segment = match self
+        let merged_superfile = match self
             .merge_superfiles_with(
                 &inputs,
                 &sealed_tombstones,
                 Arc::clone(&merge),
-                job.merge_memory_mb,
+                job.merge_input_mb,
+                merge_threads,
             )
             .await
         {
@@ -962,7 +976,7 @@ impl Supertable {
             bytes_for_cache,
             merged_superfile_id,
             term_contributions,
-        ) = match merged_segment {
+        ) = match merged_superfile {
             Some(PreparedSuperfile {
                 entry: merged_prepared,
                 bytes_for_store,
@@ -1107,7 +1121,7 @@ impl Supertable {
         let mut next_id_floor: u64 = 0;
         // The batch's term-index delta, built on the first attempt and
         // appended again by any retry instead of rebuilt.
-        let mut reserved_segment: Option<ReservedSegment> = None;
+        let mut reserved_layer: Option<ReservedLayer> = None;
         // Parts rebuilt for the batch's removals, reused by any retry.
         let mut rebuilt_parts = RebuiltParts::default();
         let started = Instant::now();
@@ -1241,7 +1255,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
-                Some(&mut reserved_segment),
+                Some(&mut reserved_layer),
                 Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )
@@ -1394,7 +1408,7 @@ impl Supertable {
         // manifest among them. Only the manifest swap can find the inputs
         // gone, which is the race this outcome is for rather than an error.
         let prepared = self
-            .prepare_compaction_job_with(job, stale_seal_timeout, merge)
+            .prepare_compaction_job_with(job, stale_seal_timeout, merge, None)
             .await?;
         match self.commit_compaction_batch(vec![prepared]).await {
             Ok(()) => Ok(JobOutcome::Committed),
@@ -1440,6 +1454,11 @@ impl Supertable {
         host_check: fn() -> bool,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
+        // The maintenance width shared out among the merges in flight.
+        let merge_threads = maint_pool()?
+            .current_num_threads()
+            .div_ceil(concurrency)
+            .max(1);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         // Finished merges waiting for the next commit.
@@ -1488,7 +1507,13 @@ impl Supertable {
                 let (plan_index, job) = queued.pop_front().expect("loop condition");
                 log_merge_admitted(merging.len(), queued.len(), held_back);
                 held_back = 0;
-                self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
+                self.spawn_merge(
+                    &mut merging,
+                    plan_index,
+                    job,
+                    stale_seal_timeout,
+                    merge_threads,
+                );
                 next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
                 continue;
             }
@@ -1561,7 +1586,7 @@ impl Supertable {
                         let (plan_index, job) = queued.pop_front().expect("guarded above");
                         log_merge_admitted(merging.len(), queued.len(), held_back);
                         held_back = 0;
-                        self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout);
+                        self.spawn_merge(&mut merging, plan_index, job, stale_seal_timeout, merge_threads);
                     } else {
                         held_back += 1;
                     }
@@ -1633,6 +1658,7 @@ impl Supertable {
         plan_index: usize,
         job: CompactionJob,
         stale_seal_timeout: Duration,
+        merge_threads: usize,
     ) {
         let table = self.clone();
         let pass = Span::current();
@@ -1642,7 +1668,15 @@ impl Supertable {
             let span = detail_span!("compaction_merge", plan_index = plan_index);
             span.follows_from(&pass);
             async move {
-                let prepared = match table.prepare_compaction_job(job, stale_seal_timeout).await {
+                let prepared = match table
+                    .prepare_compaction_job_with(
+                        job,
+                        stale_seal_timeout,
+                        Arc::new(CompactionMerge),
+                        Some(merge_threads),
+                    )
+                    .await
+                {
                     Ok(prepared) => prepared,
                     Err(e) => return (plan_index, Err(e)),
                 };
@@ -2887,7 +2921,7 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![bogus],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -2963,7 +2997,7 @@ mod tests {
             partition_key: entry_a.partition_key.clone(),
             inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
             estimated_output_bytes: 1,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -4639,7 +4673,7 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![superfiles[0].superfile_id, superfiles[2].superfile_id],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let before = part_objects(&dir);
         let peer_handle = peer.clone();
@@ -4708,7 +4742,7 @@ mod tests {
                 .map(|e| e.superfile_id)
                 .collect(),
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         faults.fail_with(
             FaultKind::Precondition,
@@ -6795,13 +6829,13 @@ mod tests {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), live[0]],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
         let good = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![live[1], live[2]],
             estimated_output_bytes: 0,
-            merge_memory_mb: None,
+            merge_input_mb: None,
         };
 
         let err = st
@@ -6879,7 +6913,7 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: pair.to_vec(),
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             })
             .collect()
     }
@@ -7409,7 +7443,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -7492,7 +7526,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.to_vec(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -7532,7 +7566,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -7675,7 +7709,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8138,7 +8172,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8225,7 +8259,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8296,13 +8330,13 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[2], live[3]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
         ];
         st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
@@ -8354,7 +8388,7 @@ mod tests {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
                         estimated_output_bytes: 0,
-                        merge_memory_mb: None,
+                        merge_input_mb: None,
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8419,7 +8453,7 @@ mod tests {
                     partition_key: Vec::new(),
                     inputs: vec![live[0], live[1]],
                     estimated_output_bytes: 0,
-                    merge_memory_mb: None,
+                    merge_input_mb: None,
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8435,7 +8469,7 @@ mod tests {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
                 estimated_output_bytes: 0,
-                merge_memory_mb: None,
+                merge_input_mb: None,
             },
             Duration::ZERO,
         )

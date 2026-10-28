@@ -680,6 +680,8 @@ impl GcReport {
 #[pyclass(name = "OptimizeOptions", skip_from_py_object)]
 #[derive(Clone, Default)]
 struct CompactOptions {
+    max_merge_input_mb: Option<u64>,
+    /// Deprecated name of `max_merge_input_mb`; honoured when that is absent.
     max_memory_mb: Option<u64>,
     min_fill_percent: Option<u8>,
     target_superfile_size_mb: Option<u64>,
@@ -690,15 +692,17 @@ struct CompactOptions {
 #[pymethods]
 impl CompactOptions {
     #[new]
-    #[pyo3(signature = (*, max_memory_mb=None, min_fill_percent=None, target_superfile_size_mb=None, stale_seal_timeout_ms=None, recalibrate=None))]
+    #[pyo3(signature = (*, max_merge_input_mb=None, min_fill_percent=None, target_superfile_size_mb=None, stale_seal_timeout_ms=None, recalibrate=None, max_memory_mb=None))]
     fn new(
-        max_memory_mb: Option<u64>,
+        max_merge_input_mb: Option<u64>,
         min_fill_percent: Option<u8>,
         target_superfile_size_mb: Option<u64>,
         stale_seal_timeout_ms: Option<u64>,
         recalibrate: Option<String>,
+        max_memory_mb: Option<u64>,
     ) -> Self {
         Self {
+            max_merge_input_mb,
             max_memory_mb,
             min_fill_percent,
             target_superfile_size_mb,
@@ -1315,8 +1319,8 @@ impl Table {
     fn optimize(&self, py: Python<'_>, settings: Option<&CompactOptions>) -> PyResult<()> {
         let mut s = CompactionSettings::default();
         if let Some(o) = settings {
-            if let Some(v) = o.max_memory_mb {
-                s.max_memory_mb = v;
+            if let Some(v) = o.max_merge_input_mb.or(o.max_memory_mb) {
+                s.max_merge_input_mb = v;
             }
             if let Some(v) = o.min_fill_percent {
                 s.min_fill_percent = v;

@@ -175,7 +175,7 @@ use crate::{
             part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{
-                self, Contribution as TermContribution, ReservedSegment, Root, TermIndexError,
+                self, Contribution as TermContribution, ReservedLayer, Root, TermIndexError,
             },
         },
         mutations::{
@@ -1329,7 +1329,7 @@ impl WriterSlot {
 /// Orders the publishes of shared append writers. Each takes a ticket and a
 /// term-index base once its superfiles are uploaded, then publishes in ticket
 /// order, so its base is the root's length on its turn and its prebuilt
-/// segment is appended as is. A base the root no longer matches (another
+/// layer is appended as is. A base the root no longer matches (another
 /// writer or an optimize moved it) costs a rebuild at the root's length.
 #[derive(Default)]
 pub(super) struct AppendQueue {
@@ -1346,7 +1346,7 @@ struct AppendQueueState {
     published_end: u32,
     /// Superfiles reserved by tickets not yet served.
     pending: u32,
-    /// Prebuilt segments the commit had to rebuild on their turn.
+    /// Prebuilt layers the commit had to rebuild on their turn.
     #[cfg(test)]
     rebuilt: usize,
 }
@@ -1356,9 +1356,9 @@ impl AppendQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A ticket and the base for a segment of `superfiles`, or no base when
+    /// A ticket and the base for a layer of `superfiles`, or no base when
     /// `root` is not the root the queue last published: its length is then
-    /// unknown, so the segment is built on the ticket's turn instead.
+    /// unknown, so the layer is built on the ticket's turn instead.
     fn reserve(
         &self,
         root: Option<&RoutingRef>,
@@ -2871,10 +2871,10 @@ impl SupertableWriter {
     }
 
     /// Publish an append's superfiles. A shared writer uploads them and builds
-    /// its term-index segment before taking its turn in the append queue, so
+    /// its term-index layer before taking its turn in the append queue, so
     /// only the manifest and root writes are serialized between appends. When
     /// the root is not one the queue published, its length is unknown until
-    /// the turn, so the segment is built then, once.
+    /// the turn, so the layer is built then, once.
     fn publish_appended(
         &self,
         mut batch: SuperfilePublishBatch,
@@ -2893,7 +2893,7 @@ impl SupertableWriter {
             .check_schema(&self.inner.manifest.load())
             .map_err(BuildError::from)?;
         let current_root = || self.inner.manifest.load().term_index_ref().cloned();
-        let mut segment = None;
+        let mut layer = None;
         let mut prebuilt_end = None;
         let mut ticket = match &self.inner.options.storage {
             None => self.inner.append_queue.reserve(None, 0).0,
@@ -2930,10 +2930,10 @@ impl SupertableWriter {
                             }
                         }
                     };
-                    segment = Some(
+                    layer = Some(
                         bridge_on_runtime(
-                            term_index::reserve_segment(
-                                storage.as_ref(),
+                            term_index::reserve_layer(
+                                storage,
                                 contributions,
                                 &self.inner.options.term_index_build_policy(),
                                 base,
@@ -2953,16 +2953,16 @@ impl SupertableWriter {
                 &self.inner,
                 batch,
                 list_metadata,
-                Some(&mut segment),
+                Some(&mut layer),
             ),
             &runtime,
         );
-        if let (Ok(root), Some(segment)) = (&published, &segment) {
-            ticket.published(root.clone(), segment.end());
-            if prebuilt_end.is_some_and(|end| end != segment.end()) {
+        if let (Ok(root), Some(layer)) = (&published, &layer) {
+            ticket.published(root.clone(), layer.end());
+            if prebuilt_end.is_some_and(|end| end != layer.end()) {
                 debug!(
-                    end = segment.end(),
-                    "append's prebuilt term-index segment was rebuilt on its turn"
+                    end = layer.end(),
+                    "append's prebuilt term-index layer was rebuilt on its turn"
                 );
                 #[cfg(test)]
                 {
@@ -4350,13 +4350,13 @@ pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
-    reserved_segment: Option<&mut Option<ReservedSegment>>,
+    reserved_layer: Option<&mut Option<ReservedLayer>>,
 ) -> Result<Option<RoutingRef>, BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(None);
     }
     if let Some(storage) = inner.options.storage.as_ref().cloned() {
-        let new_manifest = persist_commit_with_segment_async(
+        let new_manifest = persist_commit_with_layer_async(
             inner,
             storage,
             batch.new_entries,
@@ -4365,7 +4365,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
             Vec::new(),
             list_metadata,
             batch.term_contributions,
-            reserved_segment,
+            reserved_layer,
         )
         .await
         .map_err(BuildError::from)?;
@@ -11024,12 +11024,12 @@ where
 /// Build and publish the table-level term index over the CURRENT
 /// membership, stamping its root reference on a successor manifest (see
 /// `manifest::term_index`). Maintenance-only: optimize calls it after
-/// compaction so the base segment describes the post-merge superfile set.
+/// compaction so the base layer describes the post-merge superfile set.
 ///
-/// The index is rebuilt from its own segments ([`merge_term_index`]): a
+/// The index is rebuilt from its own layers ([`merge_term_index`]): a
 /// posting depends only on its superfile, which never changes, so copying
-/// it out of the segment that holds it gives what walking the superfile
-/// again would. Only superfiles no segment lists are walked. Every
+/// it out of the layer that holds it gives what walking the superfile
+/// again would. Only superfiles no layer lists are walked. Every
 /// superfile is walked instead ([`collect_and_build_term_index`]) when the
 /// current root will never load (gone, corrupt, or in a layout this engine
 /// no longer reads) or a slice it names is gone or corrupt. A root that
@@ -11037,7 +11037,7 @@ where
 /// earlier build to catch up from.
 ///
 /// The full build runs once. When commits land before it publishes, a retry
-/// stacks their delta segments on it as they are (`term_index::rebase`),
+/// stacks their delta layers on it as they are (`term_index::rebase`),
 /// which writes only a root. When the build lists more superfiles than the
 /// root it was made from, it folds them in instead ([`fold_term_index`]).
 /// When neither lists every live superfile, it indexes only the superfiles
@@ -11088,14 +11088,14 @@ pub(in crate::supertable) async fn stamp_term_index(
                         // a fold would miss the same ones: catch up instead.
                         Some(root) if !unlisted(&root, &entries).is_empty() => None,
                         Some(root) => {
-                            let deltas = root.segments.len() - base.segments.len();
+                            let deltas = root.layers.len() - base.layers.len();
                             if deltas > 0 {
                                 info!(
                                     deltas,
                                     "term index: publish lost a race, rebased the build onto the commits since"
                                 );
                             }
-                            // The rebased root is made of segments already on
+                            // The rebased root is made of layers already on
                             // storage, their slices and tier objects with them.
                             Some(term_index::Built {
                                 root,
@@ -11121,7 +11121,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                 (None, Some((base, _)), _) => {
                     // Only what committed since the last build.
                     let missing = unlisted(&base, &entries);
-                    // Already lists every live superfile: an empty segment
+                    // Already lists every live superfile: an empty layer
                     // would add nothing.
                     if missing.is_empty() {
                         term_index::Built {
@@ -11133,7 +11133,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         collect_and_build_term_index(&old, &missing, base).await?
                     }
                 }
-                (None, None, Some(current)) if !current.segments.is_empty() => {
+                (None, None, Some(current)) if !current.layers.is_empty() => {
                     match merge_term_index(&old, current, &entries).await {
                         Ok(built) => built,
                         Err(e) if e.calls_for_rebuild() => {
@@ -11148,8 +11148,8 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
-            term_index::write_tiers(storage.as_ref(), built.tiers).await?;
-            term_index::write_slices(storage.as_ref(), built.slices).await?;
+            term_index::write_tiers(storage, built.tiers).await?;
+            term_index::write_slices(storage, built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can
@@ -11187,8 +11187,8 @@ fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEn
         .collect()
 }
 
-/// Rebuild the index over `entries` from the segments of `current`, into
-/// one segment, reading superfiles only for the `entries` that `current`
+/// Rebuild the index over `entries` from the layers of `current`, into
+/// one layer, reading superfiles only for the `entries` that `current`
 /// does not list.
 ///
 /// Superfiles take ordinals in `entries` order, as
@@ -11207,11 +11207,11 @@ async fn merge_term_index(
         .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
     let policy = manifest.options.term_index_build_policy();
     let scratch = term_index_scratch(&policy)?;
-    // Superfiles no segment lists get one segment of their own, numbered
+    // Superfiles no layer lists get one layer of their own, numbered
     // past the ones `current` lists, and merge like the rest.
     let missing = unlisted(current, entries);
     // When nothing `current` lists is still live — a compaction that
-    // replaced every superfile — its segments hold only postings the merge
+    // replaced every superfile — its layers hold only postings the merge
     // would drop, so they are not fetched: the fresh build over `entries`
     // is the index, in `entries` order, as the merge would have numbered it.
     let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
@@ -11232,26 +11232,25 @@ async fn merge_term_index(
         .await
         .map_err(|e| TermIndexError::Build(e.to_string()))?;
     }
-    let mut sources =
-        term_index::download_segments(storage.as_ref(), &current.segments, scratch.path())
-            .instrument(detail_span!(
-                "term_index.download",
-                segments = current.segments.len(),
-            ))
-            .await?;
+    let mut sources = term_index::download_layers(storage, &current.layers, scratch.path())
+        .instrument(detail_span!(
+            "term_index.download",
+            layers = current.layers.len(),
+        ))
+        .await?;
     let mut old = Root {
         superfiles: current.superfiles.clone(),
         id_mins: current.id_mins.clone(),
-        segments: Vec::new(),
+        layers: Vec::new(),
     };
     if !missing.is_empty() {
         let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
         let built = term_index::build_onto(old, &contributions, &policy)?;
         let fresh = built
             .root
-            .segments
+            .layers
             .last()
-            .expect("a build onto a root appends its segment");
+            .expect("a build onto a root appends its layer");
         term_index::spill_tiers(scratch.path(), &fresh.slices, built.tiers)?;
         sources.push(term_index::spill_slices(
             scratch.path(),
@@ -11286,7 +11285,7 @@ async fn merge_term_index(
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index merge",
-        move || term_index::merge_segments(&sources, &ordinals, &policy),
+        move || term_index::merge_layers(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!(
         "term_index.merge",
@@ -11295,7 +11294,7 @@ async fn merge_term_index(
     ))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(merged.segment);
+    root.layers.push(merged.layer);
     Ok(term_index::Built {
         root,
         slices: merged.slices,
@@ -11303,15 +11302,15 @@ async fn merge_term_index(
     })
 }
 
-/// Fold the delta segments committed since `prior` onto `base`, the build
+/// Fold the delta layers committed since `prior` onto `base`, the build
 /// made from `prior`, for a retry after a lost race. The deltas merge into
-/// one segment appended to `base`; their superfiles take the ordinals
+/// one layer appended to `base`; their superfiles take the ordinals
 /// after `base`'s, and those no longer live are dropped, so no padding is
 /// left behind.
 ///
 /// `None` when `current` was not built on `prior`. Relies on the deltas
 /// naming only ordinals at or past `prior`'s length (see
-/// `term_index::segments_since`).
+/// `term_index::layers_since`).
 async fn fold_term_index(
     manifest: &ManifestSnapshot,
     base: &Root,
@@ -11319,7 +11318,7 @@ async fn fold_term_index(
     current: &Root,
     entries: &[Arc<SuperfileEntry>],
 ) -> Result<Option<term_index::Built>, TermIndexError> {
-    let Some(deltas) = term_index::segments_since(prior, current) else {
+    let Some(deltas) = term_index::layers_since(prior, current) else {
         return Ok(None);
     };
     let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
@@ -11356,16 +11355,16 @@ async fn fold_term_index(
         ..policy
     };
     let scratch = term_index_scratch(&policy)?;
-    let sources = term_index::download_segments(storage.as_ref(), deltas, scratch.path()).await?;
+    let sources = term_index::download_layers(storage, deltas, scratch.path()).await?;
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",
-        move || term_index::merge_segments(&sources, &ordinals, &policy),
+        move || term_index::merge_layers(&sources, &ordinals, &policy),
     )
     .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.segments.push(merged.segment);
+    root.layers.push(merged.layer);
     Ok(Some(term_index::Built {
         root,
         slices: merged.slices,
@@ -11380,7 +11379,7 @@ fn term_index_scratch(policy: &term_index::BuildPolicy) -> io::Result<TempDir> {
 }
 
 /// Walk every superfile's dictionary once, spilling a contribution per
-/// superfile into one scratch directory, then merge them into one segment
+/// superfile into one scratch directory, then merge them into one layer
 /// on top of `onto`. The scratch directory goes with the contributions when
 /// this returns.
 async fn collect_and_build_term_index(
@@ -11401,7 +11400,7 @@ async fn collect_and_build_term_index(
 /// what a merge keys the superfile's tier entries at. A superfile the
 /// manifest does not list, or a column it records no average for, is left
 /// out and keys at the default.
-fn scoring_by_ordinal(
+pub(in crate::supertable) fn scoring_by_ordinal(
     manifest: &ManifestSnapshot,
     superfiles: &[Uuid],
 ) -> Vec<BTreeMap<FieldId, term_index::ColumnScoring>> {
@@ -11964,7 +11963,7 @@ pub(in crate::supertable) async fn persist_commit_async(
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
-    persist_commit_with_segment_async(
+    persist_commit_with_layer_async(
         inner,
         storage,
         new_entries,
@@ -11978,9 +11977,9 @@ pub(in crate::supertable) async fn persist_commit_async(
     .await
 }
 
-/// [`persist_commit_async`] appending `reserved_segment`, when given, as the
+/// [`persist_commit_async`] appending `reserved_layer`, when given, as the
 /// commit's term-index delta (see `term_index::append_reserved`).
-async fn persist_commit_with_segment_async(
+async fn persist_commit_with_layer_async(
     inner: &SupertableInner,
     storage: Arc<dyn StorageProvider>,
     new_entries: Vec<Arc<SuperfileEntry>>,
@@ -11989,7 +11988,7 @@ async fn persist_commit_with_segment_async(
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
-    mut reserved_segment: Option<&mut Option<ReservedSegment>>,
+    mut reserved_layer: Option<&mut Option<ReservedLayer>>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -12033,7 +12032,7 @@ async fn persist_commit_with_segment_async(
                 pending_writes,
                 pending_replaces,
                 contributions,
-                reserved_segment.as_deref_mut(),
+                reserved_layer.as_deref_mut(),
                 None,
                 None,
             )
@@ -12421,7 +12420,7 @@ pub(crate) async fn try_commit_attempt(
     term_contributions: &[TermContribution],
     // Set by a caller that retries: the delta is built once at a reserved
     // ordinal and kept here across attempts (see `term_index::append_reserved`).
-    reserved_segment: Option<&mut Option<ReservedSegment>>,
+    reserved_layer: Option<&mut Option<ReservedLayer>>,
     // Set by a caller that retries a commit with removals: parts rebuilt by
     // an earlier attempt are reused (see `RebuiltParts`).
     mut rebuilt_parts: Option<&mut RebuiltParts>,
@@ -12532,13 +12531,13 @@ pub(crate) async fn try_commit_attempt(
         })?;
 
     // 3b. The term index: this commit's superfiles publish their postings
-    //     in the SAME CAS as their entries — a delta segment appended to
+    //     in the SAME CAS as their entries — a delta layer appended to
     //     the root the current manifest references (which `update` carried
     //     forward), then the new root's reference on this successor. So a
     //     visible superfile always has postings, and a crash between these
     //     writes and the CAS leaves only orphans for GC. On a lost CAS the
     //     retry rebuilds against the winner's root, unless the caller keeps
-    //     a reserved segment: then the retry appends the segment it already
+    //     a reserved layer: then the retry appends the layer it already
     //     built and writes only a new root.
     //
     //     Runs after the pointer fence above so a purged table refuses the
@@ -12546,7 +12545,7 @@ pub(crate) async fn try_commit_attempt(
     //     be loaded is not fatal to the commit — membership is the commit's
     //     job, routing is derived. A root that is gone or corrupt restarts
     //     the index from this commit's superfiles alone, marked incomplete;
-    //     a read that merely failed keeps the reference and the segments it
+    //     a read that merely failed keeps the reference and the layers it
     //     has accumulated, and marks the index incomplete because this
     //     commit's superfiles are not listed. A maintenance rebuild makes
     //     either whole.
@@ -12601,12 +12600,12 @@ pub(crate) async fn try_commit_attempt(
             scoring_by_superfile: Arc::new(scoring_by_superfile(&new_manifest)),
             ..current_manifest.options.term_index_build_policy()
         };
-        let store = storage.as_ref();
+        let store = &storage;
         // A fold the root calls for is CPU work, merged on the reader pool as
         // optimize's rebuild and fold merge theirs.
         let pool = Some(&*current_manifest.options.reader_pool);
         let reference = async move {
-            match reserved_segment {
+            match reserved_layer {
                 Some(reserved) => {
                     term_index::append_reserved(
                         store,
@@ -16542,12 +16541,12 @@ supertable:
         );
         assert!(
             !listed.contains(&Uuid::nil()),
-            "each prebuilt segment was appended at its reserved base, never rebuilt with padding"
+            "each prebuilt layer was appended at its reserved base, never rebuilt with padding"
         );
         assert_eq!(
             st.inner().append_queue.lock().rebuilt,
             0,
-            "without another writer, every prebuilt segment is appended as built"
+            "without another writer, every prebuilt layer is appended as built"
         );
     }
 

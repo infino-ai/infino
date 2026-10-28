@@ -313,6 +313,19 @@ impl<'a> TermBlocks<'a> {
         Some((block_start, key_start))
     }
 
+    /// Blocks in the dictionary.
+    pub(crate) fn n_blocks(&self) -> usize {
+        self.n_blocks
+    }
+
+    /// Block `b`'s first entry: its key, from the index table, and its
+    /// value, decoded from the block.
+    pub(crate) fn block_first(&self, b: usize) -> Option<(&'a [u8], DictEntry)> {
+        let key = self.first_key(b)?;
+        let entry = BlockCursor::new(&self.bytes[self.block_range(b)?]).next()?;
+        Some((key, entry))
+    }
+
     /// Block `b`'s first key.
     fn first_key(&self, b: usize) -> Option<&'a [u8]> {
         let (_, start) = self.entry(b)?;

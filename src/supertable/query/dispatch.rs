@@ -33,7 +33,10 @@
 //!     with intra-superfile parallelism expressed as additional tokio
 //!     work units (doc-id sub-ranges; see `query/fts.rs`). Cheap
 //!     shapes stay inline where the pool round trip would cost more
-//!     than the scan.
+//!     than the scan, and so does an FTS unit a caller blocks on
+//!     directly (`runtime_bridge::run_on_pool_unless_blocking`): its
+//!     thread is already parked on the query, so running the kernel there
+//!     adds no concurrency beyond the callers' own threads.
 //!
 //! The per-superfile merge (top-k ascending for vector distance,
 //! descending for BM25 relevance) stays with each caller; this layer

@@ -71,7 +71,8 @@ use std::{
     io::{BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     ops::Range,
     str::from_utf8,
-    sync::Arc,
+    sync::{Arc, mpsc::sync_channel},
+    thread,
     time::Duration,
 };
 
@@ -81,7 +82,6 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
-#[cfg(feature = "detailed-tracing")]
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
@@ -144,6 +144,10 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
+/// Batches a merge decodes ahead of the one it is encoding: enough to keep
+/// decoding through a row group's encode, which takes many batches at once.
+const DECODED_BATCHES_AHEAD: usize = 64;
+
 /// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
 const BYTES_PER_MIB: u64 = 1 << 20;
 
@@ -172,19 +176,20 @@ const REORDER_TERMS_PER_DOC: usize = 16;
 
 /// Bytes the bisection's forward index may take.
 ///
-/// `merge_memory_mb` is what the compaction run was configured with, which is
-/// what a per-deployment override sets; the global configuration is the
-/// fallback for a merge with no run behind it.
+/// Derived from the merge input cap: `merge_input_mb` is the cap the
+/// compaction run was configured with, which is what a per-deployment
+/// override sets; the global configuration's cap is the fallback for a merge
+/// with no run behind it.
 ///
 /// A merge large enough to be split at the real budget is far larger than a
 /// test can build, so tests narrow this instead of the corpus.
-fn reorder_budget_bytes(merge_memory_mb: Option<u64>) -> u64 {
+fn reorder_budget_bytes(merge_input_mb: Option<u64>) -> u64 {
     #[cfg(test)]
     if let Some(bytes) = tests::reorder_budget_override() {
         return bytes;
     }
-    merge_memory_mb
-        .unwrap_or(global().compaction.max_memory_mb)
+    merge_input_mb
+        .unwrap_or(global().compaction.max_merge_input_mb)
         .saturating_mul(BYTES_PER_MIB)
         / REORDER_FORWARD_INDEX_BUDGET_SHARE
 }
@@ -257,6 +262,88 @@ fn reorder_plan(
         terms_per_doc,
         chunk_docs: n_docs.div_ceil(runs.max(1)),
     })
+}
+
+/// Keeps each document's most selective terms for the bisection: what the
+/// second pass of `merge_doc_order` does for one input over one stretch of
+/// output rows.
+struct TermPicker<'a, E: Fn(u32) -> bool> {
+    n_fts_columns: u32,
+    terms_per_doc: usize,
+    df: &'a [u32],
+    eligible: &'a E,
+}
+
+impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
+    /// Fill the slots of output rows `first_row..past_row` from `reader`'s
+    /// terms. `slots`, `filled` and `worst` cover exactly those rows. A slot
+    /// list holds the terms carried by the fewest documents; `worst` points
+    /// at its most common one, so a term that cannot displace it costs one
+    /// comparison.
+    #[allow(clippy::too_many_arguments)]
+    fn pick(
+        &self,
+        reader: &SuperfileReader,
+        rows: &[Option<RowId>],
+        first_row: usize,
+        past_row: usize,
+        slots: &mut [u32],
+        filled: &mut [u8],
+        worst: &mut [u8],
+    ) -> Result<(), BuildError> {
+        let (terms_per_doc, df) = (self.terms_per_doc, self.df);
+        let fts = reader.fts().expect("checked by the caller");
+        for column_id in 0..self.n_fts_columns {
+            // An ineligible term is skipped before its postings are read.
+            let on_term = |term: &[u8]| {
+                let t = term_bucket(term);
+                (self.eligible)(t).then_some(t)
+            };
+            fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                let Some(row) = rows[local_doc as usize] else {
+                    return;
+                };
+                let row = row.get() as usize;
+                if row < first_row || row >= past_row {
+                    return;
+                }
+                let row = row - first_row;
+                let slot_base = row * terms_per_doc;
+                let used = filled[row] as usize;
+                if used < terms_per_doc {
+                    slots[slot_base + used] = t;
+                    if used == 0
+                        || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
+                    {
+                        worst[row] = used as u8;
+                    }
+                    filled[row] = (used + 1) as u8;
+                    return;
+                }
+                let worst_slot = slot_base + worst[row] as usize;
+                if df[t as usize] >= df[slots[worst_slot] as usize] {
+                    return;
+                }
+                slots[worst_slot] = t;
+
+                // The worst moved; find it again over the fixed, small slot
+                // count.
+                let mut w = 0usize;
+                for i in 1..terms_per_doc {
+                    if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
+                        w = i;
+                    }
+                }
+                worst[row] = w as u8;
+            })
+            .map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "fts merge: reading terms for the document order failed: {e}"
+                )))
+            })?;
+        }
+        Ok(())
+    }
 }
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
@@ -699,11 +786,11 @@ pub struct BuilderOptions {
     /// Memory this merge may use, in MiB, taken from the compaction settings
     /// the run was given rather than from the global configuration. The
     /// reordering sizes its forward index from a share of it, so a deployment
-    /// that raises the merge budget reorders more documents together.
+    /// that raises the merge input cap reorders more documents together.
     ///
     /// `None` outside compaction, where there is no run to honour and the
     /// configured value is the only one there is.
-    pub(crate) merge_memory_mb: Option<u64>,
+    pub(crate) merge_input_mb: Option<u64>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -850,15 +937,15 @@ impl BuilderOptions {
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
-            merge_memory_mb: None,
+            merge_input_mb: None,
         }
     }
 
-    /// Give the merge the memory budget its compaction run was configured
-    /// with (see [`BuilderOptions::merge_memory_mb`]). `None` leaves it on
-    /// the configured value.
-    pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
-        self.merge_memory_mb = mb;
+    /// Give the merge the input cap its compaction run was configured with
+    /// (see [`BuilderOptions::merge_input_mb`]). `None` leaves it on the
+    /// configured value.
+    pub(crate) fn with_merge_input_mb(mut self, mb: Option<u64>) -> Self {
+        self.merge_input_mb = mb;
         self
     }
 
@@ -2696,7 +2783,7 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
         rows_of: &[Vec<Option<RowId>>],
-        merge_memory_mb: Option<u64>,
+        merge_input_mb: Option<u64>,
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -2713,31 +2800,48 @@ impl SuperfileBuilder {
         // eligible it is what makes one more informative than another.
         let count_span = detail_span!("merge_order_count_terms").entered();
         let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
-        let mut df: Vec<u32> = vec![0; n_buckets];
         let rows_by_blob: Vec<Vec<Option<RowId>>> = readers
             .iter()
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
             .collect::<Result<_, _>>()?;
-        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
-            let fts = reader.fts().expect("checked above");
-            for column_id in 0..n_fts_columns {
-                fts.for_each_term_doc(
-                    column_id,
-                    |term| Some(term_bucket(term)),
-                    |&t, local_doc| {
-                        if rows[local_doc as usize].is_some() {
-                            df[t as usize] += 1;
-                        }
-                    },
-                )
-                .map_err(|e| {
-                    BuildError::Io(Error::other(format!(
-                        "fts merge: counting terms for the document order failed: {e}"
-                    )))
-                })?;
-            }
-        }
+        // The inputs are counted side by side, each thread into its own table,
+        // and the tables summed: counts come out the same in any order.
+        let df: Vec<u32> = readers
+            .par_iter()
+            .zip(rows_by_blob.par_iter())
+            .try_fold(
+                || vec![0u32; n_buckets],
+                |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
+                    let fts = reader.fts().expect("checked above");
+                    for column_id in 0..n_fts_columns {
+                        fts.for_each_term_doc(
+                            column_id,
+                            |term| Some(term_bucket(term)),
+                            |&t, local_doc| {
+                                if rows[local_doc as usize].is_some() {
+                                    df[t as usize] += 1;
+                                }
+                            },
+                        )
+                        .map_err(|e| {
+                            BuildError::Io(Error::other(format!(
+                                "fts merge: counting terms for the document order failed: {e}"
+                            )))
+                        })?;
+                    }
+                    Ok(df)
+                },
+            )
+            .try_reduce(
+                || vec![0u32; n_buckets],
+                |mut a, b| {
+                    for (x, y) in a.iter_mut().zip(&b) {
+                        *x += y;
+                    }
+                    Ok(a)
+                },
+            )?;
         drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
@@ -2754,7 +2858,7 @@ impl SuperfileBuilder {
             .filter(|&(t, _)| eligible(t as u32))
             .map(|(_, &d)| u64::from(d))
             .sum();
-        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_memory_mb)
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_input_mb)
         else {
             // No term groups anything; arrival order it is.
             return Ok(None);
@@ -2804,64 +2908,64 @@ impl SuperfileBuilder {
             let mut filled: Vec<u8> = vec![0; run];
             let mut worst: Vec<u8> = vec![0; run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
-            for (((reader, _), rows), span) in
-                readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
-            {
-                match *span {
-                    Some((lo, hi)) if lo < past_row && hi >= first_row => {}
-                    _ => continue,
+            let picker = TermPicker {
+                n_fts_columns,
+                terms_per_doc,
+                df: &df,
+                eligible: &eligible,
+            };
+            // The inputs this run holds, with the rows of it each covers.
+            let mut covering: Vec<(usize, usize, usize)> = span_of
+                .iter()
+                .enumerate()
+                .filter_map(|(i, span)| match *span {
+                    Some((lo, hi)) if lo < past_row && hi >= first_row => {
+                        Some((i, lo.max(first_row), (hi + 1).min(past_row)))
+                    }
+                    _ => None,
+                })
+                .collect();
+            covering.sort_unstable_by_key(|&(_, start, _)| start);
+            let apart = covering.windows(2).all(|pair| pair[0].2 <= pair[1].1);
+            if apart {
+                // Every row belongs to one input, so inputs whose rows do not
+                // interleave fill disjoint stretches of the slots, side by side;
+                // each still reads its own terms in the order it always did.
+                let (mut slots_rest, mut filled_rest, mut worst_rest) =
+                    (&mut slots[..], &mut filled[..], &mut worst[..]);
+                let mut at = first_row;
+                let mut windows = Vec::with_capacity(covering.len());
+                for &(i, start, end) in &covering {
+                    let skip = start - at;
+                    let take = end - start;
+                    let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
+                    let (s, rest) = rest.split_at_mut(take * terms_per_doc);
+                    slots_rest = rest;
+                    let (_, rest) = filled_rest.split_at_mut(skip);
+                    let (f, rest) = rest.split_at_mut(take);
+                    filled_rest = rest;
+                    let (_, rest) = worst_rest.split_at_mut(skip);
+                    let (w, rest) = rest.split_at_mut(take);
+                    worst_rest = rest;
+                    windows.push((i, start, end, s, f, w));
+                    at = end;
                 }
-                let fts = reader.fts().expect("checked above");
-                for column_id in 0..n_fts_columns {
-                    let on_term = |term: &[u8]| {
-                        let t = term_bucket(term);
-                        let keep = eligible(t);
-                        keep.then_some(t)
-                    };
-                    fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
-                        let Some(row) = rows[local_doc as usize] else {
-                            return;
-                        };
-                        let row = row.get() as usize;
-                        if row < first_row || row >= past_row {
-                            return;
-                        }
-                        let row = row - first_row;
-                        let slot_base = row * terms_per_doc;
-                        let used = filled[row] as usize;
-                        if used < terms_per_doc {
-                            slots[slot_base + used] = t;
-                            if used == 0
-                                || df[t as usize]
-                                    > df[slots[slot_base + worst[row] as usize] as usize]
-                            {
-                                worst[row] = used as u8;
-                            }
-                            filled[row] = (used + 1) as u8;
-                            return;
-                        }
-                        let worst_slot = slot_base + worst[row] as usize;
-                        if df[t as usize] >= df[slots[worst_slot] as usize] {
-                            return;
-                        }
-                        slots[worst_slot] = t;
-
-                        // The worst moved; find it again over the fixed,
-                        // small slot count.
-                        let mut w = 0usize;
-                        for i in 1..terms_per_doc {
-                            if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize]
-                            {
-                                w = i;
-                            }
-                        }
-                        worst[row] = w as u8;
-                    })
-                    .map_err(|e| {
-                        BuildError::Io(Error::other(format!(
-                            "fts merge: reading terms for the document order failed: {e}"
-                        )))
+                windows
+                    .into_par_iter()
+                    .try_for_each(|(i, start, end, s, f, w)| {
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, f, w)
                     })?;
+            } else {
+                for &(i, _, _) in &covering {
+                    picker.pick(
+                        &readers[i].0,
+                        &rows_by_blob[i],
+                        first_row,
+                        past_row,
+                        &mut slots,
+                        &mut filled,
+                        &mut worst,
+                    )?;
                 }
             }
 
@@ -3090,7 +3194,7 @@ impl SuperfileBuilder {
                     n_fts_columns,
                     n_out_docs,
                     &rows_of,
-                    superfile_builder.opts.merge_memory_mb,
+                    superfile_builder.opts.merge_input_mb,
                 )?
             }
             false => None,
@@ -3220,36 +3324,61 @@ impl SuperfileBuilder {
             timings.fts += start.elapsed();
             if ordered_batches.is_none() {
                 // Stream surviving rows batch by batch. Do not decode and retain an
-                // entire input in memory.
-                let mut batches = input.batches(&superfile_builder.opts)?;
+                // entire input in memory. A thread of its own decodes the next
+                // few batches and computes their stats while this one encodes
+                // the last; they arrive in the order they were read, so the
+                // output is the same.
+                let opts = superfile_builder.opts.clone();
+                let (sender, decoded) = sync_channel::<
+                    Result<(RecordBatch, SuperfileStats), BuildError>,
+                >(DECODED_BATCHES_AHEAD);
+                thread::scope(|scope| -> Result<(), BuildError> {
+                    scope.spawn(move || {
+                        let batches = match input.batches(&opts) {
+                            Ok(batches) => batches,
+                            Err(e) => {
+                                let _ = sender.send(Err(e));
+                                return;
+                            }
+                        };
+                        for batch in batches {
+                            let decoded = batch.and_then(|batch| {
+                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                                Ok((batch, stats))
+                            });
+                            let failed = decoded.is_err();
+                            // The receiver is gone once the merge has failed.
+                            if sender.send(decoded).is_err() || failed {
+                                return;
+                            }
+                        }
+                    });
+                    loop {
+                        let start = std::time::Instant::now();
+                        let Ok(next) = decoded.recv() else {
+                            break;
+                        };
+                        let (record_batch, stats) = next?;
+                        // Time spent waiting on the decoder, not decoding.
+                        timings.read_parquet += start.elapsed();
+                        stats_collector.push(stats);
 
-                loop {
-                    let start = std::time::Instant::now();
-                    let Some(record_batch) = batches.next().transpose()? else {
-                        break;
-                    };
-                    timings.read_parquet += start.elapsed();
+                        let start = std::time::Instant::now();
+                        body_encoder.write_batch(&record_batch)?;
+                        timings.write_parquet += start.elapsed();
 
-                    let start = std::time::Instant::now();
-                    stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                        &record_batch,
-                    )?);
-                    timings.stats_compute += start.elapsed();
+                        push_stable_ids(&mut id_sidecar, &record_batch, &id_column)?;
 
-                    let start = std::time::Instant::now();
-                    body_encoder.write_batch(&record_batch)?;
-                    timings.write_parquet += start.elapsed();
-
-                    push_stable_ids(&mut id_sidecar, &record_batch, &id_column)?;
-
-                    let rows = record_batch.num_rows() as u32;
-                    // A re-analyzed merge indexes the rows as they go by,
-                    // under the doc ids they are written at.
-                    if reanalyze {
-                        superfile_builder.index_fts_batch(&record_batch, rows)?;
+                        let rows = record_batch.num_rows() as u32;
+                        // A re-analyzed merge indexes the rows as they go by,
+                        // under the doc ids they are written at.
+                        if reanalyze {
+                            superfile_builder.index_fts_batch(&record_batch, rows)?;
+                        }
+                        superfile_builder.next_local_doc_id += rows;
                     }
-                    superfile_builder.next_local_doc_id += rows;
-                }
+                    Ok(())
+                })?;
             }
         }
         copy_span.record("read_parquet", timings.read_parquet.as_millis());
@@ -6576,10 +6705,10 @@ mod tests {
             vec![FtsConfig::new("title").positions(true)],
             vec![],
         );
-        assert_eq!(opts.merge_memory_mb, None, "no run behind a plain build");
+        assert_eq!(opts.merge_input_mb, None, "no run behind a plain build");
 
-        let given = opts.clone().with_merge_memory_mb(Some(16_384));
-        assert_eq!(given.merge_memory_mb, Some(16_384));
+        let given = opts.clone().with_merge_input_mb(Some(16_384));
+        assert_eq!(given.merge_input_mb, Some(16_384));
 
         // The merge rebuilds its options from the inputs before it runs, and
         // that reshaping must not drop the budget on the way.
@@ -6592,7 +6721,7 @@ mod tests {
         }];
         let reshaped = merge_builder_opts(&inputs, given).expect("merge options");
         assert_eq!(
-            reshaped.merge_memory_mb,
+            reshaped.merge_input_mb,
             Some(16_384),
             "the budget must reach the builder the merge actually runs with"
         );

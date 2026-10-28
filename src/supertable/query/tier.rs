@@ -364,7 +364,7 @@ pub(crate) struct TierSelection {
     pub(crate) merge_ns: u64,
 }
 
-/// One term's chunked tier in one segment: where its regions sit, and
+/// One term's chunked tier in one layer: where its regions sit, and
 /// the regions once read.
 struct Source {
     object: ContentHash,
@@ -553,7 +553,7 @@ pub(crate) struct PreparedMerge<'a> {
 }
 
 /// Prepare the merge of `query` over the tiers of `index`. `None` when a
-/// term has postings in a segment without a tier, a kept superfile is not
+/// term has postings in a layer without a tier, a kept superfile is not
 /// in the root, or a table-wide idf is missing: the caller then keeps its
 /// ceilings.
 pub(crate) async fn prepare_merge<'a>(
@@ -610,7 +610,7 @@ pub(crate) async fn prepare_merge<'a>(
         idf.push(idf_table);
     }
     // The terms' runs first, and nothing more if a term has postings in a
-    // segment without a tier: no sound bound exists for it, and a table
+    // layer without a tier: no sound bound exists for it, and a table
     // indexed before tiers would otherwise pay a slot per superfile on
     // every query only to be declined.
     let runs_per_term = index.runs_many(query.column, terms).await?;
@@ -849,7 +849,7 @@ impl PreparedMerge<'_> {
             ..
         } = self;
         // A round merges the next block of every live head. The blocks of one
-        // depth lie together, one chunk per term and segment. The first wave
+        // depth lie together, one chunk per term and layer. The first wave
         // reads a small tier whole and a large tier's first block, every
         // term's at once; a second wave, issued only if the merge goes on,
         // reads what a large tier has left, so the merge costs one storage

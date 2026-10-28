@@ -44,9 +44,9 @@ use crate::{
 
 /// Rewrites between term-index rebuilds.
 ///
-/// Every rewrite adds a superfile, and with it a delta segment the index
+/// Every rewrite adds a superfile, and with it a delta layer the index
 /// lookups must also search. Rebuilding every few rewrites folds those deltas
-/// into one segment; rebuilding after each would repeat the work for little gain.
+/// into one layer; rebuilding after each would repeat the work for little gain.
 const REWRITES_PER_TERM_INDEX_REFRESH: usize = 16;
 
 /// Superfiles opened at once while deciding which are stale.
@@ -377,7 +377,7 @@ pub(crate) fn plan_jobs(
                 estimated_output_bytes: s.live_bytes,
                 // A repair is not a planned compaction run, so there are no
                 // per-run settings to honour.
-                merge_memory_mb: None,
+                merge_input_mb: None,
             };
             (job, repair)
         })
