@@ -318,6 +318,7 @@ impl DiskCacheStore {
         let entry = self
             .fetch_from_source(uri, storage_key, intent, offsets, storage)
             .await?;
+        self.release_unheld_lazy_entries_over_cap();
         Ok((entry, OpenTier::Source))
     }
 

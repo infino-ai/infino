@@ -1833,7 +1833,7 @@ impl SupertableReader {
                             // already finished inside `prepare_clauses`.
                             let (hits, count) = match prep {
                                 prep @ PreparedClauses::Done { .. } => {
-                                    r.run_prepared_with_count(prep, &scoring)?
+                                    r.run_prepared_with_count_in_blob_ids(prep, &scoring)?
                                 }
                                 prep => {
                                     let kernel_reader = Arc::clone(&r);
@@ -1844,7 +1844,7 @@ impl SupertableReader {
                                         "exact-count fts kernel: reader pool dropped result",
                                         move || {
                                             op_stats::timed_kernel(&kernel_stats, || {
-                                                kernel_reader.run_prepared_with_count(
+                                                kernel_reader.run_prepared_with_count_in_blob_ids(
                                                     prep,
                                                     &table_scoring(
                                                         &kernel_column,
@@ -1860,20 +1860,19 @@ impl SupertableReader {
                                 }
                             };
                             total.fetch_add(count, AtomicOrdering::Relaxed);
-                            hits
+                            r.hits_to_rows_async(hits).await?
                         } else {
-                            match prep {
+                            // The kernels score in blob ids; the top hits are
+                            // translated to rows here, on this runtime, reading
+                            // only the doc-id map pages they fall in.
+                            let hits = match prep {
                                 // Already-final shapes: the walk (and its
                                 // kernel time) happened inside
-                                // `prepare_clauses`. It still goes through
-                                // `run_prepared`, which is where a blob
-                                // storing its documents in an order of its
-                                // own turns them back into rows; taking the
-                                // hits directly would hand the caller blob
-                                // ids, and everything downstream reads them
-                                // as rows.
+                                // `prepare_clauses`. Its hits are blob ids
+                                // like every other shape's, and are turned
+                                // into rows below with the rest.
                                 prep @ PreparedClauses::Done { .. } => {
-                                    r.run_prepared(prep, &scoring)?
+                                    r.run_prepared_in_blob_ids(prep, &scoring)?
                                 }
                                 // Gate on posting mass, not term count: this
                                 // scan isn't sliced, so a rare-term query
@@ -1888,7 +1887,7 @@ impl SupertableReader {
                                         "un-ranged fts kernel: reader pool dropped result",
                                         move || {
                                             op_stats::timed_kernel(&kernel_stats, || {
-                                                kernel_reader.run_prepared(
+                                                kernel_reader.run_prepared_in_blob_ids(
                                                     prep,
                                                     &table_scoring(
                                                         &kernel_column,
@@ -1903,9 +1902,10 @@ impl SupertableReader {
                                     .map_err(|e| QueryError::Internal(e.to_string()))??
                                 }
                                 prep => op_stats::timed_kernel(&op_stats, || {
-                                    r.run_prepared(prep, &scoring)
+                                    r.run_prepared_in_blob_ids(prep, &scoring)
                                 })?,
-                            }
+                            };
+                            r.hits_to_rows_async(hits).await?
                         }
                     }
                 };

@@ -10,6 +10,7 @@
 use std::collections::{BinaryHeap, HashMap};
 
 use bytes::Bytes;
+use futures::future::try_join_all;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -42,9 +43,18 @@ use crate::{
             short::{decode_short, short_df},
         },
         id_space::{DocMap, FtsDocId, RowId, RowSet},
+        lazy_source::Source,
     },
     utils::terms::{DictEntry, make_key},
 };
+
+/// Bytes per doc-id map entry: one little-endian `u32` row.
+const DOC_MAP_ENTRY_BYTES: usize = 4;
+/// Bytes of the doc-id map a sparse translation reads at a time.
+const DOC_MAP_PAGE_BYTES: usize = 64 * 1024;
+/// A translation reads map pages instead of the whole map while the pages
+/// come to at most one this-many-th of it.
+const DOC_MAP_SPARSE_SHARE: usize = 8;
 
 /// An unranked match holding at least one row in this many of its blob's
 /// rows is put back in row order through a bitset of the blob's rows
@@ -522,7 +532,8 @@ impl FtsReader {
                 floor,
             )
             .await?;
-        self.run_prepared(prep)
+        self.hits_to_rows_async(self.run_prepared_in_blob_ids(prep)?)
+            .await
     }
 
     /// BM25 search over explicit clause lists, with negated terms
@@ -547,7 +558,8 @@ impl FtsReader {
         floor: f32,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let prep = self.prepare_clauses(column, lists, k, floor).await?;
-        self.run_prepared(prep)
+        self.hits_to_rows_async(self.run_prepared_in_blob_ids(prep)?)
+            .await
     }
 
     /// I/O half of an un-ranged clause search: resolve the column,
@@ -592,14 +604,12 @@ impl FtsReader {
         k: usize,
         floor: f32,
     ) -> Result<PreparedClauses, FtsError> {
-        let prep = self.build_clauses(column, lists, k, floor).await?;
-        // The scoring that follows may run on the reader pool and translates
-        // its hits there, so the map is read now, on this runtime, when there
-        // can be a hit; a superfile without the terms never reads it.
-        if prep.may_hit() {
-            self.ensure_doc_map().await?;
-        }
-        Ok(prep)
+        // No doc-id map is read here: the scoring that follows returns blob
+        // ids, and its caller translates the top hits on its own runtime
+        // ([`Self::hits_to_rows_async`]), reading only the map pages they
+        // fall in. Reading the whole map before scoring cost every
+        // superfile a ranked search touched four bytes a document.
+        self.build_clauses(column, lists, k, floor).await
     }
 
     /// [`Self::prepare_clauses`] before the doc-id map: the cursors, or the
@@ -1006,6 +1016,92 @@ impl FtsReader {
         Ok(into_row_order(rows.collect(), self.n_docs() as usize))
     }
 
+    /// [`Self::ids_to_rows`] on the caller's runtime, reading only the map
+    /// pages the ids fall in when the map is not in memory yet and they are
+    /// few (see [`Self::rows_from_map_pages`]); otherwise the whole map, once,
+    /// as before.
+    pub(super) async fn ids_to_rows_async(
+        &self,
+        ids: Vec<FtsDocId>,
+    ) -> Result<Vec<RowId>, FtsError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(rows) = self.rows_from_map_pages(&ids).await? {
+            return Ok(into_row_order(rows, self.n_docs() as usize));
+        }
+        self.ensure_doc_map().await?;
+        self.ids_to_rows(ids)
+    }
+
+    /// The rows `ids` stand for, read from just the doc-id map pages they
+    /// fall in, or `None` when the whole map is the better read: it is in
+    /// memory already, the blob keeps row order or is in memory, or the
+    /// pages would add up to more than [`DOC_MAP_SPARSE_SHARE`] of it.
+    ///
+    /// A match of a few rows in each of thousands of reordered superfiles
+    /// would otherwise read every superfile's whole map, four bytes a
+    /// document, to translate a handful of ids: hundreds of megabytes a
+    /// superfile, held at once across the fan-out. The pages are not kept
+    /// and, unlike the whole-map read, not checked against the map's CRC,
+    /// which covers the whole body.
+    async fn rows_from_map_pages(&self, ids: &[FtsDocId]) -> Result<Option<Vec<RowId>>, FtsError> {
+        if self.doc_map.get().is_some() || !matches!(self.source, Source::Lazy(_)) {
+            return Ok(None);
+        }
+        let Some(region) = self.doc_map_region.clone() else {
+            return Ok(None);
+        };
+        let page_of = |id: FtsDocId| id.get() as usize * DOC_MAP_ENTRY_BYTES / DOC_MAP_PAGE_BYTES;
+        let mut pages: Vec<usize> = ids.iter().map(|&id| page_of(id)).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        if pages.len() * DOC_MAP_PAGE_BYTES * DOC_MAP_SPARSE_SHARE > region.len() {
+            return Ok(None);
+        }
+        // One read per run of adjacent pages, `(first, last)` inclusive.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for page in pages {
+            match runs.last_mut() {
+                Some((_, last)) if *last + 1 == page => *last = page,
+                _ => runs.push((page, page)),
+            }
+        }
+        let reads = runs.iter().map(|&(first, last)| {
+            let start = region.start + first * DOC_MAP_PAGE_BYTES;
+            let end = (region.start + (last + 1) * DOC_MAP_PAGE_BYTES).min(region.end);
+            async move {
+                self.source
+                    .range_async(start..end)
+                    .await
+                    .map_err(|e| FtsError::RangeFetch {
+                        what: "fts/doc-map page",
+                        source: e,
+                    })
+            }
+        });
+        let bytes = try_join_all(reads).await?;
+        ids.iter()
+            .map(|&id| {
+                let at = id.get() as usize * DOC_MAP_ENTRY_BYTES;
+                let run = runs.partition_point(|&(_, last)| last < at / DOC_MAP_PAGE_BYTES);
+                let off = at - runs[run].0 * DOC_MAP_PAGE_BYTES;
+                bytes[run]
+                    .get(off..off + DOC_MAP_ENTRY_BYTES)
+                    .and_then(|b| b.try_into().ok())
+                    .map(|b| RowId::new(u32::from_le_bytes(b)))
+                    .ok_or_else(|| {
+                        FtsError::Read(ReadError::Malformed(format!(
+                            "fts doc-map has no entry for blob doc id {}",
+                            id.get()
+                        )))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
+
+    #[cfg(test)]
     pub(crate) fn run_prepared(
         &self,
         prep: PreparedClauses,
@@ -1046,10 +1142,19 @@ impl FtsReader {
     /// exhaustive walks add a doc's term scores in a different order than
     /// the pruned kernels, so a total can differ in its last bits, and two
     /// docs tied at the k-th score within that error may swap.
+    #[cfg(test)]
     pub(crate) fn run_prepared_with_count(
         &self,
         prep: PreparedClauses,
     ) -> Result<(Vec<(RowId, f32)>, u64), FtsError> {
+        let (hits, count) = self.run_prepared_with_count_blob(prep)?;
+        Ok((self.hits_to_rows(hits)?, count))
+    }
+
+    fn run_prepared_with_count_blob(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
         debug_assert!(
             prep.exact_count(),
             "run_prepared_with_count takes clauses prepared with exact_count"
@@ -1096,12 +1201,41 @@ impl FtsReader {
                 ..
             } => self.run_windowed_union_counted(column_id, cursors, k, filter.as_mut())?,
         };
-        Ok((self.hits_to_rows(hits)?, count))
+        Ok((hits, count))
     }
 
-    /// [`Self::run_prepared`] without the translation, for the one caller
-    /// that reports work alongside the hits and does its own.
-    fn run_prepared_in_blob_ids(
+    /// [`Self::run_prepared_with_count`]'s hits, in blob ids.
+    pub(crate) fn run_prepared_with_count_in_blob_ids(
+        &self,
+        prep: PreparedClauses,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), FtsError> {
+        self.run_prepared_with_count_blob(prep)
+    }
+
+    /// [`Self::hits_to_rows`] on the caller's runtime, reading only the map
+    /// pages the hits fall in when the map is not in memory yet (see
+    /// [`Self::rows_from_map_pages`]).
+    pub(crate) async fn hits_to_rows_async(
+        &self,
+        hits: Vec<(FtsDocId, f32)>,
+    ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<FtsDocId> = hits.iter().map(|&(doc, _)| doc).collect();
+        if let Some(rows) = self.rows_from_map_pages(&ids).await? {
+            return Ok(rows
+                .into_iter()
+                .zip(hits)
+                .map(|(row, (_, score))| (row, score))
+                .collect());
+        }
+        self.ensure_doc_map().await?;
+        self.hits_to_rows(hits)
+    }
+
+    /// [`Self::run_prepared`] without the translation.
+    pub(crate) fn run_prepared_in_blob_ids(
         &self,
         prep: PreparedClauses,
     ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {

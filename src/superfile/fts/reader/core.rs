@@ -26,7 +26,6 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::future::join;
 use roaring::RoaringBitmap;
 use rustc_hash::FxHashMap;
 use tokio::sync::OnceCell;
@@ -265,17 +264,6 @@ pub(crate) enum PreparedClauses {
 }
 
 impl PreparedClauses {
-    /// Whether scoring these clauses can return a hit, which whoever runs
-    /// them translates to a row through the doc-id map.
-    pub(crate) fn may_hit(&self) -> bool {
-        match self {
-            PreparedClauses::Done { hits, .. } => !hits.is_empty(),
-            PreparedClauses::Must { must_cursors, .. } => !must_cursors.is_empty(),
-            PreparedClauses::MustShould { .. } => true,
-            PreparedClauses::Or { cursors, .. } => !cursors.is_empty(),
-        }
-    }
-
     /// Whether the clauses were prepared for the exact-count walk.
     pub(crate) fn exact_count(&self) -> bool {
         match self {
@@ -585,10 +573,10 @@ pub struct FtsReader {
     /// open, and so a SQL scan that matches no text, should not pay for.
     /// Shared by every view cloned from this reader ([`Self::with_scoring`]),
     /// so one read serves them all.
-    doc_map: Arc<OnceCell<DocMap>>,
+    pub(super) doc_map: Arc<OnceCell<DocMap>>,
     /// Where the map's body lies, with its CRC right after it; `None` on a
     /// blob in row order.
-    doc_map_region: Option<Range<usize>>,
+    pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     verify_crc: bool,
 }
@@ -1153,15 +1141,14 @@ impl FtsReader {
             .await
     }
 
-    /// Everything scoring `column` reads besides the postings — the length
-    /// buckets and the doc-id map — fetched together, so a cold superfile's
-    /// query issues them in one wave with its postings rather than one after
-    /// another. Each is a no-op once read.
+    /// The length buckets scoring `column` reads besides the postings,
+    /// fetched in the same wave as them, so a cold superfile's query does not
+    /// issue them one after another. A no-op once read.
     pub(crate) async fn prewarm_scoring(&self, column: &str) -> Result<(), FtsError> {
         let column_id = self.resolve_column_id(column)?;
-        let (norms, map) = join(self.ensure_norms(column_id), self.ensure_doc_map()).await;
-        norms?;
-        map.map(|_| ())
+        // Not the doc-id map: a ranked search translates only its top hits,
+        // reading the map pages they fall in ([`Self::hits_to_rows_async`]).
+        self.ensure_norms(column_id).await
     }
 
     /// The doc-id map, for a translation that runs off the async path.

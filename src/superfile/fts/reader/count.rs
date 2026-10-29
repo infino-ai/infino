@@ -259,10 +259,7 @@ impl FtsReader {
         });
         work.kernel_cpu_ns = walk_ns;
         let docs = walk?;
-        if !docs.is_empty() {
-            self.ensure_doc_map().await?;
-        }
-        Ok((self.ids_to_rows(docs)?, work))
+        Ok((self.ids_to_rows_async(docs).await?, work))
     }
 
     /// Phrase-aware unranked match **count** — the atoms sibling of
@@ -446,10 +443,7 @@ impl FtsReader {
                 .collect(),
         });
         work.kernel_cpu_ns = walk_ns;
-        if !docs.is_empty() {
-            self.ensure_doc_map().await?;
-        }
-        Ok((self.ids_to_rows(docs)?, work))
+        Ok((self.ids_to_rows_async(docs).await?, work))
     }
 
     /// The cursors an `Or` [`Self::token_match_prefetched`] walks over

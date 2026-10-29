@@ -17,7 +17,7 @@
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     ops::Range,
@@ -61,7 +61,7 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::ParquetMetaData,
 };
-use rayon::{ThreadPool, prelude::*};
+use rayon::ThreadPool;
 use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, warn};
 
@@ -1221,15 +1221,15 @@ async fn resolve_columns(
     let mut seg_order: Vec<SuperfileUri> = Vec::new();
     let mut seg_locals: Vec<Vec<u32>> = Vec::new();
     let mut placement: Vec<(usize, usize)> = Vec::with_capacity(hits.len());
+    // An unranked match can hold millions of hits across thousands of
+    // superfiles, so a superfile's slot is looked up, not searched for.
+    let mut seg_index: HashMap<SuperfileUri, usize> = HashMap::new();
     for hit in hits {
-        let seg_idx = match seg_order.iter().position(|s| *s == hit.superfile) {
-            Some(i) => i,
-            None => {
-                seg_order.push(hit.superfile);
-                seg_locals.push(Vec::new());
-                seg_order.len() - 1
-            }
-        };
+        let seg_idx = *seg_index.entry(hit.superfile).or_insert_with(|| {
+            seg_order.push(hit.superfile);
+            seg_locals.push(Vec::new());
+            seg_order.len() - 1
+        });
         let row = seg_locals[seg_idx].len();
         seg_locals[seg_idx].push(hit.local_doc_id);
         placement.push((seg_idx, row));
@@ -1260,11 +1260,31 @@ async fn resolve_columns(
     // table the cache cannot hold, so resolving a hit's columns never starts
     // a whole-file download the search itself declined.
     let intent = reader.open_intent();
-    // Each list of futures below is collected before the join: they do no
-    // work until polled, and a lazy iterator held across the join's awaits
-    // trips rustc's "`FnOnce` is not general enough" in the callers' streams.
-    let in_flight = manifest.options.superfiles_in_flight;
-    let opens: Vec<_> = misses
+    // Each superfile opens, takes its hit rows and drops its reader in one
+    // task, at most `superfiles_in_flight` at once: a ranked result touches
+    // a few superfiles, but an unranked match can touch every superfile of
+    // the table, and a lazy reader holds its parsed footer and page index,
+    // several MB of heap, for as long as it is held.
+    //
+    //   - **Resident readers** (in-memory tier / freshly written):
+    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode over
+    //     already-resident bytes, so it runs on `options.reader_pool`
+    //     (rayon), bridged back so no tokio worker blocks under it.
+    //   - **Lazy readers** stream only projected hit rows through their
+    //     existing `LazyByteSource`. That preserves the disk cache's block
+    //     layer: cold misses range-fetch, repeated warm reads hit local
+    //     blocks, and the file is never materialized.
+    //
+    // A file whose columns match the table's reads by name; any other reads
+    // through its map: the table's columns are projected under the file's
+    // names and reshaped to the table's.
+    let in_flight = manifest.options.superfiles_in_flight.max(1);
+    let out_schema_ref = &out_schema;
+    let seg_locals_ref = &seg_locals;
+    // Collected before the join: the futures do no work until polled, and a
+    // lazy iterator held across the join's awaits trips rustc's "`FnOnce` is
+    // not general enough" in the callers' streams.
+    let units: Vec<_> = misses
         .into_iter()
         .map(|(index, uri)| async move {
             let entry = manifest
@@ -1276,7 +1296,7 @@ async fn resolve_columns(
                         "resolve_hits: superfile {uri:?} missing from manifest"
                     ))
                 })?;
-            superfile_reader(
+            let rd = superfile_reader(
                 store,
                 disk_cache,
                 storage,
@@ -1286,98 +1306,38 @@ async fn resolve_columns(
                 intent,
             )
             .await
-            .map(|reader| (index, reader))
-            .map_err(|error| DataFusionError::from(QueryError::store(error)))
-        })
-        .collect();
-    let opened = try_join_bounded(opens, in_flight).await?;
-
-    // Materialize each superfile's projected hit rows, split by tier:
-    //
-    //   - **Resident readers** (in-memory tier / freshly written):
-    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode
-    //     over already-resident bytes, so the whole wave runs on
-    //     `options.reader_pool` (rayon) — the same pool the search
-    //     kernels and the writer's shard builds use — bridged back via
-    //     a oneshot so no tokio worker blocks under the compute.
-    //   - **Lazy readers** stream only projected hit rows through their
-    //     existing `LazyByteSource`. That preserves the disk cache's block
-    //     layer: cold misses range-fetch, repeated warm reads hit local blocks.
-    //     Async I/O stays on the query runtime and never materializes the file.
-    //
-    // Both waves run concurrently and stitch back in `seg_order`
-    // order. Superfile count here is bounded by the global top-k (one
-    // entry per distinct hit-bearing superfile), so the fan-out is small.
-    // A file whose columns match the table's reads by name as it always
-    // has; any other file reads through its map: the table's columns are
-    // projected under the file's names and reshaped to the table's.
-    let mut warm_inputs: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
-        Vec::new();
-    let mut cold_units: Vec<(usize, &Arc<SuperfileReader>, &[u32], Option<FileSchemaMap>)> =
-        Vec::new();
-    for (i, rd) in &opened {
-        let locals = &seg_locals[*i];
-        let adapter = file_adapter(manifest, rd);
-        if rd.can_take_by_local_doc_ids() {
-            warm_inputs.push((*i, Arc::clone(rd), locals.clone(), adapter));
-        } else {
-            cold_units.push((*i, rd, locals.as_slice(), adapter));
-        }
-    }
-
-    let warm_wave = async {
-        if warm_inputs.is_empty() {
-            return Ok::<Vec<((usize, RecordBatch), u64)>, DataFusionError>(Vec::new());
-        }
-        // Owned inputs so the rayon closure is `'static`.
-        let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-        let pool = Arc::clone(&manifest.options.reader_pool);
-        let inputs = warm_inputs;
-        let out_schema = Arc::clone(&out_schema);
-        run_on_pool(
-            Some(&pool),
-            "resolve decode: reader pool dropped result",
-            move || {
-                let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-                let result: Result<Vec<((usize, RecordBatch), u64)>, _> = inputs
-                    .into_par_iter()
-                    .map(|(i, sf, locals, adapter)| {
-                        // Per-superfile bracket: the resident decode is
-                        // this wave's kernel section, one chunk per file.
-                        let (batch, ns) = timed_section(|| {
-                            take_resident_file(&sf, &locals, &name_refs, &adapter, &out_schema)
-                        });
-                        batch.map(|batch| ((i, batch), ns))
+            .map_err(|error| DataFusionError::from(QueryError::store(error)))?;
+            let locals = &seg_locals_ref[index];
+            let adapter = file_adapter(manifest, &rd);
+            if !rd.can_take_by_local_doc_ids() {
+                let batch = take_lazy_file(&rd, locals, names, &adapter, out_schema_ref).await?;
+                return Ok::<_, DataFusionError>((index, batch, 0u64));
+            }
+            // Owned inputs so the rayon closure is `'static`.
+            let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+            let locals = locals.clone();
+            let out_schema = Arc::clone(out_schema_ref);
+            let (batch, ns) = run_on_pool(
+                Some(&manifest.options.reader_pool),
+                "resolve decode: reader pool dropped result",
+                move || {
+                    let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+                    timed_section(|| {
+                        take_resident_file(&rd, &locals, &name_refs, &adapter, &out_schema)
                     })
-                    .collect();
-                result
-            },
-        )
-        .await
-        .map_err(QueryError::internal)?
-        .map_err(|e| QueryError::from(e).into())
-    };
-
-    let out_schema_ref = &out_schema;
-    let cold_takes: Vec<_> = cold_units
-        .into_iter()
-        .map(|(i, rd, locals, adapter)| async move {
-            let batch = take_lazy_file(rd, locals, names, &adapter, out_schema_ref).await?;
-            Ok::<_, DataFusionError>((i, batch))
+                },
+            )
+            .await
+            .map_err(QueryError::internal)?;
+            let batch = batch.map_err(|e| DataFusionError::from(QueryError::from(e)))?;
+            Ok((index, batch, ns))
         })
         .collect();
-    let cold_wave = try_join_bounded(cold_takes, in_flight);
-
-    let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
-    let warm_done = warm_done?;
+    let done = try_join_bounded(units, in_flight).await?;
     if let Some(stats) = &reader.op_stats {
-        stats.add_kernel_cpu_ns(warm_done.iter().map(|(_, ns)| *ns).sum());
+        stats.add_kernel_cpu_ns(done.iter().map(|(_, _, ns)| *ns).sum());
     }
-    for (i, batch) in warm_done
-        .into_iter()
-        .map(|(item, _)| item)
-        .chain(cold_done?)
-    {
+    for (i, batch, _) in done {
         decoded_cache.insert(
             seg_order[i],
             schema_id,

@@ -60,6 +60,8 @@ fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
             .is_none_or(|source| !source.has_runs_in_memory())
 }
 
+use crate::supertable::options::default_superfiles_in_flight;
+
 impl DiskCacheStore {
     /// Run one pass of the `MADV_DONTNEED` sweep against
     /// currently-cached entries. Each entry with
@@ -155,17 +157,54 @@ impl DiskCacheStore {
             .map(|e| *e.key())
             .collect();
         for uri in idle {
-            // Re-check under the shard guard: a query may have taken a
-            // reference since the snapshot, in which case dropping the
-            // entry would free nothing and cost that query a re-open.
-            if let Some((_, removed)) = self
-                .cached
-                .remove_if(&uri, |_, entry| reclaimable_lazy_entry(entry))
-            {
-                self.release_entry_accounting(&removed);
-                if let Some(source) = removed.block_source() {
-                    self.retain_block_file(&uri, source, now_us);
-                }
+            self.release_lazy_entry(&uri, now_us);
+        }
+    }
+
+    /// Drop the oldest lazy entries no query holds while there are more than
+    /// a query works on at once by default
+    /// ([`default_superfiles_in_flight`], sized from the host's memory),
+    /// without waiting for the idle sweep.
+    ///
+    /// A query that touches thousands of superfiles opens a lazy reader for
+    /// each, and each finished one stays in the map until the next sweep
+    /// tick: its parsed footer and page index, several MB of heap on a large
+    /// file, times every superfile the query read. Capping the unheld ones
+    /// bounds that by the cap rather than by the table.
+    pub(crate) fn release_unheld_lazy_entries_over_cap(&self) {
+        let cap = default_superfiles_in_flight();
+        if self.cached.len() <= cap {
+            return;
+        }
+        let mut unheld: Vec<(u64, SuperfileUri)> = self
+            .cached
+            .iter()
+            .filter(|e| reclaimable_lazy_entry(e.value()))
+            .map(|e| (e.value().last_access_us.load(Ordering::Acquire), *e.key()))
+            .collect();
+        let Some(over) = unheld.len().checked_sub(cap) else {
+            return;
+        };
+        unheld.sort_unstable();
+        let now_us = self.now_us();
+        for (_, uri) in unheld.into_iter().take(over) {
+            self.release_lazy_entry(&uri, now_us);
+        }
+    }
+
+    /// Remove `uri`'s entry if it is still a lazy one only the cache holds,
+    /// releasing its budget and keeping its block file.
+    fn release_lazy_entry(&self, uri: &SuperfileUri, now_us: u64) {
+        // Re-check under the shard guard: a query may have taken a
+        // reference since the snapshot, in which case dropping the
+        // entry would free nothing and cost that query a re-open.
+        if let Some((_, removed)) = self
+            .cached
+            .remove_if(uri, |_, entry| reclaimable_lazy_entry(entry))
+        {
+            self.release_entry_accounting(&removed);
+            if let Some(source) = removed.block_source() {
+                self.retain_block_file(uri, source, now_us);
             }
         }
     }

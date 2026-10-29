@@ -77,7 +77,7 @@ use crate::{
             },
             tokenize::{Phrase, Tokenizer},
         },
-        id_space::RowId,
+        id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
         vector::{
             layout::VectorLayout,
@@ -2255,6 +2255,7 @@ impl SuperfileReader {
     /// scoring divides by a norm table derived from that same override.
     /// `with_bm25_override` is deterministic, so two separately-derived
     /// views of one pair agree bit for bit.
+    #[cfg(test)]
     pub(crate) fn run_prepared(
         &self,
         prep: PreparedClauses,
@@ -2264,15 +2265,37 @@ impl SuperfileReader {
         Ok(fts.run_prepared(prep)?)
     }
 
-    /// [`Self::run_prepared`] for clauses prepared with
-    /// `ClauseLists::exact_count`: the top-k plus the exact match count.
-    pub(crate) fn run_prepared_with_count(
+    /// [`Self::run_prepared`] in blob ids, for a caller that translates the
+    /// hits itself on its own runtime ([`Self::hits_to_rows_async`]).
+    pub(crate) fn run_prepared_in_blob_ids(
         &self,
         prep: PreparedClauses,
         scoring: &ScoringView<'_>,
-    ) -> Result<(Vec<(RowId, f32)>, u64), ReadError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, ReadError> {
         let fts = self.fts_scored(scoring)?;
-        Ok(fts.run_prepared_with_count(prep)?)
+        Ok(fts.run_prepared_in_blob_ids(prep)?)
+    }
+
+    /// [`Self::run_prepared_with_count`] in blob ids.
+    pub(crate) fn run_prepared_with_count_in_blob_ids(
+        &self,
+        prep: PreparedClauses,
+        scoring: &ScoringView<'_>,
+    ) -> Result<(Vec<(FtsDocId, f32)>, u64), ReadError> {
+        let fts = self.fts_scored(scoring)?;
+        Ok(fts.run_prepared_with_count_in_blob_ids(prep)?)
+    }
+
+    /// Blob-id hits of this superfile's FTS index as rows, reading only the
+    /// doc-id map pages they fall in when the map is not in memory.
+    pub(crate) async fn hits_to_rows_async(
+        &self,
+        hits: Vec<(FtsDocId, f32)>,
+    ) -> Result<Vec<(RowId, f32)>, ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.hits_to_rows_async(hits).await?)
     }
 
     /// The FTS reader a scored query should read through: this

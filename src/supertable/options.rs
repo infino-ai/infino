@@ -231,13 +231,48 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// seventeen; what each open fetches is a few hundred kilobytes at most once
 /// a superfile's arrays are cached, and a few megabytes on first touch.
 const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
-/// Default for [`SupertableOptions::superfiles_in_flight`]. A query over this
-/// many superfiles or fewer runs as it would with no limit. Past it, a
-/// superfile's setup (a few small, round-trip-bound reads and the buffers
-/// they fill) waits for a slot, so a table of thousands of superfiles neither
-/// sends thousands of requests together, which an object store slows until
-/// they time out, nor holds thousands of opens' buffers at once.
+/// Most superfiles a query works on at once by default (see
+/// [`default_superfiles_in_flight`]). A query over this many superfiles or
+/// fewer runs as it would with no limit. Past it, a superfile's setup (a few
+/// small, round-trip-bound reads and the buffers they fill) waits for a
+/// slot, so a table of thousands of superfiles neither sends thousands of
+/// requests together, which an object store slows until they time out, nor
+/// holds thousands of opens' buffers at once.
 pub(crate) const DEFAULT_SUPERFILES_IN_FLIGHT: usize = 256;
+/// Fewest superfiles a query works on at once by default, however little
+/// memory the host has: below this a table of thousands of superfiles pays
+/// a round trip per handful of them.
+const MIN_SUPERFILES_IN_FLIGHT: usize = 16;
+/// Memory one superfile in flight is budgeted, for sizing the default:
+/// its open (footer, page index, FTS reader) plus what its kernel and its
+/// hit rows' column reads hold. Measured on a 100B-row pageviews table of
+/// 3,220 superfiles: about 25 MB for an unranked match with three columns,
+/// about 80 MB for a two-term ranked OR.
+const BYTES_PER_SUPERFILE_IN_FLIGHT: u64 = 64 * 1024 * 1024;
+/// Share of the host's memory (the cgroup's ceiling where there is one) one
+/// query's superfiles in flight may take by default: one in this many.
+const IN_FLIGHT_MEMORY_SHARE: u64 = 4;
+
+/// The default for [`SupertableOptions::superfiles_in_flight`]: as many
+/// superfiles as a quarter of the host's memory holds at
+/// [`BYTES_PER_SUPERFILE_IN_FLIGHT`] each, between
+/// [`MIN_SUPERFILES_IN_FLIGHT`] and [`DEFAULT_SUPERFILES_IN_FLIGHT`]. The
+/// ceiling where memory cannot be read. Measured once per process.
+pub(crate) fn default_superfiles_in_flight() -> usize {
+    static IN_FLIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *IN_FLIGHT.get_or_init(|| {
+        crate::runtime_metrics::rss::total_memory_bytes()
+            .map_or(DEFAULT_SUPERFILES_IN_FLIGHT, superfiles_in_flight_for)
+    })
+}
+
+/// [`default_superfiles_in_flight`] for a host of `total_bytes`.
+fn superfiles_in_flight_for(total_bytes: u64) -> usize {
+    let fits = total_bytes / IN_FLIGHT_MEMORY_SHARE / BYTES_PER_SUPERFILE_IN_FLIGHT;
+    usize::try_from(fits)
+        .unwrap_or(usize::MAX)
+        .clamp(MIN_SUPERFILES_IN_FLIGHT, DEFAULT_SUPERFILES_IN_FLIGHT)
+}
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -440,6 +475,8 @@ pub struct SupertableOptions {
     /// setup are not limited by it, and each scan in a join, like each
     /// concurrent query, has a cap of its own. A ranked search opens no more
     /// than this at once, whatever [`Self::bound_ordered_open_window`] says.
+    /// Sized from the host's memory by default (see
+    /// [`default_superfiles_in_flight`]), so the work in flight fits the host.
     pub superfiles_in_flight: usize,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
@@ -855,7 +892,7 @@ impl SupertableOptions {
             term_head_depth: None,
             tier_merge_gate: true,
             term_index: true,
-            superfiles_in_flight: DEFAULT_SUPERFILES_IN_FLIGHT,
+            superfiles_in_flight: default_superfiles_in_flight(),
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -1524,6 +1561,27 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    /// The default superfiles in flight follow the host's memory: a quarter
+    /// of it at 64 MB each, never below the floor or past the ceiling.
+    #[test]
+    fn superfiles_in_flight_are_sized_from_the_hosts_memory() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(superfiles_in_flight_for(30 * GIB), 120);
+        assert_eq!(superfiles_in_flight_for(16 * GIB), 64);
+        assert_eq!(
+            superfiles_in_flight_for(GIB),
+            MIN_SUPERFILES_IN_FLIGHT,
+            "a small host keeps the floor"
+        );
+        assert_eq!(
+            superfiles_in_flight_for(700 * GIB),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
+            "a large host stops at the ceiling"
+        );
+        let auto = default_superfiles_in_flight();
+        assert!((MIN_SUPERFILES_IN_FLIGHT..=DEFAULT_SUPERFILES_IN_FLIGHT).contains(&auto));
+    }
     use crate::{
         superfile::vector::{distance::Metric, rerank_codec::RerankCodec},
         supertable::schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE},
