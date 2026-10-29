@@ -1059,6 +1059,7 @@ impl FtsReader {
                 n_docs,
                 baked_avgdl,
                 score_avgdl: baked_avgdl,
+                wide_blocks: format::fts::wide_blocks(version),
                 declared_params: params,
                 verify_crc: opts.verify_crc,
                 base_norms: Arc::new(OnceLock::new()),
@@ -2119,20 +2120,22 @@ pub(super) fn read_u64_le(b: &[u8]) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Unranked multi-term OR walk: the union of the cursors' doc ids in
-/// ascending order. A k-way merge — each step finds the minimum current
-/// doc id across the live cursors, hands it to `emit`, and advances
-/// every cursor sitting on it (so the next minimum is strictly greater
-/// and `emit` is called exactly once per distinct doc). No scoring; the
-/// caller wants membership, not rank.
-pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+/// Unranked multi-term OR walk: the union of the cursors' doc ids below
+/// `end`, in ascending order. A k-way merge — each step finds the minimum
+/// current doc id across the live cursors, hands it to `emit`, and
+/// advances every cursor sitting on it (so the next minimum is strictly
+/// greater and `emit` is called exactly once per distinct doc). No
+/// scoring; the caller wants membership, not rank.
+pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, end: u32, mut emit: impl FnMut(u32)) {
     loop {
         let min_doc = cursors
             .iter()
             .filter(|c| !c.is_exhausted())
             .map(TermCursor::current_doc_id)
             .min();
-        let Some(min_doc) = min_doc else { break };
+        let Some(min_doc) = min_doc.filter(|&doc| doc < end) else {
+            break;
+        };
         emit(min_doc);
         for c in cursors.iter_mut() {
             if !c.is_exhausted() && c.current_doc_id() == min_doc {
@@ -2147,12 +2150,15 @@ pub(super) fn or_walk_unranked(mut cursors: Vec<TermCursor>, mut emit: impl FnMu
 /// sit on it (equal docs pop consecutively), and advances only the
 /// cursor popped. Cost is the union size times the log of the term
 /// count, independent of how many terms there are per step.
-fn or_walk_heap(mut cursors: Vec<TermCursor>, mut emit: impl FnMut(u32)) {
+fn or_walk_heap(mut cursors: Vec<TermCursor>, end: u32, mut emit: impl FnMut(u32)) {
     let mut heap = doc_heap(&cursors, |c| {
         (!c.is_exhausted()).then(|| c.current_doc_id())
     });
     let mut last: Option<u32> = None;
     while let Some(Reverse((doc, i))) = heap.pop() {
+        if doc >= end {
+            break;
+        }
         if last != Some(doc) {
             emit(doc);
             last = Some(doc);
@@ -2206,29 +2212,66 @@ pub(super) fn or_walk_prefers_heap(terms: usize, total_df: u64, doc_space: u64) 
     heap_beats_rescan(terms, total_df, doc_space.min(total_df))
 }
 
-/// The union's doc ids in ascending order, collected into a `Vec`: through
-/// the rescan walk ([`or_walk_unranked`]), unless the union is sparse
-/// enough over many terms that the heap walk takes fewer steps
-/// ([`or_walk_prefers_heap`], [`or_merge_heap`]).
+/// The union's doc ids in ascending order, collected into a `Vec`: see
+/// [`or_merge_unranked_in`], over the whole doc-id space.
 pub(super) fn or_merge_unranked(cursors: Vec<TermCursor>) -> Vec<u32> {
+    or_merge_unranked_in(cursors, 0, u32::MAX)
+}
+
+/// The union's doc ids in `[start, end)`, ascending: each cursor first
+/// skips to `start`, and the walk stops at the first doc at or past
+/// `end`. One term's ids are its postings, copied a decoded block at a
+/// time ([`single_term_docs`]); several go through the rescan walk
+/// ([`or_walk_unranked`]), unless the union is sparse enough over many
+/// terms that the heap walk takes fewer steps ([`or_walk_prefers_heap`],
+/// [`or_merge_heap`]).
+pub(super) fn or_merge_unranked_in(mut cursors: Vec<TermCursor>, start: u32, end: u32) -> Vec<u32> {
+    if start > 0 {
+        for cursor in &mut cursors {
+            cursor.skip_to(start);
+        }
+    }
+    if let [cursor] = cursors.as_mut_slice() {
+        return single_term_docs(cursor, start, end);
+    }
     let doc_space = u64::from(cursors_max_doc(&cursors)) + 1;
     if or_walk_prefers_heap(cursors.len(), df_total(&cursors), doc_space) {
-        return or_merge_heap(cursors);
+        return or_merge_heap(cursors, end);
     }
     let mut out = Vec::new();
-    or_walk_unranked(cursors, |doc| out.push(doc));
+    or_walk_unranked(cursors, end, |doc| out.push(doc));
     out
 }
 
-/// The union's doc ids through [`or_walk_heap`], into a vector of its own
-/// and out of line. Collected into one vector with the rescan in one
-/// function, the heap path cost the dense unions the rescan keeps 3 to 7%
-/// in a release build (eight and ten common terms over a million docs);
-/// apart, they ran as they do without the heap.
+/// One term's doc ids from where `cursor` stands, at or past `start`, up
+/// to `end`: each decoded block's ids are copied whole, where the per-doc
+/// walk would compare and step once per posting. The reserve is the
+/// term's df or the slice's width, whichever is smaller: the df counts
+/// the whole file, and every slice of it would reserve that much.
+fn single_term_docs(cursor: &mut TermCursor, start: u32, end: u32) -> Vec<u32> {
+    let cap = cursor.df.min(u64::from(end.saturating_sub(start)));
+    let mut out = Vec::with_capacity(usize::try_from(cap).unwrap_or(0));
+    while !cursor.is_exhausted() {
+        let ids = &cursor.block_doc_ids[cursor.pos..cursor.block_n];
+        let below = ids.partition_point(|&doc| doc < end);
+        out.extend_from_slice(&ids[..below]);
+        if below < ids.len() {
+            break;
+        }
+        cursor.advance_by(ids.len());
+    }
+    out
+}
+
+/// The union's doc ids below `end` through [`or_walk_heap`], into a vector
+/// of its own and out of line. Collected into one vector with the rescan
+/// in one function, the heap path cost the dense unions the rescan keeps 3
+/// to 7% in a release build (eight and ten common terms over a million
+/// docs); apart, they ran as they do without the heap.
 #[inline(never)]
-fn or_merge_heap(cursors: Vec<TermCursor>) -> Vec<u32> {
+fn or_merge_heap(cursors: Vec<TermCursor>, end: u32) -> Vec<u32> {
     let mut out = Vec::new();
-    or_walk_heap(cursors, |doc| out.push(doc));
+    or_walk_heap(cursors, end, |doc| out.push(doc));
     out
 }
 
@@ -2280,7 +2323,7 @@ pub(super) fn or_count_unranked(mut cursors: Vec<TermCursor>) -> u64 {
     }
     if or_count_prefers_heap(cursors.len(), total_df, max_doc) {
         let mut n = 0u64;
-        or_walk_heap(cursors, |_| n += 1);
+        or_walk_heap(cursors, u32::MAX, |_| n += 1);
         return n;
     }
     let mut present = [0u64; OR_WINDOW_WORDS];
@@ -2650,7 +2693,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
         // in one word-load; `skip_to` would decode each block — expanding its
-        // ~128 doc ids — as the frontier drags the anchor across its whole list.
+        // all its doc ids — as the frontier drags the anchor across its whole list.
         for (word_idx, word) in present.iter_mut().enumerate() {
             let mut bits = mem::take(word);
             while bits != 0 {
@@ -2714,6 +2757,15 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
     u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
 }
 
+impl FtsReader {
+    /// Whether this file's posting blocks take the wide header reading
+    /// (see [`format::fts::wide_blocks`]).
+    #[inline]
+    pub(super) fn wide_blocks(&self) -> bool {
+        format::fts::wide_blocks(self.version)
+    }
+}
+
 /// Refuse a blob version this crate does not read: one below
 /// [`VERSION_MIN`] with the instruction to reindex it, anything else
 /// unknown as unsupported.
@@ -2722,7 +2774,8 @@ fn check_version(version: u32) -> Result<(), FtsError> {
         format::fts::VERSION_V7
         | format::fts::VERSION_V8
         | format::fts::VERSION_V9
-        | format::fts::VERSION_V10 => Ok(()),
+        | format::fts::VERSION_V10
+        | format::fts::VERSION_V11 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -3044,7 +3097,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V10 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V11 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"

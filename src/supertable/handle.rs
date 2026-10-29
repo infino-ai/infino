@@ -2048,9 +2048,9 @@ fn hidden_storage(
 }
 
 /// Options for a hidden table at `prefix` under the user table's storage,
-/// running on the user table's pools, read consistency, memory budget and
-/// disk cache. Shared by the vector index and the companions, so every
-/// hidden table is made the same way.
+/// running on the user table's pools, read consistency, memory budget, disk
+/// cache and cap on superfiles in flight. Shared by the vector index and the
+/// companions, so every hidden table is made the same way.
 fn hidden_table_options(
     user_opts: &SupertableOptions,
     prefix: &str,
@@ -2063,7 +2063,8 @@ fn hidden_table_options(
         .with_storage(sub_storage)
         .with_reader_pool(Arc::clone(&user_opts.reader_pool))
         .with_writer_pool(Arc::clone(&user_opts.writer_pool))
-        .with_read_consistency(user_opts.read_consistency);
+        .with_read_consistency(user_opts.read_consistency)
+        .with_superfiles_in_flight(user_opts.superfiles_in_flight);
     opts.connection_memory_budget = Arc::clone(&user_opts.connection_memory_budget);
     if let Some(cache) = user_opts.disk_cache.as_ref() {
         opts = opts.with_disk_cache(Arc::clone(cache));
@@ -2435,6 +2436,7 @@ fn build_tombstone_cache(
         wal_store,
         DEFAULT_SEAL_TTL,
         tombstone_seq_view(manifest),
+        options.superfiles_in_flight,
     )))
 }
 

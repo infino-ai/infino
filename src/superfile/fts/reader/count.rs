@@ -452,6 +452,61 @@ impl FtsReader {
         Ok((self.ids_to_rows(docs)?, work))
     }
 
+    /// The cursors an `Or` [`Self::token_match_prefetched`] walks over
+    /// `tokens`, built once (the postings fetch and skip-table parse) for
+    /// [`Self::token_match_range_prebuilt`] to walk one doc-id slice at a
+    /// time, with what the build read. Slices of one superfile share the
+    /// set; each walks a clone of its cursors.
+    pub(crate) async fn match_cursor_set(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(OrCursorSet, MatchWork), FtsError> {
+        let set = self
+            .build_cursor_set(
+                column,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                prefetched,
+            )
+            .await?;
+        let work = MatchWork {
+            postings_bytes: set.postings_bytes(),
+            planned_ranges: set.planned_ranges() + dictionary_fetches(tokens, prefetched),
+            kernel_cpu_ns: 0,
+        };
+        Ok((set, work))
+    }
+
+    /// The rows whose doc ids in `[start, end)` hold any of `set`'s terms,
+    /// ascending: one slice of an `Or` [`Self::token_match_prefetched`].
+    /// The slices of a superfile's doc-id space together match exactly
+    /// what the whole walk matches; the range is a cut of the blob's ids
+    /// and carries no row meaning, so each slice's rows are put in order
+    /// on their own. The work holds the walk's time alone; the set's build
+    /// counted its bytes.
+    pub(crate) fn token_match_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        let mut work = MatchWork::default();
+        if set.cursors.is_empty() || start >= end {
+            return Ok((Vec::new(), work));
+        }
+        let (docs, walk_ns) = timed_section(|| {
+            or_merge_unranked_in(set.cursors.clone(), start, end)
+                .into_iter()
+                .map(FtsDocId::new)
+                .collect::<Vec<_>>()
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((self.ids_to_rows(docs)?, work))
+    }
+
     /// Unranked token-match **count** — the cardinality
     /// [`token_match`](Self::token_match) would return, without
     /// materializing the doc-id `Vec`. The AND path counts its
@@ -933,7 +988,7 @@ pub struct TermLayout {
     pub df: u64,
     /// A df=1 term stored inline in the dictionary: no posting bytes.
     pub inline: bool,
-    /// A short-form term (`df <= BLOCK_LEN`): one bodiless block.
+    /// A short-form term (`df <= SUB_BLOCK_LEN`): one bodiless block.
     pub short: bool,
     /// Posting blocks (one for a short term, zero for an inline one).
     pub num_blocks: usize,
@@ -957,7 +1012,7 @@ mod tests {
     use super::{super::test_util::*, *};
     use crate::superfile::fts::{
         builder::FtsBuilder,
-        posting::{self, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
+        posting::{self, BLOCK_LEN, ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED},
     };
 
     #[tokio::test]
@@ -1333,8 +1388,8 @@ mod tests {
         // each pick the right branch block by block. Uniform-stride corpora
         // never produce this, so drive it explicitly and cross-check every count
         // kernel against `token_match`'s independent flat-merge length.
-        const RUN_END: u32 = 128; // docs 0..128 all hold `mix` → one RUN block
-        const DENSE_END: u32 = 512; // then all but every 11th → BITSET
+        const RUN_END: u32 = BLOCK_LEN as u32; // the first block's docs all hold `mix` → RUN
+        const DENSE_END: u32 = 4 * BLOCK_LEN as u32; // then all but every 11th → BITSET
         const SPARSE_STRIDE: u32 = 30; // docs after that every 30th → PACKED
         const N_DOCS: u32 = 4200;
         let mut b = FtsBuilder::new();

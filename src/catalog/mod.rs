@@ -2113,6 +2113,7 @@ mod tests {
         Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
         OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
+        runtime_metrics::io::UriClass,
         supertable::{
             manifest::commit::POINTER_PATH,
             query::{provider::TABLE_NAME, sql::value_count_schema},
@@ -2221,6 +2222,117 @@ mod tests {
     // test below poisons a gate the way a panicking build would, then drives
     // one of the three ops that lock it (open / drop / create) and asserts the
     // op does not panic and still produces a correct result.
+
+    /// Rows per superfile in the cacheless tests, and how many superfiles.
+    const CACHELESS_ROWS: i64 = 2_000;
+    const CACHELESS_SUPERFILES: i64 = 3;
+    /// Payload bytes per row, incompressible, so a superfile is far larger
+    /// than its footer and than its `n` column.
+    const CACHELESS_PAYLOAD_BYTES: usize = 1_000;
+
+    /// A storage-backed table `wide` of `CACHELESS_SUPERFILES` superfiles of
+    /// incompressible rows under a connection with no cache dir, and the
+    /// bytes its superfiles take on disk. The connection that wrote it is
+    /// dropped: a test reopens the directory, so the in-memory tier is
+    /// empty and every byte a query needs is fetched from storage.
+    fn cacheless_wide_table() -> (tempfile::TempDir, u64) {
+        let (conn, dir) = storage_conn();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("payload", DataType::LargeUtf8, false),
+        ]));
+        let table = conn
+            .create_table("wide", Arc::clone(&schema), IndexSpec::new())
+            .expect("create_table");
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for file in 0..CACHELESS_SUPERFILES {
+            let n: Vec<i64> = (0..CACHELESS_ROWS)
+                .map(|i| file * CACHELESS_ROWS + i)
+                .collect();
+            let payload: Vec<String> = (0..CACHELESS_ROWS)
+                .map(|_| {
+                    (0..CACHELESS_PAYLOAD_BYTES)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            char::from(b'a' + (seed % 26) as u8)
+                        })
+                        .collect()
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(n)),
+                    Arc::new(LargeStringArray::from(payload)),
+                ],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        let on_disk = walkdir_parquet_bytes(dir.path());
+        assert!(on_disk > 0, "the table wrote superfiles");
+        (dir, on_disk)
+    }
+
+    /// Reopen the directory `cacheless_wide_table` wrote.
+    fn reopen(dir: &tempfile::TempDir) -> Connection {
+        connect(dir.path().to_str().expect("utf8 path")).expect("reopen")
+    }
+
+    /// A connection with no disk cache opens superfiles by range. Measured on
+    /// a reopened connection, whose in-memory tier is empty, with a question
+    /// the manifest cannot answer from its statistics: a count under a
+    /// residual predicate on `n` reads the one superfile the manifest keeps,
+    /// and of it the footer and the `n` column, so it fetches less than that
+    /// superfile holds. An open that fetched the object whole would fetch
+    /// more.
+    #[test]
+    fn a_cacheless_query_fetches_less_than_the_superfile_it_reads() {
+        let (dir, on_disk) = cacheless_wide_table();
+        let conn = reopen(&dir);
+        let before = conn.usage_snapshot();
+        let last_file_from = (CACHELESS_SUPERFILES - 1) * CACHELESS_ROWS;
+        let out = conn
+            .query_sql(&format!(
+                "SELECT COUNT(*) FROM wide WHERE n >= {last_file_from} AND n % 2 = 0"
+            ))
+            .expect("query");
+        let count = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count")
+            .value(0);
+        assert_eq!(count, CACHELESS_ROWS / 2);
+        let data = conn
+            .usage_snapshot()
+            .since(&before)
+            .class_io(UriClass::UserData);
+        let one_superfile = on_disk / CACHELESS_SUPERFILES as u64;
+        assert!(
+            data.get_bytes < one_superfile,
+            "a query over the footer and one column of a {one_superfile}-byte superfile fetched {} bytes",
+            data.get_bytes
+        );
+    }
+
+    /// Bytes of every `.parquet` file under `root`.
+    fn walkdir_parquet_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    total += walkdir_parquet_bytes(&path);
+                } else if path.extension().is_some_and(|e| e == "parquet") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
 
     #[test]
     fn poisoned_gate_does_not_wedge_open() {
@@ -6822,6 +6934,24 @@ mod tests {
         });
         cancel_and_expect_cancelled(&cancel, &running);
         wait_until("the sort memory comes back", || budget.used() == 0);
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
+    /// A query cancelled while its scan opens the files returns at once, and
+    /// the opens stop with it. Each open runs on a task of its own; one left
+    /// running would read on after the call returned.
+    #[test]
+    fn a_query_cancelled_while_opening_files_stops_reading() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", LARGE_FILES, ROWS_PER_LARGE_FILE);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("the scan opens a file", || stores.reads_of(SUPERFILE) > 0);
+        cancel_and_expect_cancelled(&cancel, &running);
+        assert_no_foreground_read_follows(&conn);
         assert_cache_ledger_settles(&conn, &stores);
     }
 

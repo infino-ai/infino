@@ -3196,13 +3196,13 @@ fn build_one_shard_with_layout(
 }
 
 /// The sink a shard build hands its terms to, with the head depth, when
-/// the table keeps a term index: storage-backed, with text columns. The
-/// builder's column names resolve to the ids the index keys terms by; a
-/// column the table does not have contributes nothing.
+/// the table keeps a term index: storage-backed, not opted out of, with
+/// text columns. The builder's column names resolve to the ids the index
+/// keys terms by; a column the table does not have contributes nothing.
 pub(in crate::supertable) fn term_head_sink_for(
     manifest: &ManifestSnapshot,
 ) -> Result<Option<(term_index::HeadSink, usize)>, BuildError> {
-    if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
+    if !manifest.options.keeps_term_index() || manifest.fts_configs().is_empty() {
         return Ok(None);
     }
     let columns: HashMap<String, FieldId> = manifest
@@ -3754,8 +3754,8 @@ pub(in crate::supertable) fn build_term_contribution(
     superfile_id: Uuid,
     id_min: i128,
 ) -> Result<Option<TermContribution>, BuildError> {
-    // No storage, or no text columns: no term index to publish into.
-    if manifest.options.storage.is_none() || manifest.fts_configs().is_empty() {
+    // No term index kept, or no text columns: nothing to publish into.
+    if !manifest.options.keeps_term_index() || manifest.fts_configs().is_empty() {
         return Ok(None);
     }
     let policy = manifest.options.term_index_build_policy();
@@ -11047,6 +11047,7 @@ where
 /// membership, stamping its root reference on a successor manifest (see
 /// `manifest::term_index`). Maintenance-only: optimize calls it after
 /// compaction so the base layer describes the post-merge superfile set.
+/// A table that keeps no term index is left as it is.
 ///
 /// The index is rebuilt from its own layers ([`merge_term_index`]): a
 /// posting depends only on its superfile, which never changes, so copying
@@ -11070,7 +11071,7 @@ pub(in crate::supertable) async fn stamp_term_index(
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
     };
-    if inner.manifest.load().fts_configs().is_empty() {
+    if !inner.options.term_index || inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
     // The last build's root, and the root it was built from. A retry

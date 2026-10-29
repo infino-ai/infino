@@ -341,7 +341,7 @@ mod tests {
 
     /// Rows in the block-edge corpora: enough for the negated list to
     /// span several full blocks and end in a partial one.
-    const EDGE_DOCS: u32 = 1000;
+    const EDGE_DOCS: u32 = 2200;
     /// Every doc divisible by this carries both phrase words in the
     /// wrong order, so it is the survivor of a negated phrase.
     const REVERSED_EVERY: u32 = 7;

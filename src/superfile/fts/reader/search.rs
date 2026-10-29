@@ -137,7 +137,7 @@ impl FetchedTermMemo {
 /// high enough to skip them. Decoding the highest-block-max blocks up front
 /// (found via the coarse block-max table) raises the k-th threshold first,
 /// so the main walk prunes those otherwise-wasted decodes.
-mod seed {
+pub(super) mod seed {
     /// Don't seed lists shorter than this many blocks — the setup isn't
     /// worth it when there's little waste to prune.
     pub const MIN_BLOCKS: usize = 256;
@@ -1221,14 +1221,29 @@ impl FtsReader {
         idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<OrCursorSet, FtsError> {
+        self.build_cursor_set(column, terms, idf, CursorUse::Score, prefetched)
+            .await
+    }
+
+    /// [`Self::build_or_cursor_set`] for cursors built for `purpose`: the
+    /// ranked fan-out scores its slices, the unranked one only matches
+    /// them ([`Self::match_cursor_set`]).
+    pub(super) async fn build_cursor_set(
+        &self,
+        column: &str,
+        terms: &[&str],
+        idf: QueryIdf<'_>,
+        purpose: CursorUse,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
+            self.build_term_cursors(column_id, terms, idf, purpose, None, prefetched)
                 .await?
         };
-        // Each slice's search translates its hits off this runtime.
+        // Each slice translates its ids to rows off this runtime.
         if !cursors.is_empty() {
             self.ensure_doc_map().await?;
         }
@@ -1561,7 +1576,11 @@ impl FtsReader {
                     let &(_, bi) = blocks.next()?;
                     let range = term_meta.block_range_in_term(postings, bi, None);
                     let bytes = &postings[range.start..range.end];
-                    let hdr = BlockHeader::parse(bytes, term_meta.prev_last_doc_id(postings, bi));
+                    let hdr = BlockHeader::parse(
+                        bytes,
+                        term_meta.prev_last_doc_id(postings, bi),
+                        self.wide_blocks(),
+                    );
                     Some(decode_block(bytes, &hdr, ids, tfs))
                 };
                 let cap = top_k_initial_capacity(k, u64::from(self.n_docs), None);
@@ -1590,6 +1609,7 @@ impl FtsReader {
             floor_eff,
             seed_threshold,
             coarse_enabled,
+            wide_blocks: self.wide_blocks(),
         };
         // At a large `k` most docs the walk scores are admitted, and a heap's
         // sift per admission dominates; the buffer pays an append instead.
@@ -1914,6 +1934,8 @@ struct SingleTermWalk<'a> {
     floor_eff: f32,
     seed_threshold: f32,
     coarse_enabled: bool,
+    /// The file's block header reading (see `ColumnMeta::wide_blocks`).
+    wide_blocks: bool,
 }
 
 impl SingleTermWalk<'_> {
@@ -1935,6 +1957,7 @@ impl SingleTermWalk<'_> {
             floor_eff,
             seed_threshold,
             coarse_enabled,
+            wide_blocks,
         } = *self;
         let coarse_span = format::fts::COARSE_BLOCK_MAX_SPAN;
         let mut buf_d = [0u32; BLOCK_LEN];
@@ -2009,7 +2032,11 @@ impl SingleTermWalk<'_> {
 
             // Locate the block's bytes.
             let block_bytes = &postings[range.start..range.end];
-            let hdr = BlockHeader::parse(block_bytes, term_meta.prev_last_doc_id(postings, i));
+            let hdr = BlockHeader::parse(
+                block_bytes,
+                term_meta.prev_last_doc_id(postings, i),
+                wide_blocks,
+            );
 
             //  Actual number of real docs in that block.
             let n = decode_block(block_bytes, &hdr, &mut buf_d, &mut buf_t);
@@ -2129,6 +2156,69 @@ mod tests {
                     .collect();
                 assert_eq!(got, want, "{n_rows} rows, `{term}`");
             }
+        }
+    }
+
+    /// Doc-id cuts of the slice fixture: the first doc, one inside the first
+    /// posting block, block-straddling ones, and the end.
+    const SLICE_CUTS: [u32; 6] = [1, 100, 1000, 2047, 2048, 4000];
+
+    /// Cut into doc-id slices at any boundary, an unranked `Or` match on a
+    /// reordered blob gives back exactly the whole walk's rows: each slice
+    /// ascending, together every row once. One term (its blocks copied
+    /// whole) and two (the union walk), dense and sparse.
+    #[tokio::test]
+    async fn sliced_unranked_match_rows_are_the_whole_walk() {
+        let n_rows = ORDER_FIXTURE_ROWS[1];
+        let docs: Vec<String> = (0..n_rows)
+            .map(|row| {
+                let mut text = String::from("alpha");
+                if row.is_multiple_of(BETA_EVERY) {
+                    text.push_str(" beta");
+                }
+                if row.is_multiple_of(RARE_EVERY) {
+                    text.push_str(" rare");
+                }
+                text
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let mut next = xorshift(u64::from(n_rows));
+        let mut order: Vec<u32> = (0..n_rows).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(r.has_doc_map(), "the fixture must be reordered");
+
+        let mut bounds = vec![0];
+        bounds.extend(SLICE_CUTS);
+        bounds.push(n_rows);
+        for terms in [
+            &["alpha"][..],
+            &["rare"],
+            &["beta", "rare"],
+            &["rare", "absent"],
+        ] {
+            let (whole, _) = r
+                .token_match("body", terms, BoolMode::Or)
+                .await
+                .expect("whole walk");
+            let (set, _) = r
+                .match_cursor_set("body", terms, None)
+                .await
+                .expect("cursor set");
+            let mut sliced: Vec<RowId> = Vec::new();
+            for pair in bounds.windows(2) {
+                let (rows, _) = r
+                    .token_match_range_prebuilt(&set, pair[0], pair[1])
+                    .expect("slice");
+                assert!(rows.is_sorted(), "{terms:?}: slice {pair:?} ascending");
+                sliced.extend(rows);
+            }
+            sliced.sort_unstable();
+            assert_eq!(sliced, whole, "{terms:?}");
         }
     }
 
@@ -2600,9 +2690,9 @@ mod tests {
     /// bit for bit, with the heap collector and the buffer.
     #[tokio::test]
     async fn a_single_term_seed_is_not_taken_over_negated_docs() {
-        /// Enough docs for the single-term walk to seed (`seed::MIN_BLOCKS`
-        /// blocks of `BLOCK_LEN`), every one holding `x`.
-        const N_DOCS: u32 = 34_000;
+        /// Docs past the single-term walk's seed floor, every one holding
+        /// `x`, which a term in every doc takes in wide blocks.
+        const N_DOCS: u32 = (seed::MIN_BLOCKS as u32 + 8) * BLOCK_LEN as u32;
         /// Tokens per doc.
         const DOC_LEN: usize = 5;
         for k in [64, BUFFERED_TOPK_MIN_K + 100] {
@@ -2624,6 +2714,12 @@ mod tests {
             }
             let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
             let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            let layout = r
+                .term_layout("body", "x")
+                .await
+                .expect("layout")
+                .expect("x");
+            assert!(layout.num_blocks >= seed::MIN_BLOCKS, "premise: {layout:?}");
             let bits = |hits: Vec<(RowId, f32)>| -> Vec<(u32, u32)> {
                 hits.into_iter()
                     .map(|(d, s)| (d.get(), s.to_bits()))

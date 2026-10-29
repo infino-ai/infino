@@ -53,6 +53,7 @@ use std::{
     cmp,
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    future::Future,
     sync::{Arc, atomic},
     time::Instant,
 };
@@ -64,7 +65,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{ColumnStatistics, Statistics, stats::Precision},
+    common::{ColumnStatistics, Statistics, runtime::SpawnedTask, stats::Precision},
     datasource::{
         listing::PartitionedFile,
         physical_plan::{
@@ -80,7 +81,6 @@ use datafusion::{
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
-use futures::future::try_join_all;
 use object_store::ObjectStore as OsObjectStore;
 use parquet::{
     arrow::{
@@ -122,14 +122,19 @@ use crate::{
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
-            superfile_reader::{OpenTierCounts, superfile_reader_tiered},
+            superfile_reader::{
+                OpenTierCounts, superfile_reader_in_memory, superfile_reader_tiered,
+            },
             value_count_carry::ValueCountCarry,
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
         tombstones::SidecarCache,
     },
-    utils::trace::{self, detail_span, tiered_span},
+    utils::{
+        join::try_join_bounded,
+        trace::{self, detail_span, tiered_span},
+    },
 };
 
 /// Logical name the supertable is registered under in the
@@ -172,6 +177,37 @@ struct PreparedScanFile {
     /// later scan of the same provider reuses the prepared file and reports
     /// the same tier: what it paid, not what it would pay now.
     tier: OpenTier,
+}
+
+/// Register an opened superfile with the scan's store and footers, which
+/// DataFusion's Parquet opener reads it through, and describe it for the
+/// scan.
+fn prepare_scan_file(
+    scan_store: &SuperfileObjectStore,
+    scan_footers: &ScanFooters,
+    entry: &SuperfileEntry,
+    reader: Arc<SuperfileReader>,
+    tier: OpenTier,
+    parquet_meta: Arc<ParquetMetaData>,
+) -> Arc<PreparedScanFile> {
+    let path = ObjPath::from(entry.storage_path());
+    let source = reader.byte_source();
+    let size = source.size();
+    let row_counts: Arc<[u32]> = parquet_meta
+        .row_groups()
+        .iter()
+        .map(|row_group| row_group.num_rows() as u32)
+        .collect::<Vec<_>>()
+        .into();
+    scan_store.insert_source(path.clone(), source);
+    scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
+    Arc::new(PreparedScanFile {
+        reader,
+        path,
+        size,
+        row_counts,
+        tier,
+    })
 }
 
 /// Concurrent first-open coalescing for one immutable superfile.
@@ -575,73 +611,111 @@ impl SupertableProvider {
         }
     }
 
-    /// Open and prepare one superfile once for this pinned manifest.
+    /// One superfile ready for this pinned manifest's scans, opened at most
+    /// once: the [`OnceCell`] coalesces concurrent first scans, and an error
+    /// is not cached, so the next query retries a transient storage failure.
     ///
-    /// The [`OnceCell`] coalesces concurrent first scans. Errors are not
-    /// cached, so a transient storage failure can be retried by the next query.
-    async fn prepared_scan_file(
+    /// A file an earlier scan of this provider prepared is ready at once, and
+    /// so is one this process already holds in memory with its page indexes
+    /// loaded. Any other is opened on a task of its own, because its footer
+    /// and page-index decodes are CPU work that would otherwise run one file
+    /// after another on the scan's task; the task runs on the query runtime,
+    /// as DataFusion's own Parquet decodes do, and is aborted if the returned
+    /// future is dropped. The future does nothing until it is first polled.
+    fn prepared_scan_file(
         &self,
-        entry: &Arc<SuperfileEntry>,
-    ) -> DfResult<Arc<PreparedScanFile>> {
+        entry: Arc<SuperfileEntry>,
+    ) -> impl Future<Output = DfResult<Arc<PreparedScanFile>>> + Send + 'static {
         let cell = self
             .prepared_scan_files
             .entry(entry.superfile_id)
             .or_insert_with(|| Arc::new(OnceCell::new()))
             .clone();
-        if let Some(prepared) = cell.get() {
-            return Ok(Arc::clone(prepared));
-        }
-
         let store = Arc::clone(&self.store);
         let disk_cache = self.disk_cache.clone();
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
         let scan_footers = Arc::clone(&self.scan_footers);
-        let entry = Arc::clone(entry);
-        let prepared = cell
-            .get_or_try_init(|| async move {
-                let (reader, tier) = superfile_reader_tiered(
-                    &store,
-                    disk_cache.as_ref(),
-                    storage.as_ref(),
-                    &entry.uri,
-                    &entry.storage_path(),
-                    entry.subsection_offsets.as_ref(),
-                    ReadIntent::Warm,
-                )
+        async move {
+            if let Some(prepared) = cell.get() {
+                return Ok(Arc::clone(prepared));
+            }
+            // The catalog builds a provider per query, so a warm catalog
+            // query lands here for every file: preparing a file already in
+            // memory on this task keeps a warm scan over thousands of files
+            // from paying a task each. It still goes through the cell, so a
+            // file is registered with the scan's store once.
+            let resident = superfile_reader_in_memory(
+                &store,
+                disk_cache.as_ref(),
+                storage.as_ref(),
+                &entry.uri,
+                &entry.storage_path(),
+                ReadIntent::Warm,
+            );
+            if let Some(reader) = &resident
+                && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
+            {
+                let prepared = cell
+                    .get_or_try_init(|| async {
+                        Ok::<_, DataFusionError>(prepare_scan_file(
+                            &scan_store,
+                            &scan_footers,
+                            &entry,
+                            Arc::clone(reader),
+                            OpenTier::Memory,
+                            parquet_meta,
+                        ))
+                    })
+                    .await?;
+                return Ok(Arc::clone(prepared));
+            }
+            let open = async move {
+                let prepared = cell
+                    .get_or_try_init(|| async {
+                        // A reader already in memory only lacks its page
+                        // indexes; reuse it rather than walk the tiers again.
+                        let (reader, tier) = match resident {
+                            Some(reader) => (reader, OpenTier::Memory),
+                            None => superfile_reader_tiered(
+                                &store,
+                                disk_cache.as_ref(),
+                                storage.as_ref(),
+                                &entry.uri,
+                                &entry.storage_path(),
+                                entry.subsection_offsets.as_ref(),
+                                ReadIntent::Warm,
+                            )
+                            .await
+                            .map_err(QueryError::store)?,
+                        };
+                        // Index-complete metadata (column + offset page indexes),
+                        // loaded through the reader's own byte source. Serving
+                        // DataFusion a footer-only parse would make its opener
+                        // fetch the page-index bytes through the metered store on
+                        // predicated scans — but only for lazily-opened readers,
+                        // making `sql_page_bytes` depend on reader-cache state.
+                        let parquet_meta = reader
+                            .parquet_metadata_with_page_index()
+                            .await
+                            .map_err(QueryError::from)?;
+                        Ok::<_, DataFusionError>(prepare_scan_file(
+                            &scan_store,
+                            &scan_footers,
+                            &entry,
+                            reader,
+                            tier,
+                            parquet_meta,
+                        ))
+                    })
+                    .await?;
+                Ok(Arc::clone(prepared))
+            };
+            SpawnedTask::spawn(open.in_current_span())
+                .join_unwind()
                 .await
-                .map_err(QueryError::store)?;
-                let path = ObjPath::from(entry.storage_path());
-                let source = reader.byte_source();
-                let size = source.size();
-                // Index-complete metadata (column + offset page indexes),
-                // loaded through the reader's own byte source. Serving
-                // DataFusion a footer-only parse would make its opener
-                // fetch the page-index bytes through the metered store on
-                // predicated scans — but only for lazily-opened readers,
-                // making `sql_page_bytes` depend on reader-cache state.
-                let parquet_meta = reader
-                    .parquet_metadata_with_page_index()
-                    .await
-                    .map_err(QueryError::from)?;
-                let row_counts: Arc<[u32]> = parquet_meta
-                    .row_groups()
-                    .iter()
-                    .map(|row_group| row_group.num_rows() as u32)
-                    .collect::<Vec<_>>()
-                    .into();
-                scan_store.insert_source(path.clone(), source);
-                scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
-                Ok::<Arc<PreparedScanFile>, DataFusionError>(Arc::new(PreparedScanFile {
-                    path,
-                    size,
-                    row_counts,
-                    reader,
-                    tier,
-                }))
-            })
-            .await?;
-        Ok(Arc::clone(prepared))
+                .map_err(|e| DataFusionError::ExecutionJoin(Box::new(e)))?
+        }
     }
 
     /// Test hook: how many superfiles survive pruning for `filters` — the
@@ -1165,8 +1239,6 @@ impl TableProvider for SupertableProvider {
         select_span.record("survivors", survivor_entries.len());
         trace::end(select_span);
 
-        let survivors: Vec<&Arc<SuperfileEntry>> = survivor_entries.iter().collect();
-
         // Nothing survived (empty table, or every superfile pruned):
         // a schema-correct empty scan. EmptyExec yields one
         // partition / zero rows, so `COUNT(*)` is 0 and `SELECT *`
@@ -1174,7 +1246,7 @@ impl TableProvider for SupertableProvider {
         // honored here too — `COUNT(*)` projects zero columns, and
         // DataFusion checks the physical schema against the logical
         // one.
-        if survivors.is_empty() {
+        if survivor_entries.is_empty() {
             let projected = match projection {
                 // DataFusion projects only columns this table has.
                 Some(indices) => {
@@ -1195,7 +1267,7 @@ impl TableProvider for SupertableProvider {
         // the bm25 / vector fan-out (see `SidecarCache::prefetch`);
         // each `bitmap_for` in the loop then resolves from cache.
         if let Some(cache) = self.tombstone_cache.as_ref() {
-            let ids: Vec<_> = survivors.iter().map(|e| e.superfile_id).collect();
+            let ids: Vec<_> = survivor_entries.iter().map(|e| e.superfile_id).collect();
             cache.prefetch(&ids, now).await;
         }
 
@@ -1233,20 +1305,27 @@ impl TableProvider for SupertableProvider {
         let needs_expansion = candidate_plan.has_like();
         // The term index's locations for the predicate's terms: each
         // superfile then resolves them from its postings, not its dictionary.
-        let survivor_entries: Vec<Arc<SuperfileEntry>> =
-            survivors.iter().map(|e| Arc::clone(e)).collect();
         let plan_locations =
             plan_locations_for(&self.manifest, &candidate_plan, &survivor_entries).await?;
         let plan_locations = &plan_locations;
 
-        // Opening every survivor: the part of a scan that pays for a cache
-        // miss. The span says how many files each tier served, so a cold
-        // scan is legible from one line.
-        let open_span = tiered_span!("scan.open_files", files = survivors.len());
-        let prepared_files =
-            try_join_all(survivors.iter().map(|entry| self.prepared_scan_file(entry)))
-                .instrument(open_span.clone())
-                .await?;
+        // Open every survivor, at most `superfiles_in_flight` at once, so a
+        // scan over thousands of files does not hold thousands of opens'
+        // requests and buffers together; `prepared_scan_file` says which
+        // opens get a task of their own. This is the part of a scan that
+        // pays for a cache miss, and the span says how many files each tier
+        // served, so a cold scan is legible from one line.
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let open_span = tiered_span!("scan.open_files", files = survivor_entries.len());
+        let prepared_files = try_join_bounded(
+            survivor_entries
+                .iter()
+                .cloned()
+                .map(|entry| self.prepared_scan_file(entry)),
+            in_flight,
+        )
+        .instrument(open_span.clone())
+        .await?;
         // The tally is a pass over the files; without the feature the span
         // is `none` and would drop the counts, so skip the pass too.
         if cfg!(feature = "detailed-tracing") {
@@ -1281,18 +1360,22 @@ impl TableProvider for SupertableProvider {
         let exact_slots = &exact_slots;
 
         // Pass 1 (per superfile), fanned out: every survivor resolves its
-        // candidate rows in its own future and `try_join_all` drives them
-        // together, so one superfile's dictionary fetch overlaps another's
-        // walk on the reader pool and a third's posting reads, instead of
-        // each superfile waiting for the one before it. The futures share
-        // this task rather than being spawned — the CPU is on the pool and
-        // the I/O is awaited, so the task only polls, and nothing here is
-        // `'static`. `try_join_all` keeps survivor order, so the file list
-        // below stays deterministic in manifest order, and the first
-        // error (in time) ends the scan.
-        let superfiles: Vec<SuperfileScan> = try_join_all(
-            survivors
+        // candidate rows in its own future and `try_join_bounded` drives up
+        // to `superfiles_in_flight` of them together, so one superfile's
+        // dictionary fetch overlaps another's walk on the reader pool and a
+        // third's posting reads, instead of each superfile waiting for the
+        // one before it. The futures share this task rather than being
+        // spawned — the CPU is on the pool and the I/O is awaited, so the
+        // task only polls, and nothing here is `'static`. Results come back
+        // in survivor order, so the file list below stays deterministic in
+        // manifest order, and the first error (in time) ends the scan.
+        let superfiles: Vec<SuperfileScan> = try_join_bounded(
+            // Owned entries: a closure over borrowed ones, held across an
+            // await in this `async_trait` method, trips rustc's "`FnOnce` is
+            // not general enough".
+            survivor_entries
                 .iter()
+                .cloned()
                 .zip(prepared_files)
                 .map(|(entry, prepared)| {
                     let candidate_plan = &candidate_plan;
@@ -1422,13 +1505,14 @@ impl TableProvider for SupertableProvider {
                         })
                     }
                 }),
+            in_flight,
         )
         // The per-superfile predicate work above: index candidate plans,
         // their evaluation, and the tombstone overlay. Distinct from opening
         // the files, which was paid for in `scan.open_files`.
         .instrument(detail_span!(
             "scan.index_predicates",
-            files = survivors.len()
+            files = survivor_entries.len()
         ))
         .await?;
 
@@ -2192,8 +2276,10 @@ mod tests {
     };
 
     use arrow::util::display::{ArrayFormatter, FormatOptions};
-    use arrow_array::{Int64Array, LargeStringArray, RecordBatch};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_array::{
+        Int64Array, LargeStringArray, RecordBatch, RecordBatchIterator, TimestampSecondArray,
+    };
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use datafusion::{
         common::DFSchema,
         datasource::physical_plan::FileGroup,
@@ -2224,6 +2310,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
+            hydrate::hydrate_from_reader,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
             query::{read_ahead::fixture, sql::sql_session_context},
         },
@@ -2857,6 +2944,26 @@ mod tests {
     /// "mango" — so scalar min/max prunes none of them — while only the
     /// middle one actually holds the token. Returns the provider and a
     /// runtime to drive its async surface.
+    /// A provider over `st`'s current manifest, the way a query builds one.
+    fn provider_of(st: &Supertable) -> SupertableProvider {
+        let reader = st.reader().expect("reader");
+        SupertableProvider::new(
+            reader.manifest().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        )
+    }
+
+    /// A runtime to drive a provider's async surface from a sync test.
+    fn query_runtime() -> runtime::Runtime {
+        runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt")
+    }
+
     fn provider_over_mango_superfiles() -> (SupertableProvider, runtime::Runtime) {
         let st = Supertable::create(cat_title_opts()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2871,20 +2978,150 @@ mod tests {
         w.commit().expect("c3");
         assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
-        let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
         (provider, rt)
     }
+
+    fn time_hits_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("time", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("hits", DataType::Int64, false),
+        ]))
+    }
+
+    /// A no-index table over `time_hits_schema`, one superfile per commit.
+    fn time_hits_opts() -> SupertableOptions {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        SupertableOptions::new(time_hits_schema(), vec![], vec![])
+            .expect("opts")
+            .with_writer_pool(pool)
+    }
+
+    /// One row per entry of `hours`, stamped at that hour.
+    fn time_hits_batch(hours: &[i64]) -> RecordBatch {
+        RecordBatch::try_new(
+            time_hits_schema(),
+            vec![
+                Arc::new(TimestampSecondArray::from(
+                    hours.iter().map(|h| h * SECS_PER_HOUR).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(vec![1i64; hours.len()])),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// A second-resolution timestamp literal at `hour`.
+    fn at_hour(hour: i64) -> Expr {
+        lit(ScalarValue::TimestampSecond(
+            Some(hour * SECS_PER_HOUR),
+            None,
+        ))
+    }
+
+    /// Seconds in an hour, for the timestamp fixtures.
+    const SECS_PER_HOUR: i64 = 3_600;
+
+    /// A time-ordered load lands as superfiles with disjoint `time` ranges,
+    /// and a range predicate on the column must prune to the ones the range
+    /// touches: every superfile a one-hour query opens past those is a
+    /// footer fetch and an open for nothing, which at thousands of files is
+    /// the whole latency of the query.
+    #[test]
+    fn superfile_prune_by_timestamp_range() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 3);
+        let provider = provider_of(&st);
+        let rt = query_runtime();
+
+        let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
+        assert_eq!(survivors(&[]), 3, "no predicate reads every superfile");
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(4))]),
+            1,
+            "a lower bound keeps only the superfiles whose range reaches it"
+        );
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(2)), col("time").lt(at_hour(3))]),
+            1,
+            "a one-hour window keeps the one superfile holding that hour"
+        );
+        assert_eq!(
+            survivors(&[col("time").lt(at_hour(0))]),
+            0,
+            "a range before the table's first row keeps nothing"
+        );
+    }
+
+    /// The same range prune over superfiles a bulk load wrote: hydrate
+    /// records the column statistics itself, from the batches it packs.
+    #[test]
+    fn superfile_prune_by_timestamp_range_after_hydrate() {
+        let st = Supertable::create(time_hits_opts()).expect("create");
+        let batches = [[0, 1], [2, 3], [4, 5]].map(|hours| time_hits_batch(&hours));
+        let mut reader = RecordBatchIterator::new(batches.into_iter().map(Ok), time_hits_schema());
+        hydrate_from_reader(&st, &mut reader, HYDRATE_ROWS_PER_SUPERFILE).expect("hydrate");
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 3);
+        let provider = provider_of(&st);
+        let rt = query_runtime();
+        let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
+        assert_eq!(survivors(&[col("time").gt_eq(at_hour(4))]), 1);
+        assert_eq!(
+            survivors(&[col("time").gt_eq(at_hour(2)), col("time").lt(at_hour(3))]),
+            1
+        );
+        assert_eq!(survivors(&[col("time").lt(at_hour(0))]), 0);
+    }
+
+    /// The same range prune after compaction merged the files: the merged
+    /// superfile's statistics fold its inputs', so a range past them still
+    /// prunes it and a range inside them keeps it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn superfile_prune_by_timestamp_range_after_a_merge() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(time_hits_opts().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        for hours in [[0, 1], [2, 3], [4, 5]] {
+            w.append(&time_hits_batch(&hours)).expect("append");
+            w.commit().expect("commit");
+        }
+        drop(w);
+        st.compact_async(&CompactionSettings {
+            target_superfile_size_mb: 1,
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .await
+        .expect("compact");
+        let reader = st.reader().expect("reader");
+        assert_eq!(reader.n_superfiles(), 1, "the three files merged into one");
+        let provider = provider_of(&st);
+        let inside = [col("time").gt_eq(at_hour(4))];
+        let before = [col("time").lt(at_hour(0))];
+        let after = [col("time").gt_eq(at_hour(6))];
+        assert_eq!(provider.surviving_superfile_count(&inside).await, 1);
+        assert_eq!(provider.surviving_superfile_count(&before).await, 0);
+        assert_eq!(provider.surviving_superfile_count(&after).await, 0);
+    }
+
+    /// Rows per superfile the hydrate prune test packs: one two-row batch each.
+    const HYDRATE_ROWS_PER_SUPERFILE: usize = 2;
 
     #[test]
     fn superfile_prune_index_helps_vs_does_not() {
@@ -2976,18 +3213,8 @@ mod tests {
         w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
         (provider, rt)
     }
 
@@ -3094,7 +3321,7 @@ mod tests {
         let (provider, rt) = provider_over_two_superfiles();
         let entry = Arc::clone(&provider.manifest().superfiles[0]);
         let prepared = rt
-            .block_on(provider.prepared_scan_file(&entry))
+            .block_on(provider.prepared_scan_file(Arc::clone(&entry)))
             .expect("prepare parent scan file");
         assert_eq!(provider.prepared_scan_files.len(), 1);
         assert_eq!(
@@ -3105,7 +3332,7 @@ mod tests {
         let restricted =
             provider.restricted_to([entry.superfile_id].into_iter().collect::<HashSet<_>>());
         let reused = rt
-            .block_on(restricted.prepared_scan_file(&entry))
+            .block_on(restricted.prepared_scan_file(Arc::clone(&entry)))
             .expect("reuse prepared scan file");
         assert!(Arc::ptr_eq(&prepared, &reused));
         assert!(Arc::ptr_eq(
@@ -3286,13 +3513,7 @@ mod tests {
         w.commit().expect("c2");
 
         let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
+        let provider = provider_of(&st);
 
         let stats = provider.statistics().expect("statistics");
         // 6 rows total across both superfiles, clean view → Exact.
