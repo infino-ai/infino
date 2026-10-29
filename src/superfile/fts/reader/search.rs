@@ -1221,14 +1221,29 @@ impl FtsReader {
         idf: QueryIdf<'_>,
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<OrCursorSet, FtsError> {
+        self.build_cursor_set(column, terms, idf, CursorUse::Score, prefetched)
+            .await
+    }
+
+    /// [`Self::build_or_cursor_set`] for cursors built for `purpose`: the
+    /// ranked fan-out scores its slices, the unranked one only matches
+    /// them ([`Self::match_cursor_set`]).
+    pub(super) async fn build_cursor_set(
+        &self,
+        column: &str,
+        terms: &[&str],
+        idf: QueryIdf<'_>,
+        purpose: CursorUse,
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<OrCursorSet, FtsError> {
         let column_id = self.resolve_column_id(column)?;
         let cursors = if terms.is_empty() {
             Vec::new()
         } else {
-            self.build_term_cursors(column_id, terms, idf, CursorUse::Score, None, prefetched)
+            self.build_term_cursors(column_id, terms, idf, purpose, None, prefetched)
                 .await?
         };
-        // Each slice's search translates its hits off this runtime.
+        // Each slice translates its ids to rows off this runtime.
         if !cursors.is_empty() {
             self.ensure_doc_map().await?;
         }

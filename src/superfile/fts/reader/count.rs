@@ -463,28 +463,21 @@ impl FtsReader {
         tokens: &[&str],
         prefetched: Option<&FetchedTermMemo>,
     ) -> Result<(OrCursorSet, MatchWork), FtsError> {
-        let column_id = self.resolve_column_id(column)?;
-        let cursors = match tokens.is_empty() {
-            true => Vec::new(),
-            false => {
-                self.build_term_cursors(
-                    column_id,
-                    tokens,
-                    QueryIdf::ThisFile,
-                    CursorUse::Count,
-                    None,
-                    prefetched,
-                )
-                .await?
-            }
+        let set = self
+            .build_cursor_set(
+                column,
+                tokens,
+                QueryIdf::ThisFile,
+                CursorUse::Count,
+                prefetched,
+            )
+            .await?;
+        let work = MatchWork {
+            postings_bytes: set.postings_bytes(),
+            planned_ranges: set.planned_ranges() + dictionary_fetches(tokens, prefetched),
+            kernel_cpu_ns: 0,
         };
-        let mut work = MatchWork::for_cursors(&cursors);
-        work.planned_ranges += dictionary_fetches(tokens, prefetched);
-        // Each slice translates its ids to rows off this runtime.
-        if !cursors.is_empty() {
-            self.ensure_doc_map().await?;
-        }
-        Ok((OrCursorSet { column_id, cursors }, work))
+        Ok((set, work))
     }
 
     /// The rows whose doc ids in `[start, end)` hold any of `set`'s terms,

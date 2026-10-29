@@ -299,9 +299,14 @@ struct MatchKernel {
 }
 
 impl MatchKernel {
-    /// The rows of superfile `suid`, read through `r`, that the match
-    /// keeps: the positive walk minus any row a negated atom reaches.
-    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+    /// What every walk of superfile `suid` starts from: the matched column
+    /// under the name `r` knows it by, the index's memo of the terms'
+    /// postings there, and the terms.
+    async fn file_inputs(
+        &self,
+        r: &SuperfileReader,
+        suid: Uuid,
+    ) -> (String, Option<Arc<FetchedTermMemo>>, Vec<&str>) {
         // A file written before a rename labels the column as it was then,
         // and its dictionary is keyed by that label; the id is what finds
         // the column in either file.
@@ -310,6 +315,13 @@ impl MatchKernel {
             .to_owned();
         let memo = memo_from_locations(r, &self.locations, suid).await;
         let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
+        (column, memo, refs)
+    }
+
+    /// The rows of superfile `suid`, read through `r`, that the match
+    /// keeps: the positive walk minus any row a negated atom reaches.
+    async fn docs(&self, r: &SuperfileReader, suid: Uuid) -> Result<Vec<RowId>, QueryError> {
+        let (column, memo, refs) = self.file_inputs(r, suid).await;
         // Any phrase atom (match or negated) takes the phrase-aware walk;
         // plain-token queries keep the optimized token_match path.
         let (docs, mut work) = match self.phrase_involved {
@@ -362,11 +374,7 @@ impl MatchKernel {
 
     /// The cursors every slice of superfile `suid` walks, built once.
     async fn cursor_set(&self, r: &SuperfileReader, suid: Uuid) -> Result<OrCursorSet, QueryError> {
-        let column = r
-            .column_alias(self.column_field_id, &self.column)
-            .to_owned();
-        let memo = memo_from_locations(r, &self.locations, suid).await;
-        let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
+        let (column, memo, refs) = self.file_inputs(r, suid).await;
         let (set, work) = r.match_cursor_set(&column, &refs, memo.as_deref()).await?;
         self.flush(&work);
         Ok(set)
@@ -1721,11 +1729,7 @@ impl SupertableReader {
                     // queries (`fanout_for` never slices when a must
                     // or negated clause exists).
                     Some((start, end)) => {
-                        let cell = {
-                            let mut sets =
-                                cursor_sets.lock().expect("cursor-set map lock poisoned");
-                            Arc::clone(sets.entry(suid).or_default())
-                        };
+                        let cell = cursor_cell(&cursor_sets, suid);
                         // The global idf is one map for the whole query, so
                         // every slice of a superfile wants cursors built
                         // with the same override — sharing the cursor set
@@ -2737,11 +2741,7 @@ impl SupertableReader {
                 let docs = match range {
                     None => kernel.docs(&r, suid).await?,
                     Some((start, end)) => {
-                        let cell = {
-                            let mut sets =
-                                cursor_sets.lock().expect("cursor-set map lock poisoned");
-                            Arc::clone(sets.entry(suid).or_default())
-                        };
+                        let cell = cursor_cell(&cursor_sets, suid);
                         let set = cell
                             .get_or_try_init(|| async {
                                 Ok::<_, QueryError>(Arc::new(kernel.cursor_set(&r, suid).await?))
@@ -3541,7 +3541,17 @@ impl SupertableReader {
 /// The cursors one superfile's doc-id slices share, keyed by superfile id
 /// and built by the first slice to need them; the `OnceCell` coalesces
 /// concurrent slices of a file.
-type SharedCursorSets = Arc<Mutex<HashMap<Uuid, Arc<OnceCell<Arc<OrCursorSet>>>>>>;
+type SharedCursorSets = Arc<Mutex<HashMap<Uuid, SharedCursorCell>>>;
+
+/// One superfile's slot in [`SharedCursorSets`].
+type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
+
+/// Superfile `suid`'s slot in `sets`, made empty by the first slice to
+/// ask; the slice then builds or awaits the set through it.
+fn cursor_cell(sets: &SharedCursorSets, suid: Uuid) -> SharedCursorCell {
+    let mut sets = sets.lock().expect("cursor-set map lock poisoned");
+    Arc::clone(sets.entry(suid).or_default())
+}
 
 /// One unit of per-superfile search work scheduled into the reader
 /// pool's `par_iter`. `range == None` means "the whole superfile" and

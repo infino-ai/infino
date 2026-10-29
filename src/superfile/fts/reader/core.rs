@@ -2231,7 +2231,7 @@ pub(super) fn or_merge_unranked_in(mut cursors: Vec<TermCursor>, start: u32, end
         }
     }
     if let [cursor] = cursors.as_mut_slice() {
-        return single_term_docs(cursor, end);
+        return single_term_docs(cursor, start, end);
     }
     let doc_space = u64::from(cursors_max_doc(&cursors)) + 1;
     if or_walk_prefers_heap(cursors.len(), df_total(&cursors), doc_space) {
@@ -2242,11 +2242,14 @@ pub(super) fn or_merge_unranked_in(mut cursors: Vec<TermCursor>, start: u32, end
     out
 }
 
-/// One term's doc ids from where `cursor` stands up to `end`: each
-/// decoded block's ids are copied whole, where the per-doc walk would
-/// compare and step once per posting.
-fn single_term_docs(cursor: &mut TermCursor, end: u32) -> Vec<u32> {
-    let mut out = Vec::with_capacity(usize::try_from(cursor.df).unwrap_or(0));
+/// One term's doc ids from where `cursor` stands, at or past `start`, up
+/// to `end`: each decoded block's ids are copied whole, where the per-doc
+/// walk would compare and step once per posting. The reserve is the
+/// term's df or the slice's width, whichever is smaller: the df counts
+/// the whole file, and every slice of it would reserve that much.
+fn single_term_docs(cursor: &mut TermCursor, start: u32, end: u32) -> Vec<u32> {
+    let cap = cursor.df.min(u64::from(end.saturating_sub(start)));
+    let mut out = Vec::with_capacity(usize::try_from(cap).unwrap_or(0));
     while !cursor.is_exhausted() {
         let ids = &cursor.block_doc_ids[cursor.pos..cursor.block_n];
         let below = ids.partition_point(|&doc| doc < end);

@@ -689,6 +689,39 @@ mod tests {
     /// Rows of the sliced-match fixture's one superfile: enough for three
     /// slices at the fewest docs a slice is cut at.
     const SLICED_ROWS: usize = 150_000;
+    /// Plain unions of terms, the shape whose match is sliced.
+    const SLICED_QUERIES: [&str; 2] = ["rust", "rust python"];
+    /// A conjunction of two terms, which walks its superfile whole.
+    const WHOLE_QUERY: &str = "rust systems";
+
+    /// The rows of each batch the column path gives for `query`: one batch
+    /// per superfile, or per slice of one.
+    fn column_batch_rows(st: &Supertable, query: &str, mode: BoolMode) -> Vec<usize> {
+        let reader = st.reader().expect("reader");
+        reader
+            .block_on(reader.token_match_columns_async("title", query, mode, &["title"]))
+            .expect("columns over the match")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .collect()
+    }
+
+    /// The fixture's one superfile is really cut: a plain union comes back
+    /// as several slices, together every matched row once, and a
+    /// conjunction as one batch.
+    fn assert_the_match_is_sliced(st: &Supertable) {
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
+        for query in SLICED_QUERIES {
+            let slices = column_batch_rows(st, query, BoolMode::Or);
+            assert!(slices.len() > 1, "{query}: {slices:?} is one batch");
+            let matched = rows(
+                st,
+                &format!("SELECT _id FROM token_match('title', '{query}')"),
+            );
+            assert_eq!(slices.iter().sum::<usize>(), matched, "{query}");
+        }
+        assert_eq!(column_batch_rows(st, WHOLE_QUERY, BoolMode::And).len(), 1);
+    }
 
     /// The same agreement when one superfile is large enough, and the
     /// reader pool wide enough, for an aggregate's match to be cut into
@@ -722,11 +755,12 @@ mod tests {
             w.append(&titles_batch(&titles)).expect("append");
             w.commit().expect("commit");
         }
-        assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
+        assert_the_match_is_sliced(&st);
         assert_aggregates_equal_the_rows(&st);
 
         st.delete(col("title").eq(lit(DELETED_TITLE)))
             .expect("delete");
+        assert_the_match_is_sliced(&st);
         assert_aggregates_equal_the_rows(&st);
     }
 
