@@ -49,14 +49,15 @@ impl Drop for AheadRoom {
 /// lazy entry (no mmap — its cost is anonymous heap that `madvise` cannot
 /// reclaim) and the cache must be its last holder (a reader a query still
 /// has in hand keeps the heap alive regardless, and re-opening costs that
-/// query a round trip). An entry whose block source still has a run waiting to
-/// be written is kept too, since that run's bytes are not counted yet.
+/// query a round trip). An entry whose block source still has a run in memory
+/// (being fetched, or waiting to be written) is kept too, since that run's
+/// bytes are not counted yet.
 fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
     entry.mmap().is_none()
         && Arc::strong_count(&entry.reader) <= 1
         && entry
             .block_source()
-            .is_none_or(|source| !source.has_pending_writes())
+            .is_none_or(|source| !source.has_runs_in_memory())
 }
 
 impl DiskCacheStore {

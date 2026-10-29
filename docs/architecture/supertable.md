@@ -604,10 +604,17 @@ fusion. Whatever the index could not bound (a scalar column, a
 negation, a token superset that the exact predicate trims), the
 function makes up by applying the exact predicate to its own resolved
 rows and widening the search — doubling k each round — until k rows
-survive or the table is exhausted; the cost is proportional to the
-predicate's selectivity, never to a fixed over-fetch. Prefix search
-takes only that last tier: its term set is known per superfile, not
-per query.
+survive or a bounded ceiling is reached. `bm25_search` goes one step
+further when that widening ends short at a ceiling below the table's
+size: it evaluates the predicate over the rows the query's terms match,
+keeps exactly the rows it holds on, and ranks once more within those,
+so the answer is the top k among matching rows however far below the
+unfiltered top-k they rank. The cost of that pass is an unranked match
+of the query's terms and a decode of the predicate's columns over those
+matches, paid only by a predicate the widening could not fill.
+`vector_search`, `hybrid_search` and prefix search stop at the
+widening, and prefix search takes only that tier: its term set is
+known per superfile, not per query.
 
 ## Concurrency
 

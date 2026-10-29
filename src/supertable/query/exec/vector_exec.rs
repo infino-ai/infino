@@ -64,11 +64,13 @@ use crate::{
         query::{
             candidate::CandidatePlan,
             exec::common::{
-                PushedPredicate, SCORE_COLUMN, arg_to_string, arg_to_usize,
-                candidate_plan_for_filters, fill_top_k, live_reader, output_schema_with_score,
-                resolve_hits, scope_to_call, traced_tvf,
+                PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                fill_top_k, live_reader, output_schema_with_score, resolve_hits, scope_to_call,
+                traced_tvf,
             },
-            vector::{free_column_slot, hits_id_score_batch, user_placement_for_scalar_resolve},
+            vector::{
+                hits_id_score_batch, sql_id_score_projection, user_placement_for_scalar_resolve,
+            },
         },
     },
     utils::trace::detail_span,
@@ -360,46 +362,11 @@ impl ExecutionPlan for VectorSearchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
-        let requested: Vec<usize> = projection
-            .clone()
-            .unwrap_or_else(|| (0..output_schema.fields().len()).collect());
-        // Same rule as the public API, classified through the same
-        // function ([`free_column_slot`]) rather than a second copy of
-        // it: map each requested DataFusion column index back to its
-        // name and ask whether that column comes free with the search
-        // wave. Empty stays `Some([])` here — DataFusion emits an empty
-        // projection for `COUNT(*)`-shaped plans, where a zero-column
-        // batch is the wanted output (the public API sends empty down
-        // the general path instead; each policy lives at its own call
-        // site).
-        //
-        // Arrow permits duplicate field names, so a user column
-        // literally named `score` (or matching the id column) would
-        // make the name lookup ambiguous where the old index compare
-        // could not be. Decline the fast path outright in that case.
-        let id_column = reader.options().id_column.as_str();
-        let ambiguous = |name: &str| {
-            output_schema
-                .fields()
-                .iter()
-                .filter(|f| f.name() == name)
-                .count()
-                > 1
-        };
-        let id_score_projection: Option<Vec<usize>> =
-            if ambiguous(id_column) || ambiguous(SCORE_COLUMN) {
-                None
-            } else {
-                requested
-                    .iter()
-                    .map(|&idx| {
-                        output_schema
-                            .fields()
-                            .get(idx)
-                            .and_then(|f| free_column_slot(f.name(), id_column))
-                    })
-                    .collect()
-            };
+        let id_score_projection = sql_id_score_projection(
+            &output_schema,
+            projection.as_deref(),
+            reader.options().id_column.as_str(),
+        );
 
         let fut = async move {
             // Lower the pushed-down `WHERE` filters to an FTS candidate
@@ -432,10 +399,9 @@ impl ExecutionPlan for VectorSearchExec {
                     Ok::<_, QueryError>(hits)
                 }
             };
-            // Same stamp guard as the hybrid exec path: unstamped hits fall
-            // through to placement rather than failing the query. The
-            // free-column fast path decodes nothing, so it can only serve
-            // a query with no predicate to check.
+            // Unstamped hits fall through to placement rather than failing
+            // the query. The free-column fast path decodes nothing, so it
+            // can only serve a query with no predicate to check.
             if filters.is_empty()
                 && let Some(indices) = id_score_projection
             {

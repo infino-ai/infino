@@ -25,6 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
@@ -64,6 +65,7 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use rayon::{ThreadPool, prelude::*};
+use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, warn};
 
 use crate::{
@@ -73,17 +75,22 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        reader::{rank_back_indices, row_selection_for_ids},
+        reader::{WHOLE_COLUMN_TAKE_DIVISOR, rank_back_indices, row_selection_for_ids},
     },
     supertable::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
-        manifest::{ManifestSnapshot, SuperfileUri},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::{
-            SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
-            superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+            SuperfileHit,
+            candidate::{CandidatePlan, CandidateScope},
+            dispatch::{fanout_with, tombstone_deny_set},
+            exec::metered_exec::MeteredExec,
+            superfile_reader::superfile_reader,
+            vector::row_id_from_manifest_entry,
         },
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
+        tombstones::SidecarCache,
     },
     utils::trace::record,
 };
@@ -149,18 +156,25 @@ const OVER_FETCH_MAX_K_MULTIPLE: usize = 64;
 /// alone would give a small `k` a tiny budget — 64 hits at `k = 1` — and
 /// a selective predicate needs to look past that before concluding its
 /// rows are not there.
-const OVER_FETCH_MIN_CEILING: usize = 10_000;
+pub(crate) const OVER_FETCH_MIN_CEILING: usize = 10_000;
 
 /// The absolute ceiling on one fill's hit count, bounding the rows any
 /// single round resolves into memory. A caller asking for more than this
 /// still gets its `k`: [`over_fetch_ceiling`] never returns less.
 const OVER_FETCH_MAX_HITS: usize = 100_000;
 
+/// Rows of one superfile [`exact_scope`] decodes and checks at a time, when
+/// the superfile is too large to take its rows in one read: past
+/// `EXACT_SCOPE_TAKE_ROWS` × [`WHOLE_COLUMN_TAKE_DIVISOR`] rows a chunk this
+/// size is a sparse take, which decodes only the pages its rows land on, so
+/// the predicate's columns over a large superfile never sit in memory whole.
+const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
+
 /// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
 /// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
 /// [`OVER_FETCH_MAX_HITS`], never below the `k` actually asked for, and
 /// never above the table's row count.
-fn over_fetch_ceiling(k: usize, total: usize) -> usize {
+pub(crate) fn over_fetch_ceiling(k: usize, total: usize) -> usize {
     k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
         .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
@@ -632,6 +646,41 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
 {
+    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+    fill_top_k_within(
+        reader,
+        k,
+        predicate,
+        scalar_schema,
+        output_schema,
+        projection,
+        over_fetch_ceiling(k, total),
+        search,
+    )
+    .await
+}
+
+/// [`fill_top_k`] with the caller's own `ceiling` on the hits a round may
+/// ask for. A ceiling of `k` runs exactly one round: the kernel's `k` best
+/// within its scope, checked against the predicate and returned however
+/// many survive — what a caller wants when it has a better move than
+/// widening, or when its scope already admits only rows the predicate keeps
+/// (see [`exact_scope`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fill_top_k_within<F, Fut>(
+    reader: &SupertableReader,
+    k: usize,
+    predicate: Option<&PushedPredicate>,
+    scalar_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    ceiling: usize,
+    search: F,
+) -> DfResult<RecordBatch>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
+{
     let Some(predicate) = predicate else {
         let hits = search(k).await?;
         return resolve_hits(reader, &hits, scalar_schema, output_schema, projection).await;
@@ -656,8 +705,6 @@ where
     );
     let bound = predicate.bind(&decoded_schema)?;
     let requested_positions: Vec<usize> = (0..requested.len()).collect();
-    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-    let ceiling = over_fetch_ceiling(k, total);
     let mut want = k.min(ceiling);
     loop {
         let hits = search(want).await?;
@@ -682,6 +729,162 @@ where
         }
         want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
     }
+}
+
+/// `scope` narrowed to exactly the rows its pushed-down `predicate` keeps:
+/// each admitted superfile's candidate rows, decoded on the predicate's
+/// columns and kept where it holds. A bounded scope's sets are read as they
+/// are, already free of tombstones; an unbounded one stands for every row
+/// of each superfile, less its tombstones. A kernel gated on the result
+/// admits only rows the `WHERE` keeps, so one round at `k` returns the `k`
+/// best of them, or every one when fewer exist: no widening, and no
+/// ceiling to come up short at.
+///
+/// This is how a predicate the index cannot bound — a scalar equality, a
+/// range — still means the top `k` among the rows satisfying it. The cost
+/// is a decode of the predicate's columns over the scope's rows, so a
+/// caller narrows the scope to the rows its search can return first (a
+/// text search, to the rows its terms match) and asks for this only once
+/// widening has stopped short at its ceiling.
+///
+/// A superfile small enough that its rows are a dense take
+/// ([`WHOLE_COLUMN_TAKE_DIVISOR`]) is read in one take, which reads each
+/// fixed-width column once; a larger one in sparse chunks of
+/// [`EXACT_SCOPE_TAKE_ROWS`], pulled off the candidate set one at a time.
+///
+/// `None` when the predicate reads no column or one no superfile stores —
+/// the score, the id column, an index-only text column — so it cannot be
+/// evaluated before ranking; the caller then keeps what widening found.
+pub(crate) async fn exact_scope(
+    reader: &SupertableReader,
+    scope: &CandidateScope,
+    predicate: &PushedPredicate,
+    output_schema: &SchemaRef,
+) -> DfResult<Option<CandidateScope>> {
+    let manifest = Arc::clone(reader.manifest());
+    let stored = manifest.stored_schema();
+    let id_column = reader.options().id_column.as_str();
+    let mut names = Vec::with_capacity(predicate.columns().len());
+    for &index in predicate.columns() {
+        let name = output_schema.field(index).name();
+        if name == SCORE_COLUMN || name == id_column || stored.field_with_name(name).is_err() {
+            return Ok(None);
+        }
+        names.push(name.clone());
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let out_schema = hit_output_schema(&stored, &refs)?;
+    let bound = Arc::new(predicate.bind(&out_schema)?);
+    let names = Arc::new(names);
+    let op_stats = reader.op_stats.clone();
+    // A bounded scope hands each superfile its set, tombstones already
+    // subtracted; an unbounded one hands `None`, read as all of its rows.
+    let units: Vec<(Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>)> = scope
+        .admitted_superfiles()
+        .map(|entry| {
+            let rows = scope
+                .allow
+                .as_ref()
+                .and_then(|allow| allow.get(&entry.uri).cloned());
+            (Arc::clone(entry), rows)
+        })
+        .collect();
+    let body = move |r: Arc<SuperfileReader>,
+                     entry: Arc<SuperfileEntry>,
+                     cache: Option<Arc<SidecarCache>>,
+                     now: Instant,
+                     rows: Option<Arc<RoaringBitmap>>| {
+        let manifest = Arc::clone(&manifest);
+        let names = Arc::clone(&names);
+        let out_schema = Arc::clone(&out_schema);
+        let bound = Arc::clone(&bound);
+        let op_stats = op_stats.clone();
+        async move {
+            let candidates = match rows {
+                Some(rows) => rows,
+                None => {
+                    let n_docs = u32::try_from(r.n_docs()).map_err(QueryError::internal)?;
+                    let mut all = RoaringBitmap::new();
+                    all.insert_range(0..n_docs);
+                    if let Some(cache) = cache.as_ref()
+                        && let Some(deny) = tombstone_deny_set(cache, entry.superfile_id, now)?
+                    {
+                        all -= deny.as_ref();
+                    }
+                    Arc::new(all)
+                }
+            };
+            // A superfile whose every row a chunk could cover is read in one
+            // take; past that, chunks small enough to stay sparse takes.
+            let n_docs = usize::try_from(r.n_docs()).map_err(QueryError::internal)?;
+            let whole_file_rows =
+                EXACT_SCOPE_TAKE_ROWS.saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR as usize);
+            let take_rows = if n_docs <= whole_file_rows {
+                n_docs.max(1)
+            } else {
+                EXACT_SCOPE_TAKE_ROWS
+            };
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut kept = RoaringBitmap::new();
+            let mut remaining = candidates.iter();
+            loop {
+                let chunk: Vec<u32> = remaining.by_ref().take(take_rows).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(chunk.len() as u64);
+                }
+                let batch =
+                    take_file_columns(&manifest, &r, chunk.clone(), &refs, &out_schema, &op_stats)
+                        .await
+                        .map_err(QueryError::DataFusion)?;
+                let bound = Arc::clone(&bound);
+                // The predicate runs over up to a chunk of rows: compute, so
+                // the reader pool takes it rather than the tokio worker. It
+                // hands back the positions it holds at; the chunk maps them
+                // to rows here.
+                let (held, ns) = run_on_pool(
+                    Some(&manifest.options.reader_pool),
+                    "exact scope check: reader pool dropped result",
+                    move || {
+                        timed_section(|| {
+                            bound.mask(&batch).map(|mask| {
+                                mask.iter()
+                                    .enumerate()
+                                    .filter_map(|(at, holds)| (holds == Some(true)).then_some(at))
+                                    .collect::<Vec<usize>>()
+                            })
+                        })
+                    },
+                )
+                .await
+                .map_err(QueryError::internal)?;
+                if let Some(stats) = &op_stats {
+                    stats.add_kernel_cpu_ns(ns);
+                }
+                kept.extend(
+                    held.map_err(QueryError::DataFusion)?
+                        .into_iter()
+                        .map(|at| chunk[at]),
+                );
+            }
+            Ok((entry.uri, kept))
+        }
+    };
+    let kept = fanout_with(reader, units, true, reader.open_intent(), body).await?;
+    let allow = kept
+        .into_iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .map(|(uri, rows)| (uri, Arc::new(rows)))
+        .collect();
+    Ok(Some(CandidateScope {
+        superfiles: scope.superfiles.clone(),
+        allow: Some(allow),
+    }))
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -897,11 +1100,17 @@ fn resolve_ids_arithmetic(
     )
 }
 
-/// Fill each hit's `stable_id` in place using the cheap, cache-backed
-/// resolution path: inline id / contiguous-span arithmetic where they
-/// apply, else a `_id`-column read routed through `resolve_columns` (and
+/// Fill the `stable_id` of each hit that lacks one, in place, using the
+/// cheap, cache-backed resolution path: contiguous-span arithmetic where it
+/// applies, else a `_id`-column read routed through `resolve_columns` (and
 /// thus `decoded_scalar_cache`), so a warm reader decodes each superfile's
 /// `_id` column at most once and later queries hit the cache.
+///
+/// A hit that already has an id is never read again. Its local may not
+/// address a Parquet row: a vector hit in a cell-packed file carries the
+/// position in its cell's postings (boundary stubs included), stamped from
+/// the inline id region at search time, so reading `_id` at that local would
+/// overwrite a right id with another row's.
 ///
 /// This is the resolution `resolve_hits` already uses for an id-only
 /// projection. The scored fan-out uses it to stamp its final top-k instead
@@ -913,9 +1122,39 @@ pub(crate) async fn stamp_stable_ids(
     reader: &SupertableReader,
     hits: &mut [SuperfileHit],
 ) -> DfResult<()> {
-    if hits.is_empty() || hits.iter().all(|h| h.stable_id.is_some()) {
+    let unstamped = hits.iter().filter(|h| h.stable_id.is_none()).count();
+    if unstamped == 0 {
         return Ok(());
     }
+    // No hit has an id: resolve the slice as it is. An FTS hit set over
+    // cell-packed files arrives this way and can hold every row of the
+    // table, so copying it out first would cost a pass over all of them.
+    if unstamped == hits.len() {
+        let ids = resolve_hit_ids(reader, hits).await?;
+        for (hit, id) in hits.iter_mut().zip(ids.values()) {
+            hit.stable_id = Some(*id);
+        }
+        return Ok(());
+    }
+    // Some hits have one (hybrid fuses stamped vector hits with unstamped
+    // FTS hits): resolve only the rest, a set no larger than the fused k.
+    let missing: Vec<usize> = (0..hits.len())
+        .filter(|&i| hits[i].stable_id.is_none())
+        .collect();
+    let subset: Vec<SuperfileHit> = missing.iter().map(|&i| hits[i]).collect();
+    let ids = resolve_hit_ids(reader, &subset).await?;
+    for (&i, id) in missing.iter().zip(ids.values()) {
+        hits[i].stable_id = Some(*id);
+    }
+    Ok(())
+}
+
+/// The `_id` of each hit in `hits`, in order: span arithmetic where it
+/// applies, else a cache-backed `_id`-column read.
+async fn resolve_hit_ids(
+    reader: &SupertableReader,
+    hits: &[SuperfileHit],
+) -> DfResult<Decimal128Array> {
     let id_batch = match resolve_ids_arithmetic(reader, hits) {
         Some(batch) => batch?,
         None => {
@@ -927,13 +1166,9 @@ pub(crate) async fn stamp_stable_ids(
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| {
-            QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into())
-        })?;
-    for (hit, id) in hits.iter_mut().zip(ids.values()) {
-        hit.stable_id = Some(*id);
-    }
-    Ok(())
+        .ok_or_else(|| QueryError::Internal("stamp_stable_ids: _id column not Decimal128".into()))?
+        .clone();
+    Ok(ids)
 }
 
 /// Build the engine-native `_id` + `score` batch directly from already-resolved
@@ -2438,6 +2673,132 @@ mod tests {
         assert!(
             row_id_from_manifest_entry(entry, 0).is_none(),
             "fixture must force a gapped id span"
+        );
+    }
+
+    /// A hit set spanning a gapped file and a contiguous one arrives part
+    /// stamped (the contiguous file's hits get their id by arithmetic when
+    /// tagged), so stamping reads `_id` for the gapped file's hits alone.
+    /// Every hit must still end up with its own row's id: the term's ids
+    /// equal a scan's.
+    #[test]
+    fn stamp_stable_ids_over_gapped_and_contiguous_files_matches_a_scan() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        commit_titles_to(&storage);
+        let st = Supertable::open(default_supertable_options().with_storage(Arc::clone(&storage)))
+            .expect("open");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["rust tooling", "java beans"]))
+            .expect("append");
+        w.commit().expect("commit");
+        let reader = st.reader().expect("reader");
+        let spans: Vec<bool> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| row_id_from_manifest_entry(e, 0).is_some())
+            .collect();
+        assert_eq!(
+            spans.len(),
+            2,
+            "one gapped file and one contiguous file, got {spans:?}"
+        );
+        assert!(
+            spans.contains(&true) && spans.contains(&false),
+            "one gapped file and one contiguous file, got {spans:?}"
+        );
+
+        // Each hit's title is read at its own (superfile, local), which the
+        // stamp does not touch, so a pair holds only if the id is that row's.
+        let hits = reader
+            .token_match("title", "rust", BoolMode::And)
+            .expect("token_match");
+        let titles = reader
+            .block_on(resolve_columns(&reader, &hits, &["title"]))
+            .expect("read titles");
+        let titles = titles
+            .column(0)
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("title");
+        let mut matched: Vec<(String, i128)> = hits
+            .iter()
+            .enumerate()
+            .map(|(i, h)| (titles.value(i).to_string(), h.stable_id.expect("stamped")))
+            .collect();
+        matched.sort_unstable();
+        let mut scanned: Vec<(String, i128)> = reader
+            .query_sql("SELECT title, _id FROM supertable WHERE title LIKE '%rust%'")
+            .expect("scan")
+            .iter()
+            .flat_map(|b| {
+                let titles = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .expect("title");
+                let ids = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal `_id`");
+                (0..b.num_rows())
+                    .map(|i| (titles.value(i).to_string(), ids.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        scanned.sort_unstable();
+        assert_eq!(scanned.len(), 3, "rust is in three rows");
+        assert_eq!(matched, scanned, "each hit carries its own row's `_id`");
+    }
+
+    /// Stamping reads `_id` only for the hits that lack one. A hit that has
+    /// one keeps it even when the call must read the `_id` column for another
+    /// hit: its local can be a cell-postings position rather than a Parquet
+    /// row, so reading `_id` there would replace a right id with a wrong one.
+    #[test]
+    fn stamp_stable_ids_reads_only_the_hits_without_an_id() {
+        /// An id no row holds, so a hit still carrying it was left alone.
+        const KEPT_ID: i128 = -7;
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        commit_titles_to(&storage);
+        let st =
+            Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
+        let reader = st.reader().expect("reader");
+        let entry = Arc::clone(&reader.manifest().superfiles[0]);
+        let hit = |local_doc_id, stable_id| SuperfileHit {
+            superfile: entry.uri,
+            local_doc_id,
+            score: 0.0,
+            stable_id,
+        };
+        let mut hits = [hit(0, None), hit(1, Some(KEPT_ID))];
+        reader
+            .block_on(stamp_stable_ids(&reader, &mut hits))
+            .expect("stamp");
+        assert_eq!(
+            hits[1].stable_id,
+            Some(KEPT_ID),
+            "a stamped hit is not read again"
+        );
+
+        let row_0 = reader
+            .block_on(resolve_columns(&reader, &[hit(0, None)], &["_id"]))
+            .expect("read row 0's `_id`");
+        let row_0 = row_0
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal `_id`")
+            .value(0);
+        assert_eq!(
+            hits[0].stable_id,
+            Some(row_0),
+            "an unstamped hit gets its own row's id"
         );
     }
 

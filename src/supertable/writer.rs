@@ -186,7 +186,7 @@ use crate::{
         options::SupertableOptions,
         query::{
             dispatch::{open_compaction_input, open_reader},
-            vector::{IndexOutcome, stable_ids_by_local_for_routing},
+            vector::{IndexOutcome, serves_via_graph, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
         schema::{
@@ -4930,6 +4930,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         .clone()
         .ok_or_else(|| BuildError::Store("hidden drain requires storage".into()))?;
     let shard_count = packed_cell_shard_count(&hidden_inner.options);
+    let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
     let budget = if batch_cfg < 0 {
         usize::MAX
@@ -5170,7 +5171,12 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let clean_uncheckpointed_drain = local_checkpoint.batches_done == 0
         && completed_shards.is_empty()
         && local_checkpoint.spills.is_empty();
-    let mut width_law = clean_uncheckpointed_drain.then(|| {
+    // A table already served by the centroid graph keeps the laws it has:
+    // compaction skips recalibrating it for the same reason, and scoring
+    // every new cell here costs more CPU than building it. The first drain
+    // still measures, so filtered queries always have laws to read.
+    let graph_served = hidden_bootstrapped && serves_via_graph(&hidden_manifest, &column);
+    let mut width_law = (clean_uncheckpointed_drain && !graph_served).then(|| {
         opann::WidthLawCalibration::new(
             running_clusters.dim as usize,
             metric,
@@ -5443,34 +5449,33 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 let column_name_ref = column_name.as_str();
                 let stable_ids_per_input: Vec<Vec<i128>> =
                     readers.iter().map(|(_, ids)| ids.clone()).collect();
-                let routed: HashMap<u32, (MergedIvfSubsection, Vec<i128>)> =
-                    hidden_inner.options.writer_pool.install(
-                        || -> Result<HashMap<u32, (MergedIvfSubsection, Vec<i128>)>, BuildError> {
-                            let inputs: Vec<(&VectorReader, &str)> = readers
-                                .iter()
-                                .map(|(r, _)| {
-                                    r.vec()
-                                        .ok_or_else(|| {
-                                            BuildError::Store(
-                                                "user superfile missing vector index".into(),
-                                            )
-                                        })
-                                        .map(|vr| (vr, column_name_ref))
-                                })
-                                .collect::<Result<_, _>>()?;
-                            let clusters_ref = &running_clusters;
-                            route_clusters_into_cells(
-                                &inputs,
-                                &stable_ids_per_input,
-                                |centroid: &[f32]| {
-                                    let mut assign = [0u32];
-                                    clusters_ref.assign_rows(metric, centroid, &mut assign);
-                                    vec![assign[0]]
-                                },
-                            )
-                            .map_err(|e| e.into())
-                        },
-                    )?;
+                let routed: HashMap<u32, (MergedIvfSubsection, Vec<i128>)> = drain_pool.install(
+                    || -> Result<HashMap<u32, (MergedIvfSubsection, Vec<i128>)>, BuildError> {
+                        let inputs: Vec<(&VectorReader, &str)> = readers
+                            .iter()
+                            .map(|(r, _)| {
+                                r.vec()
+                                    .ok_or_else(|| {
+                                        BuildError::Store(
+                                            "user superfile missing vector index".into(),
+                                        )
+                                    })
+                                    .map(|vr| (vr, column_name_ref))
+                            })
+                            .collect::<Result<_, _>>()?;
+                        let clusters_ref = &running_clusters;
+                        route_clusters_into_cells(
+                            &inputs,
+                            &stable_ids_per_input,
+                            |centroid: &[f32]| {
+                                let mut assign = [0u32];
+                                clusters_ref.assign_rows(metric, centroid, &mut assign);
+                                vec![assign[0]]
+                            },
+                        )
+                        .map_err(|e| e.into())
+                    },
+                )?;
                 let n_cells = routed.len();
                 let dim = running_clusters.dim as usize;
                 // Accumulate in cell-id order: `routed` is a HashMap, and its
@@ -5636,32 +5641,28 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         // Python binding drops) rather than inferring it from a
                         // noisy recall delta.
                         let fine_hits = std::sync::atomic::AtomicUsize::new(0);
-                        let out: Vec<opann::BoundaryAssignment> =
-                            hidden_inner.options.writer_pool.install(|| {
-                                distinct_rows
-                                    .par_iter()
-                                    .map(|row| {
-                                        let row_fp = opann::dequantize_row(&row.encoded, dim);
-                                        match fr.assign_row_to_cells(clusters_ref, metric, &row_fp)
-                                        {
-                                            Some(a) => {
-                                                fine_hits.fetch_add(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                                a
-                                            }
-                                            None => opann::boundary_assignment_encoded(
-                                                clusters_ref,
-                                                metric,
-                                                &row.encoded,
-                                                &admit_ctx,
-                                                window,
-                                            ),
+                        let out: Vec<opann::BoundaryAssignment> = drain_pool.install(|| {
+                            distinct_rows
+                                .par_iter()
+                                .map(|row| {
+                                    let row_fp = opann::dequantize_row(&row.encoded, dim);
+                                    match fr.assign_row_to_cells(clusters_ref, metric, &row_fp) {
+                                        Some(a) => {
+                                            fine_hits
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            a
                                         }
-                                    })
-                                    .collect()
-                            });
+                                        None => opann::boundary_assignment_encoded(
+                                            clusters_ref,
+                                            metric,
+                                            &row.encoded,
+                                            &admit_ctx,
+                                            window,
+                                        ),
+                                    }
+                                })
+                                .collect()
+                        });
                         if drain_timers {
                             eprintln!(
                                 "[gfc-drain] batch {} fine placement engaged: {}/{} rows placed by nearest fine centroid (rest coarse fallback)",
@@ -5677,14 +5678,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                         // lazily on the first batch with rows. The build is
                         // serial + deterministic (see `Hnsw::build_serial`) so
                         // cell placement is reproducible run to run; the
-                        // writer-pool install below is for the per-row
+                        // drain-pool install below is for the per-row
                         // assignment fan-out. The result type is identical to
                         // the shortlist path, so the spill/replica code below
                         // is untouched.
                         // Cosine-only path (gated above), so ef is the cosine
                         // beam: max(16, round(sqrt(n_cent)/4)).
                         let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
-                        hidden_inner.options.writer_pool.install(|| {
+                        drain_pool.install(|| {
                             let router = coarse_router.get_or_insert_with(|| {
                                 opann::build_coarse_router(clusters_ref, metric)
                             });
@@ -5716,7 +5717,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
                         let window =
                             opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
-                        hidden_inner.options.writer_pool.install(|| {
+                        drain_pool.install(|| {
                             distinct_rows
                                 .par_iter()
                                 .map(|row| {
@@ -5942,14 +5943,10 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // grid is final here — every spill is already assigned to its
         // cells — so the rerank-law pools rank against what queries will
         // actually sweep. Freezing rotates every sampled query and ranks
-        // it against the full grid — CPU work, so it rides a rayon pool
+        // it against the full grid — CPU work, so it rides the drain pool
         // behind `run_on_pool` instead of pinning this tokio worker. The
-        // GLOBAL pool, deliberately: the writer pool is busy with the
-        // overlapping user-table build (the two publishes run under a
-        // `join!`), so queueing there stalls the drain behind build
-        // shards, and the maintenance pool is contractually
-        // optimize-only. The grid MOVES into the task and comes back
-        // with the frozen state — no clone of the centroid bytes.
+        // grid MOVES into the task and comes back with the frozen state —
+        // no clone of the centroid bytes.
         let freeze_t0 = time::Instant::now();
         if let Some(mut cal) = width_law.take() {
             let rot_seed = vector_config.rot_seed;
@@ -5960,12 +5957,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             let pool_hint =
                 opann::rerank_pool_hint(&routing.width_for_k, running_clusters.n_cent as usize);
             let clusters_for_freeze = running_clusters;
-            let (frozen, clusters_back) = run_on_pool(None, "width-law freeze", move || {
-                cal.freeze(&clusters_for_freeze, rot_seed, pool_hint);
-                (cal, clusters_for_freeze)
-            })
-            .await
-            .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
+            let (frozen, clusters_back) =
+                run_on_pool(Some(drain_pool), "width-law freeze", move || {
+                    cal.freeze(&clusters_for_freeze, rot_seed, pool_hint);
+                    (cal, clusters_for_freeze)
+                })
+                .await
+                .map_err(|e| BuildError::Store(format!("width-law freeze: {e}")))?;
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
@@ -5974,27 +5972,31 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         let cell_build_span = detail_span!(
             "drain_cell_build",
             shards = shard_sources.len(),
-            workers = hidden_inner.options.writer_pool.current_num_threads(),
+            workers = drain_pool.current_num_threads(),
         )
         .entered();
-        let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
-            &hidden_inner.options.writer_pool,
-            &shard_sources,
-            |(shard_id, cells)| {
-                let _shard_span = detail_span!(
-                    "drain_shard",
-                    parent: &cell_build_span,
-                    shard = *shard_id,
-                    cells = cells.len(),
-                )
-                .entered();
-                let mut packed = Vec::with_capacity(cells.len());
-                for (cell_id, source) in cells {
-                    let cell = match source {
+        // One task per cell, not per shard: cell sizes vary widely, so a
+        // shard-per-task fan-out leaves workers idle behind the shard holding
+        // the largest cells. `collect` keeps the cells in input order, so each
+        // shard below packs the same cells in the same order.
+        let cell_tasks: Vec<(usize, &u32, &DrainCellSource)> = shard_sources
+            .iter()
+            .enumerate()
+            .flat_map(|(shard_idx, (_, cells))| {
+                cells
+                    .iter()
+                    .map(move |(cell_id, source)| (shard_idx, cell_id, source))
+            })
+            .collect();
+        let built_cells: Vec<(usize, u32, SpilledPackedCell)> =
+            fanout_shards(drain_pool, &cell_tasks, |&(shard_idx, cell_id, source)| {
+                let cell =
+                    match source {
                         DrainCellSource::Packed(cell) => cell.clone(),
                         DrainCellSource::Rows(spill) => {
                             let _cell_span = detail_span!(
                                 "drain_cell",
+                                parent: &cell_build_span,
                                 cell = *cell_id,
                                 rows = spill.n_rows(),
                                 score_ms = tracing::field::Empty,
@@ -6052,11 +6054,32 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             cell
                         }
                     };
-                    packed.push((*cell_id, cell));
-                }
+                Ok::<_, BuildError>((shard_idx, *cell_id, cell))
+            })?;
+        let mut packed_per_shard: Vec<Vec<(u32, SpilledPackedCell)>> = shard_sources
+            .iter()
+            .map(|(_, cells)| Vec::with_capacity(cells.len()))
+            .collect();
+        for (shard_idx, cell_id, cell) in built_cells {
+            packed_per_shard[shard_idx].push((cell_id, cell));
+        }
+        let shard_tasks: Vec<(u32, Vec<(u32, SpilledPackedCell)>)> = shard_sources
+            .iter()
+            .map(|(shard_id, _)| *shard_id)
+            .zip(packed_per_shard)
+            .collect();
+        let prepared_shards: Vec<PreparedSuperfile> =
+            fanout_shards(drain_pool, &shard_tasks, |(shard_id, packed)| {
+                let _shard_span = detail_span!(
+                    "drain_shard",
+                    parent: &cell_build_span,
+                    shard = *shard_id,
+                    cells = packed.len(),
+                )
+                .entered();
                 let prepared: PreparedSuperfile = {
                     let _span = detail_span!("drain_shard.assemble").entered();
-                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, &packed)?
+                    build_prepared_from_spilled_cells(&hidden_inner, scratch, *shard_id, packed)?
                 };
                 // Depth-law observation: fine clusters exist only now that
                 // the shard is packed; record each surviving candidate's
@@ -6089,8 +6112,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     }
                 }
                 Ok::<_, BuildError>(prepared)
-            },
-        )?;
+            })?;
         drop(cell_build_span);
         local_checkpoint = checkpoint
             .lock()
