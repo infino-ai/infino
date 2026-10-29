@@ -161,9 +161,9 @@ pub mod fts {
     /// The version written once a posting block may hold up to 256 docs
     /// (two 128-lane sub-blocks at one width): header bit 31, which from
     /// `V10` flagged tfs stored minus one, becomes the count's eighth bit,
-    /// and every block stores its tfs minus one. A `V11` reader reads a
-    /// `V10` or `V9` file by taking bit 31 the old way, which is why the
-    /// version moves: the bit's meaning is per file, not per block.
+    /// and every block stores its tfs minus one. A `V11` reader reads any
+    /// older file by taking bit 31 the old way, which is why the version
+    /// moves: the bit's meaning is per file, not per block.
     pub const VERSION_V11: u32 = 11;
 
     /// Whether `version` writes blocks of up to two sub-blocks, with the

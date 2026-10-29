@@ -54,10 +54,7 @@
 use std::collections::HashSet;
 
 use infino::{
-    superfile::{
-        SuperfileReader,
-        fts::{posting::BLOCK_LEN, reader::BoolMode},
-    },
+    superfile::{SuperfileReader, fts::reader::BoolMode},
     test_helpers::{brute_force_bm25::BruteForceBm25, default_tokenizer},
 };
 use proptest::{prelude::*, test_runner::TestCaseError};
@@ -126,19 +123,19 @@ const TIER_PATCHED: usize = 6;
 
 /// Stride of [`TIER_PACKED`]. Three is the narrowest stride a block of
 /// it packs into fewer bytes than a presence bitset over the same span:
-/// at stride two the 128 postings span 254 documents, which is four
-/// 64-bit presence words — exactly what two-bit deltas cost — and the
-/// encoder keeps the bitset on a tie.
+/// at stride two a block's 256 postings span 510 documents, which is
+/// eight 64-bit presence words — exactly what two-bit deltas cost — and
+/// the encoder keeps the bitset on a tie.
 const TIER_PACKED_STRIDE: usize = 3;
 /// Base stride of [`TIER_PATCHED`], between its wider jumps.
 const TIER_PATCHED_STRIDE: usize = 3;
 /// Postings between [`TIER_PATCHED`]'s wider jumps: a handful of
-/// exception lanes per 128-lane block, which is where patching pays.
+/// exception lanes per block, which is where patching pays.
 const TIER_PATCHED_OUTLIER_EVERY: usize = 24;
 /// [`TIER_PATCHED`]'s wider jump. Wide enough that a block's span costs
 /// more as presence words than its deltas do packed, so the bitset does
 /// not claim the block, while the lanes needing that width stay few
-/// enough for the exception list to beat widening all 128.
+/// enough for the exception list to beat widening every lane.
 const TIER_PATCHED_JUMP: usize = 200;
 
 /// Tokens [`tiered_corpus_strategy`] plants into a document on top of
@@ -148,16 +145,16 @@ const TIER_PATCHED_JUMP: usize = 200;
 /// just planted.
 const PLANTED_TOKENS_PER_DOC: usize = 4;
 
-/// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is long form
-/// only once its stride has laid down more than the short-form cap of
-/// 128 postings, so a corpus under `3 x 129` documents cannot show the
-/// packed form at all. The other lanes vary the corpus size; this one
-/// exists to span the posting formats, so it draws from the range where
-/// they are all present.
+/// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is held to the
+/// packed form only once its stride has laid down a whole block, so a
+/// corpus under `3 x 257` documents cannot show it. The other lanes vary
+/// the corpus size; this one exists to span the posting formats, so it
+/// draws from the range where they are all present.
 const TIERED_MIN_DOCS: usize = TIER_PACKED_STRIDE * (BLOCK_POSTINGS + 1);
 /// Postings a full block holds, mirrored from the format so the sizing
-/// note above reads on its own.
-const BLOCK_POSTINGS: usize = 128;
+/// notes read on their own. Every planted tier is in enough of the
+/// documents for the wide block.
+const BLOCK_POSTINGS: usize = 256;
 
 /// Postings the single-term ranked walk wants before it seeds its
 /// threshold from the coarse block-max table: 256 blocks' worth. Stated
@@ -652,16 +649,16 @@ async fn tiered_vocabulary_spans_the_posting_forms() {
             dense.bitset_blocks + dense.run_blocks > 0,
             "sample {sample}: the densest drawn tier should store presence bits or runs, got {dense:?}"
         );
-        // A block holds up to twice the lanes the packer fills at once, so
-        // a lone partial block of more than one sub-block pads to the second
-        // and the presence bitset can come out smaller: only a tier long
-        // enough for a full block is held to the packed form.
+        // A lone partial block pads to its second sub-block, where the
+        // presence bitset can come out smaller, so the packed form is held
+        // to only from the corpus size that fills a block; a corpus capped
+        // under that by the environment is let off.
         let packed = layout(TIER_PACKED).await;
         assert!(
             !packed.short,
             "sample {sample}: the strided tier is long, got {packed:?}"
         );
-        if packed.df >= BLOCK_LEN as u64 {
+        if docs.len() >= TIERED_MIN_DOCS {
             assert!(
                 packed.packed_blocks > 0,
                 "sample {sample}: the strided tier should pack its deltas, got {packed:?}"

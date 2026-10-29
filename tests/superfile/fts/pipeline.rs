@@ -10,6 +10,7 @@
 use bytes::Bytes;
 use infino::superfile::fts::{
     builder::FtsBuilder,
+    posting::BLOCK_LEN,
     reader::{BoolMode, FtsReader},
 };
 
@@ -30,11 +31,14 @@ const BMW_TF_MODULUS: u32 = 8;
 const BMW_FILLER_MODULUS: u32 = 20;
 /// Score-equality tolerance comparing the BMW vs multi-term paths.
 const BMW_SCORE_TOLERANCE: f32 = 1e-5;
-/// Corpus size for the coarse-skip multi-span fixture: large enough that
-/// a near-ubiquitous term spans many `COARSE_BLOCK_MAX_SPAN`-block spans
-/// (>> 4096 postings), so the coarse skip level jumps whole spans rather
-/// than degenerating to a single span.
-const BMW_MULTISPAN_N_DOCS: u32 = 40_000;
+/// Blocks the single-term walk wants before it seeds its threshold,
+/// restated from the walk, plus headroom.
+const BMW_MULTISPAN_SEED_FLOOR_BLOCKS: u32 = 256 + 16;
+/// Corpus size for the coarse-skip multi-span fixture: `foo` is in nine
+/// docs of ten, so its list runs past the seed floor and across several
+/// `COARSE_BLOCK_MAX_SPAN`-block spans, and the coarse skip level jumps
+/// whole spans rather than degenerating to a single span.
+const BMW_MULTISPAN_N_DOCS: u32 = BMW_MULTISPAN_SEED_FLOOR_BLOCKS * BLOCK_LEN as u32 * 10 / 9;
 /// The high-scoring docs sit at the low doc-ids (early blocks), so the
 /// heap fills with them early and every later span drops below the k-th
 /// bar — the case that makes the coarse skip jump spans.
@@ -347,6 +351,15 @@ async fn bmw_single_term_multispan_matches_brute_force() {
     let bytes = b.finish().expect("finish fts");
     let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
     let r = FtsReader::open(Bytes::from(bytes), json).expect("open FtsReader");
+    let layout = r
+        .term_layout("body", "foo")
+        .await
+        .expect("layout")
+        .expect("foo");
+    assert!(
+        layout.num_blocks as u32 >= BMW_MULTISPAN_SEED_FLOOR_BLOCKS,
+        "premise: {layout:?}"
+    );
 
     // Single term → coarse-skip BMW path.
     let bmw_hits = r

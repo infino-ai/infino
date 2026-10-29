@@ -39,7 +39,7 @@ use infino::{
     superfile::{
         SuperfileReader,
         builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
-        fts::{reader::BoolMode, tokenize::Tokenizer},
+        fts::{posting::BLOCK_LEN, reader::BoolMode, tokenize::Tokenizer},
     },
     test_helpers::{brute_force_bm25::BruteForceBm25, decimal128_ids, default_tokenizer},
 };
@@ -431,11 +431,18 @@ async fn oracle_common_heavy_or_matches_brute_force_at_seed_scale() {
     }
 }
 
+/// Blocks the single-term walk wants before it seeds its threshold,
+/// restated from the walk, plus headroom.
+const SEED_SCALE_BLOCKS: u64 = 256 + 8;
+/// Docs of the seed-scale corpus: that many wide blocks of a term in every
+/// doc.
+const SEED_SCALE_DOCS: u64 = SEED_SCALE_BLOCKS * BLOCK_LEN as u64;
+
 /// Single-term ranked at a scale that ACTUALLY ENGAGES the block-max
 /// optimizations the small oracles never reach: a term present in every one
-/// of ~35 000 docs spans ~273 posting blocks, past the threshold-first
-/// seed's `MIN_BLOCKS = 256` gate and across ~9 coarse spans (`COARSE_
-/// BLOCK_MAX_SPAN = 32`). So this exercises the seed, the multi-span coarse
+/// of [`SEED_SCALE_DOCS`] docs spans [`SEED_SCALE_BLOCKS`] posting blocks,
+/// past the threshold-first seed's `MIN_BLOCKS = 256` gate and across
+/// several coarse spans (`COARSE_BLOCK_MAX_SPAN = 32`). So this exercises the seed, the multi-span coarse
 /// skip, the per-block BMW skip, and the exact-f32 block-max bound together
 /// — the paths that decide the ranked results order, at the size where they
 /// fire. Every doc has the SAME length (padded with the unqueried token
@@ -443,7 +450,7 @@ async fn oracle_common_heavy_or_matches_brute_force_at_seed_scale() {
 /// the term frequency: nine anchors with tf 20..12 form a **tie-free**,
 /// strictly-ordered top-9 far above the tf=1 bulk.
 fn seed_scale_single_term_corpus() -> Vec<(u64, String)> {
-    const N: u64 = 35_000;
+    const N: u64 = SEED_SCALE_DOCS;
     const DL: usize = 20; // uniform doc length ⇒ length-norm 1 for every doc
     const ANCHORS: usize = 9;
     let mk = |tf: usize| -> String {
@@ -468,6 +475,17 @@ async fn oracle_single_term_seed_scale_matches_brute_force() {
     let corp = seed_scale_single_term_corpus();
     let corp_refs: Vec<(u64, &str)> = corp.iter().map(|(d, s)| (*d, s.as_str())).collect();
     let infino = build_infino_superfile(&corp_refs);
+    let layout = infino
+        .fts()
+        .expect("full-text index")
+        .term_layout("title", "common")
+        .await
+        .expect("layout")
+        .expect("common");
+    assert_eq!(
+        layout.num_blocks as u64, SEED_SCALE_BLOCKS,
+        "premise: {layout:?}"
+    );
     let tok = default_tokenizer();
     let oracle = BruteForceBm25::index(&corp_refs, tok.as_ref());
     // The tie-free top-8 must match brute force *in order* at every depth —
@@ -1366,7 +1384,7 @@ async fn oracle_long_doc_vs_short_doc_dl_norm() {
 // ─── Multi-block AND oracles ──────────────────────────────────────────
 //
 // The 60-doc corpus above holds every term in a single PFOR block
-// (BLOCK_LEN = 128). Block-crossing paths in `run_and_intersect_*` —
+// (a block holds `BLOCK_LEN` docs). Block-crossing paths in `run_and_intersect_*` —
 // the inner-loop `next()` cross-block walk, the alignment step that
 // fires when a non-leader cursor lands in a new block, and the
 // block-max-AND pruning that skips a whole leader block — only fire

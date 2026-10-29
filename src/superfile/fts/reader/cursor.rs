@@ -36,7 +36,7 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_RUN, SUB_BLOCK_LEN, decode_block,
+            BLOCK_LEN, BlockHeader, ENCODING_RUN, SUB_BLOCK_LEN, block_lanes, decode_block,
             decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
@@ -1334,7 +1334,7 @@ impl TermCursor {
     /// The tf at `rank` of the current bitset block for a probe. Normally
     /// the block's tf array is unpacked once (doc order) and reused across
     /// a run of probes into the same block — the union and intersection
-    /// kernels probe a dense block many times, and one 128-lane unpack
+    /// kernels probe a dense block many times, and one unpack of its lanes
     /// beats a bit-field read per probe (measured: reading the single lane
     /// cost union 7% and intersection 5%). While the block is held lazily,
     /// though, `block_tfs[0]` is the published doc's tf and `pos` names
@@ -1637,22 +1637,20 @@ impl TermCursor {
         self.current_block >= self.blocks.len()
     }
 
-    /// Docs a full block of this term holds: two sub-blocks in a wide
-    /// file, one before it. An estimate's unit, not a decoded block's
+    /// Docs a full block of this term holds. A wide file writes its
+    /// common terms in two sub-blocks and its rarer ones in one, so the
+    /// length is the term's: more postings than one sub-block per block
+    /// could hold means two. An estimate's unit, not a decoded block's
     /// count, which the header gives.
     #[inline]
     pub(super) fn block_len(&self) -> usize {
-        match self.wide_blocks {
-            true => BLOCK_LEN,
-            false => SUB_BLOCK_LEN,
-        }
+        let one_each = (SUB_BLOCK_LEN * self.blocks.len()) as u64;
+        block_lanes(self.wide_blocks && self.df > one_each)
     }
 
-    /// Block count, used as a cheap proxy for df when AND intersection
-    /// picks the rarest cursor as the leader. Block count is an exact
-    /// upper bound on df: a term's df is `(blocks - 1) * BLOCK_LEN +
-    /// last_block_n`, so cursors compare in the same order by block
-    /// count as they do by df. Inline cursors return 1.
+    /// The term's posting blocks here. Not an order on terms: a wide file
+    /// gives its common terms twice the docs per block, so a term with more
+    /// blocks may hold fewer postings — rank by `df`. Inline cursors have 1.
     #[inline(always)]
     pub(super) fn block_count(&self) -> usize {
         self.blocks.len()
@@ -2048,11 +2046,14 @@ mod tests {
     use rand_distr::{Distribution, LogNormal};
 
     use super::*;
-    use crate::superfile::fts::{
-        bm25,
-        builder::FtsBuilder,
-        posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, block_encoding},
-        reader::{FtsReader, QueryIdf},
+    use crate::superfile::{
+        format::fts::COARSE_BLOCK_MAX_SPAN,
+        fts::{
+            bm25,
+            builder::FtsBuilder,
+            posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, block_encoding},
+            reader::{FtsReader, QueryIdf},
+        },
     };
 
     #[test]
@@ -2187,6 +2188,10 @@ mod tests {
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
+    /// Docs of the two-column fixture: `common` in every one spans more
+    /// than a coarse span of wide blocks.
+    const TWO_COLUMN_DOCS: u32 = (3 * COARSE_BLOCK_MAX_SPAN / 2 * BLOCK_LEN) as u32;
+
     /// A positional and a positionless column, each with a term spanning
     /// many blocks whose gaps vary, so the length-coded skip table has
     /// to be right in both entry widths.
@@ -2195,11 +2200,15 @@ mod tests {
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
         let mut text = String::new();
-        for doc_id in 0..6000u32 {
+        for doc_id in 0..TWO_COLUMN_DOCS {
             // Every doc has `common`; a stretch of docs carries it several
             // times, and every 500th doc is a long one.
             text.clear();
-            let reps = if (doc_id / 128) % 3 == 0 { 3 } else { 1 };
+            let reps = if (doc_id / SUB_BLOCK_LEN as u32).is_multiple_of(3) {
+                3
+            } else {
+                1
+            };
             for r in 0..reps {
                 text.push_str(&format!("filler{} common ", (doc_id + r) % 97));
             }
@@ -2366,7 +2375,7 @@ mod tests {
         c.skip_to(4_100);
         assert!(c.contains(4_105));
         assert_eq!(c.bitset_probe_tf(4_105), Some(tf_of(4_105)));
-        assert!(!c.contains(4_105 + 7_000));
+        assert!(!c.contains(TWO_COLUMN_DOCS));
     }
 
     /// The lazy probes must stay exact when a caller alternates between
@@ -2445,7 +2454,7 @@ mod tests {
                 walked.push((reference.current_doc_id(), reference.current_tf()));
                 reference.next();
             }
-            assert_eq!(walked.len(), 6000);
+            assert_eq!(walked.len(), TWO_COLUMN_DOCS as usize);
             let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
 
             let mut c = cursors[0].clone();
@@ -2509,7 +2518,11 @@ mod tests {
                 .await
                 .expect("cursors");
             let cursor = &cursors[0];
-            assert!(cursor.blocks.len() > 20, "{} blocks", cursor.blocks.len());
+            assert!(
+                cursor.blocks.len() > COARSE_BLOCK_MAX_SPAN,
+                "premise: {} blocks cross a span",
+                cursor.blocks.len()
+            );
             let postings: &[u8] = cursor.bytes.as_ref();
             let meta = TermMeta::parse(postings, 0, positional).expect("meta");
             assert_eq!(meta.num_blocks, cursor.blocks.len());

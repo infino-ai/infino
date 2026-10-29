@@ -77,7 +77,7 @@ const DELTA_EXCEPTION_HEAD: u64 = BLOCK_LEN as u64 - 1;
 /// Documents in the tf-exception corpus.
 const TF_EXCEPTION_DOCS: u64 = 1_000;
 /// Planting stride of `spiky`: three, so its blocks are not dense
-/// enough for the bitset form (six presence words against four bytes
+/// enough for the bitset form (twelve presence words against 64 bytes
 /// of two-bit deltas).
 const TF_EXCEPTION_STRIDE: u64 = 3;
 /// The one document with a repeated term.
@@ -111,16 +111,15 @@ const PATCHED_DF_CAP_GAP: u64 = 300;
 const UNALIGNED_BITSET_DOCS: u64 = 600;
 /// `dense` is in every document except these two: skipping document 0
 /// puts the first block's origin below its first document, skipping
-/// [`BLOCK_LEN`] gives that block one two-wide delta so its presence
-/// words (three) fit under its tight packing (four bytes per lane
-/// pair).
+/// [`BLOCK_LEN`] gives that block one two-wide delta, so its presence
+/// words (five) fit under its tight packing (two bits a lane).
 const UNALIGNED_BITSET_SKIPPED: [u64; 2] = [0, BLOCK_LEN as u64];
 /// The rare driver's documents, chosen around word and block edges.
 const UNALIGNED_DRIVER_DOCS: [u64; 6] = [1, 64, 65, BLOCK_LEN as u64, BLOCK_LEN as u64 + 1, 300];
 
 /// Documents in the density-transition corpus.
 const DENSITY_DOCS: u64 = 6_000;
-/// Where the dense run of `frontdense` ends (sixteen full blocks of
+/// Where the dense run of `frontdense` ends (eight full blocks of
 /// consecutive documents, all run blocks).
 const DENSITY_FRONT_END: u64 = 2_048;
 /// The dense run of `backdense`, placed after a sparse head.
@@ -130,14 +129,16 @@ const DENSITY_BACK_END: u64 = 4_096;
 /// its blocks are bitsets rather than runs of consecutive documents.
 const DENSITY_BACK_HOLE_STRIDE: u64 = 61;
 /// Stride of both terms outside their dense run: sparse enough that
-/// those blocks pack (thirteen presence words against two-bit deltas).
+/// those blocks pack (forty presence words against four-bit deltas).
 const DENSITY_SPARSE_STRIDE: u64 = 10;
 /// Stride of the rarer driver.
 const DENSITY_DRIVER_STRIDE: u64 = 37;
 
+/// Blocks in a coarse span. Restated from the format like the caps above.
+const ANCHOR_SPAN_BLOCKS: u64 = 32;
 /// Full blocks in the anchor corpus: one whole coarse span plus one
 /// block, then a partial block.
-const ANCHOR_FULL_BLOCKS: u64 = 33;
+const ANCHOR_FULL_BLOCKS: u64 = ANCHOR_SPAN_BLOCKS + 1;
 /// Documents in the partial last block.
 const ANCHOR_PARTIAL: u64 = 50;
 /// Uniform document length, so score is monotonic in term frequency.
@@ -145,7 +146,12 @@ const ANCHOR_DOC_LEN: usize = 6;
 /// `(document, term frequency)` of the planted anchors: two in the
 /// partial last block, two in the block that opens the second coarse
 /// span. Frequencies strictly decrease in this order.
-const ANCHORS: [(u64, usize); 4] = [(4_270, 5), (4_250, 4), (4_100, 3), (4_200, 2)];
+const ANCHORS: [(u64, usize); 4] = [
+    (ANCHOR_FULL_BLOCKS * BLOCK_LEN as u64 + 46, 5),
+    (ANCHOR_FULL_BLOCKS * BLOCK_LEN as u64 + 26, 4),
+    (ANCHOR_SPAN_BLOCKS * BLOCK_LEN as u64 + 4, 3),
+    (ANCHOR_SPAN_BLOCKS * BLOCK_LEN as u64 + 104, 2),
+];
 
 /// Documents in the far-member phrase corpus.
 const FAR_PHRASE_DOCS: u64 = 8_000;
@@ -157,8 +163,8 @@ const FAR_PHRASE_SPLIT: u64 = 7_900;
 
 /// Documents in the negation-edge corpus.
 const NEGATION_EDGE_DOCS: u64 = 1_000;
-/// `neg`'s two full blocks: documents `0..=127` and `300..=427`, so its
-/// blocks' last documents are 127 and 427.
+/// `neg`'s two full blocks: the first [`BLOCK_LEN`] documents, and as
+/// many again from here.
 const NEGATION_EDGE_SECOND_BLOCK_START: u64 = 300;
 /// `pos` sits on and just past each edge, and past the list's end.
 const NEGATION_EDGE_POS: [u64; 7] = [
@@ -476,12 +482,12 @@ async fn lists_at_the_patched_df_cap_agree_with_the_oracle() {
 /// `dense`'s first block holds documents 1 to one below the block length
 /// and the one past it: its presence
 /// bitset starts at the word-aligned origin 0, one below its first
-/// document, and spans three words (24 bytes) against 32 bytes of
+/// document, and spans five words (40 bytes) against 64 bytes of
 /// two-bit deltas, so the encoder stores it as a bitset. Every walk
 /// that bit-tests the block — the intersection's membership probe, the
 /// phrase member check, the negation filter — must translate a document
 /// id through that origin rather than through the block's first
-/// document, or document 1 reads as document 0 and 129 as 128. The
+/// document, or document 1 reads as document 0 and 257 as 256. The
 /// driver's documents sit on both sides of every such edge.
 #[tokio::test]
 async fn bitset_block_with_an_unaligned_origin_agrees_with_the_oracle() {
@@ -588,7 +594,7 @@ async fn lists_that_change_density_mid_way_agree_with_the_oracle() {
 
 // ── block-max skipping at the list's edges ────────────────────────────
 
-/// `hot` is in every document of 33 full blocks and a 50-document
+/// `hot` is in every document of 33 full wide blocks and a 50-document
 /// partial block; every document is the same length, so the score is
 /// strictly monotonic in term frequency and the four planted repeats
 /// form a tie-free head. Two of them are in the partial last block and
@@ -667,8 +673,9 @@ async fn phrase_member_seeks_many_blocks_past_the_driver() {
 // ── negation probes at block edges ────────────────────────────────────
 
 /// The negation filter skip-probes the negated list toward each
-/// candidate. `neg` has two full blocks ending at documents 127 and
-/// 427; `pos` sits on each of those last documents, one past each, on
+/// candidate. `neg` has two full blocks, the second starting at 300, so
+/// they end a document short of [`BLOCK_LEN`] and of 300 more; `pos`
+/// sits on each of those last documents, one past each, on
 /// and before the second block's first document, and past the list's
 /// end. A probe that treated a block's last document as already passed
 /// would admit 127 and 427; one that did not stop at the list's end

@@ -137,7 +137,7 @@ impl FetchedTermMemo {
 /// high enough to skip them. Decoding the highest-block-max blocks up front
 /// (found via the coarse block-max table) raises the k-th threshold first,
 /// so the main walk prunes those otherwise-wasted decodes.
-mod seed {
+pub(super) mod seed {
     /// Don't seed lists shorter than this many blocks — the setup isn't
     /// worth it when there's little waste to prune.
     pub const MIN_BLOCKS: usize = 256;
@@ -2612,9 +2612,9 @@ mod tests {
     /// bit for bit, with the heap collector and the buffer.
     #[tokio::test]
     async fn a_single_term_seed_is_not_taken_over_negated_docs() {
-        /// Enough docs for the single-term walk to seed (`seed::MIN_BLOCKS`
-        /// blocks of `BLOCK_LEN`), every one holding `x`.
-        const N_DOCS: u32 = 34_000;
+        /// Docs past the single-term walk's seed floor, every one holding
+        /// `x`, which a term in every doc takes in wide blocks.
+        const N_DOCS: u32 = (seed::MIN_BLOCKS as u32 + 8) * BLOCK_LEN as u32;
         /// Tokens per doc.
         const DOC_LEN: usize = 5;
         for k in [64, BUFFERED_TOPK_MIN_K + 100] {
@@ -2636,6 +2636,12 @@ mod tests {
             }
             let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
             let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            let layout = r
+                .term_layout("body", "x")
+                .await
+                .expect("layout")
+                .expect("x");
+            assert!(layout.num_blocks >= seed::MIN_BLOCKS, "premise: {layout:?}");
             let bits = |hits: Vec<(RowId, f32)>| -> Vec<(u32, u32)> {
                 hits.into_iter()
                     .map(|(d, s)| (d.get(), s.to_bits()))

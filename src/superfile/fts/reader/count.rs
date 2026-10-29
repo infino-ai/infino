@@ -933,7 +933,7 @@ pub struct TermLayout {
     pub df: u64,
     /// A df=1 term stored inline in the dictionary: no posting bytes.
     pub inline: bool,
-    /// A short-form term (`df <= BLOCK_LEN`): one bodiless block.
+    /// A short-form term (`df <= SUB_BLOCK_LEN`): one bodiless block.
     pub short: bool,
     /// Posting blocks (one for a short term, zero for an inline one).
     pub num_blocks: usize,

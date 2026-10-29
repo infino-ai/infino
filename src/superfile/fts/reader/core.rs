@@ -2651,7 +2651,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
         // in one word-load; `skip_to` would decode each block — expanding its
-        // ~128 doc ids — as the frontier drags the anchor across its whole list.
+        // all its doc ids — as the frontier drags the anchor across its whole list.
         for (word_idx, word) in present.iter_mut().enumerate() {
             let mut bits = mem::take(word);
             while bits != 0 {
@@ -2715,9 +2715,6 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
     u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
 }
 
-/// Refuse a blob version this crate does not read: one below
-/// [`VERSION_MIN`] with the instruction to reindex it, anything else
-/// unknown as unsupported.
 impl FtsReader {
     /// Whether this file's posting blocks take the wide header reading
     /// (see [`format::fts::wide_blocks`]).
@@ -2727,6 +2724,9 @@ impl FtsReader {
     }
 }
 
+/// Refuse a blob version this crate does not read: one below
+/// [`VERSION_MIN`] with the instruction to reindex it, anything else
+/// unknown as unsupported.
 fn check_version(version: u32) -> Result<(), FtsError> {
     match version {
         format::fts::VERSION_V7

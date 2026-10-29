@@ -79,7 +79,7 @@ pub struct DfBucket {
     pub tf_bytes: u64,
     pub bitset_bytes: u64,
     /// Of the packed lanes, the bytes spent on lanes with no document
-    /// behind them (a partial block padded to `BLOCK_LEN`).
+    /// behind them (a partial block padded to its lanes).
     pub padding_bytes: u64,
     pub long_terms: u64,
     pub blocks: u64,
@@ -531,7 +531,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::fts::{builder::FtsBuilder, posting::SUB_BLOCK_LEN};
 
     #[test]
     fn patched_form_is_granted_only_under_the_posting_cap() {
@@ -635,5 +635,48 @@ mod tests {
         // the trailing CRC) is accounted for.
         assert_eq!(c.total.postings_region_bytes(), s.postings_region_bytes);
         assert!(s.to_string().contains("df 2-4"));
+    }
+
+    /// A term one doc past a sub-block takes the long form, and dense
+    /// enough for the wide block it pads to the second sub-block: one
+    /// partial block, its padding the empty lanes at the delta width.
+    #[test]
+    fn a_wide_partial_block_pads_to_its_lanes() {
+        /// Docs holding `strided`: one past the short-form cap.
+        const DF: u32 = SUB_BLOCK_LEN as u32 + 1;
+        /// Docs between them: a delta narrower than the span's presence
+        /// bits, so the block packs.
+        const STRIDE: u32 = 10;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..DF * STRIDE {
+            let text = match i % STRIDE {
+                0 => format!("strided f{i}"),
+                _ => format!("f{i}"),
+            };
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let s = r.size_breakdown().expect("breakdown");
+        let c = &s.columns[0];
+        assert_eq!(
+            (c.total.long_terms, c.total.blocks, c.total.partial_blocks),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                c.total.patched_blocks,
+                c.total.run_blocks,
+                c.total.bitset_bytes
+            ),
+            (0, 0, 0),
+            "plain packed: {c:?}"
+        );
+        let delta_bits = u64::from(width_of(u64::from(STRIDE)));
+        assert_eq!(
+            c.total.padding_bytes,
+            (BLOCK_LEN - DF as usize) as u64 * delta_bits / 8
+        );
     }
 }
