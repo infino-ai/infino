@@ -28,7 +28,10 @@ use super::{
 };
 use crate::superfile::{
     error::FtsError,
-    fts::{bm25, posting::BLOCK_LEN},
+    fts::{
+        bm25,
+        posting::{BLOCK_LEN, SUB_BLOCK_LEN},
+    },
     id_space::FtsDocId,
 };
 
@@ -631,7 +634,7 @@ fn union_seed(cursors: &[TermCursor], k: usize, dl_norm: &NormTable) -> f32 {
         // the last holds `BLOCK_LEN`) — selected rather than sorted.
         let need = match lone {
             true => seed_blocks_for(k),
-            false => UNION_SEED_DEPTH * (k.div_ceil(BLOCK_LEN) + 1),
+            false => UNION_SEED_DEPTH * (k.div_ceil(SUB_BLOCK_LEN) + 1),
         }
         .min(n_blocks);
         order.clear();
@@ -674,19 +677,25 @@ const PROMOTE_DENSITY: f32 = 0.5;
 /// collect theirs and score only the required docs among them.
 const OPTIONAL_FIRST_RATIO: f32 = 2.0;
 
-/// Bit `p` set for each position `p` of `ids` (ascending, at most 128) whose
-/// doc is in `docs` (ascending).
-fn positions_held(ids: &[u32], docs: &[u32]) -> u128 {
-    debug_assert!(ids.len() <= 128);
+/// Words of the mask [`positions_held`] returns: one bit per lane of a
+/// block.
+const HELD_WORDS: usize = BLOCK_LEN / HELD_WORD_BITS;
+/// Bits per word of that mask.
+const HELD_WORD_BITS: usize = u64::BITS as usize;
+
+/// Bit `p` set for each position `p` of `ids` (ascending, at most a
+/// block) whose doc is in `docs` (ascending), as little-endian words.
+fn positions_held(ids: &[u32], docs: &[u32]) -> [u64; HELD_WORDS] {
+    debug_assert!(ids.len() <= BLOCK_LEN);
     // `docs` is the shorter list (the caller collects it only when it is):
     // walk it and search forward in `ids`, rather than stepping both.
-    let (mut p, mut bits) = (0usize, 0u128);
+    let (mut p, mut bits) = (0usize, [0u64; HELD_WORDS]);
     for &d in docs {
         p = seek_sorted::<true>(ids, p, d);
         if p >= ids.len() {
             break;
         }
-        bits |= u128::from(ids[p] == d) << p;
+        bits[p / HELD_WORD_BITS] |= u64::from(ids[p] == d) << (p % HELD_WORD_BITS);
     }
     bits
 }
@@ -859,23 +868,27 @@ fn must_lead_should_walk<C: Collector>(
                     .sum();
                 if optional_docs * OPTIONAL_FIRST_RATIO < (to - from) as f32 {
                     let ids = &lead.block_doc_ids[from..to];
-                    let mut held = 0u128;
+                    let mut held = [0u64; HELD_WORDS];
                     for (si, c) in shoulds.iter_mut().enumerate() {
                         opt_docs[si].clear();
                         opt_tfs[si].clear();
                         if driver[si] {
                             c.collect_range(start, range_end, &mut opt_docs[si], &mut opt_tfs[si]);
-                            held |= positions_held(ids, &opt_docs[si]);
+                            for (h, w) in held.iter_mut().zip(positions_held(ids, &opt_docs[si])) {
+                                *h |= w;
+                            }
                         }
                     }
                     cand_docs.clear();
                     cand_tfs.clear();
-                    let mut bits = held;
-                    while bits != 0 {
-                        let p = bits.trailing_zeros() as usize;
-                        bits &= bits - 1;
-                        cand_docs.push(ids[p]);
-                        cand_tfs.push(lead.block_tfs[from + p]);
+                    for (wi, &word) in held.iter().enumerate() {
+                        let mut bits = word;
+                        while bits != 0 {
+                            let p = wi * HELD_WORD_BITS + bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            cand_docs.push(ids[p]);
+                            cand_tfs.push(lead.block_tfs[from + p]);
+                        }
                     }
                     score_postings(
                         lead.idf_weight,
@@ -2176,7 +2189,7 @@ impl FtsReader {
         sink: &mut S,
     ) {
         debug_assert!(sink.needs_score(), "an unranked AND takes the flat-merge");
-        cursors.sort_by_key(|c| (c.block_count(), c.df));
+        cursors.sort_by_key(|c| c.df);
         let mut others = cursors;
         let driver = others.remove(0);
         and_membership_scored_batched(driver, others, dl_norm_k1, sink);
@@ -2263,7 +2276,7 @@ impl FtsReader {
             must_lead_should_walk(lead, should_cursors, k, filter, floor_eff, dl_norm_k1, heap);
             return;
         }
-        must_cursors.sort_by_key(|c| c.block_count());
+        must_cursors.sort_by_key(|c| c.df);
         let should_ub = should_cursors.iter().map(|c| c.term_max_bm25).sum();
         let mut sink = MustShouldSink {
             heap,
@@ -2300,7 +2313,7 @@ impl FtsReader {
             }));
         }
         Ok(self.scored_top_k(column_id, k, |dl_norm_k1, heap| {
-            must_cursors.sort_by_key(|c| c.block_count());
+            must_cursors.sort_by_key(|c| c.df);
             let mut sink = MustShouldCountSink {
                 heap,
                 k,
@@ -2326,7 +2339,7 @@ impl FtsReader {
         if cursors.is_empty() {
             return Vec::new();
         }
-        cursors.sort_by_key(|c| c.block_count());
+        cursors.sort_by_key(|c| c.df);
         let mut sink = CollectSink { out: Vec::new() };
         // A collect never scores, so it needs none of the column's norms.
         self.and_flat_merge(&mut cursors, unscored_norm_table(), &mut sink);
@@ -4306,7 +4319,10 @@ mod tests {
     use bytes::Bytes;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-    use super::{super::test_util::*, *};
+    use super::{
+        super::{search::seed, test_util::*},
+        *,
+    };
     use crate::superfile::{
         fts::{
             builder::FtsBuilder,
@@ -4317,6 +4333,23 @@ mod tests {
         },
         id_space::{FtsDocId, RowId},
     };
+
+    /// The held mask is one bit per lane: docs at a word's last lane and
+    /// the next word's first set the bits either side of the edge, out to
+    /// the block's last lane, and a doc past the block sets nothing.
+    #[test]
+    fn positions_held_sets_one_bit_per_lane_across_word_edges() {
+        let ids: Vec<u32> = (0..BLOCK_LEN as u32).map(|i| 3 * i).collect();
+        let lanes = [0usize, 63, 64, 127, 128, BLOCK_LEN - 1];
+        let mut docs: Vec<u32> = lanes.iter().map(|&p| ids[p]).collect();
+        docs.insert(1, 1);
+        docs.push(ids[BLOCK_LEN - 1] + 1);
+        let mut want = [0u64; HELD_WORDS];
+        for p in lanes {
+            want[p / HELD_WORD_BITS] |= 1 << (p % HELD_WORD_BITS);
+        }
+        assert_eq!(positions_held(&ids, &docs), want);
+    }
 
     #[tokio::test]
     async fn token_match_doc_set_matches_bm25_for_same_terms() {
@@ -4566,16 +4599,16 @@ mod tests {
     #[tokio::test]
     async fn wand_bmw_exercises_block_skips_on_multi_block_lists() {
         // A corpus large enough that the common terms span several
-        // 128-doc posting blocks, with five query terms of differing
+        // posting blocks, with five query terms of differing
         // document frequency and a handful of docs carrying all five.
         // Running WAND+BMW at a small k forces the pivot to move, the
         // block-upper-bound skip to fire, lagging cursors to re-align,
         // and the 4-wide SIMD scoring pack to be used on the
         // all-terms docs — then cross-checks the result against BMM.
 
-        /// Total planted docs; well over several `BLOCK_LEN` (128) so
-        /// the dense-term posting lists occupy multiple blocks.
-        const N_DOCS: u32 = 400;
+        /// Total planted docs: several `BLOCK_LEN`, so the dense-term
+        /// posting lists occupy multiple blocks.
+        const N_DOCS: u32 = 4 * BLOCK_LEN as u32;
         /// Requested top-K — small, so the heap fills early and the
         /// score threshold starts pruning blocks.
         const K: usize = 5;
@@ -5348,7 +5381,7 @@ mod tests {
                 floor_eff: f32::NEG_INFINITY,
             };
             let mut merge_cursors = build().await;
-            merge_cursors.sort_by_key(|c| c.block_count());
+            merge_cursors.sort_by_key(|c| c.df);
             r.and_flat_merge(&mut merge_cursors, norms, &mut merge_sink);
             let merge = drain_top_k_desc(merge_heap);
 
@@ -6342,9 +6375,9 @@ mod tests {
     /// orders the scores. Checked with the heap collector and the buffer.
     #[tokio::test]
     async fn a_single_term_seed_keeps_the_kth_doc_alone_in_its_block() {
-        /// Enough docs for the seeded single-term walk (`seed::MIN_BLOCKS`
-        /// blocks of `BLOCK_LEN`), every one holding `x`.
-        const N_DOCS: u32 = 34_000;
+        /// Docs past the single-term walk's seed floor, every one holding
+        /// `x`, which a term in every doc takes in wide blocks.
+        const N_DOCS: u32 = (seed::MIN_BLOCKS as u32 + 8) * BLOCK_LEN as u32;
         /// Tokens per doc.
         const DOC_LEN: usize = 4;
         for k in [UNION_SEED_MIN_K, BUFFERED_TOPK_MIN_K + 100] {
@@ -6365,6 +6398,12 @@ mod tests {
             }
             let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
             let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+            let layout = r
+                .term_layout("body", "x")
+                .await
+                .expect("layout")
+                .expect("x");
+            assert!(layout.num_blocks >= seed::MIN_BLOCKS, "premise: {layout:?}");
             assert_ranks_as_exhaustive(&r, &["x"], k).await;
             let hits = r
                 .search("body", &["x"], k, BoolMode::Or)
@@ -6772,7 +6811,9 @@ mod tests {
     #[tokio::test]
     async fn reused_block_tables_answer_as_fresh_ones() {
         let mut x: u64 = 0x1234_5678_9ABC_DEF1;
-        let docs: Vec<String> = (0..40_000)
+        // Enough docs that the common term's block table is long enough
+        // to be cached.
+        let docs: Vec<String> = (0..80_000)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;

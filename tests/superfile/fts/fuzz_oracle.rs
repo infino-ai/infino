@@ -81,8 +81,9 @@ const PINNED_KS: [usize; 3] = [1, 128, 129];
 
 /// Tier weights of the tiered vocabulary, per token draw. Relative to
 /// each other they set the document frequency each *drawn* tier lands
-/// at: at the default corpus size the first is in most documents, the
-/// second in about a third, and the third in a few.
+/// at: at the tiered corpus size ([`tiered_docs`]) the first is in most
+/// documents, the second in about a quarter — past the short-form cap
+/// and inside one block — and the third in under a tenth.
 ///
 /// Every drawn tier dense enough to fill a block is also dense enough
 /// for its block to store presence bits more cheaply than deltas, so the
@@ -94,8 +95,8 @@ const PINNED_KS: [usize; 3] = [1, 128, 129];
 /// these densities that gap is wide. The delta-coded formats therefore
 /// come from planted strides instead ([`TIER_PACKED`],
 /// [`TIER_PATCHED`]), whose gaps are regular by construction.
-const TIER_WEIGHT_MULTI_BLOCK: u32 = 12;
-const TIER_WEIGHT_ONE_BLOCK: u32 = 4;
+const TIER_WEIGHT_MULTI_BLOCK: u32 = 70;
+const TIER_WEIGHT_ONE_BLOCK: u32 = 3;
 const TIER_WEIGHT_SHORT: u32 = 1;
 /// Vocabulary index of each tier's token.
 ///
@@ -123,19 +124,19 @@ const TIER_PATCHED: usize = 6;
 
 /// Stride of [`TIER_PACKED`]. Three is the narrowest stride a block of
 /// it packs into fewer bytes than a presence bitset over the same span:
-/// at stride two the 128 postings span 254 documents, which is four
-/// 64-bit presence words — exactly what two-bit deltas cost — and the
-/// encoder keeps the bitset on a tie.
+/// at stride two a block's 256 postings span 510 documents, which is
+/// eight 64-bit presence words — exactly what two-bit deltas cost — and
+/// the encoder keeps the bitset on a tie.
 const TIER_PACKED_STRIDE: usize = 3;
 /// Base stride of [`TIER_PATCHED`], between its wider jumps.
 const TIER_PATCHED_STRIDE: usize = 3;
 /// Postings between [`TIER_PATCHED`]'s wider jumps: a handful of
-/// exception lanes per 128-lane block, which is where patching pays.
+/// exception lanes per block, which is where patching pays.
 const TIER_PATCHED_OUTLIER_EVERY: usize = 24;
 /// [`TIER_PATCHED`]'s wider jump. Wide enough that a block's span costs
 /// more as presence words than its deltas do packed, so the bitset does
 /// not claim the block, while the lanes needing that width stay few
-/// enough for the exception list to beat widening all 128.
+/// enough for the exception list to beat widening every lane.
 const TIER_PATCHED_JUMP: usize = 200;
 
 /// Tokens [`tiered_corpus_strategy`] plants into a document on top of
@@ -145,16 +146,19 @@ const TIER_PATCHED_JUMP: usize = 200;
 /// just planted.
 const PLANTED_TOKENS_PER_DOC: usize = 4;
 
-/// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is long form
-/// only once its stride has laid down more than the short-form cap of
-/// 128 postings, so a corpus under `3 x 129` documents cannot show the
-/// packed form at all. The other lanes vary the corpus size; this one
-/// exists to span the posting formats, so it draws from the range where
-/// they are all present.
+/// Smallest corpus the tiered lane draws. [`TIER_PACKED`] is held to the
+/// packed form only once its stride has laid down a whole block, so a
+/// corpus under `3 x 257` documents cannot show it. The other lanes vary
+/// the corpus size; this one exists to span the posting formats, so it
+/// draws from the range where they are all present.
 const TIERED_MIN_DOCS: usize = TIER_PACKED_STRIDE * (BLOCK_POSTINGS + 1);
+/// Documents the tiered lane may add past its minimum: enough to vary
+/// the partial blocks, few enough that the drawn tiers keep their forms.
+const TIERED_DOC_SPREAD: usize = 64;
 /// Postings a full block holds, mirrored from the format so the sizing
-/// note above reads on its own.
-const BLOCK_POSTINGS: usize = 128;
+/// notes read on their own. Every planted tier is in enough of the
+/// documents for the wide block.
+const BLOCK_POSTINGS: usize = 256;
 
 /// Postings the single-term ranked walk wants before it seeds its
 /// threshold from the coarse block-max table: 256 blocks' worth. Stated
@@ -202,8 +206,9 @@ fn cases() -> u32 {
     env_cap("PROPTEST_CASES", 96) as u32
 }
 
-/// Max docs per generated corpus. Default crosses several 128-doc PFOR
-/// blocks so block-crossing kernels are reached organically.
+/// Max docs per generated corpus. The default crosses a posting block so
+/// block-crossing kernels are reached organically; the tiered lane sizes
+/// its own corpus ([`tiered_docs`]).
 fn max_docs() -> usize {
     env_cap("INFINO_FTS_FUZZ_MAX_DOCS", 400).clamp(1, 4096)
 }
@@ -263,7 +268,7 @@ fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
 /// |---|---|---|
 /// | bitset, several blocks | [`TIER_DENSE`], and the denser drawn tiers | dense enough that presence bits cost no more than deltas |
 /// | short (one bodiless block) | the sparsest drawn tier, and [`TIER_PATCHED`] | under the 128-posting cap |
-/// | packed, two blocks | [`TIER_PACKED`] | planted at a uniform stride, so its deltas pack narrower than the span's presence words |
+/// | packed, a full block and a partial | [`TIER_PACKED`] | planted at a uniform stride, so its deltas pack narrower than the span's presence words |
 /// | inline df=1 | [`TIER_SINGLETON`] | planted in one document |
 ///
 /// **Patched blocks are out of reach at this size**, and no weighting
@@ -271,7 +276,7 @@ fn skewed_corpus_strategy() -> impl Strategy<Value = Vec<Vec<usize>>> {
 /// rest, but a block whose lanes are that uneven spans enough documents
 /// for its presence bits to be cheaper still, so the bitset claims it
 /// first. Escaping that needs a span of several hundred documents per
-/// block *and* 128 postings to fill it, which a corpus of a few hundred
+/// block *and* 256 postings to fill it, which a corpus of several hundred
 /// documents cannot supply at once — [`TIER_PATCHED`] is short form here
 /// and only reaches the patched form in the large tier. The planted
 /// corpora in `boundaries.rs` cover patched blocks exactly, including
@@ -334,13 +339,12 @@ fn k_strategy(max_docs: usize) -> impl Strategy<Value = usize> {
     ]
 }
 
-/// Corpus sizes the default tiered lane draws from: at least
-/// [`TIERED_MIN_DOCS`], so every case shows every form the lane claims.
-/// Clamped when `INFINO_FTS_FUZZ_MAX_DOCS` is set below that, which
-/// trades the packed form for the smaller corpus the caller asked for.
+/// Corpus sizes the default tiered lane draws from: from
+/// [`TIERED_MIN_DOCS`], so every case shows every form the lane claims,
+/// to [`TIERED_DOC_SPREAD`] past it. Independent of the other lanes'
+/// cap: the tier weights are set for this size.
 fn tiered_docs() -> impl Strategy<Value = usize> {
-    let max = max_docs();
-    TIERED_MIN_DOCS.min(max)..=max
+    TIERED_MIN_DOCS..=TIERED_MIN_DOCS + TIERED_DOC_SPREAD
 }
 
 /// Cases of the large tiered tier.
@@ -570,7 +574,7 @@ proptest! {
         corpus in tiered_corpus_strategy(tiered_docs()),
         atoms in atoms_strategy(),
         and_mode in any::<bool>(),
-        k in k_strategy(max_docs()),
+        k in k_strategy(TIERED_MIN_DOCS + TIERED_DOC_SPREAD),
     ) {
         run_case(&corpus, &atoms, and_mode, k)?;
     }
@@ -649,9 +653,16 @@ async fn tiered_vocabulary_spans_the_posting_forms() {
             dense.bitset_blocks + dense.run_blocks > 0,
             "sample {sample}: the densest drawn tier should store presence bits or runs, got {dense:?}"
         );
+        // A lone partial block pads to its second sub-block, where the
+        // presence bitset can come out smaller; the corpus starts where
+        // the strided tier fills a whole block, which packs.
         let packed = layout(TIER_PACKED).await;
         assert!(
-            packed.packed_blocks > 0 && !packed.short,
+            !packed.short,
+            "sample {sample}: the strided tier is long, got {packed:?}"
+        );
+        assert!(
+            packed.packed_blocks > 0,
             "sample {sample}: the strided tier should pack its deltas, got {packed:?}"
         );
         let short = layout(TIER_SHORT).await;

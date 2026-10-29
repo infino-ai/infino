@@ -5632,17 +5632,21 @@ mod tests {
     #[test]
     fn global_stats_small_k_pruning_matches_single_superfile() {
         // `common` is in every doc, so its postings span more than one
-        // BLOCK_LEN(=128) block and the pruner has whole blocks it can
-        // skip. Three "boost" docs additionally carry a rare, high-idf
-        // term at distinct term frequencies, giving them the three
+        // block and the pruner has whole blocks it can skip. Three
+        // "boost" docs additionally carry a rare, high-idf term at
+        // distinct term frequencies, giving them the three
         // strictly-highest, distinct scores — an unambiguous top-3.
-        const N: usize = 160;
+        const N: usize = BLOCK_LEN + 32;
         const L: usize = 8; // tokens/doc; uniform so avgdl matches everywhere
         const K: usize = 3;
         // (doc index, boost tf). Distinct tf ⇒ distinct scores; the docs
         // are spread past BLOCK_LEN so a top-k doc sits in a later block
         // the walk must not wrongly prune.
-        let boosts = [(10usize, 3u32), (90, 2), (150, 1)];
+        let boosts = [
+            (10usize, 3u32),
+            (BLOCK_LEN / 2 + 26, 2),
+            (BLOCK_LEN + 22, 1),
+        ];
         let titles: Vec<String> = (0..N)
             .map(|i| {
                 let bt = boosts
@@ -6612,10 +6616,10 @@ mod tests {
         }
     }
 
-    /// Docs in the block-skip fixture. `BLOCK_LEN` is 128, so a term
-    /// carried by every document spans several whole blocks and the
-    /// block-max skip has something to skip *over*. Three documents fit
-    /// in one partial block, where the skip path is unreachable.
+    /// Docs in the block-skip fixture: a term carried by every document
+    /// spans several whole blocks and the block-max skip has something
+    /// to skip *over*. Three documents fit in one partial block, where
+    /// the skip path is unreachable.
     const BLOCK_SKIP_DOCS: usize = 5 * BLOCK_LEN;
 
     /// Longest document, in repetitions of the padding token. Lengths
