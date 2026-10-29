@@ -81,7 +81,7 @@ use crate::{
         query::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope},
-            dispatch::{ReplanFuture, fanout_with, fanout_with_ordered, tombstone_deny_set},
+            dispatch::{ReplanFuture, fanout_with_ordered, tombstone_deny_set},
             exec::metered_exec::MeteredExec,
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
