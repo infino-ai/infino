@@ -2050,6 +2050,54 @@ mod tests {
         assert_eq!(a, b, "the same postings and entries per term");
     }
 
+    /// A build cut into key ranges at the contributions' marks writes the
+    /// terms one writer writes: every key's postings and tier entries
+    /// agree, and the ranges' slices follow each other in key order.
+    #[test]
+    fn a_build_in_key_ranges_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let contributions: Vec<Contribution> =
+            (1..=3).map(|id| range_contribution(&dir, id)).collect();
+        assert!(
+            contributions
+                .iter()
+                .all(|c| c.marks.first().map(|m| m.1) == Some(0) && c.marks.len() >= 8),
+            "every contribution marks its first record, and enough others to cut four ranges"
+        );
+        let build_in = |ranges: usize| {
+            let policy = BuildPolicy {
+                merge_ranges: Some(ranges),
+                ..range_policy()
+            };
+            let built = build_layer(&contributions, &policy, 0).expect("build");
+            build::MergedLayer {
+                layer: built.layer,
+                slices: built.slices,
+                tiers: built.tiers,
+            }
+        };
+        let (one, many) = (build_in(1), build_in(4));
+        let bounds: Vec<(&[u8], &[u8])> = many
+            .layer
+            .slices
+            .iter()
+            .map(|s| (s.first_key.as_slice(), s.last_key.as_slice()))
+            .collect();
+        assert!(
+            bounds.windows(2).all(|w| w[0].1 < w[1].0),
+            "the ranges' slices follow each other in key order"
+        );
+        assert_ne!(
+            one.layer.slices.len(),
+            0,
+            "the one-writer build writes slices"
+        );
+        let (a, b) = (merged_terms(&one), merged_terms(&many));
+        assert!(!a.is_empty());
+        assert_eq!(a.len(), b.len(), "the same terms");
+        assert_eq!(a, b, "the same postings and entries per term");
+    }
+
     /// A merge cut into key ranges writes the terms one writer over
     /// everything writes: every key's postings and tier entries agree, and
     /// the ranges' slices follow each other in key order.

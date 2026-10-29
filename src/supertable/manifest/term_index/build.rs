@@ -618,7 +618,17 @@ pub(crate) struct ContributionWriter {
     record: Vec<u8>,
     /// The record's length prefix.
     frame: Vec<u8>,
+    /// Bytes written so far: where the next record starts.
+    offset: u64,
+    /// Some records' keys with the offsets they start at (see
+    /// [`CONTRIBUTION_MARK_BYTES`]).
+    marks: Vec<(Vec<u8>, u64)>,
 }
+
+/// Bytes between the records a contribution marks, so a build cut into
+/// key ranges starts each range's reader near its first key instead of
+/// reading the file from the start.
+const CONTRIBUTION_MARK_BYTES: u64 = if cfg!(test) { 256 } else { 8 * 1024 * 1024 };
 
 impl ContributionWriter {
     /// Record the scoring `column`'s heads are keyed at.
@@ -661,6 +671,8 @@ impl ContributionWriter {
             n_terms: 0,
             record: Vec::new(),
             frame: Vec::new(),
+            offset: 0,
+            marks: Vec::new(),
         })
     }
 
@@ -715,8 +727,16 @@ impl ContributionWriter {
         }
         self.frame.clear();
         push_varint(&mut self.frame, self.record.len() as u32);
+        if self
+            .marks
+            .last()
+            .is_none_or(|(_, at)| self.offset - at >= CONTRIBUTION_MARK_BYTES)
+        {
+            self.marks.push((key.to_vec(), self.offset));
+        }
         self.out.write_all(&self.frame)?;
         self.out.write_all(&self.record)?;
+        self.offset += (self.frame.len() + self.record.len()) as u64;
         self.prev_key.clear();
         self.prev_key.extend_from_slice(key);
         self.n_terms += 1;
@@ -731,6 +751,7 @@ impl ContributionWriter {
             id_min: self.id_min,
             scoring: self.scoring,
             path: self.path,
+            marks: self.marks,
             _scratch: self.scratch,
         })
     }
@@ -812,10 +833,13 @@ impl HeadSink {
         parts.sort_by(|a, b| a.0.cmp(&b.0));
         let path = scratch.path().join(format!("{superfile_id}.terms"));
         let mut out = BufWriter::new(File::create(&path)?);
+        let mut marks = Vec::new();
+        let mut base = 0u64;
         for (_, writer) in parts {
             let part = writer.finish()?;
+            marks.extend(part.marks.into_iter().map(|(key, at)| (key, base + at)));
             let mut file = File::open(&part.path)?;
-            io::copy(&mut file, &mut out)?;
+            base += io::copy(&mut file, &mut out)?;
             fs::remove_file(&part.path)?;
         }
         out.flush()?;
@@ -824,6 +848,7 @@ impl HeadSink {
             id_min,
             scoring,
             path,
+            marks,
             _scratch: Some(scratch),
         }))
     }
@@ -967,6 +992,9 @@ pub(crate) struct Contribution {
     pub(crate) scoring: BTreeMap<FieldId, ColumnScoring>,
     /// The spill file.
     pub(crate) path: PathBuf,
+    /// Some records' keys with the offsets they start at, ascending, the
+    /// first record's among them.
+    pub(crate) marks: Vec<(Vec<u8>, u64)>,
     /// The scratch directory holding it, when this contribution owns one;
     /// dropping the contribution removes both.
     _scratch: Option<TempDir>,
@@ -1026,11 +1054,40 @@ fn read_varint_stream(rd: &mut impl Read) -> io::Result<Option<u64>> {
 }
 
 impl ContributionReader {
+    #[cfg(test)]
     fn open(path: &Path) -> Result<Self, TermIndexError> {
+        Self::open_at(path, 0)
+    }
+
+    /// A reader whose first record starts at byte `offset`.
+    fn open_at(path: &Path, offset: u64) -> Result<Self, TermIndexError> {
+        let mut file = File::open(path)?;
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset))?;
+        }
         Ok(Self {
-            rd: BufReader::new(File::open(path)?),
+            rd: BufReader::new(file),
             buf: Vec::new(),
         })
+    }
+
+    /// The next record whose key is in `start..end`: records before
+    /// `start` are skipped, and the range ends at the first key from `end`.
+    fn next_in(
+        &mut self,
+        start: Option<&[u8]>,
+        end: Option<&[u8]>,
+    ) -> Result<Option<Record>, TermIndexError> {
+        while let Some(rec) = self.next()? {
+            if start.is_some_and(|s| rec.key.as_slice() < s) {
+                continue;
+            }
+            if end.is_some_and(|e| rec.key.as_slice() >= e) {
+                return Ok(None);
+            }
+            return Ok(Some(rec));
+        }
+        Ok(None)
     }
 
     /// The next record, `None` at end of file.
@@ -1521,13 +1578,163 @@ pub(crate) fn build_layer(
     policy: &BuildPolicy,
     ordinal_base: u32,
 ) -> Result<BuiltLayer, TermIndexError> {
+    let scoring = scoring_lookup(
+        Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
+        ordinal_base,
+    );
+    let ranges = build_ranges(contributions, policy)?;
+    let (layer, slices, tiers) = if ranges.len() <= 1 {
+        build_range(contributions, None, None, policy, &scoring, ordinal_base)?
+    } else {
+        // Each range merges its keys from every contribution on its own
+        // writer; the ranges follow each other in key order, as in
+        // `merge_layers`.
+        let build_one = |(start, end): &(Option<Vec<u8>>, Option<Vec<u8>>)| {
+            build_range(
+                contributions,
+                start.as_deref(),
+                end.as_deref(),
+                policy,
+                &scoring,
+                ordinal_base,
+            )
+        };
+        let build_all =
+            || -> Result<Vec<_>, TermIndexError> { ranges.par_iter().map(build_one).collect() };
+        let parts = match policy.pool.as_deref() {
+            Some(pool) => pool.install(build_all)?,
+            None => build_all()?,
+        };
+        let mut layer = Layer::default();
+        let mut slices = Vec::new();
+        let mut tiers = Vec::new();
+        for (part_layer, part_slices, part_tiers) in parts {
+            layer.slices.extend(part_layer.slices);
+            slices.extend(part_slices);
+            tiers.extend(part_tiers);
+        }
+        (layer, slices, tiers)
+    };
+
+    Ok(BuiltLayer {
+        superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
+        id_mins: contributions.iter().map(|c| c.id_min).collect(),
+        layer,
+        slices,
+        tiers,
+    })
+}
+
+/// Contributions of at least this many bytes in all are built in key
+/// ranges. A commit's own contributions stay below it and build on one
+/// writer, byte for byte as before; a rebuild over thousands of
+/// superfiles goes over it.
+const BUILD_RANGE_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The key ranges a build of `contributions` is cut into: one when they
+/// are small or the policy says so, else up to the pool's width (at most
+/// [`MERGE_RANGES_MAX`]), cut at the contributions' marks so that each
+/// range holds about the same bytes. A mark weighs the bytes up to the
+/// next mark of its contribution.
+fn build_ranges(
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+) -> Result<Vec<(Option<Vec<u8>>, Option<Vec<u8>>)>, TermIndexError> {
+    let single = vec![(None, None)];
+    let mut lens = Vec::with_capacity(contributions.len());
+    for c in contributions {
+        lens.push(fs::metadata(&c.path)?.len());
+    }
+    let want = match policy.merge_ranges {
+        Some(n) => n.max(1),
+        None => {
+            if lens.iter().sum::<u64>() < BUILD_RANGE_MIN_BYTES {
+                return Ok(single);
+            }
+            policy
+                .pool
+                .as_deref()
+                .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
+                .clamp(1, MERGE_RANGES_MAX)
+        }
+    };
+    if want <= 1 {
+        return Ok(single);
+    }
+    let mut marks: Vec<(&[u8], u64)> = contributions
+        .iter()
+        .zip(&lens)
+        .flat_map(|(c, &len)| {
+            c.marks.iter().enumerate().map(move |(i, (key, at))| {
+                let next = c.marks.get(i + 1).map_or(len, |m| m.1);
+                (key.as_slice(), next.saturating_sub(*at))
+            })
+        })
+        .collect();
+    marks.sort_by(|a, b| a.0.cmp(b.0));
+    let total: u64 = marks.iter().map(|m| m.1).sum();
+    if marks.len() < 2 || total == 0 {
+        return Ok(single);
+    }
+    // Cut where the running weight crosses each range's share, as
+    // `key_ranges` does for a merge.
+    let n = want.min(marks.len());
+    let share = total.div_ceil(n as u64);
+    let mut cuts: Vec<&[u8]> = Vec::with_capacity(n);
+    let mut acc = 0u64;
+    let mut next_at = share;
+    let first = marks[0].0;
+    for &(key, weight) in &marks {
+        if key > first && acc >= next_at && cuts.last().is_none_or(|c| *c < key) {
+            cuts.push(key);
+            next_at = (acc / share + 1) * share;
+            if cuts.len() + 1 >= n {
+                break;
+            }
+        }
+        acc += weight;
+    }
+    if cuts.is_empty() {
+        return Ok(single);
+    }
+    let mut ranges = Vec::with_capacity(cuts.len() + 1);
+    let mut start: Option<Vec<u8>> = None;
+    for cut in cuts {
+        ranges.push((start.take(), Some(cut.to_vec())));
+        start = Some(cut.to_vec());
+    }
+    ranges.push((start, None));
+    Ok(ranges)
+}
+
+/// The built pieces of one key range: its layer, slices and tier objects.
+type RangeOutput = (
+    Layer,
+    Vec<(ContentHash, BuiltBytes)>,
+    Vec<(ContentHash, BuiltBytes)>,
+);
+
+/// Merge the keys in `start..end` of `contributions` into one run of
+/// slices. Each reader starts at its last mark at or before `start`.
+fn build_range(
+    contributions: &[Contribution],
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    policy: &BuildPolicy,
+    scoring: &ScoringOf,
+    ordinal_base: u32,
+) -> Result<RangeOutput, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
     let mut pending: Vec<Option<(Posting, Vec<(u32, u32, u8)>)>> =
         Vec::with_capacity(contributions.len());
     for (ordinal, c) in contributions.iter().enumerate() {
-        let mut rd = ContributionReader::open(&c.path)?;
-        match rd.next()? {
+        let offset = start.map_or(0, |s| {
+            let at = c.marks.partition_point(|(key, _)| key.as_slice() <= s);
+            at.checked_sub(1).map_or(0, |i| c.marks[i].1)
+        });
+        let mut rd = ContributionReader::open_at(&c.path, offset)?;
+        match rd.next_in(start, end)? {
             Some(rec) => {
                 heap.push(Reverse(MergeHead {
                     key: rec.key,
@@ -1540,11 +1747,7 @@ pub(crate) fn build_layer(
         readers.push(rd);
     }
 
-    let scoring = scoring_lookup(
-        Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
-        ordinal_base,
-    );
-    let mut writer = LayerWriter::new(policy, scoring)?;
+    let mut writer = LayerWriter::new(policy, scoring.clone())?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
 
@@ -1569,7 +1772,7 @@ pub(crate) fn build_layer(
                 len,
             }));
             run.push(p);
-            if let Some(next) = readers[ordinal as usize].next()? {
+            if let Some(next) = readers[ordinal as usize].next_in(None, end)? {
                 heap.push(Reverse(MergeHead {
                     key: next.key,
                     ordinal,
@@ -1612,14 +1815,7 @@ pub(crate) fn build_layer(
         )?;
     }
     let (layer, slices, tiers, _) = writer.finish()?;
-
-    Ok(BuiltLayer {
-        superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
-        id_mins: contributions.iter().map(|c| c.id_min).collect(),
-        layer,
-        slices,
-        tiers,
-    })
+    Ok((layer, slices, tiers))
 }
 
 /// Terms a merge cursor decodes from a slice at a time, so a cursor holds
