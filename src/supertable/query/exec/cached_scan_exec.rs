@@ -9,8 +9,8 @@
 //! every statement. With a decoded-column cache configured, the provider builds
 //! this node instead whenever it can. Each partition walks its share of the
 //! files' row groups; for each it takes every projected column from the cache,
-//! decodes the ones the cache lacks through the superfile reader
-//! ([`take_file_columns`], the read and schema adaptation the search paths
+//! decodes the ones the cache lacks from the row group whole
+//! ([`read_file_row_group`], with the schema adaptation the search paths
 //! use), keeps them, and drops the row group's deleted rows.
 //!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
@@ -64,7 +64,7 @@ use crate::{
         manifest::{ManifestSnapshot, SuperfileUri},
         query::{
             column_cache::{ColumnKey, DecodedColumnCache},
-            exec::common::{hit_output_schema, take_file_columns},
+            exec::common::{hit_output_schema, read_file_row_group},
             read_ahead::{file_pruning, statistics_pruned},
         },
         schema::cast::CAST_OPTIONS,
@@ -131,9 +131,6 @@ struct ScanContext {
     /// The scan's output: the projected columns, typed as the scan schema
     /// types them.
     schema: SchemaRef,
-    /// The same columns typed as the files store them, which the reader
-    /// decodes into.
-    stored: SchemaRef,
     manifest: Arc<ManifestSnapshot>,
     op_stats: Option<Arc<OpStatsCollector>>,
     cache: Arc<DecodedColumnCache>,
@@ -224,7 +221,6 @@ impl CachedScanExec {
         Some(Self {
             context: Arc::new(ScanContext {
                 schema,
-                stored,
                 manifest,
                 op_stats,
                 cache,
@@ -337,17 +333,19 @@ impl ScanContext {
     ) -> DfResult<Vec<ArrayRef>> {
         let fields = self.schema.fields();
         let names: Vec<&str> = missing.iter().map(|&i| fields[i].name().as_str()).collect();
-        let stored = Arc::new(
-            self.stored
+        // Read as the scan types them, so a string the scan works on as a
+        // view decodes into one directly.
+        let typed = Arc::new(
+            self.schema
                 .project(&missing)
                 .map_err(QueryError::internal)?,
         );
-        let read = take_file_columns(
+        let read = read_file_row_group(
             &self.manifest,
             &unit.file.reader,
-            unit.rows.clone().collect(),
+            unit.row_group,
             &names,
-            &stored,
+            &typed,
             &self.op_stats,
         )
         .await?;

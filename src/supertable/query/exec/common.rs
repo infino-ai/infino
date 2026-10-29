@@ -72,7 +72,10 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        reader::{WHOLE_COLUMN_TAKE_DIVISOR, rank_back_indices, row_selection_for_ids},
+        reader::{
+            WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            row_selection_for_ids, view_read_options, whole_row_group,
+        },
     },
     supertable::{
         error::QueryError,
@@ -1493,6 +1496,102 @@ pub(crate) async fn take_file_columns(
         stats.add_kernel_cpu_ns(ns);
     }
     batch.map_err(|e| QueryError::from(e).into())
+}
+
+/// `names` of every row of row group `row_group` of one superfile, in file
+/// order, under the table's column names: [`take_file_columns`] for a scan
+/// reading whole row groups. Each column is decoded once, with no list of
+/// the rows to sort and no copy to put them in its order, which a take of
+/// every row would pay. The resident decode goes to the reader pool and is
+/// counted as kernel CPU; a lazy reader streams.
+///
+/// `out_schema` types the batch, field for field with `names`, where the
+/// file's columns need adapting. A string or binary column it types as a
+/// view decodes straight into views, so a scan that works on views copies
+/// no value to make them; the file's own types serve every other column.
+pub(crate) async fn read_file_row_group(
+    manifest: &ManifestSnapshot,
+    rd: &Arc<SuperfileReader>,
+    row_group: usize,
+    names: &[&str],
+    out_schema: &SchemaRef,
+    op_stats: &Option<Arc<OpStatsCollector>>,
+) -> DfResult<RecordBatch> {
+    let adapter = file_adapter(manifest, rd);
+    let stored = |names: &[&str]| -> Vec<String> {
+        match &adapter {
+            Some(map) => map
+                .stored_names(names)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            None => names.iter().map(|name| (*name).to_owned()).collect(),
+        }
+    };
+    let physical = stored(names);
+    let viewed: Vec<&str> = names
+        .iter()
+        .zip(out_schema.fields())
+        .filter(|(_, field)| matches!(field.data_type(), DataType::Utf8View | DataType::BinaryView))
+        .map(|(name, _)| *name)
+        .collect();
+    let views = stored(&viewed);
+    let read = if rd.can_take_by_local_doc_ids() {
+        let rd = Arc::clone(rd);
+        let (read, ns) = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "row group decode: reader pool dropped result",
+            move || {
+                let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
+                let views: Vec<&str> = views.iter().map(String::as_str).collect();
+                timed_section(|| rd.read_row_group(row_group, &refs, &views))
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?;
+        if let Some(stats) = op_stats {
+            stats.add_kernel_cpu_ns(ns);
+        }
+        read.map_err(QueryError::from)?
+    } else {
+        let refs: Vec<&str> = physical.iter().map(String::as_str).collect();
+        let views: Vec<&str> = views.iter().map(String::as_str).collect();
+        read_row_group_byte_source(rd, row_group, &refs, &views).await?
+    };
+    match adapter {
+        None => Ok(read),
+        Some(map) => map
+            .adapt(&read, out_schema)
+            .map_err(|e| DataFusionError::Execution(e.to_string())),
+    }
+}
+
+/// [`SuperfileReader::read_row_group`] for a lazily opened superfile,
+/// streamed through its byte source so the disk cache's block layer serves
+/// repeated reads. Reading whole row groups needs no page index.
+async fn read_row_group_byte_source(
+    reader: &SuperfileReader,
+    row_group: usize,
+    names: &[&str],
+    views: &[&str],
+) -> DfResult<RecordBatch> {
+    let input = ByteSourceAsyncReader {
+        source: Source::Lazy(reader.byte_source()),
+        metadata: Arc::clone(reader.parquet_metadata()),
+    };
+    let options = if views.is_empty() {
+        ArrowReaderOptions::new()
+    } else {
+        view_read_options(reader.schema(), views)
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(input, options)
+        .await
+        .map_err(QueryError::store)?;
+    let (builder, rows) = whole_row_group(builder, row_group, names).map_err(QueryError::from)?;
+    let stream = builder.build().map_err(QueryError::store)?;
+    let read_schema = stream.schema().clone();
+    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
+    in_projection_order(&read_schema, batches, names, rows).map_err(|e| QueryError::from(e).into())
 }
 
 /// Parquet async reader backed by the `SuperfileReader`'s existing byte source.

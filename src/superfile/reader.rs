@@ -47,7 +47,7 @@ use parquet::{
     arrow::{
         ProjectionMask,
         arrow_reader::{
-            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+            ArrowReaderBuilder, ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
             ParquetRecordBatchReaderBuilder, RowSelection, RowSelector,
         },
         async_reader::MetadataFetch,
@@ -1511,6 +1511,55 @@ impl SuperfileReader {
         .map_err(|e| ReadError::Columnar(e.to_string()))
     }
 
+    /// The `projection` columns of every row of row group `row_group`, in
+    /// file order, decoded once from resident bytes. A scan reading whole
+    /// row groups takes this rather than
+    /// [`take_by_local_doc_ids`](Self::take_by_local_doc_ids) of every row,
+    /// which would sort a list of the row group's rows and copy each column
+    /// twice more to put them back in that list's order. Columns come out
+    /// in `projection`'s order; the string and binary columns named in
+    /// `views` decode straight into views ([`view_read_options`]).
+    ///
+    /// # Errors
+    /// - [`ReadError::LazyReaderUnsupported`] — no resident bytes.
+    /// - [`ReadError::UnknownColumn`] — a name is not in the file.
+    /// - [`ReadError::Columnar`] — `row_group` is past the file's last, or
+    ///   a Parquet/Arrow decode failure.
+    pub(crate) fn read_row_group(
+        &self,
+        row_group: usize,
+        projection: &[&str],
+        views: &[&str],
+    ) -> Result<RecordBatch, ReadError> {
+        let bytes = self
+            .bytes
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        let mut arrow_meta = self
+            .arrow_meta
+            .as_ref()
+            .ok_or(ReadError::LazyReaderUnsupported)?
+            .clone();
+        if !views.is_empty() {
+            arrow_meta = ArrowReaderMetadata::try_new(
+                Arc::clone(arrow_meta.metadata()),
+                view_read_options(arrow_meta.schema(), views),
+            )
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        }
+        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(bytes, arrow_meta);
+        let (builder, rows) = whole_row_group(builder, row_group, projection)?;
+        let reader = builder
+            .build()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        let read_schema = reader.schema();
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| ReadError::Columnar(e.to_string()))?;
+        in_projection_order(&read_schema, batches, projection, rows)
+    }
+
     /// The stable-id sidecar sliced from resident bytes, without a read: on a
     /// [fully resident](Self::is_fully_resident) reader, and on a promoted one
     /// whose missing range ([`install_resident_parquet`]) does not overlap
@@ -2757,6 +2806,108 @@ fn slice_or_err(
 // into the FTS submodule.
 pub use crate::superfile::fts::reader::BoolMode as FtsBoolMode;
 
+/// Reader options that decode the `views` columns of a file whose Arrow
+/// schema is `file` as `Utf8View` / `BinaryView` when they hold strings or
+/// binaries, and every other column as `file` types it. A view of a
+/// dictionary-encoded column points into the dictionary rather than copying
+/// each value out, and a scan that works on views would otherwise copy every
+/// value a second time to make them.
+pub(crate) fn view_read_options(file: &Schema, views: &[&str]) -> ArrowReaderOptions {
+    let fields: Vec<Field> = file
+        .fields()
+        .iter()
+        .map(|field| {
+            let view = match field.data_type() {
+                DataType::Utf8 | DataType::LargeUtf8 => Some(DataType::Utf8View),
+                DataType::Binary | DataType::LargeBinary => Some(DataType::BinaryView),
+                _ => None,
+            };
+            match view {
+                Some(view) if views.contains(&field.name().as_str()) => {
+                    field.as_ref().clone().with_data_type(view)
+                }
+                _ => field.as_ref().clone(),
+            }
+        })
+        .collect();
+    ArrowReaderOptions::new().with_schema(Arc::new(
+        Schema::new(fields).with_metadata(file.metadata().clone()),
+    ))
+}
+
+/// `builder` set to read the `projection` columns of every row of row group
+/// `row_group` as one batch, and that row group's row count. Shared by
+/// [`SuperfileReader::read_row_group`] (resident bytes) and the supertable's
+/// read of a lazily opened superfile's row group.
+pub(crate) fn whole_row_group<T>(
+    builder: ArrowReaderBuilder<T>,
+    row_group: usize,
+    projection: &[&str],
+) -> Result<(ArrowReaderBuilder<T>, usize), ReadError> {
+    let meta = builder
+        .metadata()
+        .row_groups()
+        .get(row_group)
+        .ok_or_else(|| {
+            ReadError::Columnar(format!(
+                "row group {row_group} of a file with {}",
+                builder.metadata().num_row_groups()
+            ))
+        })?;
+    let rows = usize::try_from(meta.num_rows()).map_err(|_| {
+        ReadError::Columnar(format!("row group {row_group} has a negative row count"))
+    })?;
+    let mut col_indices = Vec::with_capacity(projection.len());
+    for &name in projection {
+        let idx = builder
+            .schema()
+            .index_of(name)
+            .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
+        col_indices.push(idx);
+    }
+    let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices);
+    let builder = builder
+        .with_projection(mask)
+        .with_row_groups(vec![row_group])
+        .with_batch_size(rows.max(1));
+    Ok((builder, rows))
+}
+
+/// The batches a [`whole_row_group`] read decoded, as one batch of `rows`
+/// rows with the `projection` columns in that order (the reader returns
+/// them in file order). The read is set to one batch, so this joins
+/// nothing unless the decoder split it.
+pub(crate) fn in_projection_order(
+    read_schema: &SchemaRef,
+    batches: Vec<RecordBatch>,
+    projection: &[&str],
+    rows: usize,
+) -> Result<RecordBatch, ReadError> {
+    let mut fields: Vec<Field> = Vec::with_capacity(projection.len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(projection.len());
+    if !projection.is_empty() {
+        let whole = match <[RecordBatch; 1]>::try_from(batches) {
+            Ok([batch]) => batch,
+            Err(batches) => concat_batches(read_schema, &batches)
+                .map_err(|e| ReadError::Columnar(e.to_string()))?,
+        };
+        for &name in projection {
+            let idx = whole
+                .schema()
+                .index_of(name)
+                .map_err(|_| ReadError::UnknownColumn(name.to_string()))?;
+            fields.push(whole.schema().field(idx).clone());
+            columns.push(Arc::clone(whole.column(idx)));
+        }
+    }
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(rows)),
+    )
+    .map_err(|e| ReadError::Columnar(e.to_string()))
+}
+
 /// Sorted, deduplicated copy of `ids` plus the parquet [`RowSelection`]
 /// selecting exactly those rows, as strictly monotonic alternating
 /// skip/select runs. Decodes only the rows the ids land on — for k=10
@@ -2945,6 +3096,7 @@ fn fts_reader_error_to_read(e: FtsError) -> ReadError {
 mod tests {
     use std::collections::HashSet;
 
+    use arrow::compute::cast;
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
     use async_trait::async_trait;
@@ -4245,6 +4397,57 @@ mod tests {
             );
             assert!(!lazy.id_sidecar_broken.load(Ordering::Relaxed));
         }
+    }
+
+    /// Rows per row group in the whole-row-group read test: not a divisor
+    /// of [`SHUFFLED_ID_ROWS`], so the last row group is short.
+    const READ_ROW_GROUP_ROWS: usize = 1_500;
+
+    /// A whole row group reads the same rows, in the same order, as a take
+    /// of every row it holds, with the columns in the order asked; a row
+    /// group past the last, or a column the file lacks, is an error; and
+    /// no column still carries the row count. A column read as views holds
+    /// the same strings as `Utf8View`.
+    #[test]
+    fn a_whole_row_group_reads_what_a_take_of_its_rows_does() {
+        let (bytes, _) = build_shuffled_id_superfile_in_row_groups(READ_ROW_GROUP_ROWS);
+        let reader = SuperfileReader::open(bytes).expect("open");
+        let groups = reader.parquet_metadata().num_row_groups();
+        assert_eq!(groups, SHUFFLED_ID_ROWS.div_ceil(READ_ROW_GROUP_ROWS));
+        let projection = ["title", "doc_id"];
+        let mut start = 0u32;
+        for row_group in 0..groups {
+            let read = reader
+                .read_row_group(row_group, &projection, &[])
+                .expect("whole row group");
+            let rows: Vec<u32> = (start..start + read.num_rows() as u32).collect();
+            let taken = reader
+                .take_by_local_doc_ids(&rows, &projection)
+                .expect("take");
+            assert_eq!(read, taken, "row group {row_group}");
+
+            let viewed = reader
+                .read_row_group(row_group, &projection, &["title"])
+                .expect("titles as views");
+            assert_eq!(viewed.schema().field(0).data_type(), &DataType::Utf8View);
+            let titles = cast(viewed.column(0), &DataType::LargeUtf8).expect("cast back");
+            assert_eq!(&titles, taken.column(0), "row group {row_group}");
+            assert_eq!(viewed.column(1), taken.column(1), "row group {row_group}");
+            start += read.num_rows() as u32;
+        }
+        assert_eq!(start as usize, SHUFFLED_ID_ROWS);
+
+        assert!(matches!(
+            reader.read_row_group(groups, &projection, &[]),
+            Err(ReadError::Columnar(_))
+        ));
+        assert!(matches!(
+            reader.read_row_group(0, &["nope"], &[]),
+            Err(ReadError::UnknownColumn(_))
+        ));
+        let bare = reader.read_row_group(0, &[], &[]).expect("no column");
+        assert_eq!(bare.num_columns(), 0);
+        assert_eq!(bare.num_rows(), READ_ROW_GROUP_ROWS);
     }
 
     /// Rows per row group in the footer-check test, so the file has several.
