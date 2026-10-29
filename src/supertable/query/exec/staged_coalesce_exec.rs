@@ -35,10 +35,13 @@
 //!   partition 0, as under a plain gather. A filter that keeps almost nothing
 //!   waits for one batch, then reads in parallel as before.
 //! - **It gives no batch:** a file whose rows the index or the statistics
-//!   rule out gives none. The gate opens when partition 0 ends. The staged
-//!   gather turns off DataFusion's sharing of files between partitions, so
-//!   partition 0 ends after its own files instead of taking the next file
-//!   the others would have read, and `StageLimitGathers` leaves it one file.
+//!   rule out gives none. DataFusion shares one queue of files between a
+//!   scan's partitions, so partition 0, alone while the gate is shut, would
+//!   go on to take every such file, one after another. So `StageLimitGathers`
+//!   takes the scan's first file out of it, and partition 0 reads that file
+//!   alone, in a scan of its own; the gate opens when it ends, and partition
+//!   0 goes on with the shared queue beside the others. At most one file is
+//!   read before the others start.
 //! - **It fails:** the gate is abandoned, so no other partition starts while
 //!   the query returns the error.
 //!
@@ -56,6 +59,10 @@ use std::{
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use datafusion::{
+    datasource::{
+        physical_plan::{FileGroup, FileScanConfig},
+        source::DataSourceExec,
+    },
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
     physical_plan::{
@@ -143,18 +150,10 @@ impl ExecutionPlan for StagedCoalesceExec {
     ) -> DfResult<SendableRecordBatchStream> {
         // Each query gets its own gate, so a plan run twice never sees the
         // first run's.
-        let mut config = context
+        let config = context
             .session_config()
             .clone()
             .with_extension(Arc::new(ScanGate::new()));
-        // A partition that runs out of its own files would otherwise take the
-        // next file the others would have read. Partition 0 runs alone while
-        // the gate is shut, so it would read every file that gives no batch,
-        // one after another. This plan's only scan is the gated one.
-        config
-            .options_mut()
-            .execution
-            .enable_file_stream_work_stealing = false;
         let gated = TaskContext::new(
             context.task_id(),
             context.session_id(),
@@ -176,18 +175,97 @@ impl ExecutionPlan for StagedCoalesceExec {
 #[derive(Debug)]
 pub(crate) struct ScanGateExec {
     input: Arc<dyn ExecutionPlan>,
+    /// The scan of the one file partition 0 reads before the rest of its
+    /// partition, when `input` is a file scan that left it out; read through
+    /// `input`'s meter. See the module docs.
+    first: Option<FileScanConfig>,
 }
 
 impl ScanGateExec {
-    /// Gates `input`, a table scan.
-    pub(crate) fn new(input: Arc<dyn ExecutionPlan>) -> Self {
-        Self { input }
+    /// Gates `input`, a table scan; partition 0 reads `first`, the scan of
+    /// a file `input` leaves out, before its own partition of `input`.
+    pub(crate) fn new(input: Arc<dyn ExecutionPlan>, first: Option<FileScanConfig>) -> Self {
+        Self { input, first }
+    }
+
+    /// The scan of the file partition 0 reads first, if any.
+    #[cfg(test)]
+    pub(crate) fn first(&self) -> Option<&FileScanConfig> {
+        self.first.as_ref()
+    }
+
+    /// Partition 0: the first file, if any, gated by `gate`, then partition 0
+    /// of `input` once that file ends.
+    fn first_partition(
+        &self,
+        gate: Option<Arc<ScanGate>>,
+        context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let schema = self.schema();
+        let Some(first) = &self.first else {
+            let batches = self.input.execute(0, context)?;
+            return Ok(match gate {
+                Some(gate) => Box::pin(FirstPartition::new(schema, batches, gate)),
+                None => batches,
+            });
+        };
+        // A fresh scan each run: DataFusion keeps a scan's queue of files on
+        // the node, and a second run must read the file again.
+        let scan = DataSourceExec::from_data_source(first.clone());
+        let batches = Arc::clone(&self.input)
+            .with_new_children(vec![scan])?
+            .execute(0, Arc::clone(&context))?;
+        let lead = match &gate {
+            Some(gate) => {
+                FirstPartition::new(Arc::clone(&schema), batches, Arc::clone(gate)).boxed()
+            }
+            None => batches.boxed(),
+        };
+        let rest = self.deferred(0, gate, context);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            lead.chain(rest),
+        )))
+    }
+
+    /// Partition `partition` of `input`, not started until `gate`, if any,
+    /// opens: no file is opened and no byte fetched for a partition the
+    /// query never needs.
+    fn deferred(
+        &self,
+        partition: usize,
+        gate: Option<Arc<ScanGate>>,
+        context: Arc<TaskContext>,
+    ) -> SendableRecordBatchStream {
+        let schema = self.schema();
+        let input = Arc::clone(&self.input);
+        let empty = Arc::clone(&schema);
+        let deferred = stream::once(async move {
+            let opened = match gate {
+                Some(gate) => gate.opened().await,
+                None => true,
+            };
+            if opened {
+                input.execute(partition, context)
+            } else {
+                Ok(Box::pin(EmptyRecordBatchStream::new(empty)) as SendableRecordBatchStream)
+            }
+        })
+        .try_flatten();
+        Box::pin(RecordBatchStreamAdapter::new(schema, deferred))
     }
 }
 
 impl DisplayAs for ScanGateExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ScanGateExec")
+        write!(f, "ScanGateExec")?;
+        let Some(first) = &self.first else {
+            return Ok(());
+        };
+        for file in first.file_groups.iter().flat_map(FileGroup::iter) {
+            write!(f, ": first={}", file.object_meta.location)?;
+        }
+        Ok(())
     }
 }
 
@@ -214,7 +292,10 @@ impl ExecutionPlan for ScanGateExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(Self::new(children.swap_remove(0))))
+        Ok(Arc::new(Self::new(
+            children.swap_remove(0),
+            self.first.clone(),
+        )))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -231,31 +312,14 @@ impl ExecutionPlan for ScanGateExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        let Some(gate) = context.session_config().get_extension::<ScanGate>() else {
-            return self.input.execute(partition, context);
-        };
-        let schema = self.schema();
+        let gate = context.session_config().get_extension::<ScanGate>();
         if partition == 0 {
-            return Ok(Box::pin(FirstPartition {
-                schema,
-                batches: self.input.execute(partition, context)?,
-                gate,
-                delivered: false,
-            }));
+            return self.first_partition(gate, context);
         }
-        // Not started at all until the gate opens: no file is opened and no
-        // byte fetched for a partition the query never needs.
-        let input = Arc::clone(&self.input);
-        let empty = Arc::clone(&schema);
-        let deferred = stream::once(async move {
-            if gate.opened().await {
-                input.execute(partition, context)
-            } else {
-                Ok(Box::pin(EmptyRecordBatchStream::new(empty)) as SendableRecordBatchStream)
-            }
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, deferred)))
+        match gate {
+            Some(gate) => Ok(self.deferred(partition, Some(gate), context)),
+            None => self.input.execute(partition, context),
+        }
     }
 }
 
@@ -316,6 +380,17 @@ struct FirstPartition {
     gate: Arc<ScanGate>,
     /// Whether a batch has been handed over yet.
     delivered: bool,
+}
+
+impl FirstPartition {
+    fn new(schema: SchemaRef, batches: SendableRecordBatchStream, gate: Arc<ScanGate>) -> Self {
+        Self {
+            schema,
+            batches,
+            gate,
+            delivered: false,
+        }
+    }
 }
 
 impl Stream for FirstPartition {
@@ -517,7 +592,7 @@ mod tests {
             started: Arc::clone(&started),
             first,
         });
-        let gate = Arc::new(ScanGateExec::new(scan));
+        let gate = Arc::new(ScanGateExec::new(scan, None));
         let above: Arc<dyn ExecutionPlan> = match above {
             Above::Filter => {
                 let every_row = Arc::new(BinaryExpr::new(
@@ -656,7 +731,7 @@ mod tests {
     async fn a_scan_gate_without_a_staged_gather_passes_every_partition() {
         let full: &[usize] = &[BATCH_ROWS];
         let out = collect(
-            Arc::new(ScanGateExec::new(memory_scan(&[full; PARTITIONS]))),
+            Arc::new(ScanGateExec::new(memory_scan(&[full; PARTITIONS]), None)),
             Arc::new(TaskContext::default()),
         )
         .await

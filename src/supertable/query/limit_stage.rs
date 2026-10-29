@@ -31,14 +31,14 @@
 //! regardless.
 //!
 //! A file can give no batch at all: one whose rows the index or the
-//! statistics rule out. So partition 0 must not move on to another file while
-//! the gate is shut, or it would read every such file alone. The rule leaves
-//! the first file (or byte range) of the scan's first group alone in that
-//! group, and moves the group's other files to a group of their own at the
-//! end. The staged gather turns off DataFusion's sharing of files between
-//! partitions for the query, so partition 0 reads only that one file before
-//! the gate opens. What is read in series is at most one batch, or one file
-//! that gives none, however large the table.
+//! statistics rule out. DataFusion shares one queue of files between a
+//! scan's partitions, so partition 0, alone while the gate is shut, would go
+//! on to take every such file, one after another. So the rule takes the first
+//! file (or byte range) of the scan's first group out of the scan and hands
+//! it to the gate, which reads it alone as the start of partition 0. The gate
+//! opens when it ends, and partition 0 then goes on with the shared queue
+//! beside the others. What is read in series is at most one batch, or one
+//! file that gives none, however large the table.
 //!
 //! The gate keeps the other partitions shut when partition 0's scan is
 //! dropped before that second ask, which is right only if what dropped it
@@ -145,8 +145,9 @@ fn gated_scan(
         // `EnforceDistribution` puts the exchange below the meter when the
         // scan's files are too small to split.
         let scan = round_robin_input(meter.input()).unwrap_or(meter.input());
-        let meter = Arc::clone(plan).with_new_children(vec![first_file_alone(scan)])?;
-        return Ok(Some(Arc::new(ScanGateExec::new(meter))));
+        let (rest, first) = split_first_file(scan);
+        let meter = Arc::clone(plan).with_new_children(vec![rest])?;
+        return Ok(Some(Arc::new(ScanGateExec::new(meter, first))));
     }
     let passes_rows_on = plan.downcast_ref::<FilterExec>().is_some()
         || plan.downcast_ref::<ProjectionExec>().is_some()
@@ -162,11 +163,12 @@ fn gated_scan(
         .transpose()
 }
 
-/// `scan` with the first file of its first group alone in that group and the
-/// group's other files in a new group at the end, when it is a file scan
-/// whose first group holds more than one; else `scan` as it is. Partition 0
-/// then reads one file before the gate opens; see the module docs.
-fn first_file_alone(scan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+/// `scan` without the first file (or byte range) of its first group, and the
+/// scan of that file alone, when it is a file scan; else `scan` as it is.
+/// Partition 0 reads that file before the gate opens; see the module docs.
+fn split_first_file(
+    scan: &Arc<dyn ExecutionPlan>,
+) -> (Arc<dyn ExecutionPlan>, Option<FileScanConfig>) {
     let Some(config) = scan
         .downcast_ref::<DataSourceExec>()
         .and_then(|source| source.data_source().downcast_ref::<FileScanConfig>())
@@ -174,19 +176,20 @@ fn first_file_alone(scan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
             config
                 .file_groups
                 .first()
-                .is_some_and(|group| group.len() > 1)
+                .is_some_and(|group| !group.is_empty())
         })
     else {
-        return Arc::clone(scan);
+        return (Arc::clone(scan), None);
     };
-    let mut config = config.clone();
-    let mut groups = mem::take(&mut config.file_groups);
-    let mut first = groups.remove(0).into_inner();
-    let others = first.split_off(1);
-    groups.insert(0, FileGroup::new(first));
-    groups.push(FileGroup::new(others));
-    config.file_groups = groups;
-    DataSourceExec::from_data_source(config)
+    let mut rest = config.clone();
+    let mut groups = mem::take(&mut rest.file_groups);
+    // Cloned with no groups, so the files are copied once.
+    let mut first = rest.clone();
+    let mut files = mem::replace(&mut groups[0], FileGroup::new(Vec::new())).into_inner();
+    groups[0] = FileGroup::new(files.split_off(1));
+    first.file_groups = vec![FileGroup::new(files)];
+    rest.file_groups = groups;
+    (DataSourceExec::from_data_source(rest), Some(first))
 }
 
 /// The input of `node` when it is a round-robin exchange, else `None`.
@@ -224,7 +227,9 @@ mod tests {
     };
 
     use super::StageLimitGathers;
-    use crate::supertable::query::exec::metered_exec::MeteredExec;
+    use crate::supertable::query::exec::{
+        metered_exec::MeteredExec, staged_coalesce_exec::ScanGateExec,
+    };
 
     /// The `LIMIT` the tests' plans use.
     const LIMIT: usize = 10;
@@ -284,6 +289,23 @@ mod tests {
             .into_iter()
             .map(file_groups)
             .find(|groups| !groups.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// The files the gate in `plan` hands partition 0 first, by name.
+    fn first_file(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        if let Some(gate) = plan.downcast_ref::<ScanGateExec>() {
+            return gate
+                .first()
+                .into_iter()
+                .flat_map(|first| first.file_groups.iter().flat_map(FileGroup::iter))
+                .map(|file| file.object_meta.location.to_string())
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .map(first_file)
+            .find(|files| !files.is_empty())
             .unwrap_or_default()
     }
 
@@ -384,28 +406,23 @@ mod tests {
     }
 
     #[test]
-    fn leaves_the_first_file_of_a_staged_scan_alone_in_its_group() {
-        // Partition 0 reads only its own group while the gate is shut, so a
-        // group of many files that give no rows would be read in series.
+    fn hands_the_first_file_of_a_staged_scan_to_the_gate() {
+        // Partition 0 would otherwise take file after file from the queue
+        // the partitions share while the gate is shut.
         let plan = staged(
             filter(file_scan(&[&["a", "b", "c"], &["d"], &["e", "f"]])),
             Some(LIMIT),
         );
         assert_eq!(plan.name(), "StagedCoalesceExec");
+        assert_eq!(first_file(&plan), ["a"]);
         assert_eq!(
             file_groups(&plan),
-            [vec!["a"], vec!["d"], vec!["e", "f"], vec!["b", "c"]]
+            [vec!["b", "c"], vec!["d"], vec!["e", "f"]]
         );
-        // A first group of one file is left as it is.
+        // A first group of one file is left empty, keeping the partitions.
         let plan = staged(filter(file_scan(&[&["a"], &["b", "c"]])), Some(LIMIT));
-        assert_eq!(file_groups(&plan), [vec!["a"], vec!["b", "c"]]);
-    }
-
-    #[test]
-    fn stages_one_group_of_many_files_as_one_file_then_the_rest() {
-        let plan = staged(filter(file_scan(&[&["a", "b", "c"]])), Some(LIMIT));
-        assert_eq!(plan.name(), "StagedCoalesceExec");
-        assert_eq!(file_groups(&plan), [vec!["a"], vec!["b", "c"]]);
+        assert_eq!(first_file(&plan), ["a"]);
+        assert_eq!(file_groups(&plan), [Vec::<&str>::new(), vec!["b", "c"]]);
     }
 
     #[test]
