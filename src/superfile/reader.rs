@@ -1922,6 +1922,36 @@ impl SuperfileReader {
             .await?)
     }
 
+    /// The cursors of an `Or` match over `tokens`, built once for this
+    /// superfile's doc-id slices. Delegates to
+    /// [`FtsReader::match_cursor_set`].
+    pub(crate) async fn match_cursor_set(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(OrCursorSet, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.match_cursor_set(column, tokens, prefetched).await?)
+    }
+
+    /// One doc-id slice of an `Or` match against cursors
+    /// [`Self::match_cursor_set`] built. Delegates to
+    /// [`FtsReader::token_match_range_prebuilt`].
+    pub(crate) fn token_match_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.token_match_range_prebuilt(set, start, end)?)
+    }
+
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of
     /// `column` each covers, in one dictionary pass (a slot is `None` when
     /// more than `max_terms` qualify, or when it needs the whole column

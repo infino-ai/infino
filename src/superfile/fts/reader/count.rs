@@ -452,6 +452,68 @@ impl FtsReader {
         Ok((self.ids_to_rows(docs)?, work))
     }
 
+    /// The cursors an `Or` [`Self::token_match_prefetched`] walks over
+    /// `tokens`, built once (the postings fetch and skip-table parse) for
+    /// [`Self::token_match_range_prebuilt`] to walk one doc-id slice at a
+    /// time, with what the build read. Slices of one superfile share the
+    /// set; each walks a clone of its cursors.
+    pub(crate) async fn match_cursor_set(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(OrCursorSet, MatchWork), FtsError> {
+        let column_id = self.resolve_column_id(column)?;
+        let cursors = match tokens.is_empty() {
+            true => Vec::new(),
+            false => {
+                self.build_term_cursors(
+                    column_id,
+                    tokens,
+                    QueryIdf::ThisFile,
+                    CursorUse::Count,
+                    None,
+                    prefetched,
+                )
+                .await?
+            }
+        };
+        let mut work = MatchWork::for_cursors(&cursors);
+        work.planned_ranges += dictionary_fetches(tokens, prefetched);
+        // Each slice translates its ids to rows off this runtime.
+        if !cursors.is_empty() {
+            self.ensure_doc_map().await?;
+        }
+        Ok((OrCursorSet { column_id, cursors }, work))
+    }
+
+    /// The rows whose doc ids in `[start, end)` hold any of `set`'s terms,
+    /// ascending: one slice of an `Or` [`Self::token_match_prefetched`].
+    /// The slices of a superfile's doc-id space together match exactly
+    /// what the whole walk matches; the range is a cut of the blob's ids
+    /// and carries no row meaning, so each slice's rows are put in order
+    /// on their own. The work holds the walk's time alone; the set's build
+    /// counted its bytes.
+    pub(crate) fn token_match_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<RowId>, MatchWork), FtsError> {
+        let mut work = MatchWork::default();
+        if set.cursors.is_empty() || start >= end {
+            return Ok((Vec::new(), work));
+        }
+        let (docs, walk_ns) = timed_section(|| {
+            or_merge_unranked_in(set.cursors.clone(), start, end)
+                .into_iter()
+                .map(FtsDocId::new)
+                .collect::<Vec<_>>()
+        });
+        work.kernel_cpu_ns = walk_ns;
+        Ok((self.ids_to_rows(docs)?, work))
+    }
+
     /// Unranked token-match **count** — the cardinality
     /// [`token_match`](Self::token_match) would return, without
     /// materializing the doc-id `Vec`. The AND path counts its

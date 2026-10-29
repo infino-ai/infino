@@ -2132,6 +2132,69 @@ mod tests {
         }
     }
 
+    /// Doc-id cuts of the slice fixture: the first doc, one inside the first
+    /// posting block, block-straddling ones, and the end.
+    const SLICE_CUTS: [u32; 6] = [1, 100, 1000, 2047, 2048, 4000];
+
+    /// Cut into doc-id slices at any boundary, an unranked `Or` match on a
+    /// reordered blob gives back exactly the whole walk's rows: each slice
+    /// ascending, together every row once. One term (its blocks copied
+    /// whole) and two (the union walk), dense and sparse.
+    #[tokio::test]
+    async fn sliced_unranked_match_rows_are_the_whole_walk() {
+        let n_rows = ORDER_FIXTURE_ROWS[1];
+        let docs: Vec<String> = (0..n_rows)
+            .map(|row| {
+                let mut text = String::from("alpha");
+                if row.is_multiple_of(BETA_EVERY) {
+                    text.push_str(" beta");
+                }
+                if row.is_multiple_of(RARE_EVERY) {
+                    text.push_str(" rare");
+                }
+                text
+            })
+            .collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let mut next = xorshift(u64::from(n_rows));
+        let mut order: Vec<u32> = (0..n_rows).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let r = FtsReader::open(blob, &json).expect("open");
+        assert!(r.has_doc_map(), "the fixture must be reordered");
+
+        let mut bounds = vec![0];
+        bounds.extend(SLICE_CUTS);
+        bounds.push(n_rows);
+        for terms in [
+            &["alpha"][..],
+            &["rare"],
+            &["beta", "rare"],
+            &["rare", "absent"],
+        ] {
+            let (whole, _) = r
+                .token_match("body", terms, BoolMode::Or)
+                .await
+                .expect("whole walk");
+            let (set, _) = r
+                .match_cursor_set("body", terms, None)
+                .await
+                .expect("cursor set");
+            let mut sliced: Vec<RowId> = Vec::new();
+            for pair in bounds.windows(2) {
+                let (rows, _) = r
+                    .token_match_range_prebuilt(&set, pair[0], pair[1])
+                    .expect("slice");
+                assert!(rows.is_sorted(), "{terms:?}: slice {pair:?} ascending");
+                sliced.extend(rows);
+            }
+            sliced.sort_unstable();
+            assert_eq!(sliced, whole, "{terms:?}");
+        }
+    }
+
     /// Rows of the blob the row-order cases below are put in order over.
     const ORDER_CASE_ROWS: usize = 8;
 

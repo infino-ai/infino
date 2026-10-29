@@ -8,9 +8,10 @@
 //! result avoids decompressing the same Parquet pages on repeated search
 //! fetches while keeping memory independent of table size.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::sync::Mutex;
 
 use arrow_array::RecordBatch;
+use rustc_hash::FxHashMap;
 
 use crate::supertable::manifest::SuperfileUri;
 
@@ -37,7 +38,9 @@ struct CacheEntry {
 
 #[derive(Debug, Default)]
 struct CacheState {
-    entries: HashMap<CacheKey, CacheEntry>,
+    /// Fx-hashed: a key holds every row of a take, millions on a wide
+    /// match, where SipHash over them was 6% of a 2.26M-row match's time.
+    entries: FxHashMap<CacheKey, CacheEntry>,
     bytes: usize,
     tick: u64,
 }

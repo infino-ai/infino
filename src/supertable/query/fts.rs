@@ -124,7 +124,7 @@ use crate::{
             bm25::Bm25Params,
             reader::{
                 Bm25SearchOptions, ClauseLists, ColumnLengthStats, FetchedTermMemo, GlobalTermIdf,
-                LiveFloor, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
+                LiveFloor, MatchWork, OR_WINDOW_MIN_TERMS, OrCursorSet, PreparedClauses, QueryIdf,
                 ScoringView,
             },
             tokenize::Phrase,
@@ -346,12 +346,53 @@ impl MatchKernel {
             docs
         };
         // One flush per superfile: positive + negation walks.
+        self.flush(&work);
+        Ok(docs)
+    }
+
+    /// Whether one superfile's walk may be cut into doc-id slices: a plain
+    /// union of terms, the walk [`Self::slice`] runs one slice of. A
+    /// phrase, a negation or a conjunction of several terms walks the
+    /// whole superfile through [`Self::docs`].
+    fn slices(&self) -> bool {
+        !self.phrase_involved
+            && !self.has_negatives
+            && (matches!(self.mode, BoolMode::Or) || self.terms.len() == 1)
+    }
+
+    /// The cursors every slice of superfile `suid` walks, built once.
+    async fn cursor_set(&self, r: &SuperfileReader, suid: Uuid) -> Result<OrCursorSet, QueryError> {
+        let column = r
+            .column_alias(self.column_field_id, &self.column)
+            .to_owned();
+        let memo = memo_from_locations(r, &self.locations, suid).await;
+        let refs: Vec<&str> = self.terms.iter().map(String::as_str).collect();
+        let (set, work) = r.match_cursor_set(&column, &refs, memo.as_deref()).await?;
+        self.flush(&work);
+        Ok(set)
+    }
+
+    /// The rows in doc-id slice `[start, end)` of a superfile that `set`,
+    /// its [`Self::cursor_set`], matches. A [`Self::slices`] kernel only.
+    fn slice(
+        &self,
+        r: &SuperfileReader,
+        set: &OrCursorSet,
+        start: u32,
+        end: u32,
+    ) -> Result<Vec<RowId>, QueryError> {
+        let (rows, work) = r.token_match_range_prebuilt(set, start, end)?;
+        self.flush(&work);
+        Ok(rows)
+    }
+
+    /// Adds a walk's work to the statement's statistics.
+    fn flush(&self, work: &MatchWork) {
         if let Some(stats) = &self.op_stats {
             stats.add_fts_postings_bytes(work.postings_bytes);
             stats.add_planned_read_ranges(work.planned_ranges);
             stats.add_kernel_cpu_ns(work.kernel_cpu_ns);
         }
-        Ok(docs)
     }
 }
 
@@ -1492,9 +1533,7 @@ impl SupertableReader {
         // re-parsing every term's postings per slice — measured at 1M as
         // 2.5x cold bytes when slicing widened. The OnceCell coalesces
         // concurrent slices of a file; un-ranged units never touch this.
-        type SharedCursorCell = Arc<OnceCell<Arc<OrCursorSet>>>;
-        let cursor_sets: Arc<Mutex<HashMap<Uuid, SharedCursorCell>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let cursor_sets = SharedCursorSets::default();
         // Ranged kernels are multi-millisecond SYNC scans; run them as a
         // rayon wave on the reader pool, bridged with a oneshot, per the
         // concurrency contract. Inline on tokio workers they block the
@@ -2641,6 +2680,12 @@ impl SupertableReader {
     /// between, which on a match of a few hundred thousand rows is most of
     /// what producing a hit set costs. Tombstoned rows are left out, as
     /// the hit path leaves them out.
+    ///
+    /// A plain union of terms over a superfile holding a large share of the
+    /// table is cut into doc-id slices, as many as its share of the reader
+    /// pool ([`build_work_units`]), each walked and taken on its own and out
+    /// as its own batch: a table compacted into one file would otherwise run
+    /// the whole match on one thread.
     pub(crate) async fn token_match_columns_async(
         &self,
         column: &str,
@@ -2651,6 +2696,21 @@ impl SupertableReader {
         let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
             return Ok(Vec::new());
         };
+        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
+        let fanout = match kernel.slices() {
+            true => FanOut::SubRanges,
+            false => FanOut::PerSuperfile,
+        };
+        let kept: Vec<&Arc<SuperfileEntry>> = units.iter().map(|(entry, _)| entry).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<(u32, u32)>))> =
+            build_work_units(&kept, fanout, reader_pool.current_num_threads())
+                .into_iter()
+                .map(|unit| {
+                    let suid = unit.entry.superfile_id;
+                    (unit.entry, (suid, unit.range))
+                })
+                .collect();
+        let cursor_sets = SharedCursorSets::default();
         let manifest = Arc::clone(self.manifest());
         let out_schema =
             hit_output_schema(&manifest.stored_schema(), names).map_err(QueryError::DataFusion)?;
@@ -2664,15 +2724,44 @@ impl SupertableReader {
                          entry: Arc<SuperfileEntry>,
                          cache: Option<Arc<SidecarCache>>,
                          now: Instant,
-                         suid: Uuid| {
+                         (suid, range): (Uuid, Option<(u32, u32)>)| {
             let kernel = Arc::clone(&kernel);
             let manifest = Arc::clone(&manifest);
             let out_schema = Arc::clone(&out_schema);
             let names = Arc::clone(&names);
             let op_stats = op_stats.clone();
             let shared = Arc::clone(&shared);
+            let cursor_sets = Arc::clone(&cursor_sets);
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
-                let docs = kernel.docs(&r, suid).await?;
+                let docs = match range {
+                    None => kernel.docs(&r, suid).await?,
+                    Some((start, end)) => {
+                        let cell = {
+                            let mut sets =
+                                cursor_sets.lock().expect("cursor-set map lock poisoned");
+                            Arc::clone(sets.entry(suid).or_default())
+                        };
+                        let set = cell
+                            .get_or_try_init(|| async {
+                                Ok::<_, QueryError>(Arc::new(kernel.cursor_set(&r, suid).await?))
+                            })
+                            .await?;
+                        // A slice's walk is a sync scan of a share of the
+                        // file: a rayon job on the reader pool, so the
+                        // slices run side by side and no runtime worker
+                        // blocks under one.
+                        let (set, slice_reader, slice_kernel) =
+                            (Arc::clone(set), Arc::clone(&r), Arc::clone(&kernel));
+                        run_on_pool_unless_blocking(
+                            Some(&reader_pool),
+                            "match slice: reader pool dropped result",
+                            move || slice_kernel.slice(&slice_reader, &set, start, end),
+                        )
+                        .await
+                        .map_err(|e| QueryError::Internal(e.to_string()))??
+                    }
+                };
                 let mut locals: Vec<u32> = docs.into_iter().map(RowId::get).collect();
                 if let Some(cache) = cache.as_ref()
                     && let Some(deny) =
@@ -3448,6 +3537,11 @@ impl SupertableReader {
         self.block_on(self.exact_match_async(column, value))
     }
 }
+
+/// The cursors one superfile's doc-id slices share, keyed by superfile id
+/// and built by the first slice to need them; the `OnceCell` coalesces
+/// concurrent slices of a file.
+type SharedCursorSets = Arc<Mutex<HashMap<Uuid, Arc<OnceCell<Arc<OrCursorSet>>>>>>;
 
 /// One unit of per-superfile search work scheduled into the reader
 /// pool's `par_iter`. `range == None` means "the whole superfile" and

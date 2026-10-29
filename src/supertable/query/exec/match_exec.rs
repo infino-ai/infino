@@ -683,6 +683,53 @@ mod tests {
         assert_aggregates_equal_the_rows(&st);
     }
 
+    /// Threads of the reader pool the sliced-match fixture reads with: more
+    /// than one, so a large superfile's match is cut into doc-id slices.
+    const SLICING_READER_THREADS: usize = 4;
+    /// Rows of the sliced-match fixture's one superfile: enough for three
+    /// slices at the fewest docs a slice is cut at.
+    const SLICED_ROWS: usize = 150_000;
+
+    /// The same agreement when one superfile is large enough, and the
+    /// reader pool wide enough, for an aggregate's match to be cut into
+    /// doc-id slices walked side by side: before and after a delete, whose
+    /// row each slice must leave out on its own.
+    #[test]
+    fn aggregates_over_a_sliced_match_equal_the_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let reader_pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(SLICING_READER_THREADS)
+                .build()
+                .expect("reader pool"),
+        );
+        let st = Supertable::create(
+            options_title_fts()
+                .with_storage(storage)
+                .with_reader_pool(reader_pool),
+        )
+        .expect("create");
+        let titles: Vec<&str> = STORED_COMMITS
+            .iter()
+            .flat_map(|commit| commit.iter().copied())
+            .cycle()
+            .take(SLICED_ROWS)
+            .collect();
+        {
+            let mut w = st.writer().expect("writer");
+            w.append(&titles_batch(&titles)).expect("append");
+            w.commit().expect("commit");
+        }
+        assert_eq!(st.reader().expect("reader").n_superfiles(), 1);
+        assert_aggregates_equal_the_rows(&st);
+
+        st.delete(col("title").eq(lit(DELETED_TITLE)))
+            .expect("delete");
+        assert_aggregates_equal_the_rows(&st);
+    }
+
     #[test]
     fn token_match_tvf_or_unions_and_intersects() {
         let st = demo();
