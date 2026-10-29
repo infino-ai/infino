@@ -71,6 +71,11 @@ use crate::{
     },
 };
 
+/// Bytes a decoded string or binary value takes per row beside its data: a
+/// view, as the scan reads non-indexed strings, and the most any of Arrow's
+/// variable-width layouts takes.
+const VIEW_BYTES_PER_ROW: usize = 16;
+
 /// One file of the scan: what its row groups are read from.
 #[derive(Debug)]
 pub(crate) struct CachedFile {
@@ -210,7 +215,7 @@ impl CachedScanExec {
                 }
             }
         }
-        if decoded_bytes(&units, &names) > cache.max_bytes() {
+        if decoded_bytes(&units, &schema) > cache.max_bytes() {
             return None;
         }
         let partitions = target_partitions.clamp(1, units.len().max(1));
@@ -242,34 +247,52 @@ impl CachedScanExec {
     }
 }
 
-/// About how many bytes the `columns` of `units`' row groups take decoded:
-/// their column chunks' uncompressed sizes, from the footers. A value
-/// decodes to about its uncompressed size (a string gains an offset). A
-/// column a file holds under another name, after a rename, isn't found by
+/// About how many bytes the columns of `schema` take decoded over `units`'
+/// row groups, from the footers:
+/// - a fixed-width column, its width per row;
+/// - any other, [`VIEW_BYTES_PER_ROW`] per row plus its values' bytes, which
+///   the footer records unencoded (a dictionary-encoded column stores far
+///   fewer bytes than it decodes to), or failing that its chunk's
+///   uncompressed size.
+///
+/// A column a file holds under another name, after a rename, isn't found by
 /// this name and counts as nothing; the estimate decides only which scan
 /// serves the statement, never what it returns.
-fn decoded_bytes(units: &[RowGroupUnit], columns: &[&str]) -> usize {
+fn decoded_bytes(units: &[RowGroupUnit], schema: &Schema) -> usize {
     units
         .iter()
         .map(|unit| {
             let meta = unit.file.reader.parquet_metadata();
-            meta.row_groups()
-                .get(unit.row_group)
-                .map_or(0, |row_group| {
-                    row_group
-                        .columns()
-                        .iter()
-                        .filter(|chunk| {
-                            chunk
-                                .column_descr()
-                                .path()
-                                .parts()
-                                .first()
-                                .is_some_and(|root| columns.contains(&root.as_str()))
-                        })
-                        .map(|chunk| usize::try_from(chunk.uncompressed_size()).unwrap_or(0))
-                        .sum::<usize>()
+            let Some(row_group) = meta.row_groups().get(unit.row_group) else {
+                return 0;
+            };
+            let rows = usize::try_from(row_group.num_rows()).unwrap_or(0);
+            schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    let Some(chunk) = row_group.columns().iter().find(|chunk| {
+                        chunk
+                            .column_descr()
+                            .path()
+                            .parts()
+                            .first()
+                            .is_some_and(|root| root == field.name())
+                    }) else {
+                        return 0;
+                    };
+                    match field.data_type().primitive_width() {
+                        Some(width) => rows.saturating_mul(width),
+                        None => {
+                            let values = chunk
+                                .unencoded_byte_array_data_bytes()
+                                .unwrap_or_else(|| chunk.uncompressed_size());
+                            rows.saturating_mul(VIEW_BYTES_PER_ROW)
+                                .saturating_add(usize::try_from(values).unwrap_or(0))
+                        }
+                    }
                 })
+                .sum::<usize>()
         })
         .sum()
 }
