@@ -28,6 +28,7 @@ pub mod fts;
 #[cfg(feature = "graph-index")]
 pub mod graph;
 pub mod hierarchical_iter;
+pub(crate) mod limit_stage;
 pub mod provider;
 pub mod prune;
 pub(crate) mod read_ahead;

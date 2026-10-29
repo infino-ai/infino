@@ -39,6 +39,19 @@ const ROWS_PER_COMMIT: usize = 50;
 const DISK_CACHE_BUDGET_BYTES: u64 = 1 << 30;
 /// Mmap promotion timers disabled in tests.
 const MMAP_TIMER_DISABLED_SECS: u64 = 0;
+/// A range that cuts into commits 0 and 3 and covers commits 1 and 2, so
+/// the rewrite mixes covered statistics with a residual scan.
+const CUT_RANGE_LO: i64 = 25;
+const CUT_RANGE_HI: i64 = 3025;
+/// The mixed-case column's value over a row's rating.
+const PRICE_SCALE: i64 = 2;
+/// The dotted column's value over a row's rating.
+const BYTES_OFFSET: i64 = 1;
+/// How far an AVG may sit from its closed form.
+const AVG_TOLERANCE: f64 = 1e-9;
+
+/// A column of the exact-name fixture: its name, and its value over a row's rating.
+type NamedColumn = (&'static str, fn(i64) -> i64);
 
 fn options_cat_rating() -> SupertableOptions {
     let schema = Arc::new(Schema::new(vec![
@@ -307,6 +320,91 @@ fn boundary_cutting_range_mixes_covered_and_residual_exactly() {
         count_bonus_plan.contains("__resid_0"),
         "COUNT(bonus) takes the covered/residual path; plan was:\n{count_bonus_plan}"
     );
+}
+
+fn price_usd(rating: i64) -> i64 {
+    rating * PRICE_SCALE
+}
+
+fn geo_bytes(rating: i64) -> i64 {
+    rating + BYTES_OFFSET
+}
+
+/// A column whose name is not plain lower-case SQL (mixed case, or a dot,
+/// as a flattened document path has) is aggregated by that exact name on
+/// the residual scan. Rebuilt from SQL text, `PriceUsd` would read as
+/// `priceusd` and `geo.bytes` as column `bytes` of a table `geo`, and the
+/// query would fail.
+#[test]
+fn residual_aggregates_read_a_column_by_its_exact_name() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("rating", DataType::Int64, false),
+        Field::new("PriceUsd", DataType::Int64, false),
+        Field::new("geo.bytes", DataType::Int64, false),
+    ]));
+    let st = Supertable::create(
+        SupertableOptions::new(schema.clone(), vec![], vec![]).expect("valid options"),
+    )
+    .expect("create");
+    let mut w = st.writer().expect("writer");
+    for idx in 0..COMMITS {
+        let ratings: Vec<i64> = (0..ROWS_PER_COMMIT)
+            .map(|r| fixture_row(idx, r).0)
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(ratings.clone())),
+                Arc::new(Int64Array::from(
+                    ratings.iter().map(|&r| price_usd(r)).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    ratings.iter().map(|&r| geo_bytes(r)).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+    drop(w);
+
+    let where_range = format!("rating >= {CUT_RANGE_LO} AND rating <= {CUT_RANGE_HI}");
+    let in_range: Vec<i64> = fixture_rows()
+        .into_iter()
+        .map(|(rating, _)| rating)
+        .filter(|rating| (CUT_RANGE_LO..=CUT_RANGE_HI).contains(rating))
+        .collect();
+    let columns: [NamedColumn; 2] = [("PriceUsd", price_usd), ("geo.bytes", geo_bytes)];
+    for (column, value_of) in columns {
+        let values: Vec<i64> = in_range.iter().map(|&r| value_of(r)).collect();
+        let sql = format!(
+            "SELECT SUM(\"{column}\"), MIN(\"{column}\"), MAX(\"{column}\"), COUNT(\"{column}\") \
+             FROM supertable WHERE {where_range}"
+        );
+        assert_eq!(
+            row_i64s(&st, &sql),
+            vec![
+                values.iter().sum::<i64>(),
+                *values.iter().min().expect("rows in range"),
+                *values.iter().max().expect("rows in range"),
+                values.len() as i64,
+            ],
+            "{sql}"
+        );
+        let plan = explain(&st, &sql);
+        assert!(
+            plan.contains("__resid_0"),
+            "{sql}: expected the covered/residual rewrite; plan was:\n{plan}"
+        );
+
+        let avg_sql = format!("SELECT AVG(\"{column}\") FROM supertable WHERE {where_range}");
+        let expected_avg = values.iter().sum::<i64>() as f64 / values.len() as f64;
+        assert!(
+            (scalar_f64(&st, &avg_sql) - expected_avg).abs() < AVG_TOLERANCE,
+            "{avg_sql}"
+        );
+    }
 }
 
 /// A range over a column with nulls never answers a segment from its

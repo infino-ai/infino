@@ -15,10 +15,12 @@
 //! untouched.
 
 use std::{
+    collections::HashMap,
     fmt::{Debug, Formatter, Result as FmtResult},
+    mem,
     ops::Range,
     sync::{
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -41,8 +43,8 @@ pub struct SlowStorage {
     reads: AtomicUsize,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
-    /// The object each read started on, in order.
-    read_uris: Mutex<Vec<String>>,
+    /// Each read's start and finish, in order, by the object it read.
+    read_log: Mutex<Vec<ReadEvent>>,
     /// Whether reads are parked before they reach the inner provider.
     held: watch::Sender<bool>,
 }
@@ -56,7 +58,7 @@ impl SlowStorage {
             reads: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
-            read_uris: Mutex::new(Vec::new()),
+            read_log: Mutex::new(Vec::new()),
             held: watch::Sender::new(false),
         })
     }
@@ -79,12 +81,34 @@ impl SlowStorage {
 
     /// Reads started so far on an object whose path contains `fragment`.
     pub fn reads_of(&self, fragment: &str) -> usize {
-        self.read_uris
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.log()
             .iter()
-            .filter(|uri| uri.contains(fragment))
+            .filter(|event| event.started && event.uri.contains(fragment))
             .count()
+    }
+
+    /// The most objects whose path contains `fragment` that ever had a read
+    /// in flight at once, however many reads each had.
+    pub fn max_objects_in_flight_of(&self, fragment: &str) -> usize {
+        let mut reading: HashMap<&str, usize> = HashMap::new();
+        let mut most = 0;
+        for event in self.log().iter().filter(|e| e.uri.contains(fragment)) {
+            let reads = reading.entry(&event.uri).or_default();
+            if event.started {
+                *reads += 1;
+            } else {
+                *reads -= 1;
+                if *reads == 0 {
+                    reading.remove(event.uri.as_str());
+                }
+            }
+            most = most.max(reading.len());
+        }
+        most
+    }
+
+    fn log(&self) -> MutexGuard<'_, Vec<ReadEvent>> {
+        self.read_log.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Reads started and not yet finished, counting one abandoned midway.
@@ -106,23 +130,39 @@ impl SlowStorage {
     /// Count a read in for as long as the returned guard lives, so a read
     /// whose future is dropped midway still counts out.
     fn start_read(&self, uri: &str) -> InFlight<'_> {
-        self.read_uris
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(uri.to_owned());
+        self.log().push(ReadEvent {
+            uri: uri.to_owned(),
+            started: true,
+        });
         self.reads.fetch_add(1, Ordering::SeqCst);
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        InFlight(&self.in_flight)
+        InFlight {
+            storage: self,
+            uri: uri.to_owned(),
+        }
     }
 }
 
+/// A read starting or finishing on `uri`.
+struct ReadEvent {
+    uri: String,
+    started: bool,
+}
+
 /// One read in flight; see [`SlowStorage::start_read`].
-struct InFlight<'a>(&'a AtomicUsize);
+struct InFlight<'a> {
+    storage: &'a SlowStorage,
+    uri: String,
+}
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.storage.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.storage.log().push(ReadEvent {
+            uri: mem::take(&mut self.uri),
+            started: false,
+        });
     }
 }
 

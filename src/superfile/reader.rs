@@ -91,7 +91,7 @@ use crate::{
 /// covers a typical superfile footer (its `inf.*` KVs plus a single
 /// row group's column metadata — a few KiB to a few tens of KiB) in
 /// one range GET, so the cold open usually costs a single round-trip.
-const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
+pub(crate) const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 
 /// A cold `_id` read takes the whole stable-id sidecar once it asks for at
 /// least one distinct row in this many. At half the rows nearly every page of
@@ -833,6 +833,16 @@ impl SuperfileReader {
         &self.parquet_meta
     }
 
+    /// [`Self::parquet_metadata_with_page_index`] when it needs no read or
+    /// decode: the open already loaded the page indexes, or an earlier call
+    /// did. `None` means that call would do work.
+    pub(crate) fn loaded_parquet_metadata_with_page_index(&self) -> Option<Arc<ParquetMetaData>> {
+        if self.parquet_meta.offset_index().is_some() {
+            return Some(Arc::clone(&self.parquet_meta));
+        }
+        self.page_index_meta.get().cloned()
+    }
+
     /// Parquet metadata with the page indexes (column + offset) loaded
     /// when available.
     ///
@@ -851,8 +861,8 @@ impl SuperfileReader {
     pub(crate) async fn parquet_metadata_with_page_index(
         &self,
     ) -> Result<Arc<ParquetMetaData>, ReadError> {
-        if self.parquet_meta.offset_index().is_some() {
-            return Ok(Arc::clone(&self.parquet_meta));
+        if let Some(loaded) = self.loaded_parquet_metadata_with_page_index() {
+            return Ok(loaded);
         }
         let source = self.source.as_ref().map(Arc::clone);
         let bytes = self.bytes.clone();
@@ -1920,6 +1930,36 @@ impl SuperfileReader {
         Ok(fts
             .token_match_prefetched(column, tokens, mode, prefetched)
             .await?)
+    }
+
+    /// The cursors of an `Or` match over `tokens`, built once for this
+    /// superfile's doc-id slices. Delegates to
+    /// [`FtsReader::match_cursor_set`].
+    pub(crate) async fn match_cursor_set(
+        &self,
+        column: &str,
+        tokens: &[&str],
+        prefetched: Option<&FetchedTermMemo>,
+    ) -> Result<(OrCursorSet, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.match_cursor_set(column, tokens, prefetched).await?)
+    }
+
+    /// One doc-id slice of an `Or` match against cursors
+    /// [`Self::match_cursor_set`] built. Delegates to
+    /// [`FtsReader::token_match_range_prebuilt`].
+    pub(crate) fn token_match_range_prebuilt(
+        &self,
+        set: &OrCursorSet,
+        start: u32,
+        end: u32,
+    ) -> Result<(Vec<RowId>, MatchWork), ReadError> {
+        let fts = self
+            .fts()
+            .ok_or_else(|| ReadError::MissingKv(kv::FTS_OFFSET))?;
+        Ok(fts.token_match_range_prebuilt(set, start, end)?)
     }
 
     /// Widen the tokens of one `LIKE` leaf to the indexed terms of

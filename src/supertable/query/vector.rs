@@ -81,7 +81,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
 use datafusion::logical_expr::Expr;
-use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
 use tracing::{Instrument, warn};
@@ -148,7 +148,10 @@ use crate::{
         },
         tombstones::SidecarCache,
     },
-    utils::trace::{self, detail_span, tiered_span},
+    utils::{
+        join::try_join_bounded,
+        trace::{self, detail_span, tiered_span},
+    },
 };
 
 /// A calibrated law width at or below this resolves to `None`: one cell
@@ -1848,7 +1851,7 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
         // Build outside the lock. Each cell single-flights its superfile's index
         // (a second concurrent cold query for the same uri awaits this build,
         // not a duplicate one); the CPU inversion runs on the reader pool, not
-        // the tokio blocking pool. `try_join_all` preserves `cells` order, so
+        // the tokio blocking pool. `try_join_bounded` preserves `cells` order, so
         // the probe below stays deterministic in manifest order.
         // `unbuilt` is how many of those maps this call waits on: every gapped
         // file on a freshly started process, none once the cache is warm.
@@ -1857,17 +1860,19 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
             gapped = cells.len(),
             unbuilt = cells.iter().filter(|(_, cell)| !cell.initialized()).count(),
         );
-        let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> =
-            try_join_all(cells.into_iter().map(|(entry, cell)| async move {
+        let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> = try_join_bounded(
+            cells.into_iter().map(|(entry, cell)| async move {
                 let index = cell
                     .get_or_try_init(|| {
                         build_gapped_placement_index(manifest, &entry, id_column, op_stats)
                     })
                     .await?;
                 Ok::<_, QueryError>((entry, Arc::clone(index)))
-            }))
-            .instrument(span)
-            .await?;
+            }),
+            manifest.options.superfiles_in_flight,
+        )
+        .instrument(span)
+        .await?;
         // Probe in manifest (gapped) order: if an id is resident in two live
         // superfiles — an updated row's tombstoned-old copy plus its live copy,
         // both physical rows to `read_ids_for_locals` — first-wins resolves it to
@@ -6276,8 +6281,8 @@ impl SupertableReader {
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
-        // carries no bitmaps and fans out all units at once (matching
-        // main's concurrency — every superfile GET overlaps on tokio).
+        // carries no bitmaps and fans out as wide as the fan-out allows
+        // (`superfiles_in_flight` units), so its GETs overlap on tokio.
         let fanout_t0 = io_counters::phase_start();
         let scan_span = trace::phase(phases, || tiered_span!("vector.scan", units = units.len()));
         let mut per_superfile = if allow.is_some() {
@@ -10343,6 +10348,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
+            options::DEFAULT_SUPERFILES_IN_FLIGHT,
             query::SuperfileHit,
             tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
             wal::{WalStore, tombstones_codec::TombstonesSidecar},
@@ -10386,6 +10392,7 @@ mod tests {
                 manifest_id: 1,
                 seqs: [(sf_id, 1u64)].into_iter().collect(),
             }),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
         // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
         let mut bitmap = roaring::RoaringBitmap::new();
@@ -10454,6 +10461,7 @@ mod tests {
             ws,
             DEFAULT_SEAL_TTL,
             Arc::new(TombstoneSeqView::default()),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
 
         let entry = synthetic_entry(Uuid::from_u128(0x1111));

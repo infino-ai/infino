@@ -50,10 +50,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
-use futures::{
-    FutureExt, TryStreamExt,
-    future::{BoxFuture, try_join_all},
-};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture};
 use object_store::{ObjectStore, path::Path as ObjPath};
 use parquet::{
     arrow::{
@@ -92,7 +89,7 @@ use crate::{
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
         tombstones::SidecarCache,
     },
-    utils::trace::record,
+    utils::{join::try_join_bounded, trace::record},
 };
 
 /// A table function's search, run under `span` with the batch's row count
@@ -1263,30 +1260,37 @@ async fn resolve_columns(
     // table the cache cannot hold, so resolving a hit's columns never starts
     // a whole-file download the search itself declined.
     let intent = reader.open_intent();
-    let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
-        let entry = manifest
-            .lookup_superfile_entry(uri)
+    // Each list of futures below is collected before the join: they do no
+    // work until polled, and a lazy iterator held across the join's awaits
+    // trips rustc's "`FnOnce` is not general enough" in the callers' streams.
+    let in_flight = manifest.options.superfiles_in_flight;
+    let opens: Vec<_> = misses
+        .into_iter()
+        .map(|(index, uri)| async move {
+            let entry = manifest
+                .lookup_superfile_entry(uri)
+                .await
+                .map_err(QueryError::ManifestLoad)?
+                .ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "resolve_hits: superfile {uri:?} missing from manifest"
+                    ))
+                })?;
+            superfile_reader(
+                store,
+                disk_cache,
+                storage,
+                &entry.uri,
+                &entry.storage_path(),
+                entry.subsection_offsets.as_ref(),
+                intent,
+            )
             .await
-            .map_err(QueryError::ManifestLoad)?
-            .ok_or_else(|| {
-                QueryError::Internal(format!(
-                    "resolve_hits: superfile {uri:?} missing from manifest"
-                ))
-            })?;
-        superfile_reader(
-            store,
-            disk_cache,
-            storage,
-            &entry.uri,
-            &entry.storage_path(),
-            entry.subsection_offsets.as_ref(),
-            intent,
-        )
-        .await
-        .map(|reader| (index, reader))
-        .map_err(|error| DataFusionError::from(QueryError::store(error)))
-    }))
-    .await?;
+            .map(|reader| (index, reader))
+            .map_err(|error| DataFusionError::from(QueryError::store(error)))
+        })
+        .collect();
+    let opened = try_join_bounded(opens, in_flight).await?;
 
     // Materialize each superfile's projected hit rows, split by tier:
     //
@@ -1355,12 +1359,14 @@ async fn resolve_columns(
     };
 
     let out_schema_ref = &out_schema;
-    let cold_wave = try_join_all(cold_units.into_iter().map(
-        |(i, rd, locals, adapter)| async move {
+    let cold_takes: Vec<_> = cold_units
+        .into_iter()
+        .map(|(i, rd, locals, adapter)| async move {
             let batch = take_lazy_file(rd, locals, names, &adapter, out_schema_ref).await?;
             Ok::<_, DataFusionError>((i, batch))
-        },
-    ));
+        })
+        .collect();
+    let cold_wave = try_join_bounded(cold_takes, in_flight);
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
     let warm_done = warm_done?;
