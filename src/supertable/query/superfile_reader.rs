@@ -57,7 +57,7 @@ use crate::{
         manifest::{SubsectionOffsets, SuperfileUri},
         reader_cache::{
             DiskCacheStore, OpenTier, ReadIntent, ReaderCacheError, SuperfileReaderCache,
-            disk::DiskCacheError,
+            disk::{DiskCacheError, open_batch_overlay},
         },
     },
 };
@@ -140,31 +140,60 @@ pub async fn superfile_reader_tiered(
     // cost a one-hour query over a 1 GiB superfile the whole gigabyte, and a
     // scan over many files that many gigabytes resident at once.
     if let Some(storage) = storage {
-        // One suffix GET learns the object's size and its parquet tail. The
-        // tail stays in an overlay in front of the range source, so the
-        // open's footer read, the page-index read and the end of the last
-        // row group, which lies in it, are served from it rather than
-        // fetched a second time. With nothing caching the object, the
-        // overlay is the only thing that remembers the tail.
-        let (tail, total) = storage
-            .tail(storage_key, DEFAULT_TAIL_SPECULATIVE_BYTES)
-            .await
-            .map_err(|e| ReaderCacheError::OpenFailed {
-                source: fetch_failed(format!("storage tail {storage_key}"), e),
-            })?;
-        let ranges: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
-            Arc::clone(storage),
-            storage_key.to_owned(),
-            total,
-        ));
-        let mut source = PrefetchedSource::new(ranges);
-        source.install(total - tail.len() as u64, tail);
+        let source: Arc<dyn LazyByteSource> = match offsets {
+            // The manifest entry says how big the object is and carries its
+            // open batch, or what to fetch for one: the same overlay the disk
+            // cache's lazy open builds, so the open costs the same round
+            // trips with or without a cache, and none when the manifest
+            // carried the batch whole.
+            Some(offsets) => {
+                let ranges: Arc<dyn LazyByteSource> =
+                    Arc::new(StorageRangeSource::with_known_size(
+                        Arc::clone(storage),
+                        storage_key.to_owned(),
+                        offsets.total_size,
+                    ));
+                let overlay = open_batch_overlay(
+                    Arc::clone(storage),
+                    storage_key.to_owned(),
+                    offsets,
+                    ranges,
+                )
+                .await
+                .map_err(|e| ReaderCacheError::OpenFailed {
+                    source: fetch_failed(format!("storage open batch {storage_key}"), e),
+                })?;
+                Arc::new(overlay)
+            }
+            // Without one, a suffix GET learns the object's size and its
+            // parquet tail. The tail stays in an overlay in front of the
+            // range source, so the open's footer read and the page-index
+            // read are served from it rather than fetched a second time.
+            // With nothing caching the object, the overlay is the only thing
+            // that remembers the tail.
+            None => {
+                let (tail, total) = storage
+                    .tail(storage_key, DEFAULT_TAIL_SPECULATIVE_BYTES)
+                    .await
+                    .map_err(|e| ReaderCacheError::OpenFailed {
+                        source: fetch_failed(format!("storage tail {storage_key}"), e),
+                    })?;
+                let ranges: Arc<dyn LazyByteSource> =
+                    Arc::new(StorageRangeSource::with_known_size(
+                        Arc::clone(storage),
+                        storage_key.to_owned(),
+                        total,
+                    ));
+                let mut source = PrefetchedSource::new(ranges);
+                source.install(total - tail.len() as u64, tail);
+                Arc::new(source)
+            }
+        };
         // No CRC check: it reads the whole file, and this path reads only
         // the ranges a query touches.
-        let reader =
-            SuperfileReader::open_lazy_with(Arc::new(source), OpenOptions { verify_crc: false })
-                .await
-                .map_err(|source| ReaderCacheError::OpenFailed { source })?;
+        let reader = SuperfileReader::open_lazy_with(source, OpenOptions { verify_crc: false })
+            .await
+            .map_err(|source| ReaderCacheError::OpenFailed { source })?;
         return Ok((Arc::new(reader), OpenTier::Lazy));
     }
 
@@ -281,16 +310,19 @@ mod tests {
 
     use super::*;
     use crate::{
+        runtime_metrics::io::{UriClass, UsageMeter},
         storage::{LocalFsStorageProvider, StorageError},
         superfile::{
             FtsError, ReadError,
             builder::{BuilderOptions, SuperfileBuilder},
         },
         supertable::{
-            QueryError,
+            QueryError, Supertable,
             reader_cache::{InMemoryReaderCache, config::DiskCacheConfig},
         },
-        test_helpers::{decimal128_id_field, decimal128_ids},
+        test_helpers::{
+            build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
+        },
     };
 
     /// `n_docs()` of the superfile every helper below builds — three
@@ -419,6 +451,54 @@ mod tests {
         .expect("storage-only fallback");
         assert_eq!(reader.n_docs(), N_DOCS);
         assert_eq!(tier, OpenTier::Lazy, "a cacheless open reads by range");
+    }
+
+    /// A cacheless open of a superfile whose manifest entry carries its open
+    /// batch fetches nothing from the object: the batch rides in from the
+    /// manifest, as it does for the disk cache's lazy open, so the open costs
+    /// the same round trips with or without a cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cacheless_open_with_the_manifest_open_batch_fetches_nothing() {
+        let dir = TempDir::new().expect("tempdir");
+        let meter = UsageMeter::new();
+        let storage: Arc<dyn StorageProvider> = Arc::new(
+            LocalFsStorageProvider::new_with_meter(dir.path(), Arc::clone(&meter))
+                .expect("localfs"),
+        );
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["a", "b", "c"]))
+            .expect("append");
+        w.commit().expect("commit");
+        let manifest = st.inner().manifest.load_full();
+        let entry = manifest.superfiles.first().expect("one superfile");
+        let offsets = entry.subsection_offsets.as_ref().expect("offsets");
+        assert!(
+            !offsets.open_blob.is_empty(),
+            "the writer carried the open batch"
+        );
+
+        let before = meter.snapshot();
+        let (reader, tier) = superfile_reader_tiered(
+            &empty_store(),
+            None,
+            Some(&storage),
+            &entry.uri,
+            &entry.storage_path(),
+            Some(offsets),
+            ReadIntent::Warm,
+        )
+        .await
+        .expect("storage-only fallback");
+        assert_eq!(tier, OpenTier::Lazy);
+        assert_eq!(reader.n_docs(), N_DOCS);
+        let data = meter.snapshot().since(&before).class_io(UriClass::UserData);
+        assert_eq!(
+            data.get_count, 0,
+            "the open batch came from the manifest, not the object"
+        );
     }
 
     // ---- tier 1: non-NotFound error short-circuits ---------------------

@@ -41,7 +41,7 @@ use crate::{
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, PrefetchedSource, ReadError,
         format::{footer, kv},
-        reader::{OpenOptions, SuperfileReader},
+        reader::{DEFAULT_TAIL_SPECULATIVE_BYTES, OpenOptions, SuperfileReader},
     },
     supertable::{
         StorageRangeSource,
@@ -634,22 +634,6 @@ impl DiskCacheStore {
         );
     }
 
-    /// The `(offset, len)` ranges of `wanted` that no entry of `blob`
-    /// covers whole — what the open wave still has to fetch when the
-    /// manifest inlined only part of the open batch.
-    fn uncovered_ranges(blob: &[(u64, Vec<u8>)], wanted: &[(u64, u64)]) -> Vec<(u64, u64)> {
-        wanted
-            .iter()
-            .copied()
-            .filter(|&(off, len)| {
-                len > 0
-                    && !blob.iter().any(|(start, bytes)| {
-                        *start <= off && off + len <= *start + bytes.len() as u64
-                    })
-            })
-            .collect()
-    }
-
     /// Lazy cold-fetch path. Foreground builds a reader via
     /// `SuperfileReader::open_lazy_with(StorageRangeSource)`;
     /// background task waits for foreground lazy readers to release,
@@ -701,36 +685,6 @@ impl DiskCacheStore {
                 .await;
             let eager = whole_file.is_some();
 
-            // Match `SuperfileReader::open_lazy_with`'s parquet tail
-            // speculation length so the overlay covers the entire
-            // upcoming `source.tail()` call.
-            let parquet_tail_len = PARQUET_TAIL_SPEC_BYTES.min(total_size);
-            let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
-
-            // Seed the inner lazy readers with exact open-time metadata
-            // when the manifest carries it. Older/incomplete hints fall
-            // back to fixed headers; the readers then discover the rest.
-            let vec_ranges = if !offsets.vec_open_ranges.is_empty() {
-                offsets.vec_open_ranges.clone()
-            } else {
-                match offsets.vec {
-                    Some((off, len)) if len > 0 => {
-                        vec![(off, VECTOR_OPEN_HEADER_FALLBACK_BYTES.min(len))]
-                    }
-                    _ => Vec::new(),
-                }
-            };
-            let fts_ranges = if !offsets.fts_open_ranges.is_empty() {
-                offsets.fts_open_ranges.clone()
-            } else {
-                match offsets.fts {
-                    Some((off, len)) if len > 0 => {
-                        vec![(off, FTS_OPEN_HEADER_FALLBACK_BYTES.min(len))]
-                    }
-                    _ => Vec::new(),
-                }
-            };
-
             // Build the lazy source with the size baked in (no HEAD or suffix
             // discovery), then overlay the open-time byte ranges.
             let inner: Arc<dyn LazyByteSource> = Arc::new(StorageRangeSource::with_known_size(
@@ -751,57 +705,13 @@ impl DiskCacheStore {
             );
             unadmitted.sources.push(Arc::clone(&block_source));
             let block_source_arc = Arc::clone(&block_source);
-            let mut overlay = PrefetchedSource::new(block_source);
-
-            // Whatever the manifest part carried rides straight into the
-            // overlay; the rest of the open batch — the parquet tail and
-            // any open range the writer left out of the blob because
-            // copying it into every manifest read would cost more than
-            // the round trip (a large vector index, or the term dictionary
-            // an older writer recorded as an open range) — is fetched over
-            // the wire in one parallel wave. A complete blob means zero
-            // open-time GETs against the superfile object.
-            for (off, bytes) in &offsets.open_blob {
-                overlay.install(*off, Bytes::copy_from_slice(bytes));
-            }
-            let tail_range = (parquet_tail_start, parquet_tail_len);
-            let tail_missing = parquet_tail_len > 0
-                && !Self::uncovered_ranges(&offsets.open_blob, &[tail_range]).is_empty();
-            let vec_missing = Self::uncovered_ranges(&offsets.open_blob, &vec_ranges);
-            let fts_missing = Self::uncovered_ranges(&offsets.open_blob, &fts_ranges);
-            if tail_missing || !vec_missing.is_empty() || !fts_missing.is_empty() {
-                let storage_for_parquet = Arc::clone(&fetch_storage);
-                let storage_for_vec = Arc::clone(&fetch_storage);
-                let storage_for_fts = Arc::clone(&fetch_storage);
-                let parquet_uri = storage_uri.clone();
-                let vec_uri = storage_uri.clone();
-                let fts_uri = storage_uri.clone();
-
-                let parquet_fut = async move {
-                    if !tail_missing {
-                        return Ok::<_, StorageError>(Bytes::new());
-                    }
-                    storage_for_parquet
-                        .get_range(&parquet_uri, parquet_tail_start..total_size)
-                        .await
-                };
-                let vec_fut =
-                    async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_missing).await };
-                let fts_fut =
-                    async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_missing).await };
-
-                let (parquet_bytes, vec_pre, fts_pre) =
-                    futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
-                if !parquet_bytes.is_empty() {
-                    overlay.install(parquet_tail_start, parquet_bytes);
-                }
-                for (off, bytes) in vec_pre {
-                    overlay.install(off, bytes);
-                }
-                for (off, bytes) in fts_pre {
-                    overlay.install(off, bytes);
-                }
-            }
+            let overlay = open_batch_overlay(
+                Arc::clone(&fetch_storage),
+                storage_uri.clone(),
+                offsets,
+                block_source,
+            )
+            .await?;
             let source: Arc<dyn LazyByteSource> = Arc::new(overlay);
 
             // Every internal read inside `open_lazy_with` (parquet tail,
@@ -1129,6 +1039,111 @@ async fn finalize_to_mmap(
         let _ = fs::remove_file(&tmp_path);
     }
     res
+}
+
+/// The `(offset, len)` ranges of `wanted` that no entry of `blob`
+/// covers whole — what the open wave still has to fetch when the
+/// manifest inlined only part of the open batch.
+fn uncovered_ranges(blob: &[(u64, Vec<u8>)], wanted: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    wanted
+        .iter()
+        .copied()
+        .filter(|&(off, len)| {
+            len > 0
+                && !blob
+                    .iter()
+                    .any(|(start, bytes)| *start <= off && off + len <= *start + bytes.len() as u64)
+        })
+        .collect()
+}
+
+/// The open batch of a lazy open over `inner`, a range source of the object
+/// `offsets` describes, in an overlay in front of it. Whatever the manifest
+/// part carried in its open blob rides straight in; the rest, the parquet
+/// tail and any open range the writer left out of the blob because copying
+/// it into every manifest read would cost more than the round trip (a large
+/// vector index, or the term dictionary an older writer recorded as an open
+/// range), is fetched over the wire in one parallel wave. A complete blob
+/// means zero open-time GETs against the object. Older or incomplete hints
+/// fall back to fixed headers; the readers then discover the rest. Shared by
+/// the disk cache's lazy open and the cacheless fallback, so both open a
+/// superfile with the same round trips.
+pub(crate) async fn open_batch_overlay(
+    storage: Arc<dyn StorageProvider>,
+    storage_uri: String,
+    offsets: &SubsectionOffsets,
+    inner: Arc<dyn LazyByteSource>,
+) -> Result<PrefetchedSource, StorageError> {
+    let total_size = offsets.total_size;
+    // Match `SuperfileReader::open_lazy_with`'s parquet tail
+    // speculation length so the overlay covers the entire
+    // upcoming `source.tail()` call.
+    let parquet_tail_len = DEFAULT_TAIL_SPECULATIVE_BYTES.min(total_size);
+    let parquet_tail_start = total_size.saturating_sub(parquet_tail_len);
+
+    // Seed the inner lazy readers with exact open-time metadata
+    // when the manifest carries it. Older/incomplete hints fall
+    // back to fixed headers; the readers then discover the rest.
+    let vec_ranges = if !offsets.vec_open_ranges.is_empty() {
+        offsets.vec_open_ranges.clone()
+    } else {
+        match offsets.vec {
+            Some((off, len)) if len > 0 => {
+                vec![(off, VECTOR_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+            }
+            _ => Vec::new(),
+        }
+    };
+    let fts_ranges = if !offsets.fts_open_ranges.is_empty() {
+        offsets.fts_open_ranges.clone()
+    } else {
+        match offsets.fts {
+            Some((off, len)) if len > 0 => {
+                vec![(off, FTS_OPEN_HEADER_FALLBACK_BYTES.min(len))]
+            }
+            _ => Vec::new(),
+        }
+    };
+    let mut overlay = PrefetchedSource::new(inner);
+    for (off, bytes) in &offsets.open_blob {
+        overlay.install(*off, Bytes::copy_from_slice(bytes));
+    }
+    let tail_range = (parquet_tail_start, parquet_tail_len);
+    let tail_missing =
+        parquet_tail_len > 0 && !uncovered_ranges(&offsets.open_blob, &[tail_range]).is_empty();
+    let vec_missing = uncovered_ranges(&offsets.open_blob, &vec_ranges);
+    let fts_missing = uncovered_ranges(&offsets.open_blob, &fts_ranges);
+    if tail_missing || !vec_missing.is_empty() || !fts_missing.is_empty() {
+        let storage_for_parquet = Arc::clone(&storage);
+        let storage_for_vec = Arc::clone(&storage);
+        let storage_for_fts = Arc::clone(&storage);
+        let parquet_uri = storage_uri.clone();
+        let vec_uri = storage_uri.clone();
+        let fts_uri = storage_uri.clone();
+
+        let parquet_fut = async move {
+            if !tail_missing {
+                return Ok::<_, StorageError>(Bytes::new());
+            }
+            storage_for_parquet
+                .get_range(&parquet_uri, parquet_tail_start..total_size)
+                .await
+        };
+        let vec_fut = async move { fetch_hint_ranges(storage_for_vec, vec_uri, vec_missing).await };
+        let fts_fut = async move { fetch_hint_ranges(storage_for_fts, fts_uri, fts_missing).await };
+
+        let (parquet_bytes, vec_pre, fts_pre) = futures::try_join!(parquet_fut, vec_fut, fts_fut)?;
+        if !parquet_bytes.is_empty() {
+            overlay.install(parquet_tail_start, parquet_bytes);
+        }
+        for (off, bytes) in vec_pre {
+            overlay.install(off, bytes);
+        }
+        for (off, bytes) in fts_pre {
+            overlay.install(off, bytes);
+        }
+    }
+    Ok(overlay)
 }
 
 async fn fetch_hint_ranges(
@@ -2836,15 +2851,12 @@ mod tests {
             (3_000, 0),
         ];
         assert_eq!(
-            DiskCacheStore::uncovered_ranges(&blob, &wanted),
+            uncovered_ranges(&blob, &wanted),
             vec![(90, 20), (140, 20), (2_000, 5)],
             "whole-inside ranges are covered; straddling, outside and only empty ranges are not"
         );
-        assert!(DiskCacheStore::uncovered_ranges(&[], &[]).is_empty());
-        assert_eq!(
-            DiskCacheStore::uncovered_ranges(&[], &[(0, 1)]),
-            vec![(0, 1)]
-        );
+        assert!(uncovered_ranges(&[], &[]).is_empty());
+        assert_eq!(uncovered_ranges(&[], &[(0, 1)]), vec![(0, 1)]);
     }
 
     #[tokio::test]
