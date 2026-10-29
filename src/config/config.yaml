@@ -612,4 +612,7 @@ memory:
   # whole process. A scan of a column it has kept reads the decoded arrays
   # instead of decompressing and decoding the file's pages again; least
   # recently used columns leave first. 0 (default) keeps none.
+  # These bytes are not reserved against connection_budget_bytes. They are
+  # resident memory, so they count toward what process_limit_bytes measures:
+  # a large cache leaves statements that much less room under that limit.
   decoded_column_cache_bytes: 0

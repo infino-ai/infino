@@ -65,7 +65,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::{ColumnStatistics, Statistics, runtime::SpawnedTask, stats::Precision},
+    common::{ColumnStatistics, DFSchema, Statistics, runtime::SpawnedTask, stats::Precision},
     datasource::{
         listing::PartitionedFile,
         physical_plan::{
@@ -76,8 +76,9 @@ use datafusion::{
     },
     error::{DataFusionError, Result as DfResult},
     execution::object_store::ObjectStoreUrl,
-    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType},
+    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType, utils::conjunction},
     object_store::path::Path as ObjPath,
+    physical_expr::create_physical_expr,
     physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
     scalar::ScalarValue,
 };
@@ -114,7 +115,9 @@ use crate::{
             candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
             df_object_store::SuperfileObjectStore,
             exec::{
-                cached_scan_exec::{CachedFile, CachedScanExec, has_columns, projected_schema},
+                cached_scan_exec::{
+                    CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
+                },
                 common::{BoundPredicate, PushedPredicate, take_rows},
                 metered_exec::MeteredExec,
             },
@@ -1640,9 +1643,25 @@ impl TableProvider for SupertableProvider {
                     tombstones: Arc::clone(&seg.tombstones),
                 })
                 .collect();
+            // The `WHERE`, planned against the scan schema and mapped onto
+            // each file by the same adapter the Parquet scan uses, so the
+            // cached scan skips the row groups the Parquet scan would. A
+            // `WHERE` that doesn't plan here skips nothing; the filter above
+            // still checks every row.
+            let filter = conjunction(filters.iter().cloned())
+                .zip(DFSchema::try_from(Arc::clone(&self.schema)).ok())
+                .and_then(|(conjunction, schema)| {
+                    create_physical_expr(&conjunction, &schema, state.execution_props()).ok()
+                })
+                .map(|predicate| RowGroupFilter {
+                    predicate,
+                    table: Arc::clone(&self.schema),
+                    adapter: Arc::new(TableExprAdapterFactory::new(&self.manifest)),
+                });
             if let Some(scan) = CachedScanExec::try_new(
                 output,
                 files,
+                filter,
                 Arc::clone(&self.manifest),
                 self.scan_store.op_stats(),
                 Arc::clone(cache),

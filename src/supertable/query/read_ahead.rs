@@ -286,28 +286,13 @@ impl ScanReadAhead {
         }
     }
 
-    /// The row-group pruning for one file, built the way DataFusion's opener
-    /// builds it:
-    /// - the filter is mapped onto this file's own schema (a column the file
-    ///   lacks becomes null, a renamed one its stored name), then simplified;
-    /// - it's built per file, since files written under older schemas map
-    ///   the filter differently.
-    ///
-    /// `None` without a filter, or if it doesn't convert. Then the scan may
-    /// skip row groups this reader planned, and read-ahead turns off when the
-    /// reads go out of order.
-    fn pruning(&self, file_schema: SchemaRef) -> Option<(PruningPredicate, SchemaRef)> {
+    /// The row-group pruning for one file ([`file_pruning`] of the filter
+    /// handed over). `None` without a filter, or if it doesn't convert. Then
+    /// the scan may skip row groups this reader planned, and read-ahead turns
+    /// off when the reads go out of order.
+    fn pruning(&self, meta: &ParquetMetaData) -> Option<(PruningPredicate, SchemaRef)> {
         let (predicate, adapter) = self.predicate.get()?;
-        let schema = apply_file_schema_type_coercions(&self.schema, &file_schema)
-            .map_or(file_schema, Arc::new);
-        let mapped = adapter
-            .create(Arc::clone(&self.schema), Arc::clone(&schema))
-            .ok()?
-            .rewrite(Arc::clone(predicate))
-            .ok()?;
-        let simplified = PhysicalExprSimplifier::new(&schema).simplify(mapped).ok()?;
-        let pruning = PruningPredicate::try_new(simplified, Arc::clone(&schema)).ok()?;
-        Some((pruning, schema))
+        file_pruning(predicate, adapter, &self.schema, meta)
     }
 
     /// Reserve `bytes`, or `None` if that takes the budget past
@@ -1080,6 +1065,60 @@ impl ReadAhead {
     }
 }
 
+/// The row-group pruning of a scan filtered by `predicate`, written against
+/// `table`, for the file `meta` describes, built the way DataFusion's opener
+/// builds it:
+/// - the filter is mapped by `adapter` onto the file's own schema (a column
+///   the file lacks becomes null, a renamed one its stored name), then
+///   simplified;
+/// - it's built per file, since files written under older schemas map the
+///   filter differently.
+///
+/// `None` if the filter doesn't convert; nothing can be pruned then.
+pub(crate) fn file_pruning(
+    predicate: &Arc<dyn PhysicalExpr>,
+    adapter: &Arc<dyn PhysicalExprAdapterFactory>,
+    table: &SchemaRef,
+    meta: &ParquetMetaData,
+) -> Option<(PruningPredicate, SchemaRef)> {
+    let file_meta = meta.file_metadata();
+    let file_schema = Arc::new(
+        parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata()).ok()?,
+    );
+    let schema =
+        apply_file_schema_type_coercions(table, &file_schema).map_or(file_schema, Arc::new);
+    let mapped = adapter
+        .create(Arc::clone(table), Arc::clone(&schema))
+        .ok()?
+        .rewrite(Arc::clone(predicate))
+        .ok()?;
+    let simplified = PhysicalExprSimplifier::new(&schema).simplify(mapped).ok()?;
+    let pruning = PruningPredicate::try_new(simplified, Arc::clone(&schema)).ok()?;
+    Some((pruning, schema))
+}
+
+/// `plan` with the row groups of the file `meta` describes, at `location`,
+/// that their statistics show can't match `pruning` ([`file_pruning`])
+/// skipped. DataFusion reports its own pruning counts; this repeat goes to
+/// a throwaway set so they aren't counted twice.
+pub(crate) fn statistics_pruned(
+    plan: ParquetAccessPlan,
+    meta: &ParquetMetaData,
+    (predicate, file_schema): &(PruningPredicate, SchemaRef),
+    location: &str,
+) -> ParquetAccessPlan {
+    let metrics = ParquetFileMetrics::new(0, location, &ExecutionPlanMetricsSet::new());
+    let mut filter = RowGroupAccessPlanFilter::new(plan);
+    filter.prune_by_statistics(
+        file_schema,
+        meta.file_metadata().schema_descr(),
+        meta.row_groups(),
+        predicate,
+        &metrics,
+    );
+    filter.build()
+}
+
 /// The row groups `file` reads in this partition: the access plan, pruned by
 /// the row-group statistics, the page index and the partition's byte range,
 /// as DataFusion's opener prunes it after creating the reader.
@@ -1089,30 +1128,16 @@ fn planned_order(scan: &ScanReadAhead, file: &PartitionedFile, meta: &ParquetMet
         .extension::<ParquetAccessPlan>()
         .cloned()
         .unwrap_or_else(|| ParquetAccessPlan::new_all(groups.len()));
-    let mut filter = RowGroupAccessPlanFilter::new(plan);
     let file_meta = meta.file_metadata();
-    // Map the filter onto this file's own schema: a file written before a
-    // column was added, dropped or renamed has its columns in other places.
-    let pruning = parquet_to_arrow_schema(file_meta.schema_descr(), file_meta.key_value_metadata())
-        .ok()
-        .and_then(|file_schema| scan.pruning(Arc::new(file_schema)));
+    let location = file.object_meta.location.as_ref();
+    let pruning = scan.pruning(meta);
+    let mut plan = match &pruning {
+        Some(pruning) => statistics_pruned(plan, meta, pruning, location),
+        None => plan,
+    };
     // DataFusion already reports its pruning counts; this repeat goes to a
     // throwaway set so they aren't counted twice.
-    let metrics = ParquetFileMetrics::new(
-        0,
-        file.object_meta.location.as_ref(),
-        &ExecutionPlanMetricsSet::new(),
-    );
-    if let Some((predicate, file_schema)) = &pruning {
-        filter.prune_by_statistics(
-            file_schema,
-            file_meta.schema_descr(),
-            groups,
-            predicate,
-            &metrics,
-        );
-    }
-    let mut plan = filter.build();
+    let metrics = ParquetFileMetrics::new(0, location, &ExecutionPlanMetricsSet::new());
     if let Some((predicate, file_schema)) = &pruning
         && meta.offset_index().is_some()
     {

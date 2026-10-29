@@ -69,6 +69,10 @@ const DELETED_TAG: &str = "h";
 /// Rows the plain-LIMIT test asks for: fewer than pass its filter, more than
 /// one file holds.
 const LIMITED_ROWS: usize = 5;
+/// Rows of the one file the row-group pruning test writes, scored in order.
+const SORTED_ROWS: i64 = 100;
+/// Rows per row group of that file: ten row groups.
+const SORTED_ROW_GROUP_ROWS: usize = 10;
 /// Columns one row group keeps for `SELECT title, score`.
 const KEPT_PER_ROW_GROUP: usize = 2;
 /// How long a dropped read is given to finish its decode and keep it.
@@ -562,11 +566,11 @@ fn sql_reads_every_generation_from_kept_columns() {
 }
 
 #[test]
-fn a_plain_limit_reads_kept_columns_as_one_partition_in_file_order() {
-    // A filtered scan under a plain LIMIT: the kept columns are read as one
-    // partition, file by file, so the first rows to pass end the query. Every
-    // row returned passes the filter, and they are the first that pass in
-    // file order, as the Parquet scan returns them.
+fn a_plain_limit_gathers_kept_columns_in_stages() {
+    // A filtered scan of kept columns under a plain LIMIT is gathered in
+    // stages, as the Parquet scan is: partition 0 runs alone behind the gate,
+    // and the others start only if its first batch falls short. Every row
+    // returned passes the filter.
     let dir = TempDir::new().expect("tempdir");
     let kept = Arc::new(ByteLru::new(KEPT_COLUMN_BYTES));
     let (st, expected) = mixed_table_with(&dir, Some(kept));
@@ -574,7 +578,87 @@ fn a_plain_limit_reads_kept_columns_as_one_partition_in_file_order() {
     let sql = format!(
         "SELECT _id, title, score, rating, tag FROM supertable WHERE score > 20 LIMIT {LIMITED_ROWS}"
     );
-    let plan: String = reader
+    let plan = explained(&reader, &sql);
+    // The gather staged over the gate on the kept columns' scan, with no
+    // exchange below the filter pulling batches ahead of the limit.
+    assert!(plan.contains("StagedCoalesceExec"), "{plan}");
+    let below_filter = plan.split_once("FilterExec").map_or("", |(_, rest)| rest);
+    assert!(below_filter.contains("ScanGateExec"), "{plan}");
+    assert!(below_filter.contains("CachedScanExec"), "{plan}");
+    assert!(!below_filter.contains("RoundRobinBatch"), "{plan}");
+    let passing: Vec<Row> = expected
+        .into_iter()
+        .filter(|r| r.score.is_some_and(|s| s > 20))
+        .collect();
+    let rows = rows_of_batches(&reader.query_sql(&sql).expect("sql"));
+    assert_eq!(rows.len(), LIMITED_ROWS);
+    assert!(rows.iter().all(|row| passing.contains(row)), "{rows:?}");
+}
+
+/// The kept-columns scan skips the row groups whose statistics show the
+/// `WHERE` can't match, as the Parquet scan does: over one file of scores in
+/// order, a range on the last row group reads that row group alone, and gives
+/// back exactly its rows on the first pass and on the kept one.
+#[test]
+fn kept_columns_skip_the_row_groups_a_where_rules_out() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let mut options = SupertableOptions::new(table_schema(), vec![], vec![])
+        .expect("options")
+        .with_storage(storage);
+    options.decoded_columns = Some(Arc::new(ByteLru::new(KEPT_COLUMN_BYTES)));
+    options.row_group_size = Some(SORTED_ROW_GROUP_ROWS);
+    let st = Supertable::create(options).expect("create");
+    let scores: Vec<i64> = (0..SORTED_ROWS).collect();
+    let titles: Vec<String> = scores.iter().map(|s| format!("t{s}")).collect();
+    let batch = RecordBatch::try_new(
+        table_schema(),
+        vec![
+            Arc::new(LargeStringArray::from(titles)),
+            Arc::new(Int64Array::from(scores)),
+            Arc::new(Float64Array::from(vec![None; SORTED_ROWS as usize])),
+            Arc::new(LargeStringArray::from(vec![
+                None::<&str>;
+                SORTED_ROWS as usize
+            ])),
+        ],
+    )
+    .expect("batch");
+    let mut writer = st.writer().expect("writer");
+    writer.append(&batch).expect("append");
+    writer.commit().expect("commit");
+
+    let reader = st.reader().expect("reader");
+    let last = SORTED_ROWS - SORTED_ROW_GROUP_ROWS as i64;
+    let sql = format!("SELECT title, score FROM supertable WHERE score >= {last} ORDER BY score");
+    let row_groups = (SORTED_ROWS as usize).div_ceil(SORTED_ROW_GROUP_ROWS);
+    assert_eq!(
+        cached_row_groups(&explained(&reader, &sql)),
+        (1, row_groups - 1),
+        "only the last row group can match"
+    );
+    let want: Vec<i64> = (last..SORTED_ROWS).collect();
+    for pass in ["first", "kept"] {
+        let batches = reader.query_sql(&sql).expect("sql");
+        let got: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                let scores = b
+                    .column_by_name("score")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .expect("score")
+                    .clone();
+                (0..scores.len()).map(move |i| scores.value(i))
+            })
+            .collect();
+        assert_eq!(got, want, "{pass} pass");
+    }
+}
+
+/// The `EXPLAIN` of `sql` on `reader`, every plan line joined.
+fn explained(reader: &SupertableReader, sql: &str) -> String {
+    reader
         .query_sql(&format!("EXPLAIN {sql}"))
         .expect("explain")
         .iter()
@@ -587,21 +671,19 @@ fn a_plain_limit_reads_kept_columns_as_one_partition_in_file_order() {
                 .clone();
             (0..plans.len()).map(move |i| plans.value(i).to_owned())
         })
-        .collect();
-    // Below the filter: the meter kept whole over one partition, with no
-    // exchange pulling batches ahead of the limit. (An exchange above the
-    // limit, for the projection, reads only the rows the limit lets out.)
-    let below_filter = plan.split_once("FilterExec").map_or("", |(_, rest)| rest);
-    assert!(below_filter.contains("MeteredExec: unsplit"), "{plan}");
-    assert!(below_filter.contains("partitions=1"), "{plan}");
-    assert!(!below_filter.contains("RoundRobinBatch"), "{plan}");
-    let want: Vec<Row> = expected
-        .into_iter()
-        .filter(|r| r.score.is_some_and(|s| s > 20))
-        .take(LIMITED_ROWS)
-        .collect();
-    let batches = reader.query_sql(&sql).expect("sql");
-    assert_eq!(rows_of_batches(&batches), want);
+        .collect()
+}
+
+/// The row groups the plan's `CachedScanExec` reads, and the ones its
+/// `WHERE` ruled out.
+fn cached_row_groups(plan: &str) -> (usize, usize) {
+    let count = |label: &str| {
+        plan.split_once(label)
+            .and_then(|(_, rest)| rest.split(',').next())
+            .and_then(|n| n.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {label} in {plan}"))
+    };
+    (count("row_groups="), count("pruned="))
 }
 
 /// The plan's `CachedScanExec`, wherever it sits.

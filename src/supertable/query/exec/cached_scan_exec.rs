@@ -16,9 +16,11 @@
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
 //! tombstone deletes. A `WHERE` stays above it in a `FilterExec`, as above the
-//! Parquet scan. It does not skip a row group by its statistics: the filter
-//! above drops the rows instead, which over decoded arrays costs less than the
-//! decode it saves.
+//! Parquet scan, and like the Parquet scan it skips a row group whose
+//! statistics show the `WHERE` can't match ([`RowGroupFilter`]): such a row
+//! group is neither decoded nor kept, so a first run decodes what the Parquet
+//! scan would, and a table larger than the cache doesn't decode the rest of
+//! it on every run.
 
 use std::{fmt, ops::Range, sync::Arc};
 
@@ -29,9 +31,11 @@ use arrow_schema::{Schema, SchemaRef};
 use datafusion::{
     arrow::compute::{can_cast_types, cast_with_options, filter_record_batch},
     common::Statistics,
+    datasource::physical_plan::parquet::ParquetAccessPlan,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
-    physical_expr::EquivalenceProperties,
+    physical_expr::{EquivalenceProperties, PhysicalExpr},
+    physical_expr_adapter::PhysicalExprAdapterFactory,
     physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream,
@@ -53,6 +57,7 @@ use crate::{
         query::{
             column_cache::{ColumnKey, DecodedColumnCache},
             exec::common::{hit_output_schema, take_file_columns},
+            read_ahead::{file_pruning, statistics_pruned},
         },
         schema::cast::CAST_OPTIONS,
     },
@@ -67,6 +72,35 @@ pub(crate) struct CachedFile {
     pub(crate) row_counts: Arc<[u32]>,
     /// The file's deleted rows, by position in the file.
     pub(crate) tombstones: Arc<RoaringBitmap>,
+}
+
+/// The scan's `WHERE`, for skipping the row groups whose statistics show it
+/// can't match, as the Parquet scan skips them.
+#[derive(Debug)]
+pub(crate) struct RowGroupFilter {
+    /// The `WHERE`, written against `table`.
+    pub(crate) predicate: Arc<dyn PhysicalExpr>,
+    pub(crate) table: SchemaRef,
+    /// Maps the `WHERE` onto each file's own schema, as the Parquet scan's
+    /// adapter does.
+    pub(crate) adapter: Arc<dyn PhysicalExprAdapterFactory>,
+}
+
+impl RowGroupFilter {
+    /// Which of `file`'s row groups the statistics leave to read; `None`
+    /// when the `WHERE` doesn't map onto the file, and every row group is
+    /// read.
+    fn plan(&self, file: &CachedFile) -> Option<ParquetAccessPlan> {
+        let meta = file.reader.parquet_metadata();
+        let pruning = file_pruning(&self.predicate, &self.adapter, &self.table, meta)?;
+        let all = ParquetAccessPlan::new_all(file.row_counts.len());
+        Some(statistics_pruned(
+            all,
+            meta,
+            &pruning,
+            &file.uri.0.to_string(),
+        ))
+    }
 }
 
 /// One row group of one file: the unit a partition reads.
@@ -98,6 +132,8 @@ struct ScanContext {
 pub(crate) struct CachedScanExec {
     context: Arc<ScanContext>,
     units: Arc<[RowGroupUnit]>,
+    /// Row groups the `WHERE` ruled out by their statistics.
+    pruned: usize,
     partitions: usize,
     fetch: Option<usize>,
     statistics: Arc<Statistics>,
@@ -106,12 +142,15 @@ pub(crate) struct CachedScanExec {
 
 impl CachedScanExec {
     /// A scan of `schema`'s columns over `files`, read as up to
-    /// `target_partitions` partitions, or `None` when a column is not one the
-    /// files store in a type that converts to `schema`'s: the Parquet scan
-    /// then serves it, with its own schema adapter.
+    /// `target_partitions` partitions, skipping the row groups `filter` rules
+    /// out, or `None` when a column is not one the files store in a type that
+    /// converts to `schema`'s: the Parquet scan then serves it, with its own
+    /// schema adapter.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         schema: SchemaRef,
         files: Vec<CachedFile>,
+        filter: Option<RowGroupFilter>,
         manifest: Arc<ManifestSnapshot>,
         op_stats: Option<Arc<OpStatsCollector>>,
         cache: Arc<DecodedColumnCache>,
@@ -129,11 +168,20 @@ impl CachedScanExec {
             return None;
         }
         let mut units = Vec::new();
+        let mut pruned = 0;
         for file in files.into_iter().map(Arc::new) {
+            let plan = filter.as_ref().and_then(|filter| filter.plan(&file));
             let mut first = 0u32;
             for (row_group, &n) in file.row_counts.iter().enumerate() {
                 let rows = first..first + n;
                 first += n;
+                if plan
+                    .as_ref()
+                    .is_some_and(|plan| !plan.should_scan(row_group))
+                {
+                    pruned += 1;
+                    continue;
+                }
                 // A row group every row of which is deleted reads nothing.
                 if n > 0 && file.tombstones.range_cardinality(rows.clone()) < u64::from(n) {
                     units.push(RowGroupUnit {
@@ -157,24 +205,11 @@ impl CachedScanExec {
                 schema_id,
             }),
             units: units.into(),
+            pruned,
             partitions,
             fetch: None,
             statistics: Arc::new(statistics),
             properties,
-        })
-    }
-
-    /// This scan read as one partition, its row groups in file order: under a
-    /// `LIMIT` whose first rows end the query, a row group after them is never
-    /// read.
-    pub(crate) fn in_one_partition(&self) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self {
-            context: Arc::clone(&self.context),
-            units: Arc::clone(&self.units),
-            partitions: 1,
-            fetch: self.fetch,
-            statistics: Arc::clone(&self.statistics),
-            properties: plan_properties(&self.context.schema, 1),
         })
     }
 }
@@ -315,8 +350,9 @@ impl DisplayAs for CachedScanExec {
             .collect();
         write!(
             f,
-            "CachedScanExec: row_groups={}, partitions={}, projection=[{}]",
+            "CachedScanExec: row_groups={}, pruned={}, partitions={}, projection=[{}]",
             self.units.len(),
+            self.pruned,
             self.partitions,
             columns.join(", ")
         )?;
@@ -362,6 +398,7 @@ impl ExecutionPlan for CachedScanExec {
         Some(Arc::new(Self {
             context: Arc::clone(&self.context),
             units: Arc::clone(&self.units),
+            pruned: self.pruned,
             partitions: self.partitions,
             fetch: limit,
             statistics: Arc::clone(&self.statistics),
