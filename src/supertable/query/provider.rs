@@ -2848,6 +2848,26 @@ mod tests {
     /// "mango" — so scalar min/max prunes none of them — while only the
     /// middle one actually holds the token. Returns the provider and a
     /// runtime to drive its async surface.
+    /// A provider over `st`'s current manifest, the way a query builds one.
+    fn provider_of(st: &Supertable) -> SupertableProvider {
+        let reader = st.reader().expect("reader");
+        SupertableProvider::new(
+            reader.manifest().scalar_schema(),
+            reader.manifest().clone(),
+            st.options().store.clone(),
+            st.options().disk_cache.clone(),
+            reader.tombstone_cache.clone(),
+        )
+    }
+
+    /// A runtime to drive a provider's async surface from a sync test.
+    fn query_runtime() -> runtime::Runtime {
+        runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("rt")
+    }
+
     fn provider_over_mango_superfiles() -> (SupertableProvider, runtime::Runtime) {
         let st = Supertable::create(cat_title_opts()).expect("create");
         let mut w = st.writer().expect("writer");
@@ -2862,18 +2882,8 @@ mod tests {
         w.commit().expect("c3");
         assert_eq!(st.reader().expect("reader").n_superfiles(), 3);
 
-        let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
         (provider, rt)
     }
 
@@ -2937,17 +2947,8 @@ mod tests {
         }
         let reader = st.reader().expect("reader");
         assert_eq!(reader.n_superfiles(), 3);
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
 
         let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
         assert_eq!(survivors(&[]), 3, "no predicate reads every superfile");
@@ -2978,17 +2979,8 @@ mod tests {
         hydrate_from_reader(&st, &mut reader, HYDRATE_ROWS_PER_SUPERFILE).expect("hydrate");
         let reader = st.reader().expect("reader");
         assert_eq!(reader.n_superfiles(), 3);
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
         let survivors = |filters: &[Expr]| rt.block_on(provider.surviving_superfile_count(filters));
         assert_eq!(survivors(&[col("time").gt_eq(at_hour(4))]), 1);
         assert_eq!(
@@ -3023,13 +3015,7 @@ mod tests {
         .expect("compact");
         let reader = st.reader().expect("reader");
         assert_eq!(reader.n_superfiles(), 1, "the three files merged into one");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
+        let provider = provider_of(&st);
         let inside = [col("time").gt_eq(at_hour(4))];
         let before = [col("time").lt(at_hour(0))];
         let after = [col("time").gt_eq(at_hour(6))];
@@ -3131,18 +3117,8 @@ mod tests {
         w.append(&cat_title_batch(&["b"], &["delta"])).expect("a2");
         w.commit().expect("c2");
 
-        let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
-        let rt = runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("rt");
+        let provider = provider_of(&st);
+        let rt = query_runtime();
         (provider, rt)
     }
 
@@ -3441,13 +3417,7 @@ mod tests {
         w.commit().expect("c2");
 
         let reader = st.reader().expect("reader");
-        let provider = SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        );
+        let provider = provider_of(&st);
 
         let stats = provider.statistics().expect("statistics");
         // 6 rows total across both superfiles, clean view → Exact.

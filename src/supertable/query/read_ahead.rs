@@ -112,7 +112,7 @@ use crate::{
 };
 
 /// Fewest row groups a batch takes, when they fit the reader's cap.
-const READ_AHEAD_ROW_GROUPS: usize = 2;
+const READ_AHEAD_MIN_ROW_GROUPS: usize = 2;
 
 /// Batches a reader keeps in flight: one the scan decodes from and one
 /// downloading, so each batch is sized to half the reader's cap.
@@ -161,8 +161,8 @@ pub(crate) struct ScanReadAhead {
     batches: Mutex<Vec<Weak<Mutex<Held>>>>,
     /// Registers the scan with the budget on its first batch.
     registered: Once,
-    /// Most bytes one reader may hold: [`READ_AHEAD_MAX_BYTES`], or less
-    /// under test.
+    /// Less than [`READ_AHEAD_MAX_BYTES`] for a test over a small file.
+    #[cfg(test)]
     reader_cap_bytes: usize,
 }
 
@@ -193,7 +193,21 @@ impl ScanReadAhead {
             held: AtomicUsize::new(0),
             batches: Mutex::new(Vec::new()),
             registered: Once::new(),
+            #[cfg(test)]
             reader_cap_bytes: READ_AHEAD_MAX_BYTES,
+        }
+    }
+
+    /// Most bytes one reader may hold: [`READ_AHEAD_MAX_BYTES`], or less
+    /// under test.
+    fn reader_cap(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.reader_cap_bytes
+        }
+        #[cfg(not(test))]
+        {
+            READ_AHEAD_MAX_BYTES
         }
     }
 
@@ -914,17 +928,10 @@ impl ReadAhead {
             .max()
             .map_or(row_group, |held| held.max(row_group));
         let location = &self.file.object_meta.location;
-        let held: usize = self.batches.iter().map(|b| b.charge).sum();
-        let cap = self.scan.reader_cap_bytes;
-        // A batch may take half of what the reader may hold, so the next
-        // batch can download while the scan decodes this one, and as many
-        // row groups as fit that, with at least the minimum: a batch of small
-        // row groups then costs one round trip rather than one per row group.
-        // The walk is bounded by the row groups it looks at, local ones
-        // included, so a run of row groups already local is not walked to
-        // its end on every read. Counted by the projected chunks alone; the
-        // spans they merge into are measured below, and a batch that
-        // overshoots there is trimmed from the end.
+        let cap = self.scan.reader_cap();
+        // Half the reader's cap, so the next batch can download while the
+        // scan decodes this one. Counted by the projected chunks alone; the
+        // spans they merge into are measured below.
         let batch_cap = cap / READ_AHEAD_BATCHES_IN_FLIGHT;
         let mut row_groups: Vec<(usize, Vec<Range<u64>>)> = Vec::new();
         let mut planned = 0usize;
@@ -935,7 +942,7 @@ impl ReadAhead {
             }
             let ranges: Vec<Range<u64>> = columns.iter().map(|&c| chunk_range(meta, c)).collect();
             let bytes: usize = ranges.iter().map(|r| (r.end - r.start) as usize).sum();
-            if walked >= READ_AHEAD_ROW_GROUPS && planned + bytes > batch_cap {
+            if walked >= READ_AHEAD_MIN_ROW_GROUPS && planned + bytes > batch_cap {
                 break;
             }
             planned += bytes;
@@ -947,6 +954,7 @@ impl ReadAhead {
         // groups from the end until it fits its share and the reader's cap. A
         // batch of one row group may take the reader's whole cap: a row group
         // over half the cap is still worth downloading while the scan decodes.
+        let held: usize = self.batches.iter().map(|b| b.charge).sum();
         let blocks = self.scan.store.cache_blocks(location);
         let (clusters, charge) = loop {
             if row_groups.is_empty() {
