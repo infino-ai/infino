@@ -81,7 +81,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_array::{Array, Decimal128Array};
 use arrow_schema::Schema;
 use datafusion::logical_expr::Expr;
-use futures::{StreamExt, TryStreamExt, future::try_join_all, stream};
+use futures::{StreamExt, TryStreamExt, stream};
 use roaring::RoaringBitmap;
 use tokio::{join, sync::OnceCell};
 use tracing::{Instrument, warn};
@@ -148,7 +148,10 @@ use crate::{
         },
         tombstones::SidecarCache,
     },
-    utils::trace::{self, detail_span, tiered_span},
+    utils::{
+        join::try_join_bounded,
+        trace::{self, detail_span, tiered_span},
+    },
 };
 
 /// A calibrated law width at or below this resolves to `None`: one cell
@@ -1848,7 +1851,7 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
         // Build outside the lock. Each cell single-flights its superfile's index
         // (a second concurrent cold query for the same uri awaits this build,
         // not a duplicate one); the CPU inversion runs on the reader pool, not
-        // the tokio blocking pool. `try_join_all` preserves `cells` order, so
+        // the tokio blocking pool. `try_join_bounded` preserves `cells` order, so
         // the probe below stays deterministic in manifest order.
         // `unbuilt` is how many of those maps this call waits on: every gapped
         // file on a freshly started process, none once the cache is warm.
@@ -1857,17 +1860,19 @@ pub(crate) async fn lookup_user_placements_by_id_opt(
             gapped = cells.len(),
             unbuilt = cells.iter().filter(|(_, cell)| !cell.initialized()).count(),
         );
-        let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> =
-            try_join_all(cells.into_iter().map(|(entry, cell)| async move {
+        let built: Vec<(Arc<SuperfileEntry>, Arc<GappedPlacementIndex>)> = try_join_bounded(
+            cells.into_iter().map(|(entry, cell)| async move {
                 let index = cell
                     .get_or_try_init(|| {
                         build_gapped_placement_index(manifest, &entry, id_column, op_stats)
                     })
                     .await?;
                 Ok::<_, QueryError>((entry, Arc::clone(index)))
-            }))
-            .instrument(span)
-            .await?;
+            }),
+            manifest.options.superfiles_in_flight,
+        )
+        .instrument(span)
+        .await?;
         // Probe in manifest (gapped) order: if an id is resident in two live
         // superfiles — an updated row's tombstoned-old copy plus its live copy,
         // both physical rows to `read_ids_for_locals` — first-wins resolves it to
@@ -2375,6 +2380,55 @@ pub(crate) fn id_score_projection_indices(
     names
         .iter()
         .map(|name| free_column_slot(name, id_column))
+        .collect()
+}
+
+/// SQL table-function projection policy: positions into the synthesized
+/// `_id` + `score` batch for the columns `projection` asks of
+/// `output_schema` (`None` asks for all of them), or `None` when one of
+/// them needs the general path.
+///
+/// Same rule as the public API, classified through the same function
+/// ([`free_column_slot`]): each requested DataFusion column index is mapped
+/// back to its name. Empty stays `Some([])` here: DataFusion emits an empty
+/// projection for `COUNT(*)`-shaped plans, where a zero-column batch is the
+/// wanted output (the public API sends empty down the general path instead).
+///
+/// Arrow permits duplicate field names, so a user column literally named
+/// `score` (or matching the id column) would make the name lookup
+/// ambiguous; the fast path is declined outright in that case.
+pub(crate) fn sql_id_score_projection(
+    output_schema: &Schema,
+    projection: Option<&[usize]>,
+    id_column: &str,
+) -> Option<Vec<usize>> {
+    let ambiguous = |name: &str| {
+        output_schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() == name)
+            .count()
+            > 1
+    };
+    if ambiguous(id_column) || ambiguous(SCORE_COLUMN) {
+        return None;
+    }
+    let all: Vec<usize>;
+    let requested = match projection {
+        Some(requested) => requested,
+        None => {
+            all = (0..output_schema.fields().len()).collect();
+            &all
+        }
+    };
+    requested
+        .iter()
+        .map(|&idx| {
+            output_schema
+                .fields()
+                .get(idx)
+                .and_then(|f| free_column_slot(f.name(), id_column))
+        })
         .collect()
 }
 
@@ -6227,8 +6281,8 @@ impl SupertableReader {
         // Filtered search holds a per-superfile RoaringBitmap while the
         // kernel builds its shortlist; wave-cap the fan-out by reader-pool
         // width so transient memory stays bounded. The unfiltered path
-        // carries no bitmaps and fans out all units at once (matching
-        // main's concurrency — every superfile GET overlaps on tokio).
+        // carries no bitmaps and fans out as wide as the fan-out allows
+        // (`superfiles_in_flight` units), so its GETs overlap on tokio.
         let fanout_t0 = io_counters::phase_start();
         let scan_span = trace::phase(phases, || tiered_span!("vector.scan", units = units.len()));
         let mut per_superfile = if allow.is_some() {
@@ -7357,7 +7411,9 @@ impl SupertableReader {
             .map(|(uri, bm)| (uri, Arc::new(bm)))
             .collect())
     }
-    pub(crate) async fn vector_search_user_table_async(
+    /// kNN over every user superfile: the search before the first drain,
+    /// when the hidden vector index holds nothing yet.
+    async fn vector_search_user_table_async(
         &self,
         column: &str,
         query: &[f32],
@@ -7615,12 +7671,11 @@ impl SupertableReader {
                 }
             };
             let id_column = self.options().id_column.as_str();
-            // GUARDED on every hit carrying a stamp, exactly as the hybrid
-            // path guards its own fast path (`hybrid_exec.rs`): a superfile
-            // entry with no row-id base stamps `stable_id: None`
-            // (`dispatch.rs`), and `hits_id_score_batch` treats that as an
-            // upstream bug. Falling through resolves the id by placement
-            // instead of failing the query.
+            // Guarded on every hit carrying a stamp: a superfile entry with
+            // no row-id base stamps `stable_id: None` (`dispatch.rs`), and
+            // `hits_id_score_batch` treats that as an upstream bug. Falling
+            // through resolves the id by placement instead of failing the
+            // query.
             if free_columns_unambiguous(&self.options().schema, id_column)
                 && let Some(indices) = id_score_projection_indices(projection, id_column)
                 && hits.iter().all(|hit| hit.stable_id.is_some())
@@ -10260,6 +10315,7 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::{
             manifest::{SuperfileEntry, SuperfileUri},
+            options::DEFAULT_SUPERFILES_IN_FLIGHT,
             query::SuperfileHit,
             tombstones::{SidecarCache, TombstoneSeqView, cache::DEFAULT_SEAL_TTL},
             wal::{WalStore, tombstones_codec::TombstonesSidecar},
@@ -10303,6 +10359,7 @@ mod tests {
                 manifest_id: 1,
                 seqs: [(sf_id, 1u64)].into_iter().collect(),
             }),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
         // Pre-populate a sidecar with doc-ids 1, 3, 5 set.
         let mut bitmap = roaring::RoaringBitmap::new();
@@ -10371,6 +10428,7 @@ mod tests {
             ws,
             DEFAULT_SEAL_TTL,
             Arc::new(TombstoneSeqView::default()),
+            DEFAULT_SUPERFILES_IN_FLIGHT,
         ));
 
         let entry = synthetic_entry(Uuid::from_u128(0x1111));
@@ -11218,8 +11276,12 @@ mod tests {
         });
     }
 
+    /// Before the first drain the hidden index holds nothing, so hybrid's
+    /// vector leg, which is `vector_search`'s, falls back to the user
+    /// superfiles; once drained it searches the hidden index (see the
+    /// `hybrid_hidden_index` integration tests).
     #[test]
-    fn hybrid_vector_leg_uses_user_superfiles_not_hidden() {
+    fn hybrid_vector_leg_falls_back_to_user_superfiles_before_the_first_drain() {
         let dim = 16usize;
         let schema = schema_with_vector(dim);
         let opts = options_one_superfile_per_commit(dim);
@@ -11257,7 +11319,7 @@ mod tests {
         for hit in &hits {
             assert!(
                 user_uris.contains(&hit.superfile),
-                "hybrid vector leg must fan out on user superfiles, got {:?}",
+                "an undrained table's hybrid hits must be user superfile hits, got {:?}",
                 hit.superfile
             );
         }

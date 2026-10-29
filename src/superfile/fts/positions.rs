@@ -12,7 +12,7 @@
 //!
 //! The positions region of the FTS blob is, per term, the
 //! concatenation of its runs in posting (doc-id) order; the skip
-//! table records each 128-doc block's starting byte so a block's runs
+//! table records each posting block's starting byte so a block's runs
 //! are randomly addressable without decoding its predecessors.
 
 use std::ops::Range;
@@ -493,8 +493,8 @@ enum GroupKind {
 /// for most of them in order, and paid two to three times the
 /// sequential decode's cost per run before this switch. The density
 /// test keeps a block with a handful of scattered candidates on the
-/// per-run path, where decoding all 128 runs would cost more than they
-/// do.
+/// per-run path, where decoding every run of the block would cost more
+/// than they do.
 const BULK_AFTER_RUNS: u32 = 2;
 /// Runs up to this many positions bypass the generic lane reader.
 const SMALL_TF: usize = 4;
@@ -503,7 +503,7 @@ const BULK_MAX_STRIDE: usize = 4;
 /// A position group located for **per-run** access: one pair's run is
 /// decoded without touching the block's other runs. A phrase visits few
 /// of a common term's pairs per block when its other members are rare,
-/// so decoding a whole group — every position of 128 docs — per
+/// so decoding a whole group — every position of a block's docs — per
 /// candidate was the cost that dominated; here a candidate costs its
 /// own `tf` lanes plus one binary search over the stream's exceptions.
 /// One instance is reused across blocks so relocating allocates nothing.
@@ -532,7 +532,22 @@ impl GroupIndex {
     /// truncated or malformed group, after which the index must be
     /// relocated before use.
     pub(crate) fn locate(&mut self, bytes: &[u8], at: &mut usize, tfs: &[u32]) -> Option<()> {
-        let n: usize = tfs.iter().map(|&t| t as usize).sum();
+        // Where each pair's values begin, as a running sum over the tfs, and
+        // the group's value count as that sum's end: one pass over the tfs,
+        // the sum in a register, into a buffer sized once. A wide total kept
+        // beside it says whether the running sum wrapped — every partial sum
+        // is at most the total, so one check covers them all. (A packed
+        // pair's lanes are its gaps alone; that is applied to the sums below
+        // once the header says which encoding the group has.)
+        self.starts.clear();
+        self.starts.resize(tfs.len() + 1, 0);
+        let (mut acc, mut total) = (0u32, 0u64);
+        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
+            acc = acc.wrapping_add(tf);
+            total += u64::from(tf);
+            *slot = acc;
+        }
+        let n = usize::try_from(u32::try_from(total).ok()?).ok()?;
         self.served = 0;
         let header = *bytes.get(*at)?;
         *at += 1;
@@ -568,22 +583,14 @@ impl GroupIndex {
             }
             _ => return None,
         }
-        // Every partial sum is at most `n`, so one check that `n` fits makes
-        // the prefix sum overflow-free; the per-encoding lane rule is chosen
-        // once, not called per pair.
-        u32::try_from(n).ok()?;
-        // Sized once and filled with the running sum in a register: pushing
-        // grew the vector through memory for every pair of every block.
-        self.starts.clear();
-        self.starts.resize(tfs.len() + 1, 0);
-        let mut acc = 0u32;
-        let lanes_per_pair = |tf: u32| match self.kind {
-            GroupKind::Packed => tf.saturating_sub(1),
-            _ => tf,
-        };
-        for (slot, &tf) in self.starts[1..].iter_mut().zip(tfs) {
-            acc += lanes_per_pair(tf);
-            *slot = acc;
+        // A packed pair's lanes are its gaps: its first position sits in the
+        // other stream, so pair `p` starts `p` lanes earlier than its value
+        // sum says. A sum that falls short of `p` means a pair with no
+        // occurrences, which no block writes: the group is malformed.
+        if self.kind == GroupKind::Packed {
+            for (p, slot) in self.starts.iter_mut().enumerate() {
+                *slot = slot.checked_sub(p as u32)?;
+            }
         }
         Some(())
     }
@@ -909,6 +916,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A pair with no occurrences cannot be written, so tfs that say one
+    /// has are malformed. A packed pair starts as many lanes before its
+    /// value sum as there are pairs ahead of it, so a zero tf ahead of
+    /// another pair would put that pair before its own lanes: refused,
+    /// not summed below zero.
+    #[test]
+    fn a_zero_tf_ahead_of_a_pair_is_refused() {
+        let tfs = [2u32, 2];
+        let vals = [5u32, 3, 40, 2];
+        let mut out = Vec::new();
+        group(&mut out, &tfs, &vals, false);
+        let mut index = GroupIndex::default();
+        assert_eq!(
+            index.locate(&out, &mut 0, &tfs),
+            Some(()),
+            "premise: the group reads"
+        );
+        assert_eq!(index.locate(&out, &mut 0, &[0, 2]), None);
     }
 
     #[test]

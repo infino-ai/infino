@@ -36,8 +36,8 @@ use crate::superfile::{
         bm25,
         builder::{TERM_META_POSITIONAL_SIZE, TERM_META_SIZE},
         posting::{
-            BLOCK_LEN, BlockHeader, ENCODING_RUN, decode_block, decode_block_doc_ids,
-            decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
+            BLOCK_LEN, BlockHeader, ENCODING_RUN, SUB_BLOCK_LEN, block_lanes, decode_block,
+            decode_block_doc_ids, decode_block_tfs, dense_next_doc, dense_tf_at, is_dense_encoding,
         },
         short::decode_short,
     },
@@ -468,6 +468,9 @@ pub(crate) struct TermCursor {
     /// [`decode_block_doc_ids`]) and leaves `block_tfs` stale, so it must
     /// not be used where tfs are read.
     pub(super) purpose: CursorUse,
+    /// The file's header reading: wide blocks (two sub-blocks, count's top
+    /// bit in header bit 31) or the one-sub-block form before it.
+    pub(super) wide_blocks: bool,
     /// Which block index is currently decoded into `block_doc_ids`
     /// ([`NO_BLOCK`] = none). Lets [`Self::contains`] skip re-decoding a
     /// PACKED block it already holds while probing membership across a
@@ -707,8 +710,8 @@ impl TermCursor {
         // an exact-size iterator, so this writes each entry in place —
         // one allocation, no intermediate `Vec` + copy. The skip table
         // is ~a quarter of a long term's cursor-build bytes (one 32-byte
-        // entry per 128-doc block), so the doubled write showed up on
-        // common-term queries.
+        // entry per block), so the doubled write showed up on common-term
+        // queries.
         let key = cached.map(|(_, offset)| (offset, bounds.scale_bits()));
         let hit = cached.zip(key).and_then(|((cache, _), key)| cache.get(key));
         let (blocks, term_max_bm25) = match hit {
@@ -752,6 +755,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: term_bytes,
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: NO_BLOCK,
             tf_decoded_block: NO_BLOCK,
             predecoded: false,
@@ -850,6 +854,7 @@ impl TermCursor {
             inspect_block: 0,
             bytes: body,
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -924,6 +929,7 @@ impl TermCursor {
             // never call `decode_current_block`, so no block decode reads
             // `purpose` here.
             purpose,
+            wide_blocks: col.wide_blocks,
             decoded_block: 0,
             tf_decoded_block: 0,
             predecoded: true,
@@ -949,6 +955,7 @@ impl TermCursor {
         BlockHeader::parse(
             &self.bytes[block.block_byte_offset..block.block_byte_end],
             prev,
+            self.wide_blocks,
         )
     }
 
@@ -1327,7 +1334,7 @@ impl TermCursor {
     /// The tf at `rank` of the current bitset block for a probe. Normally
     /// the block's tf array is unpacked once (doc order) and reused across
     /// a run of probes into the same block — the union and intersection
-    /// kernels probe a dense block many times, and one 128-lane unpack
+    /// kernels probe a dense block many times, and one unpack of its lanes
     /// beats a bit-field read per probe (measured: reading the single lane
     /// cost union 7% and intersection 5%). While the block is held lazily,
     /// though, `block_tfs[0]` is the published doc's tf and `pos` names
@@ -1630,11 +1637,20 @@ impl TermCursor {
         self.current_block >= self.blocks.len()
     }
 
-    /// Block count, used as a cheap proxy for df when AND intersection
-    /// picks the rarest cursor as the leader. Block count is an exact
-    /// upper bound on df: a term's df is `(blocks - 1) * BLOCK_LEN +
-    /// last_block_n`, so cursors compare in the same order by block
-    /// count as they do by df. Inline cursors return 1.
+    /// Docs a full block of this term holds. A wide file writes its
+    /// common terms in two sub-blocks and its rarer ones in one, so the
+    /// length is the term's: more postings than one sub-block per block
+    /// could hold means two. An estimate's unit, not a decoded block's
+    /// count, which the header gives.
+    #[inline]
+    pub(super) fn block_len(&self) -> usize {
+        let one_each = (SUB_BLOCK_LEN * self.blocks.len()) as u64;
+        block_lanes(self.wide_blocks && self.df > one_each)
+    }
+
+    /// The term's posting blocks here. Not an order on terms: a wide file
+    /// gives its common terms twice the docs per block, so a term with more
+    /// blocks may hold fewer postings — rank by `df`. Inline cursors have 1.
     #[inline(always)]
     pub(super) fn block_count(&self) -> usize {
         self.blocks.len()
@@ -1785,7 +1801,7 @@ impl TermCursor {
         };
         let span = f64::from(self.blocks[i - 1].last_doc_id) - f64::from(span_start) + 1.0;
         let range = f64::from(range_end.max(range_start)) - f64::from(range_start) + 1.0;
-        let docs = (i - first) as f64 * BLOCK_LEN as f64 * (range / span).clamp(0.0, 1.0);
+        let docs = (i - first) as f64 * self.block_len() as f64 * (range / span).clamp(0.0, 1.0);
         (max, docs as f32)
     }
 
@@ -2030,11 +2046,14 @@ mod tests {
     use rand_distr::{Distribution, LogNormal};
 
     use super::*;
-    use crate::superfile::fts::{
-        bm25,
-        builder::FtsBuilder,
-        posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, block_encoding},
-        reader::{FtsReader, QueryIdf},
+    use crate::superfile::{
+        format::fts::COARSE_BLOCK_MAX_SPAN,
+        fts::{
+            bm25,
+            builder::FtsBuilder,
+            posting::{ENCODING_BITSET, ENCODING_PACKED, ENCODING_PATCHED, block_encoding},
+            reader::{FtsReader, QueryIdf},
+        },
     };
 
     #[test]
@@ -2136,7 +2155,7 @@ mod tests {
     /// the query score of a doc whose length quantizes down, and the
     /// block-max skip in the ranked-OR walk drops that doc from the top-k.
     ///
-    /// This plants a term spanning several 128-doc blocks whose documents
+    /// This plants a term spanning several blocks whose documents
     /// all have a length in the quantize-down region, then walks the term's
     /// cursor and asserts `block_max >= query_score` for every posting.
     /// Without the length-consistent block bound the assertion fires on the
@@ -2169,6 +2188,10 @@ mod tests {
         FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open")
     }
 
+    /// Docs of the two-column fixture: `common` in every one spans more
+    /// than a coarse span of wide blocks.
+    const TWO_COLUMN_DOCS: u32 = (3 * COARSE_BLOCK_MAX_SPAN / 2 * BLOCK_LEN) as u32;
+
     /// A positional and a positionless column, each with a term spanning
     /// many blocks whose gaps vary, so the length-coded skip table has
     /// to be right in both entry widths.
@@ -2177,11 +2200,15 @@ mod tests {
         b.register_column("pos".into(), true).expect("register");
         b.register_column("flat".into(), false).expect("register");
         let mut text = String::new();
-        for doc_id in 0..6000u32 {
+        for doc_id in 0..TWO_COLUMN_DOCS {
             // Every doc has `common`; a stretch of docs carries it several
             // times, and every 500th doc is a long one.
             text.clear();
-            let reps = if (doc_id / 128) % 3 == 0 { 3 } else { 1 };
+            let reps = if (doc_id / SUB_BLOCK_LEN as u32).is_multiple_of(3) {
+                3
+            } else {
+                1
+            };
             for r in 0..reps {
                 text.push_str(&format!("filler{} common ", (doc_id + r) % 97));
             }
@@ -2348,7 +2375,7 @@ mod tests {
         c.skip_to(4_100);
         assert!(c.contains(4_105));
         assert_eq!(c.bitset_probe_tf(4_105), Some(tf_of(4_105)));
-        assert!(!c.contains(4_105 + 7_000));
+        assert!(!c.contains(TWO_COLUMN_DOCS));
     }
 
     /// The lazy probes must stay exact when a caller alternates between
@@ -2427,7 +2454,7 @@ mod tests {
                 walked.push((reference.current_doc_id(), reference.current_tf()));
                 reference.next();
             }
-            assert_eq!(walked.len(), 6000);
+            assert_eq!(walked.len(), TWO_COLUMN_DOCS as usize);
             let expect_at = |target: u32| walked.iter().find(|(d, _)| *d >= target).copied();
 
             let mut c = cursors[0].clone();
@@ -2491,7 +2518,11 @@ mod tests {
                 .await
                 .expect("cursors");
             let cursor = &cursors[0];
-            assert!(cursor.blocks.len() > 40, "{} blocks", cursor.blocks.len());
+            assert!(
+                cursor.blocks.len() > COARSE_BLOCK_MAX_SPAN,
+                "premise: {} blocks cross a span",
+                cursor.blocks.len()
+            );
             let postings: &[u8] = cursor.bytes.as_ref();
             let meta = TermMeta::parse(postings, 0, positional).expect("meta");
             assert_eq!(meta.num_blocks, cursor.blocks.len());
@@ -2533,7 +2564,7 @@ mod tests {
             let mut d = vec![0u32; BLOCK_LEN];
             for i in 0..meta.num_blocks {
                 let range = meta.block_range_in_term(postings, i, None);
-                let hdr = BlockHeader::parse(&postings[range.clone()], prev_last);
+                let hdr = BlockHeader::parse(&postings[range.clone()], prev_last, true);
                 let n = decode_block_doc_ids(&postings[range], &hdr, &mut d);
                 assert!(
                     prev_last.is_none_or(|p| p < d[0]),
@@ -2595,7 +2626,7 @@ mod tests {
     /// admits most of the blocks a tight bound would skip.
     #[tokio::test]
     async fn bounds_are_exact_at_the_declared_statistics_and_sound_under_an_override() {
-        let reader = realistic_reader(6_000);
+        let reader = realistic_reader(12_000);
         assert_eq!(reader.columns[0].bound_scale(), 1.0);
         let baked = block_bounds_and_maxima(&reader).await;
         assert!(baked.len() > 30, "need a long posting list to say anything");
@@ -2664,12 +2695,12 @@ mod tests {
             "corpus doc length must quantize downward to exercise the bound"
         );
         // The term under test lives in this many docs — enough to span
-        // multiple 128-doc blocks so the block-max skip engages.
-        const TERM_DOCS: u32 = 260;
+        // multiple blocks so the block-max skip engages.
+        const TERM_DOCS: u32 = 2 * BLOCK_LEN as u32 + 4;
         // Total corpus size. Kept well above `TERM_DOCS` so the term's IDF
         // is large enough that the quantization-induced score gap is well
         // clear of `f32` rounding and the assertion is decisive.
-        const N_DOCS: u32 = 1300;
+        const N_DOCS: u32 = 5 * TERM_DOCS;
 
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)
@@ -2894,15 +2925,18 @@ mod tests {
     #[tokio::test]
     async fn seeks_land_on_the_first_doc_at_every_block_edge_of_every_encoding() {
         let mut list: Planted = Vec::new();
-        // Dense: 300 consecutive docs from 10.
-        for d in 10..310u32 {
-            list.push((d, 1 + d % 3));
+        // Dense: two blocks' worth of docs from 10 with every seventh
+        // missing, so the blocks are bitsets rather than runs.
+        for d in 10..(10 + 2 * BLOCK_LEN as u32 + 40) {
+            if d % 7 != 3 {
+                list.push((d, 1 + d % 3));
+            }
         }
-        // Patched: 4 blocks of 128 docs two apart, each with one gap and
-        // one tf outlier.
-        let mut d = 312u32;
+        // Patched: 4 blocks of docs two apart, each with one gap and one
+        // tf outlier.
+        let mut d = 10 + 2 * BLOCK_LEN as u32 + 42;
         for blk in 0..4u32 {
-            for lane in 0..128u32 {
+            for lane in 0..BLOCK_LEN as u32 {
                 let tf = if lane == 40 + blk {
                     OUTLIER_TF
                 } else {
@@ -2913,7 +2947,7 @@ mod tests {
             }
         }
         // Packed: 3 blocks at a uniform gap of 37.
-        for _ in 0..(3 * 128) {
+        for _ in 0..(3 * BLOCK_LEN) {
             list.push((d, 2));
             d += 37;
         }
@@ -3119,7 +3153,8 @@ mod tests {
         // built in later blocks: a third skip into the same bitset block
         // expands it, and two such expansions in a row make the cursor
         // eager.
-        for t in [130u32, 131, 132, 260, 261, 262] {
+        let b = BLOCK_LEN as u32;
+        for t in [b + 2, b + 3, b + 4, 2 * b + 4, 2 * b + 5, 2 * b + 6] {
             c.skip_to(t);
             let (d, tf) = expect_at(t).expect("in range");
             assert_eq!(c.current_doc_id(), d, "target {t}");

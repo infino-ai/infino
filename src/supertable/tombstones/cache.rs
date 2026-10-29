@@ -80,7 +80,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use futures::stream::{self, StreamExt};
+use futures::{StreamExt, stream};
 use roaring::RoaringBitmap;
 use tracing::debug;
 use uuid::Uuid;
@@ -102,8 +102,7 @@ pub const DEFAULT_SEAL_TTL: Duration = Duration::from_secs(1);
 /// planner prefetches every superfile the manifest lists, so an unbounded
 /// fan-out would put a whole table's worth of requests on the provider at
 /// once and trade the ids it throttles for serial re-reads. A query's
-/// bitmap prefetch is not bounded by this: its ids are the ones a delete
-/// just touched, and its wall is one round trip.
+/// bitmap prefetch has its own, configured bound (`prefetch_limit`).
 const SIDECAR_FETCH_MAX_IN_FLIGHT: usize = 32;
 
 /// Reader-side snapshot of the manifest's per-superfile tombstone
@@ -152,6 +151,8 @@ pub struct SidecarCache {
     /// allocates nothing.
     empty_bitmap: Arc<RoaringBitmap>,
     wal_store: WalStore,
+    /// Sidecar reads a [`Self::prefetch`] keeps in flight.
+    prefetch_limit: usize,
 }
 
 /// One cached entry. `etag` is the storage-layer etag returned
@@ -192,11 +193,14 @@ enum Freshness {
 impl SidecarCache {
     /// Construct a cache backed by the supplied [`WalStore`],
     /// born with `initial_view` (the tombstone-seq view of the
-    /// manifest the owning supertable handle was opened with).
+    /// manifest the owning supertable handle was opened with). A
+    /// [`Self::prefetch`] keeps at most `prefetch_limit` reads in
+    /// flight; zero means one.
     pub fn new(
         wal_store: WalStore,
         seal_ttl: Duration,
         initial_view: Arc<TombstoneSeqView>,
+        prefetch_limit: usize,
     ) -> Self {
         Self {
             inner: DashMap::new(),
@@ -204,6 +208,7 @@ impl SidecarCache {
             seq_view: ArcSwap::new(initial_view),
             empty_bitmap: Arc::new(RoaringBitmap::new()),
             wal_store,
+            prefetch_limit: prefetch_limit.max(1),
         }
     }
 
@@ -243,17 +248,19 @@ impl SidecarCache {
     ///
     /// This is the hot-path entry point for a wide fan-out: it
     /// replaces N *serial* blocking storage GETs (one per superfile,
-    /// each a sync→async bridge) with a single *concurrent* batch
-    /// whose wall cost is ≈ one round trip rather than N. Ids absent
-    /// from the seq map have no sidecar and ids whose entry matches
-    /// the map are already fresh, so in the no-new-deletes steady
-    /// state this issues zero GETs. A per-id refresh error is left
-    /// for the later [`Self::bitmap_for`] call to surface; the batch
-    /// never fails as a whole.
+    /// each a sync→async bridge) with one concurrent batch, whose wall
+    /// cost is ≈ one round trip per `prefetch_limit` stale superfiles
+    /// rather than one each. The batch keeps at most `prefetch_limit`
+    /// reads in flight, so a fan-out over thousands of superfiles that
+    /// all carry deletes does not start thousands of requests together.
+    /// Ids absent from the seq map have no sidecar and ids whose entry
+    /// matches the map are already fresh, so in the no-new-deletes
+    /// steady state this issues zero GETs. A per-id refresh error is
+    /// left for the later [`Self::bitmap_for`] call to surface; the
+    /// batch never fails as a whole.
     pub async fn prefetch(&self, superfile_ids: &[Uuid], now: Instant) {
         let stale = self.stale_entries(superfile_ids, now, Freshness::Bitmap);
-        let all_at_once = stale.len().max(1);
-        self.fetch_batch(stale, now, all_at_once).await;
+        self.fetch_batch(stale, now, self.prefetch_limit).await;
     }
 
     /// As [`Self::prefetch`], for a caller that will read seals, under the
@@ -269,9 +276,9 @@ impl SidecarCache {
     /// costs a listing per call rather than a GET per superfile. Ids the
     /// map names are read regardless of the listing, which is what the map
     /// promises, and if the listing fails every stale id is read. The
-    /// reads run [`SIDECAR_FETCH_MAX_IN_FLIGHT`] at a time: unlike
-    /// [`Self::prefetch`] the caller is a maintenance pass over a whole
-    /// table, not a query.
+    /// reads run [`SIDECAR_FETCH_MAX_IN_FLIGHT`] at a time, a fixed bound
+    /// rather than [`Self::prefetch`]'s configured one: the caller is a
+    /// maintenance pass over a whole table, not a query.
     ///
     /// `superfile_ids` is every id the caller may consult. An entry that
     /// only a seal lookup created (the seq map does not name it) for an id
@@ -550,12 +557,66 @@ mod tests {
 
     use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::{join, time::sleep};
 
     use super::*;
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
         supertable::wal::tombstones_codec::TombstonesSidecar,
+        test_helpers::slow_storage::SlowStorage,
     };
+
+    /// How long each sidecar read takes, so reads in flight overlap.
+    const READ_LATENCY: Duration = Duration::from_millis(5);
+    /// Sidecar reads a prefetch in these tests keeps in flight.
+    const PREFETCH_LIMIT: usize = 64;
+    /// How often a test checks the reads in flight while it waits on them.
+    const IN_FLIGHT_POLL: Duration = Duration::from_millis(1);
+    /// How long a test waits for reads to reach the prefetch limit.
+    const IN_FLIGHT_DEADLINE: Duration = Duration::from_secs(30);
+
+    /// A prefetch over more superfiles with deletes than it keeps in flight
+    /// reads at most its limit of sidecars at once, and reaches that many, so
+    /// the limit is what bounds it. Reads are held until the limit is reached,
+    /// so a slow runner cannot finish one before the last starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prefetch_keeps_at_most_its_limit_of_reads_in_flight() {
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let storage = SlowStorage::wrap(local, READ_LATENCY);
+        let cache = SidecarCache::new(
+            WalStore::new(storage.clone()),
+            DEFAULT_SEAL_TTL,
+            Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
+        );
+        let ids: Vec<Uuid> = (0..2 * PREFETCH_LIMIT)
+            .map(|i| Uuid::from_u128(i as u128))
+            .collect();
+        let mapped: Vec<(Uuid, u64)> = ids.iter().map(|&id| (id, 1)).collect();
+        cache.reconcile(view(1, &mapped));
+
+        let reach_the_limit = async {
+            let deadline = Instant::now() + IN_FLIGHT_DEADLINE;
+            while storage.in_flight() < PREFETCH_LIMIT {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for the limit of reads in flight"
+                );
+                sleep(IN_FLIGHT_POLL).await;
+            }
+            storage.release_reads();
+        };
+        storage.hold_reads();
+        join!(cache.prefetch(&ids, Instant::now()), reach_the_limit);
+        assert_eq!(
+            storage.max_in_flight(),
+            PREFETCH_LIMIT,
+            "at most the limit of sidecar reads at once, and the prefetch reaches it"
+        );
+        assert_eq!(cache.len(), ids.len(), "every mapped id was read");
+    }
 
     fn fixture() -> (TempDir, WalStore, SidecarCache) {
         let dir = TempDir::new().expect("tempdir");
@@ -566,6 +627,7 @@ mod tests {
             ws.clone(),
             DEFAULT_SEAL_TTL,
             Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
         );
         (dir, ws, cache)
     }
@@ -863,6 +925,7 @@ mod tests {
             ws.clone(),
             Duration::ZERO,
             Arc::new(TombstoneSeqView::default()),
+            PREFETCH_LIMIT,
         );
         let sf_id = Uuid::from_u128(0x5EA1);
         let mut bitmap = RoaringBitmap::new();

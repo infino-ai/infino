@@ -1180,6 +1180,10 @@ impl Connection {
             planned_read_ranges = tracing::field::Empty,
             rows_materialized = tracing::field::Empty,
             kernel_cpu_ns = tracing::field::Empty,
+            fts_postings_bytes = tracing::field::Empty,
+            vector_cells_scanned = tracing::field::Empty,
+            vector_candidates_scanned = tracing::field::Empty,
+            vector_rows_reranked = tracing::field::Empty,
             store_heads = tracing::field::Empty,
             store_gets = tracing::field::Empty,
             store_get_bytes = tracing::field::Empty,
@@ -2091,8 +2095,8 @@ mod tests {
 
     use arrow::util::pretty::pretty_format_batches;
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array, LargeStringArray,
-        StringViewArray,
+        Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
+        LargeStringArray, StringViewArray,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -2107,6 +2111,7 @@ mod tests {
     use crate::{
         Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
+        runtime_metrics::io::UriClass,
         supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
         test_helpers::{
             build_title_batch,
@@ -2212,6 +2217,117 @@ mod tests {
     // test below poisons a gate the way a panicking build would, then drives
     // one of the three ops that lock it (open / drop / create) and asserts the
     // op does not panic and still produces a correct result.
+
+    /// Rows per superfile in the cacheless tests, and how many superfiles.
+    const CACHELESS_ROWS: i64 = 2_000;
+    const CACHELESS_SUPERFILES: i64 = 3;
+    /// Payload bytes per row, incompressible, so a superfile is far larger
+    /// than its footer and than its `n` column.
+    const CACHELESS_PAYLOAD_BYTES: usize = 1_000;
+
+    /// A storage-backed table `wide` of `CACHELESS_SUPERFILES` superfiles of
+    /// incompressible rows under a connection with no cache dir, and the
+    /// bytes its superfiles take on disk. The connection that wrote it is
+    /// dropped: a test reopens the directory, so the in-memory tier is
+    /// empty and every byte a query needs is fetched from storage.
+    fn cacheless_wide_table() -> (tempfile::TempDir, u64) {
+        let (conn, dir) = storage_conn();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("payload", DataType::LargeUtf8, false),
+        ]));
+        let table = conn
+            .create_table("wide", Arc::clone(&schema), IndexSpec::new())
+            .expect("create_table");
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        for file in 0..CACHELESS_SUPERFILES {
+            let n: Vec<i64> = (0..CACHELESS_ROWS)
+                .map(|i| file * CACHELESS_ROWS + i)
+                .collect();
+            let payload: Vec<String> = (0..CACHELESS_ROWS)
+                .map(|_| {
+                    (0..CACHELESS_PAYLOAD_BYTES)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            char::from(b'a' + (seed % 26) as u8)
+                        })
+                        .collect()
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(n)),
+                    Arc::new(LargeStringArray::from(payload)),
+                ],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        let on_disk = walkdir_parquet_bytes(dir.path());
+        assert!(on_disk > 0, "the table wrote superfiles");
+        (dir, on_disk)
+    }
+
+    /// Reopen the directory `cacheless_wide_table` wrote.
+    fn reopen(dir: &tempfile::TempDir) -> Connection {
+        connect(dir.path().to_str().expect("utf8 path")).expect("reopen")
+    }
+
+    /// A connection with no disk cache opens superfiles by range. Measured on
+    /// a reopened connection, whose in-memory tier is empty, with a question
+    /// the manifest cannot answer from its statistics: a count under a
+    /// residual predicate on `n` reads the one superfile the manifest keeps,
+    /// and of it the footer and the `n` column, so it fetches less than that
+    /// superfile holds. An open that fetched the object whole would fetch
+    /// more.
+    #[test]
+    fn a_cacheless_query_fetches_less_than_the_superfile_it_reads() {
+        let (dir, on_disk) = cacheless_wide_table();
+        let conn = reopen(&dir);
+        let before = conn.usage_snapshot();
+        let last_file_from = (CACHELESS_SUPERFILES - 1) * CACHELESS_ROWS;
+        let out = conn
+            .query_sql(&format!(
+                "SELECT COUNT(*) FROM wide WHERE n >= {last_file_from} AND n % 2 = 0"
+            ))
+            .expect("query");
+        let count = out[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count")
+            .value(0);
+        assert_eq!(count, CACHELESS_ROWS / 2);
+        let data = conn
+            .usage_snapshot()
+            .since(&before)
+            .class_io(UriClass::UserData);
+        let one_superfile = on_disk / CACHELESS_SUPERFILES as u64;
+        assert!(
+            data.get_bytes < one_superfile,
+            "a query over the footer and one column of a {one_superfile}-byte superfile fetched {} bytes",
+            data.get_bytes
+        );
+    }
+
+    /// Bytes of every `.parquet` file under `root`.
+    fn walkdir_parquet_bytes(root: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    total += walkdir_parquet_bytes(&path);
+                } else if path.extension().is_some_and(|e| e == "parquet") {
+                    total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
 
     #[test]
     fn poisoned_gate_does_not_wedge_open() {
@@ -4402,6 +4518,162 @@ mod tests {
         );
     }
 
+    /// A nullable `title` and a nullable `fare` over two superfiles: four non-null fares summing
+    /// to 20, and the non-null titles yellow twice, green once and fhv once.
+    fn create_fares(conn: &Connection, name: &str) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, true),
+            Field::new("fare", DataType::Float64, true),
+        ]));
+        let table = conn
+            .create_table(name, Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        let batch = |titles: Vec<Option<&str>>, fares: Vec<Option<f64>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(titles)),
+                    Arc::new(Float64Array::from(fares)),
+                ],
+            )
+            .expect("batch")
+        };
+        table
+            .append(&batch(
+                vec![Some("yellow"), None, Some("green")],
+                vec![Some(10.0), Some(2.5), None],
+            ))
+            .expect("append 1");
+        table
+            .append(&batch(
+                vec![Some("yellow"), Some("fhv"), None],
+                vec![None, Some(7.0), Some(0.5)],
+            ))
+            .expect("append 2");
+    }
+
+    /// The single value in column `column` of a one-row result.
+    fn single<A: Array + Clone + 'static>(batches: &[RecordBatch], column: usize) -> A {
+        batches[0]
+            .column(column)
+            .as_any()
+            .downcast_ref::<A>()
+            .expect("column type")
+            .clone()
+    }
+
+    /// `COUNT(column)` counts the column's non-null rows from the manifest's null counts, alone
+    /// and beside `SUM` (the pair an average is assembled from), with no scan; under a range on
+    /// the same column it still counts only non-null rows.
+    #[test]
+    fn query_sql_answers_column_counts_from_manifest_stats() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let count_only = "SELECT count(fare) AS n FROM fares";
+        let counted = conn.query_sql(count_only).expect("count");
+        assert_eq!(single::<Int64Array>(&counted, 0).value(0), 4);
+
+        let pair = "SELECT sum(fare) AS s, count(fare) AS n FROM fares";
+        let summed = conn.query_sql(pair).expect("sum and count");
+        assert_eq!(single::<Float64Array>(&summed, 0).value(0), 20.0);
+        assert_eq!(single::<Int64Array>(&summed, 1).value(0), 4);
+
+        for sql in [count_only, pair] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(
+                !scans(&plan),
+                "answered from manifest stats, no scan: {sql}"
+            );
+        }
+
+        let ranged = conn
+            .query_sql("SELECT count(fare) AS n FROM fares WHERE fare >= 0")
+            .expect("ranged count");
+        assert_eq!(single::<Int64Array>(&ranged, 0).value(0), 4);
+    }
+
+    /// A grouped count filtered to the grouping column's non-null values is answered from the
+    /// value counts even though the column holds nulls; unfiltered, the null group needs the scan.
+    #[test]
+    fn query_sql_answers_not_null_grouped_counts_from_value_counts() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let not_null = "SELECT title, count(*) FROM fares WHERE title IS NOT NULL GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(not_null).expect("grouped")),
+            vec![
+                ("fhv".to_string(), 1),
+                ("green".to_string(), 1),
+                ("yellow".to_string(), 2)
+            ]
+        );
+        let plan = conn
+            .query_sql(&format!("EXPLAIN {not_null}"))
+            .expect("explain");
+        assert!(!scans(&plan), "answered from value counts, no scan");
+
+        let whole = "SELECT title, count(*) FROM fares GROUP BY title";
+        let plan = conn
+            .query_sql(&format!("EXPLAIN {whole}"))
+            .expect("explain");
+        assert!(scans(&plan), "the null group is not in the value counts");
+    }
+
+    /// `(group, count)` rows of a grouped count whose group column may be null, sorted.
+    fn nullable_grouped_counts(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let groups = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("LargeUtf8 group");
+            let counts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("Int64 count");
+            for i in 0..batch.num_rows() {
+                let group = (!groups.is_null(i)).then(|| groups.value(i).to_string());
+                rows.push((group, counts.value(i)));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// Only `IS NOT NULL` on the grouping column itself, alone, is answered from its value
+    /// counts. A filter on another column keeps the null group the value counts lack, and a
+    /// conjunction narrows the rows below them; both are scanned.
+    #[test]
+    fn query_sql_scans_grouped_counts_under_any_other_filter() {
+        let conn = connect("memory://").expect("connect");
+        create_fares(&conn, "fares");
+
+        let other_column =
+            "SELECT title, count(*) FROM fares WHERE fare IS NOT NULL GROUP BY title";
+        assert_eq!(
+            nullable_grouped_counts(&conn.query_sql(other_column).expect("grouped")),
+            vec![
+                (None, 2),
+                (Some("fhv".to_string()), 1),
+                (Some("yellow".to_string()), 1)
+            ]
+        );
+        let conjunction = "SELECT title, count(*) FROM fares \
+                           WHERE title IS NOT NULL AND fare IS NOT NULL GROUP BY title";
+        assert_eq!(
+            grouped_counts(&conn.query_sql(conjunction).expect("grouped")),
+            vec![("fhv".to_string(), 1), ("yellow".to_string(), 1)]
+        );
+        for sql in [other_column, conjunction] {
+            let plan = conn.query_sql(&format!("EXPLAIN {sql}")).expect("explain");
+            assert!(scans(&plan), "must scan: {sql}");
+        }
+    }
+
     /// The rewrite only answers an aggregate over one table's scan; an aggregate over a join of
     /// two tables still scans both and counts the joined rows.
     #[test]
@@ -6320,6 +6592,24 @@ mod tests {
         });
         cancel_and_expect_cancelled(&cancel, &running);
         wait_until("the sort memory comes back", || budget.used() == 0);
+        assert_cache_ledger_settles(&conn, &stores);
+    }
+
+    /// A query cancelled while its scan opens the files returns at once, and
+    /// the opens stop with it. Each open runs on a task of its own; one left
+    /// running would read on after the call returned.
+    #[test]
+    fn a_query_cancelled_while_opening_files_stops_reading() {
+        let (conn, dir) = storage_conn();
+        write_fox_table(&conn, "docs", LARGE_FILES, ROWS_PER_LARGE_FILE);
+        let cache = tempfile::tempdir().expect("cache dir");
+        let (conn, stores) = slow_cold_conn(dir.path(), cache.path());
+        let cancel = QueryCancel::new();
+
+        let running = query_in_background(&conn, READ_EVERY_FILE, &cancel);
+        wait_until("the scan opens a file", || stores.reads_of(SUPERFILE) > 0);
+        cancel_and_expect_cancelled(&cancel, &running);
+        assert_no_foreground_read_follows(&conn);
         assert_cache_ledger_settles(&conn, &stores);
     }
 

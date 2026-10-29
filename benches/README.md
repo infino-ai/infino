@@ -886,3 +886,32 @@ Every term the quality battery names, with the posting form it took in the grade
 | term200009 | 1 | 55 | 0 | 0 | 0 | 1 | 0 | 0 |
 | term40000 | 1 | 298 | 0 | 3 | 0 | 0 | 0 | 1 |
 <!-- END: bench/fts/superfile/quality-coverage -->
+
+### Superfile FTS — posting block length (5M-doc public corpus, 962 + 900 queries)
+
+_Host: 16-vCPU x86_64 cloud VM · fat-LTO build · best of 3 reps per query_
+
+A posting block is one or two sub-blocks of 128 lanes (`SUB_BLOCK_LEN`); the writer picks the length per term by density (`WIDE_BLOCK_MIN_DENSITY` in `builder.rs`). The second sub-block halves the per-block work a reader pays per document (header, skip entry, position group, tf array) and coarsens the block maxima a ranked walk prunes by. Measured against the previous format, every term in one-sub-block blocks, in the same run over the 962-query set (mean of per-query latency ratios):
+
+| shape | every term wide vs one sub-block |
+| --- | ---: |
+| TOP_10 | 0.94 |
+| TOP_100 | 0.94 |
+| TOP_1000 | 0.96 |
+| COUNT | 0.93 |
+| TOP_100_COUNT | 0.94 |
+
+On the 900 held-out queries the same build reads 0.98 / 0.98 / 0.95 / 0.95 (TOP_10 / TOP_100 / TOP_1000 / COUNT). Results were identical to the previous format on every query and shape.
+
+Which terms get the second sub-block, each policy its own build and run, latency relative to every term wide (search = the three top-k shapes, count = the two count shapes) and the superfile data bytes relative to the previous format:
+
+| wide when `df / n_docs` is in | search | count | data bytes |
+| --- | ---: | ---: | ---: |
+| [0, 1] (every term) | — | — | +0.24% |
+| [0.001, 1] (**default**) | +0.3% | +0.5% | +0.07% |
+| [0.01, 1] | +2.8% | +1.5% | −0.02% |
+| [0.0005, 0.05] | +4.0% | +5.8% | +0.21% |
+| [0, 0.01] | +6.1% | +7.7% | +0.26% |
+| previous format (none) | +5.3% | +8.3% | — |
+
+The order is the same on the held-out set and on every shape: the gain lives in the common terms, the ones a walk meets in every block it visits; keeping the rare and mid terms narrow costs nothing measurable (a run's noise is ±1–2%) and keeps their pruning at the finer grain. The default is one document in a thousand: the same speed as every term wide, the second-smallest data growth, and a density rather than a count so it carries across corpus sizes. The halved skip entries and block headers pay for most of the one-width-per-256-lanes cost of the doc-id and tf streams.

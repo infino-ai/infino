@@ -39,9 +39,9 @@
 //! contributes `1 / (RRF_K + r + 1)`, and the per-identity
 //! contributions from the two lists are summed. The emitted `score`
 //! column is the fused RRF score — **higher is better**, so `ORDER BY
-//! score DESC` lists the best blended matches first. Identity is
-//! `(superfile, local_doc_id)`, so a document surfaced by *both*
-//! retrievers is boosted above one surfaced by a single retriever.
+//! score DESC` lists the best blended matches first. Identity is the
+//! stable `_id`, so a document surfaced by *both* retrievers is boosted
+//! above one surfaced by a single retriever.
 //!
 //! ## `WHERE` on the function
 //!
@@ -50,7 +50,9 @@
 //! once to a [`CandidateScope`] and handed to **both** retrievers, so the
 //! BM25 leg and the vector leg rank within the same superfiles and rows
 //! before fusion; what the index could not bound is made up by
-//! [`fill_top_k`] applying the exact predicate and fetching more.
+//! [`fill_top_k`] applying the exact predicate and fetching more. Without
+//! a `WHERE`, the vector leg is `vector_search`'s own search, the hidden
+//! vector index.
 
 use std::{cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
@@ -85,10 +87,10 @@ use crate::{
     supertable::{
         QueryError,
         handle::{Supertable, SupertableReader, WeakReader},
-        manifest::SuperfileUri,
         query::{
             SuperfileHit,
             candidate::CandidateScope,
+            dispatch::attach_stable_ids_to_hits,
             exec::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
@@ -99,7 +101,8 @@ use crate::{
             },
             vector::{
                 calibrated_query, free_columns_unambiguous, hits_id_score_batch,
-                id_score_projection_indices, user_placement_for_scalar_resolve,
+                id_score_projection_indices, sql_id_score_projection,
+                user_placement_for_scalar_resolve,
             },
         },
     },
@@ -163,14 +166,17 @@ impl SupertableReader {
 
     /// [`Self::hybrid_search_async`] confined to a [`CandidateScope`] —
     /// what a SQL `WHERE` pushed into the `hybrid_search` table function
-    /// admits. One scope feeds both retrievers: the BM25 leg searches only
-    /// the scope's superfiles and admits only its candidate rows, and the
-    /// vector leg fans out over the same superfiles with the same rows as
-    /// its allow-set, so the fused top-k is the best `k` among rows that
-    /// can satisfy the predicate. The vector leg stays on the user table
-    /// as the unscoped one does: fusion joins the two legs on
-    /// `(superfile, local_doc_id)`, and a hidden-index hit carries a
-    /// different identity. `None` is the unscoped search.
+    /// admits. `None` is the unscoped search.
+    ///
+    /// Unscoped, the vector leg is the search `vector_search` runs: the
+    /// hidden vector index plus the undrained user delta, with the index's
+    /// calibrated width and rerank budget, so its cost follows k rather than
+    /// the number of superfiles. A scope keeps the leg on the user table,
+    /// fanned out over the scope's superfiles with its rows as the
+    /// allow-set, so the fused top-k is the best `k` among rows that can
+    /// satisfy the predicate; the BM25 leg reads the same scope. Fusion
+    /// joins the legs on the stable `_id`, which every hit of both legs
+    /// carries, so where a hit was found does not change its identity.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn hybrid_search_scoped_async(
         &self,
@@ -188,10 +194,10 @@ impl SupertableReader {
         // match the public vector path.
         let q_vec = calibrated_query(self, vec_col, q_vec);
         let vector_leg = async {
-            match scope {
+            let mut hits = match scope {
                 None => {
-                    self.vector_search_user_table_async(vec_col, &q_vec, k, options)
-                        .await
+                    self.vector_search_global_index_async(vec_col, &q_vec, k, options)
+                        .await?
                 }
                 Some(scope) => {
                     // Only superfiles that still hold a candidate row; the
@@ -209,9 +215,18 @@ impl SupertableReader {
                         options,
                         scope.allow.clone(),
                     )
-                    .await
+                    .await?
                 }
-            }
+            };
+            // Fusion joins the legs on `_id`, so every vector hit needs one.
+            // Hidden-index hits, and hits in cell-packed user files (from
+            // their inline id region), carry it from the search. A hit in an
+            // older plain-IVF user file whose ids are not one contiguous run
+            // can arrive without one (the scoped fan-out, or a table's search
+            // before its first drain); its local is its Parquet row, so the
+            // `_id` read there is its own. Only those hits are read.
+            attach_stable_ids_to_hits(self, &mut hits).await?;
+            Ok::<_, QueryError>(hits)
         };
         // Both retrievers run concurrently on the query runtime; each
         // inherits its own manifest skip and returns hits best-first. Each
@@ -242,7 +257,7 @@ impl SupertableReader {
         // hybrid's kernel CPU covers all three of its compute legs.
         let fused = fuse_span.in_scope(|| {
             op_stats::timed_kernel(&self.op_stats, || rrf_fuse(&bm25_hits, &vector_hits, k))
-        });
+        })?;
         fuse_span.record("rows_out", fused.len());
         Ok(fused)
     }
@@ -329,17 +344,11 @@ impl Supertable {
                     // `_id` + `score` come free with the search wave, so a
                     // projection of just those needs no placement and no
                     // Parquet decode: the same fast path `vector_search`
-                    // takes. GUARDED on every hit carrying a stable-id
-                    // stamp: hybrid fuses FTS-matched rows that never went
-                    // through the hidden vector index, and those reach here
-                    // unstamped (`stable_id: None`), which
-                    // `hits_id_score_batch` treats as an upstream bug. Any
-                    // unstamped hit falls through to the general path,
-                    // which resolves ids by placement.
+                    // takes. Fusion refuses an unstamped hit, so every
+                    // fused hit carries its `_id`.
                     let id_column = reader.options().id_column.as_str();
                     if free_columns_unambiguous(&reader.options().schema, id_column)
                         && let Some(indices) = id_score_projection_indices(projection, id_column)
-                        && hits.iter().all(|h| h.stable_id.is_some())
                     {
                         return hits_id_score_batch(&reader, &hits)?
                             .project(&indices)
@@ -632,8 +641,30 @@ impl ExecutionPlan for HybridSearchExec {
         let output_schema = Arc::clone(&self.output_schema);
         let projection = self.projection.clone();
         let projected_schema = Arc::clone(&self.projected_schema);
+        let id_score_projection = sql_id_score_projection(
+            &output_schema,
+            projection.as_deref(),
+            reader.options().id_column.as_str(),
+        );
 
         let fut = async move {
+            // `_id` and `score` come free with the fused hits (fusion
+            // refuses a hit without its `_id`), so a projection of just
+            // those needs no placement and no decode, as in
+            // `vector_search`. Only without a `WHERE`: a predicate needs
+            // the rows to check.
+            if filters.is_empty()
+                && let Some(indices) = id_score_projection
+            {
+                let fused = reader
+                    .hybrid_search_scoped_async(
+                        &text_col, &q_text, mode, &vec_col, &q_vec, options, k, None,
+                    )
+                    .await?;
+                return hits_id_score_batch(&reader, &fused)?
+                    .project(&indices)
+                    .map_err(|e| QueryError::internal(e).into());
+            }
             // What the pushed-down `WHERE` admits, resolved once and handed
             // to both retrievers.
             let scope = match filters.is_empty() {
@@ -696,31 +727,35 @@ impl ExecutionPlan for HybridSearchExec {
 /// fusion.
 ///
 /// Each list is assumed best-first. A hit at 0-based position `r`
-/// contributes `1 / (RRF_K + r + 1)` to its stable `_id` identity when
-/// stamped, otherwise to its `(superfile, local_doc_id)` identity;
-/// contributions from the two lists are summed. Stable identity matters for
-/// cell-packed files because BM25 local ids follow Parquet order while vector
-/// local ids follow packed-cell order. The result
-/// is sorted by fused score descending — `(superfile, local_doc_id)` as
-/// a total tie-break so the order is deterministic regardless of the
-/// `HashMap`'s iteration order — and truncated to `k`. The returned
-/// hits carry the fused RRF score (higher is better).
-fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<SuperfileHit> {
-    #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-    enum HitIdentity {
-        Stable(i128),
-        Local(SuperfileUri, u32),
-    }
-
-    let mut acc: HashMap<HitIdentity, (SuperfileHit, f32)> =
+/// contributes `1 / (RRF_K + r + 1)` to its stable `_id`; contributions
+/// from the two lists are summed. The stable id is the only identity the
+/// two legs share: a BM25 local follows Parquet order, a vector local
+/// follows packed-cell order, and a vector hit from the hidden index names
+/// a hidden superfile, so an unstamped hit is refused rather than fused as
+/// a second document. A document both legs found keeps the BM25 hit, which
+/// already addresses its user row. The result is sorted by fused score
+/// descending, `_id` as a total tie-break, so the order and which tied rows
+/// survive the cut to `k` do not depend on the `HashMap`'s iteration order
+/// or on which superfile a leg found a row in. The returned hits carry the
+/// fused RRF score (higher is better).
+fn rrf_fuse(
+    bm25: &[SuperfileHit],
+    vector: &[SuperfileHit],
+    k: usize,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let mut acc: HashMap<i128, (SuperfileHit, f32)> =
         HashMap::with_capacity(bm25.len() + vector.len());
     for list in [bm25, vector] {
         for (rank, hit) in list.iter().enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            let identity = hit.stable_id.map_or(
-                HitIdentity::Local(hit.superfile, hit.local_doc_id),
-                HitIdentity::Stable,
-            );
+            let identity = hit.stable_id.ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "hybrid fusion: hit {:?}/{} has no stable _id",
+                    hit.superfile, hit.local_doc_id
+                ))
+            })?;
+            // BM25 goes first: `or_insert` keeps the first hit, so a row
+            // both legs found keeps the BM25 hit and its user placement.
             acc.entry(identity).or_insert((*hit, 0.0)).1 += contribution;
         }
     }
@@ -736,11 +771,10 @@ fn rrf_fuse(bm25: &[SuperfileHit], vector: &[SuperfileHit], k: usize) -> Vec<Sup
         b.score
             .partial_cmp(&a.score)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| a.superfile.cmp(&b.superfile))
-            .then_with(|| a.local_doc_id.cmp(&b.local_doc_id))
+            .then_with(|| a.stable_id.cmp(&b.stable_id))
     });
     fused.truncate(k);
-    fused
+    Ok(fused)
 }
 
 #[cfg(test)]
@@ -753,14 +787,17 @@ mod tests {
     };
     use arrow_schema::{DataType, Field, Schema};
     use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::{
+        config::OptimizeOptions,
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions},
+        supertable::{Supertable, SupertableOptions, manifest::SuperfileUri},
     };
 
     // ---- supertable harness: title (FTS) + emb (vector) ----
@@ -898,19 +935,24 @@ mod tests {
 
     // ---- rrf_fuse unit (deterministic fusion math) ----
 
-    #[test]
-    fn rrf_fuse_boosts_shared_hits_and_orders_by_fused_score() {
-        let seg = SuperfileUri::new_v4();
-        let h = |doc: u32, score: f32| SuperfileHit {
+    /// A hit in `seg` whose stable `_id` is its local doc id.
+    fn stamped(seg: SuperfileUri, doc: u32, score: f32) -> SuperfileHit {
+        SuperfileHit {
             superfile: seg,
             local_doc_id: doc,
             score,
-            stable_id: None,
-        };
+            stable_id: Some(i128::from(doc)),
+        }
+    }
+
+    #[test]
+    fn rrf_fuse_boosts_shared_hits_and_orders_by_fused_score() {
+        let seg = SuperfileUri::new_v4();
+        let h = |doc: u32, score: f32| stamped(seg, doc, score);
         // BM25 best-first: doc1, doc2, doc3. Vector best-first: doc2, doc4.
         let bm25 = vec![h(1, 9.0), h(2, 8.0), h(3, 7.0)];
         let vector = vec![h(2, 0.1), h(4, 0.2)];
-        let fused = rrf_fuse(&bm25, &vector, 10);
+        let fused = rrf_fuse(&bm25, &vector, 10).expect("fuse");
 
         // doc2 is in both lists → highest fused score.
         let ids: Vec<u32> = fused.iter().map(|x| x.local_doc_id).collect();
@@ -926,49 +968,59 @@ mod tests {
     #[test]
     fn rrf_fuse_truncates_to_k() {
         let seg = SuperfileUri::new_v4();
-        let h = |doc: u32| SuperfileHit {
-            superfile: seg,
-            local_doc_id: doc,
-            score: 0.0,
-            stable_id: None,
-        };
+        let h = |doc: u32| stamped(seg, doc, 0.0);
         let bm25 = vec![h(1), h(2), h(3)];
         let vector = vec![h(4), h(5)];
-        let fused = rrf_fuse(&bm25, &vector, 2);
+        let fused = rrf_fuse(&bm25, &vector, 2).expect("fuse");
         assert_eq!(fused.len(), 2, "fused list truncates to k");
     }
 
     #[test]
-    fn rrf_fuse_distinguishes_same_doc_id_across_superfiles() {
-        // local_doc_id alone is not a global identity: the same
-        // doc id in two superfiles are *different* hits.
-        let seg_a = SuperfileUri::new_v4();
-        let seg_b = SuperfileUri::new_v4();
+    fn rrf_fuse_keys_on_stable_id_not_local_doc_id() {
+        // The same superfile and local holding two different stable ids are
+        // two rows (a vector local and a BM25 local name different rows in a
+        // cell-packed file), so they never merge.
+        let seg = SuperfileUri::new_v4();
         let bm25 = vec![SuperfileHit {
-            superfile: seg_a,
-            local_doc_id: 0,
-            score: 1.0,
-            stable_id: None,
+            stable_id: Some(7),
+            ..stamped(seg, 0, 1.0)
         }];
         let vector = vec![SuperfileHit {
-            superfile: seg_b,
-            local_doc_id: 0,
-            score: 0.1,
-            stable_id: None,
+            stable_id: Some(8),
+            ..stamped(seg, 0, 0.1)
         }];
-        let fused = rrf_fuse(&bm25, &vector, 10);
-        assert_eq!(fused.len(), 2, "distinct superfiles → distinct hits");
+        let fused = rrf_fuse(&bm25, &vector, 10).expect("fuse");
+        assert_eq!(fused.len(), 2, "distinct stable ids → distinct hits");
+    }
+
+    #[test]
+    fn rrf_fuse_breaks_ties_by_stable_id() {
+        // Rank 0 in either list scores the same, so the two rows tie; the
+        // smaller `_id` wins the one slot, whatever superfile each names.
+        let bm25 = vec![SuperfileHit {
+            stable_id: Some(9),
+            ..stamped(SuperfileUri::new_v4(), 0, 1.0)
+        }];
+        let vector = vec![SuperfileHit {
+            stable_id: Some(3),
+            ..stamped(SuperfileUri::new_v4(), 5, 0.1)
+        }];
+        let fused = rrf_fuse(&bm25, &vector, 1).expect("fuse");
+        assert_eq!(fused[0].stable_id, Some(3));
     }
 
     #[test]
     fn rrf_fuse_joins_different_layout_locals_by_stable_id() {
         let stable_id = 42i128;
+        let bm25_seg = SuperfileUri::new_v4();
         let bm25 = vec![SuperfileHit {
-            superfile: SuperfileUri::new_v4(),
+            superfile: bm25_seg,
             local_doc_id: 3,
             score: 1.0,
             stable_id: Some(stable_id),
         }];
+        // The vector leg found the same row through another superfile
+        // (a hidden-index cell file) at another local.
         let vector = vec![SuperfileHit {
             superfile: SuperfileUri::new_v4(),
             local_doc_id: 17,
@@ -976,11 +1028,150 @@ mod tests {
             stable_id: Some(stable_id),
         }];
 
-        let fused = rrf_fuse(&bm25, &vector, 10);
+        let fused = rrf_fuse(&bm25, &vector, 10).expect("fuse");
         assert_eq!(fused.len(), 1, "one logical row must fuse once");
         assert_eq!(fused[0].stable_id, Some(stable_id));
+        assert_eq!(
+            (fused[0].superfile, fused[0].local_doc_id),
+            (bm25_seg, 3),
+            "a row both legs found keeps the BM25 hit, which addresses its user row"
+        );
         let expected = 2.0 / (RRF_K + 1.0);
         assert!((fused[0].score - expected).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rrf_fuse_refuses_an_unstamped_hit() {
+        let seg = SuperfileUri::new_v4();
+        let bm25 = vec![stamped(seg, 1, 1.0)];
+        let vector = vec![SuperfileHit {
+            stable_id: None,
+            ..stamped(seg, 1, 0.1)
+        }];
+        let err = rrf_fuse(&bm25, &vector, 10).expect_err("unstamped hit must not fuse");
+        assert!(matches!(err, QueryError::Internal(_)), "{err:?}");
+    }
+
+    // ---- `_id` + `score` projection on a drained table ----
+
+    /// SQL `hybrid_search` serves a projection of only `_id` and `score` from
+    /// the fused hits, as `vector_search` does, instead of first placing each
+    /// hit on its user row. On a drained, compacted table every vector hit
+    /// names a vector-index file, and placing one means looking its `_id` up
+    /// in the user table, which builds an `_id` -> row map per merged file.
+    /// The `_id` + `score` query builds none and returns the public search's
+    /// rows; adding `title`, which does need the rows, builds one, so the
+    /// fixture does exercise placement.
+    #[test]
+    fn sql_id_score_projection_skips_placement() {
+        let dim = 16;
+        let k = 4;
+        let dir = TempDir::new().expect("tempdir");
+        let open = || {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+            options_title_emb(dim).with_storage(storage)
+        };
+        let st = Supertable::create(open()).expect("create");
+        let schema = st.options().schema.clone();
+        let titles = ["rust async", "python data", "rust systems", "go routines"];
+        for _ in 0..3 {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_batch(&titles, dim, Arc::clone(&schema)))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+        st.optimize(&OptimizeOptions::default()).expect("optimize");
+        drop(st);
+
+        // The vector query favours "python data", which the text query
+        // never matches, so the fused top-k holds vector-only hits.
+        let sql = |columns: &str| {
+            format!(
+                "SELECT {columns} FROM hybrid_search('title', 'rust', 'emb', '{}', {k})",
+                csv_one_hot(dim, 1)
+            )
+        };
+        // Rows of `query`'s first two columns, and how many `_id` -> row
+        // maps it built, on a freshly opened table.
+        let run = |query: &str| -> (Vec<(i128, f32)>, usize) {
+            let st = Supertable::open(open()).expect("open");
+            let reader = st.reader().expect("reader");
+            let batches = reader.query_sql(query).expect("sql hybrid_search");
+            let maps = reader.block_on(async {
+                reader
+                    .manifest()
+                    .options
+                    .gapped_id_placement_cache
+                    .lock()
+                    .await
+                    .entries
+                    .len()
+            });
+            let rows = batches
+                .iter()
+                .flat_map(|b| {
+                    let ids = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimal _id");
+                    let scores = b
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("f32 score");
+                    (0..b.num_rows())
+                        .map(|i| (ids.value(i), scores.value(i)))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            (rows, maps)
+        };
+
+        let (with_title, maps) = run(&sql("_id, score, title"));
+        assert!(
+            maps > 0,
+            "placing a vector-only hit builds an `_id` -> row map"
+        );
+        let (id_score, maps) = run(&sql("_id, score"));
+        assert_eq!(maps, 0, "an `_id` + `score` query places nothing");
+        assert_eq!(id_score, with_title, "same rows either way");
+
+        let st = Supertable::open(open()).expect("open");
+        let q: Vec<f32> = (0..dim).map(|d| if d == 1 { 1.0 } else { 0.0 }).collect();
+        let public = st
+            .hybrid_search(
+                "title",
+                "rust",
+                BoolMode::Or,
+                "emb",
+                &q,
+                VectorSearchOptions::new(),
+                k,
+                Some(&["_id", "score"]),
+            )
+            .expect("public hybrid_search");
+        let public: Vec<(i128, f32)> = public
+            .iter()
+            .flat_map(|b| {
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal _id");
+                let scores = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .expect("f32 score");
+                (0..b.num_rows())
+                    .map(|i| (ids.value(i), scores.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(id_score, public, "the public search's rows");
     }
 
     // ---- end-to-end through query_sql ----

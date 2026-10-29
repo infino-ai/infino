@@ -37,11 +37,6 @@ use crate::{
     },
 };
 
-/// Parquet footer tail-speculation length for cold opens. Must match
-/// `SuperfileReader::open_lazy_with` so the cold-fetch overlay covers
-/// the entire upcoming `source.tail()` read.
-const PARQUET_TAIL_SPEC_BYTES: u64 = 64 * 1024;
-
 /// Fallback vector-subsection open-range length when the manifest
 /// carries only a `(offset, len)` hint without explicit open ranges.
 /// Enough bytes to parse the vector outer header; the reader then
@@ -440,7 +435,7 @@ mod store_files;
 #[cfg(test)]
 pub(crate) use budget::BlockWriteTicket;
 pub(crate) use budget::Reservation;
-pub(crate) use fetch::skip_background_fill;
+pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
 pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
 
 impl DiskCacheStore {

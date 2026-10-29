@@ -6,7 +6,11 @@
 //! public path that opens its superfiles: the searches, SQL, and the
 //! maintenance that rewrites them. Checked both reading straight from
 //! storage and through a disk cache, since each wraps a failed open in its
-//! own error.
+//! own error. The fixture stamps the superfiles on disk after the commit,
+//! which a query's open never reads on the lazy paths: those open from the
+//! header bytes the manifest carries inline. So the queries are checked
+//! through a disk cache fetching whole files, and straight from storage only
+//! the maintenance, which reads each superfile whole, sees the stamp.
 
 use infino::{
     Bm25SearchOptions, ColdFetchMode, ConnectOptions, Connection, InfinoError, OptimizeError,
@@ -30,11 +34,12 @@ const FIX: &str = "reindex";
 /// Where a reopened table reads its superfiles' bytes from.
 #[derive(Debug, Clone, Copy)]
 enum Tier {
-    /// Straight from storage: no disk cache configured.
+    /// Straight from storage: no disk cache configured. A query opens from
+    /// the header bytes the manifest carries, which the on-disk edit below
+    /// does not reach; the maintenance reads each superfile whole.
     Storage,
     /// Through a disk cache that fetches whole files. The default lazy mode
-    /// opens from the header bytes the manifest carries, which the on-disk
-    /// edit below does not reach.
+    /// opens from the header bytes the manifest carries, like storage.
     DiskCache,
 }
 
@@ -92,10 +97,9 @@ fn assert_unsupported(tier: Tier, what: &str, err: &InfinoError) {
     assert!(err.to_string().contains(FIX), "{tier:?} {what}: {err}");
 }
 
-fn assert_every_path_unsupported(tier: Tier) {
-    let too_old = open_too_old(tier);
+/// Every search and SQL query over `too_old` is refused as `Unsupported`.
+fn assert_queries_unsupported(tier: Tier, too_old: &TooOldTable) {
     let (db, table) = (&too_old.db, &too_old.table);
-
     let bm25 = table
         .bm25_search(
             "body",
@@ -120,7 +124,11 @@ fn assert_every_path_unsupported(tier: Tier) {
         .query_sql(&format!("SELECT body FROM {TABLE}"))
         .expect_err("query_sql over an index too old to read");
     assert_unsupported(tier, "query_sql", &sql);
+}
 
+/// Reindex and optimize of `too_old` are refused as `Unsupported`.
+fn assert_maintenance_unsupported(tier: Tier, too_old: &TooOldTable) {
+    let table = &too_old.table;
     let reindex = table
         .reindex(&ReindexOptions::rewriting())
         .expect_err("reindex of an index too old to read");
@@ -139,10 +147,13 @@ fn assert_every_path_unsupported(tier: Tier) {
 
 #[test]
 fn an_index_too_old_to_read_is_unsupported_reading_from_storage() {
-    assert_every_path_unsupported(Tier::Storage);
+    let too_old = open_too_old(Tier::Storage);
+    assert_maintenance_unsupported(Tier::Storage, &too_old);
 }
 
 #[test]
 fn an_index_too_old_to_read_is_unsupported_through_a_disk_cache() {
-    assert_every_path_unsupported(Tier::DiskCache);
+    let too_old = open_too_old(Tier::DiskCache);
+    assert_queries_unsupported(Tier::DiskCache, &too_old);
+    assert_maintenance_unsupported(Tier::DiskCache, &too_old);
 }

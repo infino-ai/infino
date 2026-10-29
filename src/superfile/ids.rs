@@ -34,7 +34,10 @@
 //! The layout is named by the `inf.ids.layout` footer key; a sidecar
 //! without that key is the older raw `i128` array.
 
-use std::ops::Range;
+use std::{
+    io::{self, Write},
+    ops::Range,
+};
 
 #[cfg(any(test, feature = "test-helpers"))]
 use crate::superfile::format::{footer::read_kv_metadata, kv};
@@ -66,39 +69,119 @@ const N_IN_BLOCK_AT: usize = 18;
 /// into the packed layout. An empty input yields an empty output, the
 /// "no sidecar" shape both ends already understand.
 pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
-    debug_assert!(raw.len().is_multiple_of(ID_SIDECAR_ENTRY_BYTES));
-    let n_docs = raw.len() / ID_SIDECAR_ENTRY_BYTES;
-    if n_docs == 0 {
-        return Vec::new();
-    }
-    let n_blocks = n_docs.div_ceil(BLOCK_DOCS);
-    let mut out =
-        Vec::with_capacity(HEADER_BYTES + n_blocks * (DIR_ENTRY_BYTES + BLOCK_HEADER_BYTES));
-    out.extend_from_slice(&(n_docs as u32).to_le_bytes());
-    out.extend_from_slice(&(BLOCK_DOCS as u32).to_le_bytes());
-    out.extend_from_slice(&(n_blocks as u32).to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes());
-    let dir_start = out.len();
-    out.resize(dir_start + n_blocks * DIR_ENTRY_BYTES, 0);
+    let mut encoder = PackedIdEncoder::new(Vec::new());
+    encoder
+        .push_raw(raw)
+        .expect("a Vec sink never fails to write");
+    let PackedIdOutput {
+        mut directory,
+        blocks,
+        ..
+    } = encoder.finish().expect("a Vec sink never fails to write");
+    directory.extend_from_slice(&blocks);
+    directory
+}
 
-    let mut his: Vec<u64> = Vec::with_capacity(BLOCK_DOCS);
-    let mut los: Vec<u64> = Vec::with_capacity(BLOCK_DOCS);
-    for (b, chunk) in raw.chunks(BLOCK_DOCS * ID_SIDECAR_ENTRY_BYTES).enumerate() {
-        his.clear();
-        los.clear();
-        for id in chunk.chunks_exact(ID_SIDECAR_ENTRY_BYTES) {
-            let v = u128::from_le_bytes(id.try_into().expect("16-byte id"));
-            his.push((v >> 64) as u64);
-            los.push(v as u64);
+/// Encodes a sidecar block by block as its ids arrive, writing each
+/// finished block to `blocks` and keeping only the open block and one
+/// directory entry per block in memory. A merge of a hundred million rows
+/// then holds a few megabytes for its sidecar instead of sixteen bytes per
+/// row; [`encode_packed`] is the same encoder over a `Vec`.
+///
+/// The header and directory are known only once the last block is in, so
+/// they come back separately from [`Self::finish`], ahead of the blocks.
+pub(crate) struct PackedIdEncoder<W: Write> {
+    blocks: W,
+    /// Bytes written to `blocks` so far: the next block's offset within it.
+    blocks_len: u64,
+    /// Each finished block's offset within `blocks`.
+    block_offsets: Vec<u64>,
+    n_docs: usize,
+    /// The open block's ids, split into halves.
+    his: Vec<u64>,
+    los: Vec<u64>,
+    /// One block's bytes, reused across blocks.
+    block: Vec<u8>,
+}
+
+/// A finished packed sidecar in two pieces: `directory` (header plus block
+/// directory, with offsets from the sidecar's start) followed by the blocks
+/// in the sink the encoder was given. Empty when no ids were pushed.
+pub(crate) struct PackedIdOutput<W> {
+    pub(crate) directory: Vec<u8>,
+    pub(crate) blocks: W,
+    pub(crate) blocks_len: u64,
+}
+
+impl<W> PackedIdOutput<W> {
+    /// Bytes of the whole sidecar, directory and blocks together.
+    pub(crate) fn len(&self) -> u64 {
+        self.directory.len() as u64 + self.blocks_len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The same sidecar with its blocks behind another handle: a scratch
+    /// file's write handle swapped for a read handle, or a `Vec` for a
+    /// cursor over it.
+    pub(crate) fn map_blocks<R>(self, f: impl FnOnce(W) -> R) -> PackedIdOutput<R> {
+        PackedIdOutput {
+            directory: self.directory,
+            blocks: f(self.blocks),
+            blocks_len: self.blocks_len,
         }
-        let n = his.len();
-        let hi_base = his.iter().copied().min().unwrap_or(0);
-        let lo_base = los.iter().copied().min().unwrap_or(0);
-        let hi_width = width_of(his.iter().map(|&h| h - hi_base).max().unwrap_or(0));
-        let lo_width = width_of(los.iter().map(|&l| l - lo_base).max().unwrap_or(0));
-        let block_off = out.len() as u64;
-        out[dir_start + b * DIR_ENTRY_BYTES..dir_start + (b + 1) * DIR_ENTRY_BYTES]
-            .copy_from_slice(&block_off.to_le_bytes());
+    }
+}
+
+impl<W: Write> PackedIdEncoder<W> {
+    pub(crate) fn new(blocks: W) -> Self {
+        Self {
+            blocks,
+            blocks_len: 0,
+            block_offsets: Vec::new(),
+            n_docs: 0,
+            his: Vec::with_capacity(BLOCK_DOCS),
+            los: Vec::with_capacity(BLOCK_DOCS),
+            block: Vec::new(),
+        }
+    }
+
+    /// Append the next doc's id. A block that fills is encoded and written
+    /// out at once.
+    pub(crate) fn push(&mut self, id: i128) -> io::Result<()> {
+        let v = id as u128;
+        self.his.push((v >> 64) as u64);
+        self.los.push(v as u64);
+        self.n_docs += 1;
+        if self.his.len() == BLOCK_DOCS {
+            self.flush_block()?;
+        }
+        Ok(())
+    }
+
+    /// Append `raw` ids (whole little-endian `i128`s, in local doc order).
+    pub(crate) fn push_raw(&mut self, raw: &[u8]) -> io::Result<()> {
+        debug_assert!(raw.len().is_multiple_of(ID_SIDECAR_ENTRY_BYTES));
+        for id in raw.chunks_exact(ID_SIDECAR_ENTRY_BYTES) {
+            self.push(i128::from_le_bytes(id.try_into().expect("16-byte id")))?;
+        }
+        Ok(())
+    }
+
+    /// Encode the open block into `self.block` and write it to the sink.
+    fn flush_block(&mut self) -> io::Result<()> {
+        let n = self.his.len();
+        if n == 0 {
+            return Ok(());
+        }
+        let hi_base = self.his.iter().copied().min().unwrap_or(0);
+        let lo_base = self.los.iter().copied().min().unwrap_or(0);
+        let hi_width = width_of(self.his.iter().map(|&h| h - hi_base).max().unwrap_or(0));
+        let lo_width = width_of(self.los.iter().map(|&l| l - lo_base).max().unwrap_or(0));
+        let out = &mut self.block;
+        out.clear();
         out.extend_from_slice(&hi_base.to_le_bytes());
         out.extend_from_slice(&lo_base.to_le_bytes());
         out.push(hi_width);
@@ -107,7 +190,7 @@ pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&0u32.to_le_bytes());
         let hi_start = out.len();
         out.resize(hi_start + payload_bytes(n, hi_width), 0);
-        for (i, &h) in his.iter().enumerate() {
+        for (i, &h) in self.his.iter().enumerate() {
             put_bits(
                 &mut out[hi_start..],
                 i * hi_width as usize,
@@ -117,7 +200,7 @@ pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
         }
         let lo_start = out.len();
         out.resize(lo_start + payload_bytes(n, lo_width), 0);
-        for (i, &l) in los.iter().enumerate() {
+        for (i, &l) in self.los.iter().enumerate() {
             put_bits(
                 &mut out[lo_start..],
                 i * lo_width as usize,
@@ -125,8 +208,44 @@ pub(crate) fn encode_packed(raw: &[u8]) -> Vec<u8> {
                 lo_width,
             );
         }
+        self.blocks.write_all(out)?;
+        self.block_offsets.push(self.blocks_len);
+        self.blocks_len += out.len() as u64;
+        self.his.clear();
+        self.los.clear();
+        Ok(())
     }
-    out
+
+    /// Flush the open block and assemble the header and directory.
+    pub(crate) fn finish(mut self) -> io::Result<PackedIdOutput<W>> {
+        self.flush_block()?;
+        self.blocks.flush()?;
+        if self.n_docs == 0 {
+            return Ok(PackedIdOutput {
+                directory: Vec::new(),
+                blocks: self.blocks,
+                blocks_len: 0,
+            });
+        }
+        let n_blocks = self.block_offsets.len();
+        debug_assert_eq!(n_blocks, self.n_docs.div_ceil(BLOCK_DOCS));
+        let directory_len = HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES;
+        let mut directory = Vec::with_capacity(directory_len);
+        directory.extend_from_slice(&(self.n_docs as u32).to_le_bytes());
+        directory.extend_from_slice(&(BLOCK_DOCS as u32).to_le_bytes());
+        directory.extend_from_slice(&(n_blocks as u32).to_le_bytes());
+        directory.extend_from_slice(&0u32.to_le_bytes());
+        // Block offsets are from the sidecar's start, which is where the
+        // reader's directory entries point.
+        for off in &self.block_offsets {
+            directory.extend_from_slice(&(directory_len as u64 + off).to_le_bytes());
+        }
+        Ok(PackedIdOutput {
+            directory,
+            blocks: self.blocks,
+            blocks_len: self.blocks_len,
+        })
+    }
 }
 
 /// Bytes of a packed sidecar's header and block directory for `n_docs`
@@ -530,6 +649,82 @@ mod tests {
         let packed = round_trip(&ids);
         let headers = HEADER_BYTES + 3 * (DIR_ENTRY_BYTES + BLOCK_HEADER_BYTES);
         assert!(packed.len() <= ids.len() * ID_SIDECAR_ENTRY_BYTES + headers);
+    }
+
+    /// The packed layout byte by byte, for ids that cross one block
+    /// boundary, built by hand from the module's layout comment: pins the
+    /// header, the directory's sidecar-relative offsets, the block header and
+    /// the bit-packed payload independently of the encoder, so a rewrite of
+    /// the encoder cannot move the format without failing here.
+    #[test]
+    fn a_packed_sidecar_is_the_documented_bytes() {
+        const HI: u64 = 0x1122_3344_5566_7788;
+        const LO: u64 = 0x99AA_BBCC_DDEE_FF00;
+        let id = |lo: u64| (((HI as u128) << 64) | lo as u128) as i128;
+        // Block 0: one id repeated, so both halves pack at width 0 and the
+        // block is its header alone. Block 1: three ids whose low halves
+        // are base + 0, 1, 2, width 2.
+        let mut ids = vec![id(LO); BLOCK_DOCS];
+        ids.extend((0..3).map(|i| id(LO + i)));
+        let n_blocks = 2usize;
+        let block0_at = HEADER_BYTES + n_blocks * DIR_ENTRY_BYTES;
+        let block1_at = block0_at + BLOCK_HEADER_BYTES;
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&(BLOCK_DOCS as u32).to_le_bytes());
+        expected.extend_from_slice(&(n_blocks as u32).to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&(block0_at as u64).to_le_bytes());
+        expected.extend_from_slice(&(block1_at as u64).to_le_bytes());
+        expected.extend_from_slice(&HI.to_le_bytes());
+        expected.extend_from_slice(&LO.to_le_bytes());
+        expected.extend_from_slice(&[0u8, 0]);
+        expected.extend_from_slice(&(BLOCK_DOCS as u16).to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        expected.extend_from_slice(&HI.to_le_bytes());
+        expected.extend_from_slice(&LO.to_le_bytes());
+        expected.extend_from_slice(&[0u8, 2]);
+        expected.extend_from_slice(&3u16.to_le_bytes());
+        expected.extend_from_slice(&0u32.to_le_bytes());
+        // Offsets 0, 1, 2 at two bits each, as a little-endian bit stream.
+        expected.push(0b10_01_00);
+
+        assert_eq!(encode_packed(&raw(&ids)), expected);
+        assert_eq!(expected.len(), block1_at + BLOCK_HEADER_BYTES + 1);
+    }
+
+    /// The streaming encoder, fed in uneven pieces and writing its blocks to
+    /// a separate sink, produces the bytes the one-shot encode does: where a
+    /// piece ends has no bearing on the sidecar.
+    #[test]
+    fn a_streamed_encode_matches_the_whole_buffer_encode() {
+        let ids: Vec<i128> = (0..BLOCK_DOCS as i128 * 3 + 17)
+            .map(|i| ((i * 7919) << 64) | (i * 31 + 5))
+            .collect();
+        let raw: Vec<u8> = ids.iter().flat_map(|id| id.to_le_bytes()).collect();
+        let whole = encode_packed(&raw);
+
+        let mut encoder = PackedIdEncoder::new(Vec::new());
+        // Pieces that straddle block boundaries, one id at a time at the end.
+        let mut at = 0;
+        for piece in [700usize, 1500, 1, 1, 2000] {
+            let end = (at + piece * ID_SIDECAR_ENTRY_BYTES).min(raw.len());
+            encoder.push_raw(&raw[at..end]).expect("vec sink");
+            at = end;
+        }
+        encoder.push_raw(&raw[at..]).expect("vec sink");
+        let streamed = encoder.finish().expect("vec sink");
+        assert_eq!(streamed.len() as usize, whole.len());
+        let mut joined = streamed.directory.clone();
+        joined.extend_from_slice(&streamed.blocks);
+        assert_eq!(
+            joined, whole,
+            "streamed and whole-buffer encodes agree byte for byte"
+        );
+
+        let empty = PackedIdEncoder::new(Vec::new()).finish().expect("vec sink");
+        assert!(empty.is_empty(), "no ids pushed is no sidecar");
     }
 
     #[test]

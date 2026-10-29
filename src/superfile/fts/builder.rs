@@ -110,7 +110,7 @@ use crate::{
             analysis::ChainTokenizer,
             bm25,
             positions::{TermRuns, encode_group, encode_run, skip_run},
-            posting::{BLOCK_LEN, Block, EncodedBlock, encode_block_with},
+            posting::{BLOCK_LEN, Block, EncodedBlock, block_lanes, encode_block_with},
             reader::{ColumnLengthStats, TopKEntry, finish_head},
             short::{SHORT_MAX_DF, encode_short},
             sorted_merge::{SortedInput, merge_column},
@@ -273,6 +273,26 @@ const HEADER_POSITIONS_OFFSET: Range<usize> = 20..28;
 /// most. On a Zipfian corpus the bands below the bar hold ~60% of what
 /// the patched form saves, the bands above it the rest.
 const PATCHED_MAX_DF: usize = 16 * 1024;
+
+/// A term in at least this fraction of the column's scored documents is
+/// written in blocks of two sub-blocks ([`BLOCK_LEN`] docs); a rarer one
+/// in blocks of one, as every file was before blocks could be wider. A
+/// wider block halves the per-block work a reader pays per document —
+/// header, skip entry, position group, tf array — and coarsens the block
+/// maxima a ranked walk prunes by. The common terms are the ones a walk
+/// meets in every block it visits, so they carry the gain; a rare term
+/// kept narrow keeps its pruning at the finer grain and spares a short
+/// list the second sub-block's padding. A density rather than a count so
+/// the rule carries across corpora; the measurements behind the value
+/// are recorded with the benches.
+const WIDE_BLOCK_MIN_DENSITY: f64 = 0.001;
+
+/// The block length a term of `df` postings gets in a column of `n_docs`
+/// scored documents (see [`WIDE_BLOCK_MIN_DENSITY`]).
+fn block_len_for(df: usize, n_docs: usize) -> usize {
+    let density = df as f64 / n_docs.max(1) as f64;
+    block_lanes(density >= WIDE_BLOCK_MIN_DENSITY)
+}
 
 /// Smallest document frequency whose dense blocks are stored as bitsets
 /// past the size-only break-even, by [`DENSE_BITSET_BIAS`].
@@ -4371,6 +4391,7 @@ fn encode_term(
         let block_maxes = &mut scratch.block_maxes;
         encoded_blocks.clear();
         block_maxes.clear();
+        let block_len = block_len_for(pairs.len(), n_scored_docs as usize);
         let block_build_start = profile.enabled.then(Instant::now);
         // Build each block by moving the reusable `doc_ids` / `tfs`
         // buffers into a `Block` (Vec move = pointer swap, no copy),
@@ -4379,7 +4400,7 @@ fn encode_term(
         // public signature takes `&Block` whose fields are owned Vecs,
         // hence the take/put dance. The take/put preserves capacity at
         // `BLOCK_LEN`, so the steady-state per-chunk cost is
-        // `clear` + `extend_from_slice` of ≤128 u32s with no realloc.
+        // `clear` + `extend_from_slice` of a block's u32s with no realloc.
         let mut block_doc_ids = mem::take(&mut scratch.doc_ids);
         let mut block_tfs = mem::take(&mut scratch.tfs);
         if block_doc_ids.capacity() < BLOCK_LEN {
@@ -4388,7 +4409,7 @@ fn encode_term(
         if block_tfs.capacity() < BLOCK_LEN {
             block_tfs.reserve(BLOCK_LEN - block_tfs.capacity());
         }
-        for (at, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
+        for (at, chunk) in pairs.chunks(block_len).enumerate() {
             block_doc_ids.clear();
             block_tfs.clear();
             block_doc_ids.extend(chunk.iter().map(|&(d, _)| d));
@@ -4408,7 +4429,7 @@ fn encode_term(
             // against the exact length would leave the stored max below the
             // query-time score of that same doc and let the block-max skip
             // drop a qualifying document.
-            let block_max = scratch.scores[at * BLOCK_LEN..at * BLOCK_LEN + chunk.len()]
+            let block_max = scratch.scores[at * block_len..at * block_len + chunk.len()]
                 .iter()
                 .fold(0.0f32, |m, &s| m.max(s));
             block_maxes.push(block_max);
@@ -4459,11 +4480,11 @@ fn encode_term(
         if let Some(runs) = &term_positions {
             let mut at: usize = 0;
             let vals = &mut scratch.pos_vals;
-            for (c, chunk) in pairs.chunks(BLOCK_LEN).enumerate() {
+            for (c, chunk) in pairs.chunks(block_len).enumerate() {
                 pos_block_offsets.push(pos_out.len() as u32);
                 vals.clear();
                 for (k, &(_, tf)) in chunk.iter().enumerate() {
-                    runs.push_run(c * BLOCK_LEN + k, tf, &mut at, vals);
+                    runs.push_run(c * block_len + k, tf, &mut at, vals);
                 }
                 let tfs = &mut scratch.tfs;
                 tfs.clear();
@@ -4726,9 +4747,71 @@ fn sort_partition_to_file<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::superfile::fts::{
+        posting::SUB_BLOCK_LEN,
+        reader::{BoolMode, FtsReader},
+    };
+
+    /// The block length is the term's density. In a column of enough docs
+    /// that one in a thousand is past a sub-block, a term just over that
+    /// share is written wide (its postings in one block) and one just
+    /// under it narrow (two blocks), while a term in every doc is wide
+    /// throughout; the three mix in one column, and a query over the two
+    /// around the floor finds every doc.
+    #[tokio::test]
+    async fn block_length_follows_the_terms_density() {
+        /// Docs in the column: one in a thousand is a sub-block and two.
+        const N_DOCS: u32 = ((SUB_BLOCK_LEN + 2) as f64 / WIDE_BLOCK_MIN_DENSITY) as u32;
+        /// Docs holding a term at the floor; the two terms sit a doc
+        /// either side of it.
+        const AT_FLOOR: u32 = (N_DOCS as f64 * WIDE_BLOCK_MIN_DENSITY) as u32;
+        let stride = N_DOCS / AT_FLOOR;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let text = match (i % stride == 0, i) {
+                (true, 0) | (false, 1) => "every wide",
+                (true, _) => "every wide narrow",
+                (false, _) => "every",
+            };
+            b.add_doc(0, i, text).expect("add doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let layout = async |term| {
+            r.term_layout("body", term)
+                .await
+                .expect("layout")
+                .expect("present")
+        };
+        let (wide, narrow, every) = (
+            layout("wide").await,
+            layout("narrow").await,
+            layout("every").await,
+        );
+        assert_eq!(
+            (wide.df, narrow.df),
+            (u64::from(AT_FLOOR) + 1, u64::from(AT_FLOOR) - 1)
+        );
+        assert_eq!(wide.num_blocks, 1, "{wide:?}");
+        assert_eq!(narrow.num_blocks, 2, "{narrow:?}");
+        assert_eq!(
+            every.num_blocks,
+            (N_DOCS as usize).div_ceil(BLOCK_LEN),
+            "{every:?}"
+        );
+        for (mode, want) in [(BoolMode::Or, wide.df), (BoolMode::And, narrow.df)] {
+            let hits = r
+                .search("body", &["wide", "narrow"], N_DOCS as usize, mode)
+                .await
+                .expect("search");
+            assert_eq!(hits.len() as u64, want, "{mode:?}");
+        }
+    }
 
     /// The radix path (n >= `RADIX_SORT_MIN_TRIPLES`) must deliver
     /// `(lex_rank, doc_id)` order even when a term's docs arrive out of

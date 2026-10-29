@@ -19,10 +19,13 @@
 //!     task per work unit, aborted if its caller goes away: each opens its
 //!     superfile reader and runs the kernel, so superfile opens and cold
 //!     object-store range GETs across hundreds of superfiles are all in
-//!     flight at once on the shared multi-thread query runtime. Never cap the fan-out's task
-//!     count at the reader pool's width — `tokio::spawn` dispatches a
-//!     task, not an OS thread, and object-store GETs are latency-bound,
-//!     so narrowing their concurrency only hurts cold latency.
+//!     flight at once on the shared multi-thread query runtime. The one
+//!     ceiling is `SupertableOptions::superfiles_in_flight` (256 by
+//!     default), so a table of thousands of superfiles does not start
+//!     thousands of opens together. Never cap the fan-out's task count at
+//!     the reader pool's width — `tokio::spawn` dispatches a task, not an
+//!     OS thread, and object-store GETs are latency-bound, so narrowing
+//!     their concurrency only hurts cold latency.
 //!   * **The reader pool bounds CPU concurrency — the configured knob.**
 //!     Both vector and FTS scoring run their scan/scoring kernel on the
 //!     configured reader pool, bridged back to the awaiting tokio task
@@ -52,10 +55,7 @@ use std::{
 
 use arrow_array::Decimal128Array;
 use datafusion::common::runtime::SpawnedTask;
-use futures::{
-    future::try_join_all,
-    stream::{FuturesUnordered, StreamExt},
-};
+use futures::stream::{FuturesUnordered, StreamExt};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, trace};
 use uuid::Uuid;
@@ -77,6 +77,7 @@ use crate::{
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         tombstones::SidecarCache,
     },
+    utils::join::try_join_bounded,
 };
 
 /// Open one superfile's `SuperfileReader` through the reader cache.
@@ -647,11 +648,12 @@ fn spawn_unit<R: Send + 'static>(
 /// `R`.
 ///
 /// It warms the tombstone sidecar cache for every distinct superfile in
-/// one batch, spawns one task per unit on the shared query runtime (each
-/// opening its reader concurrently), then collects every task with
-/// [`futures::future::try_join_all`] — so the **first** per-superfile
-/// error (in time, not spawn order) short-circuits the whole fan-out,
-/// returns early and aborts the units still running (see [`spawn_unit`]).
+/// one batch, then spawns one task per unit on the shared query runtime,
+/// each opening its reader and running `body`, at most
+/// `superfiles_in_flight` at a time. Results come back in unit order, and
+/// the **first** per-superfile error (in time, not spawn order)
+/// short-circuits the whole fan-out: it returns early and aborts the units
+/// still running (see [`spawn_unit`]).
 ///
 /// `body` runs inside each task with the opened reader, the superfile
 /// entry, the (warmed) tombstone cache + the batch `now` instant, and
@@ -731,10 +733,11 @@ where
         let (entry, params) = units.into_iter().next().expect("len == 1");
         return Ok(vec![ctx.run(body, entry, params).await?]);
     }
-    try_join_all(
+    try_join_bounded(
         units
             .into_iter()
             .map(|(entry, params)| ctx.spawn(&body, entry, params)),
+        reader.options().superfiles_in_flight,
     )
     .await
 }
@@ -1086,7 +1089,10 @@ mod fanout_tier_tests {
     };
 
     use tempfile::TempDir;
-    use tokio::sync::Semaphore;
+    use tokio::{
+        sync::Semaphore,
+        time::{Instant, sleep},
+    };
 
     use super::*;
     use crate::{
@@ -1130,7 +1136,8 @@ mod fanout_tier_tests {
         //  - the writer leaves what it commits in the in-memory reader
         //    cache, so the table that wrote them opens all three from memory.
         //  - a table reopened on the same storage has nothing cached and no
-        //    disk cache, so all three come from the source.
+        //    disk cache, so all three are opened from storage by range: the
+        //    lazy tier.
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -1144,7 +1151,97 @@ mod fanout_tier_tests {
         assert_eq!(fanout_tiers(&table).await, [COMMITS, 0, 0, 0, 0, 0]);
 
         let reopened = Supertable::open(options()).expect("reopen");
-        assert_eq!(fanout_tiers(&reopened).await, [0, 0, 0, COMMITS, 0, 0]);
+        assert_eq!(fanout_tiers(&reopened).await, [0, 0, COMMITS, 0, 0, 0]);
+    }
+
+    /// Superfiles in the cap fixture, one unit each: more than [`FANOUT_CAP`].
+    const CAPPED_COMMITS: usize = 12;
+    /// The cap on superfiles in flight the cap fixture is opened with.
+    const FANOUT_CAP: usize = 3;
+    /// The least time each unit's body runs, so a fan-out that ignored its
+    /// cap would start more units than the cap while the first still run.
+    const UNIT_TIME: Duration = Duration::from_millis(20);
+    /// How long a unit waits for the units it expects beside it. Only a cap
+    /// tighter than expected makes it wait this long.
+    const OVERLAP_WAIT: Duration = Duration::from_secs(5);
+    /// How often a waiting unit looks again.
+    const OVERLAP_POLL: Duration = Duration::from_millis(1);
+
+    /// The most units of a fan-out over every superfile on `storage` running
+    /// at once, on a table opened with `cap` superfiles in flight (the
+    /// default when `None`). Each unit holds its slot until `expected` have
+    /// run at once, so the peak does not depend on how quickly the opens
+    /// before the units finish.
+    async fn peak_units(
+        storage: &Arc<dyn StorageProvider>,
+        cap: Option<usize>,
+        expected: usize,
+    ) -> usize {
+        let mut options = default_supertable_options().with_storage(Arc::clone(storage));
+        if let Some(cap) = cap {
+            options = options.with_superfiles_in_flight(cap);
+        }
+        let table = Supertable::open(options).expect("open");
+        let reader = table.reader().expect("reader");
+        let units: Vec<(Arc<SuperfileEntry>, ())> = reader
+            .manifest()
+            .get_all_superfiles()
+            .iter()
+            .map(|entry| (Arc::clone(entry), ()))
+            .collect();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let body = {
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            move |_, _, _, _, ()| {
+                let running = Arc::clone(&running);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    sleep(UNIT_TIME).await;
+                    let deadline = Instant::now() + OVERLAP_WAIT;
+                    while peak.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
+                        sleep(OVERLAP_POLL).await;
+                    }
+                    running.fetch_sub(1, Ordering::SeqCst);
+                    Ok::<(), QueryError>(())
+                }
+            }
+        };
+        let out = fanout_with(&reader, units, false, ReadIntent::Warm, body)
+            .await
+            .expect("fan-out");
+        assert_eq!(out.len(), CAPPED_COMMITS, "every unit ran");
+        peak.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fanout_runs_at_most_the_cap_of_superfiles_at_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let table =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        for i in 0..CAPPED_COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&[&format!("title {i}")]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        assert_eq!(
+            peak_units(&storage, None, CAPPED_COMMITS).await,
+            CAPPED_COMMITS,
+            "under the default cap every unit runs at once, so the cap has work to do"
+        );
+        assert_eq!(
+            peak_units(&storage, Some(FANOUT_CAP), FANOUT_CAP).await,
+            FANOUT_CAP,
+            "no more units than the cap run at once, and the fan-out reaches it"
+        );
     }
 
     /// Superfiles in the plan fixture: more than four windows of them, so the

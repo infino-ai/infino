@@ -2026,7 +2026,7 @@ impl SupertableReader {
             if prepared.is_none() {
                 declined.store(true, AtomicOrdering::Relaxed);
             }
-            let window = manifest.options.bound_ordered_open_window.max(1);
+            let window = manifest.options.ordered_open_window();
             match prepared {
                 Some(prepared) if prepared.resident => {
                     let selection = prepared.run().await.unwrap_or_else(|e| {
@@ -2071,7 +2071,7 @@ impl SupertableReader {
             // can only tie, and is not opened either once every document
             // at the floor precedes its own in `_id` order.
             true => {
-                let window = manifest.options.bound_ordered_open_window.max(1);
+                let window = manifest.options.ordered_open_window();
                 // A superfile whose ceiling only ties the running k-th score
                 // is skipped once the tie is settled by `_id` order: every
                 // `_id` it holds is past the tied document's. That needs
@@ -2700,6 +2700,79 @@ impl SupertableReader {
         dispatch::fanout_with(self, units, true, self.open_intent(), body)
             .instrument(fanout_span)
             .await
+    }
+
+    /// `scope` narrowed to the rows `query`'s terms match under `mode`: the
+    /// rows a BM25 search of the same query can return, which is all a
+    /// `WHERE` on that search ever needs checked. A superfile the term
+    /// bloom rules out, or that the scope does not admit, is not opened;
+    /// in the rest the match is intersected with the scope's set when it
+    /// bounds one (already free of tombstones) and has the superfile's
+    /// tombstones taken out when it does not. The result is bounded, its
+    /// sets free of tombstones, and holds only superfiles with a row left.
+    pub(crate) async fn match_scope(
+        &self,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        scope: &CandidateScope,
+    ) -> Result<CandidateScope, QueryError> {
+        let Some((units, kernel)) = self.match_kernel(column, query, mode).await? else {
+            return Ok(CandidateScope::empty());
+        };
+        let admitted: HashSet<SuperfileUri> =
+            scope.admitted_superfiles().map(|entry| entry.uri).collect();
+        let units: Vec<(Arc<SuperfileEntry>, (Uuid, Option<Arc<RoaringBitmap>>))> = units
+            .into_iter()
+            .filter(|(entry, _)| admitted.contains(&entry.uri))
+            .map(|(entry, suid)| {
+                let within = scope
+                    .allow
+                    .as_ref()
+                    .and_then(|allow| allow.get(&entry.uri).cloned());
+                (entry, (suid, within))
+            })
+            .collect();
+        let body = move |r: Arc<SuperfileReader>,
+                         entry: Arc<SuperfileEntry>,
+                         cache: Option<Arc<SidecarCache>>,
+                         now: Instant,
+                         (suid, within): (Uuid, Option<Arc<RoaringBitmap>>)| {
+            let kernel = Arc::clone(&kernel);
+            async move {
+                let mut rows: RoaringBitmap = kernel
+                    .docs(&r, suid)
+                    .await?
+                    .into_iter()
+                    .map(RowId::get)
+                    .collect();
+                match within {
+                    Some(within) => rows &= within.as_ref(),
+                    None => {
+                        if let Some(cache) = cache.as_ref()
+                            && let Some(deny) =
+                                dispatch::tombstone_deny_set(cache, entry.superfile_id, now)?
+                        {
+                            rows -= deny.as_ref();
+                        }
+                    }
+                }
+                Ok((entry, rows))
+            }
+        };
+        let matched = dispatch::fanout_with(self, units, true, self.open_intent(), body).await?;
+        let mut superfiles = Vec::with_capacity(matched.len());
+        let mut allow = HashMap::with_capacity(matched.len());
+        for (entry, rows) in matched {
+            if !rows.is_empty() {
+                allow.insert(entry.uri, Arc::new(rows));
+                superfiles.push(entry);
+            }
+        }
+        Ok(CandidateScope {
+            superfiles,
+            allow: Some(allow),
+        })
     }
 
     /// What every unranked match walk starts from: the superfiles the
@@ -5559,17 +5632,21 @@ mod tests {
     #[test]
     fn global_stats_small_k_pruning_matches_single_superfile() {
         // `common` is in every doc, so its postings span more than one
-        // BLOCK_LEN(=128) block and the pruner has whole blocks it can
-        // skip. Three "boost" docs additionally carry a rare, high-idf
-        // term at distinct term frequencies, giving them the three
+        // block and the pruner has whole blocks it can skip. Three
+        // "boost" docs additionally carry a rare, high-idf term at
+        // distinct term frequencies, giving them the three
         // strictly-highest, distinct scores — an unambiguous top-3.
-        const N: usize = 160;
+        const N: usize = BLOCK_LEN + 32;
         const L: usize = 8; // tokens/doc; uniform so avgdl matches everywhere
         const K: usize = 3;
         // (doc index, boost tf). Distinct tf ⇒ distinct scores; the docs
         // are spread past BLOCK_LEN so a top-k doc sits in a later block
         // the walk must not wrongly prune.
-        let boosts = [(10usize, 3u32), (90, 2), (150, 1)];
+        let boosts = [
+            (10usize, 3u32),
+            (BLOCK_LEN / 2 + 26, 2),
+            (BLOCK_LEN + 22, 1),
+        ];
         let titles: Vec<String> = (0..N)
             .map(|i| {
                 let bt = boosts
@@ -6539,10 +6616,10 @@ mod tests {
         }
     }
 
-    /// Docs in the block-skip fixture. `BLOCK_LEN` is 128, so a term
-    /// carried by every document spans several whole blocks and the
-    /// block-max skip has something to skip *over*. Three documents fit
-    /// in one partial block, where the skip path is unreachable.
+    /// Docs in the block-skip fixture: a term carried by every document
+    /// spans several whole blocks and the block-max skip has something
+    /// to skip *over*. Three documents fit in one partial block, where
+    /// the skip path is unreachable.
     const BLOCK_SKIP_DOCS: usize = 5 * BLOCK_LEN;
 
     /// Longest document, in repetitions of the padding token. Lengths

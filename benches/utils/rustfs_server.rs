@@ -35,6 +35,10 @@ use std::{
 };
 
 use infino::supertable::storage::{S3StorageProvider, StorageProvider};
+use object_store::{
+    Certificate, ClientOptions,
+    aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut},
+};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, SerialNumber};
 use reqwest::header::CONTENT_LENGTH;
 use tempfile::TempDir;
@@ -585,6 +589,30 @@ pub fn open_wire_test_provider() -> Result<S3StorageProvider, String> {
         Some(session.ca_pem()),
     )
     .map_err(|e| e.to_string())
+}
+
+/// A raw `object_store` S3 client on a fresh bucket of the shared session,
+/// with that bucket's name, set up as [`S3StorageProvider`] sets up a custom
+/// endpoint: path-style, trusting the bench-local CA. For wire tests that
+/// read what the provider does not expose, such as an object's user
+/// metadata; [`S3StorageProvider::from_object_store`] over a clone writes
+/// through the provider on the same bucket.
+pub fn open_wire_test_store() -> Result<(AmazonS3, String), String> {
+    let fixture = open_test_fixture("")?;
+    let session = session()?;
+    let ca = Certificate::from_pem(session.ca_pem()).map_err(|e| e.to_string())?;
+    let store = AmazonS3Builder::new()
+        .with_endpoint(session.endpoint())
+        .with_bucket_name(&fixture.bucket)
+        .with_access_key_id(session.access_key())
+        .with_secret_access_key(session.secret_key())
+        .with_region(RUSTFS_REGION)
+        .with_virtual_hosted_style_request(false)
+        .with_conditional_put(S3ConditionalPut::ETagMatch)
+        .with_client_options(ClientOptions::new().with_root_certificate(ca))
+        .build()
+        .map_err(|e| e.to_string())?;
+    Ok((store, fixture.bucket))
 }
 
 fn keep_rustfs_bucket() -> bool {
