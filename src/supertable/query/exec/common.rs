@@ -61,7 +61,7 @@ use parquet::{
     errors::{ParquetError, Result as ParquetResult},
     file::metadata::ParquetMetaData,
 };
-use rayon::ThreadPool;
+use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, warn};
 
@@ -1255,6 +1255,14 @@ pub(crate) fn id_score_batch(
     .map_err(|e| QueryError::internal(e).into())
 }
 
+/// One superfile of [`resolve_columns`] once its reader is open: its rows
+/// taken already (a lazy reader, dropped since), or a resident reader whose
+/// rows are decoded with the others in one pool job.
+enum Resolved {
+    Taken(usize, RecordBatch),
+    Resident(usize, Arc<SuperfileReader>, Option<FileSchemaMap>),
+}
+
 /// Read `names` (scalar columns) at the `hits`' `(superfile,
 /// local_doc_id)` rows and return them in global rank order.
 ///
@@ -1313,20 +1321,21 @@ async fn resolve_columns(
     // table the cache cannot hold, so resolving a hit's columns never starts
     // a whole-file download the search itself declined.
     let intent = reader.open_intent();
-    // Each superfile opens, takes its hit rows and drops its reader in one
-    // task, at most `superfiles_in_flight` at once: a ranked result touches
-    // a few superfiles, but an unranked match can touch every superfile of
-    // the table, and a lazy reader holds its parsed footer and page index,
-    // several MB of heap, for as long as it is held.
+    // Each superfile opens in a task of its own, at most
+    // `superfiles_in_flight` at once:
     //
-    //   - **Resident readers** (in-memory tier / freshly written):
-    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode over
-    //     already-resident bytes, so it runs on `options.reader_pool`
-    //     (rayon), bridged back so no tokio worker blocks under it.
-    //   - **Lazy readers** stream only projected hit rows through their
-    //     existing `LazyByteSource`. That preserves the disk cache's block
-    //     layer: cold misses range-fetch, repeated warm reads hit local
-    //     blocks, and the file is never materialized.
+    //   - **Lazy readers** take their hit rows in that task and drop the
+    //     reader with it. A ranked result touches a few superfiles, but an
+    //     unranked match can touch every superfile of the table, and a lazy
+    //     reader holds its parsed footer and page index, several MB of heap,
+    //     for as long as it is held. The rows stream through the reader's
+    //     `LazyByteSource`, which keeps the disk cache's block layer: cold
+    //     misses range-fetch, warm reads hit local blocks.
+    //   - **Resident readers** (in-memory tier / freshly written) come back
+    //     and are decoded together in one `options.reader_pool` (rayon) job:
+    //     `take_by_local_doc_ids` is a CPU-bound page decode over bytes the
+    //     cache holds anyway, and one job for all of them costs one handoff
+    //     rather than one per superfile.
     //
     // A file whose columns match the table's reads by name; any other reads
     // through its map: the table's columns are projected under the file's
@@ -1360,37 +1369,60 @@ async fn resolve_columns(
             )
             .await
             .map_err(|error| DataFusionError::from(QueryError::store(error)))?;
-            let locals = &seg_locals_ref[index];
             let adapter = file_adapter(manifest, &rd);
-            if !rd.can_take_by_local_doc_ids() {
-                let batch = take_lazy_file(&rd, locals, names, &adapter, out_schema_ref).await?;
-                return Ok::<_, DataFusionError>((index, batch, 0u64));
+            if rd.can_take_by_local_doc_ids() {
+                // Resident: decoded below with the other resident files, in
+                // one pool job. Holding it costs nothing the cache does not
+                // already hold.
+                return Ok::<_, DataFusionError>(Resolved::Resident(index, rd, adapter));
             }
-            // Owned inputs so the rayon closure is `'static`.
-            let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
-            let locals = locals.clone();
-            let out_schema = Arc::clone(out_schema_ref);
-            let (batch, ns) = run_on_pool(
-                Some(&manifest.options.reader_pool),
-                "resolve decode: reader pool dropped result",
-                move || {
-                    let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
-                    timed_section(|| {
-                        take_resident_file(&rd, &locals, &name_refs, &adapter, &out_schema)
-                    })
-                },
-            )
-            .await
-            .map_err(QueryError::internal)?;
-            let batch = batch.map_err(|e| DataFusionError::from(QueryError::from(e)))?;
-            Ok((index, batch, ns))
+            let locals = &seg_locals_ref[index];
+            let batch = take_lazy_file(&rd, locals, names, &adapter, out_schema_ref).await?;
+            Ok(Resolved::Taken(index, batch))
         })
         .collect();
-    let done = try_join_bounded(units, in_flight).await?;
-    if let Some(stats) = &reader.op_stats {
-        stats.add_kernel_cpu_ns(done.iter().map(|(_, _, ns)| *ns).sum());
+    let mut resident: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
+        Vec::new();
+    let mut done: Vec<(usize, RecordBatch)> = Vec::new();
+    for unit in try_join_bounded(units, in_flight).await? {
+        match unit {
+            Resolved::Taken(i, batch) => done.push((i, batch)),
+            Resolved::Resident(i, rd, adapter) => {
+                resident.push((i, rd, seg_locals[i].clone(), adapter))
+            }
+        }
     }
-    for (i, batch, _) in done {
+    if !resident.is_empty() {
+        // Owned inputs so the rayon closure is `'static`.
+        let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
+        let out_schema = Arc::clone(&out_schema);
+        let decoded: Vec<((usize, RecordBatch), u64)> = run_on_pool(
+            Some(&manifest.options.reader_pool),
+            "resolve decode: reader pool dropped result",
+            move || {
+                let name_refs: Vec<&str> = owned_names.iter().map(String::as_str).collect();
+                resident
+                    .into_par_iter()
+                    .map(|(i, sf, locals, adapter)| {
+                        // Per-superfile bracket: the resident decode is this
+                        // wave's kernel section, one chunk per file.
+                        let (batch, ns) = timed_section(|| {
+                            take_resident_file(&sf, &locals, &name_refs, &adapter, &out_schema)
+                        });
+                        batch.map(|batch| ((i, batch), ns))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?
+        .map_err(|e| DataFusionError::from(QueryError::from(e)))?;
+        if let Some(stats) = &reader.op_stats {
+            stats.add_kernel_cpu_ns(decoded.iter().map(|(_, ns)| *ns).sum());
+        }
+        done.extend(decoded.into_iter().map(|(item, _)| item));
+    }
+    for (i, batch) in done {
         decoded_cache.insert(
             seg_order[i],
             schema_id,
