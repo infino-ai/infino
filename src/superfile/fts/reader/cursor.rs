@@ -710,8 +710,8 @@ impl TermCursor {
         // an exact-size iterator, so this writes each entry in place —
         // one allocation, no intermediate `Vec` + copy. The skip table
         // is ~a quarter of a long term's cursor-build bytes (one 32-byte
-        // entry per 128-doc block), so the doubled write showed up on
-        // common-term queries.
+        // entry per block), so the doubled write showed up on common-term
+        // queries.
         let key = cached.map(|(_, offset)| (offset, bounds.scale_bits()));
         let hit = cached.zip(key).and_then(|((cache, _), key)| cache.get(key));
         let (blocks, term_max_bm25) = match hit {
@@ -2155,7 +2155,7 @@ mod tests {
     /// the query score of a doc whose length quantizes down, and the
     /// block-max skip in the ranked-OR walk drops that doc from the top-k.
     ///
-    /// This plants a term spanning several 128-doc blocks whose documents
+    /// This plants a term spanning several blocks whose documents
     /// all have a length in the quantize-down region, then walks the term's
     /// cursor and asserts `block_max >= query_score` for every posting.
     /// Without the length-consistent block bound the assertion fires on the
@@ -2695,12 +2695,12 @@ mod tests {
             "corpus doc length must quantize downward to exercise the bound"
         );
         // The term under test lives in this many docs — enough to span
-        // multiple 128-doc blocks so the block-max skip engages.
-        const TERM_DOCS: u32 = 260;
+        // multiple blocks so the block-max skip engages.
+        const TERM_DOCS: u32 = 2 * BLOCK_LEN as u32 + 4;
         // Total corpus size. Kept well above `TERM_DOCS` so the term's IDF
         // is large enough that the quantization-induced score gap is well
         // clear of `f32` rounding and the assertion is decisive.
-        const N_DOCS: u32 = 1300;
+        const N_DOCS: u32 = 5 * TERM_DOCS;
 
         let mut b = FtsBuilder::new();
         b.register_column("body".into(), false)

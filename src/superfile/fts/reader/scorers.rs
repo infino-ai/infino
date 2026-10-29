@@ -4599,16 +4599,16 @@ mod tests {
     #[tokio::test]
     async fn wand_bmw_exercises_block_skips_on_multi_block_lists() {
         // A corpus large enough that the common terms span several
-        // 128-doc posting blocks, with five query terms of differing
+        // posting blocks, with five query terms of differing
         // document frequency and a handful of docs carrying all five.
         // Running WAND+BMW at a small k forces the pivot to move, the
         // block-upper-bound skip to fire, lagging cursors to re-align,
         // and the 4-wide SIMD scoring pack to be used on the
         // all-terms docs — then cross-checks the result against BMM.
 
-        /// Total planted docs; well over several `BLOCK_LEN` (128) so
-        /// the dense-term posting lists occupy multiple blocks.
-        const N_DOCS: u32 = 400;
+        /// Total planted docs: several `BLOCK_LEN`, so the dense-term
+        /// posting lists occupy multiple blocks.
+        const N_DOCS: u32 = 4 * BLOCK_LEN as u32;
         /// Requested top-K — small, so the heap fills early and the
         /// score threshold starts pruning blocks.
         const K: usize = 5;

@@ -536,17 +536,25 @@ async fn oracle_single_term_seed_scale_unbounded_k_does_not_overflow() {
     );
 }
 
-/// Corpus where a common non-essential ("hot") has a high block-max only in a
-/// *mid-range* block. Five anchors in block 10 (ids 1281..1289) carry `lead` +
+/// Corpus where a common non-essential ("hot", in every other doc, so in wide
+/// blocks) has a high block-max only in a *mid-range* block. Five anchors just
+/// past the corpus midpoint, all in one block of `hot`, carry `lead` +
 /// `hot`×{10,9,8,7,6} — strictly-decreasing scores far above the bulk (bulk hot
 /// tf=1), so the tie-free top-5 lives entirely in that block. It gates the
 /// per-block bound's failure mode: the filter must advance each non-essential's
-/// `inspect_block` hint *into* block 10 and read its high max there; a stale
+/// `inspect_block` hint *into* that block and read its high max there; a stale
 /// hint would under-bound and wrongly drop a top-5 anchor — something the
 /// uniform / block-0-hot corpora can't catch.
 fn mid_hot_block_corpus() -> Vec<(u64, String)> {
-    const N: u64 = 2560; // 20 × 128-doc blocks
-    let anchors: [(u64, usize); 5] = [(1281, 10), (1283, 9), (1285, 8), (1287, 7), (1289, 6)];
+    const N: u64 = 10 * BLOCK_LEN as u64;
+    const MID: u64 = N / 2;
+    let anchors: [(u64, usize); 5] = [
+        (MID + 1, 10),
+        (MID + 3, 9),
+        (MID + 5, 8),
+        (MID + 7, 7),
+        (MID + 9, 6),
+    ];
     let mut docs = Vec::with_capacity(N as usize);
     for i in 0..N {
         if let Some(&(_, hot_tf)) = anchors.iter().find(|&&(id, _)| id == i) {
@@ -1298,10 +1306,10 @@ async fn oracle_dedup_repeated_term_block_max_skip_matches_brute_force() {
     // by a moderate earlier-block doc, and query at k=1 where the skip is most
     // aggressive. Every doc is padded to the same token length so length-norm is
     // uniform and term frequency alone decides the ranking.
-    const N: u64 = 200; // > 128 zebra-docs => the term spans two 128-doc blocks
+    const N: u64 = BLOCK_LEN as u64 + 72; // the term spans two blocks
     const LEN: usize = 12; // uniform doc length => uniform length normalization
     const MODERATE_ID: u64 = 5; // block 0: sets the k=1 threshold
-    const TOP_ID: u64 = 150; // block 1: highest tf, the true top-1
+    const TOP_ID: u64 = BLOCK_LEN as u64 + 22; // block 1: highest tf, the true top-1
     let owned: Vec<(u64, String)> = (0..N)
         .map(|i| {
             let tf: usize = match i {
