@@ -46,6 +46,7 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
+        limit_stage::StageLimitGathers,
         read_ahead_rule::ReadAheadOff,
         sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
         topk_row_filter::RowFilterUnderTopK,
@@ -166,12 +167,16 @@ pub(crate) fn budgeted_session_context(
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
+    //  - `StageLimitGathers` after DataFusion's rules, once `EnforceDistribution`
+    //    has split a filtered scan and `LimitPushdown` has set the gather's
+    //    fetch, to start its partitions in two stages under a small `LIMIT`.
     //  - `ReadAheadOff` last, once DataFusion has placed every limit, to turn
     //    read-ahead off for scans a `LIMIT` can stop early.
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.insert(1, Arc::new(OrderUnderScalarSubquery));
     rules.push(Arc::new(KeepSortedRoot));
+    rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));
     let mut builder = SessionStateBuilder::new()
         .with_config(config)

@@ -64,6 +64,10 @@ const FTS_TOP_K: usize = 8;
 /// Rows in the ranged-read fixture: enough that its superfile outgrows the
 /// tail the manifest carries inline, so a query reads the file by range.
 const RANGED_READ_ROWS: usize = 4_000;
+/// Letters in each filler title of [`titles_past_the_inline_tail`].
+const FILLER_TITLE_LETTERS: usize = 64;
+/// Xorshift seed for those letters.
+const FILLER_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 /// Generous rule budget for fanout paths (cold search issues many range
 /// GETs); large enough that every fetch of the failing phase hits it.
 const FANOUT_FAULTS: usize = 1024;
@@ -77,6 +81,11 @@ const TOMBSTONES_SUFFIX: &str = ".tombstones";
 /// A LocalFS-backed table wrapped in `FaultStorage`, with one committed
 /// batch, plus the tempdir guard.
 fn faulted_table() -> (Supertable, Arc<FaultStorage>, TempDir) {
+    faulted_table_of(&["first commit alpha"])
+}
+
+/// [`faulted_table`] with `titles` as its one commit.
+fn faulted_table_of(titles: &[&str]) -> (Supertable, Arc<FaultStorage>, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
@@ -85,11 +94,30 @@ fn faulted_table() -> (Supertable, Arc<FaultStorage>, TempDir) {
     let st =
         Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
     let mut w = st.writer().expect("writer");
-    w.append(&build_title_batch(&["first commit alpha"]))
-        .expect("append");
+    w.append(&build_title_batch(titles)).expect("append");
     w.commit().expect("commit");
     assert_eq!(st.manifest_id(), 1);
     (st, faults, dir)
+}
+
+/// Titles for a superfile a query cannot answer from the open batch the
+/// manifest carries inline: the one `alpha` row the searches look for, then
+/// filler of random letters, which no page compression shrinks, that puts
+/// the `title` column past the parquet tail.
+fn titles_past_the_inline_tail() -> Vec<String> {
+    let mut seed = FILLER_SEED;
+    let mut titles = vec!["first commit alpha".to_owned()];
+    titles.extend((1..RANGED_READ_ROWS).map(|_| {
+        (0..FILLER_TITLE_LETTERS)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                char::from(b'a' + (seed % 26) as u8)
+            })
+            .collect()
+    }));
+    titles
 }
 
 /// A LocalFS-backed VECTOR table wrapped in `FaultStorage`, empty, with a
@@ -475,12 +503,14 @@ fn open_surfaces_manifest_list_get_fault_and_recovers() {
 
 /// A read that fails in the middle of a search or a SQL query is the engine's
 /// failure, not the caller's: it surfaces as `Io`, which a caller can retry,
-/// never as the `Query` a bad query gets. Reopened, so nothing is cached and
-/// every query has to read the superfile; `title` is projected so the hits are
-/// decoded from it.
+/// never as the `Query` a bad query gets. Reopened, so nothing is cached, and
+/// the superfile is past the open batch the manifest carries inline, so every
+/// query has to read it; `title` is projected so the hits are decoded from it.
 #[test]
 fn a_storage_fault_mid_query_surfaces_as_io_not_a_query_error() {
-    let (st, faults, _dir) = faulted_table();
+    let titles = titles_past_the_inline_tail();
+    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let (st, faults, _dir) = faulted_table_of(&titles);
     drop(st);
     let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
     let st = Supertable::open(default_supertable_options().with_storage(storage)).expect("open");
@@ -534,7 +564,9 @@ fn a_storage_fault_mid_query_surfaces_as_io_not_a_query_error() {
 /// has to see `PermissionDenied` (fix the credentials), not a retryable `Io`.
 #[test]
 fn a_refused_credential_mid_query_surfaces_as_permission_denied() {
-    let (st, faults, _dir) = faulted_table();
+    let titles = titles_past_the_inline_tail();
+    let titles: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let (st, faults, _dir) = faulted_table_of(&titles);
     drop(st);
     let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
     let st = Supertable::open(default_supertable_options().with_storage(storage)).expect("open");

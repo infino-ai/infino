@@ -52,8 +52,6 @@ const DF_BAND_LABELS: [&str; 8] = [
 ];
 /// Bytes per mebibyte, for the report.
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
-/// Lanes a packed block always encodes, whether or not they hold docs.
-const LANES: u64 = BLOCK_LEN as u64;
 
 /// Byte attribution for one document-frequency band of one column.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -81,7 +79,7 @@ pub struct DfBucket {
     pub tf_bytes: u64,
     pub bitset_bytes: u64,
     /// Of the packed lanes, the bytes spent on lanes with no document
-    /// behind them (a partial block padded to `BLOCK_LEN`).
+    /// behind them (a partial block padded to its lanes).
     pub padding_bytes: u64,
     pub long_terms: u64,
     pub blocks: u64,
@@ -289,20 +287,26 @@ impl FtsReader {
                             let range = meta.block_range_in_term(tb, i, prev_end);
                             prev_end = Some(range.end);
                             let block = &tb[range];
-                            let hdr = BlockHeader::parse(block, meta.prev_last_doc_id(tb, i));
+                            let hdr = BlockHeader::parse(
+                                block,
+                                meta.prev_last_doc_id(tb, i),
+                                self.wide_blocks(),
+                            );
                             let doc_count = hdr.count() as u64;
+                            // Lanes the block encodes, whether or not they hold docs.
+                            let lanes = hdr.lanes() as u64;
                             b.block_header_bytes += hdr.payload() as u64;
-                            if doc_count < LANES {
+                            if doc_count < lanes {
                                 b.partial_blocks += 1;
                             }
                             let delta_bits = u64::from(hdr.delta_bits);
                             let tf_bits = u64::from(hdr.tf_bits);
                             match hdr.encoding {
                                 ENCODING_PACKED => {
-                                    b.docid_bytes += LANES * delta_bits / 8;
-                                    b.tf_bytes += LANES * tf_bits / 8;
+                                    b.docid_bytes += lanes * delta_bits / 8;
+                                    b.tf_bytes += lanes * tf_bits / 8;
                                     b.padding_bytes +=
-                                        (LANES - doc_count) * (delta_bits + tf_bits) / 8;
+                                        (lanes - doc_count) * (delta_bits + tf_bits) / 8;
                                 }
                                 ENCODING_PATCHED => {
                                     // Exceptions count with the stream they patch.
@@ -317,9 +321,11 @@ impl FtsReader {
                                     }
                                     let widest_tf = t[..n].iter().copied().max().unwrap_or(0);
                                     let plain = hdr.payload()
-                                        + BLOCK_LEN * width_of(u64::from(widest_delta)) as usize
+                                        + lanes as usize
+                                            * width_of(u64::from(widest_delta)) as usize
                                             / 8
-                                        + BLOCK_LEN * width_of(u64::from(widest_tf)) as usize / 8;
+                                        + lanes as usize * width_of(u64::from(widest_tf)) as usize
+                                            / 8;
                                     let saved = plain.saturating_sub(block.len()) as u64;
                                     let e = hist_band(&PATCH_HIST_EDGES, hdr.n_delta_exc() as u64);
                                     b.patched_by_exceptions[e] += 1;
@@ -328,24 +334,24 @@ impl FtsReader {
                                     b.patched_by_saving[g] += 1;
                                     b.patched_saved_by_saving[g] += saved;
                                     b.patched_saved += saved;
-                                    if doc_count < LANES {
+                                    if doc_count < lanes {
                                         b.patched_partial_blocks += 1;
                                         b.patched_partial_saved += saved;
                                     }
                                     b.docid_bytes +=
-                                        LANES * delta_bits / 8 + delta_exc.len() as u64;
-                                    b.tf_bytes += LANES * tf_bits / 8 + tf_exc.len() as u64;
+                                        lanes * delta_bits / 8 + delta_exc.len() as u64;
+                                    b.tf_bytes += lanes * tf_bits / 8 + tf_exc.len() as u64;
                                     b.padding_bytes +=
-                                        (LANES - doc_count) * (delta_bits + tf_bits) / 8;
+                                        (lanes - doc_count) * (delta_bits + tf_bits) / 8;
                                 }
                                 ENCODING_RUN => {
                                     b.run_blocks += 1;
-                                    b.tf_bytes += LANES * tf_bits / 8;
+                                    b.tf_bytes += lanes * tf_bits / 8;
                                 }
                                 _ => {
                                     b.bitset_bytes +=
-                                        (block.len() - hdr.payload()) as u64 - LANES * tf_bits / 8;
-                                    b.tf_bytes += LANES * tf_bits / 8;
+                                        (block.len() - hdr.payload()) as u64 - lanes * tf_bits / 8;
+                                    b.tf_bytes += lanes * tf_bits / 8;
                                 }
                             }
                         }
@@ -525,7 +531,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::fts::builder::FtsBuilder;
+    use crate::superfile::fts::{builder::FtsBuilder, posting::SUB_BLOCK_LEN};
 
     #[test]
     fn patched_form_is_granted_only_under_the_posting_cap() {
@@ -563,7 +569,7 @@ mod tests {
         );
         let common = band("df 16k-256k");
         assert_eq!(common.terms, 1);
-        assert!(common.blocks > 100);
+        assert!(common.blocks > 50);
         assert_eq!(common.patched_blocks, 0, "over the cap: no patched block");
         // `hole` (6,000 docs, under the cap) straddles the common stretches
         // the same way; between them they are every patched block.
@@ -629,5 +635,48 @@ mod tests {
         // the trailing CRC) is accounted for.
         assert_eq!(c.total.postings_region_bytes(), s.postings_region_bytes);
         assert!(s.to_string().contains("df 2-4"));
+    }
+
+    /// A term one doc past a sub-block takes the long form, and dense
+    /// enough for the wide block it pads to the second sub-block: one
+    /// partial block, its padding the empty lanes at the delta width.
+    #[test]
+    fn a_wide_partial_block_pads_to_its_lanes() {
+        /// Docs holding `strided`: one past the short-form cap.
+        const DF: u32 = SUB_BLOCK_LEN as u32 + 1;
+        /// Docs between them: a delta narrower than the span's presence
+        /// bits, so the block packs.
+        const STRIDE: u32 = 10;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..DF * STRIDE {
+            let text = match i % STRIDE {
+                0 => format!("strided f{i}"),
+                _ => format!("f{i}"),
+            };
+            b.add_doc(0, i, &text).expect("doc");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let s = r.size_breakdown().expect("breakdown");
+        let c = &s.columns[0];
+        assert_eq!(
+            (c.total.long_terms, c.total.blocks, c.total.partial_blocks),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            (
+                c.total.patched_blocks,
+                c.total.run_blocks,
+                c.total.bitset_bytes
+            ),
+            (0, 0, 0),
+            "plain packed: {c:?}"
+        );
+        let delta_bits = u64::from(width_of(u64::from(STRIDE)));
+        assert_eq!(
+            c.total.padding_bytes,
+            (BLOCK_LEN - DF as usize) as u64 * delta_bits / 8
+        );
     }
 }

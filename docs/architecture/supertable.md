@@ -396,6 +396,14 @@ superfiles — the manifest marks it incomplete, and part loading keeps
 the summary-based choice until a maintenance pass rebuilds the index
 over every superfile. Nothing requires old code to read a new manifest.
 
+A table can keep no term index at all (`SupertableOptions::term_index`
+off): its commits publish nothing, its maintenance rebuilds nothing, and
+no index object is written beside its superfiles. Nothing takes the
+index's place: a table on storage records no per-superfile term filter,
+so a query probes every superfile. That is worth it only where the
+index has nothing to route between, as on a table kept at one
+superfile, which then saves the index's bytes.
+
 A query that needs a term index the manifest names, and cannot use it,
 fails: with `Unsupported` when the root or a slice is in a layout this
 engine no longer reads (the message says to run `optimize()` or

@@ -2,7 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Where a `WHERE` runs: as a Parquet row filter in a scan under
-//! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else.
+//! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else. A
+//! filtered scan under a plain `LIMIT` is gathered in stages: its first
+//! partition alone, then the rest side by side if that falls short.
 //!
 //! `EXPLAIN ANALYZE` tells which. A row filter counts the rows it checks in
 //! `pushdown_rows_matched` and `pushdown_rows_pruned`; without one both are 0.
@@ -33,6 +35,15 @@ const PAD: &str =
     "--------------------------------------------------------------------------------";
 /// The metrics `EXPLAIN ANALYZE` prints for rows a row filter kept and dropped.
 const ROW_FILTER_METRICS: [&str; 2] = ["pushdown_rows_matched=", "pushdown_rows_pruned="];
+/// How `EXPLAIN` shows a plain `LIMIT`'s gather run in stages.
+const STAGED: &str = "StagedCoalesceExec: fetch=";
+/// How `EXPLAIN` shows the gate that holds a staged scan's partitions 1.. back.
+const GATE: &str = "ScanGateExec";
+/// The largest `LIMIT` whose gather runs in stages: DataFusion's default
+/// batch size, the most rows partition 0's first batch can hold.
+const MAX_FETCH: usize = 8_192;
+/// How `EXPLAIN ANALYZE` shows how many files a scan opened.
+const FILES_OPENED: &str = "files_opened=";
 
 fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -106,14 +117,19 @@ fn n_values(batches: &[RecordBatch]) -> Vec<i64> {
 /// The `n` an `ORDER BY n LIMIT FETCH` over rows whose `s` has `DIGIT` returns,
 /// skipping `deleted`.
 fn expected(descending: bool, deleted: &[i64]) -> Vec<i64> {
-    let mut n: Vec<i64> = (0..2 * ROWS_PER_APPEND)
-        .filter(|v| format!("r{v}").contains(DIGIT) && !deleted.contains(v))
-        .collect();
+    let mut n = matching(deleted);
     if descending {
         n.reverse();
     }
     n.truncate(FETCH);
     n
+}
+
+/// Every `n` whose `s` has `DIGIT`, ascending, skipping `deleted`.
+fn matching(deleted: &[i64]) -> Vec<i64> {
+    (0..2 * ROWS_PER_APPEND)
+        .filter(|v| format!("r{v}").contains(DIGIT) && !deleted.contains(v))
+        .collect()
 }
 
 /// The plan text `EXPLAIN <options> sql` prints.
@@ -363,6 +379,144 @@ fn a_scan_with_little_to_skip_gets_no_row_filter() {
         let got = n_values(&db.query_sql(&sql).expect("sql"));
         assert_eq!(got, want, "{sql}");
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+    }
+}
+
+/// Asserts `sql` returns `FETCH` distinct rows, each in `all`.
+fn assert_fetch_of(db: &Connection, sql: &str, all: &[i64]) {
+    let mut got = n_values(&db.query_sql(sql).expect("sql"));
+    assert_eq!(got.len(), FETCH, "{sql}");
+    got.sort_unstable();
+    got.dedup();
+    assert_eq!(got.len(), FETCH, "{sql}: distinct rows");
+    assert!(got.iter().all(|n| all.contains(n)), "{sql}: {got:?}");
+}
+
+#[test]
+fn a_plain_limit_gathers_its_filtered_scan_in_stages() {
+    // `WHERE s LIKE '%7%' LIMIT 5`, no `ORDER BY`, and the same with an offset.
+    //  - the gather runs the scan's first partition alone, then the rest side
+    //    by side only if that falls short; no exchange sits next to the scan.
+    //  - the `WHERE` stays in a `FilterExec`; no row filter.
+    // This test pins the plan shape and that every row returned matches.
+    let (_dir, db, _table) = fixture();
+    let all = matching(&[]);
+    for (offset, fetch) in [("", FETCH), (" OFFSET 3", FETCH + 3)] {
+        let sql = format!("SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {FETCH}{offset}");
+        assert_fetch_of(&db, &sql, &all);
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+        let plan = explain(&db, "", &sql);
+        assert!(plan.contains(&format!("{STAGED}{fetch}")), "{plan}");
+        assert!(plan.contains("FilterExec"), "{plan}");
+        let below = plan.split_once(STAGED).expect("a staged gather").1;
+        assert!(below.contains(GATE), "{plan}");
+        assert!(!below.contains("RepartitionExec"), "{plan}");
+    }
+}
+
+/// How many files the scans in `sql`'s plan opened.
+fn files_opened(db: &Connection, sql: &str) -> usize {
+    let plan = explain(db, "ANALYZE", sql);
+    plan.split(FILES_OPENED)
+        .skip(1)
+        .map(|rest| {
+            rest.split([',', ']'])
+                .next()
+                .and_then(|count| count.trim().parse::<usize>().ok())
+                .expect("a file count")
+        })
+        .sum()
+}
+
+#[test]
+fn a_first_batch_that_meets_a_plain_limit_opens_no_other_file() {
+    // `WHERE s LIKE '%-%' LIMIT 5`: every row matches.
+    //  - partition 0's first batch has the rows, so the gate stays shut and
+    //    the other superfile is never opened.
+    // This test pins the rows and the files opened.
+    let (_dir, db, _table) = fixture();
+    let sql = format!("SELECT n, s FROM t WHERE s LIKE '%-%' LIMIT {FETCH}");
+    assert_eq!(n_values(&db.query_sql(&sql).expect("sql")).len(), FETCH);
+    assert!(explain(&db, "", &sql).contains(STAGED), "{sql}");
+    assert_eq!(files_opened(&db, &sql), 1, "{sql}");
+}
+
+#[test]
+fn a_first_file_that_gives_no_row_opens_the_gate_when_it_ends() {
+    // `s ILIKE '%r39999%' LIMIT 5` on a full-text column: the one match is in
+    // the second superfile, so the index rules out every row of the first.
+    //  - partition 0 gives no batch and ends; the gate opens and partition 1
+    //    finds the row.
+    // This test pins the row and that both files were opened.
+    let (_dir, db, _table) = fixture_with(IndexSpec::new().fts("s"));
+    let last = 2 * ROWS_PER_APPEND - 1;
+    let sql = format!("SELECT n, s FROM t WHERE s ILIKE '%r{last}%' LIMIT {FETCH}");
+    assert_eq!(n_values(&db.query_sql(&sql).expect("sql")), vec![last]);
+    assert!(explain(&db, "", &sql).contains(STAGED), "{sql}");
+    assert_eq!(files_opened(&db, &sql), 2, "{sql}");
+}
+
+#[test]
+fn an_index_answered_where_under_a_plain_limit_is_gathered_in_stages() {
+    // `s ILIKE '%7%' LIMIT 5` on a full-text column.
+    //  - the index picks the rows, so there is no `FilterExec`, and the scan
+    //    still takes no fetch: its gather runs in stages all the same.
+    // This test pins the rows and the plan shape.
+    let (_dir, db, _table) = fixture_with(IndexSpec::new().fts("s"));
+    let sql = format!("SELECT n, s FROM t WHERE s ILIKE '%{DIGIT}%' LIMIT {FETCH}");
+    assert_fetch_of(&db, &sql, &matching(&[]));
+    let plan = explain(&db, "", &sql);
+    assert!(plan.contains(STAGED) && plan.contains(GATE), "{plan}");
+}
+
+#[test]
+fn deleted_rows_stay_out_under_a_plain_limit() {
+    // Delete every odd `n`, then `WHERE s LIKE '%7%' LIMIT <every match>`.
+    //  - the first partition falls short, so every partition is read; the
+    //    scan skips deleted rows in each.
+    // This test pins that every live match comes back and no deleted one does.
+    let (_dir, db, table) = fixture();
+    table
+        .delete((col("n") % lit(2_i64)).eq(lit(1_i64)))
+        .expect("delete");
+    let want: Vec<i64> = matching(&[]).into_iter().filter(|n| n % 2 == 0).collect();
+    assert!(
+        want.len() <= MAX_FETCH,
+        "the limit must stay under the staged gather's"
+    );
+    let sql = format!(
+        "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {}",
+        want.len()
+    );
+    let mut got = n_values(&db.query_sql(&sql).expect("sql"));
+    got.sort_unstable();
+    assert_eq!(got, want);
+    assert!(explain(&db, "", &sql).contains(STAGED), "{sql}");
+}
+
+#[test]
+fn a_plain_limit_is_gathered_at_once_without_a_where_or_past_the_largest_limit() {
+    // `SELECT n, s LIMIT 5` has no `WHERE`: its fetch already reaches the scan.
+    // `WHERE ... LIMIT 8193` is one past the largest staged limit.
+    // This test pins the row counts and that neither gather runs in stages.
+    let (_dir, db, _table) = fixture();
+    for (sql, rows) in [
+        (format!("SELECT n, s FROM t LIMIT {FETCH}"), FETCH),
+        (
+            format!(
+                "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {}",
+                MAX_FETCH + 1
+            ),
+            matching(&[]).len().min(MAX_FETCH + 1),
+        ),
+    ] {
+        assert_eq!(
+            n_values(&db.query_sql(&sql).expect("sql")).len(),
+            rows,
+            "{sql}"
+        );
+        assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
+        assert!(!explain(&db, "", &sql).contains(STAGED), "{sql}");
     }
 }
 

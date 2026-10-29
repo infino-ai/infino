@@ -385,11 +385,11 @@ impl PhraseCursor {
                 }
             })
             .collect();
-        // Rarest-first probe order for alignment: fewest posting blocks
-        // (shortest list) first. Query order is preserved in `members`.
+        // Rarest-first probe order for alignment: the shortest list first.
+        // Query order is preserved in `members`.
         let n_members = members.len();
         let mut align_order: Vec<usize> = (0..members.len()).collect();
-        align_order.sort_by_key(|&i| members[i].cursor.block_count());
+        align_order.sort_by_key(|&i| members[i].cursor.df);
         let mut rank = vec![0usize; n_members];
         for (r, &m) in align_order.iter().enumerate() {
             rank[m] = r;
@@ -447,11 +447,11 @@ impl PhraseCursor {
         }
         let n = self.members.len();
         self.filters = terms;
-        let lens: Vec<usize> = self
+        let lens: Vec<u64> = self
             .members
             .iter()
-            .map(|m| m.cursor.block_count())
-            .chain(self.filters.iter().map(TermCursor::block_count))
+            .map(|m| m.cursor.df)
+            .chain(self.filters.iter().map(|c| c.df))
             .collect();
         self.batch_order = (0..n + self.filters.len()).collect();
         self.batch_order.sort_by_key(|&s| lens[s]);
@@ -1534,7 +1534,7 @@ mod tests {
     // ── Cursor-level phrase seeks ─────────────────────────────────────
 
     /// Rows in the seek corpus: the common member spans a dozen blocks.
-    const SEEK_DOCS: u32 = 1500;
+    const SEEK_DOCS: u32 = 3000;
     /// Rows holding the rare member. The first holds the words reversed;
     /// the other two hold the phrase, hundreds of docs (several of the
     /// common member's blocks) apart.

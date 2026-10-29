@@ -53,6 +53,9 @@ use crate::{
     utils::trace::detail_span,
 };
 
+/// The sign bit of an `f32`.
+const SIGN_BIT: u32 = 0x8000_0000;
+
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
@@ -757,12 +760,12 @@ struct BisectState {
     /// be cleared in proportion to the partition rather than to the
     /// vocabulary.
     touched: Vec<u32>,
-    /// Ranked documents for each side, reused by every round of every
+    /// Ranked documents for each side as [`rank_key`]s, reused by every round of every
     /// split this state serves. Ranking used to return a fresh `Vec` per
     /// side per round, which is two allocations per round per partition —
     /// millions of them over a corpus-sized bisection.
-    left_gains: Vec<(f32, u32)>,
-    right_gains: Vec<(f32, u32)>,
+    left_gains: Vec<u64>,
+    right_gains: Vec<u64>,
     /// Reports of the splits this state made, by depth, until
     /// [`Self::flush`] adds them to the run's. Saves taking the shared lock
     /// once per split.
@@ -1007,16 +1010,17 @@ impl BisectState {
                         order_leading_gains(&mut right_gains, ready, parallel);
                     }
                     let (l, r) = (left_gains[swaps], right_gains[swaps]);
-                    if l.0 + r.0 <= 0.0 {
+                    let pair_gain = key_gain(l) + key_gain(r);
+                    if pair_gain <= 0.0 {
                         break;
                     }
                     swaps += 1;
-                    gain += f64::from(l.0 + r.0);
+                    gain += f64::from(pair_gain);
                     if parallel {
                         // Applied below, once the round knows its swaps.
                         continue;
                     }
-                    let (li, ri) = (l.1 as usize, r.1 as usize);
+                    let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
                     let (ld, rd) = (left[li], right[ri]);
                     // The degree tables follow the documents across.
                     for &t in fwd.doc(ld) {
@@ -1041,18 +1045,18 @@ impl BisectState {
                     );
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
                     let (left_docs, right_docs) = (&*left, &*right);
-                    lefts.par_iter().zip(rights).for_each(|(l, r)| {
-                        for &t in fwd.doc(left_docs[l.1 as usize]) {
+                    lefts.par_iter().zip(rights).for_each(|(&l, &r)| {
+                        for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
                             deg_left[t as usize].fetch_sub(1, Relaxed);
                             deg_right[t as usize].fetch_add(1, Relaxed);
                         }
-                        for &t in fwd.doc(right_docs[r.1 as usize]) {
+                        for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
                             deg_right[t as usize].fetch_sub(1, Relaxed);
                             deg_left[t as usize].fetch_add(1, Relaxed);
                         }
                     });
-                    for (l, r) in lefts.iter().zip(rights) {
-                        let (li, ri) = (l.1 as usize, r.1 as usize);
+                    for (&l, &r) in lefts.iter().zip(rights) {
+                        let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
                         let (ld, rd) = (left[li], right[ri]);
                         left[li] = rd;
                         right[ri] = ld;
@@ -1232,8 +1236,8 @@ impl BisectState {
     }
 }
 
-/// `(gain, position within the half)` for every document in `half`: the
-/// sum of its terms' move gains for that side, written into `out`.
+/// The [`rank_key`] of every document in `half`: the sum of its terms' move
+/// gains for that side, with its position within the half, written into `out`.
 ///
 /// Takes the output buffer rather than returning one so a split's rounds
 /// share two allocations instead of making two apiece.
@@ -1242,14 +1246,14 @@ fn rank_by_gain(
     half: &[u32],
     move_gain: &[f32],
     parallel: bool,
-    out: &mut Vec<(f32, u32)>,
+    out: &mut Vec<u64>,
 ) {
     let gain_of = |(i, &d): (usize, &u32)| {
         let mut gain = 0.0f32;
         for &t in fwd.doc(d) {
             gain += move_gain[t as usize];
         }
-        (gain, i as u32)
+        rank_key(gain, i as u32)
     };
     out.clear();
     match parallel {
@@ -1263,16 +1267,15 @@ fn rank_by_gain(
 /// Put the `want` highest-gain entries at the front of `gains`, in the
 /// order a full sort would have put them; leave the rest unordered.
 ///
-/// Ties break by position, which is unique, so the comparison is a total
-/// order and the leading `want` entries are the same whatever `want` was
-/// asked for before. That is what lets a round grow its block without
-/// changing which documents it swaps.
-fn order_leading_gains(gains: &mut [(f32, u32)], want: usize, parallel: bool) {
-    let by = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+/// Every key holds a unique position, so the keys are distinct and the
+/// leading `want` entries are the same whatever `want` was asked for before.
+/// That is what lets a round grow its block without changing which documents
+/// it swaps, and what makes an unstable sort deterministic here.
+fn order_leading_gains(gains: &mut [u64], want: usize, parallel: bool) {
     if want >= gains.len() {
         match parallel {
-            true => gains.par_sort_by(by),
-            false => gains.sort_by(by),
+            true => gains.par_sort_unstable(),
+            false => gains.sort_unstable(),
         }
         return;
     }
@@ -1281,12 +1284,38 @@ fn order_leading_gains(gains: &mut [(f32, u32)], want: usize, parallel: bool) {
     }
     // Linear-time partition around the `want`-th entry, then order only
     // what sits in front of it.
-    gains.select_nth_unstable_by(want, by);
+    gains.select_nth_unstable(want);
     let head = &mut gains[..want];
     match parallel {
-        true => head.par_sort_by(by),
-        false => head.sort_by(by),
+        true => head.par_sort_unstable(),
+        false => head.sort_unstable(),
     }
+}
+
+/// Sort key for a ranked document: gain descending, then position ascending,
+/// as one ascending `u64`. Gains order as [`f32::total_cmp`] orders them.
+fn rank_key(gain: f32, pos: u32) -> u64 {
+    let bits = gain.to_bits();
+    // Maps the bits to a `u32` that ascends with the gain.
+    let ascending = match bits & SIGN_BIT != 0 {
+        true => !bits,
+        false => bits ^ SIGN_BIT,
+    };
+    (u64::from(!ascending) << 32) | u64::from(pos)
+}
+
+/// The gain a [`rank_key`] was made from, bit for bit.
+fn key_gain(key: u64) -> f32 {
+    let ascending = !((key >> 32) as u32);
+    f32::from_bits(match ascending & SIGN_BIT != 0 {
+        true => ascending ^ SIGN_BIT,
+        false => !ascending,
+    })
+}
+
+/// The position a [`rank_key`] was made from.
+fn key_pos(key: u64) -> u32 {
+    key as u32
 }
 
 /// A table of 32-bit words viewed as atomics, so threads that each update
@@ -1842,6 +1871,59 @@ mod tests {
         };
         BisectState::new(fwd.n_terms).split(&fwd, &mut serial, 0, run);
         assert_eq!(bisect_order(&fwd, exhaustive()), serial);
+    }
+
+    /// Gains that order unusually under [`f32::total_cmp`].
+    const EDGE_GAINS: [f32; 12] = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        -f32::NAN,
+        f32::MIN_POSITIVE / 2.0,
+        -f32::MIN_POSITIVE / 2.0,
+        f32::MAX,
+        f32::MIN,
+    ];
+
+    /// Random gains per seed in the rank-key property test.
+    const RANK_KEY_DOCS: usize = 2_000;
+
+    /// Seeds the rank-key property test runs over.
+    const RANK_KEY_SEEDS: u64 = 50;
+
+    /// Sorting by [`rank_key`] puts documents in the order the comparison
+    /// on `(gain, position)` does, and the key gives back both exactly.
+    #[test]
+    fn the_rank_key_orders_as_the_gain_comparison_does() {
+        let by = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
+        for seed in 0..RANK_KEY_SEEDS {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut ranked: Vec<(f32, u32)> = (0..RANK_KEY_DOCS)
+                .map(|i| {
+                    let gain = match rng.random_range(0..4) {
+                        // Ties, and the edge values against each other.
+                        0 => EDGE_GAINS[rng.random_range(0..EDGE_GAINS.len())],
+                        1 => rng.random_range(-4..4) as f32,
+                        2 => f32::from_bits(rng.random()),
+                        _ => rng.random_range(-1.0e3f32..1.0e3),
+                    };
+                    (gain, i as u32)
+                })
+                .collect();
+            let mut keys: Vec<u64> = ranked.iter().map(|&(g, i)| rank_key(g, i)).collect();
+            ranked.sort_by(by);
+            keys.sort_unstable();
+            let decoded: Vec<(u32, u32)> = keys
+                .iter()
+                .map(|&k| (key_gain(k).to_bits(), key_pos(k)))
+                .collect();
+            let expected: Vec<(u32, u32)> = ranked.iter().map(|&(g, i)| (g.to_bits(), i)).collect();
+            assert_eq!(decoded, expected, "seed {seed}");
+        }
     }
 
     /// The report accounts for every split once, and records the cost really

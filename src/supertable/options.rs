@@ -231,6 +231,13 @@ const DEFAULT_EAGER_LOAD_THRESHOLD_PARTS: u32 = u32::MAX;
 /// seventeen; what each open fetches is a few hundred kilobytes at most once
 /// a superfile's arrays are cached, and a few megabytes on first touch.
 const DEFAULT_BOUND_ORDERED_OPEN_WINDOW: usize = 256;
+/// Default for [`SupertableOptions::superfiles_in_flight`]. A query over this
+/// many superfiles or fewer runs as it would with no limit. Past it, a
+/// superfile's setup (a few small, round-trip-bound reads and the buffers
+/// they fill) waits for a slot, so a table of thousands of superfiles neither
+/// sends thousands of requests together, which an object store slows until
+/// they time out, nor holds thousands of opens' buffers at once.
+pub(crate) const DEFAULT_SUPERFILES_IN_FLIGHT: usize = 256;
 /// Subdirectory under the disk-cache root that holds the
 /// content-addressed manifest-part byte cache. Kept separate from the
 /// superfile cache files so the two budgets and eviction sets don't
@@ -382,6 +389,8 @@ pub struct SupertableOptions {
     /// a later superfile whose ceiling is below it is never opened. This is
     /// I/O concurrency, deliberately independent of the reader pool's CPU
     /// width: a one-thread pool must not serialize fifteen superfile opens.
+    /// A search opens no more than [`Self::superfiles_in_flight`] at once,
+    /// whatever this is set to.
     pub bound_ordered_open_window: usize,
     /// Documents the term index keeps per term in its *tier* — a term's
     /// best documents per superfile, read ahead of any superfile open so a
@@ -408,6 +417,30 @@ pub struct SupertableOptions {
     /// runs for every query the tiers can serve (what a test of the merge
     /// wants).
     pub tier_merge_gate: bool,
+    /// Whether the table keeps a term index (see `manifest::term_index`):
+    /// per `(column, term)`, the superfiles that hold it, its score ceiling
+    /// in each and where its postings sit, with the tiers above. On, the
+    /// default, every commit publishes its superfiles' terms into it and
+    /// `optimize` rebuilds it over the whole table. Off, nothing is
+    /// published or rebuilt, the table carries no index objects beside its
+    /// superfiles, and a query probes every superfile: a table on storage
+    /// keeps no per-superfile term filter (the index replaced it), so with
+    /// the index off nothing prunes a superfile before it is opened. Worth
+    /// turning off only where the index cannot pay for itself: a table of
+    /// one superfile, where there is nothing to route between, saves its
+    /// bytes.
+    pub term_index: bool,
+    /// Superfiles one scan or search of this table works on at once: a SQL
+    /// scan's opens and index predicates, a search's per-superfile opens and
+    /// kernels (a ranged search that splits a superfile counts each part),
+    /// the opens that read a query's hits, and the delete-sidecar reads of
+    /// every query and of compaction. Past this many the next superfile waits for one to
+    /// finish. It keeps a table of thousands of superfiles from starting all
+    /// their requests together; the data reads a SQL scan makes after that
+    /// setup are not limited by it, and each scan in a join, like each
+    /// concurrent query, has a cap of its own. A ranked search opens no more
+    /// than this at once, whatever [`Self::bound_ordered_open_window`] says.
+    pub superfiles_in_flight: usize,
     /// Best-effort memory budget for the disk cache's mmap
     /// working set, in bytes. When set together with
     /// `disk_cache`, the supertable triggers
@@ -821,6 +854,8 @@ impl SupertableOptions {
             term_tier_entries_per_term: None,
             term_head_depth: None,
             tier_merge_gate: true,
+            term_index: true,
+            superfiles_in_flight: DEFAULT_SUPERFILES_IN_FLIGHT,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
             // The catalog's `build_options` overwrites this with the connection's shared budget, and
@@ -999,6 +1034,20 @@ impl SupertableOptions {
         self
     }
 
+    /// Whether the table keeps a term index (see [`Self::term_index`]).
+    pub fn with_term_index(mut self, keep: bool) -> Self {
+        self.term_index = keep;
+        self
+    }
+
+    /// Whether commits publish into a term index and maintenance rebuilds
+    /// one: the option is on and storage is attached, since the index lives
+    /// beside the superfiles on storage. A table with no text column has no
+    /// terms to index; its callers check that themselves.
+    pub(crate) fn keeps_term_index(&self) -> bool {
+        self.term_index && self.storage.is_some()
+    }
+
     /// What the term-index build takes from these options.
     pub(crate) fn term_index_build_policy(&self) -> BuildPolicy {
         // Every superfile keeps its head to the same depth, at least one
@@ -1015,6 +1064,21 @@ impl SupertableOptions {
             scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
             ..BuildPolicy::default()
         }
+    }
+
+    /// Set how many superfiles a query works on at once (see
+    /// [`Self::superfiles_in_flight`]).
+    pub fn with_superfiles_in_flight(mut self, superfiles: usize) -> Self {
+        self.superfiles_in_flight = superfiles.max(1);
+        self
+    }
+
+    /// The ranked fan-out's open window: [`Self::bound_ordered_open_window`],
+    /// never past [`Self::superfiles_in_flight`].
+    pub(crate) fn ordered_open_window(&self) -> usize {
+        self.bound_ordered_open_window
+            .min(self.superfiles_in_flight)
+            .max(1)
     }
 
     /// Attach an on-disk cache for compressed manifest-part bytes.

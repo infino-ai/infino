@@ -1059,6 +1059,7 @@ impl FtsReader {
                 n_docs,
                 baked_avgdl,
                 score_avgdl: baked_avgdl,
+                wide_blocks: format::fts::wide_blocks(version),
                 declared_params: params,
                 verify_crc: opts.verify_crc,
                 base_norms: Arc::new(OnceLock::new()),
@@ -2692,7 +2693,7 @@ fn or_count_anchored(mut cursors: Vec<TermCursor>, anchor_idx: usize) -> u64 {
         // Membership by bit-test, not `skip_to`: the anchor is the dominant
         // (common ⇒ dense) term, so its blocks are bitsets. `contains` answers
         // in one word-load; `skip_to` would decode each block — expanding its
-        // ~128 doc ids — as the frontier drags the anchor across its whole list.
+        // all its doc ids — as the frontier drags the anchor across its whole list.
         for (word_idx, word) in present.iter_mut().enumerate() {
             let mut bits = mem::take(word);
             while bits != 0 {
@@ -2756,6 +2757,15 @@ pub(super) fn read_doc_length(region: &[u8], d: usize) -> u32 {
     u32::from(u16::from_le_bytes([region[at], region[at + 1]]))
 }
 
+impl FtsReader {
+    /// Whether this file's posting blocks take the wide header reading
+    /// (see [`format::fts::wide_blocks`]).
+    #[inline]
+    pub(super) fn wide_blocks(&self) -> bool {
+        format::fts::wide_blocks(self.version)
+    }
+}
+
 /// Refuse a blob version this crate does not read: one below
 /// [`VERSION_MIN`] with the instruction to reindex it, anything else
 /// unknown as unsupported.
@@ -2764,7 +2774,8 @@ fn check_version(version: u32) -> Result<(), FtsError> {
         format::fts::VERSION_V7
         | format::fts::VERSION_V8
         | format::fts::VERSION_V9
-        | format::fts::VERSION_V10 => Ok(()),
+        | format::fts::VERSION_V10
+        | format::fts::VERSION_V11 => Ok(()),
         v if v < VERSION_MIN => Err(FtsError::IndexTooOld { version: v }),
         v => Err(FtsError::Read(ReadError::UnsupportedVersion(format!(
             "fts section version {v}"
@@ -3086,7 +3097,7 @@ mod tests {
         assert!(matches!(err, FtsError::IndexTooOld { .. }), "{err:?}");
 
         let err =
-            FtsReader::open(stamp(format::fts::VERSION_V10 + 1), json).expect_err("a future blob");
+            FtsReader::open(stamp(format::fts::VERSION_V11 + 1), json).expect_err("a future blob");
         assert!(
             matches!(err, FtsError::Read(ReadError::UnsupportedVersion(_))),
             "{err:?}"
