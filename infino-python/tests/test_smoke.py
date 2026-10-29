@@ -544,7 +544,7 @@ def test_value_counts_count_each_value():
 
     # Read from the table's statistics, without running a query.
     counts = t.value_counts("title").to_pylist()
-    assert {row["title"]: row["count"] for row in counts} == {"yellow": 2, "green": 1}
+    assert {row["title"]: row["count(*)"] for row in counts} == {"yellow": 2, "green": 1}
 
 
 def test_gc_reclaims_orphans(tmp_path):

@@ -236,10 +236,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     let id_column = manifest.options.id_column.as_str();
 
     if matches!(kinds.as_slice(), [AggKind::CountStar])
-        && superfiles
-            .iter()
-            .all(|entry| provider.entry_is_clean(entry))
-        && counts_describe_column(manifest, &range.column, superfiles)
+        && value_counts_nulls(provider, &range.column).is_some()
         && let Some(value_counts) = provider.exact_value_counts(&range.column)
         && let Some(count) = count_range_from_value_counts(&value_counts, &range)
     {
@@ -420,10 +417,20 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     let Some(provider) = provider_of(scan) else {
         return Ok(None);
     };
-    let Some((value_counts, nulls)) = manifest_value_counts(provider, &group_column.name) else {
+    // The nulls come from per-file statistics and decide the rewrite before
+    // any per-value counts are merged.
+    let Some(nulls) = value_counts_nulls(provider, &group_column.name) else {
         return Ok(None);
     };
     if !nulls_filtered && nulls != Some(0) {
+        return Ok(None);
+    }
+    let Some(value_counts) = provider.exact_value_counts(&group_column.name) else {
+        return Ok(None);
+    };
+    // A column with no value at all has no group to list, and a values
+    // list takes at least one row; the scan answers the empty grouping.
+    if value_counts.entries().is_empty() {
         return Ok(None);
     }
     let mut rows = Vec::with_capacity(value_counts.entries().len());
@@ -448,16 +455,18 @@ fn rewrite_grouped_count_from_value_counts(aggregate: &Aggregate) -> DfResult<Op
     ))
 }
 
-/// `column`'s exact table-wide value counts, when they describe every live
-/// row's value, with the number of rows that hold no value (`None` when a
-/// file doesn't record it). `None` when the counts can't be trusted: a
+/// The rows of `column` that hold no value (`None` inside when a file
+/// doesn't record its nulls), when the manifest's per-value counts can be
+/// trusted to describe every live row's value. `None` when they can't: a
 /// segment-restricted provider (the rewrite's own residual), a manifest
-/// not fully loaded, a column mid-retype, a file with deletes, or a column
-/// without recorded counts.
-pub(crate) fn manifest_value_counts(
+/// not fully loaded, a column mid-retype, or a file with deletes. Reads only
+/// per-file statistics; the counts themselves are merged by
+/// [`SupertableProvider::exact_value_counts`], which a caller needing them
+/// asks next.
+pub(crate) fn value_counts_nulls(
     provider: &SupertableProvider,
     column: &str,
-) -> Option<(Arc<ScalarValueCounts>, Option<u64>)> {
+) -> Option<Option<u64>> {
     if provider.is_segment_restricted() {
         return None;
     }
@@ -478,7 +487,7 @@ pub(crate) fn manifest_value_counts(
             .and_then(|stats| stats.null_count());
         nulls = nulls.zip(file_nulls).and_then(|(a, b)| a.checked_add(b));
     }
-    Some((provider.exact_value_counts(column)?, nulls))
+    Some(nulls)
 }
 
 fn count_range_from_value_counts(

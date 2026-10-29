@@ -2093,13 +2093,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use arrow::{
-        compute::cast,
-        util::{display::array_value_to_string, pretty::pretty_format_batches},
-    };
+    use arrow::util::{display::array_value_to_string, pretty::pretty_format_batches};
     use arrow_array::{
-        Array, Decimal128Array, FixedSizeListArray, Float32Array, Float64Array, Int64Array,
-        LargeStringArray, StringViewArray, cast::AsArray, types::UInt64Type,
+        Array, ArrayRef, BooleanArray, Decimal128Array, FixedSizeListArray, Float32Array,
+        Float64Array, Int64Array, LargeStringArray, StringViewArray, cast::AsArray,
+        types::Int64Type,
     };
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::{
@@ -2112,9 +2110,13 @@ mod tests {
 
     use super::*;
     use crate::{
-        Bm25SearchOptions, BoolMode, Consistency, Metric, Stemmer, Stopwords,
+        Bm25SearchOptions, BoolMode, CompactionSettings, Consistency, FieldPatch, Metric,
+        OptimizeOptions, SchemaPatch, Stemmer, Stopwords,
         catalog::manifest::CATALOG_PATH,
-        supertable::{manifest::commit::POINTER_PATH, query::provider::TABLE_NAME},
+        supertable::{
+            manifest::commit::POINTER_PATH,
+            query::{provider::TABLE_NAME, sql::value_count_schema},
+        },
         test_helpers::{
             build_title_batch,
             fault_storage::{FaultOp, FaultStorage},
@@ -4314,13 +4316,22 @@ mod tests {
         }
     }
 
-    /// `(value, count)` pairs of any two-column grouped count, the value as text (`None` for
-    /// the null group), sorted.
-    fn value_count_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, u64)> {
+    /// Distinct values one append of the past-the-cap fixture holds: more than a superfile
+    /// records counts for.
+    const PAST_THE_FILE_CAP: usize = 300;
+    /// Distinct values in each of two appends of the past-the-cap fixture: fewer than a
+    /// superfile's cap, more than it between them.
+    const UNDER_THE_FILE_CAP: usize = 200;
+    /// Superfiles that trigger a merge in the value-count fixture's compaction, whatever
+    /// their size: as few as merging takes.
+    const MERGE_AT_SUPERFILES: u64 = 2;
+
+    /// `(value, count)` pairs of a grouped count, the value as text (`None` for the null
+    /// group), sorted.
+    fn value_count_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
         let mut rows = Vec::new();
         for batch in batches {
-            let counts = cast(batch.column(1), &DataType::UInt64).expect("count as UInt64");
-            let counts = counts.as_primitive::<UInt64Type>();
+            let counts = batch.column(1).as_primitive::<Int64Type>();
             for i in 0..batch.num_rows() {
                 let value = batch
                     .column(0)
@@ -4333,20 +4344,73 @@ mod tests {
         rows
     }
 
-    /// `table.value_counts(column)`, which must answer, against the `GROUP BY` it stands for.
-    fn assert_value_counts_match_group_by(conn: &Connection, table: &str, column: &str) {
-        let direct = conn
-            .open_table(table)
-            .expect("open")
-            .value_counts(column)
-            .expect("value counts")
-            .expect("answered from statistics");
+    /// Where `value_counts` must find its answer.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Answered {
+        /// From the statistics alone, with no query planned.
+        FromStats,
+        /// By running the grouped count.
+        ByGroupBy,
+    }
+
+    /// `table.value_counts(column)` against the `GROUP BY` it stands for: the same rows under
+    /// the same names and types, found where `how` says.
+    fn assert_value_counts(conn: &Connection, table: &str, column: &str, how: Answered) {
+        let handle = conn.open_table(table).expect("open");
+        let direct = handle.value_counts(column).expect("value counts");
         let grouped = conn
             .query_sql(&format!(
-                "SELECT {column}, count(*) FROM {table} GROUP BY {column}"
+                "SELECT \"{column}\", count(*) FROM {table} GROUP BY \"{column}\""
             ))
             .expect("grouped");
-        assert_eq!(value_count_rows(&[direct]), value_count_rows(&grouped));
+        assert_eq!(
+            value_count_rows(std::slice::from_ref(&direct)),
+            value_count_rows(&grouped),
+            "{table}.{column}"
+        );
+        if let Some(first) = grouped.first() {
+            assert_eq!(
+                direct.schema().fields(),
+                first.schema().fields(),
+                "{table}.{column}"
+            );
+        }
+        let schema = value_count_schema(direct.schema().field(0)).expect("schema");
+        let from_stats = handle
+            .local_handle()
+            .reader()
+            .expect("reader")
+            .value_counts_from_stats(column, &schema)
+            .expect("from stats");
+        assert_eq!(
+            from_stats.is_some(),
+            how == Answered::FromStats,
+            "{table}.{column}"
+        );
+    }
+
+    /// A one-column table of `field`, holding `values`.
+    fn one_column_table(
+        conn: &Connection,
+        name: &str,
+        field: Field,
+        values: ArrayRef,
+    ) -> Supertable {
+        let schema = Arc::new(Schema::new(vec![field]));
+        let table = conn
+            .create_table(name, Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        table
+            .append(&RecordBatch::try_new(schema, vec![values]).expect("batch"))
+            .expect("append");
+        table
+    }
+
+    /// `n` distinct strings, `prefix` before each.
+    fn distinct_strings(prefix: &str, n: usize) -> ArrayRef {
+        Arc::new(LargeStringArray::from(
+            (0..n).map(|i| format!("{prefix}{i}")).collect::<Vec<_>>(),
+        ))
     }
 
     /// A table's value counts are its `GROUP BY` counts, merged across superfiles.
@@ -4354,37 +4418,238 @@ mod tests {
     fn value_counts_match_the_grouped_count() {
         let conn = connect("memory://").expect("connect");
         create_cab_types(&conn, "cabs");
-        assert_value_counts_match_group_by(&conn, "cabs", "title");
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
     }
 
     /// Rows without a value count under a null key, as `GROUP BY` puts them in a null group.
     #[test]
     fn value_counts_count_missing_values_under_a_null_key() {
         let conn = connect("memory://").expect("connect");
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "tag",
-            DataType::LargeUtf8,
-            true,
-        )]));
-        let table = conn
-            .create_table("tags", Arc::clone(&schema), IndexSpec::new())
-            .expect("create");
         let tags = LargeStringArray::from(vec![Some("a"), None, Some("a"), None, Some("b")]);
-        table
-            .append(&RecordBatch::try_new(schema, vec![Arc::new(tags)]).expect("batch"))
-            .expect("append");
-        assert_value_counts_match_group_by(&conn, "tags", "tag");
+        one_column_table(
+            &conn,
+            "tags",
+            Field::new("tag", DataType::LargeUtf8, true),
+            Arc::new(tags),
+        );
+        assert_value_counts(&conn, "tags", "tag", Answered::FromStats);
     }
 
-    /// After a delete the per-file counts still hold the deleted row, so the call declines and
-    /// the `GROUP BY` answers; an unknown column is an error.
+    /// A file whose column holds only nulls counts as its nulls, so a column filled in later
+    /// is still answered from the statistics.
     #[test]
-    fn value_counts_decline_over_deletes_and_refuse_unknown_columns() {
+    fn value_counts_count_an_all_null_file_as_its_nulls() {
+        let conn = connect("memory://").expect("connect");
+        let table = one_column_table(
+            &conn,
+            "tags",
+            Field::new("tag", DataType::LargeUtf8, true),
+            Arc::new(LargeStringArray::from(vec![None::<&str>, None])),
+        );
+        assert_value_counts(&conn, "tags", "tag", Answered::FromStats);
+        let schema = table.schema();
+        table
+            .append(
+                &RecordBatch::try_new(
+                    schema,
+                    vec![Arc::new(LargeStringArray::from(vec!["x", "y"]))],
+                )
+                .expect("batch"),
+            )
+            .expect("append");
+        assert_value_counts(&conn, "tags", "tag", Answered::FromStats);
+    }
+
+    /// Integer, boolean and decimal columns are counted from the statistics too, each value
+    /// under its own type.
+    #[test]
+    fn value_counts_answer_non_string_columns() {
+        let conn = connect("memory://").expect("connect");
+        one_column_table(
+            &conn,
+            "ints",
+            Field::new("n", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(1), None])),
+        );
+        one_column_table(
+            &conn,
+            "flags",
+            Field::new("on", DataType::Boolean, true),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(false),
+                Some(true),
+            ])),
+        );
+        one_column_table(
+            &conn,
+            "prices",
+            Field::new("price", DataType::Decimal128(10, 2), true),
+            Arc::new(
+                Decimal128Array::from(vec![Some(150), Some(150), Some(299)])
+                    .with_precision_and_scale(10, 2)
+                    .expect("decimal"),
+            ),
+        );
+        assert_value_counts(&conn, "ints", "n", Answered::FromStats);
+        assert_value_counts(&conn, "flags", "on", Answered::FromStats);
+        assert_value_counts(&conn, "prices", "price", Answered::FromStats);
+    }
+
+    /// Past the cap of distinct values, in one superfile or across two, the statistics hold no
+    /// exact answer and the grouped count runs.
+    #[test]
+    fn value_counts_past_the_cap_run_the_grouped_count() {
+        let conn = connect("memory://").expect("connect");
+        let field = Field::new("tag", DataType::LargeUtf8, true);
+        one_column_table(
+            &conn,
+            "wide",
+            field.clone(),
+            distinct_strings("w", PAST_THE_FILE_CAP),
+        );
+        assert_value_counts(&conn, "wide", "tag", Answered::ByGroupBy);
+
+        let table = one_column_table(
+            &conn,
+            "split",
+            field,
+            distinct_strings("a", UNDER_THE_FILE_CAP),
+        );
+        assert_value_counts(&conn, "split", "tag", Answered::FromStats);
+        table
+            .append(
+                &RecordBatch::try_new(
+                    table.schema(),
+                    vec![distinct_strings("b", UNDER_THE_FILE_CAP)],
+                )
+                .expect("batch"),
+            )
+            .expect("append");
+        assert_value_counts(&conn, "split", "tag", Answered::ByGroupBy);
+    }
+
+    /// A column in the middle of a type change has files counted in its old type, so the
+    /// grouped count answers, reading every value as the new type.
+    #[test]
+    fn value_counts_of_a_column_mid_type_change_run_the_grouped_count() {
+        let (conn, _dir) = storage_conn();
+        let digits = LargeStringArray::from(vec![Some("1"), Some("x"), Some("1")]);
+        one_column_table(
+            &conn,
+            "codes",
+            Field::new("code", DataType::LargeUtf8, true),
+            Arc::new(digits),
+        );
+        conn.apply_schema(
+            "codes",
+            &SchemaPatch::new(vec![FieldPatch::named("code").with_type(DataType::Int64)]),
+            None,
+        )
+        .expect("retype");
+        assert_value_counts(&conn, "codes", "code", Answered::ByGroupBy);
+    }
+
+    /// The counts follow the table: an append adds its file's counts, and a compaction that
+    /// swaps the files for one leaves the same counts, all from the statistics.
+    #[test]
+    fn value_counts_follow_appends_and_compaction() {
+        let (conn, _dir) = storage_conn();
+        create_cab_types(&conn, "cabs");
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
+        let table = conn.open_table("cabs").expect("open");
+        table
+            .append(&build_title_batch(&["green", "taxi"]))
+            .expect("append");
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
+
+        let files = |table: &Supertable| {
+            table
+                .local_handle()
+                .reader()
+                .expect("reader")
+                .n_superfiles()
+        };
+        let before = files(&table);
+        table
+            .optimize(&OptimizeOptions::compact(CompactionSettings {
+                min_superfiles_for_merge: MERGE_AT_SUPERFILES,
+                ..CompactionSettings::default()
+            }))
+            .expect("optimize");
+        let table = conn.open_table("cabs").expect("reopen");
+        let after = files(&table);
+        assert!(
+            after < before,
+            "the compaction merged the files: {before} -> {after}"
+        );
+        assert_value_counts(&conn, "cabs", "title", Answered::FromStats);
+    }
+
+    /// A table with no rows has no value and no null: no rows, from the statistics.
+    #[test]
+    fn value_counts_of_an_empty_table_are_empty() {
+        let conn = connect("memory://").expect("connect");
+        conn.create_table("empty", schema_id_title(), IndexSpec::new())
+            .expect("create");
+        assert_value_counts(&conn, "empty", "title", Answered::FromStats);
+        let direct = conn
+            .open_table("empty")
+            .expect("open")
+            .value_counts("title")
+            .expect("value counts");
+        assert_eq!(direct.num_rows(), 0);
+    }
+
+    /// A column named `count` is counted like any other, its counts beside it under
+    /// `count(*)`; a column named `count(*)` itself is refused, since its counts would take its
+    /// name.
+    #[test]
+    fn value_counts_keep_a_column_named_count_apart_from_its_counts() {
+        let conn = connect("memory://").expect("connect");
+        one_column_table(
+            &conn,
+            "tallies",
+            Field::new("count", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![7, 7, 9])),
+        );
+        assert_value_counts(&conn, "tallies", "count", Answered::FromStats);
+        let counts = conn
+            .open_table("tallies")
+            .expect("open")
+            .value_counts("count")
+            .expect("value counts");
+        let names: Vec<&str> = counts
+            .schema_ref()
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["count", "count(*)"]);
+
+        one_column_table(
+            &conn,
+            "odd",
+            Field::new("count(*)", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![1])),
+        );
+        assert!(
+            conn.open_table("odd")
+                .expect("open")
+                .value_counts("count(*)")
+                .is_err()
+        );
+    }
+
+    /// After a delete the per-file counts still hold the deleted row, so the grouped count
+    /// answers; an unknown column is an error.
+    #[test]
+    fn value_counts_run_the_grouped_count_over_deletes_and_refuse_unknown_columns() {
         let (conn, _dir) = storage_conn();
         create_cab_types(&conn, "cabs");
         let table = conn.open_table("cabs").expect("open");
         table.delete(col("title").eq(lit("green"))).expect("delete");
-        assert!(table.value_counts("title").expect("value counts").is_none());
+        assert_value_counts(&conn, "cabs", "title", Answered::ByGroupBy);
         assert!(table.value_counts("no_such_column").is_err());
     }
 

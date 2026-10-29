@@ -1189,21 +1189,16 @@ impl Table {
             .map_err(py_err)
     }
 
-    /// `column`'s rows counted per value, read from the table's statistics
-    /// without running a query: a pyarrow `Table` of each value and its
-    /// `count`, with a null value for the rows that hold none. `None` when
-    /// the statistics can't answer exactly; a `GROUP BY` answers then.
-    fn value_counts<'py>(
-        &self,
-        py: Python<'py>,
-        column: &str,
-    ) -> PyResult<Option<Bound<'py, PyAny>>> {
+    /// `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
+    /// GROUP BY column` gives them: a pyarrow `Table` of each value and its
+    /// `count(*)`, with a null value for the rows that hold none. Read from
+    /// the table's statistics when they count every row exactly, without
+    /// running a query; the grouped count runs otherwise.
+    fn value_counts<'py>(&self, py: Python<'py>, column: &str) -> PyResult<Bound<'py, PyAny>> {
         let batch = py
             .detach(|| self.inner.value_counts(column))
             .map_err(py_err)?;
-        batch
-            .map(|b| batches_to_pyarrow_table(py, vec![b]))
-            .transpose()
+        batches_to_pyarrow_table(py, vec![batch])
     }
 
     /// Hybrid BM25 + vector search fused with reciprocal-rank fusion.

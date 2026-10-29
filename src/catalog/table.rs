@@ -68,7 +68,7 @@ pub(crate) trait Table: Send + Sync {
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, InfinoError>;
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError>;
-    fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError>;
+    fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError>;
     fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError>;
     fn vector_search(
         &self,
@@ -174,7 +174,7 @@ impl Table for SupertableHandle {
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
         SupertableHandle::count(self, column, query, mode)
     }
-    fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+    fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
         SupertableHandle::value_counts(self, column)
     }
     fn tokenize(&self, column: &str, text: &str) -> Result<Vec<String>, InfinoError> {
@@ -407,17 +407,19 @@ impl Supertable {
         self.inner.count(column, query, mode)
     }
 
-    /// `column`'s rows grouped by value, read from the table's statistics
-    /// without running a query: one row per distinct value with its count
-    /// (`UInt64`, in a column named `count`), plus a null-keyed row for the
-    /// rows that hold no value. Deleted rows are not counted. Rows come in
-    /// no particular order.
+    /// `column`'s rows grouped by value: the rows of
+    /// `SELECT column, COUNT(*) ... GROUP BY column`, one per distinct value
+    /// with its count (`Int64`, in a column named `count(*)`), plus a
+    /// null-keyed row for the rows that hold no value. Deleted rows are not
+    /// counted. Rows come in no particular order.
     ///
-    /// `Ok(None)` when the statistics can't answer exactly — a file with
-    /// deletes, a column whose distinct values were not recorded, a hosted
-    /// table — and `SELECT column, COUNT(*) ... GROUP BY column` is the
-    /// way to get the counts then. An unknown column is an error.
-    pub fn value_counts(&self, column: &str) -> Result<Option<RecordBatch>, InfinoError> {
+    /// Read from the table's statistics, with no query planned, when they
+    /// count every live row exactly: no file with deletes, at most 256
+    /// distinct values across the table and in each file, and the column not
+    /// in the middle of a type change. A file whose column holds only nulls
+    /// counts as its nulls. Otherwise the grouped count runs. An unknown
+    /// column is an error, as is a column itself named `count(*)`.
+    pub fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
         self.inner.value_counts(column)
     }
 

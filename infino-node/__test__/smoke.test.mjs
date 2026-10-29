@@ -167,7 +167,7 @@ test("valueCounts counts each value from the table's statistics", () => {
   docs.append([{ title: "yellow" }, { title: "green" }, { title: "yellow" }]);
 
   const counts = docs.valueCounts("title");
-  const byValue = Object.fromEntries(counts.map((r) => [r.title, Number(r.count)]));
+  const byValue = Object.fromEntries(counts.map((r) => [r.title, Number(r["count(*)"])]));
   assert.deepEqual(byValue, { yellow: 2, green: 1 });
 });
 

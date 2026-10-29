@@ -95,7 +95,7 @@ const FORMAT_MAJOR_NAMED: &str = "1";
 /// Maximum distinct values retained as an exact per-column frequency table.
 /// Columns crossing the cap carry no table, so high-cardinality data has
 /// bounded manifest cost.
-const MAX_EXACT_VALUE_COUNTS: usize = 256;
+pub(crate) const MAX_EXACT_VALUE_COUNTS: usize = 256;
 
 /// Cells probed per query — exactly one, the grid-nearest. The p=1 read
 /// shape is the design point (one cell fetch, ~fine_nprobe × 2 MiB runs).
@@ -869,6 +869,15 @@ impl ScalarValueCounts {
 
     pub(crate) fn merged_with(&self, other: &Self) -> Option<Self> {
         Self::from_entries(self.entries.iter().chain(&other.entries).cloned().collect())
+    }
+
+    /// The counts of a column that holds no value at all: every row null, or
+    /// no rows. Only a table-wide sum is ever empty; a superfile's own table
+    /// is absent instead.
+    pub(crate) fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     pub(crate) fn entries(&self) -> &[(ScalarValue, u64)] {

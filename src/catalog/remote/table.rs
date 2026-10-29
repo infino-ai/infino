@@ -15,7 +15,13 @@ use std::{sync::Arc, time::Duration};
 
 use arrow_array::{RecordBatch, RecordBatchReader};
 use arrow_schema::SchemaRef;
-use datafusion::{prelude::Expr, sql::unparser::expr_to_sql};
+use datafusion::{
+    common::TableReference,
+    datasource::{empty::EmptyTable, provider_as_source},
+    logical_expr::LogicalPlanBuilder,
+    prelude::Expr,
+    sql::unparser::{expr_to_sql, plan_to_sql},
+};
 use serde_json::{Value, json};
 
 use super::{RemoteCatalog, read_arrow, read_json, wire};
@@ -26,6 +32,7 @@ use crate::{
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
+        query::sql::{conform_value_counts, value_count_exprs, value_count_schema},
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
     },
@@ -67,6 +74,24 @@ fn predicate_to_sql(predicate: &Expr) -> Result<String, InfinoError> {
         .map_err(|e| {
             InfinoError::Query(format!(
                 "cannot express this predicate over the remote transport: {e}"
+            ))
+        })
+}
+
+/// `SELECT column, COUNT(*) FROM table GROUP BY column` over a hosted table,
+/// built as a plan over a table of `schema` and unparsed, so the table's and
+/// the column's names are quoted wherever SQL needs them.
+fn value_count_sql(table: &str, schema: &SchemaRef, column: &str) -> Result<String, InfinoError> {
+    let (group, aggregate) = value_count_exprs(column);
+    let source = provider_as_source(Arc::new(EmptyTable::new(Arc::clone(schema))));
+    LogicalPlanBuilder::scan(TableReference::bare(table), source, None)
+        .and_then(|scan| scan.aggregate(group, aggregate))
+        .and_then(|grouped| grouped.build())
+        .and_then(|plan| plan_to_sql(&plan))
+        .map(|statement| statement.to_string())
+        .map_err(|e| {
+            InfinoError::Query(format!(
+                "cannot express value_counts over the remote transport: {e}"
             ))
         })
 }
@@ -228,10 +253,17 @@ impl Table for RemoteTable {
         read_arrow("exact_match", response)
     }
 
-    /// The wire has no value-count call, and `None` is an answer the
-    /// contract allows: the caller runs its `GROUP BY` instead.
-    fn value_counts(&self, _column: &str) -> Result<Option<RecordBatch>, InfinoError> {
-        Ok(None)
+    /// The wire has no value-count call, so the grouped count it stands for
+    /// travels as SQL ([`value_count_sql`]) and the hosted side answers it.
+    fn value_counts(&self, column: &str) -> Result<RecordBatch, InfinoError> {
+        let field = self
+            .schema
+            .field_with_name(column)
+            .map_err(|_| InfinoError::Query(format!("no column `{column}` to count")))?;
+        let schema = value_count_schema(field)?;
+        let sql = value_count_sql(&self.table_name, &self.schema, column)?;
+        let batches = self.catalog.query_sql(&sql)?;
+        Ok(conform_value_counts(&batches, &schema)?)
     }
 
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {
@@ -391,6 +423,7 @@ mod tests {
     use arrow_array::{RecordBatch, RecordBatchIterator};
     use arrow_schema::{ArrowError, DataType, Field, Schema};
 
+    use super::value_count_sql;
     use crate::{
         InfinoError,
         catalog::{
@@ -398,6 +431,22 @@ mod tests {
             table::Table,
         },
     };
+
+    /// The grouped count a hosted table's `value_counts` sends quotes a
+    /// column whose name SQL would otherwise misread, and names the count as
+    /// the local call does.
+    #[test]
+    fn value_counts_over_remote_quote_the_column() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "My Tag",
+            DataType::Utf8,
+            true,
+        )]));
+        let sql = value_count_sql("docs", &schema, "My Tag").expect("sql");
+        assert!(sql.contains("\"My Tag\""), "{sql}");
+        assert!(sql.contains("GROUP BY"), "{sql}");
+        assert!(sql.contains("\"count(*)\""), "{sql}");
+    }
 
     /// Hydrate over the remote transport is refused as unsupported, before any
     /// request is sent.

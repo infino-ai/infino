@@ -123,6 +123,7 @@ use crate::{
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
+            value_count_carry::ValueCountCarry,
         },
         reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
@@ -257,6 +258,10 @@ pub(crate) struct SupertableProvider {
     /// Exact table-level low-cardinality frequencies, merged lazily per
     /// column from this provider's immutable manifest snapshot.
     scalar_value_counts: Arc<DashMap<String, Option<Arc<ScalarValueCounts>>>>,
+    /// The table's value counts carried across snapshots, which the merge
+    /// above brings to this snapshot. A provider built without the table's
+    /// carries its own, and merges every superfile.
+    value_count_carry: Arc<ValueCountCarry>,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -326,7 +331,15 @@ impl SupertableProvider {
             scan_store: Arc::new(SuperfileObjectStore::new()),
             scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
+            value_count_carry: Arc::default(),
         }
+    }
+
+    /// This provider merging value counts through the table's `carry`, so
+    /// each snapshot adds only the superfiles that changed.
+    pub(crate) fn with_value_count_carry(mut self, carry: Arc<ValueCountCarry>) -> Self {
+        self.value_count_carry = carry;
+        self
     }
 
     /// Clone of this provider restricted to `segments` — used by the
@@ -353,6 +366,7 @@ impl SupertableProvider {
         restricted.scan_store = Arc::clone(&self.scan_store);
         restricted.scan_footers = Arc::clone(&self.scan_footers);
         restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
+        restricted.value_count_carry = Arc::clone(&self.value_count_carry);
         restricted
     }
 
@@ -380,8 +394,10 @@ impl SupertableProvider {
         }
     }
 
-    /// Exact table-wide frequencies for one low-cardinality column. Merged
-    /// once per immutable provider snapshot and cached for later statements.
+    /// Exact table-wide frequencies for one low-cardinality column, empty
+    /// when the column holds no value. Brought to this snapshot once from
+    /// the table's carried sum (see [`ValueCountCarry`]) and cached for later
+    /// statements.
     pub(crate) fn exact_value_counts(&self, column: &str) -> Option<Arc<ScalarValueCounts>> {
         if let Some(cached) = self.scalar_value_counts.get(column) {
             return cached.value().clone();
@@ -390,16 +406,12 @@ impl SupertableProvider {
             .manifest
             .complete_flat_superfiles()
             .and_then(|entries| {
-                let mut merged: Option<ScalarValueCounts> = None;
                 let id = self.manifest.field_id(column)?;
-                for entry in entries {
-                    let counts = entry.scalar_stats.column(id)?.value_counts()?;
-                    merged = Some(match merged {
-                        None => counts,
-                        Some(current) => current.merged_with(&counts)?,
-                    });
-                }
-                merged.map(Arc::new)
+                let stored = self.manifest.stored_schema();
+                let data_type = stored.field_with_name(column).ok()?.data_type();
+                self.value_count_carry
+                    .sum(id, data_type, entries)
+                    .map(Arc::new)
             });
         self.scalar_value_counts
             .insert(column.to_string(), merged.clone());
