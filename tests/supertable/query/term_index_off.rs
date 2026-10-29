@@ -3,7 +3,7 @@
 //! A table that keeps no term index (`SupertableOptions::term_index` off)
 //! writes no index object on any commit or maintenance pass, and a ranked
 //! search answers as the table with the index does, reading nothing from
-//! an index: it routes by the entries' blooms and probes the superfiles.
+//! an index: it probes every superfile.
 #![deny(clippy::unwrap_used)]
 
 use std::path::Path;

@@ -423,11 +423,12 @@ pub struct SupertableOptions {
     /// default, every commit publishes its superfiles' terms into it and
     /// `optimize` rebuilds it over the whole table. Off, nothing is
     /// published or rebuilt, the table carries no index objects beside its
-    /// superfiles, and a query routes by the entries' blooms and probes
-    /// every superfile a term may be in, as a table whose index is absent
-    /// does. Worth turning off only where the index cannot pay for itself:
-    /// a table of one superfile, where there is nothing to route between,
-    /// saves its bytes.
+    /// superfiles, and a query probes every superfile: a table on storage
+    /// keeps no per-superfile term filter (the index replaced it), so with
+    /// the index off nothing prunes a superfile before it is opened. Worth
+    /// turning off only where the index cannot pay for itself: a table of
+    /// one superfile, where there is nothing to route between, saves its
+    /// bytes.
     pub term_index: bool,
     /// Superfiles one scan or search of this table works on at once: a SQL
     /// scan's opens and index predicates, a search's per-superfile opens and
