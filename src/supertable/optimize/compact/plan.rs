@@ -89,7 +89,7 @@ pub(super) fn split_stats_at_drain_watermark(
 }
 
 /// A set of superfiles to merge into one new superfile.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CompactionJob {
     pub partition_key: Vec<u8>,
     pub inputs: Vec<Uuid>,

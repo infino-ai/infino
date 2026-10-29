@@ -1482,6 +1482,10 @@ impl Supertable {
         let concurrency = concurrency.max(1);
         let merge_threads =
             merge_pool_width(maint_pool()?.current_num_threads(), concurrency, jobs.len());
+        let settings = MergeSettings {
+            stale_seal_timeout,
+            merge_threads,
+        };
         // Whether merges here keep per-row bookkeeping, which is part of
         // what each one is charged for until its allocation shows up in
         // the host reading.
@@ -1489,16 +1493,7 @@ impl Supertable {
             let manifest = self.inner().manifest.load();
             !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty()
         };
-        // What each admitted merge is expected to take, by plan index, held
-        // from its admission until its batch commits or it fails, and the
-        // host's free memory before any of them started. Together they say
-        // how much of the reading has yet to materialize.
-        let mut charges: HashMap<usize, u64> = HashMap::new();
-        // Which plan index each merge task carries, so a task that panics,
-        // which hands back no index, still releases its charge.
-        let mut task_indices: HashMap<TaskId, usize> = HashMap::new();
-        let mut committing_indices: Vec<usize> = Vec::new();
-        let mut baseline: Option<u64> = None;
+        let mut charges = MergeCharges::new(indexed);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
         let mut merging: JoinSet<(usize, Result<PreparedJob, CompactionError>)> = JoinSet::new();
         // Finished merges waiting for the next commit.
@@ -1530,7 +1525,7 @@ impl Supertable {
                 // Plan order within the batch, which is as much of it as
                 // committing merges when they finish can preserve.
                 ready.sort_by_key(|(plan_index, _)| *plan_index);
-                committing_indices = ready.iter().map(|(plan_index, _)| *plan_index).collect();
+                charges.batch_started(ready.iter().map(|(plan_index, _)| *plan_index));
                 let batch: Vec<PreparedJob> = mem::take(&mut ready)
                     .into_iter()
                     .map(|(_, prepared)| prepared)
@@ -1547,18 +1542,13 @@ impl Supertable {
                 }
                 // Nothing of this pass is resident, so this reading is what
                 // the merges admitted from here are charged against.
-                baseline = host_memory().map(|(available, _)| available);
-                let (plan_index, job) = queued.pop_front().expect("loop condition");
-                charges.insert(plan_index, expected_merge_footprint(&job, indexed));
-                log_merge_admitted(merging.len(), queued.len(), held_back, &charges);
-                held_back = 0;
-                self.spawn_merge(
+                charges.rebase(host_memory());
+                self.admit_next_merge(
+                    &mut queued,
                     &mut merging,
-                    &mut task_indices,
-                    plan_index,
-                    job,
-                    stale_seal_timeout,
-                    merge_threads,
+                    &mut charges,
+                    &settings,
+                    &mut held_back,
                 );
                 next_admission = time::Instant::now() + MERGE_ADMIT_SETTLE;
                 continue;
@@ -1585,9 +1575,7 @@ impl Supertable {
                 (batch_jobs, commit, refreshed) = &mut committing, if is_committing => {
                     // Committed or dropped, the batch's outputs are no longer
                     // held, so its merges stop being charged.
-                    for plan_index in committing_indices.drain(..) {
-                        charges.remove(&plan_index);
-                    }
+                    charges.batch_done();
                     // Both failures leave by the same door: merges are still
                     // running, and returning here would drop their tasks with
                     // their seals placed and nothing to clear them until they
@@ -1631,23 +1619,11 @@ impl Supertable {
                     // Something is always running here, a merge or a commit,
                     // so this merge always needs the host's room, judged with
                     // the merges admitted but not yet resident charged for.
-                    let charged: u64 = charges.values().sum();
-                    let host_has_room = room_for_another_merge(host_memory(), baseline, charged);
+                    let host_has_room = charges.room(host_memory());
                     if host_has_room
                         && admits_another_merge(holding, concurrency, queued.len(), true)
                     {
-                        let (plan_index, job) = queued.pop_front().expect("guarded above");
-                        charges.insert(plan_index, expected_merge_footprint(&job, indexed));
-                        log_merge_admitted(merging.len(), queued.len(), held_back, &charges);
-                        held_back = 0;
-                        self.spawn_merge(
-                            &mut merging,
-                            &mut task_indices,
-                            plan_index,
-                            job,
-                            stale_seal_timeout,
-                            merge_threads,
-                        );
+                        self.admit_next_merge(&mut queued, &mut merging, &mut charges, &settings, &mut held_back);
                     } else {
                         held_back += 1;
                     }
@@ -1662,7 +1638,7 @@ impl Supertable {
                 continue;
             };
 
-            let joined = settle_merge_charge(joined, &mut task_indices, &mut charges);
+            let joined = charges.settle(joined);
             if collect_merge(joined, &mut ready, &mut first_error, &mut dropped) {
                 failures_in_a_row += 1;
             }
@@ -1670,7 +1646,7 @@ impl Supertable {
             // Polling once never waits, so committing early costs a sibling
             // nothing and merges that land together still batch.
             while let Some(next) = merging.try_join_next_with_id() {
-                let next = settle_merge_charge(next, &mut task_indices, &mut charges);
+                let next = charges.settle(next);
                 if collect_merge(next, &mut ready, &mut first_error, &mut dropped) {
                     failures_in_a_row += 1;
                 }
@@ -1679,10 +1655,7 @@ impl Supertable {
         }
 
         if dropped.jobs > 0 {
-            warn!(
-                dropped_jobs = dropped.jobs,
-                "compaction pass dropped jobs it could not commit"
-            );
+            warn!(dropped_jobs = dropped.jobs, "compaction pass dropped jobs");
         }
         // A pass that stopped admitting on dropped batches must not read as a
         // success.
@@ -1715,17 +1688,38 @@ impl Supertable {
     /// Spawned rather than held in a future this loop polls: the loop handles
     /// one event at a time, and a merge parked in a future polled only by it
     /// would stall while the loop works on something else.
+    /// Admit the job at the head of `queued`: charge it, log the admission
+    /// and start its merge. The caller has decided there is room.
+    fn admit_next_merge(
+        &self,
+        queued: &mut VecDeque<(usize, CompactionJob)>,
+        merging: &mut JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
+        charges: &mut MergeCharges,
+        settings: &MergeSettings,
+        held_back: &mut u64,
+    ) {
+        let (plan_index, job) = queued.pop_front().expect("the caller checked the queue");
+        let task = self.spawn_merge(merging, plan_index, &job, settings);
+        charges.admit(task, plan_index, &job);
+        log_merge_admitted(merging.len(), queued.len(), *held_back, charges.total());
+        *held_back = 0;
+    }
+
+    /// Start `job`'s merge on its own task, handing back the task's id.
     fn spawn_merge(
         &self,
         merging: &mut JoinSet<(usize, Result<PreparedJob, CompactionError>)>,
-        task_indices: &mut HashMap<TaskId, usize>,
         plan_index: usize,
-        job: CompactionJob,
-        stale_seal_timeout: Duration,
-        merge_threads: usize,
-    ) {
+        job: &CompactionJob,
+        settings: &MergeSettings,
+    ) -> TaskId {
         let table = self.clone();
         let pass = Span::current();
+        let job = job.clone();
+        let MergeSettings {
+            stale_seal_timeout,
+            merge_threads,
+        } = *settings;
         let task = merging.spawn(async move {
             // Each merge is a trace of its own, linked back to the pass, so
             // a pass of many merges does not grow into one huge trace.
@@ -1750,7 +1744,7 @@ impl Supertable {
             .instrument(span)
             .await
         });
-        task_indices.insert(task.id(), plan_index);
+        task.id()
     }
 
     /// Put this job's merged bytes in storage, inside its own task.
@@ -1849,38 +1843,135 @@ const INDEXED_MERGE_ROW_BYTES: u64 = 16;
 /// stands in for a merge's allocation between its admission and the
 /// reading that shows it.
 fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
-    let rows = match indexed {
-        true => job.live_docs.saturating_mul(INDEXED_MERGE_ROW_BYTES),
-        false => 0,
+    let rows = if indexed {
+        job.live_docs.saturating_mul(INDEXED_MERGE_ROW_BYTES)
+    } else {
+        0
     };
     job.input_bytes
         .saturating_add(job.estimated_output_bytes)
         .saturating_add(rows)
 }
 
-/// Settle a merge task's charge as it joins: a merge that failed, or a task
-/// that panicked, holds nothing any more, so its charge goes with it. A
-/// panicked task hands back no plan index; its task id finds it. Hands the
-/// outcome on without the task id.
-fn settle_merge_charge(
-    joined: Result<(TaskId, (usize, Result<PreparedJob, CompactionError>)), JoinError>,
-    task_indices: &mut HashMap<TaskId, usize>,
-    charges: &mut HashMap<usize, u64>,
-) -> Result<(usize, Result<PreparedJob, CompactionError>), JoinError> {
-    match joined {
-        Ok((task, (plan_index, outcome))) => {
-            task_indices.remove(&task);
-            if outcome.is_err() {
-                charges.remove(&plan_index);
-            }
-            Ok((plan_index, outcome))
+/// The per-pass settings every merge of a pass runs under.
+#[derive(Clone, Copy)]
+struct MergeSettings {
+    stale_seal_timeout: Duration,
+    merge_threads: usize,
+}
+
+/// What one admitted merge is charged: its expected footprint while it
+/// runs, its output alone once it has finished and waits for its commit.
+struct Charge {
+    held: u64,
+    output: u64,
+}
+
+/// What the merges of a pass are charged against the host while their
+/// allocations have yet to show in its reading.
+///
+/// A merge is charged its expected footprint from admission; its output
+/// alone once it has run, since its inputs are closed and only the staged
+/// output waits for the commit; and nothing once its batch has committed or
+/// it has failed. The charges are judged against the host reading taken
+/// before any of the pass's merges was resident.
+struct MergeCharges {
+    /// Whether merges keep per-row bookkeeping, part of the footprint.
+    indexed: bool,
+    /// By plan index, from admission until the batch commits or the merge
+    /// fails.
+    by_index: HashMap<usize, Charge>,
+    /// Plan index by merge task, so a task that panics, which hands back no
+    /// index, still releases its charge.
+    by_task: HashMap<TaskId, usize>,
+    /// Plan indices of the batch being committed, released when it returns.
+    committing: Vec<usize>,
+    /// The host's free memory before any of the pass's merges was resident.
+    baseline: Option<u64>,
+}
+
+impl MergeCharges {
+    fn new(indexed: bool) -> Self {
+        Self {
+            indexed,
+            by_index: HashMap::new(),
+            by_task: HashMap::new(),
+            committing: Vec::new(),
+            baseline: None,
         }
-        Err(e) => {
-            if let Some(plan_index) = task_indices.remove(&e.id()) {
-                charges.remove(&plan_index);
+    }
+
+    /// Take `reading` as the baseline; nothing of the pass is resident.
+    fn rebase(&mut self, reading: Option<(u64, u64)>) {
+        self.baseline = reading.map(|(available, _)| available);
+    }
+
+    /// Charge the merge of `job`, run by `task`, its expected footprint.
+    fn admit(&mut self, task: TaskId, plan_index: usize, job: &CompactionJob) {
+        let charge = Charge {
+            held: expected_merge_footprint(job, self.indexed),
+            output: job.estimated_output_bytes,
+        };
+        self.by_index.insert(plan_index, charge);
+        self.by_task.insert(task, plan_index);
+    }
+
+    /// Settle a merge task's charge as it joins. A merge that ran holds
+    /// its output from here; one that failed, or a task that panicked,
+    /// holds nothing any more, so its charge goes with it. A panicked task
+    /// hands back no plan index; its task id finds it. Hands the outcome on
+    /// without the task id.
+    fn settle(
+        &mut self,
+        joined: Result<(TaskId, (usize, Result<PreparedJob, CompactionError>)), JoinError>,
+    ) -> Result<(usize, Result<PreparedJob, CompactionError>), JoinError> {
+        match joined {
+            Ok((task, (plan_index, outcome))) => {
+                self.by_task.remove(&task);
+                match &outcome {
+                    Ok(_) => {
+                        if let Some(charge) = self.by_index.get_mut(&plan_index) {
+                            charge.held = charge.output;
+                        }
+                    }
+                    Err(_) => {
+                        self.by_index.remove(&plan_index);
+                    }
+                }
+                Ok((plan_index, outcome))
             }
-            Err(e)
+            Err(e) => {
+                if let Some(plan_index) = self.by_task.remove(&e.id()) {
+                    self.by_index.remove(&plan_index);
+                }
+                Err(e)
+            }
         }
+    }
+
+    /// The batch of `plan_indices` is committing; their charges clear when
+    /// it returns.
+    fn batch_started(&mut self, plan_indices: impl Iterator<Item = usize>) {
+        self.committing = plan_indices.collect();
+    }
+
+    /// The batch returned, committed or dropped: its outputs are no longer
+    /// held.
+    fn batch_done(&mut self) {
+        for plan_index in self.committing.drain(..) {
+            self.by_index.remove(&plan_index);
+        }
+    }
+
+    /// Bytes charged across the merges in flight.
+    fn total(&self) -> u64 {
+        self.by_index.values().map(|c| c.held).sum()
+    }
+
+    /// Whether the host, reading `reading`, has room for one more merge
+    /// beside what is charged.
+    fn room(&self, reading: Option<(u64, u64)>) -> bool {
+        room_with_charges(reading, self.baseline, self.total())
     }
 }
 
@@ -1897,11 +1988,7 @@ fn settle_merge_charge(
 /// smaller of the two is what the host can still be assumed to have: the
 /// model governs while allocations are in flight, the reading once they
 /// have shown up or if they grew past the charge.
-fn room_for_another_merge(
-    reading: Option<(u64, u64)>,
-    baseline: Option<u64>,
-    charged: u64,
-) -> bool {
+fn room_with_charges(reading: Option<(u64, u64)>, baseline: Option<u64>, charged: u64) -> bool {
     let Some((available, total)) = reading else {
         return has_room_for_another_merge(None, None);
     };
@@ -1911,17 +1998,12 @@ fn room_for_another_merge(
 
 /// Log a merge being admitted, with how many admission checks the host
 /// refused before it and what the merges in flight are charged.
-fn log_merge_admitted(
-    in_flight: usize,
-    queued: usize,
-    held_back: u64,
-    charges: &HashMap<usize, u64>,
-) {
+fn log_merge_admitted(in_flight: usize, queued: usize, held_back: u64, charged: u64) {
     debug!(
         in_flight,
         queued,
         held_back,
-        charged_mb = charges.values().sum::<u64>() / MIB,
+        charged_mb = charged / MIB,
         mem_available_mb = available_memory_bytes().map(|b| b / MIB),
         "compaction merge admitted"
     );
@@ -3067,10 +3149,7 @@ mod tests {
         let job = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![bogus],
-            estimated_output_bytes: 0,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -3146,9 +3225,7 @@ mod tests {
             partition_key: entry_a.partition_key.clone(),
             inputs: vec![entry_a.superfile_id, entry_b.superfile_id],
             estimated_output_bytes: 1,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
         let err = st
             .run_compaction_job(job, DEFAULT_STALE_SEAL_TIMEOUT)
@@ -4884,10 +4961,7 @@ mod tests {
         let job = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![superfiles[0].superfile_id, superfiles[2].superfile_id],
-            estimated_output_bytes: 0,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
         let before = part_objects(&dir);
         let peer_handle = peer.clone();
@@ -4955,10 +5029,7 @@ mod tests {
                 .iter()
                 .map(|e| e.superfile_id)
                 .collect(),
-            estimated_output_bytes: 0,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
         faults.fail_with(
             FaultKind::Precondition,
@@ -6846,8 +6917,9 @@ mod tests {
     const GIB: u64 = 1024 * 1024 * 1024;
     /// Bytes of the synthetic host the charge tests run against.
     const CHARGED_HOST_BYTES: u64 = 100 * GIB;
-    /// What each merge in the charge tests is expected to take: three of
-    /// them bring the modeled headroom under the 40% reserve.
+    /// What each merge in the charge tests is charged, as the output it
+    /// holds until its commit: three of them bring the modeled headroom
+    /// under the 40% reserve.
     const CHARGED_MERGE_BYTES: u64 = 30 * GIB;
 
     /// Between a merge's admission and the reading that shows its
@@ -6857,13 +6929,13 @@ mod tests {
     fn room_charges_what_has_not_landed() {
         let idle = Some((CHARGED_HOST_BYTES, CHARGED_HOST_BYTES));
         let baseline = Some(CHARGED_HOST_BYTES);
-        assert!(room_for_another_merge(idle, baseline, 0), "nothing charged");
+        assert!(room_with_charges(idle, baseline, 0), "nothing charged");
         assert!(
-            room_for_another_merge(idle, baseline, 2 * CHARGED_MERGE_BYTES),
+            room_with_charges(idle, baseline, 2 * CHARGED_MERGE_BYTES),
             "two charged leave the modeled headroom at the reserve"
         );
         assert!(
-            !room_for_another_merge(idle, baseline, 3 * CHARGED_MERGE_BYTES),
+            !room_with_charges(idle, baseline, 3 * CHARGED_MERGE_BYTES),
             "three charged leave too little, however idle the reading"
         );
         let landed = Some((
@@ -6871,20 +6943,20 @@ mod tests {
             CHARGED_HOST_BYTES,
         ));
         assert!(
-            room_for_another_merge(landed, baseline, 2 * CHARGED_MERGE_BYTES),
+            room_with_charges(landed, baseline, 2 * CHARGED_MERGE_BYTES),
             "charges that landed are not counted twice"
         );
         let grown = Some((CHARGED_HOST_BYTES / 10, CHARGED_HOST_BYTES));
         assert!(
-            !room_for_another_merge(grown, baseline, CHARGED_MERGE_BYTES),
+            !room_with_charges(grown, baseline, CHARGED_MERGE_BYTES),
             "allocations past their charge are what the reading says"
         );
         assert!(
-            !room_for_another_merge(idle, None, 3 * CHARGED_MERGE_BYTES),
+            !room_with_charges(idle, None, 3 * CHARGED_MERGE_BYTES),
             "with no baseline yet the reading stands in for it"
         );
         assert!(
-            room_for_another_merge(None, baseline, u64::MAX),
+            room_with_charges(None, baseline, u64::MAX),
             "an unreadable host never throttles"
         );
     }
@@ -7110,18 +7182,12 @@ mod tests {
         let doomed = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![Uuid::new_v4(), live[0]],
-            estimated_output_bytes: 0,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
         let good = CompactionJob {
             partition_key: Vec::new(),
             inputs: vec![live[1], live[2]],
-            estimated_output_bytes: 0,
-            input_bytes: 0,
-            live_docs: 0,
-            merge_input_mb: None,
+            ..CompactionJob::default()
         };
 
         let err = st
@@ -7198,10 +7264,7 @@ mod tests {
             .map(|pair| CompactionJob {
                 partition_key: Vec::new(),
                 inputs: pair.to_vec(),
-                estimated_output_bytes: 0,
-                input_bytes: 0,
-                live_docs: 0,
-                merge_input_mb: None,
+                ..CompactionJob::default()
             })
             .collect()
     }
@@ -7636,7 +7699,9 @@ mod tests {
 
     /// A host reading that never moves says every merge is still free to
     /// start; the charges say otherwise, and hold the last one back until a
-    /// charge clears with its commit.
+    /// charge clears with its commit. The merges finish at once and wait on
+    /// the held commit, so what holds the last one back is the output each
+    /// finished merge is still charged, not its inputs.
     #[tokio::test(flavor = "multi_thread")]
     async fn charges_hold_admission_while_allocations_have_not_landed() {
         let dir = TempDir::new().expect("tempdir");
@@ -7646,7 +7711,7 @@ mod tests {
             .expect("create supertable");
         let mut jobs = pair_jobs(&st, CHARGED_JOBS);
         for job in &mut jobs {
-            job.input_bytes = CHARGED_MERGE_BYTES;
+            job.estimated_output_bytes = CHARGED_MERGE_BYTES;
         }
         storage.hold.store(true, Ordering::SeqCst);
         let check = async {
@@ -7844,10 +7909,7 @@ mod tests {
                     CompactionJob {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
-                        estimated_output_bytes: 0,
-                        input_bytes: 0,
-                        live_docs: 0,
-                        merge_input_mb: None,
+                        ..CompactionJob::default()
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -7929,10 +7991,7 @@ mod tests {
                 CompactionJob {
                     partition_key: Vec::new(),
                     inputs: live.to_vec(),
-                    estimated_output_bytes: 0,
-                    input_bytes: 0,
-                    live_docs: 0,
-                    merge_input_mb: None,
+                    ..CompactionJob::default()
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -7971,10 +8030,7 @@ mod tests {
                     CompactionJob {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
-                        estimated_output_bytes: 0,
-                        input_bytes: 0,
-                        live_docs: 0,
-                        merge_input_mb: None,
+                        ..CompactionJob::default()
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8116,10 +8172,7 @@ mod tests {
                 CompactionJob {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
-                    estimated_output_bytes: 0,
-                    input_bytes: 0,
-                    live_docs: 0,
-                    merge_input_mb: None,
+                    ..CompactionJob::default()
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8581,10 +8634,7 @@ mod tests {
                 CompactionJob {
                     partition_key: Vec::new(),
                     inputs: live.clone(),
-                    estimated_output_bytes: 0,
-                    input_bytes: 0,
-                    live_docs: 0,
-                    merge_input_mb: None,
+                    ..CompactionJob::default()
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8670,10 +8720,7 @@ mod tests {
                     CompactionJob {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
-                        estimated_output_bytes: 0,
-                        input_bytes: 0,
-                        live_docs: 0,
-                        merge_input_mb: None,
+                        ..CompactionJob::default()
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8743,18 +8790,12 @@ mod tests {
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
-                estimated_output_bytes: 0,
-                input_bytes: 0,
-                live_docs: 0,
-                merge_input_mb: None,
+                ..CompactionJob::default()
             },
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[2], live[3]],
-                estimated_output_bytes: 0,
-                input_bytes: 0,
-                live_docs: 0,
-                merge_input_mb: None,
+                ..CompactionJob::default()
             },
         ];
         st.run_compaction_jobs(jobs, DEFAULT_STALE_SEAL_TIMEOUT, 2)
@@ -8805,10 +8846,7 @@ mod tests {
                     CompactionJob {
                         partition_key: Vec::new(),
                         inputs: pair.to_vec(),
-                        estimated_output_bytes: 0,
-                        input_bytes: 0,
-                        live_docs: 0,
-                        merge_input_mb: None,
+                        ..CompactionJob::default()
                     },
                     DEFAULT_STALE_SEAL_TIMEOUT,
                 )
@@ -8872,10 +8910,7 @@ mod tests {
                 CompactionJob {
                     partition_key: Vec::new(),
                     inputs: vec![live[0], live[1]],
-                    estimated_output_bytes: 0,
-                    input_bytes: 0,
-                    live_docs: 0,
-                    merge_input_mb: None,
+                    ..CompactionJob::default()
                 },
                 DEFAULT_STALE_SEAL_TIMEOUT,
             )
@@ -8890,10 +8925,7 @@ mod tests {
             CompactionJob {
                 partition_key: Vec::new(),
                 inputs: vec![live[0], live[1]],
-                estimated_output_bytes: 0,
-                input_bytes: 0,
-                live_docs: 0,
-                merge_input_mb: None,
+                ..CompactionJob::default()
             },
             Duration::ZERO,
         )
