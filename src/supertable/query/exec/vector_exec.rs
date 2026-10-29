@@ -219,9 +219,14 @@ impl TableProvider for VectorSearchTable {
     /// kNN until `k` survive (`fill_top_k`). When that widening ends short
     /// at a ceiling below the table's size, it evaluates the predicate over
     /// the scope's rows (`exact_scope`) and runs one filtered search within
-    /// exactly the rows it keeps, so matching rows are found however many
-    /// nearer rows the predicate rejects. A predicate it cannot evaluate
-    /// before ranking (one on `score`) keeps what the widening found.
+    /// exactly the rows it keeps, so the rows the predicate rejects no
+    /// longer use up the search. That search is still approximate: the
+    /// filtered kernel probes a bounded number of clusters (raised for a
+    /// rare filter) and sub-clusters per cell, so a matching row in a
+    /// cluster it never reaches is missed. Its recall is the filtered
+    /// kernel's, the same as a bounded plan's. A predicate it cannot
+    /// evaluate before ranking (one on `score`) keeps what the widening
+    /// found.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -376,7 +381,9 @@ impl ExecutionPlan for VectorSearchExec {
             // the widening ends short at a ceiling below the table's size,
             // the function evaluates the predicate over the scope's rows
             // itself and searches within exactly those (`exact_scope`), so
-            // a superset bound or a scalar predicate never leaves it short.
+            // nearer rows a superset bound or a scalar predicate rejects no
+            // longer use up the search. What the filtered search then misses
+            // is what its cluster probes don't reach.
             let plan = candidate_plan_for_filters(reader.manifest(), &filters);
             let search = |want: usize| {
                 let reader = &reader;
@@ -611,9 +618,11 @@ mod tests {
     use arrow_schema::{Field, Schema};
     use datafusion::prelude::{col, lit};
     use rayon::ThreadPoolBuilder;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
@@ -714,8 +723,17 @@ mod tests {
     /// vector `[1, i, 0, …]`, so distance to the query `[1, 0, …]` ranks by
     /// index (see [`supertable_for_pushdown`]). Requires `dim >= 2`.
     fn supertable_ranked_by_index(dim: usize, titles: &[String]) -> Supertable {
+        supertable_ranked_by_index_with(options_one_superfile_per_commit(dim), dim, titles)
+    }
+
+    /// [`supertable_ranked_by_index`] created with `options`.
+    fn supertable_ranked_by_index_with(
+        options: SupertableOptions,
+        dim: usize,
+        titles: &[String],
+    ) -> Supertable {
         let n = titles.len();
-        let st = Supertable::create(options_one_superfile_per_commit(dim)).expect("create");
+        let st = Supertable::create(options).expect("create");
         let mut w = st.writer().expect("writer");
         let schema = st.options().schema.clone();
         let titles = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1039,6 +1057,14 @@ mod tests {
     /// [`N_NEAR_PAST_THE_CEILING`] rows the predicate rejects.
     const N_FAR_PAST_THE_CEILING: usize = 5;
 
+    /// Matching rows past the rejected ones in the common-match test: three
+    /// of every four rows, so the filter's selectivity raises the filtered
+    /// search's cluster probes only twofold.
+    const N_MANY_FAR: usize = 30_000;
+
+    /// Vector width of the past-the-ceiling tests: the engine's smallest.
+    const PAST_THE_CEILING_DIM: usize = 16;
+
     /// A predicate no index bounds, whose rows all sit past the widening's
     /// ceiling: the function still finds them, because a short first round
     /// makes it evaluate the predicate over the scope's rows and search
@@ -1046,8 +1072,40 @@ mod tests {
     /// fewer do, and an aggregate counts all of them.
     #[test]
     fn vector_search_tvf_where_unbounded_predicate_reaches_rows_past_the_fill_ceiling() {
-        let dim = 16;
-        let titles: Vec<String> = (0..N_NEAR_PAST_THE_CEILING + N_FAR_PAST_THE_CEILING)
+        let titles = common_then_rare(N_NEAR_PAST_THE_CEILING);
+        let st = supertable_ranked_by_index(PAST_THE_CEILING_DIM, &titles);
+        assert_finds_the_rare_rows(&st);
+    }
+
+    /// The same search on a table whose rows have been moved into the hidden
+    /// vector index: the filtered search over the exact pass's rows routes
+    /// drained rows to the index's cells, and still finds the rare rows.
+    #[test]
+    fn vector_search_tvf_where_reaches_rows_past_the_fill_ceiling_in_the_vector_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let titles = common_then_rare(N_NEAR_PAST_THE_CEILING);
+        let options = options_one_superfile_per_commit(PAST_THE_CEILING_DIM).with_storage(storage);
+        let st = supertable_ranked_by_index_with(options, PAST_THE_CEILING_DIM, &titles);
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let hidden = st.vector_index_table().expect("hidden index");
+        assert_eq!(
+            hidden.reader().expect("hidden reader").n_docs_total(),
+            titles.len() as u64,
+            "every row is in the vector index"
+        );
+        assert_finds_the_rare_rows(&st);
+    }
+
+    /// A table whose rows are not in the vector index yet, where most rows
+    /// match but every one sits past the rejected rows nearest the query:
+    /// the widening finds none, and the filter keeps so many rows that the
+    /// filtered search raises its cluster probes little. The nearest
+    /// matching rows must still come back.
+    #[test]
+    fn vector_search_tvf_where_reaches_a_common_match_past_the_fill_ceiling() {
+        let titles: Vec<String> = (0..N_NEAR_PAST_THE_CEILING + N_MANY_FAR)
             .map(|i| {
                 if i < N_NEAR_PAST_THE_CEILING {
                     "common"
@@ -1057,8 +1115,48 @@ mod tests {
                 .to_owned()
             })
             .collect();
-        let st = supertable_ranked_by_index(dim, &titles);
-        let q = csv_one_hot(dim, 0);
+        let st = supertable_ranked_by_index(PAST_THE_CEILING_DIM, &titles);
+        let reader = st.reader().expect("reader");
+        let q = csv_one_hot(PAST_THE_CEILING_DIM, 0);
+        let k = 10;
+        let rows = reader
+            .query_sql(&format!(
+                "SELECT title, _id FROM vector_search('emb', '{q}', {k}) WHERE title <> 'common'"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(titles_of(&rows), vec!["rare"; k]);
+        // Distance grows with the row's place, and ids follow it: the k
+        // nearest matching rows are the k first.
+        let nearest = reader
+            .query_sql(&format!(
+                "SELECT _id FROM supertable WHERE title <> 'common' ORDER BY _id LIMIT {k}"
+            ))
+            .expect("nearest by place");
+        let ids = |batches: &[RecordBatch]| -> Vec<i128> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let ids = col_id(b, "_id");
+                    (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        assert_eq!(ids(&rows), ids(&nearest), "the k nearest matching rows");
+    }
+
+    /// `n_common` titles `"common"`, then [`N_FAR_PAST_THE_CEILING`] `"rare"`.
+    fn common_then_rare(n_common: usize) -> Vec<String> {
+        (0..n_common + N_FAR_PAST_THE_CEILING)
+            .map(|i| if i < n_common { "common" } else { "rare" }.to_owned())
+            .collect()
+    }
+
+    /// Over a [`common_then_rare`] table ranked by index, `WHERE title <>
+    /// 'common'` finds the rare rows however many common rows sit nearer:
+    /// the `k` nearest when `k` match, all of them and no more when fewer
+    /// do, and an aggregate counts every one.
+    fn assert_finds_the_rare_rows(st: &Supertable) {
+        let q = csv_one_hot(PAST_THE_CEILING_DIM, 0);
         let query = |k: usize, select: &str| {
             st.reader()
                 .expect("reader")

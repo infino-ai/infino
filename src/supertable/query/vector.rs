@@ -6744,9 +6744,13 @@ impl SupertableReader {
     /// the rows its `WHERE` keeps
     /// ([`exact_scope`](crate::supertable::query::exec::common::exact_scope)).
     /// The allow-sets go to the same filtered kernel a bounded plan's do,
-    /// so the search ranks distance among those rows alone, however far
-    /// from the query they sit. A scope that bounds no row is a caller
-    /// bug: it would search the whole table as if filtered.
+    /// so the search ranks distance among those rows alone and no row
+    /// outside them uses up its probes. It reaches what that kernel
+    /// reaches: a bounded number of clusters for rows not yet in the vector
+    /// index (raised for a rare filter) and of sub-clusters per cell for
+    /// rows in it, so a matching row in a cluster it never probes is
+    /// missed. A scope that bounds no row is a caller bug: it would search
+    /// the whole table as if filtered.
     pub(crate) async fn vector_hits_within_scope(
         &self,
         column: &str,
