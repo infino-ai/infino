@@ -3,8 +3,8 @@
 
 //! Where a `WHERE` runs: as a Parquet row filter in a scan under
 //! `ORDER BY ... LIMIT`, in a `FilterExec` above the scan everywhere else. A
-//! filtered scan under a plain `LIMIT` reads each file whole, one partition to
-//! a file, so separate files still read in parallel.
+//! filtered scan under a plain `LIMIT` is gathered in stages: its first
+//! partition alone, then the rest side by side if that falls short.
 //!
 //! `EXPLAIN ANALYZE` tells which. A row filter counts the rows it checks in
 //! `pushdown_rows_matched` and `pushdown_rows_pruned`; without one both are 0.
@@ -35,12 +35,11 @@ const PAD: &str =
     "--------------------------------------------------------------------------------";
 /// The metrics `EXPLAIN ANALYZE` prints for rows a row filter kept and dropped.
 const ROW_FILTER_METRICS: [&str; 2] = ["pushdown_rows_matched=", "pushdown_rows_pruned="];
-/// How `EXPLAIN` shows a scan that reads each file whole for a plain `LIMIT`.
-const FILES_WHOLE: &str = "MeteredExec: files whole";
-/// How `EXPLAIN` shows the fixture's two superfiles each read by a partition of
-/// its own, side by side.
-const A_GROUP_PER_SUPERFILE: &str = "file_groups={2 groups";
-/// The largest `LIMIT` the rule handles.
+/// How `EXPLAIN` shows a plain `LIMIT`'s gather run in stages.
+const STAGED: &str = "StagedCoalesceExec: fetch=";
+/// How `EXPLAIN` shows the gate that holds a staged scan's partitions 1.. back.
+const GATE: &str = "ScanGateExec";
+/// The largest `LIMIT` whose gather runs in stages.
 const MAX_FETCH: usize = 10_000;
 
 fn schema() -> SchemaRef {
@@ -115,9 +114,7 @@ fn n_values(batches: &[RecordBatch]) -> Vec<i64> {
 /// The `n` an `ORDER BY n LIMIT FETCH` over rows whose `s` has `DIGIT` returns,
 /// skipping `deleted`.
 fn expected(descending: bool, deleted: &[i64]) -> Vec<i64> {
-    let mut n: Vec<i64> = (0..2 * ROWS_PER_APPEND)
-        .filter(|v| format!("r{v}").contains(DIGIT) && !deleted.contains(v))
-        .collect();
+    let mut n = matching(deleted);
     if descending {
         n.reverse();
     }
@@ -393,54 +390,45 @@ fn assert_fetch_of(db: &Connection, sql: &str, all: &[i64]) {
 }
 
 #[test]
-fn a_plain_limit_reads_each_file_of_its_filtered_scan_whole() {
+fn a_plain_limit_gathers_its_filtered_scan_in_stages() {
     // `WHERE s LIKE '%7%' LIMIT 5`, no `ORDER BY`, and the same with an offset.
-    //  - each superfile is read whole by a partition of its own, so the first
-    //    rows to pass end it, and the two superfiles still read side by side.
+    //  - the gather runs the scan's first partition alone, then the rest side
+    //    by side only if that falls short; no exchange sits next to the scan.
     //  - the `WHERE` stays in a `FilterExec`; no row filter.
     // This test pins the plan shape and that every row returned matches.
     let (_dir, db, _table) = fixture();
     let all = matching(&[]);
-    for offset in ["", " OFFSET 3"] {
+    for (offset, fetch) in [("", FETCH), (" OFFSET 3", FETCH + 3)] {
         let sql = format!("SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {FETCH}{offset}");
         assert_fetch_of(&db, &sql, &all);
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
         let plan = explain(&db, "", &sql);
+        assert!(plan.contains(&format!("{STAGED}{fetch}")), "{plan}");
         assert!(plan.contains("FilterExec"), "{plan}");
-        assert!(plan.contains(FILES_WHOLE), "{plan}");
-        assert!(plan.contains(A_GROUP_PER_SUPERFILE), "{plan}");
-        // No exchange next to the scan: none below its meter, and the node
-        // right above it is the filter.
-        let (above, below) = plan
-            .split_once(FILES_WHOLE)
-            .expect("a scan reading its files whole");
+        let below = plan.split_once(STAGED).expect("a staged gather").1;
+        assert!(below.contains(GATE), "{plan}");
         assert!(!below.contains("RepartitionExec"), "{plan}");
-        let parent = above.lines().rev().find(|line| !line.trim().is_empty());
-        assert!(
-            parent.is_some_and(|line| line.contains("FilterExec")),
-            "{plan}"
-        );
     }
 }
 
 #[test]
-fn an_index_answered_where_under_a_plain_limit_reads_each_file_whole() {
+fn an_index_answered_where_under_a_plain_limit_is_gathered_in_stages() {
     // `s ILIKE '%7%' LIMIT 5` on a full-text column.
     //  - the index picks the rows, so there is no `FilterExec`, and the scan
-    //    still takes no fetch: it reads each file whole all the same.
+    //    still takes no fetch: its gather runs in stages all the same.
     // This test pins the rows and the plan shape.
     let (_dir, db, _table) = fixture_with(IndexSpec::new().fts("s"));
     let sql = format!("SELECT n, s FROM t WHERE s ILIKE '%{DIGIT}%' LIMIT {FETCH}");
     assert_fetch_of(&db, &sql, &matching(&[]));
     let plan = explain(&db, "", &sql);
-    assert!(plan.contains(FILES_WHOLE), "{plan}");
-    assert!(plan.contains(A_GROUP_PER_SUPERFILE), "{plan}");
+    assert!(plan.contains(STAGED) && plan.contains(GATE), "{plan}");
 }
 
 #[test]
 fn deleted_rows_stay_out_under_a_plain_limit() {
     // Delete matching rows, then `WHERE s LIKE '%7%' LIMIT <every match>`.
-    //  - the scan skips deleted rows; each file is read whole, in order.
+    //  - the first partition falls short, so every partition is read; the
+    //    scan skips deleted rows in each.
     // This test pins that every live match comes back and no deleted one does.
     let (_dir, db, table) = fixture();
     let deleted: Vec<i64> = matching(&[]).into_iter().step_by(3).collect();
@@ -450,7 +438,7 @@ fn deleted_rows_stay_out_under_a_plain_limit() {
     let want = matching(&deleted);
     assert!(
         want.len() <= MAX_FETCH,
-        "the limit must stay under the rule's"
+        "the limit must stay under the staged gather's"
     );
     let sql = format!(
         "SELECT n, s FROM t WHERE s LIKE '%{DIGIT}%' LIMIT {}",
@@ -459,14 +447,14 @@ fn deleted_rows_stay_out_under_a_plain_limit() {
     let mut got = n_values(&db.query_sql(&sql).expect("sql"));
     got.sort_unstable();
     assert_eq!(got, want);
-    assert!(explain(&db, "", &sql).contains(FILES_WHOLE), "{sql}");
+    assert!(explain(&db, "", &sql).contains(STAGED), "{sql}");
 }
 
 #[test]
-fn a_plain_limit_is_left_alone_without_a_where_or_past_the_largest_limit() {
+fn a_plain_limit_is_gathered_at_once_without_a_where_or_past_the_largest_limit() {
     // `SELECT n, s LIMIT 5` has no `WHERE`: its fetch already reaches the scan.
-    // `WHERE ... LIMIT 10001` is one past the largest limit the rule handles.
-    // This test pins the row counts and that neither scan is kept whole.
+    // `WHERE ... LIMIT 10001` is one past the largest staged limit.
+    // This test pins the row counts and that neither gather runs in stages.
     let (_dir, db, _table) = fixture();
     for (sql, rows) in [
         (format!("SELECT n, s FROM t LIMIT {FETCH}"), FETCH),
@@ -484,7 +472,7 @@ fn a_plain_limit_is_left_alone_without_a_where_or_past_the_largest_limit() {
             "{sql}"
         );
         assert!(!row_filter_ran(&db, &sql), "row filter ran for: {sql}");
-        assert!(!explain(&db, "", &sql).contains(FILES_WHOLE), "{sql}");
+        assert!(!explain(&db, "", &sql).contains(STAGED), "{sql}");
     }
 }
 

@@ -75,7 +75,7 @@ use crate::{
 };
 
 /// Wraps `input`, metering every partition's poll time into `op_stats`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct MeteredExec {
     input: Arc<dyn ExecutionPlan>,
     op_stats: Option<Arc<OpStatsCollector>>,
@@ -90,11 +90,6 @@ pub(crate) struct MeteredExec {
     /// provider wraps around a scan that carries filters — see
     /// [`Self::without_limit_pushdown`].
     limit_pushdown: bool,
-    /// Whether each file of the scan below is read whole by one partition, its
-    /// byte ranges in order, rather than its ranges spread across partitions.
-    /// Set for a scan a small `LIMIT` stops early; see
-    /// [`Self::with_files_whole`].
-    files_whole: bool,
 }
 
 impl MeteredExec {
@@ -112,7 +107,6 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: true,
-            files_whole: false,
         }
     }
 
@@ -137,22 +131,7 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: false,
-            files_whole: false,
         }
-    }
-
-    /// This meter, reading each file of its scan whole: one partition reads a
-    /// file's byte ranges in order, and separate files keep their own
-    /// partitions. For a scan under a small `LIMIT`, where the first rows to
-    /// pass end the query and the batches a file's other ranges decode at the
-    /// same time are thrown away. `EnforceDistribution` splits a file without
-    /// asking the node above it, so `UnsplitLimitScans` joins its ranges back
-    /// after it.
-    pub(crate) fn with_files_whole(&self) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self {
-            files_whole: true,
-            ..self.clone()
-        })
     }
 
     /// This meter with the footers of the table scan it wraps.
@@ -165,12 +144,6 @@ impl MeteredExec {
     pub(crate) fn with_read_ahead(mut self, read_ahead: Arc<ScanReadAhead>) -> Self {
         self.read_ahead = Some(read_ahead);
         self
-    }
-
-    /// Whether each file of the scan this meter wraps is read whole; see
-    /// [`Self::with_files_whole`].
-    pub(crate) fn reads_files_whole(&self) -> bool {
-        self.files_whole
     }
 
     /// Read-ahead for the table scan this meter wraps, if any.
@@ -190,20 +163,19 @@ impl MeteredExec {
 
     /// A meter over `input` with this node's collector and limit policy.
     fn rewrap(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(Self {
+        Arc::new(MeteredExec {
             input,
-            ..self.clone()
+            op_stats: self.op_stats.clone(),
+            footers: self.footers.clone(),
+            read_ahead: self.read_ahead.clone(),
+            limit_pushdown: self.limit_pushdown,
         })
     }
 }
 
 impl DisplayAs for MeteredExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MeteredExec")?;
-        if self.files_whole {
-            write!(f, ": files whole")?;
-        }
-        Ok(())
+        write!(f, "MeteredExec")
     }
 }
 
