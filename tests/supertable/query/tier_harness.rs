@@ -100,6 +100,9 @@ pub struct Build {
     pub gate: bool,
     /// Whether every third document's body is null.
     pub nulls: bool,
+    /// Whether the table keeps no term index at all (`tiers`, `depth` and
+    /// `budget` then have nothing to shape).
+    pub without_index: bool,
 }
 
 /// The options a test table is created and reopened with.
@@ -124,6 +127,9 @@ pub fn options_for(dir: &TempDir, build: Build) -> SupertableOptions {
     }
     if let Some(depth) = build.depth {
         options = options.with_term_head_depth(depth);
+    }
+    if build.without_index {
+        options = options.with_term_index(false);
     }
     options
 }

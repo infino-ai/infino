@@ -417,6 +417,18 @@ pub struct SupertableOptions {
     /// runs for every query the tiers can serve (what a test of the merge
     /// wants).
     pub tier_merge_gate: bool,
+    /// Whether the table keeps a term index (see `manifest::term_index`):
+    /// per `(column, term)`, the superfiles that hold it, its score ceiling
+    /// in each and where its postings sit, with the tiers above. On, the
+    /// default, every commit publishes its superfiles' terms into it and
+    /// `optimize` rebuilds it over the whole table. Off, nothing is
+    /// published or rebuilt, the table carries no index objects beside its
+    /// superfiles, and a query routes by the entries' blooms and probes
+    /// every superfile a term may be in, as a table whose index is absent
+    /// does. Worth turning off only where the index cannot pay for itself:
+    /// a table of one superfile, where there is nothing to route between,
+    /// saves its bytes.
+    pub term_index: bool,
     /// Superfiles one scan or search of this table works on at once: a SQL
     /// scan's opens and index predicates, a search's per-superfile opens and
     /// kernels (a ranged search that splits a superfile counts each part),
@@ -841,6 +853,7 @@ impl SupertableOptions {
             term_tier_entries_per_term: None,
             term_head_depth: None,
             tier_merge_gate: true,
+            term_index: true,
             superfiles_in_flight: DEFAULT_SUPERFILES_IN_FLIGHT,
             memory_budget_bytes: None,
             // Placeholder: standalone options (tests, direct callers) get an unshared measure-only budget.
@@ -1018,6 +1031,20 @@ impl SupertableOptions {
     pub fn with_term_head_depth(mut self, depth: usize) -> Self {
         self.term_head_depth = Some(depth);
         self
+    }
+
+    /// Whether the table keeps a term index (see [`Self::term_index`]).
+    pub fn with_term_index(mut self, keep: bool) -> Self {
+        self.term_index = keep;
+        self
+    }
+
+    /// Whether commits publish into a term index and maintenance rebuilds
+    /// one: the option is on and storage is attached, since the index lives
+    /// beside the superfiles on storage. A table with no text column has no
+    /// terms to index; its callers check that themselves.
+    pub(crate) fn keeps_term_index(&self) -> bool {
+        self.term_index && self.storage.is_some()
     }
 
     /// What the term-index build takes from these options.
