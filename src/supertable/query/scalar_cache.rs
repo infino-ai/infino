@@ -9,7 +9,10 @@
 //! fetches while keeping memory independent of table size. The SQL scan's
 //! decoded columns ([`super::column_cache`]) are held the same way.
 
-use std::{hash::Hash, sync::Arc, sync::Mutex};
+use std::{
+    hash::Hash,
+    sync::{Arc, Mutex},
+};
 
 use arrow_array::RecordBatch;
 use rustc_hash::FxHashMap;
