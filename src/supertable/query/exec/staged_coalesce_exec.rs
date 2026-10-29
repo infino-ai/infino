@@ -12,10 +12,11 @@
 //! the other ranges' batches are thrown away.
 //!
 //! The two nodes hold partitions 1.. back until partition 0's scan has handed
-//! over its first batch and been asked for another. The gate sits on the scan,
-//! below the filter, because a `FilterExec` emits nothing for a batch that
-//! keeps no rows: gating on the rows that reach the gather would hold the
-//! other partitions back until partition 0 had read everything.
+//! over its first batch and been asked for another, or has ended. The gate
+//! sits on the scan, below the filter, because a `FilterExec` emits nothing
+//! for a batch that keeps no rows: gating on the rows that reach the gather
+//! would hold the other partitions back until partition 0 had read
+//! everything.
 //!
 //! ```text
 //!   StagedCoalesceExec fetch=n      a fresh gate per query, in the task context
@@ -33,6 +34,13 @@
 //!   batch, the gate opens, and every other partition starts at once beside
 //!   partition 0, as under a plain gather. A filter that keeps almost nothing
 //!   waits for one batch, then reads in parallel as before.
+//! - **It gives no batch:** a file whose rows the index or the statistics
+//!   rule out gives none. The gate opens when partition 0 ends. The staged
+//!   gather turns off DataFusion's sharing of files between partitions, so
+//!   partition 0 ends after its own files instead of taking the next file
+//!   the others would have read, and `StageLimitGathers` leaves it one file.
+//! - **It fails:** the gate is abandoned, so no other partition starts while
+//!   the query returns the error.
 //!
 //! The shut gate is only correct when whatever drops partition 0's scan early
 //! does so because it already has the gather's `n` rows; `StageLimitGathers`
@@ -65,6 +73,8 @@ use tokio::sync::watch;
 #[derive(Debug)]
 pub(crate) struct StagedCoalesceExec {
     gather: CoalescePartitionsExec,
+    /// The most rows to return: the `LIMIT` (with any `OFFSET`) above.
+    fetch: usize,
 }
 
 impl StagedCoalesceExec {
@@ -72,18 +82,14 @@ impl StagedCoalesceExec {
     pub(crate) fn new(input: Arc<dyn ExecutionPlan>, fetch: usize) -> Self {
         Self {
             gather: CoalescePartitionsExec::new(input).with_fetch(Some(fetch)),
+            fetch,
         }
-    }
-
-    /// The most rows to return: the `LIMIT` (with any `OFFSET`) above.
-    fn limit(&self) -> usize {
-        self.gather.fetch().unwrap_or(usize::MAX)
     }
 }
 
 impl DisplayAs for StagedCoalesceExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StagedCoalesceExec: fetch={}", self.limit())
+        write!(f, "StagedCoalesceExec: fetch={}", self.fetch)
     }
 }
 
@@ -110,7 +116,7 @@ impl ExecutionPlan for StagedCoalesceExec {
                 children.len()
             )));
         }
-        Ok(Arc::new(Self::new(children.swap_remove(0), self.limit())))
+        Ok(Arc::new(Self::new(children.swap_remove(0), self.fetch)))
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -123,7 +129,7 @@ impl ExecutionPlan for StagedCoalesceExec {
     }
 
     fn fetch(&self) -> Option<usize> {
-        self.gather.fetch()
+        Some(self.fetch)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -137,10 +143,18 @@ impl ExecutionPlan for StagedCoalesceExec {
     ) -> DfResult<SendableRecordBatchStream> {
         // Each query gets its own gate, so a plan run twice never sees the
         // first run's.
-        let config = context
+        let mut config = context
             .session_config()
             .clone()
             .with_extension(Arc::new(ScanGate::new()));
+        // A partition that runs out of its own files would otherwise take the
+        // next file the others would have read. Partition 0 runs alone while
+        // the gate is shut, so it would read every file that gives no batch,
+        // one after another. This plan's only scan is the gated one.
+        config
+            .options_mut()
+            .execution
+            .enable_file_stream_work_stealing = false;
         let gated = TaskContext::new(
             context.task_id(),
             context.session_id(),
@@ -156,9 +170,9 @@ impl ExecutionPlan for StagedCoalesceExec {
 }
 
 /// Holds a scan's partitions 1.. back until partition 0 has handed over its
-/// first batch and been asked for another, when a [`StagedCoalesceExec`] above
-/// put a [`ScanGate`] in the task context. Without one, it passes every
-/// partition straight through.
+/// first batch and been asked for another, or has ended, when a
+/// [`StagedCoalesceExec`] above put a [`ScanGate`] in the task context.
+/// Without one, it passes every partition straight through.
 #[derive(Debug)]
 pub(crate) struct ScanGateExec {
     input: Arc<dyn ExecutionPlan>,
@@ -248,12 +262,12 @@ impl ExecutionPlan for ScanGateExec {
 /// Where a query's [`ScanGate`] stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateState {
-    /// Partition 0 has not yet been asked for a second batch.
+    /// Partition 0 has not yet been asked for a second batch, nor ended.
     Closed,
     /// Partition 0 fell short: start every other partition.
     Open,
-    /// Partition 0's scan was dropped while the gate was shut, by a node that
-    /// had its rows: the other partitions are not needed.
+    /// Partition 0's scan failed, or was dropped while the gate was shut by
+    /// a node that had its rows: the other partitions are not needed.
     Abandoned,
 }
 
@@ -294,7 +308,8 @@ impl ScanGate {
 }
 
 /// Partition 0 of a gated scan: opens the gate when asked for a batch after
-/// its first, or when it ends or fails, and abandons it if dropped before.
+/// its first, or when it ends, and abandons it if it fails or is dropped
+/// before.
 struct FirstPartition {
     schema: SchemaRef,
     batches: SendableRecordBatchStream,
@@ -313,7 +328,8 @@ impl Stream for FirstPartition {
         let poll = self.batches.poll_next_unpin(cx);
         match &poll {
             Poll::Ready(Some(Ok(_))) => self.delivered = true,
-            Poll::Ready(Some(Err(_)) | None) => self.gate.leave_closed(GateState::Open),
+            Poll::Ready(None) => self.gate.leave_closed(GateState::Open),
+            Poll::Ready(Some(Err(_))) => self.gate.leave_closed(GateState::Abandoned),
             Poll::Pending => {}
         }
         poll
@@ -343,16 +359,26 @@ mod tests {
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
+        common::ScalarValue,
         datasource::memory::MemorySourceConfig,
         error::{DataFusionError, Result as DfResult},
         execution::TaskContext,
+        logical_expr::Operator,
         physical_plan::{
             DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
-            collect, limit::LocalLimitExec, stream::RecordBatchStreamAdapter,
+            collect,
+            expressions::{BinaryExpr, col, lit},
+            filter::FilterExec,
+            limit::LocalLimitExec,
+            stream::RecordBatchStreamAdapter,
         },
     };
     use futures::{StreamExt, stream};
-    use tokio::time::timeout;
+    use tokio::{
+        sync::Notify,
+        task,
+        time::{sleep, timeout},
+    };
 
     use super::{ScanGateExec, StagedCoalesceExec};
 
@@ -364,6 +390,9 @@ mod tests {
     const FETCH: usize = 5;
     /// How long a test waits before calling a gather stuck.
     const STUCK: Duration = Duration::from_secs(10);
+    /// How long partition 0 gives nothing before a test checks that no other
+    /// partition started meanwhile.
+    const IDLE: Duration = Duration::from_millis(50);
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
@@ -374,14 +403,36 @@ mod tests {
         RecordBatch::try_new(schema(), vec![Arc::new(values)]).expect("batch")
     }
 
-    /// A scan that records which of its partitions were started. With
-    /// `stall`, partition 0 never ends after its batches: only a gate that
-    /// opens on the second ask lets the query finish.
+    /// An in-memory scan of `partitions`, each a list of batch sizes.
+    fn memory_scan(partitions: &[&[usize]]) -> Arc<dyn ExecutionPlan> {
+        let batches: Vec<Vec<RecordBatch>> = partitions
+            .iter()
+            .map(|sizes| sizes.iter().map(|&rows| batch(rows)).collect())
+            .collect();
+        MemorySourceConfig::try_new_exec(&batches, schema(), None).expect("input")
+    }
+
+    /// How partition 0 of a [`Tracked`] scan behaves past its batches.
+    #[derive(Debug, Clone)]
+    enum First {
+        /// Ends after them.
+        Ends,
+        /// Never ends after them: only a gate that opens on the second ask
+        /// lets the query finish.
+        NeverEnds,
+        /// Gives nothing until notified, then its batches.
+        WaitsFor(Arc<Notify>),
+        /// Fails before them.
+        Fails,
+    }
+
+    /// A scan that records which of its partitions were started. Each run of
+    /// the plan reads the next of `runs`, counted by partition 0's starts.
     #[derive(Debug)]
     struct Tracked {
-        input: Arc<dyn ExecutionPlan>,
+        runs: Vec<Arc<dyn ExecutionPlan>>,
         started: Arc<Mutex<Vec<usize>>>,
-        stall: bool,
+        first: First,
     }
 
     impl DisplayAs for Tracked {
@@ -396,7 +447,7 @@ mod tests {
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {
-            self.input.properties()
+            self.runs[0].properties()
         }
 
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -415,52 +466,111 @@ mod tests {
             partition: usize,
             context: Arc<TaskContext>,
         ) -> DfResult<SendableRecordBatchStream> {
-            self.started.lock().expect("started").push(partition);
-            let batches = self.input.execute(partition, context)?;
-            if !(self.stall && partition == 0) {
+            let run = {
+                let mut started = self.started.lock().expect("started");
+                started.push(partition);
+                started.iter().filter(|&&p| p == 0).count() - 1
+            };
+            let batches = self.runs[run].execute(partition, context)?;
+            if partition != 0 {
                 return Ok(batches);
             }
-            let stalled = batches.chain(stream::pending());
-            Ok(Box::pin(RecordBatchStreamAdapter::new(schema(), stalled)))
+            let first = match self.first.clone() {
+                First::Ends => return Ok(batches),
+                First::NeverEnds => batches.chain(stream::pending()).boxed(),
+                First::WaitsFor(notify) => stream::once(async move {
+                    notify.notified().await;
+                    batches
+                })
+                .flatten()
+                .boxed(),
+                First::Fails => stream::once(async {
+                    Err(DataFusionError::Execution("partition 0 failed".into()))
+                })
+                .chain(batches)
+                .boxed(),
+            };
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema(), first)))
         }
     }
 
-    /// Runs `LocalLimitExec(fetch)` over a gated scan of `partitions` (each a
-    /// list of batch sizes) under a staged gather of `fetch`, returning the
-    /// rows gathered and the partitions started, sorted.
-    async fn gather(partitions: &[&[usize]], fetch: usize, stall: bool) -> (usize, Vec<usize>) {
-        let batches: Vec<Vec<RecordBatch>> = partitions
-            .iter()
-            .map(|sizes| sizes.iter().map(|&rows| batch(rows)).collect())
-            .collect();
-        let input = MemorySourceConfig::try_new_exec(&batches, schema(), None).expect("input");
+    /// The node over the gate that stops pulling once it has its rows.
+    #[derive(Debug, Clone, Copy)]
+    enum Above {
+        /// A `FilterExec` with the gather's fetch, as over a `WHERE`.
+        Filter,
+        /// A `LocalLimitExec`, as over a `WHERE` an index answers.
+        Limit,
+    }
+
+    /// A staged gather of `fetch` over `above` over a gated [`Tracked`] scan
+    /// of `runs`, each a list of partitions; and the partitions it started.
+    fn staged_plan(
+        runs: &[&[&[usize]]],
+        fetch: usize,
+        above: Above,
+        first: First,
+    ) -> (Arc<dyn ExecutionPlan>, Arc<Mutex<Vec<usize>>>) {
         let started = Arc::new(Mutex::new(Vec::new()));
         let scan = Arc::new(Tracked {
-            input,
+            runs: runs.iter().map(|run| memory_scan(run)).collect(),
             started: Arc::clone(&started),
-            stall,
+            first,
         });
-        let limited = Arc::new(LocalLimitExec::new(
-            Arc::new(ScanGateExec::new(scan)),
-            fetch,
-        ));
-        let staged = Arc::new(StagedCoalesceExec::new(limited, fetch));
-        let out = timeout(STUCK, collect(staged, Arc::new(TaskContext::default())))
+        let gate = Arc::new(ScanGateExec::new(scan));
+        let above: Arc<dyn ExecutionPlan> = match above {
+            Above::Filter => {
+                let every_row = Arc::new(BinaryExpr::new(
+                    col("a", &schema()).expect("a"),
+                    Operator::GtEq,
+                    lit(ScalarValue::Int64(Some(0))),
+                ));
+                FilterExec::try_new(every_row, gate)
+                    .expect("filter")
+                    .with_fetch(Some(fetch))
+                    .expect("a filter takes a fetch")
+            }
+            Above::Limit => Arc::new(LocalLimitExec::new(gate, fetch)),
+        };
+        (Arc::new(StagedCoalesceExec::new(above, fetch)), started)
+    }
+
+    /// The rows `plan` returns.
+    async fn rows(plan: Arc<dyn ExecutionPlan>) -> DfResult<usize> {
+        let out = timeout(STUCK, collect(plan, Arc::new(TaskContext::default())))
             .await
-            .expect("the gather got stuck")
-            .expect("gather");
-        let rows = out.iter().map(RecordBatch::num_rows).sum();
+            .expect("the gather got stuck")?;
+        Ok(out.iter().map(RecordBatch::num_rows).sum())
+    }
+
+    /// The partitions started so far, sorted.
+    fn sorted(started: &Mutex<Vec<usize>>) -> Vec<usize> {
         let mut started = started.lock().expect("started").clone();
         started.sort_unstable();
-        (rows, started)
+        started
+    }
+
+    /// Runs a staged gather of `fetch` over `partitions` under `above`,
+    /// returning the rows gathered and the partitions started, sorted.
+    async fn gather(
+        partitions: &[&[usize]],
+        fetch: usize,
+        above: Above,
+        first: First,
+    ) -> (usize, Vec<usize>) {
+        let (plan, started) = staged_plan(&[partitions], fetch, above, first);
+        let rows = rows(plan).await.expect("gather");
+        (rows, sorted(&started))
     }
 
     #[tokio::test]
     async fn a_first_batch_that_meets_the_limit_starts_no_other_partition() {
         let full: &[usize] = &[BATCH_ROWS, BATCH_ROWS];
-        let (rows, started) = gather(&[full; PARTITIONS], FETCH, false).await;
-        assert_eq!(rows, FETCH);
-        assert_eq!(started, vec![0]);
+        for above in [Above::Filter, Above::Limit] {
+            let (rows, started) = gather(&[full; PARTITIONS], FETCH, above, First::Ends).await;
+            assert_eq!(rows, FETCH, "{above:?}");
+            assert_eq!(started, vec![0], "{above:?}");
+        }
     }
 
     #[tokio::test]
@@ -468,23 +578,76 @@ mod tests {
         // Partition 0 never ends, so only the second ask can open the gate.
         let short: &[usize] = &[FETCH - 1];
         let full: &[usize] = &[BATCH_ROWS];
-        let (rows, started) = gather(&[short, full, full, full], FETCH, true).await;
-        assert_eq!(rows, FETCH);
-        assert!(started.len() > 1, "started {started:?}");
+        for above in [Above::Filter, Above::Limit] {
+            let partitions = [short, full, full, full];
+            let (rows, started) = gather(&partitions, FETCH, above, First::NeverEnds).await;
+            assert_eq!(rows, FETCH, "{above:?}");
+            assert!(started.len() > 1, "{above:?}: started {started:?}");
+        }
     }
 
     #[tokio::test]
     async fn an_empty_first_partition_opens_the_gate() {
         let full: &[usize] = &[BATCH_ROWS];
-        let (rows, started) = gather(&[&[], full, full, full], FETCH, false).await;
+        let (rows, started) =
+            gather(&[&[], full, full, full], FETCH, Above::Filter, First::Ends).await;
         assert_eq!(rows, FETCH);
         assert!(started.len() > 1, "started {started:?}");
     }
 
     #[tokio::test]
+    async fn the_others_wait_while_the_first_partition_gives_nothing() {
+        // Partition 0 gives nothing for a while, then ends empty, like a
+        // file the index ruled out: the others start only when it ends.
+        let full: &[usize] = &[BATCH_ROWS];
+        let notify = Arc::new(Notify::new());
+        let (plan, started) = staged_plan(
+            &[&[&[], full, full, full]],
+            FETCH,
+            Above::Filter,
+            First::WaitsFor(Arc::clone(&notify)),
+        );
+        let query = task::spawn(rows(plan));
+        sleep(IDLE).await;
+        assert_eq!(sorted(&started), vec![0]);
+        notify.notify_one();
+        let rows = query.await.expect("join").expect("gather");
+        assert_eq!(rows, FETCH);
+        assert_eq!(sorted(&started), (0..PARTITIONS).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn a_failing_first_partition_starts_no_other() {
+        let full: &[usize] = &[BATCH_ROWS];
+        let (plan, started) =
+            staged_plan(&[&[full; PARTITIONS]], FETCH, Above::Filter, First::Fails);
+        assert!(rows(plan).await.is_err());
+        assert_eq!(sorted(&started), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn a_plan_run_twice_gets_a_fresh_gate_each_time() {
+        // The first run's partition 0 meets the limit, so its gate ends up
+        // abandoned. The second run's is empty and needs the others: with the
+        // first run's gate it would return nothing.
+        let full: &[usize] = &[BATCH_ROWS];
+        let (plan, started) = staged_plan(
+            &[&[full; PARTITIONS], &[&[], full, full, full]],
+            FETCH,
+            Above::Filter,
+            First::Ends,
+        );
+        assert_eq!(rows(Arc::clone(&plan)).await.expect("first run"), FETCH);
+        assert_eq!(sorted(&started), vec![0]);
+        assert_eq!(rows(plan).await.expect("second run"), FETCH);
+        assert!(sorted(&started).len() > 2, "started {started:?}");
+    }
+
+    #[tokio::test]
     async fn a_limit_past_every_row_returns_them_all() {
         let full: &[usize] = &[BATCH_ROWS, BATCH_ROWS];
-        let (rows, started) = gather(&[full; PARTITIONS], usize::MAX, false).await;
+        let (rows, started) =
+            gather(&[full; PARTITIONS], usize::MAX, Above::Limit, First::Ends).await;
         assert_eq!(rows, PARTITIONS * 2 * BATCH_ROWS);
         assert_eq!(started, (0..PARTITIONS).collect::<Vec<_>>());
     }
@@ -492,13 +655,8 @@ mod tests {
     #[tokio::test]
     async fn a_scan_gate_without_a_staged_gather_passes_every_partition() {
         let full: &[usize] = &[BATCH_ROWS];
-        let batches: Vec<Vec<RecordBatch>> = [full; PARTITIONS]
-            .iter()
-            .map(|sizes| sizes.iter().map(|&rows| batch(rows)).collect())
-            .collect();
-        let input = MemorySourceConfig::try_new_exec(&batches, schema(), None).expect("input");
         let out = collect(
-            Arc::new(ScanGateExec::new(input)),
+            Arc::new(ScanGateExec::new(memory_scan(&[full; PARTITIONS]))),
             Arc::new(TaskContext::default()),
         )
         .await

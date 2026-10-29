@@ -23,12 +23,22 @@
 //!
 //! The rule swaps that gather for a [`StagedCoalesceExec`] and puts a
 //! [`ScanGateExec`] on the scan, which hold partitions 1.. back until
-//! partition 0's scan has been asked for a second batch. A filter most rows
-//! pass is answered by partition 0's first batch; a filter that keeps almost
-//! nothing waits for that one batch, then reads every partition side by side
-//! as before, so nothing is ever read in series past one batch. A round-robin
-//! exchange between the gather and the scan goes too: it would start every
-//! partition at once regardless.
+//! partition 0's scan has been asked for a second batch or has ended. A
+//! filter most rows pass is answered by partition 0's first batch; a filter
+//! that keeps almost nothing waits for that one batch, then reads every
+//! partition side by side as before. A round-robin exchange between the
+//! gather and the scan goes too: it would start every partition at once
+//! regardless.
+//!
+//! A file can give no batch at all: one whose rows the index or the
+//! statistics rule out. So partition 0 must not move on to another file while
+//! the gate is shut, or it would read every such file alone. The rule leaves
+//! the first file (or byte range) of the scan's first group alone in that
+//! group, and moves the group's other files to a group of their own at the
+//! end. The staged gather turns off DataFusion's sharing of files between
+//! partitions for the query, so partition 0 reads only that one file before
+//! the gate opens. What is read in series is at most one batch, or one file
+//! that gives none, however large the table.
 //!
 //! The gate keeps the other partitions shut when partition 0's scan is
 //! dropped before that second ask, which is right only if what dropped it
@@ -41,11 +51,15 @@
 //! random leaves a selection of thousands of fragments per row group, which
 //! measured slower than decoding the batch whole.
 
-use std::sync::Arc;
+use std::{mem, sync::Arc};
 
 use datafusion::{
     common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
+    datasource::{
+        physical_plan::{FileGroup, FileScanConfig},
+        source::DataSourceExec,
+    },
     error::Result as DfResult,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
@@ -63,14 +77,6 @@ use crate::supertable::query::exec::{
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "StageLimitGathers";
 
-/// Largest `LIMIT` (with its `OFFSET`) whose gather runs in stages. A limit
-/// this small is met by the first batch or so of rows that pass, so the
-/// batches every other partition decodes at the same time are mostly thrown
-/// away; a larger one needs rows from many partitions, where starting them
-/// together pays. Set a little over one decode batch (DataFusion's 8,192
-/// rows), at the row filter's limit, not measured on its own.
-const MAX_STAGED_FETCH: usize = 10_000;
-
 /// Gathers a filtered scan under a small plain `LIMIT` in stages; see the
 /// module docs.
 #[derive(Debug, Default)]
@@ -80,13 +86,17 @@ impl PhysicalOptimizerRule for StageLimitGathers {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // A scan batch holds at most this many rows. A larger `LIMIT` (with
+        // its `OFFSET`) can never be met by partition 0's first batch, so the
+        // gate would always open and the query would only pay the wait.
+        let max_fetch = config.execution.batch_size;
         plan.transform_down(|node| {
             let Some(fetch) = node
                 .downcast_ref::<CoalescePartitionsExec>()
                 .and_then(|coalesce| coalesce.fetch())
-                .filter(|&fetch| fetch <= MAX_STAGED_FETCH)
+                .filter(|&fetch| fetch <= max_fetch)
             else {
                 return Ok(Transformed::no(node));
             };
@@ -134,10 +144,8 @@ fn gated_scan(
         }
         // `EnforceDistribution` puts the exchange below the meter when the
         // scan's files are too small to split.
-        let meter = match round_robin_input(meter.input()) {
-            Some(scan) => Arc::clone(plan).with_new_children(vec![Arc::clone(scan)])?,
-            None => Arc::clone(plan),
-        };
+        let scan = round_robin_input(meter.input()).unwrap_or(meter.input());
+        let meter = Arc::clone(plan).with_new_children(vec![first_file_alone(scan)])?;
         return Ok(Some(Arc::new(ScanGateExec::new(meter))));
     }
     let passes_rows_on = plan.downcast_ref::<FilterExec>().is_some()
@@ -152,6 +160,33 @@ fn gated_scan(
     gated_scan(child, fetch)?
         .map(|child| Arc::clone(plan).with_new_children(vec![child]))
         .transpose()
+}
+
+/// `scan` with the first file of its first group alone in that group and the
+/// group's other files in a new group at the end, when it is a file scan
+/// whose first group holds more than one; else `scan` as it is. Partition 0
+/// then reads one file before the gate opens; see the module docs.
+fn first_file_alone(scan: &Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    let Some(config) = scan
+        .downcast_ref::<DataSourceExec>()
+        .and_then(|source| source.data_source().downcast_ref::<FileScanConfig>())
+        .filter(|config| {
+            config
+                .file_groups
+                .first()
+                .is_some_and(|group| group.len() > 1)
+        })
+    else {
+        return Arc::clone(scan);
+    };
+    let mut config = config.clone();
+    let mut groups = mem::take(&mut config.file_groups);
+    let mut first = groups.remove(0).into_inner();
+    let others = first.split_off(1);
+    groups.insert(0, FileGroup::new(first));
+    groups.push(FileGroup::new(others));
+    config.file_groups = groups;
+    DataSourceExec::from_data_source(config)
 }
 
 /// The input of `node` when it is a round-robin exchange, else `None`.
@@ -169,6 +204,12 @@ mod tests {
     use datafusion::{
         common::ScalarValue,
         config::ConfigOptions,
+        datasource::{
+            listing::PartitionedFile,
+            physical_plan::{FileGroup, FileScanConfig, FileScanConfigBuilder, ParquetSource},
+            source::DataSourceExec,
+        },
+        execution::object_store::ObjectStoreUrl,
         logical_expr::Operator,
         physical_optimizer::PhysicalOptimizerRule,
         physical_plan::{
@@ -182,13 +223,15 @@ mod tests {
         },
     };
 
-    use super::{MAX_STAGED_FETCH, StageLimitGathers};
+    use super::StageLimitGathers;
     use crate::supertable::query::exec::metered_exec::MeteredExec;
 
     /// The `LIMIT` the tests' plans use.
     const LIMIT: usize = 10;
     /// Partitions a test's scan reads in.
     const PARTITIONS: usize = 4;
+    /// Bytes of each file in a test's file scan; never read.
+    const FILE_BYTES: u64 = 1_000;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]))
@@ -203,6 +246,45 @@ mod tests {
         } else {
             Arc::new(MeteredExec::new(input, None))
         }
+    }
+
+    /// A filtered Parquet scan of files named by `groups`, one group each.
+    fn file_scan(groups: &[&[&str]]) -> Arc<dyn ExecutionPlan> {
+        let url = ObjectStoreUrl::parse("infino-test://t/").expect("url");
+        let mut builder = FileScanConfigBuilder::new(url, Arc::new(ParquetSource::new(schema())));
+        for names in groups {
+            let files = names
+                .iter()
+                .map(|name| PartitionedFile::new(*name, FILE_BYTES))
+                .collect();
+            builder = builder.with_file_group(FileGroup::new(files));
+        }
+        let scan = DataSourceExec::from_data_source(builder.build());
+        Arc::new(MeteredExec::without_limit_pushdown(scan, None))
+    }
+
+    /// The files of each group of the file scan in `plan`, by name.
+    fn file_groups(plan: &Arc<dyn ExecutionPlan>) -> Vec<Vec<String>> {
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        {
+            return config
+                .file_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .iter()
+                        .map(|file| file.object_meta.location.to_string())
+                        .collect()
+                })
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .map(file_groups)
+            .find(|groups| !groups.is_empty())
+            .unwrap_or_default()
     }
 
     /// `WHERE a > 0` over `input`.
@@ -302,6 +384,31 @@ mod tests {
     }
 
     #[test]
+    fn leaves_the_first_file_of_a_staged_scan_alone_in_its_group() {
+        // Partition 0 reads only its own group while the gate is shut, so a
+        // group of many files that give no rows would be read in series.
+        let plan = staged(
+            filter(file_scan(&[&["a", "b", "c"], &["d"], &["e", "f"]])),
+            Some(LIMIT),
+        );
+        assert_eq!(plan.name(), "StagedCoalesceExec");
+        assert_eq!(
+            file_groups(&plan),
+            [vec!["a"], vec!["d"], vec!["e", "f"], vec!["b", "c"]]
+        );
+        // A first group of one file is left as it is.
+        let plan = staged(filter(file_scan(&[&["a"], &["b", "c"]])), Some(LIMIT));
+        assert_eq!(file_groups(&plan), [vec!["a"], vec!["b", "c"]]);
+    }
+
+    #[test]
+    fn stages_one_group_of_many_files_as_one_file_then_the_rest() {
+        let plan = staged(filter(file_scan(&[&["a", "b", "c"]])), Some(LIMIT));
+        assert_eq!(plan.name(), "StagedCoalesceExec");
+        assert_eq!(file_groups(&plan), [vec!["a"], vec!["b", "c"]]);
+    }
+
+    #[test]
     fn leaves_a_scan_under_a_smaller_limit_of_its_own() {
         // The gate would stay shut once this limit had its rows, short of
         // the gather's.
@@ -319,8 +426,11 @@ mod tests {
     }
 
     #[test]
-    fn leaves_a_large_limit_and_no_limit() {
-        for fetch in [Some(MAX_STAGED_FETCH + 1), None] {
+    fn stages_up_to_a_batch_and_leaves_a_larger_limit_and_no_limit() {
+        let batch_size = ConfigOptions::default().execution.batch_size;
+        let plan = staged(filter(scan(PARTITIONS, true)), Some(batch_size));
+        assert_eq!(plan.name(), "StagedCoalesceExec");
+        for fetch in [Some(batch_size + 1), None] {
             let plan = staged(filter(scan(PARTITIONS, true)), fetch);
             assert_eq!(plan.name(), "CoalescePartitionsExec");
         }
