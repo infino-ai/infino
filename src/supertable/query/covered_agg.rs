@@ -67,7 +67,7 @@ use datafusion::{
         Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
-    prelude::{cast, col},
+    prelude::{cast, col, ident},
 };
 use uuid::Uuid;
 
@@ -300,7 +300,10 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     .filter(predicate.clone())?;
 
     // Partial aggregates over the residual, one batch per output (AVG
-    // needs two: sum + non-null count).
+    // needs two: sum + non-null count). Each column is named exactly, as
+    // the query named it: `col` would parse the name as SQL, folding
+    // `AvgTicketPrice` to `avgticketprice` and reading `geo.bytes` as
+    // column `bytes` of a table `geo`.
     let mut partial_exprs: Vec<Expr> = Vec::new();
     for (i, kind) in kinds.iter().enumerate() {
         match kind {
@@ -308,16 +311,16 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                 partial_exprs.push(count(lit(1i64)).alias(format!("__resid_{i}_cnt")));
             }
             AggKind::Count(column) => {
-                partial_exprs.push(count(col(column)).alias(format!("__resid_{i}_cnt")));
+                partial_exprs.push(count(ident(column)).alias(format!("__resid_{i}_cnt")));
             }
             AggKind::Sum(column) => {
-                partial_exprs.push(sum(col(column)).alias(format!("__resid_{i}_sum")));
+                partial_exprs.push(sum(ident(column)).alias(format!("__resid_{i}_sum")));
             }
             AggKind::Min(column) => {
-                partial_exprs.push(min(col(column)).alias(format!("__resid_{i}_min")));
+                partial_exprs.push(min(ident(column)).alias(format!("__resid_{i}_min")));
             }
             AggKind::Max(column) => {
-                partial_exprs.push(max(col(column)).alias(format!("__resid_{i}_max")));
+                partial_exprs.push(max(ident(column)).alias(format!("__resid_{i}_max")));
             }
             AggKind::Avg(column) => {
                 // Explicitly cast: the analyzer's coercion pass has already
@@ -326,9 +329,9 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
                 // here. Float64 matches the cast the planner had put on
                 // the original AVG argument, which parse_aggregates peeled.
                 partial_exprs.push(
-                    sum(cast(col(column), DataType::Float64)).alias(format!("__resid_{i}_sum")),
+                    sum(cast(ident(column), DataType::Float64)).alias(format!("__resid_{i}_sum")),
                 );
-                partial_exprs.push(count(col(column)).alias(format!("__resid_{i}_cnt")));
+                partial_exprs.push(count(ident(column)).alias(format!("__resid_{i}_cnt")));
             }
         }
     }

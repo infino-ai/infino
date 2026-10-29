@@ -39,27 +39,6 @@
 //!     Bytes are uncompressed, as that's what decoding costs. A cold read pays
 //!     compressed bytes, so if the skipped columns compress well, the ratio
 //!     overstates what we save.
-//!
-//! A filtered scan under a plain `LIMIT`, with no `ORDER BY`, is read as one
-//! partition instead. Its fetch can't reach the scan (see
-//! `MeteredExec::without_limit_pushdown`), so a scan split into byte ranges
-//! decodes a batch of every column in every range at once, and the first rows
-//! to pass end the query:
-//!
-//! ```text
-//!   CoalescePartitionsExec(fetch=10)          CoalescePartitionsExec(fetch=10)
-//!     FilterExec  price > 500                   FilterExec  price > 500
-//!       DataSourceExec  16 byte ranges            DataSourceExec  1 partition
-//!       16 batches decoded, 10 rows kept          1 batch decoded, 10 rows kept
-//! ```
-//!
-//! The `WHERE` stays in the `FilterExec`. A row filter would decode only the
-//! `WHERE`'s columns for rows that fail, but a filter keeping rows at random
-//! leaves a selection of thousands of fragments per row group, which measured
-//! slower than decoding the batch whole. A filter that keeps almost nothing is
-//! read by one core instead of many, so it ends a little later while using
-//! many times less CPU. `UnsplitLimitScans` does the joining, after
-//! DataFusion's `EnforceDistribution` has split the scan.
 
 use std::sync::Arc;
 
@@ -68,7 +47,7 @@ use datafusion::{
     config::ConfigOptions,
     datasource::{
         physical_plan::{
-            FileGroup, FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
+            FileScanConfig, FileScanConfigBuilder, FileSource, ParquetSource,
             parquet::can_expr_be_pushed_down_with_schemas,
         },
         source::DataSourceExec,
@@ -82,37 +61,25 @@ use datafusion::{
     physical_expr_common::physical_expr::is_volatile,
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
-        ExecutionPlan, Partitioning,
-        filter::FilterExec,
-        limit::{GlobalLimitExec, LocalLimitExec},
-        projection::ProjectionExec,
-        repartition::RepartitionExec,
-        sorts::sort::SortExec,
+        ExecutionPlan, filter::FilterExec, projection::ProjectionExec, sorts::sort::SortExec,
     },
 };
 use rustc_hash::FxHashSet;
 
-use crate::supertable::query::{
-    exec::{cached_scan_exec::CachedScanExec, metered_exec::MeteredExec},
-    provider::ScanFooters,
-};
+use crate::supertable::query::{exec::metered_exec::MeteredExec, provider::ScanFooters};
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "RowFilterUnderTopK";
 
-/// [`UnsplitLimitScans`]'s name, as DataFusion lists it in `EXPLAIN VERBOSE`.
-const UNSPLIT_RULE_NAME: &str = "UnsplitLimitScans";
-
-/// Largest `LIMIT` the rule turns the row filter on for, or keeps a scan whole
-/// for.
+/// Largest `LIMIT` the rule turns the row filter on for.
 const MAX_FETCH: usize = 10_000;
 
 /// Least ratio of the bytes the row filter can skip to the bytes of the sort's
 /// columns for the rule to turn it on.
 const MIN_SKIP_RATIO: u64 = 4;
 
-/// Turns on the row filter for a scan under `ORDER BY ... LIMIT`, and keeps a
-/// filtered scan under a plain `LIMIT` whole; see the module docs.
+/// Turns on the row filter for a scan under `ORDER BY ... LIMIT`; see the
+/// module docs.
 #[derive(Debug, Default)]
 pub(crate) struct RowFilterUnderTopK;
 
@@ -123,23 +90,19 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
         _config: &ConfigOptions,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         plan.transform_down(|node| {
-            let marked = if let Some(sort) = node
+            let Some(sort) = node
                 .downcast_ref::<SortExec>()
                 .filter(|sort| sort.fetch().is_some_and(|fetch| fetch <= MAX_FETCH))
-            {
-                let sort_columns = column_names(sort.expr().iter().map(|e| &e.expr));
-                row_filtered(sort.input(), sort_columns, Vec::new(), Under::TopK)?
-            } else if let Some(input) = small_limit_input(&node) {
-                row_filtered(input, FxHashSet::default(), Vec::new(), Under::Limit)?
-            } else {
-                None
+            else {
+                return Ok(Transformed::no(node));
             };
-            match marked {
-                Some(input) => Ok(Transformed::yes(
-                    Arc::clone(&node).with_new_children(vec![input])?,
-                )),
-                None => Ok(Transformed::no(node)),
-            }
+            let sort_columns = column_names(sort.expr().iter().map(|e| &e.expr));
+            let Some(input) = row_filtered(sort.input(), sort_columns, Vec::new())? else {
+                return Ok(Transformed::no(node));
+            };
+            Ok(Transformed::yes(
+                Arc::clone(&node).with_new_children(vec![input])?,
+            ))
         })
         .map(|t| t.data)
     }
@@ -153,153 +116,25 @@ impl PhysicalOptimizerRule for RowFilterUnderTopK {
     }
 }
 
-/// Reads a scan [`RowFilterUnderTopK`] kept whole for a plain `LIMIT` as one
-/// partition again, once DataFusion's `EnforceDistribution` has split it into
-/// byte ranges: that rule splits a scan without asking the node above it. The
-/// ranges keep their order and their access plans, all in one partition, so
-/// the scan reads the file front to back and stops when the limit is met.
-///
-/// A round-robin exchange `EnforceDistribution` put next to the scan goes
-/// too, above the meter or below it (below when the scan's files are too
-/// small to split, so the meter declined): it would keep pulling batches out
-/// of the scan ahead of the limit, or read its files in parallel.
-#[derive(Debug, Default)]
-pub(crate) struct UnsplitLimitScans;
-
-impl PhysicalOptimizerRule for UnsplitLimitScans {
-    fn optimize(
-        &self,
-        plan: Arc<dyn ExecutionPlan>,
-        _config: &ConfigOptions,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        plan.transform_up(|node| {
-            if let Some(input) = round_robin_input(&node)
-                && input
-                    .downcast_ref::<MeteredExec>()
-                    .is_some_and(MeteredExec::is_unsplit)
-            {
-                return Ok(Transformed::yes(Arc::clone(input)));
-            }
-            let Some(meter) = node
-                .downcast_ref::<MeteredExec>()
-                .filter(|meter| meter.is_unsplit())
-            else {
-                return Ok(Transformed::no(node));
-            };
-            let input = round_robin_input(meter.input()).unwrap_or(meter.input());
-            let Some(config) = input
-                .downcast_ref::<DataSourceExec>()
-                .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
-            else {
-                // A scan already in one partition (the scan of kept columns):
-                // only an exchange below the meter goes.
-                return if Arc::ptr_eq(input, meter.input()) {
-                    Ok(Transformed::no(node))
-                } else {
-                    Ok(Transformed::yes(
-                        Arc::clone(&node).with_new_children(vec![Arc::clone(input)])?,
-                    ))
-                };
-            };
-            if config.file_groups.len() <= 1 && Arc::ptr_eq(input, meter.input()) {
-                return Ok(Transformed::no(node));
-            }
-            let files = config
-                .file_groups
-                .iter()
-                .flat_map(|group| group.iter().cloned())
-                .collect();
-            let config = FileScanConfigBuilder::from(config.clone())
-                .with_file_groups(vec![FileGroup::new(files)])
-                .build();
-            let scan = DataSourceExec::from_data_source(config);
-            Ok(Transformed::yes(
-                Arc::clone(&node).with_new_children(vec![scan])?,
-            ))
-        })
-        .map(|t| t.data)
-    }
-
-    fn name(&self) -> &str {
-        UNSPLIT_RULE_NAME
-    }
-
-    fn schema_check(&self) -> bool {
-        true
-    }
-}
-
-/// The input of `node` when it is a round-robin exchange, else `None`.
-fn round_robin_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
-    node.downcast_ref::<RepartitionExec>()
-        .filter(|exchange| matches!(exchange.partitioning(), Partitioning::RoundRobinBatch(_)))
-        .map(RepartitionExec::input)
-}
-
-/// What the scan feeds: an `ORDER BY ... LIMIT`, or a plain `LIMIT`.
-#[derive(Clone, Copy)]
-enum Under {
-    TopK,
-    Limit,
-}
-
-/// The input of a `LIMIT` of at most [`MAX_FETCH`] rows (its skip included),
-/// or `None` for any other node.
-fn small_limit_input(node: &Arc<dyn ExecutionPlan>) -> Option<&Arc<dyn ExecutionPlan>> {
-    let (input, rows) = if let Some(limit) = node.downcast_ref::<GlobalLimitExec>() {
-        (
-            limit.input(),
-            limit.fetch().map(|f| f.saturating_add(limit.skip())),
-        )
-    } else if let Some(limit) = node.downcast_ref::<LocalLimitExec>() {
-        (limit.input(), Some(limit.fetch()))
-    } else {
-        return None;
-    };
-    rows.filter(|&rows| rows <= MAX_FETCH).map(|_| input)
-}
-
-/// `plan` with the scan at the bottom marked, or `None` if the walk stops
-/// first or leaves it alone: under `ORDER BY ... LIMIT` the row filter turned
-/// on, under a plain `LIMIT` the scan kept whole. `sort_columns` are the sort's
-/// columns as `plan` names them (none under a plain `LIMIT`); `filters` are the
-/// `WHERE` parts seen on the way down.
-///
-/// A plain `LIMIT` over a scan whose meter takes its fetch, a scan with no
-/// filter, is left alone: the fetch already stops it.
+/// `plan` with the row filter turned on in the scan at the bottom, or `None`
+/// if the walk stops first. `sort_columns` are the sort's columns as `plan`
+/// names them; `filters` are the `WHERE` parts seen on the way down.
 fn row_filtered(
     plan: &Arc<dyn ExecutionPlan>,
     mut sort_columns: FxHashSet<String>,
     mut filters: Vec<Arc<dyn PhysicalExpr>>,
-    under: Under,
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     // Reached our table scan: the meter and the Parquet scan it wraps.
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
-        // A scan of kept columns has no row filter to turn on; under a plain
-        // `LIMIT` it is read as one partition, row group by row group, like
-        // the Parquet scan below.
-        if let Some(cached) = meter.input().downcast_ref::<CachedScanExec>() {
-            return Ok(match under {
-                Under::Limit if !meter.supports_limit_pushdown() => {
-                    Some(meter.unsplit(cached.in_one_partition()))
-                }
-                _ => None,
-            });
-        }
         let (Some(scan), Some(footers)) = (
             meter.input().downcast_ref::<DataSourceExec>(),
             meter.footers(),
         ) else {
             return Ok(None);
         };
-        return Ok(match under {
-            Under::TopK => with_row_filter(scan, footers, &sort_columns, &filters)
-                .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
-                .transpose()?,
-            // The fetch reaches a scan with no filter, so it stops on its own.
-            Under::Limit if meter.supports_limit_pushdown() => None,
-            Under::Limit => Some(meter.unsplit(Arc::clone(meter.input()))),
-        });
+        return with_row_filter(scan, footers, &sort_columns, &filters)
+            .map(|scan| Arc::clone(plan).with_new_children(vec![scan]))
+            .transpose();
     }
     if let Some(filter) = plan.downcast_ref::<FilterExec>() {
         // Collect the `WHERE` parts; the scan checks they can all move into it.
@@ -328,7 +163,7 @@ fn row_filtered(
         return Ok(None);
     };
     // Rebuild this node over the marked scan below it.
-    row_filtered(child, sort_columns, filters, under)?
+    row_filtered(child, sort_columns, filters)?
         .map(|child| Arc::clone(plan).with_new_children(vec![child]))
         .transpose()
 }

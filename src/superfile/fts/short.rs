@@ -2,12 +2,12 @@
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
 //! Short-form posting body for terms whose whole list fits one block
-//! (`df <= BLOCK_LEN`) — the layout for the rare-term tail.
+//! (`df <= SUB_BLOCK_LEN`) — the layout for the rare-term tail.
 //!
 //! The long form charges a single-block term its metadata header, a
 //! skip entry, a coarse slot and a block header before the first
 //! posting, and the block codec then pads the
-//! partial block to `BLOCK_LEN` lanes at the block's bit width — on a
+//! partial block to a sub-block's lanes at the block's bit width — on a
 //! Zipfian corpus that made the ~97% of terms with `df <= 128` more
 //! than half of the postings region while holding 6% of the postings.
 //! The short form is a few bytes per posting and nothing per block:
@@ -35,12 +35,14 @@
 //! uses, so nothing downstream distinguishes the two.
 
 use crate::{
-    superfile::fts::posting::BLOCK_LEN,
+    superfile::fts::posting::SUB_BLOCK_LEN,
     utils::varint::{push_varint, read_varint},
 };
 
-/// Largest posting count the short form is used for — one block.
-pub(crate) const SHORT_MAX_DF: usize = BLOCK_LEN;
+/// Largest posting count the short form is used for — one sub-block, as
+/// before blocks could be wider: a term this small is read whole, and the
+/// choice is the writer's policy, not the block length's.
+pub(crate) const SHORT_MAX_DF: usize = SUB_BLOCK_LEN;
 
 /// Decoded short body: `n` postings in `doc_ids[..n]` / `tfs[..n]`, plus
 /// where the inline position group starts when the column has one.

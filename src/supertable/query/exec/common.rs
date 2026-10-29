@@ -25,6 +25,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use arrow::compute::{concat_batches, filter_record_batch, interleave_record_batch, take};
@@ -49,10 +50,7 @@ use datafusion::{
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
-use futures::{
-    FutureExt, TryStreamExt,
-    future::{BoxFuture, try_join_all},
-};
+use futures::{FutureExt, TryStreamExt, future::BoxFuture};
 use object_store::{ObjectStore, path::Path as ObjPath};
 use parquet::{
     arrow::{
@@ -64,6 +62,7 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use rayon::{ThreadPool, prelude::*};
+use roaring::RoaringBitmap;
 use tracing::{Instrument, Span, warn};
 
 use crate::{
@@ -73,19 +72,24 @@ use crate::{
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
-        reader::{rank_back_indices, row_selection_for_ids},
+        reader::{WHOLE_COLUMN_TAKE_DIVISOR, rank_back_indices, row_selection_for_ids},
     },
     supertable::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
-        manifest::{ManifestSnapshot, SuperfileUri},
+        manifest::{ManifestSnapshot, SuperfileEntry, SuperfileUri},
         query::{
-            SuperfileHit, candidate::CandidatePlan, exec::metered_exec::MeteredExec,
-            superfile_reader::superfile_reader, vector::row_id_from_manifest_entry,
+            SuperfileHit,
+            candidate::{CandidatePlan, CandidateScope},
+            dispatch::{fanout_with, tombstone_deny_set},
+            exec::metered_exec::MeteredExec,
+            superfile_reader::superfile_reader,
+            vector::row_id_from_manifest_entry,
         },
         schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, PhysicalSchema, map::FileSchemaMap},
+        tombstones::SidecarCache,
     },
-    utils::trace::record,
+    utils::{join::try_join_bounded, trace::record},
 };
 
 /// A table function's search, run under `span` with the batch's row count
@@ -149,18 +153,25 @@ const OVER_FETCH_MAX_K_MULTIPLE: usize = 64;
 /// alone would give a small `k` a tiny budget — 64 hits at `k = 1` — and
 /// a selective predicate needs to look past that before concluding its
 /// rows are not there.
-const OVER_FETCH_MIN_CEILING: usize = 10_000;
+pub(crate) const OVER_FETCH_MIN_CEILING: usize = 10_000;
 
 /// The absolute ceiling on one fill's hit count, bounding the rows any
 /// single round resolves into memory. A caller asking for more than this
 /// still gets its `k`: [`over_fetch_ceiling`] never returns less.
 const OVER_FETCH_MAX_HITS: usize = 100_000;
 
+/// Rows of one superfile [`exact_scope`] decodes and checks at a time, when
+/// the superfile is too large to take its rows in one read: past
+/// `EXACT_SCOPE_TAKE_ROWS` × [`WHOLE_COLUMN_TAKE_DIVISOR`] rows a chunk this
+/// size is a sparse take, which decodes only the pages its rows land on, so
+/// the predicate's columns over a large superfile never sit in memory whole.
+const EXACT_SCOPE_TAKE_ROWS: usize = 1 << 20;
+
 /// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
 /// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
 /// [`OVER_FETCH_MAX_HITS`], never below the `k` actually asked for, and
 /// never above the table's row count.
-fn over_fetch_ceiling(k: usize, total: usize) -> usize {
+pub(crate) fn over_fetch_ceiling(k: usize, total: usize) -> usize {
     k.saturating_mul(OVER_FETCH_MAX_K_MULTIPLE)
         .clamp(OVER_FETCH_MIN_CEILING, OVER_FETCH_MAX_HITS)
         .max(k)
@@ -632,6 +643,41 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
 {
+    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+    fill_top_k_within(
+        reader,
+        k,
+        predicate,
+        scalar_schema,
+        output_schema,
+        projection,
+        over_fetch_ceiling(k, total),
+        search,
+    )
+    .await
+}
+
+/// [`fill_top_k`] with the caller's own `ceiling` on the hits a round may
+/// ask for. A ceiling of `k` runs exactly one round: the kernel's `k` best
+/// within its scope, checked against the predicate and returned however
+/// many survive — what a caller wants when it has a better move than
+/// widening, or when its scope already admits only rows the predicate keeps
+/// (see [`exact_scope`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn fill_top_k_within<F, Fut>(
+    reader: &SupertableReader,
+    k: usize,
+    predicate: Option<&PushedPredicate>,
+    scalar_schema: &SchemaRef,
+    output_schema: &SchemaRef,
+    projection: Option<&[usize]>,
+    ceiling: usize,
+    search: F,
+) -> DfResult<RecordBatch>
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
+{
     let Some(predicate) = predicate else {
         let hits = search(k).await?;
         return resolve_hits(reader, &hits, scalar_schema, output_schema, projection).await;
@@ -656,8 +702,6 @@ where
     );
     let bound = predicate.bind(&decoded_schema)?;
     let requested_positions: Vec<usize> = (0..requested.len()).collect();
-    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-    let ceiling = over_fetch_ceiling(k, total);
     let mut want = k.min(ceiling);
     loop {
         let hits = search(want).await?;
@@ -682,6 +726,162 @@ where
         }
         want = want.saturating_mul(OVER_FETCH_GROWTH).min(ceiling);
     }
+}
+
+/// `scope` narrowed to exactly the rows its pushed-down `predicate` keeps:
+/// each admitted superfile's candidate rows, decoded on the predicate's
+/// columns and kept where it holds. A bounded scope's sets are read as they
+/// are, already free of tombstones; an unbounded one stands for every row
+/// of each superfile, less its tombstones. A kernel gated on the result
+/// admits only rows the `WHERE` keeps, so one round at `k` returns the `k`
+/// best of them, or every one when fewer exist: no widening, and no
+/// ceiling to come up short at.
+///
+/// This is how a predicate the index cannot bound — a scalar equality, a
+/// range — still means the top `k` among the rows satisfying it. The cost
+/// is a decode of the predicate's columns over the scope's rows, so a
+/// caller narrows the scope to the rows its search can return first (a
+/// text search, to the rows its terms match) and asks for this only once
+/// widening has stopped short at its ceiling.
+///
+/// A superfile small enough that its rows are a dense take
+/// ([`WHOLE_COLUMN_TAKE_DIVISOR`]) is read in one take, which reads each
+/// fixed-width column once; a larger one in sparse chunks of
+/// [`EXACT_SCOPE_TAKE_ROWS`], pulled off the candidate set one at a time.
+///
+/// `None` when the predicate reads no column or one no superfile stores —
+/// the score, the id column, an index-only text column — so it cannot be
+/// evaluated before ranking; the caller then keeps what widening found.
+pub(crate) async fn exact_scope(
+    reader: &SupertableReader,
+    scope: &CandidateScope,
+    predicate: &PushedPredicate,
+    output_schema: &SchemaRef,
+) -> DfResult<Option<CandidateScope>> {
+    let manifest = Arc::clone(reader.manifest());
+    let stored = manifest.stored_schema();
+    let id_column = reader.options().id_column.as_str();
+    let mut names = Vec::with_capacity(predicate.columns().len());
+    for &index in predicate.columns() {
+        let name = output_schema.field(index).name();
+        if name == SCORE_COLUMN || name == id_column || stored.field_with_name(name).is_err() {
+            return Ok(None);
+        }
+        names.push(name.clone());
+    }
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let out_schema = hit_output_schema(&stored, &refs)?;
+    let bound = Arc::new(predicate.bind(&out_schema)?);
+    let names = Arc::new(names);
+    let op_stats = reader.op_stats.clone();
+    // A bounded scope hands each superfile its set, tombstones already
+    // subtracted; an unbounded one hands `None`, read as all of its rows.
+    let units: Vec<(Arc<SuperfileEntry>, Option<Arc<RoaringBitmap>>)> = scope
+        .admitted_superfiles()
+        .map(|entry| {
+            let rows = scope
+                .allow
+                .as_ref()
+                .and_then(|allow| allow.get(&entry.uri).cloned());
+            (Arc::clone(entry), rows)
+        })
+        .collect();
+    let body = move |r: Arc<SuperfileReader>,
+                     entry: Arc<SuperfileEntry>,
+                     cache: Option<Arc<SidecarCache>>,
+                     now: Instant,
+                     rows: Option<Arc<RoaringBitmap>>| {
+        let manifest = Arc::clone(&manifest);
+        let names = Arc::clone(&names);
+        let out_schema = Arc::clone(&out_schema);
+        let bound = Arc::clone(&bound);
+        let op_stats = op_stats.clone();
+        async move {
+            let candidates = match rows {
+                Some(rows) => rows,
+                None => {
+                    let n_docs = u32::try_from(r.n_docs()).map_err(QueryError::internal)?;
+                    let mut all = RoaringBitmap::new();
+                    all.insert_range(0..n_docs);
+                    if let Some(cache) = cache.as_ref()
+                        && let Some(deny) = tombstone_deny_set(cache, entry.superfile_id, now)?
+                    {
+                        all -= deny.as_ref();
+                    }
+                    Arc::new(all)
+                }
+            };
+            // A superfile whose every row a chunk could cover is read in one
+            // take; past that, chunks small enough to stay sparse takes.
+            let n_docs = usize::try_from(r.n_docs()).map_err(QueryError::internal)?;
+            let whole_file_rows =
+                EXACT_SCOPE_TAKE_ROWS.saturating_mul(WHOLE_COLUMN_TAKE_DIVISOR as usize);
+            let take_rows = if n_docs <= whole_file_rows {
+                n_docs.max(1)
+            } else {
+                EXACT_SCOPE_TAKE_ROWS
+            };
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let mut kept = RoaringBitmap::new();
+            let mut remaining = candidates.iter();
+            loop {
+                let chunk: Vec<u32> = remaining.by_ref().take(take_rows).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                if let Some(stats) = &op_stats {
+                    stats.add_rows_materialized(chunk.len() as u64);
+                }
+                let batch =
+                    take_file_columns(&manifest, &r, chunk.clone(), &refs, &out_schema, &op_stats)
+                        .await
+                        .map_err(QueryError::DataFusion)?;
+                let bound = Arc::clone(&bound);
+                // The predicate runs over up to a chunk of rows: compute, so
+                // the reader pool takes it rather than the tokio worker. It
+                // hands back the positions it holds at; the chunk maps them
+                // to rows here.
+                let (held, ns) = run_on_pool(
+                    Some(&manifest.options.reader_pool),
+                    "exact scope check: reader pool dropped result",
+                    move || {
+                        timed_section(|| {
+                            bound.mask(&batch).map(|mask| {
+                                mask.iter()
+                                    .enumerate()
+                                    .filter_map(|(at, holds)| (holds == Some(true)).then_some(at))
+                                    .collect::<Vec<usize>>()
+                            })
+                        })
+                    },
+                )
+                .await
+                .map_err(QueryError::internal)?;
+                if let Some(stats) = &op_stats {
+                    stats.add_kernel_cpu_ns(ns);
+                }
+                kept.extend(
+                    held.map_err(QueryError::DataFusion)?
+                        .into_iter()
+                        .map(|at| chunk[at]),
+                );
+            }
+            Ok((entry.uri, kept))
+        }
+    };
+    let kept = fanout_with(reader, units, true, reader.open_intent(), body).await?;
+    let allow = kept
+        .into_iter()
+        .filter(|(_, rows)| !rows.is_empty())
+        .map(|(uri, rows)| (uri, Arc::new(rows)))
+        .collect();
+    Ok(Some(CandidateScope {
+        superfiles: scope.superfiles.clone(),
+        allow: Some(allow),
+    }))
 }
 
 /// Output column carrying the per-hit score (vector distance or BM25
@@ -1060,30 +1260,37 @@ async fn resolve_columns(
     // table the cache cannot hold, so resolving a hit's columns never starts
     // a whole-file download the search itself declined.
     let intent = reader.open_intent();
-    let opened = try_join_all(misses.into_iter().map(|(index, uri)| async move {
-        let entry = manifest
-            .lookup_superfile_entry(uri)
+    // Each list of futures below is collected before the join: they do no
+    // work until polled, and a lazy iterator held across the join's awaits
+    // trips rustc's "`FnOnce` is not general enough" in the callers' streams.
+    let in_flight = manifest.options.superfiles_in_flight;
+    let opens: Vec<_> = misses
+        .into_iter()
+        .map(|(index, uri)| async move {
+            let entry = manifest
+                .lookup_superfile_entry(uri)
+                .await
+                .map_err(QueryError::ManifestLoad)?
+                .ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "resolve_hits: superfile {uri:?} missing from manifest"
+                    ))
+                })?;
+            superfile_reader(
+                store,
+                disk_cache,
+                storage,
+                &entry.uri,
+                &entry.storage_path(),
+                entry.subsection_offsets.as_ref(),
+                intent,
+            )
             .await
-            .map_err(QueryError::ManifestLoad)?
-            .ok_or_else(|| {
-                QueryError::Internal(format!(
-                    "resolve_hits: superfile {uri:?} missing from manifest"
-                ))
-            })?;
-        superfile_reader(
-            store,
-            disk_cache,
-            storage,
-            &entry.uri,
-            &entry.storage_path(),
-            entry.subsection_offsets.as_ref(),
-            intent,
-        )
-        .await
-        .map(|reader| (index, reader))
-        .map_err(|error| DataFusionError::from(QueryError::store(error)))
-    }))
-    .await?;
+            .map(|reader| (index, reader))
+            .map_err(|error| DataFusionError::from(QueryError::store(error)))
+        })
+        .collect();
+    let opened = try_join_bounded(opens, in_flight).await?;
 
     // Materialize each superfile's projected hit rows, split by tier:
     //
@@ -1152,12 +1359,14 @@ async fn resolve_columns(
     };
 
     let out_schema_ref = &out_schema;
-    let cold_wave = try_join_all(cold_units.into_iter().map(
-        |(i, rd, locals, adapter)| async move {
+    let cold_takes: Vec<_> = cold_units
+        .into_iter()
+        .map(|(i, rd, locals, adapter)| async move {
             let batch = take_lazy_file(rd, locals, names, &adapter, out_schema_ref).await?;
             Ok::<_, DataFusionError>((i, batch))
-        },
-    ));
+        })
+        .collect();
+    let cold_wave = try_join_bounded(cold_takes, in_flight);
 
     let (warm_done, cold_done) = tokio::join!(warm_wave, cold_wave);
     let warm_done = warm_done?;

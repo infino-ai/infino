@@ -90,9 +90,6 @@ pub(crate) struct MeteredExec {
     /// provider wraps around a scan that carries filters — see
     /// [`Self::without_limit_pushdown`].
     limit_pushdown: bool,
-    /// Whether the scan below may be read as several partitions. `false` for
-    /// a scan a small `LIMIT` stops early; see [`Self::unsplit`].
-    split: bool,
 }
 
 impl MeteredExec {
@@ -110,7 +107,6 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: true,
-            split: true,
         }
     }
 
@@ -135,24 +131,7 @@ impl MeteredExec {
             footers: None,
             read_ahead: None,
             limit_pushdown: false,
-            split: true,
         }
-    }
-
-    /// This meter over `input`, keeping the scan whole: read as one partition,
-    /// not as byte ranges in parallel. For a scan under a small `LIMIT`, where
-    /// the first rows to pass end the query and every other range's decode is
-    /// thrown away. `EnforceDistribution` splits a scan without asking the
-    /// node above it, so `UnsplitLimitScans` joins the ranges back after it.
-    pub(crate) fn unsplit(&self, input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        Arc::new(MeteredExec {
-            input,
-            op_stats: self.op_stats.clone(),
-            footers: self.footers.clone(),
-            read_ahead: self.read_ahead.clone(),
-            limit_pushdown: self.limit_pushdown,
-            split: false,
-        })
     }
 
     /// This meter with the footers of the table scan it wraps.
@@ -165,12 +144,6 @@ impl MeteredExec {
     pub(crate) fn with_read_ahead(mut self, read_ahead: Arc<ScanReadAhead>) -> Self {
         self.read_ahead = Some(read_ahead);
         self
-    }
-
-    /// Whether the scan this meter wraps is to be read as one partition; see
-    /// [`Self::unsplit`].
-    pub(crate) fn is_unsplit(&self) -> bool {
-        !self.split
     }
 
     /// Read-ahead for the table scan this meter wraps, if any.
@@ -196,18 +169,13 @@ impl MeteredExec {
             footers: self.footers.clone(),
             read_ahead: self.read_ahead.clone(),
             limit_pushdown: self.limit_pushdown,
-            split: self.split,
         })
     }
 }
 
 impl DisplayAs for MeteredExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MeteredExec")?;
-        if !self.split {
-            write!(f, ": unsplit")?;
-        }
-        Ok(())
+        write!(f, "MeteredExec")
     }
 }
 

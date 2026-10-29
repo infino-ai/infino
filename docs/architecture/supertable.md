@@ -396,6 +396,14 @@ superfiles — the manifest marks it incomplete, and part loading keeps
 the summary-based choice until a maintenance pass rebuilds the index
 over every superfile. Nothing requires old code to read a new manifest.
 
+A table can keep no term index at all (`SupertableOptions::term_index`
+off): its commits publish nothing, its maintenance rebuilds nothing, and
+no index object is written beside its superfiles. Nothing takes the
+index's place: a table on storage records no per-superfile term filter,
+so a query probes every superfile. That is worth it only where the
+index has nothing to route between, as on a table kept at one
+superfile, which then saves the index's bytes.
+
 A query that needs a term index the manifest names, and cannot use it,
 fails: with `Unsupported` when the root or a slice is in a layout this
 engine no longer reads (the message says to run `optimize()` or
@@ -604,10 +612,17 @@ fusion. Whatever the index could not bound (a scalar column, a
 negation, a token superset that the exact predicate trims), the
 function makes up by applying the exact predicate to its own resolved
 rows and widening the search — doubling k each round — until k rows
-survive or the table is exhausted; the cost is proportional to the
-predicate's selectivity, never to a fixed over-fetch. Prefix search
-takes only that last tier: its term set is known per superfile, not
-per query.
+survive or a bounded ceiling is reached. `bm25_search` goes one step
+further when that widening ends short at a ceiling below the table's
+size: it evaluates the predicate over the rows the query's terms match,
+keeps exactly the rows it holds on, and ranks once more within those,
+so the answer is the top k among matching rows however far below the
+unfiltered top-k they rank. The cost of that pass is an unranked match
+of the query's terms and a decode of the predicate's columns over those
+matches, paid only by a predicate the widening could not fill.
+`vector_search`, `hybrid_search` and prefix search stop at the
+widening, and prefix search takes only that tier: its term set is
+known per superfile, not per query.
 
 ## Concurrency
 

@@ -35,13 +35,22 @@
 //! [`CandidateScope`](crate::supertable::query::candidate::CandidateScope):
 //! the superfiles the manifest statistics and term blooms keep, and —
 //! when an FTS-indexed column bounds the rows — the candidate rows the
-//! kernel admits into its heap. Whatever the index could not bound is
-//! made up by [`fill_top_k`]: the function applies the exact predicate to
-//! its own rows and fetches more until `k` survive. `bm25_search_prefix`
-//! takes the fill path alone.
+//! kernel admits into its heap. The function then ranks within the scope,
+//! applies the exact predicate to the rows it gets, and widens the search
+//! until `k` survive or the fill's ceiling is reached
+//! ([`over_fetch_ceiling`]). Stopped short at a ceiling below the table's
+//! size, the rows the predicate keeps may rank below everything it looked
+//! at: the function then checks the predicate on the rows the query's
+//! terms match ([`SupertableReader::match_scope`], [`exact_scope`]) and
+//! ranks once more within exactly the ones it keeps, so the answer is the
+//! top `k` among matching rows however deep they rank, at the cost of a
+//! decode over the query's matches rather than the table. A predicate that
+//! cannot be evaluated before ranking (one on `score`) keeps what the
+//! widening found. `bm25_search_prefix` takes the widening alone.
 
 use std::{fmt, sync::Arc};
 
+use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
@@ -63,9 +72,14 @@ use crate::{
     supertable::{
         error::QueryError,
         handle::{SupertableReader, WeakReader},
-        query::exec::common::{
-            PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters, fill_top_k,
-            live_reader, output_schema_with_score, scope_to_call, traced_tvf,
+        query::{
+            SuperfileHit,
+            candidate::CandidateScope,
+            exec::common::{
+                PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
+                exact_scope, fill_top_k_within, live_reader, output_schema_with_score,
+                over_fetch_ceiling, scope_to_call, traced_tvf,
+            },
         },
     },
     utils::trace::detail_span,
@@ -421,40 +435,41 @@ impl ExecutionPlan for Bm25Exec {
                 Bm25Query::Terms { .. } | Bm25Query::Prefix { .. } => None,
             };
             let predicate = PushedPredicate::compile(&filters, &output_schema);
-            let search = |want: usize| {
-                let reader = &reader;
-                let column = &column;
-                let query = &query;
-                let scope = scope.as_ref();
-                async move {
-                    match query {
-                        Bm25Query::Terms { query, mode } => {
-                            reader
-                                .bm25_search_scoped_async(
-                                    column,
-                                    query,
-                                    want,
-                                    Bm25SearchOptions::new().with_mode(*mode),
-                                    scope,
-                                )
-                                .await
-                        }
-                        Bm25Query::Prefix { prefix } => {
-                            reader.bm25_search_prefix_async(column, prefix, want).await
-                        }
-                    }
-                }
-            };
-            fill_top_k(
-                &reader,
+            let call = RankedCall {
+                reader: &reader,
+                column: &column,
+                query: &query,
                 k,
-                predicate.as_ref(),
-                &scalar_schema,
-                &output_schema,
-                projection.as_deref(),
-                search,
-            )
-            .await
+                predicate: predicate.as_ref(),
+                scalar_schema: &scalar_schema,
+                output_schema: &output_schema,
+                projection: projection.as_deref(),
+            };
+            // Widen within the scope first, up to the fill's ceiling: the
+            // rounds stop as soon as `k` of the kernel's best pass the
+            // predicate, which for a predicate most top-ranked rows satisfy
+            // is a round or two of the search alone.
+            let widened = call.rows(scope.as_ref(), None).await?;
+            let (Some(scope), Some(predicate), Bm25Query::Terms { query: text, mode }) =
+                (scope.as_ref(), predicate.as_ref(), &query)
+            else {
+                return Ok(widened);
+            };
+            let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+            if widened.num_rows() >= k || over_fetch_ceiling(k, total) >= total {
+                // Either `k` passed, or the ceiling let the search rank every
+                // row and the rows it returned are all there are.
+                return Ok(widened);
+            }
+            // Short at the ceiling: rows the predicate keeps may rank below
+            // every hit the widening looked at. Check the predicate on the
+            // rows the query's terms match, and rank once within exactly the
+            // ones it keeps.
+            let matched = reader.match_scope(&column, text, *mode, scope).await?;
+            match exact_scope(&reader, &matched, predicate, &output_schema).await? {
+                Some(exact) => call.rows(Some(&exact), Some(k)).await,
+                None => Ok(widened),
+            }
         };
 
         let span = match &self.query {
@@ -482,6 +497,74 @@ impl ExecutionPlan for Bm25Exec {
     }
 }
 
+/// One `bm25_search` call's fixed inputs, borrowed by each ranking round
+/// [`Bm25Exec::execute`] runs.
+struct RankedCall<'a> {
+    reader: &'a SupertableReader,
+    column: &'a str,
+    query: &'a Bm25Query,
+    k: usize,
+    predicate: Option<&'a PushedPredicate>,
+    scalar_schema: &'a SchemaRef,
+    output_schema: &'a SchemaRef,
+    projection: Option<&'a [usize]>,
+}
+
+impl RankedCall<'_> {
+    /// The kernel's `want` best hits within `scope` (`None` searches the
+    /// whole table; the prefix kernel has no scoped form and ignores it).
+    async fn hits(
+        &self,
+        want: usize,
+        scope: Option<&CandidateScope>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        match self.query {
+            Bm25Query::Terms { query, mode } => {
+                self.reader
+                    .bm25_search_scoped_async(
+                        self.column,
+                        query,
+                        want,
+                        Bm25SearchOptions::new().with_mode(*mode),
+                        scope,
+                    )
+                    .await
+            }
+            Bm25Query::Prefix { prefix } => {
+                self.reader
+                    .bm25_search_prefix_async(self.column, prefix, want)
+                    .await
+            }
+        }
+    }
+
+    /// The call's `k` rows within `scope` under the predicate, widening to
+    /// at most `ceiling` hits a round — `None` is the fill's own ceiling
+    /// ([`over_fetch_ceiling`]), `Some(k)` exactly one round.
+    async fn rows(
+        &self,
+        scope: Option<&CandidateScope>,
+        ceiling: Option<usize>,
+    ) -> DfResult<RecordBatch> {
+        let ceiling = ceiling.unwrap_or_else(|| {
+            let total =
+                usize::try_from(self.reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
+            over_fetch_ceiling(self.k, total)
+        });
+        fill_top_k_within(
+            self.reader,
+            self.k,
+            self.predicate,
+            self.scalar_schema,
+            self.output_schema,
+            self.projection,
+            ceiling,
+            |want: usize| self.hits(want, scope),
+        )
+        .await
+    }
+}
+
 /// Parse the optional `mode` argument: `'or'` (default) or `'and'`.
 pub(crate) fn arg_to_bool_mode(expr: &Expr) -> DfResult<BoolMode> {
     let s = arg_to_string(expr, "bm25_search mode")?;
@@ -502,9 +585,13 @@ mod tests {
 
     use super::*;
     use crate::{
+        FieldPatch, SchemaPatch,
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::builder::FtsConfig,
-        supertable::{Supertable, SupertableOptions, query::candidate::CandidatePlan},
+        supertable::{
+            Supertable, SupertableOptions,
+            query::{candidate::CandidatePlan, exec::common::OVER_FETCH_MIN_CEILING},
+        },
     };
 
     fn title_schema() -> Arc<Schema> {
@@ -877,6 +964,375 @@ mod tests {
             .expect("filtered query_sql");
         assert_eq!(rows_of(&titles_only), k);
         assert_eq!(titles_only[0].num_columns(), 1);
+    }
+
+    /// Strong rows above the weak ones in the test below: more than the
+    /// widening's ceiling lets a small `k` look at, so a fill that only
+    /// widens stops with every weak row still below it.
+    const N_STRONG_PAST_THE_CEILING: usize = OVER_FETCH_MIN_CEILING + 100;
+
+    /// Weak rows, the only ones the predicate keeps, all ranked below
+    /// [`N_STRONG_PAST_THE_CEILING`] strong ones.
+    const N_WEAK_PAST_THE_CEILING: usize = 5;
+
+    /// A `WHERE` on a column with no index whose rows rank below the
+    /// widening's ceiling: the function finds them anyway, because widening
+    /// that stops short at the ceiling makes it check the predicate on the
+    /// query's matches and rank within exactly the ones it keeps. Returns
+    /// `k` when `k` match, every one when fewer do, and an aggregate counts
+    /// all of them.
+    #[test]
+    fn bm25_search_tvf_where_on_unindexed_column_reaches_rows_below_the_fill_ceiling() {
+        let st = Supertable::create(options_title_bucket()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&title_bucket_batch(
+            st.options().schema.clone(),
+            N_STRONG_PAST_THE_CEILING,
+            N_WEAK_PAST_THE_CEILING,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        assert_unfiltered_top_k_misses(&st, OVER_FETCH_MIN_CEILING, "bucket", "1");
+
+        let k = 3;
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, bucket, score FROM bm25_search('title', 'rust', {k}) \
+                 WHERE bucket = 1"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(
+            rows_of(&rows),
+            k,
+            "the k best of the rows the predicate keeps"
+        );
+        assert!(
+            titles_of(&rows)
+                .iter()
+                .all(|t| t == "rust with four more words"),
+            "every row is a weak bucket-1 row"
+        );
+        let scores = scores_of(&rows);
+        for w in scores.windows(2) {
+            assert!(w[0] >= w[1], "still ranked: {scores:?}");
+        }
+
+        let all = st
+            .reader()
+            .expect("reader")
+            .query_sql("SELECT bucket FROM bm25_search('title', 'rust', 10) WHERE bucket = 1")
+            .expect("filtered query_sql");
+        assert_eq!(
+            rows_of(&all),
+            N_WEAK_PAST_THE_CEILING,
+            "fewer than k match: every one of them, no more"
+        );
+
+        let count = st
+            .reader()
+            .expect("reader")
+            .query_sql(
+                "SELECT COUNT(*) AS n FROM bm25_search('title', 'rust', 10) WHERE bucket = 1",
+            )
+            .expect("count query_sql");
+        let n = count[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64")
+            .value(0);
+        assert_eq!(n, N_WEAK_PAST_THE_CEILING as i64);
+    }
+
+    /// Weak rows in the first superfile of the spread case below.
+    const N_WEAK_IN_FIRST: usize = 2;
+
+    /// Strong rows only, in the spread case's middle superfile: it holds no
+    /// row the predicate keeps.
+    const N_STRONG_ONLY: usize = 50;
+
+    /// Weak rows in the spread case's last superfile.
+    const N_WEAK_IN_LAST: usize = 3;
+
+    /// `bm25_search('title', 'rust', k) WHERE {predicate}`'s rows, `title`
+    /// and `score` projected.
+    fn filtered(st: &Supertable, k: usize, predicate: &str) -> Vec<RecordBatch> {
+        st.reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT title, score FROM bm25_search('title', 'rust', {k}) WHERE {predicate}"
+            ))
+            .expect("filtered query_sql")
+    }
+
+    /// The rows past the ceiling spread over several superfiles, one of
+    /// which holds none of them: the exact pass checks each superfile's
+    /// matches and ranks across all of them.
+    #[test]
+    fn bm25_search_tvf_where_reaches_rows_past_the_ceiling_across_superfiles() {
+        let st = Supertable::create(options_title_bucket()).expect("create");
+        let schema = st.options().schema.clone();
+        for (strong, weak) in [
+            (N_STRONG_PAST_THE_CEILING, N_WEAK_IN_FIRST),
+            (N_STRONG_ONLY, 0),
+            (0, N_WEAK_IN_LAST),
+        ] {
+            let mut w = st.writer().expect("writer");
+            w.append(&title_bucket_batch(Arc::clone(&schema), strong, weak))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let k = 3;
+        assert_eq!(
+            titles_of(&filtered(&st, k, "bucket = 1")),
+            vec!["rust with four more words"; k],
+            "the k best weak rows"
+        );
+        let past_every_match = N_WEAK_IN_FIRST + N_WEAK_IN_LAST + 1;
+        assert_eq!(
+            rows_of(&filtered(&st, past_every_match, "bucket = 1")),
+            N_WEAK_IN_FIRST + N_WEAK_IN_LAST,
+            "every weak row, from both superfiles that hold one"
+        );
+    }
+
+    /// `title` (FTS) + `category` (FTS) + `bucket` (Int64, no index): a
+    /// predicate on both bounds the scope by `category` and leaves `bucket`
+    /// to the exact pass.
+    fn options_title_category_bucket() -> SupertableOptions {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("category", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+        ]));
+        SupertableOptions::new(
+            schema,
+            vec![FtsConfig::new("title"), FtsConfig::new("category")],
+            vec![],
+        )
+        .expect("valid options")
+        .with_writer_pool(pool)
+    }
+
+    /// Weak `bucket` 1 rows outside the category the bounded case selects:
+    /// the scope leaves them out, so they must never come back.
+    const N_WEAK_OTHER_CATEGORY: usize = 4;
+
+    /// A predicate on an indexed column and a column with no index: the
+    /// indexed one bounds the scope, widening within it stops short at the
+    /// ceiling, and the exact pass checks the other column on the query's
+    /// matches inside that scope only.
+    #[test]
+    fn bm25_search_tvf_where_past_the_ceiling_within_a_bounded_scope() {
+        let st = Supertable::create(options_title_category_bucket()).expect("create");
+        let n_in = N_STRONG_PAST_THE_CEILING + N_WEAK_PAST_THE_CEILING;
+        let n = n_in + N_WEAK_OTHER_CATEGORY;
+        let mut titles =
+            strong_then_weak_titles(N_STRONG_PAST_THE_CEILING, N_WEAK_PAST_THE_CEILING);
+        titles.extend(vec!["rust with four more words"; N_WEAK_OTHER_CATEGORY]);
+        let categories: Vec<&str> = (0..n).map(|i| if i < n_in { "b" } else { "a" }).collect();
+        let buckets: Vec<i64> = (0..n)
+            .map(|i| i64::from(i >= N_STRONG_PAST_THE_CEILING))
+            .collect();
+        let batch = RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(LargeStringArray::from(categories)),
+                Arc::new(Int64Array::from(buckets)),
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT category, bucket FROM bm25_search('title', 'rust', {}) \
+                 WHERE category = 'b' AND bucket = 1",
+                N_WEAK_PAST_THE_CEILING + 1
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(
+            rows_of(&rows),
+            N_WEAK_PAST_THE_CEILING,
+            "every weak row of the category, none of the other"
+        );
+        for b in &rows {
+            let idx = b.schema().index_of("category").expect("category");
+            let c = b
+                .column(idx)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("utf8");
+            for i in 0..b.num_rows() {
+                assert_eq!(c.value(i), "b");
+            }
+        }
+    }
+
+    /// An `IS NULL` on a column the table gained after its first superfile
+    /// was written: that superfile has no such column, its rows read as
+    /// null, and the exact pass must read them so rather than as missing.
+    #[test]
+    fn bm25_search_tvf_where_is_null_reaches_a_superfile_older_than_its_column() {
+        let st = Supertable::create(options_title_bucket()).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&title_bucket_batch(
+            st.options().schema.clone(),
+            0,
+            N_WEAK_PAST_THE_CEILING,
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+        st.apply_schema(
+            &SchemaPatch::new(vec![
+                FieldPatch::named("note")
+                    .with_type(DataType::Int64)
+                    .with_nullable(true),
+            ]),
+            None,
+        )
+        .expect("add the column");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("bucket", DataType::Int64, false),
+            Field::new("note", DataType::Int64, true),
+        ]));
+        let strong = title_bucket_batch(
+            Arc::new(Schema::new(vec![
+                Field::new("title", DataType::LargeUtf8, false),
+                Field::new("bucket", DataType::Int64, false),
+            ])),
+            N_STRONG_PAST_THE_CEILING,
+            0,
+        );
+        let notes = Int64Array::from(vec![0_i64; N_STRONG_PAST_THE_CEILING]);
+        let strong = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::clone(strong.column(0)),
+                Arc::clone(strong.column(1)),
+                Arc::new(notes),
+            ],
+        )
+        .expect("batch with the new column");
+        let mut w = st.writer().expect("writer");
+        w.append(&strong).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let k = 3;
+        assert_eq!(
+            titles_of(&filtered(&st, k, "note IS NULL")),
+            vec!["rust with four more words"; k],
+            "the k best rows of the superfile older than the column"
+        );
+    }
+
+    /// Rows holding the rare term the cost case below searches for.
+    const N_RARE: usize = 3;
+
+    /// Of the [`N_RARE`] rows, how many the predicate keeps.
+    const N_RARE_KEPT: usize = 2;
+
+    /// A rare term under a predicate no index bounds, in a table larger than
+    /// the ceiling: widening stops short, and the exact pass checks the
+    /// predicate on the term's few matches, never on the rest of the table,
+    /// which it would have to decode a column of to check.
+    #[test]
+    fn bm25_search_tvf_where_on_a_rare_term_checks_only_its_matches() {
+        let st = Supertable::create(options_title_bucket()).expect("create");
+        let n = N_STRONG_PAST_THE_CEILING + N_RARE;
+        let titles: Vec<&str> = (0..n)
+            .map(|i| {
+                if i < N_STRONG_PAST_THE_CEILING {
+                    "rust rust"
+                } else {
+                    "zyzzyva"
+                }
+            })
+            .collect();
+        let buckets: Vec<i64> = (0..n).map(|i| i64::from(i >= n - N_RARE_KEPT)).collect();
+        let batch = RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![
+                Arc::new(LargeStringArray::from(titles)),
+                Arc::new(Int64Array::from(buckets)),
+            ],
+        )
+        .expect("batch");
+        let mut w = st.writer().expect("writer");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let k = 10;
+        let reader = st.reader().expect("reader");
+        let rows = reader
+            .query_sql(&format!(
+                "SELECT title FROM bm25_search('title', 'zyzzyva', {k}) WHERE bucket = 1"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(rows_of(&rows), N_RARE_KEPT);
+
+        // What the exact pass is handed to check: the same scope the
+        // function builds for this `WHERE`, narrowed to the term's matches.
+        let filters = vec![col("bucket").eq(lit(1_i64))];
+        let plan = candidate_plan_for_filters(reader.manifest(), &filters);
+        let matched = reader.block_on(async {
+            let scope = reader
+                .candidate_scope(&filters, &plan)
+                .await
+                .expect("scope");
+            reader
+                .match_scope("title", "zyzzyva", BoolMode::Or, &scope)
+                .await
+                .expect("match scope")
+        });
+        let checked: u64 = matched
+            .allow
+            .as_ref()
+            .expect("a bounded scope")
+            .values()
+            .map(|rows| rows.len())
+            .sum();
+        assert_eq!(
+            checked, N_RARE as u64,
+            "the exact pass checks the term's matches, not the table's rows"
+        );
+    }
+
+    /// A predicate that reads `score` cannot be evaluated before ranking,
+    /// so the function keeps widening instead, and still fills `k`.
+    #[test]
+    fn bm25_search_tvf_where_on_score_still_fills_k() {
+        let st = supertable_title_bucket();
+        let k = 3;
+        let rows = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT bucket FROM bm25_search('title', 'rust', {k}) \
+                 WHERE bucket = 1 AND score > 0"
+            ))
+            .expect("filtered query_sql");
+        assert_eq!(rows_of(&rows), k);
     }
 
     /// The prefix function has no scoped kernel and takes the fill path

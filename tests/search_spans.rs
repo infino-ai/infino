@@ -22,7 +22,8 @@ use std::{
     collections::BTreeMap,
     fmt,
     sync::{Arc, Mutex},
-    time::Instant,
+    thread,
+    time::{Duration, Instant},
 };
 
 use infino::{
@@ -49,6 +50,10 @@ const COMMITS: usize = 6;
 const ROWS: usize = 12;
 /// Top-K for every search.
 const K: usize = 5;
+/// How long a search's root span may take to close after the search returns.
+const CLOSE_DEADLINE: Duration = Duration::from_secs(5);
+/// How often to look again for that span.
+const CLOSE_POLL: Duration = Duration::from_millis(1);
 /// Title words; every row carries three of them.
 const WORDS: &[&str] = &["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
 
@@ -251,14 +256,28 @@ fn span<'a>(spans: &'a [Captured], name: &str) -> &'a Captured {
         .unwrap_or_else(|| panic!("no `{name}` span in {:?}", names(spans)))
 }
 
+/// The spans closed by the search that just returned, through its root span
+/// `root`. DataFusion aborts the tasks a plan spawned when the plan drops, and
+/// an aborted task is dropped later on a runtime thread, so the spans it
+/// carried, up to the root, can close a moment after the search returned.
+fn closed_through(capture: &Capture, root: &str) -> Vec<Captured> {
+    let deadline = Instant::now() + CLOSE_DEADLINE;
+    let mut spans = capture.take();
+    while !spans.iter().any(|s| s.name == root) && Instant::now() < deadline {
+        thread::sleep(CLOSE_POLL);
+        spans.extend(capture.take());
+    }
+    spans
+}
+
 /// The spans of one search: run `op` (warm, after a first run) and keep the
 /// spans whose trace root is `root`. Asserts the search's own spans all
 /// landed in that trace and that nothing per superfile was exported.
 fn trace_of(capture: &Capture, root: &str, op: impl Fn() -> u64) -> (Vec<Captured>, u64) {
     op();
-    capture.take();
+    closed_through(capture, root);
     let out = op();
-    let spans = capture.take();
+    let spans = closed_through(capture, root);
     for s in &spans {
         assert_ne!(
             s.name, "open_reader",

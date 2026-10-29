@@ -496,6 +496,10 @@ pub struct ColumnMeta {
     /// Where the length array is read from when the norms are first needed.
     pub(super) source: Source,
     pub(super) n_docs: u32,
+    /// Whether the file's posting blocks may hold two sub-blocks, with the
+    /// header's top bit as the count's eighth (blob version 11 on); an
+    /// older file reads that bit as the tfs-minus-one flag.
+    pub(super) wide_blocks: bool,
     pub(super) baked_avgdl: f32,
     /// The average length this column is scored at: the baked one, or a
     /// scoring view's (see `FtsReader::with_scoring`).

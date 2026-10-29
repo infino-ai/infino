@@ -375,6 +375,11 @@ pub(crate) fn plan_jobs(
                 partition_key: s.partition_key.clone(),
                 inputs: vec![s.superfile_id],
                 estimated_output_bytes: s.live_bytes,
+                // A repair runs one job at a time through its own runner
+                // and is never admitted against the host like a planned
+                // merge, so the plan's footprint is not read here.
+                input_bytes: 0,
+                live_docs: 0,
                 // A repair is not a planned compaction run, so there are no
                 // per-run settings to honour.
                 merge_input_mb: None,
