@@ -423,6 +423,7 @@ mod tests {
 
     use chrono::Utc;
     use tempfile::TempDir;
+    use tokio::{join, time::sleep};
 
     use super::*;
     use crate::{
@@ -435,10 +436,15 @@ mod tests {
     const READ_LATENCY: Duration = Duration::from_millis(5);
     /// Sidecar reads a prefetch in these tests keeps in flight.
     const PREFETCH_LIMIT: usize = 64;
+    /// How often a test checks the reads in flight while it waits on them.
+    const IN_FLIGHT_POLL: Duration = Duration::from_millis(1);
+    /// How long a test waits for reads to reach the prefetch limit.
+    const IN_FLIGHT_DEADLINE: Duration = Duration::from_secs(30);
 
     /// A prefetch over more superfiles with deletes than it keeps in flight
     /// reads at most its limit of sidecars at once, and reaches that many, so
-    /// the limit is what bounds it.
+    /// the limit is what bounds it. Reads are held until the limit is reached,
+    /// so a slow runner cannot finish one before the last starts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn prefetch_keeps_at_most_its_limit_of_reads_in_flight() {
         let dir = TempDir::new().expect("tempdir");
@@ -457,7 +463,19 @@ mod tests {
         let mapped: Vec<(Uuid, u64)> = ids.iter().map(|&id| (id, 1)).collect();
         cache.reconcile(view(1, &mapped));
 
-        cache.prefetch(&ids, Instant::now()).await;
+        let reach_the_limit = async {
+            let deadline = Instant::now() + IN_FLIGHT_DEADLINE;
+            while storage.in_flight() < PREFETCH_LIMIT {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for the limit of reads in flight"
+                );
+                sleep(IN_FLIGHT_POLL).await;
+            }
+            storage.release_reads();
+        };
+        storage.hold_reads();
+        join!(cache.prefetch(&ids, Instant::now()), reach_the_limit);
         assert_eq!(
             storage.max_in_flight(),
             PREFETCH_LIMIT,
