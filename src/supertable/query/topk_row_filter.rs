@@ -66,7 +66,10 @@ use datafusion::{
 };
 use rustc_hash::FxHashSet;
 
-use crate::supertable::query::{exec::metered_exec::MeteredExec, provider::ScanFooters};
+use crate::supertable::query::{
+    exec::{cached_scan_exec::CachedScanExec, metered_exec::MeteredExec},
+    provider::ScanFooters,
+};
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "RowFilterUnderTopK";
@@ -126,6 +129,13 @@ fn row_filtered(
 ) -> DfResult<Option<Arc<dyn ExecutionPlan>>> {
     // Reached our table scan: the meter and the Parquet scan it wraps.
     if let Some(meter) = plan.downcast_ref::<MeteredExec>() {
+        // A scan of kept decoded columns decodes every row of the columns it
+        // keeps; the row filter decodes the columns the cutoff doesn't read
+        // only for the rows that pass. Where the row filter applies, the
+        // Parquet scan the kept columns stand in for serves the statement.
+        if let Some(cached) = meter.input().downcast_ref::<CachedScanExec>() {
+            return row_filtered(cached.parquet(), sort_columns, filters);
+        }
         let (Some(scan), Some(footers)) = (
             meter.input().downcast_ref::<DataSourceExec>(),
             meter.footers(),

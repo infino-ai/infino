@@ -21,6 +21,14 @@
 //! group is neither decoded nor kept, so a first run decodes what the Parquet
 //! scan would, and a table larger than the cache doesn't decode the rest of
 //! it on every run.
+//!
+//! The Parquet scan serves the statement instead when it reads less:
+//! - the columns this scan would decode don't fit the cache. Kept, they
+//!   would push each other out, and every run would decode them all again;
+//! - a filtered `ORDER BY ... LIMIT` whose other columns are wide. The top-k
+//!   rule (`RowFilterUnderTopK`) takes back the Parquet scan this one stands
+//!   in for, whose row filter decodes those columns only for the rows that
+//!   pass.
 
 use std::{fmt, ops::Range, sync::Arc};
 
@@ -138,14 +146,23 @@ pub(crate) struct CachedScanExec {
     fetch: Option<usize>,
     statistics: Arc<Statistics>,
     properties: Arc<PlanProperties>,
+    /// The Parquet scan this one stands in for, metered as the provider
+    /// builds it. A plan that reads better through the Parquet scan, an
+    /// `ORDER BY ... LIMIT` whose row filter decodes the wide columns only
+    /// for the rows that pass, takes it back ([`Self::parquet`]).
+    parquet: Arc<dyn ExecutionPlan>,
 }
 
 impl CachedScanExec {
     /// A scan of `schema`'s columns over `files`, read as up to
     /// `target_partitions` partitions, skipping the row groups `filter` rules
-    /// out, or `None` when a column is not one the files store in a type that
-    /// converts to `schema`'s: the Parquet scan then serves it, with its own
-    /// schema adapter.
+    /// out, standing in for `parquet`. `None`, and the Parquet scan serves the
+    /// statement, when:
+    /// - a column is not one the files store in a type that converts to
+    ///   `schema`'s (the Parquet scan's schema adapter serves those);
+    /// - the columns it would decode don't fit the cache ([`decoded_bytes`]):
+    ///   kept, they would push each other out, and every run would decode
+    ///   them all again where the Parquet scan decodes only what it reads.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         schema: SchemaRef,
@@ -156,6 +173,7 @@ impl CachedScanExec {
         cache: Arc<DecodedColumnCache>,
         target_partitions: usize,
         statistics: Statistics,
+        parquet: Arc<dyn ExecutionPlan>,
     ) -> Option<Self> {
         let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         let stored = hit_output_schema(&manifest.stored_schema(), &names).ok()?;
@@ -192,6 +210,9 @@ impl CachedScanExec {
                 }
             }
         }
+        if decoded_bytes(&units, &names) > cache.max_bytes() {
+            return None;
+        }
         let partitions = target_partitions.clamp(1, units.len().max(1));
         let schema_id = manifest.table_schema().schema_id();
         let properties = plan_properties(&schema, partitions);
@@ -210,8 +231,47 @@ impl CachedScanExec {
             fetch: None,
             statistics: Arc::new(statistics),
             properties,
+            parquet,
         })
     }
+
+    /// The Parquet scan this one stands in for, metered as the provider
+    /// builds it.
+    pub(crate) fn parquet(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.parquet
+    }
+}
+
+/// About how many bytes the `columns` of `units`' row groups take decoded:
+/// their column chunks' uncompressed sizes, from the footers. A value
+/// decodes to about its uncompressed size (a string gains an offset). A
+/// column a file holds under another name, after a rename, isn't found by
+/// this name and counts as nothing; the estimate decides only which scan
+/// serves the statement, never what it returns.
+fn decoded_bytes(units: &[RowGroupUnit], columns: &[&str]) -> usize {
+    units
+        .iter()
+        .map(|unit| {
+            let meta = unit.file.reader.parquet_metadata();
+            meta.row_groups()
+                .get(unit.row_group)
+                .map_or(0, |row_group| {
+                    row_group
+                        .columns()
+                        .iter()
+                        .filter(|chunk| {
+                            chunk
+                                .column_descr()
+                                .path()
+                                .parts()
+                                .first()
+                                .is_some_and(|root| columns.contains(&root.as_str()))
+                        })
+                        .map(|chunk| usize::try_from(chunk.uncompressed_size()).unwrap_or(0))
+                        .sum::<usize>()
+                })
+        })
+        .sum()
 }
 
 /// The plan properties of a scan of `schema` read as `partitions` partitions.
@@ -399,6 +459,7 @@ impl ExecutionPlan for CachedScanExec {
             context: Arc::clone(&self.context),
             units: Arc::clone(&self.units),
             pruned: self.pruned,
+            parquet: Arc::clone(&self.parquet),
             partitions: self.partitions,
             fetch: limit,
             statistics: Arc::clone(&self.statistics),

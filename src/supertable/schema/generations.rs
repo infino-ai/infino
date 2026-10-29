@@ -73,6 +73,13 @@ const LIMITED_ROWS: usize = 5;
 const SORTED_ROWS: i64 = 100;
 /// Rows per row group of that file: ten row groups.
 const SORTED_ROW_GROUP_ROWS: usize = 10;
+/// Characters of each title in that file: wide beside the 8-byte score, so
+/// a top-k on the score can skip most of the bytes.
+const WIDE_TITLE_LEN: usize = 64;
+/// Kept bytes too few for even one row group's title column.
+const TOO_FEW_KEPT_BYTES: usize = 64;
+/// The score the `ORDER BY ... LIMIT` test filters above.
+const TOP_SCORES_ABOVE: i64 = 50;
 /// Columns one row group keeps for `SELECT title, score`.
 const KEPT_PER_ROW_GROUP: usize = 2;
 /// How long a dropped read is given to finish its decode and keep it.
@@ -602,16 +609,80 @@ fn a_plain_limit_gathers_kept_columns_in_stages() {
 #[test]
 fn kept_columns_skip_the_row_groups_a_where_rules_out() {
     let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, KEPT_COLUMN_BYTES);
+    let reader = st.reader().expect("reader");
+    let last = SORTED_ROWS - SORTED_ROW_GROUP_ROWS as i64;
+    let sql = format!("SELECT title, score FROM supertable WHERE score >= {last} ORDER BY score");
+    let row_groups = (SORTED_ROWS as usize).div_ceil(SORTED_ROW_GROUP_ROWS);
+    assert_eq!(
+        cached_row_groups(&explained(&reader, &sql)),
+        (1, row_groups - 1),
+        "only the last row group can match"
+    );
+    let want: Vec<i64> = (last..SORTED_ROWS).collect();
+    for pass in ["first", "kept"] {
+        assert_eq!(
+            scores_of(&reader.query_sql(&sql).expect("sql")),
+            want,
+            "{pass} pass"
+        );
+    }
+}
+
+/// A scan whose columns would not fit the kept bytes is read from the files:
+/// kept, its row groups would push each other out, and every run would
+/// decode them all again.
+#[test]
+fn a_scan_whose_columns_dont_fit_the_kept_bytes_reads_the_files() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, TOO_FEW_KEPT_BYTES);
+    let reader = st.reader().expect("reader");
+    let sql = "SELECT title, score FROM supertable WHERE score >= 0 ORDER BY score";
+    let plan = explained(&reader, sql);
+    assert!(!plan.contains("CachedScanExec"), "{plan}");
+    assert!(plan.contains("DataSourceExec"), "{plan}");
+    let want: Vec<i64> = (0..SORTED_ROWS).collect();
+    assert_eq!(scores_of(&reader.query_sql(sql).expect("sql")), want);
+}
+
+/// A filtered `ORDER BY ... LIMIT` whose other columns are wide is read
+/// through the Parquet scan's row filter, which decodes them only for the
+/// rows that pass, rather than from kept columns decoded for every row.
+#[test]
+fn a_filtered_order_by_limit_reads_through_the_row_filter() {
+    let dir = TempDir::new().expect("tempdir");
+    let st = sorted_table(&dir, KEPT_COLUMN_BYTES);
+    let reader = st.reader().expect("reader");
+    let sql = format!(
+        "SELECT title, score FROM supertable WHERE score > {TOP_SCORES_ABOVE} \
+         ORDER BY score DESC LIMIT {LIMITED_ROWS}"
+    );
+    let plan = explained(&reader, &sql);
+    assert!(!plan.contains("CachedScanExec"), "{plan}");
+    assert!(plan.contains("DataSourceExec"), "{plan}");
+    let want: Vec<i64> = (SORTED_ROWS - LIMITED_ROWS as i64..SORTED_ROWS)
+        .rev()
+        .collect();
+    assert_eq!(scores_of(&reader.query_sql(&sql).expect("sql")), want);
+}
+
+/// One file of [`SORTED_ROWS`] rows scored in order, in row groups of
+/// [`SORTED_ROW_GROUP_ROWS`], each with a [`WIDE_TITLE_LEN`]-character title,
+/// its SQL scans keeping up to `kept_bytes` of decoded columns.
+fn sorted_table(dir: &TempDir, kept_bytes: usize) -> Supertable {
     let storage: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
     let mut options = SupertableOptions::new(table_schema(), vec![], vec![])
         .expect("options")
         .with_storage(storage);
-    options.decoded_columns = Some(Arc::new(ByteLru::new(KEPT_COLUMN_BYTES)));
+    options.decoded_columns = Some(Arc::new(ByteLru::new(kept_bytes)));
     options.row_group_size = Some(SORTED_ROW_GROUP_ROWS);
     let st = Supertable::create(options).expect("create");
     let scores: Vec<i64> = (0..SORTED_ROWS).collect();
-    let titles: Vec<String> = scores.iter().map(|s| format!("t{s}")).collect();
+    let titles: Vec<String> = scores
+        .iter()
+        .map(|s| format!("{s:0>width$}", width = WIDE_TITLE_LEN))
+        .collect();
     let batch = RecordBatch::try_new(
         table_schema(),
         vec![
@@ -628,32 +699,22 @@ fn kept_columns_skip_the_row_groups_a_where_rules_out() {
     let mut writer = st.writer().expect("writer");
     writer.append(&batch).expect("append");
     writer.commit().expect("commit");
+    st
+}
 
-    let reader = st.reader().expect("reader");
-    let last = SORTED_ROWS - SORTED_ROW_GROUP_ROWS as i64;
-    let sql = format!("SELECT title, score FROM supertable WHERE score >= {last} ORDER BY score");
-    let row_groups = (SORTED_ROWS as usize).div_ceil(SORTED_ROW_GROUP_ROWS);
-    assert_eq!(
-        cached_row_groups(&explained(&reader, &sql)),
-        (1, row_groups - 1),
-        "only the last row group can match"
-    );
-    let want: Vec<i64> = (last..SORTED_ROWS).collect();
-    for pass in ["first", "kept"] {
-        let batches = reader.query_sql(&sql).expect("sql");
-        let got: Vec<i64> = batches
-            .iter()
-            .flat_map(|b| {
-                let scores = b
-                    .column_by_name("score")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    .expect("score")
-                    .clone();
-                (0..scores.len()).map(move |i| scores.value(i))
-            })
-            .collect();
-        assert_eq!(got, want, "{pass} pass");
-    }
+/// The `score` column across `batches`, in order.
+fn scores_of(batches: &[RecordBatch]) -> Vec<i64> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let scores = b
+                .column_by_name("score")
+                .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                .expect("score")
+                .clone();
+            (0..scores.len()).map(move |i| scores.value(i))
+        })
+        .collect()
 }
 
 /// The `EXPLAIN` of `sql` on `reader`, every plan line joined.

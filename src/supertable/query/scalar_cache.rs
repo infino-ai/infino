@@ -75,6 +75,11 @@ impl<K: Eq + Hash, V: Clone> ByteLru<K, V> {
         }
     }
 
+    /// The most bytes the values may hold together.
+    pub(crate) fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     /// The value under `key`, marking it used.
     pub(crate) fn get(&self, key: &K) -> Option<V> {
         let mut state = self.state.lock().expect("decoded cache poisoned");
