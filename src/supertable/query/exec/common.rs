@@ -1353,42 +1353,44 @@ async fn resolve_columns(
             let locals = seg_locals[index].clone();
             let out_schema = Arc::clone(&out_schema);
             async move {
-                crate::supertable::query::dispatch::spawn_unit(async move {
-                    let entry = manifest
-                        .lookup_superfile_entry(uri)
-                        .await
-                        .map_err(QueryError::ManifestLoad)?
-                        .ok_or_else(|| {
-                            QueryError::Internal(format!(
-                                "resolve_hits: superfile {uri:?} missing from manifest"
-                            ))
-                        })?;
-                    let options = &manifest.options;
-                    let rd = superfile_reader(
-                        &options.store,
-                        options.disk_cache.as_ref(),
-                        options.storage.as_ref(),
-                        &entry.uri,
-                        &entry.storage_path(),
-                        entry.subsection_offsets.as_ref(),
-                        intent,
-                    )
+                let entry = manifest
+                    .lookup_superfile_entry(uri)
                     .await
-                    .map_err(QueryError::store)?;
-                    let adapter = file_adapter(&manifest, &rd);
-                    if rd.can_take_by_local_doc_ids() {
-                        // Resident: decoded below with the other resident
-                        // files, in one pool job.
-                        return Ok(Resolved::Resident(index, rd, adapter));
-                    }
-                    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                    let batch = take_lazy_file(&rd, &locals, &name_refs, &adapter, &out_schema)
-                        .await
-                        .map_err(QueryError::DataFusion)?;
-                    Ok(Resolved::Taken(index, batch))
-                })
+                    .map_err(QueryError::ManifestLoad)?
+                    .ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "resolve_hits: superfile {uri:?} missing from manifest"
+                        ))
+                    })?;
+                let options = &manifest.options;
+                let rd = superfile_reader(
+                    &options.store,
+                    options.disk_cache.as_ref(),
+                    options.storage.as_ref(),
+                    &entry.uri,
+                    &entry.storage_path(),
+                    entry.subsection_offsets.as_ref(),
+                    intent,
+                )
                 .await
-                .map_err(DataFusionError::from)
+                .map_err(QueryError::store)?;
+                let adapter = file_adapter(&manifest, &rd);
+                if rd.can_take_by_local_doc_ids() {
+                    // Resident: decoded below with the other resident
+                    // files, in one pool job.
+                    return Ok::<_, DataFusionError>(Resolved::Resident(index, rd, adapter));
+                }
+                // Only a lazy take gets its own task: its decode is the
+                // CPU this fan-out would otherwise run on one thread, while
+                // a spawn per resident file costs more than its open.
+                let batch = crate::supertable::query::dispatch::spawn_unit(async move {
+                    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                    take_lazy_file(&rd, &locals, &name_refs, &adapter, &out_schema)
+                        .await
+                        .map_err(QueryError::DataFusion)
+                })
+                .await?;
+                Ok(Resolved::Taken(index, batch))
             }
         })
         .collect();
