@@ -1762,7 +1762,7 @@ impl SupertableReader {
                         // more than the scan — see the gate's doc comment. A
                         // caller blocking on the query runs even a heavy one
                         // inline, as no runtime worker waits under it.
-                        if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
+                        let hits = if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
@@ -1789,7 +1789,8 @@ impl SupertableReader {
                             op_stats::timed_kernel(&op_stats, || {
                                 r.bm25_search_or_range_prebuilt(set, k, start, end, floor, &scoring)
                             })?
-                        }
+                        };
+                        r.hits_to_rows_async(hits).await?
                     }
                     None => {
                         let must_refs: Vec<&str> = must_arc.iter().map(|s| s.as_str()).collect();

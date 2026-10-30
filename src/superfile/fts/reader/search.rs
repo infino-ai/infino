@@ -50,8 +50,9 @@ use crate::{
 
 /// Bytes per doc-id map entry: one little-endian `u32` row.
 const DOC_MAP_ENTRY_BYTES: usize = 4;
-/// Bytes of the doc-id map a sparse translation reads at a time.
-const DOC_MAP_PAGE_BYTES: usize = 64 * 1024;
+/// Bytes of the doc-id map a sparse translation reads at a time. Small
+/// under test, so a fixture of a thousand documents spans many pages.
+const DOC_MAP_PAGE_BYTES: usize = if cfg!(test) { 64 } else { 64 * 1024 };
 /// A translation reads map pages instead of the whole map while the pages
 /// come to at most one this-many-th of it.
 const DOC_MAP_SPARSE_SHARE: usize = 8;
@@ -1334,7 +1335,9 @@ impl FtsReader {
         idf: QueryIdf<'_>,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let set = self.build_or_cursor_set(column, terms, idf, None).await?;
-        self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
+        let hits =
+            self.search_or_range_prebuilt_in_blob_ids(&set, k, doc_id_start, doc_id_end, floor)?;
+        self.hits_to_rows_async(hits).await
     }
 
     /// Build the OR cursors for `terms` once — the postings fetch and
@@ -1377,8 +1380,9 @@ impl FtsReader {
             self.build_term_cursors(column_id, terms, idf, purpose, None, prefetched)
                 .await?
         };
-        // Each slice translates its ids to rows off this runtime.
-        if !cursors.is_empty() {
+        // An unranked slice translates its ids to rows off this runtime; a
+        // ranked one returns blob ids for its caller to translate.
+        if !cursors.is_empty() && purpose != CursorUse::Score {
             self.ensure_doc_map().await?;
         }
         Ok(OrCursorSet { column_id, cursors })
@@ -1393,6 +1397,7 @@ impl FtsReader {
     /// a query runs the identical kernel whether or not the fan-out sliced it —
     /// hardcoding a single-regime scorer here once caused an 11-24x post-compact
     /// broad-OR regression.
+    #[cfg(test)]
     pub(crate) fn search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -1401,6 +1406,20 @@ impl FtsReader {
         doc_id_end: u32,
         floor: f32,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
+        self.search_or_range_prebuilt_in_blob_ids(set, k, doc_id_start, doc_id_end, floor)
+            .and_then(|h| self.hits_to_rows(h))
+    }
+
+    /// [`Self::search_or_range_prebuilt`] without the translation: the
+    /// slice's top hits in blob ids, for [`Self::hits_to_rows_async`].
+    pub(crate) fn search_or_range_prebuilt_in_blob_ids(
+        &self,
+        set: &OrCursorSet,
+        k: usize,
+        doc_id_start: u32,
+        doc_id_end: u32,
+        floor: f32,
+    ) -> Result<Vec<(FtsDocId, f32)>, FtsError> {
         if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
@@ -1417,7 +1436,6 @@ impl FtsReader {
             doc_id_start,
             doc_id_end,
         )
-        .and_then(|h| self.hits_to_rows(h))
     }
 
     /// Multi-column BM25 search (most_fields semantics): each
@@ -3723,5 +3741,89 @@ mod tests {
             .await
             .expect("floored ranged search");
         assert!(hits.is_empty(), "floor above all scores prunes everything");
+    }
+
+    /// Ids translated through doc-id map pages on a lazily read, reordered
+    /// blob give the rows the whole map gives: ids in one page, in adjacent
+    /// pages, in a lone page and in the map's last page, which is shorter
+    /// than the rest. Enough pages to pass the sparse share fall back to the
+    /// whole map, with the same rows.
+    #[tokio::test]
+    async fn map_pages_translate_ids_like_the_whole_map() {
+        use super::super::metadata::OpenOptions;
+        use crate::superfile::lazy_source::LazyByteSource;
+
+        const N_DOCS: u32 = 1000;
+        let docs: Vec<String> = (0..N_DOCS).map(|row| format!("alpha r{row}")).collect();
+        let refs: Vec<&str> = docs.iter().map(String::as_str).collect();
+        let mut next = xorshift(u64::from(N_DOCS));
+        let mut order: Vec<u32> = (0..N_DOCS).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, (next() % (i as u64 + 1)) as usize);
+        }
+        let (blob, json) = build_standard_blob_with(&refs, Some(&order));
+        let open = || async {
+            let src: Arc<dyn LazyByteSource> = Arc::new(AsyncOnlySource(blob.clone()));
+            FtsReader::open_lazy(src, &json, OpenOptions { verify_crc: false })
+                .await
+                .expect("open_lazy")
+        };
+        let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
+        let last_page = (N_DOCS - 1) / per_page;
+        assert!(
+            N_DOCS % per_page != 0,
+            "the map's last page must be shorter than the rest"
+        );
+        let row = |id: u32| RowId::new(order[id as usize]);
+
+        // Pages 0 to 3 in one run, a lone page, and the last page.
+        let ids: Vec<u32> = vec![
+            last_page * per_page + 3,
+            0,
+            per_page - 1,
+            per_page,
+            3 * per_page,
+            N_DOCS / 2,
+            N_DOCS - 1,
+            last_page * per_page,
+        ];
+        let r = open().await;
+        let hits: Vec<(FtsDocId, f32)> = ids
+            .iter()
+            .map(|&id| (FtsDocId::new(id), id as f32))
+            .collect();
+        let got = r
+            .hits_to_rows_async(hits)
+            .await
+            .expect("hits_to_rows_async");
+        let want: Vec<(RowId, f32)> = ids.iter().map(|&id| (row(id), id as f32)).collect();
+        assert_eq!(got, want);
+        let id_list: Vec<FtsDocId> = ids.iter().map(|&id| FtsDocId::new(id)).collect();
+        let got = r
+            .ids_to_rows_async(id_list)
+            .await
+            .expect("ids_to_rows_async");
+        let mut want: Vec<RowId> = ids.iter().map(|&id| row(id)).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        assert!(
+            r.doc_map.get().is_none(),
+            "the pages served the translation, not the whole map"
+        );
+
+        // One id in every page: past the sparse share, so the whole map.
+        let r = open().await;
+        let every_page: Vec<u32> = (0..=last_page).map(|p| p * per_page).collect();
+        let hits: Vec<(FtsDocId, f32)> = every_page
+            .iter()
+            .map(|&id| (FtsDocId::new(id), 1.0))
+            .collect();
+        let got = r
+            .hits_to_rows_async(hits)
+            .await
+            .expect("hits_to_rows_async");
+        let want: Vec<(RowId, f32)> = every_page.iter().map(|&id| (row(id), 1.0)).collect();
+        assert_eq!(got, want);
+        assert!(r.doc_map.get().is_some(), "the whole map was read");
     }
 }

@@ -4719,40 +4719,6 @@ mod tests {
         );
     }
 
-    /// A source that only serves bytes asynchronously, the way an
-    /// object store or a cold disk cache does.
-    ///
-    /// `BytesLazyByteSource` answers a synchronous read from memory, so
-    /// a region left out of the open-time prefetch is still served and
-    /// the omission never shows. This one refuses, which is what turns
-    /// "the prefetch is missing a region the open needs" into a failure
-    /// rather than a slower path.
-    struct AsyncOnlySource(Bytes);
-
-    #[async_trait]
-    impl LazyByteSource for AsyncOnlySource {
-        fn size(&self) -> u64 {
-            self.0.len() as u64
-        }
-
-        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-            let s = start as usize;
-            let e = s + len as usize;
-            match e <= self.0.len() {
-                true => Ok(self.0.slice(s..e)),
-                false => Err(LazyByteSourceError::OutOfBounds {
-                    start,
-                    len,
-                    size: self.0.len() as u64,
-                }),
-            }
-        }
-
-        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
-            None
-        }
-    }
-
     /// The doc-id map's length trailer is the one field between the map and
     /// the directory that no CRC covers, so it is held to the document
     /// count: a map is one id per document plus its CRC, or there is none.

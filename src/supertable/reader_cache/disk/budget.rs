@@ -60,8 +60,6 @@ fn reclaimable_lazy_entry(entry: &CachedEntry) -> bool {
             .is_none_or(|source| !source.has_runs_in_memory())
 }
 
-use crate::supertable::options::default_superfiles_in_flight;
-
 impl DiskCacheStore {
     /// Run one pass of the `MADV_DONTNEED` sweep against
     /// currently-cached entries. Each entry with
@@ -161,10 +159,16 @@ impl DiskCacheStore {
         }
     }
 
+    /// Set how many unheld lazy entries a cold open keeps: the table's
+    /// `superfiles_in_flight`.
+    pub(crate) fn set_lazy_entry_cap(&self, cap: usize) {
+        self.lazy_entry_cap.store(cap.max(1), Ordering::Relaxed);
+    }
+
     /// Drop the oldest lazy entries no query holds while there are more than
-    /// a query works on at once by default
-    /// ([`default_superfiles_in_flight`], sized from the host's memory),
-    /// without waiting for the idle sweep.
+    /// the table's queries work on at once (its `superfiles_in_flight`, by
+    /// default sized from the host's memory), without waiting for the idle
+    /// sweep.
     ///
     /// A query that touches thousands of superfiles opens a lazy reader for
     /// each, and each finished one stays in the map until the next sweep
@@ -172,7 +176,7 @@ impl DiskCacheStore {
     /// file, times every superfile the query read. Capping the unheld ones
     /// bounds that by the cap rather than by the table.
     pub(crate) fn release_unheld_lazy_entries_over_cap(&self) {
-        let cap = default_superfiles_in_flight();
+        let cap = self.lazy_entry_cap.load(Ordering::Relaxed);
         if self.cached.len() <= cap {
             return;
         }

@@ -5,8 +5,6 @@
 //! eviction. Split across sibling files: `read` (open a superfile), `fetch` (cold-fetch it in), `budget`
 //! (reserve and evict), `store_files` (the on-disk directory), and `sources` (mmap).
 
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
 use std::{
     collections::HashSet,
     fmt, fs,
@@ -14,7 +12,7 @@ use std::{
     process,
     sync::{
         Arc, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, UNIX_EPOCH},
@@ -30,6 +28,7 @@ use crate::{
     superfile::reader::SuperfileReader,
     supertable::{
         manifest::SuperfileUri,
+        options::default_superfiles_in_flight,
         reader_cache::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
@@ -382,6 +381,10 @@ pub struct DiskCacheStore {
     /// directory but no byte budget). Set via
     /// [`Self::mark_budget_auto_sized`] at construction time.
     budget_auto_sized: AtomicBool,
+    /// Lazy entries no query holds kept past a cold open; see
+    /// [`Self::release_unheld_lazy_entries_over_cap`]. The table's
+    /// `superfiles_in_flight`, set through [`Self::set_lazy_entry_cap`].
+    lazy_entry_cap: AtomicUsize,
     /// One-shot latch so an explicit budget smaller than the table
     /// footprint warns once, not on every reconcile.
     budget_warned: AtomicBool,
@@ -485,6 +488,7 @@ impl DiskCacheStore {
             block_writes_idle: Notify::new(),
             budget_bytes: AtomicU64::new(configured_budget),
             budget_auto_sized: AtomicBool::new(false),
+            lazy_entry_cap: AtomicUsize::new(default_superfiles_in_flight()),
             budget_warned: AtomicBool::new(false),
             n_cold_fetches: AtomicU64::new(0),
             n_disk_reuses: AtomicU64::new(0),

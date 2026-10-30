@@ -4,9 +4,13 @@
 //! Shared test fixtures for the `reader/` submodule tests: blob builders that
 //! plant small, known corpora so each test asserts against a fixed layout.
 
+use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::superfile::fts::builder::FtsBuilder;
+use crate::superfile::{
+    fts::builder::FtsBuilder,
+    lazy_source::{LazyByteSource, LazyByteSourceError},
+};
 
 /// A one-column (`body`) `standard`-analyzer blob holding `docs`, doc `i`
 /// being `docs[i]`.
@@ -109,5 +113,39 @@ pub(super) fn xorshift(mut x: u64) -> impl FnMut() -> u64 {
         x ^= x >> 7;
         x ^= x << 17;
         x
+    }
+}
+
+/// A source that only serves bytes asynchronously, the way an
+/// object store or a cold disk cache does.
+///
+/// `BytesLazyByteSource` answers a synchronous read from memory, so
+/// a region left out of the open-time prefetch is still served and
+/// the omission never shows. This one refuses, which is what turns
+/// "the prefetch is missing a region the open needs" into a failure
+/// rather than a slower path.
+pub(super) struct AsyncOnlySource(pub(super) Bytes);
+
+#[async_trait]
+impl LazyByteSource for AsyncOnlySource {
+    fn size(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        let s = start as usize;
+        let e = s + len as usize;
+        match e <= self.0.len() {
+            true => Ok(self.0.slice(s..e)),
+            false => Err(LazyByteSourceError::OutOfBounds {
+                start,
+                len,
+                size: self.0.len() as u64,
+            }),
+        }
+    }
+
+    fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+        None
     }
 }

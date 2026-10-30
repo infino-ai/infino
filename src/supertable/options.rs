@@ -75,6 +75,7 @@ use crate::{
         ThreadCount,
     },
     memory::ConnectionMemoryBudget,
+    runtime_metrics::rss::total_memory_bytes,
     storage::{
         AzureStorageProvider, GcsStorageProvider, LocalFsStorageProvider, S3StorageProvider,
         StorageProvider,
@@ -260,10 +261,9 @@ const IN_FLIGHT_MEMORY_SHARE: u64 = 4;
 /// [`MIN_SUPERFILES_IN_FLIGHT`] and [`DEFAULT_SUPERFILES_IN_FLIGHT`]. The
 /// ceiling where memory cannot be read. Measured once per process.
 pub(crate) fn default_superfiles_in_flight() -> usize {
-    static IN_FLIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static IN_FLIGHT: OnceLock<usize> = OnceLock::new();
     *IN_FLIGHT.get_or_init(|| {
-        crate::runtime_metrics::rss::total_memory_bytes()
-            .map_or(DEFAULT_SUPERFILES_IN_FLIGHT, superfiles_in_flight_for)
+        total_memory_bytes().map_or(DEFAULT_SUPERFILES_IN_FLIGHT, superfiles_in_flight_for)
     })
 }
 
@@ -1045,6 +1045,7 @@ impl SupertableOptions {
     /// budget / eviction policy fits the deployment; pass the
     /// resulting `Arc<DiskCacheStore>` here.
     pub fn with_disk_cache(mut self, cache: Arc<DiskCacheStore>) -> Self {
+        cache.set_lazy_entry_cap(self.superfiles_in_flight);
         self.disk_cache = Some(cache);
         self
     }
@@ -1113,6 +1114,9 @@ impl SupertableOptions {
     /// [`Self::superfiles_in_flight`]).
     pub fn with_superfiles_in_flight(mut self, superfiles: usize) -> Self {
         self.superfiles_in_flight = superfiles.max(1);
+        if let Some(cache) = &self.disk_cache {
+            cache.set_lazy_entry_cap(self.superfiles_in_flight);
+        }
         self
     }
 

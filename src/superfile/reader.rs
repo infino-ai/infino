@@ -2460,7 +2460,8 @@ impl SuperfileReader {
 
     /// Ranged multi-term OR against prebuilt cursors — see
     /// [`Self::bm25_search_or_range_pretokenized_with_floor`] for the
-    /// range and floor contract.
+    /// range and floor contract. Hits are in blob ids, for
+    /// [`Self::hits_to_rows_async`].
     pub(crate) fn bm25_search_or_range_prebuilt(
         &self,
         set: &OrCursorSet,
@@ -2469,9 +2470,9 @@ impl SuperfileReader {
         doc_id_end: u32,
         floor: f32,
         scoring: &ScoringView<'_>,
-    ) -> Result<Vec<(RowId, f32)>, ReadError> {
+    ) -> Result<Vec<(FtsDocId, f32)>, ReadError> {
         let fts = self.fts_scored(scoring)?;
-        Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
+        Ok(fts.search_or_range_prebuilt_in_blob_ids(set, k, doc_id_start, doc_id_end, floor)?)
     }
 
     /// Multi-column BM25 search with per-column weights ("most
