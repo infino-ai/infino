@@ -74,8 +74,10 @@ use tracing::{Instrument, Span, debug, warn};
 use crate::{
     memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
     runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
-    runtime_metrics::op_stats::{OpStatsCollector, timed_section},
-    runtime_metrics::rss::total_memory_bytes,
+    runtime_metrics::{
+        op_stats::{OpStatsCollector, timed_section},
+        rss::total_memory_bytes,
+    },
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
@@ -1746,6 +1748,9 @@ impl ChunkReader for PrefetchedChunks {
 /// Most bytes a take fetches ahead for one superfile; past this it streams
 /// row group by row group as before.
 const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Take prefetch spans this close share one read: fewer GETs for a few
+/// unrequested bytes (f06 on 100B: 1.88M → 1.45M GETs at 128 KiB).
+const TAKE_PREFETCH_GAP_BYTES: u64 = 128 * 1024;
 /// Spans of one superfile's take prefetch in flight at once.
 const TAKE_PREFETCH_CONCURRENCY: usize = 16;
 /// The share of the host's memory every take's prefetch together may hold.
@@ -1769,7 +1774,7 @@ fn take_prefetch_budget() -> &'static Semaphore {
 
 /// The column chunks of the `roots` columns (top-level, as the Arrow
 /// schema numbers them) in every row group `sorted` (ascending, distinct
-/// rows) falls in, merged where they touch: the bytes a take's decode reads,
+/// rows) falls in, merged where at most `gap` bytes apart: the bytes a take's decode reads,
 /// so they can be fetched at once instead of one row group after another. A
 /// nested root contributes every leaf under it. `None` when they come to
 /// more than `max_bytes` ([`TAKE_PREFETCH_MAX_BYTES`]) or a root is not in
@@ -1779,6 +1784,7 @@ fn take_prefetch_spans(
     sorted: &[u32],
     roots: &[usize],
     max_bytes: u64,
+    gap: u64,
 ) -> Option<Vec<Range<u64>>> {
     let descr = metadata.file_metadata().schema_descr();
     if roots
@@ -1819,7 +1825,7 @@ fn take_prefetch_spans(
     let mut merged: Vec<Range<u64>> = Vec::with_capacity(spans.len());
     for span in spans {
         match merged.last_mut() {
-            Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+            Some(last) if span.start <= last.end + gap => last.end = last.end.max(span.end),
             _ => merged.push(span),
         }
     }
@@ -2016,8 +2022,14 @@ pub(crate) async fn take_rows_byte_source(
     let mut prefetched = Vec::new();
     // Held until the decode is done: the prefetched bytes live that long.
     let mut _room = None;
-    if let Some(spans) = take_prefetch_spans(&metadata, &sorted, &roots, TAKE_PREFETCH_MAX_BYTES)
-        .filter(|s| !s.is_empty())
+    if let Some(spans) = take_prefetch_spans(
+        &metadata,
+        &sorted,
+        &roots,
+        TAKE_PREFETCH_MAX_BYTES,
+        TAKE_PREFETCH_GAP_BYTES,
+    )
+    .filter(|s| !s.is_empty())
     {
         let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
         _room = Some(
@@ -2527,8 +2539,8 @@ mod tests {
         assert_eq!(metadata.num_row_groups(), 10);
 
         let rows = [5u32, 150, 151, 950];
-        let spans =
-            take_prefetch_spans(&metadata, &rows, &[0, 2], TAKE_PREFETCH_MAX_BYTES).expect("spans");
+        let spans = take_prefetch_spans(&metadata, &rows, &[0, 2], TAKE_PREFETCH_MAX_BYTES, 0)
+            .expect("spans");
         let covered = |(offset, len): (u64, u64)| {
             spans
                 .iter()
@@ -2552,11 +2564,22 @@ mod tests {
             !covered(metadata.row_group(0).column(1).byte_range()),
             "an unprojected column is not fetched"
         );
-        assert!(take_prefetch_spans(&metadata, &rows, &[3], TAKE_PREFETCH_MAX_BYTES).is_none());
+        assert!(take_prefetch_spans(&metadata, &rows, &[3], TAKE_PREFETCH_MAX_BYTES, 0).is_none());
         // Past the limit there is no prefetch: the take streams instead.
         let need: u64 = spans.iter().map(|r| r.end - r.start).sum();
-        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need).is_some());
-        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need - 1).is_none());
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need, 0).is_some());
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need - 1, 0).is_none());
+        // Spans within the gap share one read, the bytes between included.
+        assert!(spans.len() > 1);
+        let one = take_prefetch_spans(
+            &metadata,
+            &rows,
+            &[0, 2],
+            TAKE_PREFETCH_MAX_BYTES,
+            u64::MAX / 2,
+        )
+        .expect("spans");
+        assert_eq!(one, vec![spans[0].start..spans[spans.len() - 1].end]);
     }
 
     /// With the page index loaded, a take's prefetch covers only the pages
@@ -2585,7 +2608,7 @@ mod tests {
 
         let rows = [5u32, 37, 150];
         let spans =
-            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES).expect("spans");
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
         let covered = |offset: u64, len: u64| {
             spans
                 .iter()
@@ -2690,13 +2713,15 @@ mod tests {
                 .any(|s| s.start <= offset && offset + len <= s.end)
         };
 
-        let b = take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES).expect("spans");
+        let b =
+            take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
         assert!(covered(&b, 2), "b is leaf 2");
         assert!(!covered(&b, 1), "s.y is not projected");
-        let s = take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES).expect("spans");
+        let s =
+            take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
         assert!(covered(&s, 0) && covered(&s, 1), "both leaves of s");
         assert!(!covered(&s, 2), "b is not projected");
-        assert!(take_prefetch_spans(&metadata, &[3], &[2], TAKE_PREFETCH_MAX_BYTES).is_none());
+        assert!(take_prefetch_spans(&metadata, &[3], &[2], TAKE_PREFETCH_MAX_BYTES, 0).is_none());
     }
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.
@@ -3735,14 +3760,18 @@ mod tests {
         };
         let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
         let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("cache");
-        let consumer = Supertable::open(
-            default_supertable_options()
-                .with_storage(storage)
-                .with_disk_cache(Arc::clone(&cache)),
-        )
-        .expect("open consumer");
+        // A fresh handle per take, so the second finds only what the disk
+        // cache kept, not what the first handle holds in memory.
+        let open = || {
+            Supertable::open(
+                default_supertable_options()
+                    .with_storage(Arc::clone(&storage))
+                    .with_disk_cache(Arc::clone(&cache)),
+            )
+            .expect("open consumer")
+        };
         let take = || {
-            consumer
+            open()
                 .reader()
                 .expect("reader")
                 .bm25_search(
@@ -3760,7 +3789,7 @@ mod tests {
         assert_eq!(take(), first);
         // The FTS subsection is read through, never kept, by design; what the
         // take read is kept.
-        let reader = consumer.reader().expect("reader");
+        let reader = open().reader().expect("reader");
         let entry = &reader.manifest().superfiles[0];
         let (fts_at, fts_len) = entry
             .subsection_offsets
