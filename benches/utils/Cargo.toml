@@ -48,7 +48,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "fs", 
 # reqwest — blocking HTTPS for release download, /health poll, and CreateBucket.
 # sha2 / hmac / hex — verify upstream SHA256SUMS and sign SigV4 CreateBucket.
 rcgen = "0.14"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "blocking"] }
 sha2 = "0.10"
 hmac = "0.12"
