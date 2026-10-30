@@ -5152,8 +5152,15 @@ mod tests {
                         .await
                         .expect("cursor set");
                     let hits = r
-                        .search_or_range_prebuilt(&set, 10, 0, r.n_docs(), f32::NEG_INFINITY)
+                        .search_or_range_prebuilt_in_blob_ids(
+                            &set,
+                            10,
+                            0,
+                            r.n_docs(),
+                            f32::NEG_INFINITY,
+                        )
                         .expect("ranged search");
+                    let hits = r.hits_to_rows_async(hits).await.expect("translate");
                     sorted(hits.into_iter().map(|(row, _)| row.get()))
                 }
                 "term-index head" => {

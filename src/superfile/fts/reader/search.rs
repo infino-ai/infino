@@ -3771,7 +3771,7 @@ mod tests {
         let per_page = (DOC_MAP_PAGE_BYTES / DOC_MAP_ENTRY_BYTES) as u32;
         let last_page = (N_DOCS - 1) / per_page;
         assert!(
-            N_DOCS % per_page != 0,
+            !N_DOCS.is_multiple_of(per_page),
             "the map's last page must be shorter than the rest"
         );
         let row = |id: u32| RowId::new(order[id as usize]);
