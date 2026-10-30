@@ -613,6 +613,9 @@ impl ManifestSnapshot {
             partition_strategy: strategy,
             vector_index_storage_prefix,
             companions,
+            // A list built from the options starts a table no writer has
+            // fenced; the commit path carries the fence past it.
+            writer_fence: 0,
             global_vector_index: None,
             drained_ranges: Default::default(),
             deleted_user_ids_inline: None,
@@ -1412,6 +1415,19 @@ impl ManifestSnapshot {
         let Some(list_to_write) = self.list.as_ref() else {
             return Ok(());
         };
+        // A writer replaced by one holding a higher fence token publishes
+        // nothing. The list carries the fence of the manifest it succeeds,
+        // and the pointer swap below goes through only while that manifest
+        // is still current, so the check holds at the moment of publishing:
+        // a fence raised in between makes the swap lose, and the retry
+        // rebuilds on the fenced manifest and is refused here.
+        let writer_fence = self.superfile_list.options.writer_fence();
+        if list_to_write.writer_fence > writer_fence {
+            return Err(CommitError::Fenced {
+                table_fence: list_to_write.writer_fence,
+                writer_fence,
+            });
+        }
         // Step 1+2: parallel write of (list, parts). `parts_to_write` is
         // every object the touched parts publish, by key: the parts, their
         // routing siblings and their summaries sections
@@ -1771,6 +1787,17 @@ impl ManifestSnapshot {
             stamped_schema: self.stamped_schema.clone(),
             derived_length_totals: Arc::clone(&self.derived_length_totals),
         }
+    }
+
+    /// The fence the table's list records (see `Supertable::fence`); 0 when
+    /// no writer has fenced the table, and on a manifest with no list.
+    pub(crate) fn writer_fence(&self) -> u64 {
+        self.list.as_ref().map_or(0, |list| list.writer_fence)
+    }
+
+    /// A successor that records `token` as the table's fence.
+    pub(crate) fn with_writer_fence(&self, token: u64) -> Self {
+        self.with_list_edited(true, |list| list.writer_fence = token)
     }
 
     /// The manifest's term-index root reference, when one has been built.
@@ -2850,6 +2877,9 @@ impl ManifestSnapshot {
             // Set at create and carried on every commit after; a hidden
             // table never has any, so nothing to guard here.
             companions: self.companions(),
+            // Carried on every commit, so the check in `write` compares a
+            // writer against the fence of the manifest this one succeeds.
+            writer_fence: self.writer_fence(),
             global_vector_index: self.get_global_vector_index(),
             deleted_user_ids_inline: self
                 .list
@@ -6589,6 +6619,7 @@ mod tests {
                 },
                 vector_index_storage_prefix: None,
                 companions: Default::default(),
+                writer_fence: 0,
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -7436,6 +7467,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7624,6 +7656,7 @@ mod tests {
                 },
                 vector_index_storage_prefix: None,
                 companions: Default::default(),
+                writer_fence: 0,
                 deleted_user_ids_inline: None,
                 slow_vector_state_uri: None,
                 slow_vector_state_content_hash: None,
@@ -7769,6 +7802,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -7850,6 +7884,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: Some("slow-vector-state/state-abc.bin".into()),
             slow_vector_state_content_hash: Some(ContentHash([7u8; 32])),
@@ -8458,6 +8493,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: slow_uri,
             slow_vector_state_content_hash: slow_hash,
@@ -8674,6 +8710,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9198,6 +9235,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9377,6 +9415,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9540,6 +9579,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9757,6 +9797,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -9868,6 +9909,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10006,6 +10048,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10134,6 +10177,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10280,6 +10324,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10436,6 +10481,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10606,6 +10652,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10842,6 +10889,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -10950,6 +10998,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11074,6 +11123,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11223,6 +11273,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11369,6 +11420,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11467,6 +11519,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11584,6 +11637,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -11728,6 +11782,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,

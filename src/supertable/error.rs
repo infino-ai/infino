@@ -39,6 +39,11 @@ pub enum BuildError {
     #[error("no documents to build")]
     NoDocsToBuild,
 
+    /// The commit was refused because the table is fenced past this writer
+    /// (see [`CommitError::Fenced`]).
+    #[error("the table is fenced at {table_fence}; this writer holds fence {writer_fence}")]
+    Fenced { table_fence: u64, writer_fence: u64 },
+
     #[error(
         "hydrate requires a SQL-only table with no index; this table declares \
          {fts} full-text and {vector} vector column(s). Use `append` for an \
@@ -214,6 +219,12 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    /// True when the build's commit was refused because the table is fenced
+    /// past this writer.
+    pub(crate) fn is_fenced(&self) -> bool {
+        matches!(self, BuildError::Fenced { .. })
+    }
+
     /// The over-budget message if this is a budget refusal, else `None`.
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {
@@ -303,6 +314,13 @@ impl From<CommitError> for BuildError {
             CommitError::SchemaMoved { expected, current } => {
                 BuildError::SchemaMoved { expected, current }
             }
+            CommitError::Fenced {
+                table_fence,
+                writer_fence,
+            } => BuildError::Fenced {
+                table_fence,
+                writer_fence,
+            },
             other if other.is_conflict() => BuildError::WriteContention,
             other if other.is_permission_denied() => {
                 BuildError::PermissionDenied(other.to_string())
@@ -366,9 +384,26 @@ pub enum CommitError {
 
     #[error("the table's schema moved from {expected} to {current} under this commit")]
     SchemaMoved { expected: u32, current: u32 },
+
+    /// The table is fenced past this writer: a writer holding a higher
+    /// fence token raised it (see `Supertable::fence`), so this writer has
+    /// been replaced. Not retryable: nothing this writer does lets it commit
+    /// again.
+    #[error("the table is fenced at {table_fence}; this writer holds fence {writer_fence}")]
+    Fenced { table_fence: u64, writer_fence: u64 },
 }
 
 impl CommitError {
+    /// True when the commit was refused because the table is fenced past
+    /// this writer.
+    pub(crate) fn is_fenced(&self) -> bool {
+        match self {
+            CommitError::Fenced { .. } => true,
+            CommitError::Build(b) => b.is_fenced(),
+            _ => false,
+        }
+    }
+
     /// True when the commit failed because a concurrent writer won the
     /// pointer / part CAS, so reissuing against fresh state can succeed.
     ///

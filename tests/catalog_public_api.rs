@@ -25,7 +25,7 @@ use infino::{
     BoolMode, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
     arrow_array::{
         Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
-        UInt64Array,
+        StringViewArray, UInt64Array,
     },
     arrow_schema::{DataType, Field, Schema, SchemaRef},
     connect,
@@ -898,4 +898,130 @@ fn a_memory_connection_refuses_companions() {
         .expect_err("no storage, no companion");
     assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
     assert!(db.list_tables().expect("list").is_empty());
+}
+
+// ---- Writer fencing ----
+
+/// The fence token of the writer being replaced, and of its replacement.
+const OLD_WRITER_FENCE: u64 = 1;
+const NEW_WRITER_FENCE: u64 = 2;
+/// Where under a table a delete or update writes before its commit: the
+/// WAL documents, and each superfile's tombstone sidecar.
+const WAL_DIR: &str = "wal";
+const SIDECAR_DIR: &str = "superfiles";
+const SIDECAR_EXTENSION: &str = "tombstones";
+
+/// Files a delete or update has written under the table at `root` ahead of
+/// its commit: WAL documents and tombstone sidecars.
+fn mutation_files(root: &Path) -> usize {
+    let table = table_dir(root);
+    let wal = table.join(WAL_DIR);
+    let wal_files = if wal.is_dir() { files_under(&wal) } else { 0 };
+    let sidecars = fs::read_dir(table.join(SIDECAR_DIR)).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == SIDECAR_EXTENSION))
+            .count()
+    });
+    wal_files + sidecars
+}
+
+/// Every `title` across `batches`, sorted.
+fn sorted_titles(batches: &[RecordBatch]) -> Vec<String> {
+    let mut titles = Vec::new();
+    for batch in batches {
+        let column = batch.column(batch.schema().index_of("title").expect("title projected"));
+        for i in 0..batch.num_rows() {
+            let title = if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+                arr.value(i)
+            } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+                arr.value(i)
+            } else {
+                column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("title is utf8")
+                    .value(i)
+            };
+            titles.push(title.to_string());
+        }
+    }
+    titles.sort();
+    titles
+}
+
+/// Two connections to one table stand for two processes: the writer that
+/// fenced lower is refused on every write once the other fences higher,
+/// with nothing it was refused for reaching the table, while the new
+/// writer and its readers carry on. A writer that never fenced is refused
+/// too, and neither writer can lower a fence.
+#[test]
+fn a_fenced_writer_is_refused_and_writes_nothing() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    let old_db = connect(&uri).expect("connect");
+    let old = old_db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    old.append(&title_batch(&["alpha", "bravo"]))
+        .expect("append");
+    old.fence(OLD_WRITER_FENCE).expect("old writer fences");
+    old.append(&title_batch(&["charlie"]))
+        .expect("the fenced-in writer writes");
+
+    let new_db = connect(&uri).expect("second connection");
+    let new = new_db.open_table("docs").expect("open_table");
+    new.fence(NEW_WRITER_FENCE).expect("new writer takes over");
+
+    let fenced = |result: Result<(), InfinoError>, what: &str| match result {
+        Err(InfinoError::Fenced(_)) => {}
+        other => panic!("{what}: expected Fenced, got {other:?}"),
+    };
+    fenced(old.append(&title_batch(&["delta"])), "append");
+    fenced(
+        old.delete(col("title").eq(lit("alpha"))).map(|_| ()),
+        "delete",
+    );
+    fenced(
+        old.update(
+            col("title").eq(lit("bravo")),
+            &title_batch(&["bravo again"]),
+        )
+        .map(|_| ()),
+        "update",
+    );
+    assert_eq!(
+        mutation_files(dir.path()),
+        0,
+        "a refused delete or update writes no WAL and no tombstone, so no \
+         recovery sweep can finish it later"
+    );
+    fenced(old.fence(OLD_WRITER_FENCE), "re-fence below the table");
+    fenced(new.fence(OLD_WRITER_FENCE), "lower the handle's own fence");
+    new.fence(NEW_WRITER_FENCE)
+        .expect("the table's own fence again commits nothing");
+
+    let unfenced = connect(&uri)
+        .expect("third connection")
+        .open_table("docs")
+        .expect("open_table");
+    fenced(unfenced.append(&title_batch(&["echo"])), "unfenced append");
+
+    new.append(&title_batch(&["foxtrot"]))
+        .expect("the new writer writes");
+    assert_eq!(
+        sorted_titles(&new_db.query_sql("SELECT title FROM docs").expect("sql")),
+        ["alpha", "bravo", "charlie", "foxtrot"]
+    );
+}
+
+/// A table without storage has nothing to fence.
+#[test]
+fn a_memory_table_refuses_a_fence() {
+    let db = connect("memory://").expect("connect");
+    let docs = db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    let err = docs.fence(OLD_WRITER_FENCE).expect_err("no storage");
+    assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
 }

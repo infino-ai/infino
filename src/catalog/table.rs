@@ -102,6 +102,7 @@ pub(crate) trait Table: Send + Sync {
     fn reindex_plan(&self, opts: &ReindexOptions) -> Result<Vec<PlannedRepair>, ReindexError>;
     fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError>;
     fn companion(&self, purpose: &str) -> Result<Option<Supertable>, InfinoError>;
+    fn fence(&self, token: u64) -> Result<(), InfinoError>;
     fn apply_schema(
         &self,
         patch: &SchemaPatch,
@@ -240,6 +241,9 @@ impl Table for SupertableHandle {
         SupertableHandle::companion(self, purpose)
             .map(|found| found.map(Supertable::from_local))
             .map_err(|e| InfinoError::from(e).with_context("companion", None))
+    }
+    fn fence(&self, token: u64) -> Result<(), InfinoError> {
+        SupertableHandle::fence(self, token)
     }
     fn apply_schema(
         &self,
@@ -647,6 +651,31 @@ impl Supertable {
     /// Garbage-collect orphaned superfiles older than `safety_gap`.
     pub fn gc(&self, safety_gap: Duration) -> Result<GcReport, GcError> {
         self.inner.gc(safety_gap)
+    }
+
+    /// Take over this table's writes with fence `token`, for a system that
+    /// moves a table's writer from one process to another: the new writer
+    /// fences with a token higher than the old one's, and from then on every
+    /// commit from a writer holding a lower token is refused with
+    /// [`InfinoError::Fenced`], whatever it had in flight.
+    ///
+    /// - The table records the highest token raised; raising it is a
+    ///   commit, and the token it already records commits nothing.
+    /// - A commit is checked against the version its publish replaces, so a
+    ///   fence raised while a commit was being built still stops it.
+    /// - A writer that has not fenced holds 0: once a table is fenced, every
+    ///   writer fences before it writes. The token is held by this handle;
+    ///   a handle opened again holds none until it fences again.
+    /// - A token below the table's, or below this handle's, is refused.
+    /// - A delete or update is refused before it writes anything when its
+    ///   writer is fenced. One already writing when the fence is raised is
+    ///   not undone: the deleted rows' marks land before the commit that
+    ///   records them, and the recovery sweep completes what it left.
+    ///
+    /// Needs a table on storage; a memory table and a hosted table return
+    /// [`InfinoError::Unsupported`].
+    pub fn fence(&self, token: u64) -> Result<(), InfinoError> {
+        self.inner.fence(token)
     }
 
     /// The hidden companion table of `purpose` beside this table, as

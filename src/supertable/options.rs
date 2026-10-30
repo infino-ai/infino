@@ -53,7 +53,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -565,6 +568,12 @@ pub struct SupertableOptions {
     /// again. Superfiles are immutable, so a damaged sidecar stays damaged;
     /// this outlives any one reader, which the cache can evict or stream.
     pub(crate) damaged_id_sidecars: Arc<Mutex<HashSet<SuperfileUri>>>,
+    /// The fence token this process's writers hold on the table, raised by
+    /// `Supertable::fence`; 0 until then. Every manifest write checks it
+    /// against the fence the table's list records, and a commit whose list
+    /// records a higher one is refused. Runtime state, shared by every
+    /// handle on the options; not part of the options hash.
+    pub(crate) writer_fence: Arc<AtomicU64>,
     /// Rows per Parquet row group in the superfiles this table writes, in
     /// place of the builder's default, so a test reaches several row groups
     /// with a few thousand rows.
@@ -911,6 +920,7 @@ impl SupertableOptions {
             centroid_router_build_lock: Arc::new(TokioMutex::new(())),
             gapped_id_placement_cache: Arc::new(TokioMutex::new(GappedIdPlacementCache::default())),
             damaged_id_sidecars: Arc::new(Mutex::new(HashSet::new())),
+            writer_fence: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             row_group_size: None,
             user_centroid_cache: Arc::new(TokioMutex::new(None)),
@@ -935,6 +945,18 @@ impl SupertableOptions {
             hidden_cell_count: None,
             companions: Vec::new(),
         })
+    }
+
+    /// The fence token this process's writers hold on the table; 0 when
+    /// they hold none.
+    pub(crate) fn writer_fence(&self) -> u64 {
+        self.writer_fence.load(Ordering::Acquire)
+    }
+
+    /// Raise the token this process's writers hold to `token`, never
+    /// lowering it. Returns the token held before.
+    pub(crate) fn raise_writer_fence(&self, token: u64) -> u64 {
+        self.writer_fence.fetch_max(token, Ordering::AcqRel)
     }
 
     /// Resolve the effective partition strategy for this

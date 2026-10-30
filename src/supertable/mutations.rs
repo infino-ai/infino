@@ -208,9 +208,25 @@ pub enum MutationError {
     /// committed after that snapshot).
     #[error("failed to refresh to the latest manifest for target resolution: {0}")]
     TargetResolve(#[source] ManifestLoadError),
+
+    /// The table is fenced past this writer, found before the mutation
+    /// wrote anything: no WAL, sidecar bit or manifest was touched.
+    #[error("the table is fenced at {table_fence}; this writer holds fence {writer_fence}")]
+    Fenced { table_fence: u64, writer_fence: u64 },
 }
 
 impl MutationError {
+    /// True when the mutation was refused because the table is fenced past
+    /// this writer, before it started or at one of its commits.
+    pub(crate) fn is_fenced(&self) -> bool {
+        match self {
+            MutationError::Fenced { .. } => true,
+            MutationError::AppendPhase(e) => e.is_fenced(),
+            MutationError::TombstonePhase(e) => e.is_fenced(),
+            _ => false,
+        }
+    }
+
     /// The over-budget message if a budget-refused predicate eval caused this,
     /// else `None`. The append phase isn't budget-gated, so it never carries one.
     pub(crate) fn over_budget(&self) -> Option<&str> {
@@ -328,6 +344,15 @@ pub enum CommitError {
 }
 
 impl CommitError {
+    /// True when the commit was refused because the table is fenced past
+    /// this writer. On `PartialCommit` this reports the cause of the stop.
+    pub(crate) fn is_fenced(&self) -> bool {
+        match self {
+            CommitError::AppendFlush(b) => b.is_fenced(),
+            CommitError::PartialCommit { cause, .. } => cause.is_fenced(),
+        }
+    }
+
     /// The over-budget message if the append flush, or a buffered mutation's
     /// predicate eval, was budget-refused, else `None`.
     pub(crate) fn over_budget(&self) -> Option<&str> {

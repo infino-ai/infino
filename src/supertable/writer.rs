@@ -2044,6 +2044,22 @@ impl SupertableWriter {
         }
     }
 
+    /// Refuse a mutation before it writes anything when the table is fenced
+    /// past this writer. Resolving the mutation's targets read the newest
+    /// manifest, so a fence raised by then is seen here without another
+    /// read; one raised later is caught at the mutation's commits.
+    fn refuse_if_fenced(&self) -> Result<(), MutationError> {
+        let writer_fence = self.inner.options.writer_fence();
+        let table_fence = self.inner.manifest.load().writer_fence();
+        if table_fence > writer_fence {
+            return Err(MutationError::Fenced {
+                table_fence,
+                writer_fence,
+            });
+        }
+        Ok(())
+    }
+
     /// Drive one pending update entry through its full WAL
     /// pipeline. Returns the per-op outcome on success.
     fn drive_one_update(&self, entry: &PendingUpdateEntry) -> Result<MutationStats, MutationError> {
@@ -2054,6 +2070,7 @@ impl SupertableWriter {
             .as_ref()
             .ok_or(MutationError::NoStorageAttached)?
             .clone();
+        self.refuse_if_fenced()?;
 
         let wal_doc = self.update_wal_doc(entry, Utc::now());
 
@@ -2207,6 +2224,7 @@ impl SupertableWriter {
             .as_ref()
             .ok_or(MutationError::NoStorageAttached)?
             .clone();
+        self.refuse_if_fenced()?;
 
         let wal_doc = self.delete_wal_doc(entry, Utc::now());
 

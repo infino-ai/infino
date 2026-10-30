@@ -40,6 +40,7 @@ Supertable::append_rows	exempt	the bindings' append(rows) routes record input th
 Supertable::append_rows_named	exempt	the bindings' append_named(rows, source) routes record input through it; one public method per binding
 Supertable::apply_schema	exempt	the bindings change a named table's schema through the connection's `schema(name, patch, expected_schema_id)` overload; this handle form exists for companion tables, which have no catalog name, and the bindings create no companions
 Supertable::companion	exempt	companion tables are declared through the Rust IndexSpec for embedders that keep their own state beside a table; the bindings create no companions, so there is none to reach
-Supertable::hydrate	exempt	experimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
+Supertable::fence	exempt	Rust-embedder API for a system that hands a table's writes from one process to another; the bindings run one writer per table and have no takeover to fence
+Supertable::hydrate	exemptexperimental SQL-only bulk-load; engine-only, not yet wrapped in bindings
 Supertable::tokenize	exempt	How the index reads a text; Rust-embedder API for a caller judging its own texts against a column's terms, not a data operation the bindings wrap.
 Supertable::update_rows	exempt	the bindings' update(predicate, rows) routes record input through it; their public shape is the one update

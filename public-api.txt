@@ -119,6 +119,7 @@ pub infino::InfinoError::Cancelled(alloc::string::String)
 pub infino::InfinoError::Cardinality(alloc::string::String)
 pub infino::InfinoError::Config(alloc::string::String)
 pub infino::InfinoError::Conflict(alloc::string::String)
+pub infino::InfinoError::Fenced(alloc::string::String)
 pub infino::InfinoError::Io(alloc::string::String)
 pub infino::InfinoError::NotFound(alloc::string::String)
 pub infino::InfinoError::OverBudget(alloc::string::String)
@@ -1003,6 +1004,7 @@ pub fn infino::Supertable::companion(&self, &str) -> core::result::Result<core::
 pub fn infino::Supertable::count(&self, &str, &str, infino::BoolMode) -> core::result::Result<u64, infino::InfinoError>
 pub fn infino::Supertable::delete(&self, datafusion_expr::expr::Expr) -> core::result::Result<infino::MutationStats, infino::InfinoError>
 pub fn infino::Supertable::exact_match(&self, &str, &str, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
+pub fn infino::Supertable::fence(&self, u64) -> core::result::Result<(), infino::InfinoError>
 pub fn infino::Supertable::gc(&self, core::time::Duration) -> core::result::Result<infino::GcReport, infino::GcError>
 pub fn infino::Supertable::hybrid_search(&self, &str, &str, infino::BoolMode, &str, &[f32], usize, core::option::Option<&[&str]>) -> core::result::Result<alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, infino::InfinoError>
 pub fn infino::Supertable::hydrate(&self, impl arrow_array::record_batch::RecordBatchReader, usize) -> core::result::Result<usize, infino::InfinoError>

@@ -209,6 +209,12 @@ pub enum AppendPhaseError {
 }
 
 impl AppendPhaseError {
+    /// True when the append phase's commit was refused because the table is
+    /// fenced past this writer.
+    pub(crate) fn is_fenced(&self) -> bool {
+        matches!(self, AppendPhaseError::ManifestCommit(e) if e.is_fenced())
+    }
+
     /// True when the append phase lost a compare-and-set race, so reissuing
     /// the mutation against fresh state can succeed.
     pub(crate) fn is_conflict(&self) -> bool {
@@ -828,6 +834,12 @@ pub enum TombstonePhaseError {
 }
 
 impl TombstonePhaseError {
+    /// True when the phase's manifest stamp was refused because the table is
+    /// fenced past this writer.
+    pub(crate) fn is_fenced(&self) -> bool {
+        matches!(self, TombstonePhaseError::ManifestStamp(e) if e.is_fenced())
+    }
+
     /// True when the tombstone phase lost a race against a concurrent
     /// writer or the compactor, so reissuing the mutation against fresh
     /// state can succeed.

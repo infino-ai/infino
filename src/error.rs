@@ -112,6 +112,16 @@ pub enum InfinoError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// The table is fenced past this writer: a writer holding a higher fence
+    /// token took it over (see [`Supertable::fence`]), so this one's write was
+    /// refused. **Not retryable** — the writer has been replaced, and every
+    /// later write from it is refused the same way. Nothing it was refused
+    /// for was published.
+    ///
+    /// [`Supertable::fence`]: crate::Supertable::fence
+    #[error("fenced: {0}")]
+    Fenced(String),
+
     /// Backend / internal failure that doesn't map to a more specific
     /// variant.
     #[error("backend: {0}")]
@@ -167,6 +177,7 @@ impl InfinoError {
             Self::Query(m) => Self::Query(format!("{prefix}: {m}")),
             Self::OverBudget(m) => Self::OverBudget(format!("{prefix}: {m}")),
             Self::Conflict(m) => Self::Conflict(format!("{prefix}: {m}")),
+            Self::Fenced(m) => Self::Fenced(format!("{prefix}: {m}")),
             Self::Backend(m) => Self::Backend(format!("{prefix}: {m}")),
             Self::Config(m) => Self::Config(format!("{prefix}: {m}")),
             Self::Unsupported(m) => Self::Unsupported(format!("{prefix}: {m}")),
@@ -395,6 +406,9 @@ impl From<SuperfileBuildError> for InfinoError {
 
 impl From<SupertableBuildError> for InfinoError {
     fn from(e: SupertableBuildError) -> Self {
+        if e.is_fenced() {
+            return InfinoError::Fenced(e.to_string());
+        }
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
@@ -449,6 +463,7 @@ impl From<SupertableBuildError> for InfinoError {
             // longer resolves, the same answer the read path gives.
             SupertableBuildError::TableGone => InfinoError::NotFound(message),
             // Decided by the checks above, named here for completeness.
+            SupertableBuildError::Fenced { .. } => InfinoError::Fenced(message),
             SupertableBuildError::OverBudget(_) => InfinoError::OverBudget(message),
             SupertableBuildError::PermissionDenied(_) => InfinoError::PermissionDenied(message),
             // A commit that lost the schema compare-and-set is a lost race like
@@ -471,6 +486,9 @@ impl From<SupertableBuildError> for InfinoError {
 impl From<SupertableCommitError> for InfinoError {
     fn from(e: SupertableCommitError) -> Self {
         let msg = e.to_string();
+        if e.is_fenced() {
+            return InfinoError::Fenced(msg);
+        }
         if e.is_permission_denied() {
             return InfinoError::PermissionDenied(msg);
         }
@@ -500,6 +518,9 @@ impl From<OpenError> for InfinoError {
 impl From<MutationError> for InfinoError {
     fn from(e: MutationError) -> Self {
         let msg = e.to_string();
+        if e.is_fenced() {
+            return InfinoError::Fenced(msg);
+        }
         if e.is_conflict() {
             return InfinoError::Conflict(msg);
         }
@@ -524,6 +545,9 @@ impl From<MutationError> for InfinoError {
 
 impl From<MutationCommitError> for InfinoError {
     fn from(e: MutationCommitError) -> Self {
+        if e.is_fenced() {
+            return InfinoError::Fenced(e.to_string());
+        }
         if let Some(msg) = e.over_budget() {
             return InfinoError::OverBudget(msg.to_string());
         }
@@ -1159,6 +1183,55 @@ mod tests {
                 SupertableBuildError::NoDocsToBuild
             )),
             InfinoError::Backend(_)
+        ));
+    }
+
+    /// A commit refused for a fence arrives as `Fenced` on every write path,
+    /// never as the retryable `Conflict`: a replaced writer that retried
+    /// would be refused forever.
+    #[test]
+    fn a_fenced_commit_maps_to_fenced_on_every_write_path() {
+        let fenced = || SupertableCommitError::Fenced {
+            table_fence: 2,
+            writer_fence: 1,
+        };
+        assert!(matches!(
+            InfinoError::from(fenced()),
+            InfinoError::Fenced(_)
+        ));
+        // `append`: writer flush → commit refused.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::AppendFlush(
+                SupertableBuildError::from(fenced())
+            )),
+            InfinoError::Fenced(_)
+        ));
+        // `update`: the append phase's manifest commit refused.
+        assert!(matches!(
+            InfinoError::from(MutationError::AppendPhase(
+                AppendPhaseError::ManifestCommit(Box::new(fenced()))
+            )),
+            InfinoError::Fenced(_)
+        ));
+        // `delete`: the tombstone-seq stamp refused, mid-commit.
+        assert!(matches!(
+            InfinoError::from(MutationCommitError::PartialCommit {
+                committed_wal_ids: Vec::new(),
+                committed: 0,
+                total: 1,
+                cause: Box::new(MutationError::TombstonePhase(
+                    TombstonePhaseError::ManifestStamp(Box::new(fenced()))
+                )),
+            }),
+            InfinoError::Fenced(_)
+        ));
+        // `delete` / `update` refused before writing anything.
+        assert!(matches!(
+            InfinoError::from(MutationError::Fenced {
+                table_fence: 2,
+                writer_fence: 1,
+            }),
+            InfinoError::Fenced(_)
         ));
     }
 

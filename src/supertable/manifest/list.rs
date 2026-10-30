@@ -164,6 +164,12 @@ pub struct Manifest {
     /// every other table, and then absent from the wire, so a list without
     /// companions encodes exactly as before the field existed.
     pub companions: BTreeMap<String, String>,
+    /// The highest fence token a writer has raised on this table
+    /// (`Supertable::fence`): a commit from a writer holding a lower one is
+    /// refused. Carried on every commit after. 0 on a table no writer has
+    /// fenced, and then absent from the wire, so its list encodes exactly as
+    /// before the field existed.
+    pub writer_fence: u64,
     /// Global vector cell-index coordination state, owned by THIS (the user)
     /// table. Source of truth for the immutable cell grids trained from the
     /// first committed batch: `grid` at `hidden_cell_count` cells (read
@@ -1508,6 +1514,8 @@ struct ManifestDto {
     vector_index_storage_prefix: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     companions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer_fence: Option<u64>,
     #[serde(default)]
     deleted_user_ids_inline_b64: Option<String>, // base64 of encoded id set
     #[serde(default)]
@@ -2146,6 +2154,7 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
         partition_strategy: strategy_to_dto(&l.partition_strategy),
         vector_index_storage_prefix: l.vector_index_storage_prefix.clone(),
         companions: l.companions.clone(),
+        writer_fence: (l.writer_fence > 0).then_some(l.writer_fence),
         global_vector_index: l
             .global_vector_index
             .as_ref()
@@ -2231,6 +2240,7 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
         partition_strategy: strategy_from_dto(d.partition_strategy)?,
         vector_index_storage_prefix: d.vector_index_storage_prefix,
         companions: d.companions,
+        writer_fence: d.writer_fence.unwrap_or(0),
         global_vector_index: d
             .global_vector_index
             .map(|g| -> Result<GlobalVectorIndex, ListParseError> {
@@ -3126,6 +3136,7 @@ mod tests {
             },
             vector_index_storage_prefix: None,
             companions: Default::default(),
+            writer_fence: 0,
             deleted_user_ids_inline: None,
             slow_vector_state_uri: None,
             slow_vector_state_content_hash: None,
@@ -4444,6 +4455,32 @@ mod tests {
                 .companions
                 .is_empty()
         );
+    }
+
+    /// A fence token a writer raised, for the round trip below.
+    const RAISED_FENCE: u64 = 7;
+
+    /// A table's fence survives the wire, and a list no writer fenced
+    /// carries no key for it, so it is the bytes it was before the field
+    /// existed and reads back unfenced.
+    #[test]
+    fn writer_fence_roundtrips_and_is_absent_when_unset() {
+        let mut list = empty_list();
+        let without = encode(&list).expect("encode");
+        let v: serde_json::Value = serde_json::from_slice(&without).expect("json");
+        assert!(
+            !v.as_object().expect("object").contains_key("writer_fence"),
+            "an unfenced list writes no key"
+        );
+        assert_eq!(
+            decode(&without, &LegacyNames::none())
+                .expect("decode")
+                .writer_fence,
+            0
+        );
+        list.writer_fence = RAISED_FENCE;
+        let got = decode(&encode(&list).expect("encode"), &LegacyNames::none()).expect("decode");
+        assert_eq!(got.writer_fence, RAISED_FENCE);
     }
 
     /// The schema slot carries the document as JSON and the commit token

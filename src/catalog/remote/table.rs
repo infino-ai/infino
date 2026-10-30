@@ -402,6 +402,14 @@ impl Table for RemoteTable {
         Ok(None)
     }
 
+    fn fence(&self, _token: u64) -> Result<(), InfinoError> {
+        // The hosted side is the table's one writer; there is no other
+        // writer of it for a client to fence off.
+        Err(InfinoError::Unsupported(
+            "fence is not supported over the remote transport".to_string(),
+        ))
+    }
+
     fn apply_schema(
         &self,
         patch: &SchemaPatch,

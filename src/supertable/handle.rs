@@ -47,6 +47,7 @@ use super::{
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
+    InfinoError,
     config::{self, CompactionSteps},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
@@ -78,7 +79,7 @@ use crate::{
             lease::DEFAULT_LEASE_DURATION,
             recovery::{RecoveryError, RecoveryReport, scan_and_recover},
         },
-        writer::{AppendQueue, WriterSlot, builder_options_of},
+        writer::{AppendQueue, WriterSlot, builder_options_of, stamp_with_retries},
     },
     utils::trace::{CloseOut, TableRole, record},
 };
@@ -1128,6 +1129,60 @@ impl Supertable {
     /// ```
     pub fn schema(&self) -> SchemaRef {
         self.inner.manifest.load().user_schema()
+    }
+
+    /// Take over this table's writes with fence `token`: from now on a
+    /// commit from any writer holding a lower token is refused with
+    /// [`InfinoError::Fenced`].
+    ///
+    /// The table records the highest token a writer has raised. A commit is
+    /// published only while its writer holds a token at least that high,
+    /// checked against the manifest its pointer swap replaces, so a fence
+    /// raised between building a commit and publishing it is never crossed.
+    /// A writer that has not fenced holds 0, so once a table is fenced every
+    /// writer fences before it writes. The token is held by this table
+    /// handle; a handle opened again holds none until it fences again.
+    ///
+    /// Raising the fence is itself a commit. The token the table already
+    /// records commits nothing. A token below the table's, or below the one
+    /// this handle holds, is refused.
+    ///
+    /// A delete or update is refused before it writes anything when the
+    /// table is fenced past its writer. One already writing when the fence
+    /// is raised is not undone: its tombstone bits land before the commit
+    /// that records them, and the recovery sweep completes what it left.
+    pub fn fence(&self, token: u64) -> Result<(), InfinoError> {
+        let storage = self.inner.options.storage.clone().ok_or_else(|| {
+            InfinoError::Unsupported("fencing needs a table on storage".to_string())
+                .with_context("fence", None)
+        })?;
+        let held = self.inner.options.raise_writer_fence(token);
+        if held > token {
+            return Err(InfinoError::Fenced(format!(
+                "this writer already holds fence {held}, past {token}"
+            ))
+            .with_context("fence", None));
+        }
+        // The decision is taken against the newest manifest, so a fence
+        // another process raised is seen before this one compares to it.
+        self.block_on_query(self.refresh())
+            .map_err(|e| InfinoError::from(e).with_context("fence", None))?;
+        self.block_on_query(stamp_with_retries(
+            &self.inner,
+            &storage,
+            "writer fence",
+            |current| async move {
+                let table_fence = current.writer_fence();
+                if table_fence > token {
+                    return Err(BuildError::Fenced {
+                        table_fence,
+                        writer_fence: token,
+                    });
+                }
+                Ok((table_fence < token).then(|| current.with_writer_fence(token)))
+            },
+        ))
+        .map_err(|e| InfinoError::from(e).with_context("fence", None))
     }
 
     /// Sync→async bridge for the public query surface. Mirrors the
