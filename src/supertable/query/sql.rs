@@ -454,6 +454,17 @@ impl SupertableReader {
         .map_err(QueryError::internal)
     }
 
+    /// Register the pushdown-aware provider over this reader's pinned
+    /// snapshot into `ctx` under `name`.
+    pub(crate) fn register_as(&self, ctx: &SessionContext, name: &str) -> Result<(), QueryError> {
+        // Provider scans the cached string-viewed schema.
+        let provider = self.sql_provider();
+        // Registering the table we just built is ours to get right.
+        ctx.register_table(name, Arc::new(provider))
+            .map_err(QueryError::internal)?;
+        Ok(())
+    }
+
     /// The pushdown-aware provider over this reader's pinned snapshot,
     /// merging value counts through the table's carried sums.
     fn sql_provider(&self) -> SupertableProvider {
@@ -659,11 +670,7 @@ impl Supertable {
         // under Strong, fails rather than serving a stale snapshot), so no
         // separate `ensure_fresh` call is needed here.
         let reader = Arc::new(self.reader().map_err(QueryError::ManifestLoad)?);
-        // Provider scans the cached string-viewed schema.
-        let provider = reader.sql_provider();
-        // Registering the table we just built is ours to get right.
-        ctx.register_table(name, Arc::new(provider))
-            .map_err(QueryError::internal)?;
+        reader.register_as(ctx, name)?;
         Ok(reader)
     }
 

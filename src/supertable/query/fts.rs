@@ -3908,21 +3908,31 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, mode = ?mode, "token_match");
         let close_out = self.close_out();
-        let reader = self.reader()?;
+        let batch = self.token_match_rows(&self.reader()?, column, query, mode, projection)?;
+        close_out.finish(batch.num_rows() as u64);
+        Ok(vec![batch])
+    }
+
+    /// [`Self::token_match`] over `reader`'s snapshot of this table.
+    pub(crate) fn token_match_rows(
+        &self,
+        reader: &SupertableReader,
+        column: &str,
+        query: &str,
+        mode: BoolMode,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch, InfinoError> {
         reader
             .check_projection(projection)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
         let hits = reader
             .token_match(column, query, mode)
             .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
-        let batch = self
-            .block_on_query(
-                resolve_hits_named(&reader, &hits, projection)
-                    .instrument(detail_span!("search.resolve", hits = hits.len())),
-            )
-            .map_err(|e| InfinoError::from(e).with_context("token_match", None))?;
-        close_out.finish(batch.num_rows() as u64);
-        Ok(vec![batch])
+        self.block_on_query(
+            resolve_hits_named(reader, &hits, projection)
+                .instrument(detail_span!("search.resolve", hits = hits.len())),
+        )
+        .map_err(|e| InfinoError::from(e).with_context("token_match", None))
     }
 
     /// Unranked exact match: rows whose `column` value equals `value`
@@ -3961,21 +3971,30 @@ impl Supertable {
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(column, "exact_match");
         let close_out = self.close_out();
-        let reader = self.reader()?;
+        let batch = self.exact_match_rows(&self.reader()?, column, value, projection)?;
+        close_out.finish(batch.num_rows() as u64);
+        Ok(vec![batch])
+    }
+
+    /// [`Self::exact_match`] over `reader`'s snapshot of this table.
+    pub(crate) fn exact_match_rows(
+        &self,
+        reader: &SupertableReader,
+        column: &str,
+        value: &str,
+        projection: Option<&[&str]>,
+    ) -> Result<RecordBatch, InfinoError> {
         reader
             .check_projection(projection)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
         let hits = reader
             .exact_match(column, value)
             .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
-        let batch = self
-            .block_on_query(
-                resolve_hits_named(&reader, &hits, projection)
-                    .instrument(detail_span!("search.resolve", hits = hits.len())),
-            )
-            .map_err(|e| InfinoError::from(e).with_context("exact_match", None))?;
-        close_out.finish(batch.num_rows() as u64);
-        Ok(vec![batch])
+        self.block_on_query(
+            resolve_hits_named(reader, &hits, projection)
+                .instrument(detail_span!("search.resolve", hits = hits.len())),
+        )
+        .map_err(|e| InfinoError::from(e).with_context("exact_match", None))
     }
 
     /// Count documents whose `column` matches `query`'s tokens under

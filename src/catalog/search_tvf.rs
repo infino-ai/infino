@@ -32,7 +32,7 @@ use datafusion::{
     logical_expr::Expr,
 };
 
-use super::Connection;
+use super::{Connection, TableSnapshot};
 #[cfg(feature = "graph-index")]
 use crate::supertable::query::exec::graph_exec::{GraphFunc, Traversal};
 use crate::{
@@ -69,12 +69,30 @@ fn open_table_error(name: &str, e: InfinoError) -> DataFusionError {
     }
 }
 
+/// What a vector or hybrid search over a [`TableSnapshot`] is refused with.
+const NO_VECTOR_SEARCH_ON_A_SNAPSHOT: &str = "vector and hybrid search are not offered on a table \
+     snapshot: the vector index is maintained beside the table and is not held with it";
+
 /// A resolved table's pinned snapshot: the reader the search kernels run
 /// against plus its scalar schema (the TVF's output columns).
 #[derive(Clone)]
 struct ResolvedTable {
     reader: Arc<SupertableReader>,
     scalar_schema: SchemaRef,
+    /// Whether the reader is a [`TableSnapshot`]'s, which serves the
+    /// full-text and match searches only.
+    held: bool,
+}
+
+impl ResolvedTable {
+    /// The table for a vector or hybrid search, which a snapshot does not
+    /// serve.
+    fn for_vector_search(self) -> DfResult<Self> {
+        if self.held {
+            return Err(QueryError::Unsupported(NO_VECTOR_SEARCH_ON_A_SNAPSHOT.to_string()).into());
+        }
+        Ok(self)
+    }
 }
 
 /// Opens catalog tables by name (once per query) for the search TVFs.
@@ -96,10 +114,24 @@ impl fmt::Debug for TableResolver {
 }
 
 impl TableResolver {
-    fn new(conn: Connection) -> Self {
+    /// A resolver over `conn` in which each of `snapshots` answers for the
+    /// table it was taken of.
+    fn new(conn: Connection, snapshots: &[&TableSnapshot]) -> Self {
+        let held = snapshots
+            .iter()
+            .map(|snapshot| {
+                let reader = snapshot.query_reader();
+                let resolved = ResolvedTable {
+                    scalar_schema: reader.manifest().stored_schema(),
+                    reader: Arc::new(reader),
+                    held: true,
+                };
+                (snapshot.table_name().to_string(), resolved)
+            })
+            .collect();
         Self {
             conn,
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(held),
             op_stats: op_stats::current(),
         }
     }
@@ -136,6 +168,7 @@ impl TableResolver {
             // not projectable).
             scalar_schema: reader.manifest().stored_schema(),
             reader: Arc::new(reader),
+            held: false,
         };
         self.cache
             .lock()
@@ -164,9 +197,14 @@ impl TableResolver {
 }
 
 /// Register the catalog search TVFs (table-name-first form) on `ctx`,
-/// resolving tables through `conn`.
-pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
-    let resolver = Arc::new(TableResolver::new(conn));
+/// resolving tables through `conn`, except that each of `snapshots` answers
+/// for the table it was taken of.
+pub(crate) fn register_search_tvfs(
+    ctx: &SessionContext,
+    conn: Connection,
+    snapshots: &[&TableSnapshot],
+) {
+    let resolver = Arc::new(TableResolver::new(conn, snapshots));
     ctx.register_udtf(
         BM25_SEARCH_UDTF,
         Arc::new(Bm25SearchCatalogFunc {
@@ -212,16 +250,19 @@ pub(crate) fn register_search_tvfs(ctx: &SessionContext, conn: Connection) {
 /// form a graph attached from another catalog is served in
 /// (`Connection::attach_graph`), where the edge table is not one the
 /// statement could name. Under one catalog `graph` and `tables` are the
-/// same connection.
+/// same connection. Each of `graph_snapshots` answers for the edge table it
+/// was taken of, and each of `table_snapshots` for the walked table.
 #[cfg(feature = "graph-index")]
 pub(crate) fn register_graph_tvfs(
     ctx: &SessionContext,
     graph: Connection,
     tables: Connection,
     edge_table: Option<String>,
+    graph_snapshots: &[&TableSnapshot],
+    table_snapshots: &[&TableSnapshot],
 ) {
-    let graph = Arc::new(TableResolver::new(graph));
-    let tables = Arc::new(TableResolver::new(tables));
+    let graph = Arc::new(TableResolver::new(graph, graph_snapshots));
+    let tables = Arc::new(TableResolver::new(tables, table_snapshots));
     for traversal in [Traversal::Walk, Traversal::Rank] {
         ctx.register_udtf(
             traversal.name(),
@@ -309,6 +350,7 @@ struct VectorSearchCatalogFunc {
 impl TableFunctionImpl for VectorSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let (t, rest) = self.resolver.split_leading(args.exprs(), "vector_search")?;
+        let t = t.for_vector_search()?;
 
         VectorSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))
@@ -322,6 +364,7 @@ struct HybridSearchCatalogFunc {
 impl TableFunctionImpl for HybridSearchCatalogFunc {
     fn call_with_args(&self, args: TableFunctionArgs) -> DfResult<Arc<dyn TableProvider>> {
         let (t, rest) = self.resolver.split_leading(args.exprs(), "hybrid_search")?;
+        let t = t.for_vector_search()?;
 
         HybridSearchFunc::new(t.reader, t.scalar_schema)
             .call_with_args(TableFunctionArgs::new(rest, args.session()))

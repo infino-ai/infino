@@ -20,6 +20,7 @@ mod options;
 #[cfg(feature = "remote")]
 mod remote;
 mod search_tvf;
+mod snapshot;
 mod table;
 mod uri;
 
@@ -72,6 +73,7 @@ use manifest::{
     TableEntry, VectorEntry, commit_catalog, read_catalog, schema_from_ipc, schema_to_ipc,
 };
 pub use options::{ColdFetchMode, ConnectOptions};
+pub use snapshot::TableSnapshot;
 pub use table::Supertable;
 use tokio::{runtime::Runtime, sync::Semaphore};
 use tracing::{Instrument, debug, info, warn};
@@ -815,6 +817,38 @@ impl Connection {
         Ok(Supertable::from_local(self.open_table_handle(name)?))
     }
 
+    /// Take a snapshot of table `name`: its current version, held for
+    /// reading while later writes land (see [`TableSnapshot`]). Read it with
+    /// its own search methods, or in SQL through [`Self::query_sql_at`].
+    ///
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use infino::arrow_array::{LargeStringArray, RecordBatch};
+    /// # use infino::arrow_schema::{DataType, Field, Schema};
+    /// # use infino::{connect, IndexSpec};
+    /// # let db = connect("memory://")?;
+    /// # let schema = Arc::new(Schema::new(vec![Field::new("body", DataType::LargeUtf8, false)]));
+    /// # let posts = db.create_table("posts", schema.clone(), IndexSpec::new().fts("body"))?;
+    /// # let row = |text: &str| RecordBatch::try_new(
+    /// #     schema.clone(), vec![Arc::new(LargeStringArray::from(vec![text]))]);
+    /// posts.append(&row("first")?)?;
+    /// let snapshot = db.snapshot("posts")?;
+    /// posts.append(&row("second")?)?;
+    /// let rows = db.query_sql_at("SELECT _id FROM posts", &[&snapshot])?;
+    /// assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn snapshot(&self, name: &str) -> Result<TableSnapshot, InfinoError> {
+        #[cfg(feature = "remote")]
+        if let CatalogStore::Remote(_) = &self.inner.store {
+            return Err(InfinoError::Unsupported(
+                "a hosted connection does not take table snapshots".to_string(),
+            )
+            .with_context("snapshot", Some(name)));
+        }
+        TableSnapshot::take(name, self.open_table_handle(name)?)
+    }
+
     /// The schema document of table `name`: its live columns with their
     /// ids, types, nullability and indexes, the field cap, and the
     /// `schema_id` a write can compare against. What this returns is also
@@ -1162,6 +1196,31 @@ impl Connection {
     /// assert!(matches!(result, Err(InfinoError::Cancelled(_))));
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
+    pub fn query_sql_cancellable(
+        &self,
+        sql: &str,
+        cancel: &QueryCancel,
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.run_sql(sql, cancel, &[])
+    }
+
+    /// [`query_sql`](Self::query_sql) reading each of `snapshots` in place of
+    /// the table it was taken of: a `FROM` relation and a search function
+    /// naming that table read the snapshot's version, and every other table
+    /// is read as `query_sql` reads it. `vector_search` and `hybrid_search`
+    /// over a snapshot are refused with [`InfinoError::Unsupported`] (see
+    /// [`TableSnapshot`]), as are two snapshots of one table, with
+    /// [`InfinoError::Query`].
+    pub fn query_sql_at(
+        &self,
+        sql: &str,
+        snapshots: &[&TableSnapshot],
+    ) -> Result<Vec<RecordBatch>, InfinoError> {
+        self.run_sql(sql, &QueryCancel::new(), snapshots)
+    }
+
+    /// The SQL path behind [`Self::query_sql_cancellable`] and
+    /// [`Self::query_sql_at`].
     #[cfg_attr(
         feature = "detailed-tracing",
         // Connection-level entry: no table handle yet, so no `role` — the
@@ -1191,10 +1250,11 @@ impl Connection {
             store_bg_get_bytes = tracing::field::Empty,
         ))
     )]
-    pub fn query_sql_cancellable(
+    fn run_sql(
         &self,
         sql: &str,
         cancel: &QueryCancel,
+        snapshots: &[&TableSnapshot],
     ) -> Result<Vec<RecordBatch>, InfinoError> {
         debug!(sql, "running sql query");
 
@@ -1208,11 +1268,29 @@ impl Connection {
         // one it sees.
         #[cfg(feature = "remote")]
         if let CatalogStore::Remote(c) = &self.inner.store {
+            if !snapshots.is_empty() {
+                return Err(InfinoError::Unsupported(
+                    "a hosted connection does not read table snapshots".to_string(),
+                )
+                .with_context("query_sql", None));
+            }
             return c.query_sql(sql);
         }
 
         // Past the cap the planner aborts instead of erroring; refuse before any planning work.
         ensure_sql_within_connective_cap(sql)?;
+
+        // The tables a snapshot answers for, by name.
+        let mut held: HashMap<&str, &TableSnapshot> = HashMap::new();
+        for snapshot in snapshots {
+            if held.insert(snapshot.table_name(), snapshot).is_some() {
+                return Err(InfinoError::Query(format!(
+                    "two snapshots of table {:?} in one query",
+                    snapshot.table_name()
+                ))
+                .with_context("query_sql", None));
+            }
+        }
 
         // Gate SQL heap on the connection budget: DataFusion allocates the
         // working set (sort / aggregate / join), so its pool is the gate. The
@@ -1242,6 +1320,14 @@ impl Connection {
             if !seen.insert(name.clone()) {
                 continue;
             }
+            if let Some(snapshot) = held.get(name.as_str()) {
+                snapshot
+                    .query_reader()
+                    .register_as(&ctx, &name)
+                    .map_err(|e| InfinoError::from(e).with_context("query_sql", None))?;
+                handles.push(snapshot.table().clone());
+                continue;
+            }
             if let Some(table) = self
                 .open_and_register_cancellable(&ctx, &name, cancel)
                 .map_err(|e| e.with_context("query_sql", None))?
@@ -1253,7 +1339,7 @@ impl Connection {
         // Search TVFs resolve their leading table-name argument through
         // the catalog at call time (so a table named only inside a TVF —
         // not as a `FROM` relation — still resolves).
-        search_tvf::register_search_tvfs(&ctx, self.clone());
+        search_tvf::register_search_tvfs(&ctx, self.clone(), snapshots);
         // The graph functions walk an edge table of this catalog by name, or
         // the one attached from another catalog with no name.
         #[cfg(feature = "graph-index")]
@@ -1276,9 +1362,25 @@ impl Connection {
                                     .to_string(),
                             )
                         })?;
-                    search_tvf::register_graph_tvfs(&ctx, graph, self.clone(), Some(table));
+                    // The edge table is the attached catalog's, which no
+                    // snapshot of this one stands in for.
+                    search_tvf::register_graph_tvfs(
+                        &ctx,
+                        graph,
+                        self.clone(),
+                        Some(table),
+                        &[],
+                        snapshots,
+                    );
                 }
-                None => search_tvf::register_graph_tvfs(&ctx, self.clone(), self.clone(), None),
+                None => search_tvf::register_graph_tvfs(
+                    &ctx,
+                    self.clone(),
+                    self.clone(),
+                    None,
+                    snapshots,
+                    snapshots,
+                ),
             }
         }
         trace::follow_spans_into_datafusion_tasks();

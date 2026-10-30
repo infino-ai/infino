@@ -22,10 +22,11 @@ use std::{
 
 use datafusion::prelude::{col, lit};
 use infino::{
-    BoolMode, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch, Supertable,
+    BoolMode, Connection, FieldPatch, IndexSpec, InfinoError, Metric, OptimizeOptions, SchemaPatch,
+    Supertable,
     arrow_array::{
         Array, FixedSizeListArray, Float32Array, LargeStringArray, RecordBatch, StringArray,
-        UInt64Array,
+        StringViewArray, UInt64Array,
     },
     arrow_schema::{DataType, Field, Schema, SchemaRef},
     connect,
@@ -898,4 +899,216 @@ fn a_memory_connection_refuses_companions() {
         .expect_err("no storage, no companion");
     assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
     assert!(db.list_tables().expect("list").is_empty());
+}
+
+// ---- Table snapshots ----
+
+/// The rows a snapshot is taken over, all in one commit (one superfile).
+const HELD_TITLES: &[&str] = &["alpha", "bravo", "charlie", "echo"];
+/// Deleted before the snapshot, so the superfile has tombstones when it is
+/// taken.
+const DELETED_BEFORE: &str = "echo";
+/// Deleted after the snapshot, from the same superfile: the delete rewrites
+/// the tombstones the snapshot read.
+const DELETED_AFTER: &str = "alpha";
+/// Updated after the snapshot, and what it is updated to.
+const UPDATED: &str = "bravo";
+const UPDATED_TO: &str = "bravo rewritten";
+/// Appended after the snapshot.
+const APPENDED_AFTER: &str = "delta";
+/// A gc safety gap that keeps every file the snapshot reads.
+const KEEP_SNAPSHOT_FILES: Duration = Duration::from_secs(3600);
+
+/// Every `title` across `batches`, sorted.
+fn titles_of(batches: &[RecordBatch]) -> Vec<String> {
+    let mut titles = Vec::new();
+    for batch in batches {
+        let column = batch.column(batch.schema().index_of("title").expect("title projected"));
+        for i in 0..batch.num_rows() {
+            let title = if let Some(arr) = column.as_any().downcast_ref::<LargeStringArray>() {
+                arr.value(i)
+            } else if let Some(arr) = column.as_any().downcast_ref::<StringViewArray>() {
+                arr.value(i)
+            } else {
+                column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("title is utf8")
+                    .value(i)
+            };
+            titles.push(title.to_string());
+        }
+    }
+    titles.sort();
+    titles
+}
+
+/// Sorted owned copies of `titles`.
+fn sorted(titles: &[&str]) -> Vec<String> {
+    let mut titles: Vec<String> = titles.iter().map(|t| t.to_string()).collect();
+    titles.sort();
+    titles
+}
+
+/// A title-only table `docs` holding [`HELD_TITLES`] less [`DELETED_BEFORE`].
+fn held_docs(db: &Connection) -> Supertable {
+    let docs = db
+        .create_table("docs", title_schema(), IndexSpec::new().fts("title"))
+        .expect("create_table");
+    docs.append(&title_batch(HELD_TITLES)).expect("append");
+    docs.delete(col("title").eq(lit(DELETED_BEFORE)))
+        .expect("delete before the snapshot");
+    docs
+}
+
+/// A snapshot holds its version while the table moves on: SQL, the search
+/// functions and the snapshot's own searches all see the rows the table
+/// held when it was taken, not rows appended, deleted or updated since,
+/// and the live table sees the new state.
+#[test]
+fn a_snapshot_reads_its_version_through_later_writes() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let docs = held_docs(&db);
+    let held = sorted(&HELD_TITLES[..3]);
+
+    let snapshot = db.snapshot("docs").expect("snapshot");
+    assert_eq!(snapshot.table_name(), "docs");
+    assert_eq!(
+        db.snapshot("docs").expect("second snapshot").version(),
+        snapshot.version(),
+        "nothing committed in between, so the same version"
+    );
+
+    docs.append(&title_batch(&[APPENDED_AFTER]))
+        .expect("append after");
+    docs.delete(col("title").eq(lit(DELETED_AFTER)))
+        .expect("delete after");
+    docs.update(col("title").eq(lit(UPDATED)), &title_batch(&[UPDATED_TO]))
+        .expect("update after");
+
+    let live = titles_of(&db.query_sql("SELECT title FROM docs").expect("live"));
+    assert_eq!(live, sorted(&["charlie", APPENDED_AFTER, UPDATED_TO]));
+    let read = |sql: &str| titles_of(&db.query_sql_at(sql, &[&snapshot]).expect(sql));
+    assert_eq!(read("SELECT title FROM docs"), held);
+    assert_eq!(
+        read(&format!(
+            "SELECT title FROM token_match('docs', 'title', '{DELETED_AFTER}')"
+        )),
+        vec![DELETED_AFTER.to_string()]
+    );
+    assert!(
+        read(&format!(
+            "SELECT title FROM token_match('docs', 'title', '{APPENDED_AFTER}')"
+        ))
+        .is_empty()
+    );
+
+    let rows = |batches: Vec<RecordBatch>| batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+    assert_eq!(
+        rows(
+            snapshot
+                .token_match("title", DELETED_AFTER, BoolMode::Or, None)
+                .expect("token_match")
+        ),
+        1
+    );
+    assert_eq!(matches(&docs, "title", DELETED_AFTER), 0);
+    assert_eq!(
+        snapshot
+            .count("title", APPENDED_AFTER, BoolMode::Or)
+            .expect("count"),
+        0
+    );
+    assert_eq!(
+        rows(
+            snapshot
+                .exact_match("title", UPDATED, Some(&["title"]))
+                .expect("exact_match")
+        ),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .count("title", DELETED_BEFORE, BoolMode::Or)
+            .expect("count"),
+        0,
+        "a delete the snapshot's version holds stays applied"
+    );
+    assert!(db.snapshot("docs").expect("later snapshot").version() > snapshot.version());
+}
+
+/// Another connection's deletes, a compaction and a gc that keeps the
+/// snapshot's files do not reach a snapshot.
+#[test]
+fn a_snapshot_reads_its_version_through_another_writer_and_a_compaction() {
+    let dir = TempDir::new().expect("tempdir");
+    let uri = dir.path().to_str().expect("utf-8 path").to_string();
+    let db = connect(&uri).expect("connect");
+    let docs = held_docs(&db);
+    docs.append(&title_batch(&[APPENDED_AFTER]))
+        .expect("a second superfile");
+    let snapshot = db.snapshot("docs").expect("snapshot");
+
+    let writer = connect(&uri).expect("second connection");
+    let other = writer.open_table("docs").expect("open_table");
+    other
+        .delete(col("title").eq(lit(DELETED_AFTER)))
+        .expect("delete from the other connection");
+    other
+        .optimize(&OptimizeOptions::default())
+        .expect("optimize");
+    let report = other.gc(KEEP_SNAPSHOT_FILES).expect("gc");
+    assert_eq!(report.delete_errors, 0);
+
+    assert_eq!(
+        titles_of(&writer.query_sql("SELECT title FROM docs").expect("live")),
+        sorted(&["bravo", "charlie", APPENDED_AFTER])
+    );
+    assert_eq!(
+        titles_of(
+            &db.query_sql_at("SELECT title FROM docs", &[&snapshot])
+                .expect("snapshot")
+        ),
+        sorted(&["alpha", "bravo", "charlie", APPENDED_AFTER])
+    );
+}
+
+/// A snapshot does not serve vector search (the vector index is not held
+/// with it), and one query takes one snapshot per table.
+#[test]
+fn a_snapshot_refuses_vector_search_and_a_second_snapshot_of_its_table() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let schema = table_schema();
+    let docs = db
+        .create_table(
+            "docs",
+            schema.clone(),
+            IndexSpec::new()
+                .fts("title")
+                .vector("emb", EMB_DIM, Metric::Cosine),
+        )
+        .expect("create_table");
+    docs.append(&build_batch(schema, FIRST_BATCH, 0))
+        .expect("append");
+    let snapshot = db.snapshot("docs").expect("snapshot");
+
+    let query: Vec<String> = unit_embedding(0).iter().map(f32::to_string).collect();
+    let err = db
+        .query_sql_at(
+            &format!(
+                "SELECT _id FROM vector_search('docs', 'emb', '{}', {SEARCH_TOP_K})",
+                query.join(",")
+            ),
+            &[&snapshot],
+        )
+        .expect_err("vector search over a snapshot");
+    assert!(matches!(err, InfinoError::Unsupported(_)), "got {err:?}");
+
+    let again = db.snapshot("docs").expect("second snapshot");
+    let err = db
+        .query_sql_at("SELECT _id FROM docs", &[&snapshot, &again])
+        .expect_err("two snapshots of one table");
+    assert!(matches!(err, InfinoError::Query(_)), "got {err:?}");
 }

@@ -51,6 +51,11 @@
 //! the manifest the caller pinned instead of the newest one, which is a
 //! change to every lookup's signature rather than to the rule here.
 //!
+//! A reader that must hold its snapshot across commits uses a frozen cache
+//! instead ([`SidecarCache::frozen_at`]): one whose view is its own
+//! manifest's and whose bitmaps were read when it was taken, so neither a
+//! later commit nor a later delete reaches it.
+//!
 //! ## Seal freshness
 //!
 //! Sealing (compaction stamping a [`SealRecord`] onto a sidecar)
@@ -368,6 +373,85 @@ impl SidecarCache {
         );
     }
 
+    /// A cache that answers for `view` alone for as long as it lives: every
+    /// superfile `view` names a sidecar for holds that sidecar's bitmap, and
+    /// every other superfile has none. It never reads storage after this
+    /// call, so a reader pinned to the manifest `view` was taken from keeps
+    /// that manifest's tombstones while later deletes rewrite the sidecars
+    /// (each superfile has one sidecar object, overwritten in place, so a
+    /// later read could not get the earlier bitmap back).
+    ///
+    /// Entries this cache already holds at the seq `view` names are shared;
+    /// the rest are read now, [`Self::prefetch`]'s limit at a time. A
+    /// sidecar `view` names that storage does not hold, or a read that
+    /// fails, fails the call: a frozen view missing a bitmap would show
+    /// deleted rows for as long as it is held.
+    ///
+    /// A sidecar is written before the manifest that names its new seq, so
+    /// a bitmap read here may already carry a delete whose commit has not
+    /// landed. The caller decides whether that matters (see
+    /// [`Supertable::snapshot_reader`](crate::supertable::Supertable::snapshot_reader)).
+    pub async fn frozen_at(
+        &self,
+        view: Arc<TombstoneSeqView>,
+    ) -> Result<SidecarCache, SidecarCacheError> {
+        let frozen = SidecarCache::new(
+            self.wal_store.clone(),
+            self.seal_ttl,
+            Arc::clone(&view),
+            self.prefetch_limit,
+        );
+        let mut to_read = Vec::new();
+        for (&id, &seq) in &view.seqs {
+            match self.inner.get(&id) {
+                Some(entry) if entry.seq == Some(seq) => {
+                    frozen.inner.insert(id, entry.value().clone());
+                }
+                _ => to_read.push((id, seq)),
+            }
+        }
+        let read: Vec<_> = stream::iter(to_read)
+            .map(|(id, seq)| {
+                let wal_store = self.wal_store.clone();
+                async move { (id, seq, wal_store.get_tombstones(id).await) }
+            })
+            .buffer_unordered(self.prefetch_limit)
+            .collect()
+            .await;
+        let now = Instant::now();
+        for (id, seq, result) in read {
+            let (sidecar, etag) = match result {
+                Ok(Some(found)) => found,
+                Ok(None) => {
+                    return Err(SidecarCacheError::RefreshFailed {
+                        superfile_id: id,
+                        message: format!(
+                            "manifest {} names a tombstone sidecar that storage no longer holds",
+                            view.manifest_id
+                        ),
+                    });
+                }
+                Err(e) => {
+                    return Err(SidecarCacheError::RefreshFailed {
+                        superfile_id: id,
+                        message: format!("{e}"),
+                    });
+                }
+            };
+            frozen.inner.insert(
+                id,
+                CachedSidecar {
+                    etag: Some(etag),
+                    bitmap: Arc::new(sidecar.bitmap),
+                    seal: sidecar.seal,
+                    seq: Some(seq),
+                    fetched_at: now,
+                },
+            );
+        }
+        Ok(frozen)
+    }
+
     /// Fetch every `(id, expected seq)` concurrently, `max_in_flight` at a
     /// time, and cache what comes back. A per-id error leaves any prior
     /// entry untouched; the serial lookup that follows re-attempts and
@@ -638,6 +722,64 @@ mod tests {
             manifest_id,
             seqs: entries.iter().copied().collect(),
         })
+    }
+
+    /// A frozen cache keeps the bitmap it read while the sidecar is
+    /// rewritten and the shared cache moves on, answers "none" for a
+    /// superfile its view does not name, and refuses to freeze a view that
+    /// names a sidecar storage does not hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frozen_cache_keeps_its_bitmaps_while_the_sidecar_is_rewritten() {
+        let (_dir, ws, cache) = fixture();
+        let held = Uuid::from_u128(0x1);
+        let unnamed = Uuid::from_u128(0x2);
+        let first = RoaringBitmap::from_iter([3u32]);
+        ws.put_tombstones(
+            held,
+            None,
+            &TombstonesSidecar {
+                seal: None,
+                bitmap: first.clone(),
+            },
+        )
+        .await
+        .expect("put");
+        let frozen = cache
+            .frozen_at(view(1, &[(held, 1)]))
+            .await
+            .expect("freeze");
+
+        let (_, etag) = ws
+            .get_tombstones(held)
+            .await
+            .expect("get")
+            .expect("sidecar");
+        ws.put_tombstones(
+            held,
+            Some(&etag),
+            &TombstonesSidecar {
+                seal: None,
+                bitmap: RoaringBitmap::from_iter([3u32, 7]),
+            },
+        )
+        .await
+        .expect("rewrite");
+        cache.reconcile(view(2, &[(held, 2)]));
+
+        let now = Instant::now();
+        assert_eq!(*frozen.bitmap_for(held, now).expect("frozen"), first);
+        assert_eq!(
+            cache.bitmap_for(held, now).expect("shared").len(),
+            2,
+            "the shared cache follows the rewrite"
+        );
+        assert!(frozen.bitmap_for(unnamed, now).expect("unnamed").is_empty());
+
+        let missing = Uuid::from_u128(0x3);
+        assert!(
+            cache.frozen_at(view(2, &[(missing, 2)])).await.is_err(),
+            "a view naming a sidecar storage lacks cannot be frozen"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

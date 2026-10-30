@@ -35,7 +35,7 @@ use tracing::{Instrument, debug, warn};
 
 use super::{
     companion::{VECTOR_INDEX_SUFFIX, companion_purpose_of, hidden_table_prefix},
-    error::{BuildError, CommitError, OpenError},
+    error::{BuildError, CommitError, OpenError, QueryError},
     hidden_deleted::{self, HiddenDeletedError},
     manifest::{
         ManifestSnapshot,
@@ -47,6 +47,7 @@ use super::{
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
+    InfinoError,
     config::{self, CompactionSteps},
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, shared_io_runtime},
     runtime_metrics::op_stats::{self, OpStatsCollector},
@@ -90,6 +91,10 @@ use crate::{
         reader_cache::ReaderCacheError,
     },
 };
+
+/// Times [`Supertable::snapshot_reader`] takes a snapshot before a commit
+/// that keeps landing while it reads tombstones is the caller's to retry.
+const SNAPSHOT_ATTEMPTS: usize = 4;
 
 /// Top-level handle. Cheap to clone (one `Arc::clone`); all clones
 /// share the same `SupertableInner`. Hand a clone to each thread
@@ -833,6 +838,61 @@ impl Supertable {
             inner: Arc::clone(&self.inner),
             op_stats,
         }
+    }
+
+    /// A reader that keeps the current manifest's view of the table for as
+    /// long as it is held: rows committed later stay out of it, and rows
+    /// deleted later stay in. [`Self::reader`] pins the manifest but reads
+    /// tombstones through the handle's shared cache, which follows the
+    /// newest manifest; this reader carries a cache frozen at its own
+    /// ([`SidecarCache::frozen_at`]). It carries no per-query collector: a
+    /// caller running a query on it sets its own.
+    ///
+    /// Freezing reads the sidecars the shared cache does not hold at the
+    /// pinned seqs, and a sidecar is written before the commit that names
+    /// it, so a bitmap may already carry a delete still in flight. That
+    /// agrees with the pinned manifest while no commit lands during the
+    /// freeze: an update commits its new rows before it tombstones the old
+    /// ones, so a tombstone the freeze sees belongs to a commit the pin
+    /// already holds unless one landed in between, in which case the
+    /// snapshot would hold neither the old row nor its replacement. The
+    /// pointer is read again after the freeze, and a snapshot a commit raced
+    /// is taken again, up to [`SNAPSHOT_ATTEMPTS`] times; past that the
+    /// call fails with [`InfinoError::Conflict`], which a retry can clear.
+    ///
+    /// The superfiles and manifest parts the snapshot names stay readable
+    /// while garbage collection keeps them, that is until they have been
+    /// unreferenced by the newest manifest for longer than its safety gap.
+    pub(crate) fn snapshot_reader(&self) -> Result<SupertableReader, InfinoError> {
+        for _ in 0..SNAPSHOT_ATTEMPTS {
+            let mut reader = self.reader()?;
+            reader.op_stats = None;
+            let Some(shared) = reader.tombstone_cache.clone() else {
+                // No storage, so no sidecars: the manifest is the whole view.
+                return Ok(reader);
+            };
+            let view = tombstone_seq_view(&reader.manifest);
+            let reads_bitmaps = !view.seqs.is_empty();
+            let pinned = reader.manifest.manifest_id;
+            let frozen = self.block_on_query(async {
+                let frozen = shared
+                    .frozen_at(view)
+                    .await
+                    .map_err(QueryError::tombstone_cache)?;
+                if reads_bitmaps {
+                    self.refresh().await.map_err(QueryError::ManifestLoad)?;
+                }
+                Ok::<_, QueryError>(frozen)
+            })?;
+            if !reads_bitmaps || self.inner.manifest.load().manifest_id == pinned {
+                reader.tombstone_cache = Some(Arc::new(frozen));
+                return Ok(reader);
+            }
+        }
+        Err(InfinoError::Conflict(format!(
+            "the table committed while each of {SNAPSHOT_ATTEMPTS} snapshots read its deletes; \
+             take the snapshot again"
+        )))
     }
 
     /// Which table this handle drives, for the `role` span field.
