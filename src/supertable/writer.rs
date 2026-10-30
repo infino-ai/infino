@@ -185,7 +185,7 @@ use crate::{
         opann,
         options::SupertableOptions,
         query::{
-            dispatch::{open_compaction_input, open_reader},
+            dispatch::{open_reader, open_whole_superfile},
             vector::{IndexOutcome, serves_via_graph, stable_ids_by_local_for_routing},
         },
         reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
@@ -5069,6 +5069,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     };
 
     let store = user_inner.options.store.clone();
+    let disk_cache = user_inner.options.disk_cache.clone();
     let storage_opt = user_inner.options.storage.clone();
     let (metric, drain_rot_seed) = hidden_inner
         .options
@@ -5340,7 +5341,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // Open this batch's user superfiles FULLY RESIDENT: the splice/materialize
         // read via `try_get_range_sync` on rayon workers, which needs the whole
         // superfile in memory — a lazy reader yields VectorReadError. Reuse a
-        // resident cached reader if present, else fetch the full bytes + open.
+        // resident cached reader if present, else load the whole file through
+        // the disk cache.
         // `buffered` (NOT `buffer_unordered`): the collect below is a barrier,
         // so ordered delivery costs no wall time, and the order is load-bearing
         // twice over. (1) Row order must be deterministic: the drained row
@@ -5366,6 +5368,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             stream::iter(batch_sources.iter().map(|entry| {
                 let entry = Arc::clone(entry);
                 let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
                 let storage_opt = storage_opt.clone();
                 let manifest = Arc::clone(&user_manifest);
                 async move {
@@ -5380,11 +5383,9 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                     "drain requires storage to load user superfiles".into(),
                                 )
                             })?;
-                            let (bytes, _) = storage
-                                .get(&entry.storage_path())
+                            open_whole_superfile(&store, disk_cache.as_ref(), Some(storage), &entry)
                                 .await
-                                .map_err(|e| BuildError::Store(e.to_string()))?;
-                            Arc::new(SuperfileReader::open(bytes).map_err(BuildError::from)?)
+                                .map_err(|e| BuildError::Store(e.to_string()))?
                         }
                     };
                     // Write-path materialization: no per-query collector.
@@ -10046,7 +10047,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         // Stream the live superfiles once, extracting only the small state the
         // scan needs past the open — each superfile's fine-cluster centroids
         // (the router nodes) and its per-cell flat-cluster base — dropping each
-        // reader before opening the next. `open_compaction_input` cannot serve a
+        // reader before opening the next. `open_whole_superfile` cannot serve a
         // hidden vector superfile from the mmap disk cache (its vector blob is
         // left sparse), so it materializes the whole superfile in anonymous
         // memory; holding one resident reader per live superfile at once would
@@ -10055,7 +10056,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         flat_base_by_si = Vec::with_capacity(work.len());
         let open_span = detail_span!("recalibrate.router_open", superfiles = work.len());
         for (si, (entry, cells)) in work.iter().enumerate() {
-            let reader = open_compaction_input(
+            let reader = open_whole_superfile(
                 &inner.options.store,
                 inner.options.disk_cache.as_ref(),
                 inner.options.storage.as_ref(),
@@ -10282,7 +10283,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         // would silently skip its depth observation and keep the previous law,
         // the staleness this pass exists to fix. Open the way compaction opens
         // its own inputs: resident bytes guaranteed.
-        let reader = open_compaction_input(
+        let reader = open_whole_superfile(
             &inner.options.store,
             inner.options.disk_cache.as_ref(),
             inner.options.storage.as_ref(),

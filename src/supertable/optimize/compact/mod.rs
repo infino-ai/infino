@@ -61,7 +61,7 @@ use crate::{
             term_index::{Contribution as TermContribution, ReservedLayer},
         },
         opann::rerank_pool_hint,
-        query::{dispatch::open_compaction_input, vector},
+        query::{dispatch::open_whole_superfile, vector},
         reader_cache::disk::mmap_readonly_bytes,
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
@@ -721,7 +721,7 @@ impl Supertable {
                 .expect("should not be closed");
             let open_fut = async move {
                 let _permit = permit;
-                let r = open_compaction_input(
+                let r = open_whole_superfile(
                     &store,
                     disk_cache.as_ref(),
                     storage.as_ref(),

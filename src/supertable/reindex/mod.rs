@@ -38,7 +38,7 @@ use crate::{
         error::{CompactionError, ReindexError},
         manifest::SubsectionOffsets,
         optimize::compact::{CompactionJob, JobOutcome, SuperfileMerge},
-        query::dispatch::open_compaction_input,
+        query::dispatch::open_whole_superfile,
     },
 };
 
@@ -447,13 +447,9 @@ impl Supertable {
                 let (store, disk_cache, storage) =
                     (store.clone(), disk_cache.clone(), storage.clone());
                 async move {
-                    let reader = open_compaction_input(
-                        &store,
-                        disk_cache.as_ref(),
-                        storage.as_ref(),
-                        &entry,
-                    )
-                    .await;
+                    let reader =
+                        open_whole_superfile(&store, disk_cache.as_ref(), storage.as_ref(), &entry)
+                            .await;
                     (entry, reader)
                 }
             });
