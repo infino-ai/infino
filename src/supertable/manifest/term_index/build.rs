@@ -52,6 +52,7 @@ use super::{
     },
 };
 use crate::{
+    config::scratch_root,
     superfile::{
         error::BuildError,
         format::checksum::crc32c,
@@ -242,7 +243,7 @@ struct TermInput {
 }
 
 /// A scratch directory for a build, removed when dropped: under `root`
-/// when one is set, else in the system temporary directory.
+/// when one is set, else under `storage.scratch_root`.
 pub(crate) fn scratch_dir(root: Option<&Path>) -> io::Result<TempDir> {
     let builder = {
         let mut b = tempfile::Builder::new();
@@ -254,7 +255,7 @@ pub(crate) fn scratch_dir(root: Option<&Path>) -> io::Result<TempDir> {
             fs::create_dir_all(root)?;
             builder.tempdir_in(root)
         }
-        None => builder.tempdir(),
+        None => builder.tempdir_in(scratch_root()),
     }
 }
 

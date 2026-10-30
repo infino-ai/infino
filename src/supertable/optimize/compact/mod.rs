@@ -40,7 +40,7 @@ use tracing::{Instrument, Span, debug, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{CompactionSettings, RecalibratePolicy, global},
+    config::{CompactionSettings, RecalibratePolicy, global, scratch_root},
     runtime_bridge::{bridge_on_runtime, run_on_own_pool, run_on_pool},
     runtime_metrics::rss::{available_memory_bytes, memory_budget},
     storage::StorageError,
@@ -811,7 +811,7 @@ impl Supertable {
             // Mapped pages are file-backed and reclaimable; downstream publish
             // takes `Bytes` unchanged (large superfiles already stream via
             // put_multipart).
-            let mut output = NamedTempFile::new()
+            let mut output = NamedTempFile::new_in(scratch_root())
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());
