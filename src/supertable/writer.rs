@@ -5385,7 +5385,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                             })?;
                             open_whole_superfile(&store, disk_cache.as_ref(), Some(storage), &entry)
                                 .await
-                                .map_err(|e| BuildError::Store(e.to_string()))?
+                                .map_err(BuildError::from)?
                         }
                     };
                     // Write-path materialization: no per-query collector.
