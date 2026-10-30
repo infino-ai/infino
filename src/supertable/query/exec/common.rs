@@ -2323,11 +2323,18 @@ pub(crate) mod test_support {
 mod tests {
     use std::{thread::sleep, time::Duration};
 
-    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray};
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray, StructArray};
     use arrow_schema::Field;
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
+    use parquet::{
+        arrow::ArrowWriter,
+        file::{
+            metadata::{PageIndexPolicy, ParquetMetaDataReader},
+            properties::WriterProperties,
+        },
+    };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
@@ -2341,6 +2348,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
+            query::fts::TIE_NARROW_BATCH,
             reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
         },
         test_helpers::{
@@ -2358,7 +2366,7 @@ mod tests {
         // superfile puts the smallest 20 ids in 20 superfiles, past the first
         // batch, so a walk that stops too early returns larger ids.
         smallest_ids_survive_a_tie(12, 20, 5);
-        const _: () = assert!(20 > crate::supertable::query::fts::TIE_NARROW_BATCH);
+        const _: () = assert!(20 > TIE_NARROW_BATCH);
         smallest_ids_survive_a_tie(100, 1, 20);
     }
 
@@ -2408,7 +2416,6 @@ mod tests {
     /// row groups its rows fall in, and declines a column the file lacks.
     #[test]
     fn take_prefetch_spans_cover_the_hit_row_groups_projected_chunks() {
-        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int64, false),
@@ -2425,7 +2432,7 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
-        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+        let metadata = ParquetMetaDataReader::new()
             .parse_and_finish(&Bytes::from(bytes))
             .expect("metadata");
         assert_eq!(metadata.num_row_groups(), 10);
@@ -2462,7 +2469,6 @@ mod tests {
     /// that hold its rows, plus each chunk's dictionary page.
     #[test]
     fn take_prefetch_spans_cover_only_the_hit_pages_with_a_page_index() {
-        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
         let values = Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i % 7))) as ArrayRef;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).expect("batch");
@@ -2475,8 +2481,8 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
-        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
-            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required)
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
             .parse_and_finish(&Bytes::from(bytes))
             .expect("metadata");
         let pages =
@@ -2516,8 +2522,6 @@ mod tests {
     /// a projected struct brings every leaf under it.
     #[test]
     fn take_prefetch_spans_find_a_column_after_a_struct_by_its_leaves() {
-        use arrow_array::StructArray;
-        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
         let leaf =
             |m: i64| Arc::new(Int64Array::from_iter_values((0..100).map(|i| i * m))) as ArrayRef;
         let s = StructArray::from(vec![
@@ -2537,7 +2541,7 @@ mod tests {
         let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
         writer.write(&batch).expect("write");
         writer.close().expect("close");
-        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+        let metadata = ParquetMetaDataReader::new()
             .parse_and_finish(&Bytes::from(bytes))
             .expect("metadata");
         let rg = metadata.row_group(0);
