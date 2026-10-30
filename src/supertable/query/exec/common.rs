@@ -22,7 +22,7 @@ use std::{
     future::Future,
     ops::Range,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -34,7 +34,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, buf::Reader};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{
@@ -50,25 +50,32 @@ use datafusion::{
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
-use futures::{FutureExt, TryStreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream};
 use object_store::{ObjectStore, path::Path as ObjPath};
 use parquet::{
     arrow::{
         ProjectionMask,
-        arrow_reader::ArrowReaderOptions,
+        arrow_reader::{
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+        },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
     errors::{ParquetError, Result as ParquetResult},
-    file::metadata::ParquetMetaData,
+    file::{
+        metadata::ParquetMetaData,
+        reader::{ChunkReader, Length},
+    },
 };
 use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
-use tracing::{Instrument, Span, warn};
+use tokio::sync::Semaphore;
+use tracing::{Instrument, Span, debug, warn};
 
 use crate::{
     memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
-    runtime_bridge::run_on_pool,
+    runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
     runtime_metrics::op_stats::{OpStatsCollector, timed_section},
+    runtime_metrics::rss::total_memory_bytes,
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
@@ -1380,15 +1387,16 @@ async fn resolve_columns(
                     // files, in one pool job.
                     return Ok::<_, DataFusionError>(Resolved::Resident(index, rd, adapter));
                 }
-                // Only a lazy take gets its own task: its decode is the
-                // CPU this fan-out would otherwise run on one thread, while
-                // a spawn per resident file costs more than its open.
-                let batch = crate::supertable::query::dispatch::spawn_unit(async move {
-                    let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
-                    take_lazy_file(&rd, &locals, &name_refs, &adapter, &out_schema)
-                        .await
-                        .map_err(QueryError::DataFusion)
-                })
+                // A lazy take fetches here and decodes on the reader pool.
+                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let batch = take_lazy_file(
+                    &rd,
+                    &locals,
+                    &name_refs,
+                    &adapter,
+                    &out_schema,
+                    &manifest.options.reader_pool,
+                )
                 .await?;
                 Ok(Resolved::Taken(index, batch))
             }
@@ -1503,12 +1511,13 @@ async fn take_lazy_file(
     names: &[&str],
     adapter: &Option<FileSchemaMap>,
     out_schema: &SchemaRef,
+    pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     match adapter {
-        None => take_rows_byte_source(rd, locals, names).await,
+        None => take_rows_byte_source(rd, locals, names, Some(pool)).await,
         Some(map) => {
             let physical = map.stored_names(names);
-            let read = take_rows_byte_source(rd, locals, &physical).await?;
+            let read = take_rows_byte_source(rd, locals, &physical, Some(pool)).await?;
             map.adapt(&read, out_schema)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))
         }
@@ -1530,7 +1539,15 @@ pub(crate) async fn take_file_columns(
 ) -> DfResult<RecordBatch> {
     let adapter = file_adapter(manifest, rd);
     if !rd.can_take_by_local_doc_ids() {
-        return take_lazy_file(rd, &locals, names, &adapter, out_schema).await;
+        return take_lazy_file(
+            rd,
+            &locals,
+            names,
+            &adapter,
+            out_schema,
+            &manifest.options.reader_pool,
+        )
+        .await;
     }
     let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
     let out_schema = Arc::clone(out_schema);
@@ -1677,12 +1694,51 @@ struct ByteSourceAsyncReader {
 impl ByteSourceAsyncReader {
     /// `range` from a prefetched span that holds it whole.
     fn prefetched(&self, range: &Range<u64>) -> Option<Bytes> {
-        let at = self
-            .prefetched
-            .partition_point(|(span, _)| span.end <= range.start);
-        let (span, bytes) = self.prefetched.get(at)?;
-        (span.start <= range.start && range.end <= span.end).then(|| {
-            bytes.slice((range.start - span.start) as usize..(range.end - span.start) as usize)
+        prefetched_slice(&self.prefetched, range)
+    }
+}
+
+/// `range` from the one of `spans` (ascending, disjoint) that holds it whole.
+fn prefetched_slice(spans: &[(Range<u64>, Bytes)], range: &Range<u64>) -> Option<Bytes> {
+    let at = spans.partition_point(|(span, _)| span.end <= range.start);
+    let (span, bytes) = spans.get(at)?;
+    (span.start <= range.start && range.end <= span.end).then(|| {
+        bytes.slice((range.start - span.start) as usize..(range.end - span.start) as usize)
+    })
+}
+
+/// A take's prefetched spans as a file the synchronous Parquet reader can
+/// decode from, off the async runtime. A read outside them is an error, and
+/// the take then decodes through its byte source instead.
+struct PrefetchedChunks {
+    len: u64,
+    spans: Vec<(Range<u64>, Bytes)>,
+}
+
+impl Length for PrefetchedChunks {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for PrefetchedChunks {
+    type T = Reader<Bytes>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        let at = self.spans.partition_point(|(span, _)| span.end <= start);
+        match self.spans.get(at) {
+            Some((span, bytes)) if span.start <= start => {
+                Ok(bytes.slice((start - span.start) as usize..).reader())
+            }
+            _ => Err(ParquetError::General(format!(
+                "byte {start} is not prefetched"
+            ))),
+        }
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        prefetched_slice(&self.spans, &(start..start + length as u64)).ok_or_else(|| {
+            ParquetError::General(format!("bytes {start}+{length} are not prefetched"))
         })
     }
 }
@@ -1692,6 +1748,24 @@ impl ByteSourceAsyncReader {
 const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Spans of one superfile's take prefetch in flight at once.
 const TAKE_PREFETCH_CONCURRENCY: usize = 16;
+/// The share of the host's memory every take's prefetch together may hold.
+const TAKE_PREFETCH_MEMORY_SHARE: u64 = 16;
+
+/// Prefetched bytes every take in the process holds at once, in KiB: a share
+/// of the host's memory, never less than one take's
+/// [`TAKE_PREFETCH_MAX_BYTES`]. A take waits for room, and holds it until
+/// its decode is done.
+fn take_prefetch_budget() -> &'static Semaphore {
+    static BUDGET: OnceLock<Semaphore> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let bytes = total_memory_bytes()
+            .map_or(TAKE_PREFETCH_MAX_BYTES, |total| {
+                total / TAKE_PREFETCH_MEMORY_SHARE
+            })
+            .max(TAKE_PREFETCH_MAX_BYTES);
+        Semaphore::new((bytes / 1024) as usize)
+    })
+}
 
 /// The column chunks of the `roots` columns (top-level, as the Arrow
 /// schema numbers them) in every row group `sorted` (ascending, distinct
@@ -1718,7 +1792,7 @@ fn take_prefetch_spans(
         .collect();
     let mut spans: Vec<Range<u64>> = Vec::new();
     let (mut first_row, mut next) = (0u64, 0usize);
-    for rg in metadata.row_groups() {
+    for (index, rg) in metadata.row_groups().iter().enumerate() {
         let end_row = first_row + rg.num_rows() as u64;
         let before = next;
         while next < sorted.len() && u64::from(sorted[next]) < end_row {
@@ -1726,8 +1800,15 @@ fn take_prefetch_spans(
         }
         if next > before {
             for &c in &columns {
-                let (offset, len) = rg.column(c).byte_range();
-                spans.push(offset..offset + len);
+                hit_pages(
+                    metadata,
+                    index,
+                    c,
+                    first_row,
+                    end_row,
+                    &sorted[before..next],
+                    &mut spans,
+                );
             }
         }
         first_row = end_row;
@@ -1742,6 +1823,50 @@ fn take_prefetch_spans(
     }
     let bytes: u64 = merged.iter().map(|r| r.end - r.start).sum();
     (bytes <= TAKE_PREFETCH_MAX_BYTES).then_some(merged)
+}
+
+/// The bytes of leaf column `c` in row group `index` (rows `first_row` to
+/// `end_row`) that a decode of rows `hits` reads, pushed onto `spans`. With
+/// the page index loaded the decode skips pages without a hit, so that is
+/// each page holding one, plus the dictionary page; without it, the chunk.
+fn hit_pages(
+    metadata: &ParquetMetaData,
+    index: usize,
+    c: usize,
+    first_row: u64,
+    end_row: u64,
+    hits: &[u32],
+    spans: &mut Vec<Range<u64>>,
+) {
+    let (offset, len) = metadata.row_group(index).column(c).byte_range();
+    let pages = metadata
+        .offset_index()
+        .and_then(|oi| oi.get(index))
+        .and_then(|cols| cols.get(c))
+        .map(|oi| oi.page_locations())
+        .filter(|pages| !pages.is_empty());
+    let Some(pages) = pages else {
+        spans.push(offset..offset + len);
+        return;
+    };
+    let first_page = pages[0].offset as u64;
+    if first_page > offset {
+        spans.push(offset..first_page);
+    }
+    let mut hit = 0;
+    for (i, page) in pages.iter().enumerate() {
+        let start_row = first_row + page.first_row_index as u64;
+        let page_end_row = pages
+            .get(i + 1)
+            .map_or(end_row, |next| first_row + next.first_row_index as u64);
+        while hit < hits.len() && u64::from(hits[hit]) < start_row {
+            hit += 1;
+        }
+        if hit < hits.len() && u64::from(hits[hit]) < page_end_row {
+            let start = page.offset as u64;
+            spans.push(start..start + page.compressed_page_size as u64);
+        }
+    }
 }
 
 impl AsyncFileReader for ByteSourceAsyncReader {
@@ -1768,26 +1893,29 @@ impl AsyncFileReader for ByteSourceAsyncReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        // `get_ranges_parallel_async` serves each resident range synchronously
-        // and batches only the cold misses into one `try_join_all`, returning
-        // bytes in input order.
-        if let Some(all) = ranges
-            .iter()
-            .map(|range| self.prefetched(range))
-            .collect::<Option<Vec<Bytes>>>()
-        {
-            return async move { Ok(all) }.boxed();
+        // Each range the prefetch holds is served from it; only the rest go
+        // to the source. `get_ranges_parallel_async` serves each resident one
+        // synchronously and batches the cold misses into one `try_join_all`,
+        // returning bytes in input order.
+        let mut out: Vec<Option<Bytes>> = ranges.iter().map(|r| self.prefetched(r)).collect();
+        let missing: Vec<usize> = (0..out.len()).filter(|&i| out[i].is_none()).collect();
+        if missing.is_empty() {
+            return async move { Ok(out.into_iter().flatten().collect()) }.boxed();
         }
         let source = self.source.clone();
-        let ranges: Vec<Range<usize>> = ranges
-            .into_iter()
-            .map(|range| range.start as usize..range.end as usize)
+        let wanted: Vec<Range<usize>> = missing
+            .iter()
+            .map(|&i| ranges[i].start as usize..ranges[i].end as usize)
             .collect();
         async move {
-            source
-                .get_ranges_parallel_async(&ranges)
+            let fetched = source
+                .get_ranges_parallel_async(&wanted)
                 .await
-                .map_err(|error| ParquetError::External(Box::new(error)))
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            for (i, bytes) in missing.into_iter().zip(fetched) {
+                out[i] = Some(bytes);
+            }
+            Ok(out.into_iter().flatten().collect())
         }
         .boxed()
     }
@@ -1812,7 +1940,7 @@ pub(crate) async fn take_rows(
     pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     if !reader.can_take_by_local_doc_ids() {
-        return take_rows_byte_source(reader, local_doc_ids, names).await;
+        return take_rows_byte_source(reader, local_doc_ids, names, Some(pool)).await;
     }
     let owned_reader = Arc::clone(reader);
     let ids = local_doc_ids.to_vec();
@@ -1841,6 +1969,7 @@ pub(crate) async fn take_rows_byte_source(
     reader: &SuperfileReader,
     local_doc_ids: &[u32],
     names: &[&str],
+    pool: Option<&ThreadPool>,
 ) -> DfResult<RecordBatch> {
     // The bare `_id` projection of a few rows comes from the packed sidecar's
     // blocks when the superfile carries one: a couple of kilobytes a block,
@@ -1882,25 +2011,60 @@ pub(crate) async fn take_rows_byte_source(
         .iter()
         .filter_map(|name| reader.schema().index_of(name).ok())
         .collect();
-    use futures::StreamExt as _;
-    let prefetched = match take_prefetch_spans(&metadata, &sorted, &roots) {
-        Some(spans) if !spans.is_empty() => {
-            let fetched: Vec<Bytes> = futures::stream::iter(spans.iter().cloned().map(|span| {
-                let source = source.clone();
-                async move {
-                    source
-                        .range_exact_async(span.start as usize..span.end as usize)
-                        .await
-                        .map_err(|e| QueryError::Internal(format!("take prefetch: {e}")))
-                }
-            }))
-            .buffered(TAKE_PREFETCH_CONCURRENCY)
-            .try_collect()
-            .await?;
-            spans.into_iter().zip(fetched).collect()
+    let mut prefetched = Vec::new();
+    // Held until the decode is done: the prefetched bytes live that long.
+    let mut _room = None;
+    if let Some(spans) = take_prefetch_spans(&metadata, &sorted, &roots).filter(|s| !s.is_empty()) {
+        let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
+        _room = Some(
+            take_prefetch_budget()
+                .acquire_many(bytes.div_ceil(1024) as u32)
+                .await
+                .map_err(QueryError::internal)?,
+        );
+        let fetched: Vec<Bytes> = stream::iter(spans.iter().cloned().map(|span| {
+            let source = source.clone();
+            async move {
+                source
+                    .range_exact_async(span.start as usize..span.end as usize)
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("take prefetch: {e}")))
+            }
+        }))
+        .buffered(TAKE_PREFETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+        prefetched = spans.into_iter().zip(fetched).collect();
+        // The fetch was the I/O; the decode is CPU, and goes to the reader
+        // pool, reading only the prefetched bytes.
+        let chunks = PrefetchedChunks {
+            len: reader.byte_source().size(),
+            spans: prefetched.clone(),
+        };
+        let (metadata, schema, n_docs) = (
+            Arc::clone(&metadata),
+            Arc::clone(reader.schema()),
+            reader.n_docs(),
+        );
+        let ids = local_doc_ids.to_vec();
+        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let decoded = run_on_pool_unless_blocking(
+            pool,
+            "take decode: reader pool dropped result",
+            move || {
+                let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+                take_rows_prefetched(chunks, metadata, &schema, n_docs, &ids, &names)
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?;
+        match decoded {
+            Ok(batch) => return Ok(batch),
+            // A read outside the prefetch: decode through the source, which
+            // still serves the prefetched spans from memory.
+            Err(error) => debug!(%error, "take decoding through its byte source"),
         }
-        _ => Vec::new(),
-    };
+    }
     let input = ByteSourceAsyncReader {
         source,
         metadata,
@@ -1948,6 +2112,68 @@ async fn take_rows_async<R>(
 where
     R: AsyncFileReader + Unpin + Send + 'static,
 {
+    let plan = match take_plan(file_schema, n_docs, local_doc_ids, names)? {
+        Ok(plan) => plan,
+        Err(done) => return Ok(done),
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new(input)
+        .await
+        .map_err(QueryError::store)?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
+    let stream = builder
+        .with_projection(mask)
+        .with_row_selection(plan.selection.clone())
+        .build()
+        .map_err(QueryError::store)?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
+    finish_take(&plan, batches, local_doc_ids, names)
+}
+
+/// [`take_rows_async`] decoding from `chunks`, synchronously: the reader-pool
+/// half of a prefetched take.
+fn take_rows_prefetched(
+    chunks: PrefetchedChunks,
+    metadata: Arc<ParquetMetaData>,
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    let plan = match take_plan(file_schema, n_docs, local_doc_ids, names)? {
+        Ok(plan) => plan,
+        Err(done) => return Ok(done),
+    };
+    let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+        .map_err(QueryError::store)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, metadata);
+    let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
+    let batches: Vec<RecordBatch> = builder
+        .with_projection(mask)
+        .with_row_selection(plan.selection.clone())
+        .build()
+        .map_err(QueryError::store)?
+        .collect::<Result<_, _>>()
+        .map_err(QueryError::store)?;
+    finish_take(&plan, batches, local_doc_ids, names)
+}
+
+/// What a take of `local_doc_ids` decodes: the projected columns, the output
+/// schema, and the rows as a sorted selection.
+struct TakePlan {
+    col_indices: Vec<usize>,
+    out_schema: SchemaRef,
+    sorted: Vec<u32>,
+    selection: RowSelection,
+}
+
+/// The [`TakePlan`] of a take, or the batch itself when there is nothing to
+/// decode: no rows, or no columns this file has.
+fn take_plan(
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<Result<TakePlan, RecordBatch>> {
     // Projected column indices (file order) + output fields (caller order).
     let mut col_indices = Vec::with_capacity(names.len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
@@ -1961,7 +2187,7 @@ where
     let out_schema = Arc::new(Schema::new(out_fields));
 
     if local_doc_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(out_schema));
+        return Ok(Err(RecordBatch::new_empty(out_schema)));
     }
     for &d in local_doc_ids {
         if u64::from(d) >= n_docs {
@@ -1981,6 +2207,7 @@ where
             vec![],
             &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
         )
+        .map(Err)
         .map_err(|e| QueryError::internal(e).into());
     }
 
@@ -1989,17 +2216,23 @@ where
     // contract as `take_by_local_doc_ids` — shared helpers, different
     // I/O model (async range GETs here vs resident-bytes decode there).
     let (sorted, selection) = row_selection_for_ids(local_doc_ids);
+    Ok(Ok(TakePlan {
+        col_indices,
+        out_schema,
+        sorted,
+        selection,
+    }))
+}
 
-    let builder = ParquetRecordBatchStreamBuilder::new(input)
-        .await
-        .map_err(QueryError::store)?;
-    let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
-    let stream = builder
-        .with_projection(mask)
-        .with_row_selection(selection)
-        .build()
-        .map_err(QueryError::store)?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
+/// A take's decoded `batches` (file column order, sorted rows) as the
+/// caller asked: `names` in its order, rows in `local_doc_ids` order.
+fn finish_take(
+    plan: &TakePlan,
+    batches: Vec<RecordBatch>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    let out_schema = Arc::clone(&plan.out_schema);
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(out_schema));
     }
@@ -2007,7 +2240,7 @@ where
     let selected = concat_batches(&read_schema, &batches).map_err(QueryError::internal)?;
 
     // Rank back into the caller's (possibly duplicated) order.
-    let indices = rank_back_indices(local_doc_ids, &sorted);
+    let indices = rank_back_indices(local_doc_ids, &plan.sorted);
 
     // Gather columns in caller projection order (parquet returns file order).
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(names.len());
@@ -2223,6 +2456,59 @@ mod tests {
             "an unprojected column is not fetched"
         );
         assert!(take_prefetch_spans(&metadata, &rows, &[3]).is_none());
+    }
+
+    /// With the page index loaded, a take's prefetch covers only the pages
+    /// that hold its rows, plus each chunk's dictionary page.
+    #[test]
+    fn take_prefetch_spans_cover_only_the_hit_pages_with_a_page_index() {
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values = Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i % 7))) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .with_page_index_policy(parquet::file::metadata::PageIndexPolicy::Required)
+            .parse_and_finish(&Bytes::from(bytes))
+            .expect("metadata");
+        let pages =
+            |rg: usize| metadata.offset_index().expect("page index")[rg][0].page_locations();
+        assert_eq!(pages(0).len(), 10, "ten pages a row group");
+
+        let rows = [5u32, 37, 150];
+        let spans = take_prefetch_spans(&metadata, &rows, &[0]).expect("spans");
+        let covered = |offset: u64, len: u64| {
+            spans
+                .iter()
+                .any(|s| s.start <= offset && offset + len <= s.end)
+        };
+        let page = |rg: usize, i: usize| {
+            let p = &pages(rg)[i];
+            (p.offset as u64, p.compressed_page_size as u64)
+        };
+        for (rg, i) in [(0, 0), (0, 3), (1, 5)] {
+            let (offset, len) = page(rg, i);
+            assert!(covered(offset, len), "rg {rg} page {i} holds a hit");
+        }
+        for (rg, i) in [(0, 1), (0, 2), (1, 4), (2, 0)] {
+            let (offset, len) = page(rg, i);
+            assert!(!covered(offset, len), "rg {rg} page {i} holds none");
+        }
+        let (chunk_start, _) = metadata.row_group(0).column(0).byte_range();
+        let first_page = pages(0)[0].offset as u64;
+        assert!(chunk_start < first_page, "the chunk has a dictionary page");
+        assert!(
+            covered(chunk_start, first_page - chunk_start),
+            "the dictionary page"
+        );
     }
 
     /// A struct before a projected column fills two leaf chunks, so the

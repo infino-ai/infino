@@ -338,7 +338,9 @@ pub(crate) async fn attach_stable_ids(
         }
         batch?
     } else {
-        take_rows_byte_source(reader, &locals, &[id_column])
+        // No caller fetches the lazy id page today; one that does decodes on
+        // the global pool.
+        take_rows_byte_source(reader, &locals, &[id_column], None)
             .await
             .map_err(|error| QueryError::Internal(error.to_string()))?
     };
@@ -633,7 +635,7 @@ impl FanoutContext {
 /// task fetching and decoding after its caller had gone. The join error is
 /// flattened into a `QueryError`, so a collecting caller short-circuits on
 /// the first failing superfile.
-pub(crate) fn spawn_unit<R: Send + 'static>(
+fn spawn_unit<R: Send + 'static>(
     unit: impl Future<Output = Result<R, QueryError>> + Send + 'static,
 ) -> impl Future<Output = Result<R, QueryError>> {
     let task = SpawnedTask::spawn(unit);

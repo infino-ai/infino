@@ -2150,9 +2150,14 @@ async fn read_ids_for_locals(
         }
         return id_values_from_batch(&batch?);
     }
-    let batch = take_rows_byte_source(&reader, local_ids, &[id_column])
-        .await
-        .map_err(QueryError::DataFusion)?;
+    let batch = take_rows_byte_source(
+        &reader,
+        local_ids,
+        &[id_column],
+        Some(&manifest.options.reader_pool),
+    )
+    .await
+    .map_err(QueryError::DataFusion)?;
     id_values_from_batch(&batch)
 }
 
@@ -9961,6 +9966,7 @@ mod tests {
             &reader,
             &locals,
             &[manifest.options.id_column.as_str()],
+            None,
         ))
         .expect("read the `_id` column");
         id_values_from_batch(&batch).expect("decimal `_id`")

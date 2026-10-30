@@ -3266,6 +3266,7 @@ impl SupertableReader {
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
         let op_stats = self.op_stats.clone();
+        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -3276,6 +3277,7 @@ impl SupertableReader {
             let tokens_arc = Arc::clone(&tokens_arc);
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
@@ -3329,9 +3331,14 @@ impl SupertableReader {
                     // clock spanning an await bills whatever else the runtime
                     // ran on this thread to this query. The verify comparison
                     // below is charged on both arms.
-                    None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
-                        .await
-                        .map_err(QueryError::DataFusion)?,
+                    None => take_rows_byte_source(
+                        &r,
+                        &candidates,
+                        &[column_arc.as_str()],
+                        Some(&reader_pool),
+                    )
+                    .await
+                    .map_err(QueryError::DataFusion)?,
                 };
                 // The verify decode materialized one row per candidate,
                 // on either arm. Folding it here rather than per-arm keeps
