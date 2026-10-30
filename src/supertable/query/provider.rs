@@ -97,7 +97,6 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::{
-    runtime_metrics::op_stats,
     superfile::{
         SuperfileReader,
         fts::{
@@ -106,7 +105,7 @@ use crate::{
         },
     },
     supertable::{
-        SuperfileEntry,
+        SuperfileEntry, SupertableReader,
         error::QueryError,
         manifest::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
@@ -165,6 +164,13 @@ const SUPERFILE_STORE_URL_PREFIX: &str = "superfile://supertable-";
 
 /// Monotonic source of per-provider object-store authorities.
 static STORE_URL_SEQ: atomic::AtomicU64 = atomic::AtomicU64::new(0);
+
+/// An object-store registry key no other provider holds.
+fn unique_store_url() -> ObjectStoreUrl {
+    let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
+    ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
+        .expect("invariant: a counter-derived store URL is always valid")
+}
 
 /// One immutable superfile's query-independent Parquet scan inputs.
 ///
@@ -265,6 +271,10 @@ pub(crate) struct SupertableProvider {
     store: Arc<dyn SuperfileReaderCache>,
     /// Optional disk cache (storage-backed supertables).
     disk_cache: Option<Arc<DiskCacheStore>>,
+    /// How scans open superfiles through the disk cache: toward whole local
+    /// copies only when the cache can hold the table (see
+    /// [`SupertableReader::open_intent`]).
+    open_intent: ReadIntent,
     /// Per-superfile soft-delete (tombstone) overlay. `None` for
     /// in-memory tables with no WAL/mutation surface. When present,
     /// [`scan`](TableProvider::scan) pushes the tombstoned rows into
@@ -345,27 +355,20 @@ pub(crate) fn view_string_schema(schema: &Schema, fts_columns: &HashSet<&str>) -
 }
 
 impl SupertableProvider {
-    /// Build a provider over a pinned snapshot. `schema` is the scan schema
+    /// Build a provider over `reader`'s pinned snapshot, opening superfiles
+    /// the way the reader's other queries do. `schema` is the scan schema
     /// DataFusion plans against, already string-viewed and cached on the table
     /// (`view_string_schema`); the provider stores it verbatim.
-    pub(crate) fn new(
-        schema: SchemaRef,
-        manifest: Arc<ManifestSnapshot>,
-        store: Arc<dyn SuperfileReaderCache>,
-        disk_cache: Option<Arc<DiskCacheStore>>,
-        tombstone_cache: Option<Arc<SidecarCache>>,
-    ) -> Self {
-        let seq = STORE_URL_SEQ.fetch_add(1, atomic::Ordering::Relaxed);
-        let store_url = ObjectStoreUrl::parse(format!("{SUPERFILE_STORE_URL_PREFIX}{seq}/"))
-            .expect("invariant: a counter-derived store URL is always valid");
-
+    pub(crate) fn new(schema: SchemaRef, reader: &SupertableReader) -> Self {
+        let options = reader.options();
         Self {
             schema,
-            manifest,
-            store,
-            disk_cache,
-            tombstone_cache,
-            store_url,
+            manifest: Arc::clone(reader.manifest()),
+            store: Arc::clone(&options.store),
+            disk_cache: options.disk_cache.clone(),
+            open_intent: reader.open_intent(),
+            tombstone_cache: reader.tombstone_cache.clone(),
+            store_url: unique_store_url(),
             segment_filter: None,
             prepared_scan_files: Arc::new(DashMap::new()),
             scan_store: Arc::new(SuperfileObjectStore::new()),
@@ -384,30 +387,26 @@ impl SupertableProvider {
 
     /// Clone of this provider restricted to `segments` — used by the
     /// covered/residual aggregate rewrite for the residual (boundary
-    /// segment) scan. Gets its own object-store registry key so the
-    /// restricted scan's registration can't collide with the parent's.
+    /// segment) scan. It shares the parent's snapshot, prepared files and
+    /// scan store, so its reads count toward the parent query, and gets its
+    /// own object-store registry key so the restricted scan's registration
+    /// can't collide with the parent's.
     pub(crate) fn restricted_to(&self, segments: HashSet<Uuid>) -> Self {
-        // Suppressed: `Self::new` mints a transient scan store that
-        // captures the thread-local collector, but the restricted scan
-        // reuses the PARENT's store (replaced just below) — this clone
-        // runs mid-query on whatever thread drives the rewrite, and no
-        // mid-query code may consult the scope's thread-local.
-        let mut restricted = op_stats::suppressed(|| {
-            Self::new(
-                Arc::clone(&self.schema),
-                Arc::clone(&self.manifest),
-                Arc::clone(&self.store),
-                self.disk_cache.clone(),
-                self.tombstone_cache.clone(),
-            )
-        });
-        restricted.segment_filter = Some(segments);
-        restricted.prepared_scan_files = Arc::clone(&self.prepared_scan_files);
-        restricted.scan_store = Arc::clone(&self.scan_store);
-        restricted.scan_footers = Arc::clone(&self.scan_footers);
-        restricted.scalar_value_counts = Arc::clone(&self.scalar_value_counts);
-        restricted.value_count_carry = Arc::clone(&self.value_count_carry);
-        restricted
+        Self {
+            schema: Arc::clone(&self.schema),
+            manifest: Arc::clone(&self.manifest),
+            store: Arc::clone(&self.store),
+            disk_cache: self.disk_cache.clone(),
+            open_intent: self.open_intent,
+            tombstone_cache: self.tombstone_cache.clone(),
+            store_url: unique_store_url(),
+            segment_filter: Some(segments),
+            prepared_scan_files: Arc::clone(&self.prepared_scan_files),
+            scan_store: Arc::clone(&self.scan_store),
+            scan_footers: Arc::clone(&self.scan_footers),
+            scalar_value_counts: Arc::clone(&self.scalar_value_counts),
+            value_count_carry: Arc::clone(&self.value_count_carry),
+        }
     }
 
     /// `true` when this provider is a covered/residual residual scan —
@@ -637,6 +636,7 @@ impl SupertableProvider {
             .clone();
         let store = Arc::clone(&self.store);
         let disk_cache = self.disk_cache.clone();
+        let open_intent = self.open_intent;
         let storage = self.manifest.options.storage.clone();
         let scan_store = Arc::clone(&self.scan_store);
         let scan_footers = Arc::clone(&self.scan_footers);
@@ -655,7 +655,7 @@ impl SupertableProvider {
                 storage.as_ref(),
                 &entry.uri,
                 &entry.storage_path(),
-                ReadIntent::Warm,
+                open_intent,
             );
             if let Some(reader) = &resident
                 && let Some(parquet_meta) = reader.loaded_parquet_metadata_with_page_index()
@@ -688,7 +688,7 @@ impl SupertableProvider {
                                 &entry.uri,
                                 &entry.storage_path(),
                                 entry.subsection_offsets.as_ref(),
-                                ReadIntent::Warm,
+                                open_intent,
                             )
                             .await
                             .map_err(QueryError::store)?,
@@ -3015,13 +3015,7 @@ mod tests {
     /// A provider over `st`'s current manifest, the way a query builds one.
     fn provider_of(st: &Supertable) -> SupertableProvider {
         let reader = st.reader().expect("reader");
-        SupertableProvider::new(
-            reader.manifest().scalar_schema(),
-            reader.manifest().clone(),
-            st.options().store.clone(),
-            st.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
-        )
+        SupertableProvider::new(reader.manifest().scalar_schema(), &reader)
     }
 
     /// A runtime to drive a provider's async surface from a sync test.
@@ -3474,10 +3468,7 @@ mod tests {
         assert_eq!(reader.n_superfiles(), 1, "the merge left one file");
         let provider = Arc::new(SupertableProvider::new(
             reader.sql_schemas().scan().clone(),
-            Arc::clone(reader.manifest()),
-            Arc::clone(&table.options().store),
-            table.options().disk_cache.clone(),
-            reader.tombstone_cache.clone(),
+            &reader,
         ));
         let ctx = sql_session_context(&table.options().connection_memory_budget).expect("ctx");
         ctx.register_table(TABLE_NAME, Arc::clone(&provider) as Arc<dyn TableProvider>)

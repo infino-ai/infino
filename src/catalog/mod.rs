@@ -2123,6 +2123,7 @@ mod tests {
             fault_storage::{FaultOp, FaultStorage},
             schema_id_title,
             slow_storage::SlowStorage,
+            xorshift,
         },
     };
 
@@ -7134,5 +7135,121 @@ mod tests {
         let running = query_in_background(&conn, &sql, &cancel);
         thread::sleep(EXECUTE_BEFORE_CANCEL);
         cancel_and_expect_cancelled(&cancel, &running);
+    }
+
+    // ---- whole-file downloads on a SQL scan ----
+
+    /// Files in the download fixture, and rows in each: enough rows that a
+    /// scan reads each file's data from storage, not from what the manifest
+    /// carries for its open.
+    const DOWNLOAD_FIXTURE_FILES: usize = 6;
+    const ROWS_PER_DOWNLOAD_FILE: usize = 20_000;
+    /// Bytes of random text in each row's `body`. The scan never reads
+    /// `body`; it makes a whole file many times what the scan reads of it,
+    /// as on a production table, where a query reads a few of many columns.
+    const BODY_BYTES: usize = 256;
+    /// Letters the bodies are drawn from.
+    const BODY_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+    /// Seed for the fixture's rows.
+    const DOWNLOAD_FIXTURE_SEED: u64 = 7;
+    /// A scan that reads `n` from every file; the filter keeps statistics
+    /// from answering it.
+    const SCAN_N: &str = "SELECT sum(n) FROM wide WHERE n % 7 = 3";
+    /// Times the scan runs, each on a provider of its own as a query builds:
+    /// the first reads what the scan needs, the rest find it in the cache,
+    /// unless downloads have evicted it.
+    const SCANS: usize = 4;
+    /// How long the downloads the scans started may take to finish.
+    const FILL_TIMEOUT: Duration = Duration::from_secs(30);
+    /// The most of the table a scan by ranges may read, in percent. Each file
+    /// costs about one smallest read (512 KiB) for `n` and later scans hit
+    /// the cache: under a fifth of the table. Downloading costs the table at
+    /// least once.
+    const RANGE_READ_CEILING_PERCENT: u64 = 25;
+
+    /// Write the `wide` table, one file per append, and return its size in
+    /// superfile bytes.
+    fn write_wide_table(dir: &Path) -> u64 {
+        let conn = connect(dir.to_str().expect("utf8 path")).expect("connect");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("n", DataType::Int64, false),
+            Field::new("body", DataType::LargeUtf8, false),
+        ]));
+        let table = conn
+            .create_table("wide", Arc::clone(&schema), IndexSpec::new())
+            .expect("create");
+        let mut next = xorshift(DOWNLOAD_FIXTURE_SEED);
+        for _ in 0..DOWNLOAD_FIXTURE_FILES {
+            // 32-bit values, so their sum cannot overflow.
+            let n: Vec<i64> = (0..ROWS_PER_DOWNLOAD_FILE)
+                .map(|_| (next() >> u32::BITS) as i64)
+                .collect();
+            // A letter from each byte of a random word: the bodies of one
+            // file as one string, sliced into rows.
+            let letters: String = (0..ROWS_PER_DOWNLOAD_FILE * BODY_BYTES / size_of::<u64>())
+                .flat_map(|_| next().to_le_bytes())
+                .map(|byte| char::from(BODY_ALPHABET[usize::from(byte) % BODY_ALPHABET.len()]))
+                .collect();
+            let body = LargeStringArray::from_iter_values(
+                (0..ROWS_PER_DOWNLOAD_FILE)
+                    .map(|row| &letters[row * BODY_BYTES..(row + 1) * BODY_BYTES]),
+            );
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int64Array::from(n)), Arc::new(body)],
+            )
+            .expect("batch");
+            table.append(&batch).expect("append");
+        }
+        table.local_handle().storage_bytes().expect("table size")
+    }
+
+    /// Connect to `dir` with an empty disk cache of `budget` bytes, run
+    /// [`SCAN_N`] [`SCANS`] times, and give the downloads the scans started
+    /// [`FILL_TIMEOUT`] to finish. Returns the bytes read from storage,
+    /// downloads included.
+    fn bytes_read_by_scans(dir: &Path, budget: u64) -> u64 {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let conn = connect_with(
+            dir.to_str().expect("utf8 path"),
+            ConnectOptions::new()
+                .with_cache_dir(cache.path())
+                .with_cache_budget_bytes(budget),
+        )
+        .expect("connect");
+        let table = conn.open_table("wide").expect("open");
+        let opened = conn.usage_snapshot();
+        for _ in 0..SCANS {
+            conn.query_sql(SCAN_N).expect("scan");
+        }
+        // Not unwrapped: downloads on a cache too small for the table evict
+        // one another and never settle, and the bytes read by the deadline
+        // are what the caller checks.
+        let _ = table.local_handle().wait_until_warm(FILL_TIMEOUT);
+        let read = conn.usage_snapshot().since(&opened);
+        read.get_bytes + read.bg_get_bytes
+    }
+
+    /// A scan downloads whole files into the disk cache only when the cache
+    /// can hold the table. On a smaller cache the downloads would evict one
+    /// another, each query downloading files again for the next to evict,
+    /// so the scan reads only the ranges it needs and the cache keeps them.
+    #[test]
+    fn a_sql_scan_downloads_whole_files_only_when_the_cache_holds_the_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table_bytes = write_wide_table(dir.path());
+
+        let ranges_only = bytes_read_by_scans(dir.path(), table_bytes / 2);
+        let downloaded = bytes_read_by_scans(dir.path(), table_bytes * 2);
+        assert!(
+            ranges_only * 100 < table_bytes * RANGE_READ_CEILING_PERCENT,
+            "a cache smaller than its table keeps a scan to the ranges it reads: \
+             {ranges_only} bytes read of a {table_bytes}-byte table"
+        );
+        assert!(
+            downloaded >= table_bytes,
+            "a cache that holds the table downloads every file the scan opened: \
+             {downloaded} bytes read of a {table_bytes}-byte table"
+        );
     }
 }

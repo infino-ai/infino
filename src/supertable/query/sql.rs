@@ -457,14 +457,8 @@ impl SupertableReader {
     /// The pushdown-aware provider over this reader's pinned snapshot,
     /// merging value counts through the table's carried sums.
     fn sql_provider(&self) -> SupertableProvider {
-        SupertableProvider::new(
-            self.sql_schemas().scan().clone(),
-            Arc::clone(self.manifest()),
-            Arc::clone(&self.options().store),
-            self.options().disk_cache.as_ref().map(Arc::clone),
-            self.tombstone_cache.clone(),
-        )
-        .with_value_count_carry(self.value_count_carry())
+        SupertableProvider::new(self.sql_schemas().scan().clone(), self)
+            .with_value_count_carry(self.value_count_carry())
     }
 
     /// Build (or reuse the cached) [`SessionContext`] for the
@@ -665,18 +659,8 @@ impl Supertable {
         // under Strong, fails rather than serving a stale snapshot), so no
         // separate `ensure_fresh` call is needed here.
         let reader = Arc::new(self.reader().map_err(QueryError::ManifestLoad)?);
-        let manifest = Arc::clone(reader.manifest());
-        let store = Arc::clone(&self.options().store);
-        let disk_cache = self.options().disk_cache.as_ref().map(Arc::clone);
         // Provider scans the cached string-viewed schema.
-        let provider = SupertableProvider::new(
-            self.sql_schemas().scan().clone(),
-            manifest,
-            store,
-            disk_cache,
-            reader.tombstone_cache.clone(),
-        )
-        .with_value_count_carry(reader.value_count_carry());
+        let provider = reader.sql_provider();
         // Registering the table we just built is ours to get right.
         ctx.register_table(name, Arc::new(provider))
             .map_err(QueryError::internal)?;
@@ -1585,8 +1569,8 @@ mod tests {
     #[test]
     fn sql_schemas_is_memoized_across_calls() {
         let st = Supertable::create(options_id_cat_title()).expect("create");
-        let a = st.sql_schemas();
-        let b = st.sql_schemas();
+        let a = st.reader().expect("reader").sql_schemas();
+        let b = st.reader().expect("reader").sql_schemas();
         assert!(
             Arc::ptr_eq(&a, &b),
             "sql_schemas must be cached (same Arc), not recomputed per call",

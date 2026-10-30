@@ -1130,11 +1130,6 @@ impl Supertable {
         self.inner.manifest.load().user_schema()
     }
 
-    /// Cached per-table SQL schemas (scan view + scalar schema).
-    pub(crate) fn sql_schemas(&self) -> Arc<SqlSchemas> {
-        self.inner.sql_schemas()
-    }
-
     /// Sync→async bridge for the public query surface. Mirrors the
     /// runtime handling in [`Supertable::query_sql`]: when a caller is
     /// already on a `multi_thread` runtime, reuse it via
