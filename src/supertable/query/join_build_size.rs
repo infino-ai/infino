@@ -40,19 +40,13 @@
 //! build side. Each column of each batch is judged on its own: one charged
 //! more than [`OVERCOUNT_FACTOR`] times the bytes its rows use is copied into
 //! fresh buffers, and every other column passes through as the same array.
-//! The copy has the same values, nulls and order, so the join's result cannot
-//! change; it costs one copy of the over-counted columns, and the larger
-//! buffers are freed once no batch points into them. Until then a slice's
-//! source is charged to nobody (an aggregate shrinks its reservation once it
-//! has emitted), so while the slices are copied the budget sees less than the
-//! process holds.
-//!
-//! Two nested cases are not right-sized. A string or binary view nested in a
-//! list, struct or dictionary keeps all of its source's string buffers
-//! through the copy, so such a column looks over-counted, is copied, and
-//! stays over-counted: the copy costs time and changes nothing else. A column
-//! with a dictionary below its top level is passed through uncopied, because
-//! arrow's copy rejects a dictionary whose values fill its key type.
+//! A struct's fields and a list's values are judged the same way, so a
+//! nested column is right-sized like a top-level one. The copy has the same
+//! values, nulls and order, so the join's result cannot change; it costs one
+//! copy of the over-counted columns, and the larger buffers are freed once no
+//! batch points into them. Until then a slice's source is charged to nobody
+//! (an aggregate shrinks its reservation once it has emitted), so while the
+//! slices are copied the budget sees less than the process holds.
 //!
 //! Nested-loop and cross joins also charge each build batch for the full
 //! capacity of its buffers, are not wrapped, and are not covered by
@@ -69,11 +63,15 @@
 use std::{fmt, sync::Arc};
 
 use arrow::{
-    array::{MutableArrayData, make_array},
-    compute::take,
+    array::{Capacities, MutableArrayData, make_array},
+    buffer::{BooleanBuffer, NullBuffer, OffsetBuffer},
 };
-use arrow_array::{Array, ArrayRef, RecordBatch, UInt32Array, cast::AsArray};
-use arrow_schema::DataType;
+use arrow_array::{
+    Array, ArrayRef, DictionaryArray, FixedSizeListArray, GenericListArray, OffsetSizeTrait,
+    RecordBatch, StructArray, cast::AsArray, downcast_dictionary_array,
+    types::ArrowDictionaryKeyType,
+};
+use arrow_schema::{DataType, FieldRef};
 use datafusion::{
     common::{
         Statistics,
@@ -93,7 +91,7 @@ use datafusion::{
 };
 use futures::StreamExt;
 
-use crate::runtime_metrics::ingest::visible_array_bytes;
+use crate::runtime_metrics::ingest::{offset_window, visible_array_bytes};
 
 /// Rule name, as DataFusion lists it in `EXPLAIN VERBOSE`.
 const RULE_NAME: &str = "RightSizeJoinBuild";
@@ -246,36 +244,23 @@ impl BuildSizer {
         }
     }
 
-    /// `batch` with each [`is_overcounted`] column copied into fresh buffers
-    /// and every other column as it came; `batch` itself when no column is
-    /// copied. A batch with no rows passes through: it holds nothing to
-    /// charge, and its columns' rounding capacity would read as over-counted.
+    /// `batch` with each column passed through [`right_size_column`];
+    /// `batch` itself when no column is copied. A batch with no rows passes
+    /// through: it holds nothing to charge, and its columns' rounding
+    /// capacity would read as over-counted.
     fn right_size(&self, batch: RecordBatch) -> DfResult<RecordBatch> {
         if batch.num_rows() == 0 {
             return Ok(batch);
         }
-        // Row indices `take` copies by, built on the first column that needs
-        // them.
-        let mut rows: Option<UInt32Array> = None;
         let mut columns: Option<Vec<ArrayRef>> = None;
         for (i, column) in batch.columns().iter().enumerate() {
-            if !is_overcounted(column.as_ref()) {
+            let copy = right_size_column(column)?;
+            if Arc::ptr_eq(&copy, column) {
                 if let Some(columns) = columns.as_mut() {
-                    columns.push(Arc::clone(column));
+                    columns.push(copy);
                 }
                 continue;
             }
-            let Ok(len) = u32::try_from(batch.num_rows()) else {
-                return Ok(batch);
-            };
-            let rows = rows.get_or_insert_with(|| UInt32Array::from_iter_values(0..len));
-            let Some(copy) = copy_column(column, rows)? else {
-                if let Some(columns) = columns.as_mut() {
-                    columns.push(Arc::clone(column));
-                }
-                continue;
-            };
-            // A copy can be charged more than its source (a fresh buffer rounds up).
             self.uncharged.add(
                 column
                     .get_array_memory_size()
@@ -293,66 +278,169 @@ impl BuildSizer {
     }
 }
 
+/// `column` copied into buffers of its own when it [`is_overcounted`] and the
+/// copy is charged less; `column` itself otherwise. The second test keeps a
+/// column the size check misjudges, like a `NULL` literal (no bytes to
+/// compare against) or a struct of strings it owns (the check counts a
+/// struct's strings at 16 bytes a row), from being swapped for a copy that
+/// saves nothing.
+fn right_size_column(column: &ArrayRef) -> DfResult<ArrayRef> {
+    if !is_overcounted(column.as_ref()) {
+        return Ok(Arc::clone(column));
+    }
+    let copy = copy_column(column)?;
+    if copy.get_array_memory_size() < column.get_array_memory_size() {
+        Ok(copy)
+    } else {
+        Ok(Arc::clone(column))
+    }
+}
+
 /// Whether a hash join would charge `column` more than [`OVERCOUNT_FACTOR`]
 /// times the bytes its rows use.
 fn is_overcounted(column: &dyn Array) -> bool {
     column.get_array_memory_size() as u64 > visible_array_bytes(column) * OVERCOUNT_FACTOR
 }
 
-/// `column` in buffers of its own, or `None` when it holds a dictionary below
-/// its top level (see [`has_nested_dictionary`]). Arrow's `MutableArrayData`
-/// writes fresh values, offsets, views and null bitmaps and sizes a list's
-/// child to its own window; a view column then keeps only the out-of-line
-/// bytes its rows reference. A dictionary is copied by its keys through
-/// `take` and keeps its values, which every slice legitimately holds:
-/// `MutableArrayData` rejects a dictionary whose values fill its key type.
-fn copy_column(column: &ArrayRef, rows: &UInt32Array) -> DfResult<Option<ArrayRef>> {
-    if let DataType::Dictionary(..) = column.data_type() {
-        return Ok(Some(take(column.as_ref(), rows, None)?));
-    }
-    if has_nested_dictionary(column.data_type()) {
-        return Ok(None);
-    }
-    let data = column.to_data();
-    let mut copy = MutableArrayData::new(vec![&data], false, data.len());
-    copy.extend(0, 0, data.len());
-    let copy = make_array(copy.freeze());
-    Ok(Some(match copy.data_type() {
-        DataType::Utf8View => Arc::new(copy.as_string_view().gc()),
-        DataType::BinaryView => Arc::new(copy.as_binary_view().gc()),
-        _ => copy,
-    }))
+/// `column` with the same values, nulls and order in buffers sized to its
+/// rows. A struct is rebuilt from its fields, each through
+/// [`right_size_column`], and a list from offsets starting at zero and only
+/// the child values its rows address, so nested columns are right-sized the
+/// same way as top-level ones. A dictionary gets keys of its own and keeps
+/// its values, which every slice legitimately holds. Everything else is
+/// copied by arrow's `MutableArrayData`, and a view column is then
+/// compacted to only the out-of-line bytes its rows reference. Map, union,
+/// run-end encoded and list-view columns come back as they are: their slices
+/// are measured with their children in full and never read as over-counted.
+fn copy_column(column: &ArrayRef) -> DfResult<ArrayRef> {
+    Ok(match column.data_type() {
+        DataType::Struct(fields) => {
+            let record = column.as_struct();
+            let fields_copied = record
+                .columns()
+                .iter()
+                .map(right_size_column)
+                .collect::<DfResult<Vec<_>>>()?;
+            Arc::new(StructArray::try_new(
+                fields.clone(),
+                fields_copied,
+                copy_nulls(record.nulls()),
+            )?)
+        }
+        DataType::List(field) => copy_list(column.as_list::<i32>(), field)?,
+        DataType::LargeList(field) => copy_list(column.as_list::<i64>(), field)?,
+        DataType::FixedSizeList(field, size) => {
+            // A sliced fixed-size list's values are already its own window.
+            let list = column.as_fixed_size_list();
+            Arc::new(FixedSizeListArray::try_new(
+                Arc::clone(field),
+                *size,
+                right_size_column(list.values())?,
+                copy_nulls(list.nulls()),
+            )?)
+        }
+        DataType::Dictionary(..) => {
+            let dictionary = column.as_ref();
+            downcast_dictionary_array! {
+                dictionary => copy_dictionary(dictionary)?,
+                other => {
+                    return Err(DataFusionError::Internal(format!(
+                        "RightSizeBuildExec cannot copy a dictionary of {other}"
+                    )));
+                }
+            }
+        }
+        DataType::Map(..)
+        | DataType::Union(..)
+        | DataType::RunEndEncoded(..)
+        | DataType::ListView(_)
+        | DataType::LargeListView(_) => Arc::clone(column),
+        _ => {
+            let data = column.to_data();
+            let mut copy =
+                MutableArrayData::with_capacities(vec![&data], false, flat_capacities(column));
+            copy.extend(0, 0, data.len());
+            let copy = make_array(copy.freeze());
+            match copy.data_type() {
+                DataType::Utf8View => Arc::new(copy.as_string_view().gc()),
+                DataType::BinaryView => Arc::new(copy.as_binary_view().gc()),
+                _ => copy,
+            }
+        }
+    })
 }
 
-/// Whether a dictionary sits anywhere below `data_type`'s top level, where
-/// `MutableArrayData` would copy it and panics on one whose values fill its
-/// key type (128 values for an `Int8` key). Such a column is passed through
-/// uncopied.
-fn has_nested_dictionary(data_type: &DataType) -> bool {
-    let is_or_has = |child: &DataType| {
-        matches!(child, DataType::Dictionary(..)) || has_nested_dictionary(child)
-    };
-    match data_type {
-        DataType::List(field)
-        | DataType::LargeList(field)
-        | DataType::ListView(field)
-        | DataType::LargeListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::Map(field, _) => is_or_has(field.data_type()),
-        DataType::Struct(fields) => fields.iter().any(|field| is_or_has(field.data_type())),
-        DataType::Union(fields, _) => fields.iter().any(|(_, field)| is_or_has(field.data_type())),
-        DataType::Dictionary(_, values) => has_nested_dictionary(values),
-        DataType::RunEndEncoded(_, values) => is_or_has(values.data_type()),
-        _ => false,
+/// `list` with offsets of its own starting at zero, a null bitmap of its own,
+/// and only the child values its rows address, right-sized.
+fn copy_list<O: OffsetSizeTrait>(
+    list: &GenericListArray<O>,
+    field: &FieldRef,
+) -> DfResult<ArrayRef> {
+    let (start, end) = offset_window(list.value_offsets());
+    let offsets: Vec<O> = list
+        .value_offsets()
+        .iter()
+        .map(|offset| O::usize_as(offset.as_usize() - start))
+        .collect();
+    let values = right_size_column(&list.values().slice(start, end - start))?;
+    Ok(Arc::new(GenericListArray::try_new(
+        Arc::clone(field),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        copy_nulls(list.nulls()),
+    )?))
+}
+
+/// `dictionary` with keys of its own and the same values. Arrow's
+/// `MutableArrayData` would reject a dictionary whose values fill its key
+/// type (128 values for an `Int8` key), so only the keys go through it.
+fn copy_dictionary<K: ArrowDictionaryKeyType>(
+    dictionary: &DictionaryArray<K>,
+) -> DfResult<ArrayRef> {
+    let keys: ArrayRef = Arc::new(dictionary.keys().clone());
+    let keys = copy_column(&keys)?.as_primitive::<K>().clone();
+    Ok(Arc::new(DictionaryArray::try_new(
+        keys,
+        Arc::clone(dictionary.values()),
+    )?))
+}
+
+/// A null bitmap of its own for `nulls`: a slice's bitmap points into its
+/// source's, which is charged in full.
+fn copy_nulls(nulls: Option<&NullBuffer>) -> Option<NullBuffer> {
+    nulls.map(|nulls| {
+        NullBuffer::new(BooleanBuffer::collect_bool(nulls.len(), |row| {
+            nulls.is_valid(row)
+        }))
+    })
+}
+
+/// Capacities that fit a flat `column`'s rows exactly: for offset strings
+/// and binaries, the value bytes its window addresses rather than arrow's
+/// default of one byte a row, which a copy of longer values outgrows by
+/// doubling.
+fn flat_capacities(column: &dyn Array) -> Capacities {
+    let len = column.len();
+    let bytes = |offsets: (usize, usize)| Capacities::Binary(len, Some(offsets.1 - offsets.0));
+    match column.data_type() {
+        DataType::Utf8 => bytes(offset_window(column.as_string::<i32>().value_offsets())),
+        DataType::LargeUtf8 => bytes(offset_window(column.as_string::<i64>().value_offsets())),
+        DataType::Binary => bytes(offset_window(column.as_binary::<i32>().value_offsets())),
+        DataType::LargeBinary => bytes(offset_window(column.as_binary::<i64>().value_offsets())),
+        _ => Capacities::Array(len),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use arrow::compute::{BatchCoalescer, take_record_batch};
+    use arrow::{
+        buffer::{NullBuffer, OffsetBuffer},
+        compute::{BatchCoalescer, take_record_batch},
+    };
     use arrow_array::{
-        BinaryViewArray, BooleanArray, DictionaryArray, Int64Array, LargeStringArray, ListArray,
-        StringArray, StringViewArray, StructArray,
+        BinaryViewArray, BooleanArray, DictionaryArray, FixedSizeListArray, Float32Array,
+        Int64Array, LargeStringArray, ListArray, NullArray, StringArray, StringViewArray,
+        StructArray, UInt32Array,
         types::{Int8Type, Int32Type, Int64Type},
     };
     use arrow_schema::{Field, Schema};
@@ -386,6 +474,10 @@ mod tests {
     const INT8_KEYS: usize = 128;
     /// Values in each list row of the list test.
     const LIST_WIDTH: usize = 4;
+    /// In the sparse list test, one row in this many holds a value.
+    const SPARSE_EVERY: usize = 4;
+    /// Floats in each vector of the sparse list test.
+    const VECTOR_WIDTH: i32 = 8;
     /// Distinct short keys in the inline-strings test: each at most 4 bytes,
     /// so it lives inline in its view.
     const SHORT_KEYS: usize = 1000;
@@ -509,8 +601,7 @@ mod tests {
                 is_overcounted(slice.as_ref()),
                 "{name}: the slice is over-counted"
             );
-            let rows = UInt32Array::from_iter_values(0..SLICE_ROWS as u32);
-            let copy = copy_column(&slice, &rows).expect("copy").expect("copied");
+            let copy = copy_column(&slice).expect("copy");
             assert_eq!(&copy, &slice, "{name}: same strings and nulls");
             assert!(
                 !is_overcounted(copy.as_ref()),
@@ -534,8 +625,7 @@ mod tests {
         )) as ArrayRef;
         let slice = list.slice(SLICE_OFFSET, SLICE_ROWS);
         assert!(is_overcounted(slice.as_ref()), "the slice is over-counted");
-        let rows = UInt32Array::from_iter_values(0..SLICE_ROWS as u32);
-        let copy = copy_column(&slice, &rows).expect("copy").expect("copied");
+        let copy = copy_column(&slice).expect("copy");
         assert_eq!(&copy, &slice, "same lists");
         assert!(
             !is_overcounted(copy.as_ref()),
@@ -562,8 +652,7 @@ mod tests {
             is_overcounted(slice.as_ref()),
             "the slice's keys are over-counted"
         );
-        let rows = UInt32Array::from_iter_values(0..SLICE_ROWS as u32);
-        let copy = copy_column(&slice, &rows).expect("copy").expect("copied");
+        let copy = copy_column(&slice).expect("copy");
         assert_eq!(&copy, &slice, "same keys and values");
         assert!(
             !is_overcounted(copy.as_ref()),
@@ -571,26 +660,173 @@ mod tests {
         );
     }
 
-    /// A column with a dictionary below its top level passes through uncopied,
-    /// even when it is a slice of a large result, instead of reaching arrow's
-    /// copy, which rejects a dictionary whose values fill its key type.
+    /// A slice of a sparse list column is copied with only the child values
+    /// its rows address, not one per row: a list with a value in one row of
+    /// four, an all-null list, and a sparse list of fixed-size lists.
     #[test]
-    fn a_column_with_a_nested_dictionary_passes_through() {
+    fn a_slice_of_a_sparse_list_column_is_copied() {
+        let sparse = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            (0..BIG_ROWS).map(|i| Some((i % SPARSE_EVERY == 0).then_some(Some(i as i64)))),
+        )) as ArrayRef;
+        let all_null = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>(
+            (0..BIG_ROWS).map(|_| None::<Vec<Option<i64>>>),
+        )) as ArrayRef;
+        let vectors = FixedSizeListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Float32, false)),
+            VECTOR_WIDTH,
+            Arc::new(Float32Array::from_iter_values(
+                (0..BIG_ROWS / SPARSE_EVERY * VECTOR_WIDTH as usize).map(|i| i as f32),
+            )),
+            None,
+        )
+        .expect("vectors");
+        let sparse_vectors = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new_list_field(vectors.data_type().clone(), false)),
+                OffsetBuffer::from_lengths(
+                    (0..BIG_ROWS).map(|i| usize::from(i % SPARSE_EVERY == 0)),
+                ),
+                Arc::new(vectors),
+                None,
+            )
+            .expect("list of vectors"),
+        ) as ArrayRef;
+        for (name, column) in [
+            ("sparse", sparse),
+            ("all null", all_null),
+            ("sparse vectors", sparse_vectors),
+        ] {
+            let slice = column.slice(SLICE_OFFSET, SLICE_ROWS);
+            assert!(
+                is_overcounted(slice.as_ref()),
+                "{name}: the slice is over-counted"
+            );
+            let copy = copy_column(&slice).expect("copy");
+            assert_eq!(&copy, &slice, "{name}: same lists");
+            assert!(
+                !is_overcounted(copy.as_ref()),
+                "{name}: {} B charged for {} B of rows",
+                copy.get_array_memory_size(),
+                visible_array_bytes(copy.as_ref())
+            );
+        }
+    }
+
+    /// A slice of nested columns is right-sized field by field: a struct of a
+    /// dictionary whose values fill its key type, long string views and
+    /// integers, and a list of long string views. The copy holds the same
+    /// rows, no field or list of it is over-counted, and it is charged a
+    /// fraction of the slice.
+    #[test]
+    fn a_slice_of_nested_dictionaries_and_views_is_copied() {
         let values: Vec<String> = (0..BIG_ROWS)
             .map(|i| format!("value {}", i % INT8_KEYS))
             .collect();
-        let keys: ArrayRef = Arc::new(
+        let codes: ArrayRef = Arc::new(
             values
                 .iter()
                 .map(String::as_str)
                 .collect::<DictionaryArray<Int8Type>>(),
         );
-        let field = Arc::new(Field::new("code", keys.data_type().clone(), false));
+        let names: ArrayRef = Arc::new(StringViewArray::from_iter((0..BIG_ROWS).map(long_text)));
+        let ids: ArrayRef = Arc::new(Int64Array::from_iter_values(0..BIG_ROWS as i64));
+        let record_fields = vec![
+            Arc::new(Field::new("code", codes.data_type().clone(), false)),
+            Arc::new(Field::new("name", DataType::Utf8View, true)),
+            Arc::new(Field::new("id", DataType::Int64, false)),
+        ];
+        let record: ArrayRef = Arc::new(
+            StructArray::try_new(
+                record_fields.into(),
+                vec![codes, Arc::clone(&names), ids],
+                Some(NullBuffer::from_iter((0..BIG_ROWS).map(valid))),
+            )
+            .expect("struct"),
+        );
+        let name_lists: ArrayRef = Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+                OffsetBuffer::from_lengths(std::iter::repeat_n(1, BIG_ROWS)),
+                names,
+                None,
+            )
+            .expect("list"),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("record", record.data_type().clone(), true),
+            Field::new("names", name_lists.data_type().clone(), false),
+        ]));
+        let big = RecordBatch::try_new(schema, vec![record, name_lists]).expect("batch");
+        let slice = big.slice(SLICE_OFFSET, SLICE_ROWS);
+
+        let copied = sizer().right_size(slice.clone()).expect("right_size");
+        assert_eq!(copied, slice, "same rows, keys, strings and nulls");
+        let record = copied.column(0).as_struct();
+        assert_eq!(
+            record.nulls().expect("nulls").buffer().len(),
+            SLICE_ROWS.div_ceil(8),
+            "the struct's null bitmap is its own"
+        );
+        for (field, column) in record.fields().iter().zip(record.columns()) {
+            assert!(
+                !is_overcounted(column.as_ref()),
+                "{}: {} B charged for {} B of rows",
+                field.name(),
+                column.get_array_memory_size(),
+                visible_array_bytes(column.as_ref())
+            );
+        }
+        assert!(
+            !is_overcounted(copied.column(1).as_ref()),
+            "the list of names is charged for its rows"
+        );
+        let before = get_record_batch_memory_size(&slice);
+        let after = get_record_batch_memory_size(&copied);
+        assert!(
+            after * MIN_SHRINK < before,
+            "the copy is charged {after} B, the slice {before} B"
+        );
+    }
+
+    /// A struct of long strings it owns reads as over-counted, since a
+    /// struct's strings are measured at 16 bytes a row, but copying it would
+    /// save nothing: it passes through as the same array.
+    #[test]
+    fn a_struct_that_owns_its_strings_passes_through() {
+        let names: ArrayRef = Arc::new(StringViewArray::from_iter(
+            (0..SLICE_ROWS).map(|i| Some(format!("a string much longer than a view {i}"))),
+        ));
+        let field = Arc::new(Field::new("name", DataType::Utf8View, true));
         let record: ArrayRef =
-            Arc::new(StructArray::try_new(vec![field].into(), vec![keys], None).expect("struct"));
-        let slice = record.slice(SLICE_OFFSET, SLICE_ROWS);
-        let rows = UInt32Array::from_iter_values(0..SLICE_ROWS as u32);
-        assert!(copy_column(&slice, &rows).expect("copy").is_none());
+            Arc::new(StructArray::try_new(vec![field].into(), vec![names], None).expect("struct"));
+        assert!(
+            is_overcounted(record.as_ref()),
+            "the size check misjudges the struct"
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "record",
+            record.data_type().clone(),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::clone(&record)]).expect("batch");
+        let sizer = sizer();
+        let out = sizer.right_size(batch).expect("right_size");
+        assert!(Arc::ptr_eq(out.column(0), &record));
+        assert_eq!(sizer.right_sized.value(), 0);
+    }
+
+    /// A `NULL` literal column uses no bytes and is never copied.
+    #[test]
+    fn a_null_column_passes_through() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Null, true)]));
+        let nulls: ArrayRef = Arc::new(NullArray::new(BIG_ROWS));
+        let sizer = sizer();
+        for column in [nulls.slice(SLICE_OFFSET, SLICE_ROWS), nulls] {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![column]).expect("batch");
+            let out = sizer.right_size(batch.clone()).expect("right_size");
+            assert_eq!(out, batch);
+        }
+        assert_eq!(sizer.right_sized.value(), 0);
     }
 
     /// A batch arrow's coalescer assembles from sparse string views, as a hash
