@@ -633,7 +633,7 @@ impl FanoutContext {
 /// task fetching and decoding after its caller had gone. The join error is
 /// flattened into a `QueryError`, so a collecting caller short-circuits on
 /// the first failing superfile.
-fn spawn_unit<R: Send + 'static>(
+pub(crate) fn spawn_unit<R: Send + 'static>(
     unit: impl Future<Output = Result<R, QueryError>> + Send + 'static,
 ) -> impl Future<Output = Result<R, QueryError>> {
     let task = SpawnedTask::spawn(unit);

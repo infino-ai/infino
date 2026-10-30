@@ -165,6 +165,14 @@ pub trait LazyByteSource: Send + Sync {
         self.range(start, len).await
     }
 
+    /// [`Self::range`] for a caller that knows exactly which bytes it needs:
+    /// a cache that grows a short miss into a wider window, for the reads
+    /// that usually follow it, fetches just these bytes instead. Defaults to
+    /// [`Self::range`].
+    async fn range_exact(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.range(start, len).await
+    }
+
     /// Count `[start, start + len)` as read, for a reader served those bytes
     /// from what it downloaded ahead, so a cache that tracks which way reads
     /// move still follows it. Downloads nothing. Does nothing by default.
@@ -465,6 +473,26 @@ impl Source {
         s.range(range.start as u64, range.len() as u64).await
     }
 
+    /// [`Self::range_async`] for exactly `range`: a cache in front of a lazy
+    /// source fetches just these bytes on a miss rather than a wider window
+    /// (see [`LazyByteSource::range_exact`]).
+    pub async fn range_exact_async(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.try_get_range_sync(range.clone()) {
+            return Ok(bytes);
+        }
+        let Self::Lazy(s) = self else {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start: range.start as u64,
+                len: range.len() as u64,
+                size: self.len() as u64,
+            });
+        };
+        s.range_exact(range.start as u64, range.len() as u64).await
+    }
+
     /// Async concurrent multi-range fetch. Sync-resident ranges are
     /// served immediately; cold `Lazy` misses are dispatched as one
     /// `try_join_all` batch and `await`ed on the caller's runtime.
@@ -629,6 +657,17 @@ impl LazyByteSource for LazySubSource {
         self.inner.range(self.offset + start, len).await
     }
 
+    async fn range_exact(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if start.saturating_add(len) > self.len {
+            return Err(LazyByteSourceError::OutOfBounds {
+                start,
+                len,
+                size: self.len,
+            });
+        }
+        self.inner.range_exact(self.offset + start, len).await
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if start.saturating_add(len) > self.len {
             return None;
@@ -750,6 +789,13 @@ impl LazyByteSource for PrefetchedSource {
             return Ok(b);
         }
         self.inner.range_ahead(start, len).await
+    }
+
+    async fn range_exact(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(b) = self.lookup(start, len) {
+            return Ok(b);
+        }
+        self.inner.range_exact(start, len).await
     }
 
     fn note_read(&self, start: u64, len: u64) {

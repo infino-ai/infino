@@ -100,6 +100,11 @@ pub(crate) const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 /// reads less.
 const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
+/// Gap between two stable-id sidecar blocks a lookup reads in one span
+/// rather than two: past a block's few KB, a round trip costs more than
+/// this many bytes of transfer.
+const ID_BLOCK_GAP_BYTES: usize = 128 * 1024;
+
 /// A take of at least one row in this many of the file, over fixed-width
 /// columns only, reads each projected column whole and gathers the rows
 /// from it, instead of decoding through a row selection. A selection skips
@@ -1651,13 +1656,34 @@ impl SuperfileReader {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let bodies = try_join_all(
-            ranges
+        // Exact reads, since a block is a few KB and a cache widening each to
+        // its read window downloaded hundreds of KB per hit; blocks closer
+        // than `ID_BLOCK_GAP_BYTES` share one read, so a superfile with many
+        // hits costs a few reads rather than one per block.
+        let mut spans: Vec<Range<usize>> = Vec::new();
+        for r in &ranges {
+            match spans.last_mut() {
+                Some(span) if r.start <= span.end + ID_BLOCK_GAP_BYTES => {
+                    span.end = span.end.max(r.end)
+                }
+                _ => spans.push(r.clone()),
+            }
+        }
+        let span_bodies = try_join_all(
+            spans
                 .iter()
-                .map(|r| source.range(loc.offset + r.start as u64, r.len() as u64)),
+                .map(|r| source.range_exact(loc.offset + r.start as u64, r.len() as u64)),
         )
         .await
         .map_err(fetch("stable-id sidecar block fetch"))?;
+        let bodies: Vec<Bytes> = ranges
+            .iter()
+            .map(|r| {
+                let at = spans.partition_point(|span| span.end <= r.start);
+                let span = &spans[at];
+                span_bodies[at].slice(r.start - span.start..r.end - span.start)
+            })
+            .collect();
         let mut by_doc: Vec<i128> = Vec::with_capacity(sorted.len());
         let mut at = 0usize;
         for (&b, body) in blocks.iter().zip(&bodies) {

@@ -2120,6 +2120,17 @@ impl LazyByteSource for BlockCachedSource {
         self.read(start, len).await
     }
 
+    /// Local bytes as any read gets them; a miss fetches exactly `len` bytes
+    /// and fills no block, since the caller knows the bytes around them are
+    /// not what it reads next.
+    async fn range_exact(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(bytes) = self.read_sync(start, len) {
+            self.note_read(start, len);
+            return Ok(bytes);
+        }
+        self.inner.range(start, len).await
+    }
+
     async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
         // Pass through: `tail` both fetches and (on unknown-size sources)
         // discovers the object size, which the inner source caches. Tail
