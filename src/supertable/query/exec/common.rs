@@ -1772,11 +1772,13 @@ fn take_prefetch_budget() -> &'static Semaphore {
 /// rows) falls in, merged where they touch: the bytes a take's decode reads,
 /// so they can be fetched at once instead of one row group after another. A
 /// nested root contributes every leaf under it. `None` when they come to
-/// more than [`TAKE_PREFETCH_MAX_BYTES`] or a root is not in the file.
+/// more than `max_bytes` ([`TAKE_PREFETCH_MAX_BYTES`]) or a root is not in
+/// the file.
 fn take_prefetch_spans(
     metadata: &ParquetMetaData,
     sorted: &[u32],
     roots: &[usize],
+    max_bytes: u64,
 ) -> Option<Vec<Range<u64>>> {
     let descr = metadata.file_metadata().schema_descr();
     if roots
@@ -1822,7 +1824,7 @@ fn take_prefetch_spans(
         }
     }
     let bytes: u64 = merged.iter().map(|r| r.end - r.start).sum();
-    (bytes <= TAKE_PREFETCH_MAX_BYTES).then_some(merged)
+    (bytes <= max_bytes).then_some(merged)
 }
 
 /// The bytes of leaf column `c` in row group `index` (rows `first_row` to
@@ -2014,7 +2016,9 @@ pub(crate) async fn take_rows_byte_source(
     let mut prefetched = Vec::new();
     // Held until the decode is done: the prefetched bytes live that long.
     let mut _room = None;
-    if let Some(spans) = take_prefetch_spans(&metadata, &sorted, &roots).filter(|s| !s.is_empty()) {
+    if let Some(spans) = take_prefetch_spans(&metadata, &sorted, &roots, TAKE_PREFETCH_MAX_BYTES)
+        .filter(|s| !s.is_empty())
+    {
         let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
         _room = Some(
             take_prefetch_budget()
@@ -2321,19 +2325,21 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread::sleep, time::Duration};
+    use std::{sync::Mutex, thread::sleep, time::Duration};
 
     use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray, StructArray};
     use arrow_schema::Field;
+    use async_trait::async_trait;
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
     use parquet::{
         arrow::ArrowWriter,
         file::{
-            metadata::{PageIndexPolicy, ParquetMetaDataReader},
+            metadata::{FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
             properties::WriterProperties,
         },
+        schema::types::{SchemaDescriptor, Type},
     };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
@@ -2344,17 +2350,52 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
+            lazy_source::{LazyByteSource, LazyByteSourceError},
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
             query::fts::TIE_NARROW_BATCH,
-            reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
+            reader_cache::{
+                ColdFetchMode, DiskCacheConfig, DiskCacheStore,
+                disk::test_support::RecordingStorage,
+            },
         },
         test_helpers::{
             build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
         },
     };
+
+    /// An in-memory source that records every range asked of it.
+    struct RecordingSource {
+        blob: Bytes,
+        asked: Mutex<Vec<Range<u64>>>,
+    }
+
+    impl RecordingSource {
+        fn new(blob: Bytes) -> Self {
+            Self {
+                blob,
+                asked: Default::default(),
+            }
+        }
+
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.asked.lock().expect("asked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.asked.lock().expect("asked").push(start..start + len);
+            Ok(self.blob.slice(start as usize..(start + len) as usize))
+        }
+    }
 
     /// When far more hits tie at the k-th score than there are places, the
     /// top-k is still exactly the smallest `_id`s among the ties: narrowing
@@ -2368,6 +2409,54 @@ mod tests {
         smallest_ids_survive_a_tie(12, 20, 5);
         const _: () = assert!(20 > TIE_NARROW_BATCH);
         smallest_ids_survive_a_tie(100, 1, 20);
+    }
+
+    /// Hits scoring strictly better than the k-th always place, and the
+    /// places they leave go to the smallest `_id`s among the ties: the top k
+    /// with the narrowing equal the top k of the whole ranking.
+    #[test]
+    fn hits_better_than_the_tie_always_place() {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        for i in 0..100 {
+            // Every 30th superfile holds one row the term scores higher in.
+            let title = if i % 30 == 7 { "tie tie" } else { "tie" };
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&[title])).expect("append");
+            w.commit().expect("commit");
+        }
+        let ranked = |k: usize| -> Vec<(i128, f32)> {
+            let batches = st
+                .bm25_search(
+                    "title",
+                    "tie",
+                    k,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("bm25_search");
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let ids = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimal ids")
+                        .clone();
+                    let scores = b
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("scores")
+                        .clone();
+                    (0..ids.len()).map(move |i| (ids.value(i), scores.value(i)))
+                })
+                .collect()
+        };
+        let all = ranked(100);
+        let better = all.iter().filter(|(_, s)| *s > all[99].1).count();
+        assert_eq!(better, 4, "rows 7, 37, 67 and 97 score higher");
+        assert_eq!(ranked(20), all[..20], "the top 20 of the whole ranking");
     }
 
     /// `superfiles` commits of `rows` equal titles each: BM25's top `k` are
@@ -2438,7 +2527,8 @@ mod tests {
         assert_eq!(metadata.num_row_groups(), 10);
 
         let rows = [5u32, 150, 151, 950];
-        let spans = take_prefetch_spans(&metadata, &rows, &[0, 2]).expect("spans");
+        let spans =
+            take_prefetch_spans(&metadata, &rows, &[0, 2], TAKE_PREFETCH_MAX_BYTES).expect("spans");
         let covered = |(offset, len): (u64, u64)| {
             spans
                 .iter()
@@ -2462,7 +2552,11 @@ mod tests {
             !covered(metadata.row_group(0).column(1).byte_range()),
             "an unprojected column is not fetched"
         );
-        assert!(take_prefetch_spans(&metadata, &rows, &[3]).is_none());
+        assert!(take_prefetch_spans(&metadata, &rows, &[3], TAKE_PREFETCH_MAX_BYTES).is_none());
+        // Past the limit there is no prefetch: the take streams instead.
+        let need: u64 = spans.iter().map(|r| r.end - r.start).sum();
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need).is_some());
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need - 1).is_none());
     }
 
     /// With the page index loaded, a take's prefetch covers only the pages
@@ -2490,7 +2584,8 @@ mod tests {
         assert_eq!(pages(0).len(), 10, "ten pages a row group");
 
         let rows = [5u32, 37, 150];
-        let spans = take_prefetch_spans(&metadata, &rows, &[0]).expect("spans");
+        let spans =
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES).expect("spans");
         let covered = |offset: u64, len: u64| {
             spans
                 .iter()
@@ -2514,6 +2609,48 @@ mod tests {
         assert!(
             covered(chunk_start, first_page - chunk_start),
             "the dictionary page"
+        );
+    }
+
+    /// A batch of ranges the prefetch holds only some of fetches just the
+    /// others from the source.
+    #[tokio::test]
+    async fn ranges_the_prefetch_holds_are_not_fetched_again() {
+        let blob = Bytes::from((0..4096u32).map(|i| i as u8).collect::<Vec<_>>());
+        let inner = Arc::new(RecordingSource::new(blob.clone()));
+        let mut reader = ByteSourceAsyncReader {
+            source: Source::Lazy(Arc::clone(&inner) as Arc<dyn LazyByteSource>),
+            metadata: Arc::new(ParquetMetaData::new(
+                FileMetaData::new(
+                    0,
+                    0,
+                    None,
+                    None,
+                    Arc::new(SchemaDescriptor::new(Arc::new(
+                        Type::group_type_builder("s").build().expect("schema"),
+                    ))),
+                    None,
+                ),
+                Vec::new(),
+            )),
+            prefetched: vec![(100..200, blob.slice(100..200))],
+        };
+        let got = reader
+            .get_byte_ranges(vec![120..180, 1000..1100, 150..160])
+            .await
+            .expect("ranges");
+        assert_eq!(
+            got,
+            vec![
+                blob.slice(120..180),
+                blob.slice(1000..1100),
+                blob.slice(150..160)
+            ]
+        );
+        assert_eq!(
+            inner.ranges(),
+            vec![1000..1100],
+            "only the range outside the prefetch"
         );
     }
 
@@ -2553,13 +2690,13 @@ mod tests {
                 .any(|s| s.start <= offset && offset + len <= s.end)
         };
 
-        let b = take_prefetch_spans(&metadata, &[3], &[1]).expect("spans");
+        let b = take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES).expect("spans");
         assert!(covered(&b, 2), "b is leaf 2");
         assert!(!covered(&b, 1), "s.y is not projected");
-        let s = take_prefetch_spans(&metadata, &[3], &[0]).expect("spans");
+        let s = take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES).expect("spans");
         assert!(covered(&s, 0) && covered(&s, 1), "both leaves of s");
         assert!(!covered(&s, 2), "b is not projected");
-        assert!(take_prefetch_spans(&metadata, &[3], &[2]).is_none());
+        assert!(take_prefetch_spans(&metadata, &[3], &[2], TAKE_PREFETCH_MAX_BYTES).is_none());
     }
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.
@@ -3559,6 +3696,87 @@ mod tests {
         commit_titles_to(&storage);
         let (cache, consumer) = open_cold(Arc::clone(&storage), &cache_dir);
         (storage_dir, cache_dir, cache, consumer)
+    }
+
+    /// The same take run twice reads its rows from storage once: the bytes
+    /// its exact reads fetched are kept, so the second run finds them local.
+    #[test]
+    fn a_repeated_cold_take_reads_storage_once() {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        // Big enough that a take reads past the open's tail into many blocks.
+        let titles: Vec<String> = (0..50_000)
+            .map(|i| format!("rust title {i} {}", i * 7919))
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("create producer");
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&refs)).expect("append");
+        w.commit().expect("commit");
+        drop(producer);
+        // A cache smaller than the table reads ranges and keeps their blocks,
+        // where one that holds it would download whole files.
+        let table_bytes =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("open")
+                .storage_bytes()
+                .expect("table size");
+        let recording = RecordingStorage::over(local);
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            disk_budget_bytes: table_bytes / 2,
+            promotion_defer_timeout: Duration::MAX,
+            ..Default::default()
+        };
+        let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+        let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("cache");
+        let consumer = Supertable::open(
+            default_supertable_options()
+                .with_storage(storage)
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("open consumer");
+        let take = || {
+            consumer
+                .reader()
+                .expect("reader")
+                .bm25_search(
+                    "title",
+                    "rust",
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["title"]),
+                )
+                .expect("cold bm25 with a scalar projection")
+        };
+        let first = take();
+        let after_first = recording.n_ranges();
+        assert!(after_first > 0, "the first take reads storage");
+        assert_eq!(take(), first);
+        // The FTS subsection is read through, never kept, by design; what the
+        // take read is kept.
+        let reader = consumer.reader().expect("reader");
+        let entry = &reader.manifest().superfiles[0];
+        let (fts_at, fts_len) = entry
+            .subsection_offsets
+            .as_ref()
+            .and_then(|o| o.fts)
+            .expect("an FTS subsection");
+        let outside: Vec<Range<u64>> = recording
+            .ranges_since(after_first)
+            .into_iter()
+            .filter(|r| r.start < fts_at || r.end > fts_at + fts_len)
+            .collect();
+        assert_eq!(
+            outside,
+            Vec::<Range<u64>>::new(),
+            "the second take reads nothing again"
+        );
     }
 
     #[test]
