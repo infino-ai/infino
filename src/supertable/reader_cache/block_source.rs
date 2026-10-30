@@ -1498,9 +1498,10 @@ impl BlockCachedSource {
         bf: &BlockFile,
         start: u64,
         len: u64,
+        window: Window,
     ) -> Result<Option<Bytes>, LazyByteSourceError> {
         let (b0, b1) = Self::block_span(start, len);
-        let segments = self.claim_segments(b0, b1, bf.size);
+        let segments = self.claim_segments(b0, b1, bf.size, window);
 
         // Every fetch is awaited to its end, even once one has ended without
         // bytes: the others queue their bytes for writing as they land, so those
@@ -1630,7 +1631,7 @@ impl BlockCachedSource {
     /// Window 1 fetches through blocks 10..12 (it would have alone, and the read
     /// takes them from it); window 2 starts on blocks another read is fetching,
     /// so the read waits for those and GETs it from block 18.
-    fn claim_segments(&self, b0: u32, b1: u32, size: u64) -> Vec<Segment> {
+    fn claim_segments(&self, b0: u32, b1: u32, size: u64, window: Window) -> Vec<Segment> {
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
         let segments = self.segments_in(&runs, b0, b1, InFlight::Fetching);
         let missing: Vec<(u32, u32)> = segments
@@ -1645,7 +1646,7 @@ impl BlockCachedSource {
         }
 
         let mut fetches = Vec::new();
-        for (start, last) in self.plan_windows(&runs, size, b0, b1) {
+        for (start, last) in self.plan_windows(&runs, size, b0, b1, window) {
             // A window that holds none of the read's missing blocks is not sent:
             // nothing waits on it, so dropping it would cancel it mid-GET. The
             // read that wants its other blocks sizes a window of its own.
@@ -1721,6 +1722,7 @@ impl BlockCachedSource {
         size: u64,
         b0: u32,
         b1: u32,
+        window: Window,
     ) -> Vec<(u32, u32)> {
         let mut windows: Vec<(u32, u32)> = Vec::new();
         for segment in self.segments_in(runs, b0, b1, InFlight::Missing) {
@@ -1736,7 +1738,10 @@ impl BlockCachedSource {
                 first = covered + 1;
             }
             let floor = windows.last().map_or(0, |&(_, covered)| covered + 1);
-            windows.push(self.get_run(runs, size, first, last, floor));
+            windows.push(match window {
+                Window::Grown => self.get_run(runs, size, first, last, floor),
+                Window::Exact => (first, last),
+            });
         }
         windows
     }
@@ -2088,6 +2093,17 @@ impl Drop for BlockCachedSource {
     }
 }
 
+/// How far a read that misses the cache fetches.
+#[derive(Clone, Copy)]
+enum Window {
+    /// Grown to a window around the read ([`BlockCachedSource::get_run`]), so
+    /// its neighbours are local for the reads after it.
+    Grown,
+    /// Just the blocks the read touches: a caller that knows exactly which
+    /// bytes it needs, and fetches them all at once.
+    Exact,
+}
+
 #[async_trait]
 impl LazyByteSource for BlockCachedSource {
     fn size(&self) -> u64 {
@@ -2095,7 +2111,7 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-        let bytes = self.read(start, len).await;
+        let bytes = self.read(start, len, Window::Grown).await;
         self.note_read(start, len);
         bytes
     }
@@ -2117,18 +2133,17 @@ impl LazyByteSource for BlockCachedSource {
     }
 
     async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-        self.read(start, len).await
+        self.read(start, len, Window::Grown).await
     }
 
-    /// Local bytes as any read gets them; a miss fetches exactly `len` bytes
-    /// and fills no block, since the caller knows the bytes around them are
-    /// not what it reads next.
+    /// [`Self::range`] without the window: a miss fetches just the blocks the
+    /// read touches and keeps them, since the caller knows the bytes around
+    /// them are not what it reads next, and a repeat of the read finds them
+    /// local.
     async fn range_exact(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
-        if let Some(bytes) = self.read_sync(start, len) {
-            self.note_read(start, len);
-            return Ok(bytes);
-        }
-        self.inner.range(start, len).await
+        let bytes = self.read(start, len, Window::Exact).await;
+        self.note_read(start, len);
+        bytes
     }
 
     async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
@@ -2166,7 +2181,12 @@ impl LazyByteSource for BlockCachedSource {
 }
 
 impl BlockCachedSource {
-    async fn read(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+    async fn read(
+        &self,
+        start: u64,
+        len: u64,
+        window: Window,
+    ) -> Result<Bytes, LazyByteSourceError> {
         if len == 0 {
             return Ok(Bytes::new());
         }
@@ -2180,7 +2200,7 @@ impl BlockCachedSource {
             } else if !in_hole
                 // Missing blocks are fetched and kept, except in the hole,
                 // which reads never fill.
-                && let Some(bytes) = self.read_through(bf, start, len).await?
+                && let Some(bytes) = self.read_through(bf, start, len, window).await?
             {
                 return Ok(bytes);
             }
@@ -4351,6 +4371,31 @@ mod tests {
         let (uri, src) =
             installed_source(dir, store, Arc::clone(&inner) as Arc<dyn LazyByteSource>);
         (uri, inner, src)
+    }
+
+    /// An exact read that misses fetches just the blocks it touches, not a
+    /// window, and keeps them: the same read again makes no GET, and the
+    /// bytes are the ones a windowed read returns.
+    #[tokio::test]
+    async fn an_exact_read_fetches_its_blocks_once_and_keeps_them() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (_uri, inner, src) = counting_source(dir.path(), &store, 64 * UNIT as usize);
+        let (start, len) = (10 * UNIT + 100, 4096);
+        let want = inner.blob.slice(start as usize..(start + len) as usize);
+
+        assert_eq!(src.range_exact(start, len).await.expect("exact read"), want);
+        assert_eq!(inner.calls(), 1);
+        assert!(
+            inner.fetched_bytes() <= 2 * CACHE_BLOCK_BYTES,
+            "the blocks the read touches, not a window: {} bytes",
+            inner.fetched_bytes()
+        );
+        for _ in 0..2 {
+            assert_eq!(src.range_exact(start, len).await.expect("repeat"), want);
+        }
+        assert_eq!(src.range(start, len).await.expect("windowed"), want);
+        assert_eq!(inner.calls(), 1, "repeats come from the kept blocks");
     }
 
     /// A read whose block write is held:

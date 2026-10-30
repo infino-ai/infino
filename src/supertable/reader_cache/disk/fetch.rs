@@ -3386,6 +3386,10 @@ mod tests {
                 source.range(start, len).await.expect("read") == want,
                 "range {start}+{len} returns the file's bytes"
             );
+            assert!(
+                source.range_exact(start, len).await.expect("exact read") == want,
+                "an exact range {start}+{len} returns the file's bytes"
+            );
         }
         assert_eq!(recording.n_ranges(), gets, "no read went to object storage");
     }

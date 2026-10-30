@@ -1949,6 +1949,12 @@ impl SupertableReader {
         // beside the first opens, and re-plans the units not yet issued
         // when it reports. Either way one plan applies what it found.
         let mut units = units;
+        // Each superfile's smallest `_id`, for narrowing score ties: taken
+        // from the units here rather than looked up per tied superfile.
+        let id_mins: HashMap<SuperfileUri, i128> = units
+            .iter()
+            .map(|(entry, _)| (entry.uri, entry.id_min))
+            .collect();
         let mut settled_before: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut replan: Option<dispatch::ReplanFuture<'_, UnitParams, Vec<SuperfileHit>>> = None;
         if let (Some(query), Some((index, _))) = (tier_query, index_column) {
@@ -2164,7 +2170,7 @@ impl SupertableReader {
         }
         let mut per_unit = per_unit;
         per_unit.extend(settled_before);
-        let hits = select_top_k_stable(self, per_unit, k).await?;
+        let hits = select_top_k_stable(self, per_unit, k, &id_mins).await?;
         // Noted for the way the policy chose, whether or not the merge
         // then ran: a shape it declines every time is thereby measured as
         // the cost of asking, and the class settles on not asking.
@@ -3720,6 +3726,7 @@ async fn narrow_ties_by_id(
     cands: Vec<SuperfileHit>,
     k: usize,
     kth_score: f32,
+    id_mins: &HashMap<SuperfileUri, i128>,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     let (mut keep, ties): (Vec<SuperfileHit>, Vec<SuperfileHit>) =
         cands.into_iter().partition(|c| c.score > kth_score);
@@ -3732,18 +3739,12 @@ async fn narrow_ties_by_id(
     for hit in ties {
         by_superfile.entry(hit.superfile).or_default().push(hit);
     }
-    let manifest = tr.manifest();
-    let mut groups: Vec<(i128, Vec<SuperfileHit>)> = Vec::with_capacity(by_superfile.len());
-    for (uri, hits) in by_superfile {
-        // A superfile the manifest does not name sorts first, so it is
-        // always resolved.
-        let id_min = manifest
-            .lookup_superfile_entry(uri)
-            .await
-            .map_err(QueryError::ManifestLoad)?
-            .map_or(i128::MIN, |entry| entry.id_min);
-        groups.push((id_min, hits));
-    }
+    // A superfile `id_mins` does not name sorts first, so it is always
+    // resolved.
+    let mut groups: Vec<(i128, Vec<SuperfileHit>)> = by_superfile
+        .into_iter()
+        .map(|(uri, hits)| (id_mins.get(&uri).copied().unwrap_or(i128::MIN), hits))
+        .collect();
     groups.sort_unstable_by_key(|(id_min, _)| *id_min);
     let mut placing: Vec<SuperfileHit> = Vec::new();
     let mut groups = groups.into_iter().peekable();
@@ -3796,6 +3797,7 @@ async fn select_top_k_stable(
     tr: &SupertableReader,
     per_unit: Vec<Vec<SuperfileHit>>,
     k: usize,
+    id_mins: &HashMap<SuperfileUri, i128>,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     let mut cands: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
     // Narrow to the top-k *by score plus its boundary ties* before touching
@@ -3810,7 +3812,7 @@ async fn select_top_k_stable(
         });
         let kth_score = cands[k - 1].score;
         cands.retain(|c| c.score >= kth_score);
-        cands = narrow_ties_by_id(tr, cands, k, kth_score).await?;
+        cands = narrow_ties_by_id(tr, cands, k, kth_score, id_mins).await?;
     }
     dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
     // Total order: score desc, then stable `_id` asc — deterministic and

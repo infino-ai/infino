@@ -571,6 +571,21 @@ test_visible! {
 
 #[cfg(any(test, feature = "test-helpers"))]
 test_visible! {
+    /// Test-only: a copy of `superfile` whose id directory starts block `b`
+    /// where block `at` starts, so `b` begins before an earlier block ends.
+    fn with_out_of_order_id_block(superfile: &[u8], b: usize, at: usize) -> Vec<u8> {
+        let mut out = superfile.to_vec();
+        let range = id_sidecar_range(superfile);
+        let sidecar = &mut out[range];
+        let start = block_offset(sidecar, at) as u64;
+        let entry = HEADER_BYTES + b * DIR_ENTRY_BYTES;
+        sidecar[entry..entry + DIR_ENTRY_BYTES].copy_from_slice(&start.to_le_bytes());
+        out
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+test_visible! {
     /// Test-only: a copy of `superfile` whose id sidecar block `b` still
     /// decodes but to the wrong ids: its high base is one more, which moves
     /// every id in the block out of the file's id range. The damage a block
