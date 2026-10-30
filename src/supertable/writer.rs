@@ -4625,6 +4625,12 @@ async fn load_drain_remote_checkpoint(
         .storage
         .as_ref()
         .ok_or_else(|| BuildError::Store("drain checkpoint requires storage".into()))?;
+    if !slow_vector_state::has_pending_drain(storage.as_ref(), uri)
+        .await
+        .unwrap_or(true)
+    {
+        return Ok(None);
+    }
     let state = slow_vector_state::load_full_state(
         storage.as_ref(),
         uri,
@@ -8469,13 +8475,16 @@ async fn pin_uploaded_superfiles(
         if let (Some((uri, hash)), Some(storage)) = (
             manifest.slow_vector_state_blob(),
             inner.options.storage.as_ref(),
-        ) && let Ok(state) = slow_vector_state::load_full_state(
-            storage.as_ref(),
-            uri,
-            &hash,
-            &inner.options.legacy_names(),
-        )
-        .await
+        ) && slow_vector_state::has_pending_drain(storage.as_ref(), uri)
+            .await
+            .unwrap_or(true)
+            && let Ok(state) = slow_vector_state::load_full_state(
+                storage.as_ref(),
+                uri,
+                &hash,
+                &inner.options.legacy_names(),
+            )
+            .await
             && let Some(pending) = state.pending_drain
             && pending_metadata_schema(&pending.metadata) == Some(DRAIN_CHECKPOINT_SCHEMA)
         {
