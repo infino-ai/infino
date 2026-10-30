@@ -1693,20 +1693,29 @@ const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Spans of one superfile's take prefetch in flight at once.
 const TAKE_PREFETCH_CONCURRENCY: usize = 16;
 
-/// The projected column chunks of every row group `sorted` (ascending,
-/// distinct rows) falls in, merged where they touch: the bytes a take's
-/// decode reads, so they can be fetched at once instead of one row group
-/// after another. `None` when they come to more than
-/// [`TAKE_PREFETCH_MAX_BYTES`] or the file's columns are not flat.
+/// The column chunks of the `roots` columns (top-level, as the Arrow
+/// schema numbers them) in every row group `sorted` (ascending, distinct
+/// rows) falls in, merged where they touch: the bytes a take's decode reads,
+/// so they can be fetched at once instead of one row group after another. A
+/// nested root contributes every leaf under it. `None` when they come to
+/// more than [`TAKE_PREFETCH_MAX_BYTES`] or a root is not in the file.
 fn take_prefetch_spans(
     metadata: &ParquetMetaData,
     sorted: &[u32],
-    columns: &[usize],
+    roots: &[usize],
 ) -> Option<Vec<Range<u64>>> {
-    let leaves = metadata.file_metadata().schema_descr().num_columns();
-    if columns.iter().any(|&c| c >= leaves) {
+    let descr = metadata.file_metadata().schema_descr();
+    if roots
+        .iter()
+        .any(|&r| r >= descr.root_schema().get_fields().len())
+    {
         return None;
     }
+    // Chunks are per Parquet leaf, so a struct before a projected column
+    // shifts its chunk past its Arrow index.
+    let columns: Vec<usize> = (0..descr.num_columns())
+        .filter(|&leaf| roots.contains(&descr.get_column_root_idx(leaf)))
+        .collect();
     let mut spans: Vec<Range<u64>> = Vec::new();
     let (mut first_row, mut next) = (0u64, 0usize);
     for rg in metadata.row_groups() {
@@ -1716,7 +1725,7 @@ fn take_prefetch_spans(
             next += 1;
         }
         if next > before {
-            for &c in columns {
+            for &c in &columns {
                 let (offset, len) = rg.column(c).byte_range();
                 spans.push(offset..offset + len);
             }
@@ -1869,12 +1878,12 @@ pub(crate) async fn take_rows_byte_source(
     let mut sorted = local_doc_ids.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
-    let columns: Vec<usize> = names
+    let roots: Vec<usize> = names
         .iter()
         .filter_map(|name| reader.schema().index_of(name).ok())
         .collect();
     use futures::StreamExt as _;
-    let prefetched = match take_prefetch_spans(&metadata, &sorted, &columns) {
+    let prefetched = match take_prefetch_spans(&metadata, &sorted, &roots) {
         Some(spans) if !spans.is_empty() => {
             let fetched: Vec<Bytes> = futures::stream::iter(spans.iter().cloned().map(|span| {
                 let source = source.clone();
@@ -2112,10 +2121,22 @@ mod tests {
     /// which ids are read, never which hits are returned.
     #[test]
     fn a_tie_far_past_k_keeps_the_smallest_ids() {
+        // Within one batch of superfiles, and across several: one row a
+        // superfile puts the smallest 20 ids in 20 superfiles, past the first
+        // batch, so a walk that stops too early returns larger ids.
+        smallest_ids_survive_a_tie(12, 20, 5);
+        const _: () = assert!(20 > crate::supertable::query::fts::TIE_NARROW_BATCH);
+        smallest_ids_survive_a_tie(100, 1, 20);
+    }
+
+    /// `superfiles` commits of `rows` equal titles each: BM25's top `k` are
+    /// the `k` smallest `_id`s among them.
+    fn smallest_ids_survive_a_tie(superfiles: usize, rows: usize, k: usize) {
         let st = Supertable::create(default_supertable_options()).expect("create");
-        for _ in 0..12 {
+        for _ in 0..superfiles {
             let mut w = st.writer().expect("writer");
-            w.append(&build_title_batch(&["tie"; 20])).expect("append");
+            w.append(&build_title_batch(&vec!["tie"; rows]))
+                .expect("append");
             w.commit().expect("commit");
         }
         let ids = |batches: Vec<RecordBatch>| -> Vec<i128> {
@@ -2136,13 +2157,18 @@ mod tests {
         let mut all = ids(st
             .token_match("title", "tie", BoolMode::Or, Some(&["_id"]))
             .expect("token_match"));
-        assert_eq!(all.len(), 240);
+        assert_eq!(all.len(), superfiles * rows);
         all.sort_unstable();
         let mut top = ids(st
-            .bm25_search("title", "tie", 5, Bm25SearchOptions::new(), Some(&["_id"]))
+            .bm25_search("title", "tie", k, Bm25SearchOptions::new(), Some(&["_id"]))
             .expect("bm25_search"));
         top.sort_unstable();
-        assert_eq!(top, all[..5], "the five smallest ids among 240 ties");
+        assert_eq!(
+            top,
+            all[..k],
+            "the {k} smallest ids among {} ties",
+            all.len()
+        );
     }
 
     /// A take's prefetch covers the projected column chunks of exactly the
@@ -2197,6 +2223,53 @@ mod tests {
             "an unprojected column is not fetched"
         );
         assert!(take_prefetch_spans(&metadata, &rows, &[3]).is_none());
+    }
+
+    /// A struct before a projected column fills two leaf chunks, so the
+    /// projected column's chunk is found by its leaf, not its Arrow index;
+    /// a projected struct brings every leaf under it.
+    #[test]
+    fn take_prefetch_spans_find_a_column_after_a_struct_by_its_leaves() {
+        use arrow_array::StructArray;
+        use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+        let leaf =
+            |m: i64| Arc::new(Int64Array::from_iter_values((0..100).map(|i| i * m))) as ArrayRef;
+        let s = StructArray::from(vec![
+            (Arc::new(Field::new("x", DataType::Int64, false)), leaf(1)),
+            (Arc::new(Field::new("y", DataType::Int64, false)), leaf(2)),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", s.data_type().clone(), false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s), leaf(3)]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(50))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&Bytes::from(bytes))
+            .expect("metadata");
+        let rg = metadata.row_group(0);
+        assert_eq!(rg.num_columns(), 3, "s.x, s.y, b");
+        let covered = |spans: &[Range<u64>], leaf: usize| {
+            let (offset, len) = rg.column(leaf).byte_range();
+            spans
+                .iter()
+                .any(|s| s.start <= offset && offset + len <= s.end)
+        };
+
+        let b = take_prefetch_spans(&metadata, &[3], &[1]).expect("spans");
+        assert!(covered(&b, 2), "b is leaf 2");
+        assert!(!covered(&b, 1), "s.y is not projected");
+        let s = take_prefetch_spans(&metadata, &[3], &[0]).expect("spans");
+        assert!(covered(&s, 0) && covered(&s, 1), "both leaves of s");
+        assert!(!covered(&s, 2), "b is not projected");
+        assert!(take_prefetch_spans(&metadata, &[3], &[2]).is_none());
     }
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.

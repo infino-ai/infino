@@ -3702,7 +3702,7 @@ fn build_work_units(
 /// them are narrowed by `_id` before every tie's `_id` is resolved.
 const TIE_NARROW_MIN_FACTOR: usize = 4;
 /// Superfiles of tied candidates whose `_id`s one step resolves together.
-const TIE_NARROW_BATCH: usize = 16;
+pub(crate) const TIE_NARROW_BATCH: usize = 16;
 
 /// `cands` (scoring at least `kth_score`, the k-th best) with the hits tied
 /// at `kth_score` cut to the ones that can place: the smallest `_id`s among
