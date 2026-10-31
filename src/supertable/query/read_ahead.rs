@@ -89,7 +89,7 @@ use datafusion::{
     physical_plan::metrics::ExecutionPlanMetricsSet,
 };
 use futures::{FutureExt, future::BoxFuture};
-use object_store::{ObjectStore, Result as OsResult};
+use object_store::{OBJECT_STORE_COALESCE_DEFAULT, ObjectStore, Result as OsResult};
 use parquet::{
     arrow::{
         arrow_reader::ArrowReaderOptions,
@@ -137,6 +137,13 @@ const MIN_CHUNK_READ_PERCENT: u64 = 75;
 /// Read-ahead uses at most this share of the connection's memory budget, and
 /// leaves the rest to joins, sorts and appends, which can't do without it.
 const BUDGET_SHARE_PERCENT: usize = 50;
+
+/// Widest run of skipped pages inside one column chunk that the scan reads
+/// through to fetch the kept pages on either side in one GET. A GET to object
+/// storage waits about 25 ms for its first byte, and one stream moves about
+/// 60 MB/s, so a separate GET costs about as much time as 1.5 MB more bytes,
+/// and it is billed while in-region bytes are not.
+pub(super) const PAGE_READ_THROUGH_BYTES: u64 = 2 << 20;
 
 /// Shared by every reader of one scan: the store, the memory budget and the
 /// scan's filter.
@@ -815,8 +822,27 @@ impl ReadAhead {
         order.get_or_insert_with(|| planned_order(scan, file, meta))
     }
 
+    /// The bytes of `ranges`, downloaded now. Kept pages of one column chunk a
+    /// little apart come down in one span (see [`read_through_spans`]).
     async fn fetch(&self, ranges: &[Range<u64>]) -> ParquetResult<Vec<Bytes>> {
-        Ok(self.scan.store.get_ranges(self.location(), ranges).await?)
+        let store = &self.scan.store;
+        let location = self.location();
+        let spans = ranges
+            .first()
+            .and_then(|range| row_group_holding(&self.meta, range.start))
+            .and_then(|rg| {
+                let row_group = self.meta.row_group(rg);
+                read_through_spans(
+                    ranges,
+                    |range| column_of(row_group, range),
+                    |range| store.is_local(location, range),
+                )
+            });
+        let Some(spans) = spans else {
+            return Ok(store.get_ranges(location, ranges).await?);
+        };
+        let fetched = store.get_ranges(location, &spans).await?;
+        cut(ranges, &spans, &fetched)
     }
 
     /// `ranges` of `row_group`: what `batch` holds comes from it, the rest is
@@ -1170,6 +1196,93 @@ fn planned_order(scan: &ScanReadAhead, file: &PartitionedFile, meta: &ParquetMet
     }
 }
 
+/// The spans to download for `ranges` when kept pages of one column chunk lie
+/// further apart than the store merges across (object_store's default gap) but
+/// no further than [`PAGE_READ_THROUGH_BYTES`]: those come down as one span,
+/// the skipped pages between them included, because those bytes cost less
+/// than another GET. Other ranges merge as the store merges them. `None` when
+/// nothing is read through, so the store fetches `ranges` as it always has.
+///
+/// ```text
+///   kept pages of one chunk:  [p0]---- > 1 MiB, <= 2 MiB ----[p10]
+///   the store alone:          GET p0                         GET p10
+///   read through:             GET p0 ................................ p10
+/// ```
+///
+/// - Never across columns: the bytes between two chunks are columns the scan
+///   doesn't read, and reading them would change what every projection costs.
+/// - Never next to a local range: it would download the gap to save a GET for
+///   bytes the cache already holds.
+fn read_through_spans(
+    ranges: &[Range<u64>],
+    column_of: impl Fn(&Range<u64>) -> Option<usize>,
+    is_local: impl Fn(&Range<u64>) -> bool,
+) -> Option<Vec<Range<u64>>> {
+    let mut sorted: Vec<&Range<u64>> = ranges.iter().collect();
+    sorted.sort_unstable_by_key(|range| range.start);
+    let mut spans: Vec<Range<u64>> = Vec::with_capacity(sorted.len());
+    let mut read_through = false;
+    let mut prev: Option<&Range<u64>> = None;
+    for &range in &sorted {
+        if let (Some(prev), Some(span)) = (prev, spans.last_mut()) {
+            let gap = range.start.saturating_sub(span.end);
+            let through = gap > OBJECT_STORE_COALESCE_DEFAULT
+                && gap <= PAGE_READ_THROUGH_BYTES
+                && column_of(prev).is_some_and(|column| column_of(range) == Some(column))
+                && !is_local(prev)
+                && !is_local(range);
+            if gap <= OBJECT_STORE_COALESCE_DEFAULT || through {
+                span.end = span.end.max(range.end);
+                read_through |= through;
+            } else {
+                spans.push(range.clone());
+            }
+        } else {
+            spans.push(range.clone());
+        }
+        prev = Some(range);
+    }
+    read_through.then_some(spans)
+}
+
+/// The row group whose bytes hold `offset`, or `None` outside every row group
+/// (the footer, page indexes, bloom filters).
+fn row_group_holding(meta: &ParquetMetaData, offset: u64) -> Option<usize> {
+    let groups = meta.row_groups();
+    let i = groups.partition_point(|rg| row_group_span(rg).end <= offset);
+    groups
+        .get(i)
+        .filter(|rg| row_group_span(rg).contains(&offset))
+        .map(|_| i)
+}
+
+/// Each of `ranges`, cut from the downloaded `spans`: `fetched[i]` holds
+/// `spans[i]`, and the spans are sorted and apart.
+fn cut(
+    ranges: &[Range<u64>],
+    spans: &[Range<u64>],
+    fetched: &[Bytes],
+) -> ParquetResult<Vec<Bytes>> {
+    ranges
+        .iter()
+        .map(|range| {
+            let i = spans.partition_point(|span| span.end < range.end);
+            spans
+                .get(i)
+                .zip(fetched.get(i))
+                .filter(|(span, bytes)| {
+                    span.start <= range.start && bytes.len() as u64 == span.end - span.start
+                })
+                .map(|(span, bytes)| {
+                    bytes.slice(
+                        (range.start - span.start) as usize..(range.end - span.start) as usize,
+                    )
+                })
+                .ok_or_else(|| ParquetError::General("read-through: a range was not served".into()))
+        })
+        .collect()
+}
+
 /// The column whose chunk in `row_group` holds all of `range`, if one does.
 fn column_of(row_group: &RowGroupMetaData, range: &Range<u64>) -> Option<usize> {
     (0..row_group.num_columns()).find(|&c| {
@@ -1488,6 +1601,7 @@ mod tests {
     };
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use bytes::Bytes;
     use datafusion::{
         common::DFSchema,
         datasource::{
@@ -1502,6 +1616,7 @@ mod tests {
             expressions::{Column, DynamicFilterPhysicalExpr},
         },
     };
+    use object_store::OBJECT_STORE_COALESCE_DEFAULT;
     use parquet::{
         arrow::{
             arrow_reader::{RowSelection, RowSelector},
@@ -1518,12 +1633,12 @@ mod tests {
         supertable::query::{
             df_object_store::SuperfileObjectStore,
             read_ahead::{
-                Batch, Held, READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead, ScanReadAhead, chunk_range,
-                download_bytes, fetch_spans,
+                Batch, Held, PAGE_READ_THROUGH_BYTES, READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead,
+                ScanReadAhead, chunk_range, cut, download_bytes, fetch_spans,
                 fixture::{
                     GROUPS, ROWS_PER_GROUP, Superfile, block_cached, schema, small_file, wide_file,
                 },
-                leave_shared_ends, lock, row_group_span,
+                leave_shared_ends, lock, read_through_spans, row_group_span,
             },
         },
     };
@@ -1546,6 +1661,8 @@ mod tests {
     const SLOW_DOWNLOAD: Duration = Duration::from_millis(200);
     /// How long a test waits for downloads ahead from an in-memory source.
     const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+    /// A page's bytes in the read-through tests.
+    const PAGE: u64 = 64 * 1024;
 
     /// The superfile, a store serving it, its path and its footer.
     fn setup(
@@ -1957,6 +2074,119 @@ mod tests {
             spans(leave_shared_ends(short_first(), BLOCKS, &[])),
             spans(short_first())
         );
+    }
+
+    /// `read_through_spans` over `pages`: page `i` lies in column `columns[i]`
+    /// (`None`: in no chunk), and is local if `local` names it.
+    fn read_through(
+        pages: &[Range<u64>],
+        columns: &[Option<usize>],
+        local: &[usize],
+    ) -> Option<Vec<Range<u64>>> {
+        let index = |range: &Range<u64>| pages.iter().position(|page| page == range);
+        read_through_spans(
+            pages,
+            |range| index(range).and_then(|i| columns[i]),
+            |range| index(range).is_some_and(|i| local.contains(&i)),
+        )
+    }
+
+    /// A page starting `gap` bytes after `before` ends.
+    fn page_after(before: &Range<u64>, gap: u64) -> Range<u64> {
+        let start = before.end + gap;
+        start..start + PAGE
+    }
+
+    #[test]
+    fn kept_pages_of_one_chunk_a_little_apart_are_read_through() {
+        let first = 0..PAGE;
+        for gap in [OBJECT_STORE_COALESCE_DEFAULT + 1, PAGE_READ_THROUGH_BYTES] {
+            let next = page_after(&first, gap);
+            let both = first.start..next.end;
+            assert_eq!(
+                read_through(&[first.clone(), next.clone()], &[Some(1), Some(1)], &[]),
+                Some(vec![both]),
+                "a gap of {gap} bytes is read through"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_gap_is_left_to_the_store() {
+        let first = 0..PAGE;
+        let near = page_after(&first, OBJECT_STORE_COALESCE_DEFAULT + 1);
+        let cases = [
+            (
+                "the store merges it already",
+                page_after(&first, OBJECT_STORE_COALESCE_DEFAULT),
+                [Some(1), Some(1)],
+                &[][..],
+            ),
+            (
+                "it costs more than a GET",
+                page_after(&first, PAGE_READ_THROUGH_BYTES + 1),
+                [Some(1), Some(1)],
+                &[],
+            ),
+            (
+                "another column's chunk",
+                near.clone(),
+                [Some(1), Some(2)],
+                &[],
+            ),
+            ("outside every chunk", near.clone(), [Some(1), None], &[]),
+            (
+                "the first page is local",
+                near.clone(),
+                [Some(1), Some(1)],
+                &[0],
+            ),
+            ("the next page is local", near, [Some(1), Some(1)], &[1]),
+        ];
+        for (name, next, columns, local) in cases {
+            assert_eq!(
+                read_through(&[first.clone(), next], &columns, local),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_through_keeps_the_stores_merges_in_any_order() {
+        // p0 and p1 merge as the store would, p2 is read through after them,
+        // and the other column's page far away stays a span of its own.
+        let p0 = 0..PAGE;
+        let p1 = page_after(&p0, PAGE);
+        let p2 = page_after(&p1, OBJECT_STORE_COALESCE_DEFAULT + 1);
+        let other = page_after(&p2, PAGE_READ_THROUGH_BYTES + 1);
+        let pages = [p2.clone(), other.clone(), p0.clone(), p1];
+        assert_eq!(
+            read_through(&pages, &[Some(1), Some(2), Some(1), Some(1)], &[]),
+            Some(vec![p0.start..p2.end, other])
+        );
+    }
+
+    #[test]
+    fn each_range_is_cut_from_its_span_or_fails_when_one_came_back_short() {
+        let bytes = Bytes::from(
+            (0..=u8::MAX)
+                .cycle()
+                .take(4 * PAGE as usize)
+                .collect::<Vec<_>>(),
+        );
+        let spans = [0..2 * PAGE, 3 * PAGE..4 * PAGE];
+        let fetched: Vec<Bytes> = spans
+            .iter()
+            .map(|span| bytes.slice(span.start as usize..span.end as usize))
+            .collect();
+        let ranges = [PAGE..2 * PAGE, 0..PAGE / 2, 3 * PAGE..4 * PAGE];
+        let cut_out = cut(&ranges, &spans, &fetched).expect("every range is served");
+        for (range, got) in ranges.iter().zip(&cut_out) {
+            assert_eq!(got, &bytes.slice(range.start as usize..range.end as usize));
+        }
+        let short = [fetched[0].clone(), fetched[1].slice(..PAGE as usize - 1)];
+        assert!(cut(&ranges, &spans, &short).is_err());
     }
 
     #[tokio::test]
