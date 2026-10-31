@@ -22,7 +22,7 @@ use std::{
     future::Future,
     ops::Range,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -34,7 +34,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes, buf::Reader};
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{
@@ -50,25 +50,34 @@ use datafusion::{
     physical_plan::{ExecutionPlan, collect},
     scalar::ScalarValue,
 };
-use futures::{FutureExt, TryStreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt, TryStreamExt, future::BoxFuture, stream};
 use object_store::{ObjectStore, path::Path as ObjPath};
 use parquet::{
     arrow::{
         ProjectionMask,
-        arrow_reader::ArrowReaderOptions,
+        arrow_reader::{
+            ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+        },
         async_reader::{AsyncFileReader, ParquetObjectReader, ParquetRecordBatchStreamBuilder},
     },
     errors::{ParquetError, Result as ParquetResult},
-    file::metadata::ParquetMetaData,
+    file::{
+        metadata::ParquetMetaData,
+        reader::{ChunkReader, Length},
+    },
 };
 use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
-use tracing::{Instrument, Span, warn};
+use tokio::sync::Semaphore;
+use tracing::{Instrument, Span, debug, warn};
 
 use crate::{
     memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
-    runtime_bridge::run_on_pool,
-    runtime_metrics::op_stats::{OpStatsCollector, timed_section},
+    runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
+    runtime_metrics::{
+        op_stats::{OpStatsCollector, timed_section},
+        rss::total_memory_bytes,
+    },
     superfile::{
         ReadError, SuperfileReader,
         lazy_source::Source,
@@ -1301,9 +1310,6 @@ async fn resolve_columns(
     // disk-cache cold fetches), so overlapping them is the right
     // model and they cost ~microseconds when warm.
     let manifest = reader.manifest();
-    let store = &manifest.options.store;
-    let disk_cache = manifest.options.disk_cache.as_ref();
-    let storage = manifest.options.storage.as_ref();
     let out_schema = hit_output_schema(&manifest.stored_schema(), names)?;
     let decoded_cache = reader.decoded_scalar_cache();
     let schema_id = manifest.table_schema().schema_id();
@@ -1321,64 +1327,81 @@ async fn resolve_columns(
     // table the cache cannot hold, so resolving a hit's columns never starts
     // a whole-file download the search itself declined.
     let intent = reader.open_intent();
-    // Each superfile opens in a task of its own, at most
-    // `superfiles_in_flight` at once:
+    // Each superfile opens, takes its hit rows and drops its reader in one
+    // task, at most `superfiles_in_flight` at once: a ranked result touches
+    // a few superfiles, but an unranked match can touch every superfile of
+    // the table, and a lazy reader holds its parsed footer and page index,
+    // several MB of heap, for as long as it is held.
     //
-    //   - **Lazy readers** take their hit rows in that task and drop the
-    //     reader with it. A ranked result touches a few superfiles, but an
-    //     unranked match can touch every superfile of the table, and a lazy
-    //     reader holds its parsed footer and page index, several MB of heap,
-    //     for as long as it is held. The rows stream through the reader's
-    //     `LazyByteSource`, which keeps the disk cache's block layer: cold
-    //     misses range-fetch, warm reads hit local blocks.
-    //   - **Resident readers** (in-memory tier / freshly written) come back
-    //     and are decoded together in one `options.reader_pool` (rayon) job:
-    //     `take_by_local_doc_ids` is a CPU-bound page decode over bytes the
-    //     cache holds anyway, and one job for all of them costs one handoff
-    //     rather than one per superfile.
+    //   - **Resident readers** (in-memory tier / freshly written):
+    //     `take_by_local_doc_ids` is a CPU-bound Parquet page decode over
+    //     already-resident bytes, so it runs on `options.reader_pool`
+    //     (rayon), bridged back so no tokio worker blocks under it.
+    //   - **Lazy readers** stream only projected hit rows through their
+    //     existing `LazyByteSource`. That preserves the disk cache's block
+    //     layer: cold misses range-fetch, repeated warm reads hit local
+    //     blocks, and the file is never materialized.
     //
     // A file whose columns match the table's reads by name; any other reads
     // through its map: the table's columns are projected under the file's
     // names and reshaped to the table's.
     let in_flight = manifest.options.superfiles_in_flight.max(1);
-    let out_schema_ref = &out_schema;
-    let seg_locals_ref = &seg_locals;
+    let manifest_arc = Arc::clone(reader.manifest());
+    let names_owned: Arc<Vec<String>> = Arc::new(names.iter().map(|s| (*s).to_string()).collect());
     // Collected before the join: the futures do no work until polled, and a
     // lazy iterator held across the join's awaits trips rustc's "`FnOnce` is
-    // not general enough" in the callers' streams.
+    // not general enough" in the callers' streams. Each unit is spawned when
+    // the join first polls it, so at most `in_flight` exist at once, and on a
+    // task of its own: polled inside the join they would all decode on one
+    // thread.
     let units: Vec<_> = misses
         .into_iter()
-        .map(|(index, uri)| async move {
-            let entry = manifest
-                .lookup_superfile_entry(uri)
+        .map(|(index, uri)| {
+            let manifest = Arc::clone(&manifest_arc);
+            let names = Arc::clone(&names_owned);
+            let locals = seg_locals[index].clone();
+            let out_schema = Arc::clone(&out_schema);
+            async move {
+                let entry = manifest
+                    .lookup_superfile_entry(uri)
+                    .await
+                    .map_err(QueryError::ManifestLoad)?
+                    .ok_or_else(|| {
+                        QueryError::Internal(format!(
+                            "resolve_hits: superfile {uri:?} missing from manifest"
+                        ))
+                    })?;
+                let options = &manifest.options;
+                let rd = superfile_reader(
+                    &options.store,
+                    options.disk_cache.as_ref(),
+                    options.storage.as_ref(),
+                    &entry.uri,
+                    &entry.storage_path(),
+                    entry.subsection_offsets.as_ref(),
+                    intent,
+                )
                 .await
-                .map_err(QueryError::ManifestLoad)?
-                .ok_or_else(|| {
-                    QueryError::Internal(format!(
-                        "resolve_hits: superfile {uri:?} missing from manifest"
-                    ))
-                })?;
-            let rd = superfile_reader(
-                store,
-                disk_cache,
-                storage,
-                &entry.uri,
-                &entry.storage_path(),
-                entry.subsection_offsets.as_ref(),
-                intent,
-            )
-            .await
-            .map_err(|error| DataFusionError::from(QueryError::store(error)))?;
-            let adapter = file_adapter(manifest, &rd);
-            if rd.can_take_by_local_doc_ids() {
-                // Resident: decoded below with the other resident files, in
-                // one pool job. Holding it costs nothing the cache does not
-                // already hold.
-                return Ok::<_, DataFusionError>(Resolved::Resident(index, rd, adapter));
+                .map_err(QueryError::store)?;
+                let adapter = file_adapter(&manifest, &rd);
+                if rd.can_take_by_local_doc_ids() {
+                    // Resident: decoded below with the other resident
+                    // files, in one pool job.
+                    return Ok::<_, DataFusionError>(Resolved::Resident(index, rd, adapter));
+                }
+                // A lazy take fetches here and decodes on the reader pool.
+                let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                let batch = take_lazy_file(
+                    &rd,
+                    &locals,
+                    &name_refs,
+                    &adapter,
+                    &out_schema,
+                    &manifest.options.reader_pool,
+                )
+                .await?;
+                Ok(Resolved::Taken(index, batch))
             }
-            let locals = &seg_locals_ref[index];
-            let batch = take_lazy_file(&rd, locals, names, &adapter, out_schema_ref).await?;
-            Ok(Resolved::Taken(index, batch))
         })
         .collect();
     let mut resident: Vec<(usize, Arc<SuperfileReader>, Vec<u32>, Option<FileSchemaMap>)> =
@@ -1404,8 +1427,6 @@ async fn resolve_columns(
                 resident
                     .into_par_iter()
                     .map(|(i, sf, locals, adapter)| {
-                        // Per-superfile bracket: the resident decode is this
-                        // wave's kernel section, one chunk per file.
                         let (batch, ns) = timed_section(|| {
                             take_resident_file(&sf, &locals, &name_refs, &adapter, &out_schema)
                         });
@@ -1492,12 +1513,13 @@ async fn take_lazy_file(
     names: &[&str],
     adapter: &Option<FileSchemaMap>,
     out_schema: &SchemaRef,
+    pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     match adapter {
-        None => take_rows_byte_source(rd, locals, names).await,
+        None => take_rows_byte_source(rd, locals, names, Some(pool)).await,
         Some(map) => {
             let physical = map.stored_names(names);
-            let read = take_rows_byte_source(rd, locals, &physical).await?;
+            let read = take_rows_byte_source(rd, locals, &physical, Some(pool)).await?;
             map.adapt(&read, out_schema)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))
         }
@@ -1519,7 +1541,15 @@ pub(crate) async fn take_file_columns(
 ) -> DfResult<RecordBatch> {
     let adapter = file_adapter(manifest, rd);
     if !rd.can_take_by_local_doc_ids() {
-        return take_lazy_file(rd, &locals, names, &adapter, out_schema).await;
+        return take_lazy_file(
+            rd,
+            &locals,
+            names,
+            &adapter,
+            out_schema,
+            &manifest.options.reader_pool,
+        )
+        .await;
     }
     let owned_names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
     let out_schema = Arc::clone(out_schema);
@@ -1620,6 +1650,7 @@ async fn read_row_group_byte_source(
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
         metadata: Arc::clone(reader.parquet_metadata()),
+        prefetched: Vec::new(),
     };
     let options = if views.is_empty() {
         ArrowReaderOptions::new()
@@ -1657,10 +1688,200 @@ pub(crate) fn hit_output_schema(stored: &Schema, names: &[&str]) -> DfResult<Sch
 struct ByteSourceAsyncReader {
     source: Source,
     metadata: Arc<ParquetMetaData>,
+    /// Spans fetched ahead of the decode, ascending and disjoint: a read
+    /// inside one is served from it (see [`take_prefetch_spans`]).
+    prefetched: Vec<(Range<u64>, Bytes)>,
+}
+
+impl ByteSourceAsyncReader {
+    /// `range` from a prefetched span that holds it whole.
+    fn prefetched(&self, range: &Range<u64>) -> Option<Bytes> {
+        prefetched_slice(&self.prefetched, range)
+    }
+}
+
+/// `range` from the one of `spans` (ascending, disjoint) that holds it whole.
+fn prefetched_slice(spans: &[(Range<u64>, Bytes)], range: &Range<u64>) -> Option<Bytes> {
+    let at = spans.partition_point(|(span, _)| span.end <= range.start);
+    let (span, bytes) = spans.get(at)?;
+    (span.start <= range.start && range.end <= span.end).then(|| {
+        bytes.slice((range.start - span.start) as usize..(range.end - span.start) as usize)
+    })
+}
+
+/// A take's prefetched spans as a file the synchronous Parquet reader can
+/// decode from, off the async runtime. A read outside them is an error, and
+/// the take then decodes through its byte source instead.
+struct PrefetchedChunks {
+    len: u64,
+    spans: Vec<(Range<u64>, Bytes)>,
+}
+
+impl Length for PrefetchedChunks {
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+impl ChunkReader for PrefetchedChunks {
+    type T = Reader<Bytes>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        let at = self.spans.partition_point(|(span, _)| span.end <= start);
+        match self.spans.get(at) {
+            Some((span, bytes)) if span.start <= start => {
+                Ok(bytes.slice((start - span.start) as usize..).reader())
+            }
+            _ => Err(ParquetError::General(format!(
+                "byte {start} is not prefetched"
+            ))),
+        }
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        prefetched_slice(&self.spans, &(start..start + length as u64)).ok_or_else(|| {
+            ParquetError::General(format!("bytes {start}+{length} are not prefetched"))
+        })
+    }
+}
+
+/// Most bytes a take fetches ahead for one superfile; past this it streams
+/// row group by row group as before.
+const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Take prefetch spans this close share one read: fewer GETs for a few
+/// unrequested bytes (f06 on 100B: 1.88M → 1.45M GETs at 128 KiB).
+const TAKE_PREFETCH_GAP_BYTES: u64 = 128 * 1024;
+/// Spans of one superfile's take prefetch in flight at once.
+const TAKE_PREFETCH_CONCURRENCY: usize = 16;
+/// The share of the host's memory every take's prefetch together may hold.
+const TAKE_PREFETCH_MEMORY_SHARE: u64 = 16;
+
+/// Prefetched bytes every take in the process holds at once, in KiB: a share
+/// of the host's memory, never less than one take's
+/// [`TAKE_PREFETCH_MAX_BYTES`]. A take waits for room, and holds it until
+/// its decode is done.
+fn take_prefetch_budget() -> &'static Semaphore {
+    static BUDGET: OnceLock<Semaphore> = OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let bytes = total_memory_bytes()
+            .map_or(TAKE_PREFETCH_MAX_BYTES, |total| {
+                total / TAKE_PREFETCH_MEMORY_SHARE
+            })
+            .max(TAKE_PREFETCH_MAX_BYTES);
+        Semaphore::new((bytes / 1024) as usize)
+    })
+}
+
+/// The column chunks of the `roots` columns (top-level, as the Arrow
+/// schema numbers them) in every row group `sorted` (ascending, distinct
+/// rows) falls in, merged where at most `gap` bytes apart: the bytes a take's decode reads,
+/// so they can be fetched at once instead of one row group after another. A
+/// nested root contributes every leaf under it. `None` when they come to
+/// more than `max_bytes` ([`TAKE_PREFETCH_MAX_BYTES`]) or a root is not in
+/// the file.
+fn take_prefetch_spans(
+    metadata: &ParquetMetaData,
+    sorted: &[u32],
+    roots: &[usize],
+    max_bytes: u64,
+    gap: u64,
+) -> Option<Vec<Range<u64>>> {
+    let descr = metadata.file_metadata().schema_descr();
+    if roots
+        .iter()
+        .any(|&r| r >= descr.root_schema().get_fields().len())
+    {
+        return None;
+    }
+    // Chunks are per Parquet leaf, so a struct before a projected column
+    // shifts its chunk past its Arrow index.
+    let columns: Vec<usize> = (0..descr.num_columns())
+        .filter(|&leaf| roots.contains(&descr.get_column_root_idx(leaf)))
+        .collect();
+    let mut spans: Vec<Range<u64>> = Vec::new();
+    let (mut first_row, mut next) = (0u64, 0usize);
+    for (index, rg) in metadata.row_groups().iter().enumerate() {
+        let end_row = first_row + rg.num_rows() as u64;
+        let before = next;
+        while next < sorted.len() && u64::from(sorted[next]) < end_row {
+            next += 1;
+        }
+        if next > before {
+            for &c in &columns {
+                hit_pages(
+                    metadata,
+                    index,
+                    c,
+                    first_row,
+                    end_row,
+                    &sorted[before..next],
+                    &mut spans,
+                );
+            }
+        }
+        first_row = end_row;
+    }
+    spans.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        match merged.last_mut() {
+            Some(last) if span.start <= last.end + gap => last.end = last.end.max(span.end),
+            _ => merged.push(span),
+        }
+    }
+    let bytes: u64 = merged.iter().map(|r| r.end - r.start).sum();
+    (bytes <= max_bytes).then_some(merged)
+}
+
+/// The bytes of leaf column `c` in row group `index` (rows `first_row` to
+/// `end_row`) that a decode of rows `hits` reads, pushed onto `spans`. With
+/// the page index loaded the decode skips pages without a hit, so that is
+/// each page holding one, plus the dictionary page; without it, the chunk.
+fn hit_pages(
+    metadata: &ParquetMetaData,
+    index: usize,
+    c: usize,
+    first_row: u64,
+    end_row: u64,
+    hits: &[u32],
+    spans: &mut Vec<Range<u64>>,
+) {
+    let (offset, len) = metadata.row_group(index).column(c).byte_range();
+    let pages = metadata
+        .offset_index()
+        .and_then(|oi| oi.get(index))
+        .and_then(|cols| cols.get(c))
+        .map(|oi| oi.page_locations())
+        .filter(|pages| !pages.is_empty());
+    let Some(pages) = pages else {
+        spans.push(offset..offset + len);
+        return;
+    };
+    let first_page = pages[0].offset as u64;
+    if first_page > offset {
+        spans.push(offset..first_page);
+    }
+    let mut hit = 0;
+    for (i, page) in pages.iter().enumerate() {
+        let start_row = first_row + page.first_row_index as u64;
+        let page_end_row = pages
+            .get(i + 1)
+            .map_or(end_row, |next| first_row + next.first_row_index as u64);
+        while hit < hits.len() && u64::from(hits[hit]) < start_row {
+            hit += 1;
+        }
+        if hit < hits.len() && u64::from(hits[hit]) < page_end_row {
+            let start = page.offset as u64;
+            spans.push(start..start + page.compressed_page_size as u64);
+        }
+    }
 }
 
 impl AsyncFileReader for ByteSourceAsyncReader {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+        if let Some(bytes) = self.prefetched(&range) {
+            return async move { Ok(bytes) }.boxed();
+        }
         // `range_async` resolves mmap/block-resident ranges synchronously
         // (zero-copy, no I/O) via `try_get_range_sync`, and only `await`s a
         // real fetch on a cold miss — the same fast path the FTS reader's
@@ -1680,19 +1901,29 @@ impl AsyncFileReader for ByteSourceAsyncReader {
         &mut self,
         ranges: Vec<Range<u64>>,
     ) -> BoxFuture<'_, ParquetResult<Vec<Bytes>>> {
-        // `get_ranges_parallel_async` serves each resident range synchronously
-        // and batches only the cold misses into one `try_join_all`, returning
-        // bytes in input order.
+        // Each range the prefetch holds is served from it; only the rest go
+        // to the source. `get_ranges_parallel_async` serves each resident one
+        // synchronously and batches the cold misses into one `try_join_all`,
+        // returning bytes in input order.
+        let mut out: Vec<Option<Bytes>> = ranges.iter().map(|r| self.prefetched(r)).collect();
+        let missing: Vec<usize> = (0..out.len()).filter(|&i| out[i].is_none()).collect();
+        if missing.is_empty() {
+            return async move { Ok(out.into_iter().flatten().collect()) }.boxed();
+        }
         let source = self.source.clone();
-        let ranges: Vec<Range<usize>> = ranges
-            .into_iter()
-            .map(|range| range.start as usize..range.end as usize)
+        let wanted: Vec<Range<usize>> = missing
+            .iter()
+            .map(|&i| ranges[i].start as usize..ranges[i].end as usize)
             .collect();
         async move {
-            source
-                .get_ranges_parallel_async(&ranges)
+            let fetched = source
+                .get_ranges_parallel_async(&wanted)
                 .await
-                .map_err(|error| ParquetError::External(Box::new(error)))
+                .map_err(|error| ParquetError::External(Box::new(error)))?;
+            for (i, bytes) in missing.into_iter().zip(fetched) {
+                out[i] = Some(bytes);
+            }
+            Ok(out.into_iter().flatten().collect())
         }
         .boxed()
     }
@@ -1717,7 +1948,7 @@ pub(crate) async fn take_rows(
     pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     if !reader.can_take_by_local_doc_ids() {
-        return take_rows_byte_source(reader, local_doc_ids, names).await;
+        return take_rows_byte_source(reader, local_doc_ids, names, Some(pool)).await;
     }
     let owned_reader = Arc::clone(reader);
     let ids = local_doc_ids.to_vec();
@@ -1746,6 +1977,7 @@ pub(crate) async fn take_rows_byte_source(
     reader: &SuperfileReader,
     local_doc_ids: &[u32],
     names: &[&str],
+    pool: Option<&ThreadPool>,
 ) -> DfResult<RecordBatch> {
     // The bare `_id` projection of a few rows comes from the packed sidecar's
     // blocks when the superfile carries one: a couple of kilobytes a block,
@@ -1776,9 +2008,83 @@ pub(crate) async fn take_rows_byte_source(
         .parquet_metadata_with_page_index()
         .await
         .map_err(QueryError::from)?;
+    let source = Source::Lazy(reader.byte_source());
+    // Fetch the take's column chunks at once rather than letting the decode
+    // fetch them a row group at a time: a hit set spread over hundreds of
+    // row groups otherwise costs that many round trips one after another.
+    let mut sorted = local_doc_ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let roots: Vec<usize> = names
+        .iter()
+        .filter_map(|name| reader.schema().index_of(name).ok())
+        .collect();
+    let mut prefetched = Vec::new();
+    // Held until the decode is done: the prefetched bytes live that long.
+    let mut _room = None;
+    if let Some(spans) = take_prefetch_spans(
+        &metadata,
+        &sorted,
+        &roots,
+        TAKE_PREFETCH_MAX_BYTES,
+        TAKE_PREFETCH_GAP_BYTES,
+    )
+    .filter(|s| !s.is_empty())
+    {
+        let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
+        _room = Some(
+            take_prefetch_budget()
+                .acquire_many(bytes.div_ceil(1024) as u32)
+                .await
+                .map_err(QueryError::internal)?,
+        );
+        let fetched: Vec<Bytes> = stream::iter(spans.iter().cloned().map(|span| {
+            let source = source.clone();
+            async move {
+                source
+                    .range_exact_async(span.start as usize..span.end as usize)
+                    .await
+                    .map_err(|e| QueryError::Internal(format!("take prefetch: {e}")))
+            }
+        }))
+        .buffered(TAKE_PREFETCH_CONCURRENCY)
+        .try_collect()
+        .await?;
+        prefetched = spans.into_iter().zip(fetched).collect();
+        // The fetch was the I/O; the decode is CPU, and goes to the reader
+        // pool, reading only the prefetched bytes.
+        let chunks = PrefetchedChunks {
+            len: reader.byte_source().size(),
+            spans: prefetched.clone(),
+        };
+        let (metadata, schema, n_docs) = (
+            Arc::clone(&metadata),
+            Arc::clone(reader.schema()),
+            reader.n_docs(),
+        );
+        let ids = local_doc_ids.to_vec();
+        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let decoded = run_on_pool_unless_blocking(
+            pool,
+            "take decode: reader pool dropped result",
+            move || {
+                let names: Vec<&str> = owned.iter().map(String::as_str).collect();
+                take_rows_prefetched(chunks, metadata, &schema, n_docs, &ids, &names)
+            },
+        )
+        .await
+        .map_err(QueryError::internal)?;
+        match decoded {
+            Ok(batch) => return Ok(batch),
+            // A read outside the prefetch: decode through the source, which
+            // still serves the prefetched spans from memory.
+            Err(error) => debug!(%error, "take decoding through its byte source"),
+        }
+    }
     let input = ByteSourceAsyncReader {
-        source: Source::Lazy(reader.byte_source()),
+        source,
         metadata,
+        prefetched,
     };
     take_rows_async(
         input,
@@ -1822,6 +2128,68 @@ async fn take_rows_async<R>(
 where
     R: AsyncFileReader + Unpin + Send + 'static,
 {
+    let plan = match take_plan(file_schema, n_docs, local_doc_ids, names)? {
+        Ok(plan) => plan,
+        Err(done) => return Ok(done),
+    };
+    let builder = ParquetRecordBatchStreamBuilder::new(input)
+        .await
+        .map_err(QueryError::store)?;
+    let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
+    let stream = builder
+        .with_projection(mask)
+        .with_row_selection(plan.selection.clone())
+        .build()
+        .map_err(QueryError::store)?;
+    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
+    finish_take(&plan, batches, local_doc_ids, names)
+}
+
+/// [`take_rows_async`] decoding from `chunks`, synchronously: the reader-pool
+/// half of a prefetched take.
+fn take_rows_prefetched(
+    chunks: PrefetchedChunks,
+    metadata: Arc<ParquetMetaData>,
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    let plan = match take_plan(file_schema, n_docs, local_doc_ids, names)? {
+        Ok(plan) => plan,
+        Err(done) => return Ok(done),
+    };
+    let metadata = ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new())
+        .map_err(QueryError::store)?;
+    let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunks, metadata);
+    let mask = ProjectionMask::roots(builder.parquet_schema(), plan.col_indices.iter().copied());
+    let batches: Vec<RecordBatch> = builder
+        .with_projection(mask)
+        .with_row_selection(plan.selection.clone())
+        .build()
+        .map_err(QueryError::store)?
+        .collect::<Result<_, _>>()
+        .map_err(QueryError::store)?;
+    finish_take(&plan, batches, local_doc_ids, names)
+}
+
+/// What a take of `local_doc_ids` decodes: the projected columns, the output
+/// schema, and the rows as a sorted selection.
+struct TakePlan {
+    col_indices: Vec<usize>,
+    out_schema: SchemaRef,
+    sorted: Vec<u32>,
+    selection: RowSelection,
+}
+
+/// The [`TakePlan`] of a take, or the batch itself when there is nothing to
+/// decode: no rows, or no columns this file has.
+fn take_plan(
+    file_schema: &SchemaRef,
+    n_docs: u64,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<Result<TakePlan, RecordBatch>> {
     // Projected column indices (file order) + output fields (caller order).
     let mut col_indices = Vec::with_capacity(names.len());
     let mut out_fields: Vec<Field> = Vec::with_capacity(names.len());
@@ -1835,7 +2203,7 @@ where
     let out_schema = Arc::new(Schema::new(out_fields));
 
     if local_doc_ids.is_empty() {
-        return Ok(RecordBatch::new_empty(out_schema));
+        return Ok(Err(RecordBatch::new_empty(out_schema)));
     }
     for &d in local_doc_ids {
         if u64::from(d) >= n_docs {
@@ -1855,6 +2223,7 @@ where
             vec![],
             &RecordBatchOptions::new().with_row_count(Some(local_doc_ids.len())),
         )
+        .map(Err)
         .map_err(|e| QueryError::internal(e).into());
     }
 
@@ -1863,17 +2232,23 @@ where
     // contract as `take_by_local_doc_ids` — shared helpers, different
     // I/O model (async range GETs here vs resident-bytes decode there).
     let (sorted, selection) = row_selection_for_ids(local_doc_ids);
+    Ok(Ok(TakePlan {
+        col_indices,
+        out_schema,
+        sorted,
+        selection,
+    }))
+}
 
-    let builder = ParquetRecordBatchStreamBuilder::new(input)
-        .await
-        .map_err(QueryError::store)?;
-    let mask = ProjectionMask::roots(builder.parquet_schema(), col_indices.iter().copied());
-    let stream = builder
-        .with_projection(mask)
-        .with_row_selection(selection)
-        .build()
-        .map_err(QueryError::store)?;
-    let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(QueryError::store)?;
+/// A take's decoded `batches` (file column order, sorted rows) as the
+/// caller asked: `names` in its order, rows in `local_doc_ids` order.
+fn finish_take(
+    plan: &TakePlan,
+    batches: Vec<RecordBatch>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+) -> DfResult<RecordBatch> {
+    let out_schema = Arc::clone(&plan.out_schema);
     if batches.is_empty() {
         return Ok(RecordBatch::new_empty(out_schema));
     }
@@ -1881,7 +2256,7 @@ where
     let selected = concat_batches(&read_schema, &batches).map_err(QueryError::internal)?;
 
     // Rank back into the caller's (possibly duplicated) order.
-    let indices = rank_back_indices(local_doc_ids, &sorted);
+    let indices = rank_back_indices(local_doc_ids, &plan.sorted);
 
     // Gather columns in caller projection order (parquet returns file order).
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(names.len());
@@ -1962,13 +2337,22 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread::sleep, time::Duration};
+    use std::{sync::Mutex, thread::sleep, time::Duration};
 
-    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray};
+    use arrow_array::{Array, FixedSizeListArray, Int64Array, LargeStringArray, StructArray};
     use arrow_schema::Field;
+    use async_trait::async_trait;
     use bytes::Bytes;
     use datafusion::prelude::{col, lit};
     use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory, path::Path as ObjPath};
+    use parquet::{
+        arrow::ArrowWriter,
+        file::{
+            metadata::{FileMetaData, PageIndexPolicy, ParquetMetaDataReader},
+            properties::WriterProperties,
+        },
+        schema::types::{SchemaDescriptor, Type},
+    };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
@@ -1978,16 +2362,367 @@ mod tests {
         superfile::{
             builder::{BuilderOptions, FtsConfig, SuperfileBuilder, VectorConfig},
             fts::reader::{Bm25SearchOptions, BoolMode},
+            lazy_source::{LazyByteSource, LazyByteSourceError},
             vector::{distance::Metric, layout::VectorLayout, rerank_codec::RerankCodec},
         },
         supertable::{
             Supertable, SupertableOptions,
-            reader_cache::{ColdFetchMode, DiskCacheConfig, DiskCacheStore},
+            query::fts::TIE_NARROW_BATCH,
+            reader_cache::{
+                ColdFetchMode, DiskCacheConfig, DiskCacheStore,
+                disk::test_support::RecordingStorage,
+            },
         },
         test_helpers::{
             build_title_batch, decimal128_id_field, decimal128_ids, default_supertable_options,
         },
     };
+
+    /// An in-memory source that records every range asked of it.
+    struct RecordingSource {
+        blob: Bytes,
+        asked: Mutex<Vec<Range<u64>>>,
+    }
+
+    impl RecordingSource {
+        fn new(blob: Bytes) -> Self {
+            Self {
+                blob,
+                asked: Default::default(),
+            }
+        }
+
+        fn ranges(&self) -> Vec<Range<u64>> {
+            self.asked.lock().expect("asked").clone()
+        }
+    }
+
+    #[async_trait]
+    impl LazyByteSource for RecordingSource {
+        fn size(&self) -> u64 {
+            self.blob.len() as u64
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            self.asked.lock().expect("asked").push(start..start + len);
+            Ok(self.blob.slice(start as usize..(start + len) as usize))
+        }
+    }
+
+    /// When far more hits tie at the k-th score than there are places, the
+    /// top-k is still exactly the smallest `_id`s among the ties: narrowing
+    /// the ties by superfile `id_min` before resolving their ids changes
+    /// which ids are read, never which hits are returned.
+    #[test]
+    fn a_tie_far_past_k_keeps_the_smallest_ids() {
+        // Within one batch of superfiles, and across several: one row a
+        // superfile puts the smallest 20 ids in 20 superfiles, past the first
+        // batch, so a walk that stops too early returns larger ids.
+        smallest_ids_survive_a_tie(12, 20, 5);
+        const _: () = assert!(20 > TIE_NARROW_BATCH);
+        smallest_ids_survive_a_tie(100, 1, 20);
+    }
+
+    /// Hits scoring strictly better than the k-th always place, and the
+    /// places they leave go to the smallest `_id`s among the ties: the top k
+    /// with the narrowing equal the top k of the whole ranking.
+    #[test]
+    fn hits_better_than_the_tie_always_place() {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        for i in 0..100 {
+            // Every 30th superfile holds one row the term scores higher in.
+            let title = if i % 30 == 7 { "tie tie" } else { "tie" };
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&[title])).expect("append");
+            w.commit().expect("commit");
+        }
+        let ranked = |k: usize| -> Vec<(i128, f32)> {
+            let batches = st
+                .bm25_search(
+                    "title",
+                    "tie",
+                    k,
+                    Bm25SearchOptions::new(),
+                    Some(&["_id", "score"]),
+                )
+                .expect("bm25_search");
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let ids = b
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimal ids")
+                        .clone();
+                    let scores = b
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("scores")
+                        .clone();
+                    (0..ids.len()).map(move |i| (ids.value(i), scores.value(i)))
+                })
+                .collect()
+        };
+        let all = ranked(100);
+        let better = all.iter().filter(|(_, s)| *s > all[99].1).count();
+        assert_eq!(better, 4, "rows 7, 37, 67 and 97 score higher");
+        assert_eq!(ranked(20), all[..20], "the top 20 of the whole ranking");
+    }
+
+    /// `superfiles` commits of `rows` equal titles each: BM25's top `k` are
+    /// the `k` smallest `_id`s among them.
+    fn smallest_ids_survive_a_tie(superfiles: usize, rows: usize, k: usize) {
+        let st = Supertable::create(default_supertable_options()).expect("create");
+        for _ in 0..superfiles {
+            let mut w = st.writer().expect("writer");
+            w.append(&build_title_batch(&vec!["tie"; rows]))
+                .expect("append");
+            w.commit().expect("commit");
+        }
+        let ids = |batches: Vec<RecordBatch>| -> Vec<i128> {
+            batches
+                .iter()
+                .flat_map(|b| {
+                    let col = b
+                        .column_by_name("_id")
+                        .expect("_id")
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimal ids")
+                        .clone();
+                    (0..col.len()).map(move |i| col.value(i))
+                })
+                .collect()
+        };
+        let mut all = ids(st
+            .token_match("title", "tie", BoolMode::Or, Some(&["_id"]))
+            .expect("token_match"));
+        assert_eq!(all.len(), superfiles * rows);
+        all.sort_unstable();
+        let mut top = ids(st
+            .bm25_search("title", "tie", k, Bm25SearchOptions::new(), Some(&["_id"]))
+            .expect("bm25_search"));
+        top.sort_unstable();
+        assert_eq!(
+            top,
+            all[..k],
+            "the {k} smallest ids among {} ties",
+            all.len()
+        );
+    }
+
+    /// A take's prefetch covers the projected column chunks of exactly the
+    /// row groups its rows fall in, and declines a column the file lacks.
+    #[test]
+    fn take_prefetch_spans_cover_the_hit_row_groups_projected_chunks() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let col =
+            |m: i64| Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i * m))) as ArrayRef;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![col(1), col(2), col(3)]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&Bytes::from(bytes))
+            .expect("metadata");
+        assert_eq!(metadata.num_row_groups(), 10);
+
+        let rows = [5u32, 150, 151, 950];
+        let spans = take_prefetch_spans(&metadata, &rows, &[0, 2], TAKE_PREFETCH_MAX_BYTES, 0)
+            .expect("spans");
+        let covered = |(offset, len): (u64, u64)| {
+            spans
+                .iter()
+                .any(|s| s.start <= offset && offset + len <= s.end)
+        };
+        for rg in [0, 1, 9] {
+            for c in [0, 2] {
+                assert!(
+                    covered(metadata.row_group(rg).column(c).byte_range()),
+                    "rg {rg} col {c}"
+                );
+            }
+        }
+        for rg in [2, 5, 8] {
+            assert!(
+                !covered(metadata.row_group(rg).column(0).byte_range()),
+                "rg {rg} not hit"
+            );
+        }
+        assert!(
+            !covered(metadata.row_group(0).column(1).byte_range()),
+            "an unprojected column is not fetched"
+        );
+        assert!(take_prefetch_spans(&metadata, &rows, &[3], TAKE_PREFETCH_MAX_BYTES, 0).is_none());
+        // Past the limit there is no prefetch: the take streams instead.
+        let need: u64 = spans.iter().map(|r| r.end - r.start).sum();
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need, 0).is_some());
+        assert!(take_prefetch_spans(&metadata, &rows, &[0, 2], need - 1, 0).is_none());
+        // Spans within the gap share one read, the bytes between included.
+        assert!(spans.len() > 1);
+        let one = take_prefetch_spans(
+            &metadata,
+            &rows,
+            &[0, 2],
+            TAKE_PREFETCH_MAX_BYTES,
+            u64::MAX / 2,
+        )
+        .expect("spans");
+        assert_eq!(one, vec![spans[0].start..spans[spans.len() - 1].end]);
+    }
+
+    /// With the page index loaded, a take's prefetch covers only the pages
+    /// that hold its rows, plus each chunk's dictionary page.
+    #[test]
+    fn take_prefetch_spans_cover_only_the_hit_pages_with_a_page_index() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let values = Arc::new(Int64Array::from_iter_values((0..1000).map(|i| i % 7))) as ArrayRef;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![values]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(100))
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&Bytes::from(bytes))
+            .expect("metadata");
+        let pages =
+            |rg: usize| metadata.offset_index().expect("page index")[rg][0].page_locations();
+        assert_eq!(pages(0).len(), 10, "ten pages a row group");
+
+        let rows = [5u32, 37, 150];
+        let spans =
+            take_prefetch_spans(&metadata, &rows, &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        let covered = |offset: u64, len: u64| {
+            spans
+                .iter()
+                .any(|s| s.start <= offset && offset + len <= s.end)
+        };
+        let page = |rg: usize, i: usize| {
+            let p = &pages(rg)[i];
+            (p.offset as u64, p.compressed_page_size as u64)
+        };
+        for (rg, i) in [(0, 0), (0, 3), (1, 5)] {
+            let (offset, len) = page(rg, i);
+            assert!(covered(offset, len), "rg {rg} page {i} holds a hit");
+        }
+        for (rg, i) in [(0, 1), (0, 2), (1, 4), (2, 0)] {
+            let (offset, len) = page(rg, i);
+            assert!(!covered(offset, len), "rg {rg} page {i} holds none");
+        }
+        let (chunk_start, _) = metadata.row_group(0).column(0).byte_range();
+        let first_page = pages(0)[0].offset as u64;
+        assert!(chunk_start < first_page, "the chunk has a dictionary page");
+        assert!(
+            covered(chunk_start, first_page - chunk_start),
+            "the dictionary page"
+        );
+    }
+
+    /// A batch of ranges the prefetch holds only some of fetches just the
+    /// others from the source.
+    #[tokio::test]
+    async fn ranges_the_prefetch_holds_are_not_fetched_again() {
+        let blob = Bytes::from((0..4096u32).map(|i| i as u8).collect::<Vec<_>>());
+        let inner = Arc::new(RecordingSource::new(blob.clone()));
+        let mut reader = ByteSourceAsyncReader {
+            source: Source::Lazy(Arc::clone(&inner) as Arc<dyn LazyByteSource>),
+            metadata: Arc::new(ParquetMetaData::new(
+                FileMetaData::new(
+                    0,
+                    0,
+                    None,
+                    None,
+                    Arc::new(SchemaDescriptor::new(Arc::new(
+                        Type::group_type_builder("s").build().expect("schema"),
+                    ))),
+                    None,
+                ),
+                Vec::new(),
+            )),
+            prefetched: vec![(100..200, blob.slice(100..200))],
+        };
+        let got = reader
+            .get_byte_ranges(vec![120..180, 1000..1100, 150..160])
+            .await
+            .expect("ranges");
+        assert_eq!(
+            got,
+            vec![
+                blob.slice(120..180),
+                blob.slice(1000..1100),
+                blob.slice(150..160)
+            ]
+        );
+        assert_eq!(
+            inner.ranges(),
+            vec![1000..1100],
+            "only the range outside the prefetch"
+        );
+    }
+
+    /// A struct before a projected column fills two leaf chunks, so the
+    /// projected column's chunk is found by its leaf, not its Arrow index;
+    /// a projected struct brings every leaf under it.
+    #[test]
+    fn take_prefetch_spans_find_a_column_after_a_struct_by_its_leaves() {
+        let leaf =
+            |m: i64| Arc::new(Int64Array::from_iter_values((0..100).map(|i| i * m))) as ArrayRef;
+        let s = StructArray::from(vec![
+            (Arc::new(Field::new("x", DataType::Int64, false)), leaf(1)),
+            (Arc::new(Field::new("y", DataType::Int64, false)), leaf(2)),
+        ]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("s", s.data_type().clone(), false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(s), leaf(3)]).expect("batch");
+        let mut bytes = Vec::new();
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(50))
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&Bytes::from(bytes))
+            .expect("metadata");
+        let rg = metadata.row_group(0);
+        assert_eq!(rg.num_columns(), 3, "s.x, s.y, b");
+        let covered = |spans: &[Range<u64>], leaf: usize| {
+            let (offset, len) = rg.column(leaf).byte_range();
+            spans
+                .iter()
+                .any(|s| s.start <= offset && offset + len <= s.end)
+        };
+
+        let b =
+            take_prefetch_spans(&metadata, &[3], &[1], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        assert!(covered(&b, 2), "b is leaf 2");
+        assert!(!covered(&b, 1), "s.y is not projected");
+        let s =
+            take_prefetch_spans(&metadata, &[3], &[0], TAKE_PREFETCH_MAX_BYTES, 0).expect("spans");
+        assert!(covered(&s, 0) && covered(&s, 1), "both leaves of s");
+        assert!(!covered(&s, 2), "b is not projected");
+        assert!(take_prefetch_spans(&metadata, &[3], &[2], TAKE_PREFETCH_MAX_BYTES, 0).is_none());
+    }
 
     /// Force Snowflake ids in one committed superfile across an ms boundary.
     const ID_GAP_WAIT: Duration = Duration::from_millis(20);
@@ -2986,6 +3721,91 @@ mod tests {
         commit_titles_to(&storage);
         let (cache, consumer) = open_cold(Arc::clone(&storage), &cache_dir);
         (storage_dir, cache_dir, cache, consumer)
+    }
+
+    /// The same take run twice reads its rows from storage once: the bytes
+    /// its exact reads fetched are kept, so the second run finds them local.
+    #[test]
+    fn a_repeated_cold_take_reads_storage_once() {
+        let storage_dir = TempDir::new().expect("storage tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+        // Big enough that a take reads past the open's tail into many blocks.
+        let titles: Vec<String> = (0..50_000)
+            .map(|i| format!("rust title {i} {}", i * 7919))
+            .collect();
+        let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+        let producer =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("create producer");
+        let mut w = producer.writer().expect("writer");
+        w.append(&build_title_batch(&refs)).expect("append");
+        w.commit().expect("commit");
+        drop(producer);
+        // A cache smaller than the table reads ranges and keeps their blocks,
+        // where one that holds it would download whole files.
+        let table_bytes =
+            Supertable::open(default_supertable_options().with_storage(Arc::clone(&local)))
+                .expect("open")
+                .storage_bytes()
+                .expect("table size");
+        let recording = RecordingStorage::over(local);
+        let cfg = DiskCacheConfig {
+            cache_root: cache_dir.path().to_path_buf(),
+            cold_fetch_mode: ColdFetchMode::LazyForegroundWithBackgroundFill,
+            disk_budget_bytes: table_bytes / 2,
+            promotion_defer_timeout: Duration::MAX,
+            ..Default::default()
+        };
+        let storage = Arc::clone(&recording) as Arc<dyn StorageProvider>;
+        let cache = DiskCacheStore::new_unpinned(Arc::clone(&storage), cfg).expect("cache");
+        // A fresh handle per take, so the second finds only what the disk
+        // cache kept, not what the first handle holds in memory.
+        let open = || {
+            Supertable::open(
+                default_supertable_options()
+                    .with_storage(Arc::clone(&storage))
+                    .with_disk_cache(Arc::clone(&cache)),
+            )
+            .expect("open consumer")
+        };
+        let take = || {
+            open()
+                .reader()
+                .expect("reader")
+                .bm25_search(
+                    "title",
+                    "rust",
+                    10,
+                    Bm25SearchOptions::new(),
+                    Some(&["title"]),
+                )
+                .expect("cold bm25 with a scalar projection")
+        };
+        let first = take();
+        let after_first = recording.n_ranges();
+        assert!(after_first > 0, "the first take reads storage");
+        assert_eq!(take(), first);
+        // The FTS subsection is read through, never kept, by design; what the
+        // take read is kept.
+        let reader = open().reader().expect("reader");
+        let entry = &reader.manifest().superfiles[0];
+        let (fts_at, fts_len) = entry
+            .subsection_offsets
+            .as_ref()
+            .and_then(|o| o.fts)
+            .expect("an FTS subsection");
+        let outside: Vec<Range<u64>> = recording
+            .ranges_since(after_first)
+            .into_iter()
+            .filter(|r| r.start < fts_at || r.end > fts_at + fts_len)
+            .collect();
+        assert_eq!(
+            outside,
+            Vec::<Range<u64>>::new(),
+            "the second take reads nothing again"
+        );
     }
 
     #[test]

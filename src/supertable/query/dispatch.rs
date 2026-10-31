@@ -338,7 +338,9 @@ pub(crate) async fn attach_stable_ids(
         }
         batch?
     } else {
-        take_rows_byte_source(reader, &locals, &[id_column])
+        // No caller fetches the lazy id page today; one that does decodes on
+        // the global pool.
+        take_rows_byte_source(reader, &locals, &[id_column], None)
             .await
             .map_err(|error| QueryError::Internal(error.to_string()))?
     };

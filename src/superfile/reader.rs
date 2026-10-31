@@ -100,6 +100,11 @@ pub(crate) const DEFAULT_TAIL_SPECULATIVE_BYTES: u64 = 64 * 1024;
 /// reads less.
 const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 
+/// Gap between two stable-id sidecar blocks a lookup reads in one span
+/// rather than two: past a block's few KB, a round trip costs more than
+/// this many bytes of transfer.
+const ID_BLOCK_GAP_BYTES: usize = if cfg!(test) { 0 } else { 128 * 1024 };
+
 /// A take of at least one row in this many of the file, over fixed-width
 /// columns only, reads each projected column whole and gathers the rows
 /// from it, instead of decoding through a row selection. A selection skips
@@ -1651,13 +1656,42 @@ impl SuperfileReader {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let bodies = try_join_all(
-            ranges
+        // The merge below takes each block to start past the one before it;
+        // a directory that says otherwise is corrupt.
+        if let Some(w) = ranges.windows(2).find(|w| w[1].start < w[0].end) {
+            return Err(malformed(format!(
+                "stable-id sidecar block at {}..{} starts before the one before it ends at {}",
+                w[1].start, w[1].end, w[0].end
+            )));
+        }
+        // Exact reads, since a block is a few KB and a cache widening each to
+        // its read window downloaded hundreds of KB per hit; blocks closer
+        // than `ID_BLOCK_GAP_BYTES` share one read, so a superfile with many
+        // hits costs a few reads rather than one per block.
+        let mut spans: Vec<Range<usize>> = Vec::new();
+        for r in &ranges {
+            match spans.last_mut() {
+                Some(span) if r.start <= span.end + ID_BLOCK_GAP_BYTES => {
+                    span.end = span.end.max(r.end)
+                }
+                _ => spans.push(r.clone()),
+            }
+        }
+        let span_bodies = try_join_all(
+            spans
                 .iter()
-                .map(|r| source.range(loc.offset + r.start as u64, r.len() as u64)),
+                .map(|r| source.range_exact(loc.offset + r.start as u64, r.len() as u64)),
         )
         .await
         .map_err(fetch("stable-id sidecar block fetch"))?;
+        let bodies: Vec<Bytes> = ranges
+            .iter()
+            .map(|r| {
+                let at = spans.partition_point(|span| span.end <= r.start);
+                let span = &spans[at];
+                span_bodies[at].slice(r.start - span.start..r.end - span.start)
+            })
+            .collect();
         let mut by_doc: Vec<i128> = Vec::with_capacity(sorted.len());
         let mut at = 0usize;
         for (&b, body) in blocks.iter().zip(&bodies) {
@@ -3530,6 +3564,32 @@ mod tests {
             .expect("decimal ids");
         let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
         assert_eq!(got, expected, "ids from the blocks match the oracle");
+
+        // Blocks next to each other share a read and blocks apart do not;
+        // either way each block's ids come out of its own slice.
+        for locals in [vec![5u32, 1030], vec![5, 4100], vec![1030, 5, 4100, 2050]] {
+            let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+            let got = lazy
+                .ids_from_sidecar_blocks(&locals)
+                .await
+                .expect("read")
+                .expect("a packed sidecar serves");
+            let got = got
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal ids");
+            let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
+            assert_eq!(got, expected, "rows {locals:?}");
+        }
+
+        // A directory that starts block 2 where block 0 starts is malformed,
+        // not a panic.
+        let reordered = Bytes::from(ids::with_out_of_order_id_block(&bytes, 2, 0));
+        let lazy = lazy_shuffled_id_reader(reordered).await;
+        assert!(
+            lazy.ids_from_sidecar_blocks(&[5, 2050]).await.is_err(),
+            "an out-of-order block is an error, for the Parquet fallback"
+        );
 
         let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
         let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));

@@ -1949,6 +1949,12 @@ impl SupertableReader {
         // beside the first opens, and re-plans the units not yet issued
         // when it reports. Either way one plan applies what it found.
         let mut units = units;
+        // Each superfile's smallest `_id`, for narrowing score ties: taken
+        // from the units here rather than looked up per tied superfile.
+        let id_mins: HashMap<SuperfileUri, i128> = units
+            .iter()
+            .map(|(entry, _)| (entry.uri, entry.id_min))
+            .collect();
         let mut settled_before: Vec<Vec<SuperfileHit>> = Vec::new();
         let mut replan: Option<dispatch::ReplanFuture<'_, UnitParams, Vec<SuperfileHit>>> = None;
         if let (Some(query), Some((index, _))) = (tier_query, index_column) {
@@ -2164,7 +2170,7 @@ impl SupertableReader {
         }
         let mut per_unit = per_unit;
         per_unit.extend(settled_before);
-        let hits = select_top_k_stable(self, per_unit, k).await?;
+        let hits = select_top_k_stable(self, per_unit, k, &id_mins).await?;
         // Noted for the way the policy chose, whether or not the merge
         // then ran: a shape it declines every time is thereby measured as
         // the cost of asking, and the class settles on not asking.
@@ -3260,6 +3266,7 @@ impl SupertableReader {
         let value_arc = Arc::new(value.to_owned());
         let tokens_arc = Arc::new(term_strings);
         let op_stats = self.op_stats.clone();
+        let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -3270,6 +3277,7 @@ impl SupertableReader {
             let tokens_arc = Arc::clone(&tokens_arc);
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
+            let reader_pool = Arc::clone(&reader_pool);
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
@@ -3323,9 +3331,14 @@ impl SupertableReader {
                     // clock spanning an await bills whatever else the runtime
                     // ran on this thread to this query. The verify comparison
                     // below is charged on both arms.
-                    None => take_rows_byte_source(&r, &candidates, &[column_arc.as_str()])
-                        .await
-                        .map_err(QueryError::DataFusion)?,
+                    None => take_rows_byte_source(
+                        &r,
+                        &candidates,
+                        &[column_arc.as_str()],
+                        Some(&reader_pool),
+                    )
+                    .await
+                    .map_err(QueryError::DataFusion)?,
                 };
                 // The verify decode materialized one row per candidate,
                 // on either arm. Folding it here rather than per-arm keeps
@@ -3698,6 +3711,80 @@ fn build_work_units(
     units
 }
 
+/// Ties at the k-th score more than this many times the places left for
+/// them are narrowed by `_id` before every tie's `_id` is resolved.
+const TIE_NARROW_MIN_FACTOR: usize = 4;
+/// Superfiles of tied candidates whose `_id`s one step resolves together.
+pub(crate) const TIE_NARROW_BATCH: usize = 16;
+
+/// `cands` (scoring at least `kth_score`, the k-th best) with the hits tied
+/// at `kth_score` cut to the ones that can place: the smallest `_id`s among
+/// them, as many as the places the strictly better hits leave. When the
+/// ties far outnumber those places — a query whose every match scores the
+/// same, over thousands of superfiles — resolving every tie's `_id` cost a
+/// sidecar read per candidate. Instead the ties' superfiles are taken in
+/// ascending `id_min`, a batch at a time, and taking stops once the next
+/// superfile's `id_min` is above the largest `_id` still placing: every
+/// `_id` of a superfile is at least its `id_min`, so none of its ties
+/// could place. The hits returned are exactly those the full resolution
+/// would keep.
+async fn narrow_ties_by_id(
+    tr: &SupertableReader,
+    cands: Vec<SuperfileHit>,
+    k: usize,
+    kth_score: f32,
+    id_mins: &HashMap<SuperfileUri, i128>,
+) -> Result<Vec<SuperfileHit>, QueryError> {
+    let (mut keep, ties): (Vec<SuperfileHit>, Vec<SuperfileHit>) =
+        cands.into_iter().partition(|c| c.score > kth_score);
+    let places = k.saturating_sub(keep.len());
+    if places == 0 || ties.len() <= places.saturating_mul(TIE_NARROW_MIN_FACTOR) {
+        keep.extend(ties);
+        return Ok(keep);
+    }
+    let mut by_superfile: HashMap<SuperfileUri, Vec<SuperfileHit>> = HashMap::new();
+    for hit in ties {
+        by_superfile.entry(hit.superfile).or_default().push(hit);
+    }
+    // A superfile `id_mins` does not name sorts first, so it is always
+    // resolved.
+    let mut groups: Vec<(i128, Vec<SuperfileHit>)> = by_superfile
+        .into_iter()
+        .map(|(uri, hits)| (id_mins.get(&uri).copied().unwrap_or(i128::MIN), hits))
+        .collect();
+    groups.sort_unstable_by_key(|(id_min, _)| *id_min);
+    let mut placing: Vec<SuperfileHit> = Vec::new();
+    let mut groups = groups.into_iter().peekable();
+    loop {
+        // The largest `_id` still placing, once the places are full.
+        let bound = (placing.len() >= places).then(|| {
+            placing
+                .iter()
+                .filter_map(|h| h.stable_id)
+                .max()
+                .unwrap_or(i128::MAX)
+        });
+        let mut batch: Vec<SuperfileHit> = Vec::new();
+        for _ in 0..TIE_NARROW_BATCH {
+            match groups.next_if(|(id_min, _)| bound.is_none_or(|b| *id_min <= b)) {
+                Some((_, hits)) => batch.extend(hits),
+                None => break,
+            }
+        }
+        if batch.is_empty() {
+            break;
+        }
+        dispatch::attach_stable_ids_to_hits(tr, &mut batch).await?;
+        placing.extend(batch);
+        if placing.len() > places {
+            placing.select_nth_unstable_by_key(places - 1, |h| h.stable_id);
+            placing.truncate(places);
+        }
+    }
+    keep.extend(placing);
+    Ok(keep)
+}
+
 /// Merge per-superfile hits and return the top-k by *descending*
 /// score (highest BM25 = most relevant). Uses a min-heap of size k
 /// so we never sort more than k elements.
@@ -3717,6 +3804,7 @@ async fn select_top_k_stable(
     tr: &SupertableReader,
     per_unit: Vec<Vec<SuperfileHit>>,
     k: usize,
+    id_mins: &HashMap<SuperfileUri, i128>,
 ) -> Result<Vec<SuperfileHit>, QueryError> {
     let mut cands: Vec<SuperfileHit> = per_unit.into_iter().flatten().collect();
     // Narrow to the top-k *by score plus its boundary ties* before touching
@@ -3731,6 +3819,7 @@ async fn select_top_k_stable(
         });
         let kth_score = cands[k - 1].score;
         cands.retain(|c| c.score >= kth_score);
+        cands = narrow_ties_by_id(tr, cands, k, kth_score, id_mins).await?;
     }
     dispatch::attach_stable_ids_to_hits(tr, &mut cands).await?;
     // Total order: score desc, then stable `_id` asc — deterministic and
