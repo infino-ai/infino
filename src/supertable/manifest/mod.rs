@@ -169,6 +169,10 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 /// attempt that wrote them, so what this bounds is how much stays alive
 /// between attempts. A part past it is rebuilt on each attempt, as before.
 const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Headroom over a list's part bytes when sizing the manifest disk cache, in
+/// divisor form (`bytes + bytes / this`), for the term-index slices and
+/// routing siblings that share the cache.
+const MANIFEST_CACHE_HEADROOM_DIVISOR: u64 = 10;
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -3386,7 +3390,11 @@ impl ManifestPartLoader {
         legacy: LegacyNames,
     ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
+        let mut part_bytes: u64 = 0;
         for entry in &list.parts {
+            part_bytes = part_bytes
+                .saturating_add(entry.size_bytes_compressed)
+                .saturating_add(entry.summaries.as_ref().map_or(0, |s| s.size_bytes));
             idx.insert(
                 entry.part_id,
                 PartRefs {
@@ -3395,6 +3403,13 @@ impl ManifestPartLoader {
                     routing: entry.routing.clone(),
                     summaries: entry.summaries.clone(),
                 },
+            );
+        }
+        // Holds every part of the list, so a full load reuses the cache
+        // instead of evicting parts before the next load reads them.
+        if let Some(cache) = &manifest_disk_cache {
+            cache.raise_budget(
+                part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
             );
         }
         Self {
@@ -7328,6 +7343,39 @@ mod tests {
                 "disk-cache hit ⇒ no additional storage.get"
             );
             assert!(cache.stats().n_hits >= 1, "recorded a cache hit");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn a_cache_smaller_than_the_list_grows_to_hold_every_part() {
+            // A cache that starts at one byte must still hold the whole list,
+            // so a second full load reads nothing from storage.
+            let parts: Vec<ManifestPart> = (31..34).map(make_test_part).collect();
+            let (objects, entries) = encode_and_index(&parts);
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+            let cache_root = std::env::temp_dir()
+                .join("infino-manifest-cache-loader-test-grows_to_hold_every_part");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = ManifestDiskCache::new(cache_root.clone(), 1).expect("cache");
+
+            for _ in 0..2 {
+                let loader = ManifestPartLoader::new_with_cache(
+                    Arc::clone(&storage_dyn),
+                    &list,
+                    Some(Arc::clone(&cache)),
+                );
+                for part in &parts {
+                    loader.load(part.part_id).await.expect("load");
+                }
+            }
+            assert_eq!(
+                storage.get_call_count(),
+                parts.len(),
+                "the second load is served from the cache"
+            );
 
             let _ = std::fs::remove_dir_all(&cache_root);
         }
