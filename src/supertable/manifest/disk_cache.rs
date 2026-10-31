@@ -89,7 +89,7 @@ pub struct ManifestCacheStats {
 /// runs inline, matching the loader's existing hash check.
 pub struct ManifestDiskCache {
     cache_root: PathBuf,
-    budget_bytes: u64,
+    budget_bytes: AtomicU64,
     started_at: Instant,
     /// Accounting index: content hash → size + last-access. The bytes
     /// are on disk under [`Self::cache_path`]; this map exists only so
@@ -118,7 +118,7 @@ impl ManifestDiskCache {
         fs::create_dir_all(&cache_root)?;
         let cache = Self {
             cache_root,
-            budget_bytes,
+            budget_bytes: AtomicU64::new(budget_bytes),
             started_at: Instant::now(),
             entries: DashMap::new(),
             current_bytes: AtomicU64::new(0),
@@ -241,7 +241,7 @@ impl ManifestDiskCache {
         let size = bytes.len() as u64;
         // A single part larger than the whole budget can never fit;
         // don't bother evicting everything for a doomed insert.
-        if size > self.budget_bytes {
+        if size > self.budget_bytes() {
             return;
         }
         if !self.reserve(size) {
@@ -293,7 +293,8 @@ impl ManifestDiskCache {
     fn reserve(&self, size: u64) -> bool {
         loop {
             let cur = self.current_bytes.load(Ordering::Acquire);
-            if cur + size <= self.budget_bytes {
+            let budget = self.budget_bytes();
+            if cur + size <= budget {
                 if self
                     .current_bytes
                     .compare_exchange_weak(cur, cur + size, Ordering::AcqRel, Ordering::Acquire)
@@ -303,7 +304,7 @@ impl ManifestDiskCache {
                 }
                 continue;
             }
-            let needed = (cur + size).saturating_sub(self.budget_bytes);
+            let needed = (cur + size).saturating_sub(budget);
             if !self.evict_at_least(needed) {
                 return false;
             }
@@ -366,13 +367,23 @@ impl ManifestDiskCache {
         }
     }
 
+    /// The current byte budget.
+    pub fn budget_bytes(&self) -> u64 {
+        self.budget_bytes.load(Ordering::Acquire)
+    }
+
+    /// Raise the budget to `floor_bytes` when it is lower. Never lowers it.
+    pub fn raise_budget(&self, floor_bytes: u64) {
+        self.budget_bytes.fetch_max(floor_bytes, Ordering::AcqRel);
+    }
+
     /// Snapshot of the cache's load. Cheap: reads atomics + a
     /// `DashMap::len`.
     pub fn stats(&self) -> ManifestCacheStats {
         ManifestCacheStats {
             n_entries: self.entries.len() as u64,
             current_bytes: self.current_bytes.load(Ordering::Acquire),
-            budget_bytes: self.budget_bytes,
+            budget_bytes: self.budget_bytes(),
             n_hits: self.n_hits.load(Ordering::Acquire),
             n_misses: self.n_misses.load(Ordering::Acquire),
             n_evictions: self.n_evictions.load(Ordering::Acquire),
@@ -402,7 +413,7 @@ impl std::fmt::Debug for ManifestDiskCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManifestDiskCache")
             .field("cache_root", &self.cache_root)
-            .field("budget_bytes", &self.budget_bytes)
+            .field("budget_bytes", &self.budget_bytes())
             .field("current_bytes", &self.current_bytes.load(Ordering::Acquire))
             .field("n_entries", &self.entries.len())
             .finish()
@@ -473,6 +484,18 @@ mod tests {
         let h = hash_of(b"never-inserted");
         assert!(cache.get(&h).await.is_none());
         assert_eq!(cache.stats().n_misses, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raise_budget_never_lowers_it() {
+        let root = tmp_root("raise-budget");
+        let _ = fs::remove_dir_all(&root);
+        let cache = ManifestDiskCache::new(root.clone(), 100).expect("cache");
+        cache.raise_budget(50);
+        assert_eq!(cache.budget_bytes(), 100);
+        cache.raise_budget(500);
+        assert_eq!(cache.budget_bytes(), 500);
         let _ = fs::remove_dir_all(&root);
     }
 
