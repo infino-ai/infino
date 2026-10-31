@@ -61,6 +61,7 @@ use arrow_schema::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::Statistics,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
@@ -95,7 +96,7 @@ use crate::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                     fill_top_k, live_reader, output_schema_with_score, resolve_hits_named,
-                    scope_to_call, traced_tvf,
+                    scope_to_call, top_k_statistics, traced_tvf,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -524,6 +525,9 @@ struct HybridSearchExec {
     /// Output schema after `projection`.
     projected_schema: SchemaRef,
     cache: Arc<PlanProperties>,
+    /// What the planner is told about this search's size, built once:
+    /// DataFusion asks on every optimizer pass. See [`top_k_statistics`].
+    statistics: Arc<Statistics>,
 }
 
 impl HybridSearchExec {
@@ -556,6 +560,7 @@ impl HybridSearchExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let statistics = top_k_statistics(&projected_schema, k, reader.manifest().n_docs_total());
         Ok(Self {
             reader,
             text_col,
@@ -571,6 +576,7 @@ impl HybridSearchExec {
             projection,
             projected_schema,
             cache,
+            statistics,
         })
     }
 
@@ -616,6 +622,10 @@ impl ExecutionPlan for HybridSearchExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        Ok(Arc::clone(&self.statistics))
     }
 
     fn execute(
@@ -786,6 +796,7 @@ mod tests {
         LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::physical_plan::{displayable, joins::HashJoinExec};
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
@@ -797,7 +808,10 @@ mod tests {
             builder::{FtsConfig, VectorConfig},
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
-        supertable::{Supertable, SupertableOptions, manifest::SuperfileUri},
+        supertable::{
+            Supertable, SupertableOptions, manifest::SuperfileUri,
+            query::exec::common::test_support::sql_row_count,
+        },
     };
 
     // ---- supertable harness: title (FTS) + emb (vector) ----
@@ -1441,6 +1455,181 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Rows [`demo`] writes.
+    const DEMO_ROWS: usize = 8;
+
+    /// Rows of [`demo`] with "rust" in the title; each search below asks for
+    /// exactly these.
+    const RUST_ROWS: usize = 2;
+
+    /// A `k` past [`DEMO_ROWS`]: a search asking for more rows than its
+    /// table holds.
+    const K_PAST_THE_TABLE: usize = 100;
+
+    /// The plan DataFusion runs for `sql`, from the reader's own session,
+    /// collecting a join's build side into one hash table only under
+    /// `collect_rows` rows (DataFusion's default when `None`).
+    fn physical_plan(
+        st: &Supertable,
+        sql: &str,
+        collect_rows: Option<usize>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let reader = st.reader().expect("reader");
+        let mut state = reader.sql_session_context().expect("session").state();
+        if let Some(rows) = collect_rows {
+            state
+                .config_mut()
+                .options_mut()
+                .optimizer
+                .hash_join_single_partition_threshold_rows = rows;
+        }
+        let ctx = SessionContext::new_with_state(state);
+        reader
+            .block_on(async { ctx.sql(sql).await?.create_physical_plan().await })
+            .expect("physical plan")
+    }
+
+    /// The first hash join in `plan`, top down.
+    fn hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<&HashJoinExec> {
+        plan.downcast_ref::<HashJoinExec>()
+            .or_else(|| plan.children().into_iter().find_map(hash_join))
+    }
+
+    /// Whether a node named `name` runs anywhere in `plan`.
+    fn runs(plan: &Arc<dyn ExecutionPlan>, name: &str) -> bool {
+        plan.name() == name || plan.children().into_iter().any(|child| runs(child, name))
+    }
+
+    /// A ranked search joined back to its table on `_id` builds the join's
+    /// hash table on its hits, not on the table: in every shape a query can
+    /// spell the join-back in, whether DataFusion collects the build side
+    /// into one hash table or partitions both sides, and when `k` asks for
+    /// more rows than the table holds. Where the join drops unmatched table
+    /// rows, the hits' `_id`s reach the table scan as a filter.
+    #[test]
+    fn a_search_joined_back_on_id_builds_on_its_hits() {
+        let dim = 16;
+        let st = demo(dim);
+        let qv = csv_one_hot(dim, 0);
+        let bm25 = format!("bm25_search('title', 'rust', {RUST_ROWS})");
+        let shapes = [
+            (
+                format!("{bm25} s JOIN supertable t ON t._id = s._id"),
+                "Bm25Exec",
+                true,
+                RUST_ROWS,
+            ),
+            (
+                format!(
+                    "vector_search('emb', '{qv}', {RUST_ROWS}) s \
+                     JOIN supertable t ON t._id = s._id"
+                ),
+                "VectorSearchExec",
+                true,
+                RUST_ROWS,
+            ),
+            (
+                format!(
+                    "hybrid_search('title', 'rust', 'emb', '{qv}', {RUST_ROWS}) s \
+                     JOIN supertable t ON t._id = s._id"
+                ),
+                "HybridSearchExec",
+                true,
+                RUST_ROWS,
+            ),
+            (
+                format!("supertable t JOIN {bm25} s ON t._id = s._id"),
+                "Bm25Exec",
+                true,
+                RUST_ROWS,
+            ),
+            (
+                format!("supertable t WHERE t._id IN (SELECT _id FROM {bm25})"),
+                "Bm25Exec",
+                true,
+                RUST_ROWS,
+            ),
+            (
+                format!("{bm25} s LEFT JOIN supertable t ON t._id = s._id"),
+                "Bm25Exec",
+                true,
+                RUST_ROWS,
+            ),
+            // Every table row survives a left join from the table, so the
+            // hits can filter nothing out of its scan.
+            (
+                format!("supertable t LEFT JOIN {bm25} s ON t._id = s._id"),
+                "Bm25Exec",
+                false,
+                DEMO_ROWS,
+            ),
+            (
+                format!(
+                    "bm25_search('title', 'rust', {K_PAST_THE_TABLE}) s \
+                     JOIN supertable t ON t._id = s._id"
+                ),
+                "Bm25Exec",
+                true,
+                RUST_ROWS,
+            ),
+        ];
+        // `Some(0)`: nothing is small enough to collect, so every join
+        // partitions and the build side comes from comparing row counts alone.
+        for collect_rows in [None, Some(0)] {
+            for (from, search, filters_scan, rows) in &shapes {
+                let sql = format!("SELECT t.title FROM {from}");
+                let plan = physical_plan(&st, &sql, collect_rows);
+                let join = hash_join(&plan).expect("the join-back plans as a hash join");
+                let shown = displayable(plan.as_ref()).indent(true).to_string();
+                assert!(
+                    runs(join.left(), search),
+                    "the join must build on the {search} hits ({collect_rows:?}): {sql}\n{shown}"
+                );
+                let probe = displayable(join.right().as_ref()).indent(true).to_string();
+                assert_eq!(
+                    probe.contains("DynamicFilter"),
+                    *filters_scan,
+                    "the hits' `_id`s reach the table scan iff the join drops unmatched \
+                     table rows ({collect_rows:?}): {sql}\n{shown}"
+                );
+                assert_eq!(sql_row_count(&st, &sql), *rows, "{sql}");
+            }
+        }
+    }
+
+    /// A search's row count is an estimate the planner may act on, never a
+    /// fact it may answer from: `COUNT(*)` counts the rows the search finds,
+    /// not its `k`, and a `k` near `i64::MAX` plans a join-back without
+    /// overflowing DataFusion's join-size arithmetic.
+    #[test]
+    fn a_search_reports_its_k_as_an_estimate_only() {
+        let st = demo(16);
+        let count = |sql: &str| -> i64 {
+            let batches = st.reader().expect("reader").query_sql(sql).expect("count");
+            batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is Int64")
+                .value(0)
+        };
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM bm25_search('title', 'rust', {K_PAST_THE_TABLE})"
+            )),
+            RUST_ROWS as i64,
+            "the rows the search finds, not the k it allows"
+        );
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM bm25_search('title', 'rust', {}) s \
+                 JOIN supertable t ON t._id = s._id",
+                i64::MAX
+            )),
+            RUST_ROWS as i64
+        );
     }
 
     /// Construct `HybridSearchTable` directly through the TVF `call`

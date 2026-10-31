@@ -38,8 +38,9 @@ use bytes::Bytes;
 use datafusion::{
     catalog::{Session, TableProvider},
     common::{
-        Column, DFSchema, TableReference,
+        Column, DFSchema, Statistics, TableReference,
         runtime::SpawnedTask,
+        stats::Precision,
         tree_node::{Transformed, TreeNode},
     },
     datasource::provider_as_source,
@@ -179,6 +180,16 @@ const EXACT_SCOPE_FIRST_TAKE_ROWS: usize = 1 << 16;
 /// this much, however long its values run, where a fixed count of rows of
 /// long text could hold gigabytes.
 const EXACT_SCOPE_TAKE_BYTES: usize = 32 << 20;
+
+/// The most rows a search tells the planner it returns (see
+/// [`top_k_statistics`]), whatever its `k`. DataFusion sizes a join by
+/// multiplying its two sides' row counts unchecked, so reporting a `k` near
+/// `i64::MAX` overflows that product: a panic in a debug build, a garbage
+/// estimate in release. 2^20 keeps the product inside `usize` for tables
+/// up to 2^44 rows (17 trillion), and sits above the 128K rows under which
+/// DataFusion's default collects a join's build side into one hash table, so
+/// a search this large still builds partitioned.
+const MAX_REPORTED_HITS: usize = 1 << 20;
 
 /// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
 /// times `k`, floored at [`OVER_FETCH_MIN_CEILING`], capped at
@@ -940,6 +951,30 @@ pub(crate) async fn exact_scope(
 /// Output column carrying the per-hit score (vector distance or BM25
 /// relevance — direction is the originating TVF's contract).
 pub(crate) const SCORE_COLUMN: &str = "score";
+
+/// What a ranked search tells the planner about its size: about `k` rows,
+/// and never more than the `table_rows` it searches.
+///
+/// DataFusion builds a join's hash table on the side it expects to be
+/// smaller. Knowing nothing about a search, it builds on the table instead,
+/// holding the whole table in memory to match a handful of hits. Told the
+/// search's size, it builds on the hits, and any join that drops the table
+/// rows no hit matches (inner, semi, or a left join from the search) hands
+/// the hits' `_id`s to the table scan as a filter.
+///
+/// The bound by `table_rows` matters for a large `k`: a search asking for a
+/// million rows over a 500K-row table would otherwise look the larger side
+/// and send the build to the table.
+///
+/// The count is an estimate, never exact: a `WHERE` or fewer matches can
+/// leave fewer rows, and DataFusion answers `COUNT(*)` from an exact count
+/// without running the search.
+pub(crate) fn top_k_statistics(schema: &SchemaRef, k: usize, table_rows: u64) -> Arc<Statistics> {
+    let table_rows = usize::try_from(table_rows).unwrap_or(usize::MAX);
+    let mut statistics = Statistics::new_unknown(schema);
+    statistics.num_rows = Precision::Inexact(k.min(table_rows).min(MAX_REPORTED_HITS));
+    Arc::new(statistics)
+}
 
 /// Search-TVF output schema: the scalar schema with a trailing
 /// non-null `score: Float32` appended.
@@ -1928,6 +1963,7 @@ pub(crate) fn arg_to_usize(expr: &Expr, what: &str) -> DfResult<usize> {
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use arrow_array::RecordBatch;
     use datafusion::{
         catalog::{TableFunctionArgs, TableFunctionImpl, TableProvider},
         error::Result as DfResult,
@@ -1936,6 +1972,18 @@ pub(crate) mod test_support {
     };
 
     use super::CallScopedTable;
+    use crate::supertable::Supertable;
+
+    /// How many rows `sql` returns over `st`.
+    pub(crate) fn sql_row_count(st: &Supertable, sql: &str) -> usize {
+        st.reader()
+            .expect("reader")
+            .query_sql(sql)
+            .expect("query_sql")
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
 
     /// Invoke a table function's `call_with_args` with a throwaway session.
     /// The search TVFs read only the argument exprs, not the session, so a
