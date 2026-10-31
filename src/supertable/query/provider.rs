@@ -2369,6 +2369,7 @@ mod tests {
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
+        runtime_metrics::op_stats::{current, with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::FtsConfig,
@@ -3807,6 +3808,9 @@ mod tests {
         gets: usize,
         /// The byte range of each of those GETs.
         reads: Vec<Range<u64>>,
+        /// Page bytes the scan's work stats counted, which must not depend on
+        /// what the cache held.
+        page_bytes: u64,
     }
 
     impl ScanRun {
@@ -3925,7 +3929,10 @@ mod tests {
         superfile.clear();
 
         let path = ObjPath::from("t/sf.parquet");
-        let store = Arc::new(SuperfileObjectStore::new());
+        let ((store, stats), _) = with_op_stats(|| {
+            let store = Arc::new(SuperfileObjectStore::new());
+            (store, current().expect("a work stats scope"))
+        });
         store.insert_source(path.clone(), source);
         let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
         footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
@@ -3984,6 +3991,7 @@ mod tests {
             fetched: superfile.fetched_bytes(),
             gets: superfile.reads().len(),
             reads: superfile.reads(),
+            page_bytes: stats.snapshot().sql_page_bytes,
         };
         assert_eq!(budget.used(), 0, "every byte held ahead is given back");
         (run, budget.peak())
@@ -4123,12 +4131,23 @@ mod tests {
                 .any(|r| r.start <= page(first).start && page(last).end <= r.end),
             "near: one GET reads both pages and the gap: {near:?}"
         );
+        let warm = ScanShape {
+            cached_row_groups: vec![1],
+            ..shape("warm", NEAR_PAGES)
+        };
+        let (warm, _) = scan_through_the_cache(true, &warm, &file, GET_LATENCY).await;
+        assert_eq!(warm.gets, 0, "warm: every page is local");
+        assert_eq!(
+            near.page_bytes, warm.page_bytes,
+            "the pages counted don't depend on what was read through"
+        );
 
         let [first, last] = FAR_PAGES;
         assert!(page(last).start - page(first).end > PAGE_READ_THROUGH_BYTES);
         let (far, _) =
             scan_through_the_cache(true, &shape("far", FAR_PAGES), &file, GET_LATENCY).await;
         assert_eq!(far.rows, 2 * WIDE_PAGE_ROWS, "far: the two pages' rows");
+        assert!(near.gets < far.gets, "near: fewer GETs than far apart");
         let skipped = page(SKIPPED_PAGE);
         assert!(
             !far.reads
