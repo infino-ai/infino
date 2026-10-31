@@ -293,7 +293,9 @@ async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsRes
 
 /// How the store merges `ranges` into reads: sorted, and merged where the
 /// gap between two is at most object_store's default coalesce distance. The
-/// one merge rule for fetching, counting and charging. It matches
+/// one merge rule for counting and charging, and for fetching, except that a
+/// scan's own reads may also join cold pages of one column chunk up to 2 MiB
+/// apart (see the read-ahead module). It matches
 /// object_store's own `coalesce_ranges` (pinned by a test), so merging is the
 /// same as the default `get_ranges`.
 pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
