@@ -112,7 +112,7 @@ use std::{
     array,
     collections::BTreeMap,
     fs,
-    os::unix::fs::FileExt,
+    os::unix::fs::{FileExt, MetadataExt},
     panic::resume_unwind,
     path::PathBuf,
     pin::Pin,
@@ -199,21 +199,19 @@ const ALIGNED_GET_BLOCKS: u32 = (ALIGNED_GET_BYTES / CACHE_BLOCK_BYTES) as u32;
 /// reader keeps its headers), and a slice would keep the whole run in memory.
 const COPY_BELOW_BYTES: u64 = 512 * 1024;
 
-/// Leads every block index: the block size it was written with, so a later
-/// build reads its block numbers in the right units (see
-/// [`indexed_filled_bytes`]).
-const IDX_HEADER: [u8; 8] = CACHE_BLOCK_BYTES.to_le_bytes();
+/// Leads every block index, so one an older build wrote (which starts with its
+/// block size and names no block file) is told apart and never adopted.
+const IDX_MAGIC: [u8; 8] = *b"INFBIDX\x01";
 
-/// The block size older builds wrote block indexes with. Such an index
-/// converts exactly to ours; one with any other size is not adopted.
-const LEGACY_BLOCK_BYTES: u64 = 512 * 1024;
+/// Bytes ahead of a block index's bitmap: [`IDX_MAGIC`], the block size it was
+/// written with, and the inode of the block file it describes.
+const IDX_HEADER_BYTES: usize = IDX_MAGIC.len() + 2 * size_of::<u64>();
 
-// Every GET size, and the legacy block size, is a whole number of blocks.
+// Every GET size is a whole number of blocks.
 const _: () = assert!(
     MIN_GET_BLOCKS > 0
         && MIN_GET_BYTES.is_multiple_of(CACHE_BLOCK_BYTES)
         && ALIGNED_GET_BYTES.is_multiple_of(CACHE_BLOCK_BYTES)
-        && LEGACY_BLOCK_BYTES.is_multiple_of(CACHE_BLOCK_BYTES)
 );
 
 /// Where a superfile's sections lie, as far as sizing GETs goes: byte ranges
@@ -265,6 +263,9 @@ static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct BlockFile {
     file: fs::File,
     size: u64,
+    /// The file's inode. Its index records it, so an index never describes
+    /// another generation's file at the same path.
+    ino: u64,
     /// Lazily-created read-only mapping for zero-copy hit service.
     /// Inner `None` = mapping failed once; keep serving via pread.
     mmap: OnceLock<Option<Arc<Mmap>>>,
@@ -314,7 +315,15 @@ pub(crate) struct BlockCachedSource {
     /// Tests set this to hold block-file writes; see [`Self::stall_writes`].
     #[cfg(test)]
     write_stall: (Mutex<WriteStallState>, Condvar),
+    /// Tests set this to run once [`Self::block_file`] has created a fresh file,
+    /// given its inode, before the index at the path is removed again.
+    #[cfg(test)]
+    created_hook: Mutex<Option<CreatedHook>>,
 }
+
+/// See [`BlockCachedSource::created_hook`].
+#[cfg(test)]
+type CreatedHook = Box<dyn FnOnce(u64) + Send>;
 
 /// How a missing run is fetched and cached.
 #[derive(Clone, Copy)]
@@ -750,6 +759,8 @@ impl BlockCachedSource {
             flushing: AtomicBool::new(false),
             #[cfg(test)]
             write_stall: (Mutex::new(WriteStallState::default()), Condvar::new()),
+            #[cfg(test)]
+            created_hook: Mutex::new(None),
         })
     }
 
@@ -875,8 +886,15 @@ impl BlockCachedSource {
                 if let Some(adopted) = self.try_adopt(size) {
                     return Some(adopted);
                 }
+                // The file at the path is deleted below, so nothing may stay
+                // charged for it: a record left behind would later be evicted
+                // and unlink our new file under us.
+                if let Some(store) = self.store.upgrade() {
+                    store.release_scanned_block_file(&self.uri);
+                }
+                let idx = self.idx_path();
                 let _ = fs::remove_file(&self.path);
-                let _ = fs::remove_file(self.idx_path());
+                let _ = fs::remove_file(&idx);
                 let file = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
@@ -884,9 +902,24 @@ impl BlockCachedSource {
                     .open(&self.path)
                     .ok()?;
                 file.set_len(size).ok()?;
+                let ino = file.metadata().ok()?.ino();
+                #[cfg(test)]
+                if let Some(hook) = self.created_hook.lock().expect("hook poisoned").take() {
+                    hook(ino);
+                }
+                // Remove the index again, now that our file exists. A superseded
+                // generation that checked the path before the unlink above can
+                // still rename its index in, then close its file, and ours can be
+                // given that file's inode number, so its index would pass as ours.
+                // Any later rename comes from a generation still holding its
+                // file, whose inode is not ours. The first removal is still
+                // needed: after a crash between the two, the old index must not
+                // be left beside a file that took the old one's inode number.
+                let _ = fs::remove_file(&idx);
                 Some(BlockFile {
                     file,
                     size,
+                    ino,
                     mmap: OnceLock::new(),
                 })
             })
@@ -905,20 +938,23 @@ impl BlockCachedSource {
         PathBuf::from(p)
     }
 
-    /// Adopt a prior generation's sparse file when its persisted index proves
-    /// which ranges are valid (immutable superfile, so size-match is enough).
+    /// Adopts the block file an earlier generation left at the path, when its
+    /// index was written for that very file (see [`indexed_filled_bytes`]). A
+    /// superfile never changes, so a file of the right size holds its bytes
+    /// wherever the index says. The inode is read from the opened file, so the
+    /// file checked is the file kept.
     fn try_adopt(&self, size: u64) -> Option<BlockFile> {
-        let meta = fs::metadata(&self.path).ok()?;
-        if meta.len() != size {
-            return None;
-        }
-        let idx_bytes = fs::read(self.idx_path()).ok()?;
-        let (bitmap, adopted_bytes) = indexed_filled_bytes(size, &idx_bytes)?;
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&self.path)
             .ok()?;
+        let meta = file.metadata().ok()?;
+        if meta.len() != size {
+            return None;
+        }
+        let idx_bytes = fs::read(self.idx_path()).ok()?;
+        let (bitmap, adopted_bytes) = indexed_filled_bytes(size, &idx_bytes, meta.ino())?;
         if let Some(store) = self.store.upgrade() {
             if self.owns_accounting {
                 store.account_adopted_bytes(&self.uri, adopted_bytes);
@@ -931,6 +967,7 @@ impl BlockCachedSource {
         Some(BlockFile {
             file,
             size,
+            ino: meta.ino(),
             mmap: OnceLock::new(),
         })
     }
@@ -940,23 +977,22 @@ impl BlockCachedSource {
     /// writes the fsync already flushed — a concurrent fill that marks a new
     /// block after this snapshot is simply absent (a safe undercount), never a
     /// durably-claimed hole.
-    fn snapshot_index(&self) -> Vec<u8> {
+    fn snapshot_index(&self, bf: &BlockFile) -> Vec<u8> {
         let filled = self.filled.lock().expect("filled bitmap mutex poisoned");
-        serialize_index(&filled)
+        serialize_index(&filled, bf.ino)
     }
 
     /// Write a pre-serialized index snapshot, only after its blocks are durable
     /// AND only while `self.path` still names THIS source's own data inode.
     ///
-    /// The shared, generation-less `.blocks` / `.blocks.idx` paths mean a later
-    /// generation can unlink our data file and publish a fresh inode (all holes)
-    /// at the same path while we are still alive. A plain `path.exists()` guard
-    /// then lets a dropped or superseded generation rename its own filled-block
-    /// bitmap onto the successor's inode — over-claiming that inode's holes. A
-    /// subsequent `try_adopt` trusts the stale bitmap and preads zeros where a
-    /// Parquet page-index (ColumnIndex) tag belongs, so the decode fails with
-    /// `Required field null_pages is missing`. Comparing inodes keeps the
-    /// persisted index faithful to whatever data file the path currently names.
+    /// The `.blocks` / `.blocks.idx` paths carry no generation, so a later
+    /// generation can unlink our file and create a fresh one (all holes) at the
+    /// same path while we are still alive. Adopting our bitmap for that file
+    /// would read zeros from its holes (a page index then fails to decode with
+    /// `Required field null_pages is missing`). Our index names our inode, so it
+    /// is never adopted for the fresh file; this check also keeps it from
+    /// replacing the fresh file's own index. The check and the rename are not
+    /// atomic, and [`Self::block_file`] covers a rename that lands between.
     fn persist_idx(&self, bf: &BlockFile, snapshot: &[u8]) {
         // Path is gone or now names another generation's inode — never
         // stamp our bitmap onto it.
@@ -976,11 +1012,7 @@ impl BlockCachedSource {
     /// Whether `self.path` still names `bf`'s inode, rather than being gone or
     /// naming a later generation's file.
     fn path_names(&self, bf: &BlockFile) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        match (bf.file.metadata(), fs::metadata(&self.path)) {
-            (Ok(own), Ok(named)) => own.ino() == named.ino(),
-            _ => false,
-        }
+        fs::metadata(&self.path).is_ok_and(|named| named.ino() == bf.ino)
     }
 
     /// Whether this source has a block file and its path still names it.
@@ -1298,7 +1330,7 @@ impl BlockCachedSource {
             // Clear the flag before reading the bitmap: a block marked after this
             // sets it again, and the loop runs once more.
             self.dirty.store(false, Ordering::SeqCst);
-            let snapshot = self.snapshot_index();
+            let snapshot = self.snapshot_index(bf);
             let synced = bf.file.sync_data().is_ok();
 
             if synced {
@@ -2025,43 +2057,46 @@ impl Drop for WriteStall<'_> {
     }
 }
 
-pub(super) fn serialize_index(bitmap: &RoaringBitmap) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(IDX_HEADER.len() + bitmap.serialized_size());
-    buf.extend_from_slice(&IDX_HEADER);
+/// The index of the block file with inode `ino`: [`IDX_MAGIC`], the block size,
+/// the inode, then the filled-block bitmap.
+pub(super) fn serialize_index(bitmap: &RoaringBitmap, ino: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(IDX_HEADER_BYTES + bitmap.serialized_size());
+    buf.extend_from_slice(&IDX_MAGIC);
+    buf.extend_from_slice(&CACHE_BLOCK_BYTES.to_le_bytes());
+    buf.extend_from_slice(&ino.to_le_bytes());
     let _ = bitmap.serialize_into(&mut buf);
     buf
 }
 
-/// The blocks an index marks filled, in [`CACHE_BLOCK_BYTES`] blocks, and their
-/// bytes. An index written with [`LEGACY_BLOCK_BYTES`] converts exactly: each of
-/// its blocks is a run of ours at the same offsets. `None` for any other block
-/// size, so a corrupt header never claims bytes, or for a block past the end of
-/// a `size`-byte file.
-pub(super) fn indexed_filled_bytes(size: u64, idx_bytes: &[u8]) -> Option<(RoaringBitmap, u64)> {
-    let (header, body) = idx_bytes.split_first_chunk::<8>()?;
-    let written_block = u64::from_le_bytes(*header);
-    if written_block != CACHE_BLOCK_BYTES && written_block != LEGACY_BLOCK_BYTES {
-        return None;
-    }
-    let written = RoaringBitmap::deserialize_from(body).ok()?;
-    if written
-        .max()
-        .is_some_and(|m| u64::from(m) >= size.div_ceil(written_block))
+/// The blocks an index marks filled and their bytes, for the `size`-byte block
+/// file with inode `ino`. `None`, so the blocks are fetched again rather than
+/// trusted, for:
+/// - an index written for another inode: a generation that lost its file to a
+///   newer one at the same path can still rename its index over the newer
+///   one's, and it marks blocks the newer file never filled;
+/// - an index an older build wrote, which names no file to check;
+/// - another block size, a block past the end of the file, or a corrupt index.
+pub(super) fn indexed_filled_bytes(
+    size: u64,
+    idx_bytes: &[u8],
+    ino: u64,
+) -> Option<(RoaringBitmap, u64)> {
+    let header = idx_bytes.strip_prefix(&IDX_MAGIC)?;
+    let (block_bytes, header) = header.split_first_chunk::<8>()?;
+    let (written_ino, body) = header.split_first_chunk::<8>()?;
+    if u64::from_le_bytes(*block_bytes) != CACHE_BLOCK_BYTES
+        || u64::from_le_bytes(*written_ino) != ino
     {
         return None;
     }
-    let per = written_block / CACHE_BLOCK_BYTES;
+    let bitmap = RoaringBitmap::deserialize_from(body).ok()?;
+    if bitmap
+        .max()
+        .is_some_and(|m| u64::from(m) >= size.div_ceil(CACHE_BLOCK_BYTES))
+    {
+        return None;
+    }
     let last = BlockCachedSource::last_block(size);
-    let bitmap = if per == 1 {
-        written
-    } else {
-        let mut ours = RoaringBitmap::new();
-        for b in &written {
-            let first = u64::from(b) * per;
-            ours.insert_range(first as u32..=((first + per - 1) as u32).min(last));
-        }
-        ours
-    };
     let short_tail = if bitmap.contains(last) {
         CACHE_BLOCK_BYTES - BlockCachedSource::block_len(size, last)
     } else {
@@ -2251,9 +2286,16 @@ mod tests {
     use crate::{
         runtime_bridge::bridge_sync_to_async_send,
         supertable::reader_cache::{
-            ColdFetchMode, DiskCacheConfig, LruPolicy, disk::BLOCK_WRITERS,
+            ColdFetchMode, DiskCacheConfig, LruPolicy,
+            disk::{
+                BLOCK_WRITERS,
+                test_support::{OLDER_BUILD_BLOCK_BYTES, unstamped_index},
+            },
         },
     };
+
+    /// An inode for indexes no test file backs.
+    const TEST_INO: u64 = 42;
 
     /// How long a test waits for something that should happen right away, before
     /// failing instead of hanging.
@@ -2606,7 +2648,9 @@ mod tests {
         let size = 2 * CACHE_BLOCK_BYTES;
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(2);
-        assert!(indexed_filled_bytes(size, &serialize_index(&bitmap)).is_none());
+        assert!(
+            indexed_filled_bytes(size, &serialize_index(&bitmap, TEST_INO), TEST_INO).is_none()
+        );
     }
 
     #[test]
@@ -2615,9 +2659,20 @@ mod tests {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(0);
         bitmap.insert(2);
-        let (_, filled) =
-            indexed_filled_bytes(size, &serialize_index(&bitmap)).expect("valid index");
+        let (_, filled) = indexed_filled_bytes(size, &serialize_index(&bitmap, TEST_INO), TEST_INO)
+            .expect("valid index");
         assert_eq!(filled, CACHE_BLOCK_BYTES + 100);
+    }
+
+    /// An index names the inode of the block file it was written for, and only
+    /// that file adopts it.
+    #[test]
+    fn indexed_filled_bytes_rejects_another_files_index() {
+        let size = 2 * CACHE_BLOCK_BYTES;
+        let bitmap = RoaringBitmap::from_iter([0]);
+        let idx = serialize_index(&bitmap, TEST_INO);
+        assert!(indexed_filled_bytes(size, &idx, TEST_INO).is_some());
+        assert!(indexed_filled_bytes(size, &idx, TEST_INO + 1).is_none());
     }
 
     #[test]
@@ -2625,9 +2680,9 @@ mod tests {
         let size = 2 * CACHE_BLOCK_BYTES;
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert(0);
-        let mut bytes = serialize_index(&bitmap);
+        let mut bytes = serialize_index(&bitmap, TEST_INO);
         bytes[0] ^= 0xFF;
-        assert!(indexed_filled_bytes(size, &bytes).is_none());
+        assert!(indexed_filled_bytes(size, &bytes, TEST_INO).is_none());
     }
 
     /// Regression for the transient `Required field type_ is missing` decode
@@ -2764,15 +2819,21 @@ mod tests {
         let tail = 3 * CACHE_BLOCK_BYTES + 10;
         let _ = b.range(tail, 50).await.expect("B fill disjoint block");
         wait_until(|| idx_path.exists(), "B writes its index").await;
+        let b_index = fs::read(&idx_path).expect("B's index");
 
         // A's write runs now and writes its {0} bitmap. WITHOUT the inode fence
         // this renames {0} onto `.blocks.idx`, which now names Y (block 0 = hole).
         drop(a_stall);
         store.block_writes_settled().await;
         drop(a);
+        assert_eq!(
+            fs::read(&idx_path).expect("index"),
+            b_index,
+            "A sees the path names another file and leaves B's index in place"
+        );
 
-        // Gen3 D cold-opens → try_adopt(size) accepts Y (len matches) with the
-        // over-claimed bitmap {0}, then serves block 0 from a hole = zeros.
+        // Gen3 D cold-opens. Had A's {0} landed, adopting it for Y would serve
+        // block 0 from a hole: zeros.
         let inner_d = Arc::new(CountingSource::new(OBJ));
         let d = BlockCachedSource::new(
             Arc::clone(&inner_d) as Arc<dyn LazyByteSource>,
@@ -4201,121 +4262,292 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// An index written with `block`-byte blocks, marking `blocks`.
+    /// An index of `blocks` for [`TEST_INO`] whose header names `block`-byte
+    /// blocks.
     fn index_with_block_size(block: u64, blocks: &[u32]) -> Vec<u8> {
-        let mut idx = block.to_le_bytes().to_vec();
-        RoaringBitmap::from_iter(blocks.iter().copied())
-            .serialize_into(&mut idx)
-            .expect("serialize");
+        let mut idx = serialize_index(&RoaringBitmap::from_iter(blocks.iter().copied()), TEST_INO);
+        idx[IDX_MAGIC.len()..IDX_MAGIC.len() + size_of::<u64>()]
+            .copy_from_slice(&block.to_le_bytes());
         idx
     }
 
-    /// An index written with larger blocks converts to ours: each of its blocks
-    /// is the run of ours at the same offsets, the last one clipped to the file.
-    #[test]
-    fn an_index_written_with_larger_blocks_converts() {
-        let per = (LEGACY_BLOCK_BYTES / CACHE_BLOCK_BYTES) as u32;
-        let large = LEGACY_BLOCK_BYTES;
-        let size = 2 * large + 100;
-        let (bitmap, filled) =
-            indexed_filled_bytes(size, &index_with_block_size(large, &[1, 2])).expect("converts");
-        let last = 2 * per;
-        assert_eq!(bitmap, RoaringBitmap::from_iter(per..=last));
-        assert_eq!(filled, size - large);
-        assert!(
-            indexed_filled_bytes(size, &index_with_block_size(large, &[3])).is_none(),
-            "a block past the file"
+    /// A source over `inner` for `uri` at `path`, installed as its current
+    /// generation.
+    fn generation_at(
+        store: &Arc<DiskCacheStore>,
+        uri: SuperfileUri,
+        path: &Path,
+        inner: &Arc<CountingSource>,
+    ) -> Arc<BlockCachedSource> {
+        let src = BlockCachedSource::new(
+            Arc::clone(inner) as Arc<dyn LazyByteSource>,
+            Arc::downgrade(store),
+            uri,
+            path.to_path_buf(),
         );
+        store.install_block_entry_for_test(uri, Arc::clone(&src));
+        src
     }
 
-    /// An index written with any block size but ours or the legacy one is not
-    /// adopted, even a multiple of ours: a corrupt header must not claim bytes.
+    /// An index an older build wrote names no block file, so it may describe an
+    /// earlier file at the path; it is not trusted, whatever its block size.
+    #[test]
+    fn an_index_an_older_build_wrote_is_rejected() {
+        let size = 4 * GROUP;
+        for block in OLDER_BUILD_BLOCK_BYTES {
+            assert!(indexed_filled_bytes(size, &unstamped_index(block, &[0]), TEST_INO).is_none());
+        }
+    }
+
+    /// An older build reads an index's first 8 bytes as its block size, so the
+    /// magic must not read as one it accepts: rolled back, it refetches instead
+    /// of misreading this build's indexes.
+    #[test]
+    fn an_older_build_does_not_read_the_magic_as_a_block_size() {
+        assert!(!OLDER_BUILD_BLOCK_BYTES.contains(&u64::from_le_bytes(IDX_MAGIC)));
+    }
+
+    /// An index whose header names any block size but ours is not adopted, even a
+    /// multiple of ours: a corrupt header must not claim bytes.
     #[test]
     fn an_index_written_with_another_block_size_is_rejected() {
         let size = 4 * GROUP;
+        assert!(
+            indexed_filled_bytes(
+                size,
+                &index_with_block_size(CACHE_BLOCK_BYTES, &[0]),
+                TEST_INO
+            )
+            .is_some()
+        );
         for block in [
             CACHE_BLOCK_BYTES / 2,
             CACHE_BLOCK_BYTES + 1,
             2 * CACHE_BLOCK_BYTES,
-            2 * LEGACY_BLOCK_BYTES,
             0,
         ] {
-            assert!(indexed_filled_bytes(size, &index_with_block_size(block, &[0])).is_none());
+            assert!(
+                indexed_filled_bytes(size, &index_with_block_size(block, &[0]), TEST_INO).is_none()
+            );
         }
     }
 
-    /// A block file indexed with larger blocks by an older build is adopted with
-    /// no refetch. Its index stays as the older build wrote it until this build
-    /// fills a block, so an older process sharing the cache can still adopt it;
-    /// the next fill rewrites it in our block size.
+    /// An index cut short anywhere up to the end of its header is not adopted.
+    #[test]
+    fn a_truncated_index_is_rejected() {
+        let idx = serialize_index(&RoaringBitmap::from_iter([0]), TEST_INO);
+        for len in 0..=IDX_HEADER_BYTES {
+            assert!(
+                indexed_filled_bytes(4 * GROUP, &idx[..len], TEST_INO).is_none(),
+                "{len} bytes"
+            );
+        }
+    }
+
+    /// A block file an older build indexed is not adopted: its blocks are fetched
+    /// again, and the next write indexes the file in this build's format.
     #[tokio::test]
-    async fn a_block_file_indexed_with_larger_blocks_is_adopted() {
+    async fn a_block_file_an_older_build_indexed_is_fetched_again() {
         let dir = tempdir().expect("tempdir");
         let store = test_store(dir.path(), u64::MAX);
         let uri = SuperfileUri::new_v4();
         let path = dir.path().join("old.blocks");
         let size = 2 * GROUP;
+        let generation = |inner: &Arc<CountingSource>| generation_at(&store, uri, &path, inner);
+
+        let older = generation(&Arc::new(CountingSource::new(size as usize)));
+        let _ = older.range(0, size).await.expect("fill the file");
+        store.block_writes_settled().await;
+        let idx = older.idx_path();
+        store.remove_block_entry_for_test(&uri);
+        drop(older);
+        fs::write(&idx, unstamped_index(CACHE_BLOCK_BYTES, &[0])).expect("an older index");
 
         let inner = Arc::new(CountingSource::new(size as usize));
-        let gen1 = BlockCachedSource::new(
-            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
-            Arc::downgrade(&store),
-            uri,
-            path.clone(),
-        );
-        store.install_block_entry_for_test(uri, Arc::clone(&gen1));
-        let _ = gen1.range(0, size).await.expect("fill the file");
+        let later = generation(&inner);
+        let got = later.range(10, 100).await.expect("read block 0");
+        assert_eq!(got, inner.blob.slice(10..110));
+        assert_eq!(inner.calls(), 1, "not adopted, so fetched again");
         store.block_writes_settled().await;
-        let idx = gen1.idx_path();
+        let ino = fs::metadata(&path).expect("block file").ino();
+        let (bitmap, _) = indexed_filled_bytes(size, &fs::read(&idx).expect("index"), ino)
+            .expect("indexed in this build's format");
+        assert!(bitmap.contains(0));
         store.remove_block_entry_for_test(&uri);
-        drop(gen1);
-        fs::write(&idx, index_with_block_size(LEGACY_BLOCK_BYTES, &[1])).expect("an older index");
+    }
 
-        let inner2 = Arc::new(CountingSource::new(size as usize));
-        let gen2 = BlockCachedSource::new(
-            Arc::clone(&inner2) as Arc<dyn LazyByteSource>,
-            Arc::downgrade(&store),
-            uri,
-            path,
-        );
-        store.install_block_entry_for_test(uri, Arc::clone(&gen2));
-        let start = LEGACY_BLOCK_BYTES + 10;
-        let got = gen2.range(start, 100).await.expect("read the old block");
+    /// A generation that loses its block file to a newer one at the same path can
+    /// still rename its index over the newer one's: it checks the path, the file is
+    /// replaced, then it renames. That index marks blocks the newer file never
+    /// filled, so adopting it would read zeros there. It names the older file's
+    /// inode, so it is not adopted and the read refetches.
+    #[tokio::test]
+    async fn an_index_left_by_an_older_file_at_the_path_is_not_adopted() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = dir.path().join("race.blocks");
+        let size = 4 * UNIT;
+        let generation = |inner: &Arc<CountingSource>| generation_at(&store, uri, &path, inner);
+
+        // The older generation fills the head of the file and indexes it.
+        let older = generation(&Arc::new(CountingSource::new(size as usize)));
+        let _ = older.range(0, 100).await.expect("fill the head");
+        store.block_writes_settled().await;
+        let idx = older.idx_path();
+        let older_index = fs::read(&idx).expect("older index");
+        // The older generation still holds its file when it renames, so the newer
+        // file cannot reuse its inode number; hold it here the same way.
+        let older_file = fs::File::open(&path).expect("hold the older file");
+        store.remove_block_entry_for_test(&uri);
+        drop(older);
+
+        // Evicted; a newer generation fills only the tail of a fresh file.
+        fs::remove_file(&path).expect("unlink blocks");
+        fs::remove_file(&idx).expect("unlink index");
+        let newer = generation(&Arc::new(CountingSource::new(size as usize)));
+        let _ = newer.range(3 * UNIT, 100).await.expect("fill the tail");
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+        drop(newer);
+        drop(older_file);
+
+        // The older generation's rename lands last.
+        fs::write(&idx, older_index).expect("stale rename");
+
+        let inner = Arc::new(CountingSource::new(size as usize));
+        let later = generation(&inner);
+        let got = later.range(0, 100).await.expect("read the head");
         assert_eq!(
             got,
-            inner2.blob.slice(start as usize..(start + 100) as usize)
+            inner.blob.slice(0..100),
+            "real bytes, not the newer file's holes"
         );
-        assert_eq!(inner2.calls(), 0, "adopted, no refetch");
-        assert_eq!(store.stats().current_bytes, LEGACY_BLOCK_BYTES);
-
+        assert_eq!(
+            inner.calls(),
+            1,
+            "the stale index is not trusted, so the head is fetched"
+        );
         store.remove_block_entry_for_test(&uri);
-        drop(gen2);
-        let kept = fs::read(&idx).expect("index");
-        assert!(
-            !kept.starts_with(&IDX_HEADER),
-            "an open that fills nothing leaves the older index as it was"
-        );
+    }
 
-        let inner3 = Arc::new(CountingSource::new(size as usize));
-        let gen3 = BlockCachedSource::new(
-            Arc::clone(&inner3) as Arc<dyn LazyByteSource>,
-            Arc::downgrade(&store),
-            uri,
-            dir.path().join("old.blocks"),
+    /// A superseded generation can rename its index in just before a fresh file
+    /// is created at the path, then close its file, and the fresh file can be
+    /// given its inode number, so the index names the fresh file. The index is
+    /// removed again once the fresh file exists, so a later open never adopts it.
+    #[tokio::test]
+    async fn an_index_that_lands_as_a_fresh_file_takes_its_inode_is_not_adopted() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = dir.path().join("reuse.blocks");
+        let size = 4 * UNIT;
+        let generation = |inner: &Arc<CountingSource>| generation_at(&store, uri, &path, inner);
+
+        // The fresh file is created and filled with nothing; the stale index lands
+        // stamped with its inode, as it would if the inode number were reused.
+        let fresh = generation(&Arc::new(CountingSource::new(size as usize)));
+        let idx = fresh.idx_path();
+        let landed = idx.clone();
+        *fresh.created_hook.lock().expect("hook poisoned") = Some(Box::new(move |ino| {
+            let stale = serialize_index(&RoaringBitmap::from_iter([0]), ino);
+            fs::write(&landed, stale).expect("a late rename");
+        }));
+        assert!(fresh.block_file().is_some(), "the fresh file is created");
+        assert!(!idx.exists(), "the index that landed is removed");
+        store.remove_block_entry_for_test(&uri);
+        drop(fresh);
+
+        let inner = Arc::new(CountingSource::new(size as usize));
+        let later = generation(&inner);
+        let got = later.range(0, 100).await.expect("read block 0");
+        assert_eq!(
+            got,
+            inner.blob.slice(0..100),
+            "real bytes, not the fresh file's hole"
         );
-        store.install_block_entry_for_test(uri, Arc::clone(&gen3));
-        let _ = gen3.range(10, 100).await.expect("fill a block");
-        assert_eq!(inner3.calls(), 1, "a block the older index did not hold");
+        assert_eq!(inner.calls(), 1, "nothing adopted, so block 0 is fetched");
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A dropped generation whose file a newer one replaced at the path keeps no
+    /// charge: the record would name the path, and evicting it would unlink the
+    /// newer file.
+    #[tokio::test]
+    async fn a_dropped_generation_whose_file_was_replaced_keeps_no_charge() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = store.blocks_path(&uri);
+        let size = 4 * UNIT;
+
+        let older = generation_at(
+            &store,
+            uri,
+            &path,
+            &Arc::new(CountingSource::new(size as usize)),
+        );
+        let _ = older.range(0, 100).await.expect("fill block 0");
         store.block_writes_settled().await;
         store.remove_block_entry_for_test(&uri);
-        drop(gen3);
-        let rewritten = fs::read(&idx).expect("index");
-        assert!(
-            rewritten.starts_with(&IDX_HEADER),
-            "rewritten in our block size"
+
+        // A newer generation replaces the file at the path.
+        fs::remove_file(&path).expect("unlink blocks");
+        fs::File::create(&path).expect("newer file");
+
+        store.retain_block_file(&uri, &older, 0);
+        drop(older);
+        assert_eq!(
+            store.stats().current_bytes,
+            0,
+            "the source gave back its own bytes and nothing was retained"
         );
-        let (bitmap, _) = indexed_filled_bytes(size, &rewritten).expect("valid");
-        assert_eq!(bitmap, RoaringBitmap::from_iter(0..2 * ALIGNED_GET_BLOCKS));
+        assert!(path.exists(), "the newer file stays");
+        assert_eq!(store.evict_block_files(u64::MAX), 0, "no record to evict");
+        assert!(path.exists(), "the newer file survives eviction");
+    }
+
+    /// A block file the store charges for (kept for a dropped entry, or found by
+    /// the restart scan) that a new open cannot adopt is deleted, and its charge
+    /// goes with it. Left behind, the charge would count bytes twice, and evicting
+    /// it would unlink the new file at the path.
+    #[tokio::test]
+    async fn a_charged_block_file_that_is_not_adopted_gives_back_its_charge() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let uri = SuperfileUri::new_v4();
+        let path = store.blocks_path(&uri);
+        let size = 4 * UNIT;
+
+        let older = generation_at(
+            &store,
+            uri,
+            &path,
+            &Arc::new(CountingSource::new(size as usize)),
+        );
+        let _ = older.range(0, 100).await.expect("fill block 0");
+        store.block_writes_settled().await;
+        store.remove_block_entry_for_test(&uri);
+        store.retain_block_file(&uri, &older, 0);
+        drop(older);
+        assert!(store.stats().current_bytes > 0, "the kept file is charged");
+
+        // Its index now names another file, as after a lost rename race.
+        let ino = fs::metadata(&path).expect("block file").ino();
+        let stale = serialize_index(&RoaringBitmap::from_iter([0]), ino + 1);
+        fs::write(store.blocks_idx_path(&uri), stale).expect("stale index");
+
+        let inner = Arc::new(CountingSource::new(size as usize));
+        let later = generation_at(&store, uri, &path, &inner);
+        let _ = later.range(0, 100).await.expect("read block 0");
+        assert_eq!(inner.calls(), 1, "not adopted");
+        store.block_writes_settled().await;
+        assert_eq!(
+            store.stats().current_bytes,
+            later.filled_bytes_handle().load(Ordering::Acquire),
+            "only the new file's blocks are charged"
+        );
+        store.remove_block_entry_for_test(&uri);
     }
 
     /// A source over `inner`, installed as current for a fresh uri.
@@ -4387,7 +4619,8 @@ mod tests {
         assert_eq!(store.stats().current_bytes, 3 * b);
         assert_eq!(store.write_behind_in_use(), 0);
         let idx = fs::read(src.idx_path()).expect("index written after the write");
-        let (bitmap, _) = indexed_filled_bytes(4 * b, &idx).expect("valid index");
+        let ino = fs::metadata(&src.path).expect("block file").ino();
+        let (bitmap, _) = indexed_filled_bytes(4 * b, &idx, ino).expect("valid index");
         let per_unit = (b / CACHE_BLOCK_BYTES) as u32;
         assert_eq!(
             bitmap.iter().collect::<Vec<_>>(),

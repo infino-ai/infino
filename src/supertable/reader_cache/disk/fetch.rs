@@ -1785,6 +1785,7 @@ mod tests {
     use std::{
         collections::HashSet,
         fs,
+        os::unix::fs::MetadataExt,
         path::PathBuf,
         sync::{Arc, atomic::Ordering},
         time::Duration,
@@ -3048,7 +3049,10 @@ mod tests {
         let mut idx_path = store.blocks_path(&uri).into_os_string();
         idx_path.push(".idx");
         if let Ok(idx) = fs::read(PathBuf::from(idx_path)) {
-            let (_, on_disk) = indexed_filled_bytes(size, &idx).expect("a valid block index");
+            let ino = fs::metadata(store.blocks_path(&uri))
+                .expect("block file")
+                .ino();
+            let (_, on_disk) = indexed_filled_bytes(size, &idx, ino).expect("a valid block index");
             assert!(
                 on_disk <= filled,
                 "no block on disk outside the charge ({on_disk} > {filled})"

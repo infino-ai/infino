@@ -721,6 +721,7 @@ impl DiskCacheStore {
 pub(crate) mod test_support {
     use std::{
         ops::Range,
+        os::unix::fs::MetadataExt,
         sync::{
             Arc, Mutex,
             atomic::{AtomicBool, Ordering},
@@ -881,6 +882,19 @@ pub(crate) mod test_support {
         )
     }
 
+    /// Block sizes older builds wrote at the head of their block indexes, which carry no magic
+    /// and no inode.
+    pub(crate) const OLDER_BUILD_BLOCK_BYTES: [u64; 2] = [CACHE_BLOCK_BYTES, 512 * 1024];
+
+    /// A block index as an older build wrote it: its block size, then the bitmap of `blocks`.
+    pub(crate) fn unstamped_index(block: u64, blocks: &[u32]) -> Vec<u8> {
+        let mut idx = block.to_le_bytes().to_vec();
+        RoaringBitmap::from_iter(blocks.iter().copied())
+            .serialize_into(&mut idx)
+            .expect("serialize");
+        idx
+    }
+
     pub(crate) fn seed_valid_block_file(
         store: &Arc<DiskCacheStore>,
         uri: &SuperfileUri,
@@ -898,7 +912,8 @@ pub(crate) mod test_support {
         for &b in blocks {
             bitmap.insert(b);
         }
-        fs::write(store.blocks_idx_path(uri), serialize_index(&bitmap)).expect("idx");
+        let ino = f.metadata().expect("metadata").ino();
+        fs::write(store.blocks_idx_path(uri), serialize_index(&bitmap, ino)).expect("idx");
         blocks
             .iter()
             .map(|&b| {
