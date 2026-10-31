@@ -34,6 +34,7 @@ pub(crate) mod build;
 #[cfg(test)]
 mod fold_tool;
 pub(crate) mod format;
+mod layer_store;
 mod rebase;
 pub(crate) mod tier;
 
@@ -61,6 +62,8 @@ use format::Layer;
 pub(crate) use format::TierRef;
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
+use layer_store::{SLICE_EXTENSION, TIER_EXTENSION};
+pub(crate) use layer_store::{keep_built, prune_layer_store};
 use rayon::ThreadPool;
 use rebase::{OrdinalShift, rebase_layer, remove_spilled};
 use thiserror::Error;
@@ -759,7 +762,8 @@ pub(crate) async fn fold_tail(
 ) -> Result<(), TermIndexError> {
     while let Some(run) = next_fold(root, policy) {
         let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-        let sources = download_layers(storage, &root.layers[run.clone()], scratch.path()).await?;
+        let sources =
+            download_layers(storage, &root.layers[run.clone()], scratch.path(), None).await?;
         // Every ordinal keeps its place: the fold renumbers nothing.
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
         let policy = policy.clone();
@@ -900,11 +904,13 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
 /// Each slice's tier object lands in `dir` too, named by [`tier_path`],
 /// so a merge finds it beside the slice. The bytes skip the manifest
 /// disk cache: a merge reads each object once, and filling the cache with
-/// the whole index would evict what queries use.
+/// the whole index would evict what queries use. With a `store`, an object
+/// it holds is linked from it, and one downloaded is kept in it.
 pub(crate) async fn download_layers(
     storage: &Arc<dyn StorageProvider>,
     layers: &[Layer],
     dir: &Path,
+    store: Option<&Path>,
 ) -> Result<Vec<Vec<SliceFile>>, TermIndexError> {
     let mut unique: HashSet<ContentHash> = HashSet::new();
     let jobs = layers
@@ -913,25 +919,59 @@ pub(crate) async fn download_layers(
         .filter(|slice| unique.insert(slice.content_hash))
         .map(|slice| {
             let storage = Arc::clone(storage);
+            let store = store.map(Path::to_path_buf);
             let path = slice_file_path(dir, &slice.content_hash);
             let tier_file = tier_path(dir, &slice.content_hash);
             let (hash, tier) = (slice.content_hash, slice.tier);
             async move {
                 // One object resident at a time: the slice is on disk
                 // before its tier object is fetched.
-                let bytes =
-                    fetch_verified(storage.as_ref(), None, &slice_uri(&hash), &hash).await?;
-                write_object(path, bytes).await?;
+                let store = store.as_deref();
+                let uri = slice_uri(&hash);
+                fetch_object(storage.as_ref(), store, &uri, &hash, SLICE_EXTENSION, path).await?;
                 if let Some(tier) = &tier {
-                    let bytes =
-                        fetch_verified(storage.as_ref(), None, &tier_uri(tier), tier).await?;
-                    write_object(tier_file, bytes).await?;
+                    let uri = tier_uri(tier);
+                    fetch_object(
+                        storage.as_ref(),
+                        store,
+                        &uri,
+                        tier,
+                        TIER_EXTENSION,
+                        tier_file,
+                    )
+                    .await?;
                 }
                 Ok(())
             }
         });
     run_bounded(LAYER_FETCH_CONCURRENCY, "layer fetch", jobs).await?;
+    if let Some(store) = store {
+        layer_store::sync_dir(store).await;
+    }
     Ok(slice_files(dir, layers))
+}
+
+/// Put the object `hash` at `path`: linked from `store` when it holds it,
+/// else downloaded, verified, and kept in `store`.
+async fn fetch_object(
+    storage: &dyn StorageProvider,
+    store: Option<&Path>,
+    uri: &str,
+    hash: &ContentHash,
+    extension: &'static str,
+    path: PathBuf,
+) -> Result<(), TermIndexError> {
+    if let Some(store) = store
+        && layer_store::link_kept(store, hash, extension, &path).await
+    {
+        return Ok(());
+    }
+    let bytes = fetch_verified(storage, None, uri, hash).await?;
+    write_object(path.clone(), bytes).await?;
+    if let Some(store) = store {
+        layer_store::keep_file(store.to_path_buf(), path, *hash, extension).await;
+    }
+    Ok(())
 }
 
 /// Where `download_layers` puts the slice named by `hash` under `dir`.
@@ -7981,10 +8021,114 @@ mod tests {
             .expect("root");
         let scratch = TempDir::new().expect("scratch");
         faults.fail(FaultOp::Get, "term-index/slice-", 1);
-        let got = rt.block_on(download_layers(&faulty, &root.layers, scratch.path()));
+        let got = rt.block_on(download_layers(&faulty, &root.layers, scratch.path(), None));
         assert!(got.is_err(), "a failed fetch fails the download");
         assert_eq!(faults.fired(), 2);
-        let good = rt.block_on(download_layers(&local, &root.layers, scratch.path()));
+        let good = rt.block_on(download_layers(&local, &root.layers, scratch.path(), None));
         assert!(good.is_ok(), "the same download succeeds without the fault");
+    }
+
+    /// Every file `download_layers` placed under `dir` for `layers`: each
+    /// slice and its tier object.
+    fn downloaded_bytes(dir: &Path, layers: &[Layer]) -> Vec<Vec<u8>> {
+        layers
+            .iter()
+            .flat_map(|layer| &layer.slices)
+            .flat_map(|slice| {
+                let tier = slice.tier.map(|_| tier_path(dir, &slice.content_hash));
+                [Some(slice_file_path(dir, &slice.content_hash)), tier]
+            })
+            .flatten()
+            .map(|path| fs::read(path).expect("downloaded file"))
+            .collect()
+    }
+
+    /// A store that kept a download serves the next one with no fetch, the
+    /// same bytes, and a prune to an empty root clears it.
+    #[test]
+    fn a_kept_download_serves_the_next_one_without_a_fetch() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 2048,
+            tier_entries_per_term: 100_000,
+            ..BuildPolicy::default()
+        };
+        let built = build(&[range_contribution(&dir, 1)], &policy).expect("build");
+        let objects = TempDir::new().expect("objects");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(objects.path()).expect("local"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        assert!(root.layers[0].slices.iter().any(|s| s.tier.is_some()));
+        let store = TempDir::new().expect("store");
+
+        let first = TempDir::new().expect("first");
+        rt.block_on(download_layers(
+            &local,
+            &root.layers,
+            first.path(),
+            Some(store.path()),
+        ))
+        .expect("download");
+        faults.fail(FaultOp::Get, STORAGE_PREFIX, usize::MAX);
+        let second = TempDir::new().expect("second");
+        rt.block_on(download_layers(
+            &faulty,
+            &root.layers,
+            second.path(),
+            Some(store.path()),
+        ))
+        .expect("served from the store");
+        assert_eq!(faults.fired(), 0, "no object was fetched");
+        assert_eq!(
+            downloaded_bytes(first.path(), &root.layers),
+            downloaded_bytes(second.path(), &root.layers)
+        );
+
+        rt.block_on(prune_layer_store(store.path(), &Root::default()));
+        assert_eq!(fs::read_dir(store.path()).expect("store").count(), 0);
+    }
+
+    /// A build kept before it is written serves the download of the root
+    /// it publishes with no fetch.
+    #[test]
+    fn a_kept_build_serves_the_download_of_its_root_without_a_fetch() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: 2048,
+            tier_entries_per_term: 100_000,
+            spill_to_disk: true,
+            scratch_root: Some(dir.path().to_path_buf()),
+            ..BuildPolicy::default()
+        };
+        let built = build(&[range_contribution(&dir, 1)], &policy).expect("build");
+        let objects = TempDir::new().expect("objects");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(objects.path()).expect("local"));
+        let faults = FaultStorage::wrap(Arc::clone(&local));
+        let faulty = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let store = TempDir::new().expect("store");
+
+        rt.block_on(keep_built(store.path(), &built.slices, &built.tiers));
+        let reference = rt.block_on(write_built(&local, built)).expect("write");
+        let root = rt
+            .block_on(load_root(local.as_ref(), &reference))
+            .expect("root");
+        faults.fail(FaultOp::Get, STORAGE_PREFIX, usize::MAX);
+        let scratch = TempDir::new().expect("scratch");
+        rt.block_on(download_layers(
+            &faulty,
+            &root.layers,
+            scratch.path(),
+            Some(store.path()),
+        ))
+        .expect("served from the store");
+        assert_eq!(faults.fired(), 0, "no object was fetched");
     }
 }

@@ -53,6 +53,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    path::PathBuf,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -1108,6 +1109,12 @@ impl SupertableOptions {
             scratch_root: self.disk_cache.as_ref().map(|c| c.scratch_root()),
             ..BuildPolicy::default()
         }
+    }
+
+    /// Where a term-index rebuild keeps its layer files: beside the disk
+    /// cache when the table has one.
+    pub(crate) fn term_index_layer_store(&self) -> Option<PathBuf> {
+        self.disk_cache.as_ref().map(|c| c.term_index_layer_root())
     }
 
     /// Set how many superfiles a query works on at once (see

@@ -189,7 +189,7 @@ fn fold_timing() {
         }
         None => {
             let sources = st
-                .block_on_query(download_layers(&storage, &root.layers, &scratch))
+                .block_on_query(download_layers(&storage, &root.layers, &scratch, None))
                 .expect("download layers");
             eprintln!(
                 "FOLD download {:.1}s ({} objects)",
