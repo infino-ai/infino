@@ -11181,10 +11181,17 @@ pub(in crate::supertable) async fn stamp_term_index(
                 }
             };
             let root = built.root;
+            let store = old.options.term_index_layer_store();
+            if let Some(store) = &store {
+                term_index::keep_built(store, &built.slices, &built.tiers).await;
+            }
             term_index::write_tiers(storage, built.tiers).await?;
             term_index::write_slices(storage, built.slices).await?;
             *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
             let reference = term_index::write_root(storage.as_ref(), &root).await?;
+            if let Some(store) = &store {
+                term_index::prune_layer_store(store, &root).await;
+            }
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -11265,12 +11272,14 @@ async fn merge_term_index(
         .await
         .map_err(|e| TermIndexError::Build(e.to_string()))?;
     }
-    let mut sources = term_index::download_layers(storage, &current.layers, scratch.path())
-        .instrument(detail_span!(
-            "term_index.download",
-            layers = current.layers.len(),
-        ))
-        .await?;
+    let store = manifest.options.term_index_layer_store();
+    let mut sources =
+        term_index::download_layers(storage, &current.layers, scratch.path(), store.as_deref())
+            .instrument(detail_span!(
+                "term_index.download",
+                layers = current.layers.len(),
+            ))
+            .await?;
     let mut old = Root {
         superfiles: current.superfiles.clone(),
         id_mins: current.id_mins.clone(),
@@ -11388,7 +11397,7 @@ async fn fold_term_index(
         ..policy
     };
     let scratch = term_index_scratch(&policy)?;
-    let sources = term_index::download_layers(storage, deltas, scratch.path()).await?;
+    let sources = term_index::download_layers(storage, deltas, scratch.path(), None).await?;
     let merged = run_on_pool(
         Some(&manifest.options.reader_pool),
         "term-index fold",

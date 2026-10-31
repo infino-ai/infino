@@ -28,9 +28,10 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
+    collections::HashSet,
     ops::Range,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -68,6 +69,10 @@ struct CountingProxy {
     get_range_calls: AtomicUsize,
     get_range_bytes: AtomicUsize,
     head_calls: AtomicUsize,
+    /// URI of every whole-object GET, in order.
+    gets: Mutex<Vec<String>>,
+    /// URI of every atomic PUT, in order.
+    puts: Mutex<Vec<String>>,
 }
 
 impl CountingProxy {
@@ -77,7 +82,15 @@ impl CountingProxy {
             get_range_calls: AtomicUsize::new(0),
             get_range_bytes: AtomicUsize::new(0),
             head_calls: AtomicUsize::new(0),
+            gets: Mutex::new(Vec::new()),
+            puts: Mutex::new(Vec::new()),
         })
+    }
+    fn gets(&self) -> Vec<String> {
+        self.gets.lock().expect("gets").clone()
+    }
+    fn puts(&self) -> Vec<String> {
+        self.puts.lock().expect("puts").clone()
     }
     fn calls(&self) -> usize {
         self.get_range_calls.load(Ordering::Acquire)
@@ -98,6 +111,7 @@ impl StorageProvider for CountingProxy {
         self.inner.head(uri).await
     }
     async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+        self.gets.lock().expect("gets").push(uri.to_string());
         self.inner.get(uri).await
     }
     async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
@@ -107,6 +121,7 @@ impl StorageProvider for CountingProxy {
         Ok(b)
     }
     async fn put_atomic(&self, uri: &str, bytes: Bytes) -> Result<Option<String>, StorageError> {
+        self.puts.lock().expect("puts").push(uri.to_string());
         self.inner.put_atomic(uri, bytes).await
     }
 
@@ -459,6 +474,8 @@ const TERM_PASS_TERMS_PER_DOC: usize = 20;
 /// GETs the whole `optimize` may make on the cold table. It makes 3 with the
 /// prefetch and about 50 without, one per batch.
 const TERM_PASS_MAX_OPTIMIZE_GETS: usize = 15;
+/// Object-store prefix of the term index's objects.
+const TERM_INDEX_PREFIX: &str = "term-index/";
 
 fn term_pass_titles() -> Vec<String> {
     (0..TERM_PASS_DOC_COUNT)
@@ -513,5 +530,58 @@ fn term_pass_on_a_lazy_cache_makes_few_gets() {
         gets <= TERM_PASS_MAX_OPTIMIZE_GETS,
         "optimize made {gets} range GETs on a cold lazy cache; at most \
          {TERM_PASS_MAX_OPTIMIZE_GETS} expected with the FTS section prefetched"
+    );
+}
+
+#[test]
+fn a_second_optimize_downloads_no_term_index_object_the_first_wrote() {
+    let storage_dir = TempDir::new().expect("storage tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(storage_dir.path()).expect("provider"));
+    let counting = CountingProxy::new(Arc::clone(&local));
+    let storage: Arc<dyn StorageProvider> = Arc::<CountingProxy>::clone(&counting);
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let cache = lazy_foreground_disk_cache(Arc::clone(&storage), cache_dir.path());
+    let st = Supertable::create(
+        default_supertable_options()
+            .with_storage(storage)
+            .with_disk_cache(cache),
+    )
+    .expect("create");
+    let titles = term_pass_titles();
+    let refs: Vec<&str> = titles.iter().map(String::as_str).collect();
+    let commits: Vec<&[&str]> = refs.chunks(refs.len() / 3).collect();
+
+    // Two commits, so the first optimize compacts and rebuilds the index.
+    for batch in &commits[..2] {
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(batch)).expect("append");
+        w.commit().expect("commit");
+    }
+    let puts_before = counting.puts().len();
+    st.optimize(&OptimizeOptions::default())
+        .expect("first optimize");
+    let written: HashSet<String> = counting.puts()[puts_before..]
+        .iter()
+        .filter(|uri| uri.contains(TERM_INDEX_PREFIX))
+        .cloned()
+        .collect();
+    assert!(!written.is_empty(), "the first optimize wrote a term index");
+
+    let mut w = st.writer().expect("writer");
+    w.append(&build_title_batch(commits[2])).expect("append");
+    w.commit().expect("commit");
+    let gets_before = counting.gets().len();
+    st.optimize(&OptimizeOptions::default())
+        .expect("second optimize");
+    let refetched: Vec<String> = counting.gets()[gets_before..]
+        .iter()
+        .filter(|uri| written.contains(*uri))
+        .cloned()
+        .collect();
+    assert!(
+        refetched.is_empty(),
+        "the second optimize downloaded {} term-index objects the first wrote: {refetched:?}",
+        refetched.len()
     );
 }

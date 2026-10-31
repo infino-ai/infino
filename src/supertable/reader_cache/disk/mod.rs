@@ -83,6 +83,9 @@ const BLOCKS_IDX_TMP_INFIX: &str = ".idx.tmp.";
 /// deleting a live one would fail the owner's rename and cost it a retried fetch.
 const TMP_RECLAIM_AGE: Duration = Duration::from_secs(15 * 60);
 
+/// Subdirectory of the cache root holding a term-index rebuild's kept layer files.
+const TERM_INDEX_LAYER_SUBDIR: &str = "term-index-layers";
+
 /// Numbers each download's tempfile across every store in this process, see
 /// [`DiskCacheStore::tmp_path`].
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
@@ -446,6 +449,12 @@ impl DiskCacheStore {
     /// sized for the table, rather than in the system temporary directory.
     pub(crate) fn scratch_root(&self) -> PathBuf {
         self.config.cache_root.join("scratch")
+    }
+
+    /// Where a term-index rebuild keeps the layer files it downloaded or
+    /// wrote, for the next rebuild to reuse.
+    pub(crate) fn term_index_layer_root(&self) -> PathBuf {
+        self.config.cache_root.join(TERM_INDEX_LAYER_SUBDIR)
     }
 
     /// Construct a new disk cache rooted at `config.cache_root`
