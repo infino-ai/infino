@@ -2249,6 +2249,19 @@ mod tests {
         assert!(all_cold(&store, &path, &(0..OBJECT_STORE_COALESCE_DEFAULT)));
     }
 
+    #[test]
+    fn nothing_is_all_cold_without_a_cache_in_front() {
+        // With no cache, no GET is saved by reading through a gap, so the
+        // whole file reads as not cold.
+        let (bytes, _) = wide_file(WIDE_ROWS, WIDE_ROWS);
+        let size = bytes.len() as u64;
+        let source: Arc<dyn LazyByteSource> = Superfile::new(bytes, false);
+        let path = ObjPath::from("t/sf.parquet");
+        let store = SuperfileObjectStore::from_sources(HashMap::from([(path.clone(), source)]));
+        assert!(!store.is_local(&path, &(0..size)), "nothing is local");
+        assert!(!all_cold(&store, &path, &(0..size)));
+    }
+
     #[tokio::test]
     async fn a_single_read_never_looks_ahead() {
         let (superfile, store, path, meta) = setup(false);

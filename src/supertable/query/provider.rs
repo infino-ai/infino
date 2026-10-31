@@ -4158,6 +4158,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kept_pages_of_different_columns_are_not_read_through_as_one() {
+        // A scan of `a` and `b` keeping one page of each in row group 1,
+        // picked so the bytes between them (the rest of `a`'s chunk, then the
+        // start of `b`'s) are wider than object_store's merge gap but within
+        // `PAGE_READ_THROUGH_BYTES`. Close enough to read through, but the
+        // gap runs across a chunk boundary, so each page comes down in a GET
+        // of its own.
+        let file = fixture::wide_file(SPREAD_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let offsets = file.1.offset_index().expect("page index");
+        let page = |column: usize, p: usize| {
+            let at = &offsets[1][column].page_locations()[p];
+            at.offset as u64..at.offset as u64 + at.compressed_page_size as u64
+        };
+        let kept = (0..offsets[1][0].page_locations().len())
+            .find(|&p| {
+                let gap = page(1, p).start - page(0, p).end;
+                OBJECT_STORE_COALESCE_DEFAULT < gap && gap <= PAGE_READ_THROUGH_BYTES
+            })
+            .expect("a page whose two columns sit between the two gaps");
+        let (a, b) = (page(0, kept), page(1, kept));
+        let (b_start, _) = file.1.row_group(1).column(1).byte_range();
+        assert!(
+            a.end < b_start && b_start < b.start,
+            "the gap crosses into b's chunk"
+        );
+        let shape = ScanShape {
+            name: "two columns",
+            projection: Some(vec![0, 1]),
+            filter: Some(col("a").in_list(
+                vec![lit((SPREAD_ROWS_PER_GROUP + kept * WIDE_PAGE_ROWS) as i64)],
+                false,
+            )),
+            row_filter: false,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: Vec::new(),
+        };
+        let (run, _) = scan_through_the_cache(true, &shape, &file, GET_LATENCY).await;
+        assert_eq!(run.rows, WIDE_PAGE_ROWS, "the kept page's rows");
+        assert!(
+            !run.reads
+                .iter()
+                .any(|r| r.start <= a.start && b.end <= r.end),
+            "a GET read through from a's chunk into b's: {run:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_row_filter_reading_in_turns_downloads_each_block_once() {
         // Under a row filter the scan reads a row group's columns in turns:
         //  - a batch starts on the first of those reads;
