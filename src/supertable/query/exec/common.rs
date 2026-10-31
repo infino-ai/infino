@@ -69,7 +69,7 @@ use parquet::{
 use rayon::{ThreadPool, prelude::*};
 use roaring::RoaringBitmap;
 use tokio::sync::Semaphore;
-use tracing::{Instrument, Span, debug, warn};
+use tracing::{Instrument, Span, warn};
 
 use crate::{
     memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
@@ -82,7 +82,7 @@ use crate::{
         ReadError, SuperfileReader,
         lazy_source::Source,
         reader::{
-            WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            ID_BLOCK_GAP_BYTES, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
         },
     },
@@ -1749,7 +1749,7 @@ impl ChunkReader for PrefetchedChunks {
 /// row group by row group as before.
 const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// Take prefetch spans this close share one read: fewer GETs for a few
-/// unrequested bytes (f06 on 100B: 1.88M → 1.45M GETs at 128 KiB).
+/// unrequested bytes.
 const TAKE_PREFETCH_GAP_BYTES: u64 = 128 * 1024;
 /// Spans of one superfile's take prefetch in flight at once.
 const TAKE_PREFETCH_CONCURRENCY: usize = 16;
@@ -1988,7 +1988,10 @@ pub(crate) async fn take_rows_byte_source(
         && *name == reader.id_column()
         && !reader.id_sidecar_serves(local_doc_ids, name)
     {
-        match reader.ids_from_sidecar_blocks(local_doc_ids).await {
+        match reader
+            .ids_from_sidecar_blocks(local_doc_ids, ID_BLOCK_GAP_BYTES)
+            .await
+        {
             Ok(Some(ids)) => {
                 let field = reader
                     .schema()
@@ -2019,18 +2022,43 @@ pub(crate) async fn take_rows_byte_source(
         .iter()
         .filter_map(|name| reader.schema().index_of(name).ok())
         .collect();
-    let mut prefetched = Vec::new();
-    // Held until the decode is done: the prefetched bytes live that long.
-    let mut _room = None;
-    if let Some(spans) = take_prefetch_spans(
+    let spans = take_prefetch_spans(
         &metadata,
         &sorted,
         &roots,
         TAKE_PREFETCH_MAX_BYTES,
         TAKE_PREFETCH_GAP_BYTES,
-    )
-    .filter(|s| !s.is_empty())
-    {
+    );
+    take_prefetched(reader, source, metadata, spans, local_doc_ids, names, pool).await
+}
+
+/// Takes whose decode read outside their prefetch and decoded again through
+/// the byte source. Expected to stay zero: a nonzero count means
+/// [`take_prefetch_spans`] misses bytes the decode reads.
+static TAKE_PREFETCH_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of [`TAKE_PREFETCH_FALLBACKS`]; callers report deltas.
+#[cfg(test)]
+fn take_prefetch_fallbacks() -> u64 {
+    TAKE_PREFETCH_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// Fetch `spans` of the take at once and decode from them on the reader
+/// pool, or with no spans stream through `source`, as does a decode that
+/// reads outside them.
+async fn take_prefetched(
+    reader: &SuperfileReader,
+    source: Source,
+    metadata: Arc<ParquetMetaData>,
+    spans: Option<Vec<Range<u64>>>,
+    local_doc_ids: &[u32],
+    names: &[&str],
+    pool: Option<&ThreadPool>,
+) -> DfResult<RecordBatch> {
+    let mut prefetched = Vec::new();
+    // Held until the decode is done: the prefetched bytes live that long.
+    let mut _room = None;
+    if let Some(spans) = spans.filter(|s| !s.is_empty()) {
         let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
         _room = Some(
             take_prefetch_budget()
@@ -2078,7 +2106,10 @@ pub(crate) async fn take_rows_byte_source(
             Ok(batch) => return Ok(batch),
             // A read outside the prefetch: decode through the source, which
             // still serves the prefetched spans from memory.
-            Err(error) => debug!(%error, "take decoding through its byte source"),
+            Err(error) => {
+                TAKE_PREFETCH_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                warn!(%error, "take read outside its prefetch, decoding through its byte source");
+            }
         }
     }
     let input = ByteSourceAsyncReader {
@@ -3346,6 +3377,51 @@ mod tests {
             .downcast_ref::<LargeStringArray>()
             .expect("title col");
         (0..arr.len()).map(|i| arr.value(i).to_string()).collect()
+    }
+
+    /// A take whose prefetch lacks bytes its decode reads falls back to
+    /// streaming through the source, returns the same rows, and is counted.
+    #[tokio::test]
+    async fn a_take_reading_outside_its_prefetch_falls_back_and_is_counted() {
+        let bytes = titled_superfile_bytes();
+        let source: Arc<dyn LazyByteSource> = Arc::new(RecordingSource::new(bytes));
+        let reader = SuperfileReader::open_lazy(source).await.expect("open lazy");
+        let metadata = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("metadata");
+        let root = reader.schema().index_of("title").expect("title");
+        let mut spans =
+            take_prefetch_spans(&metadata, &[0, 3], &[root], u64::MAX, 0).expect("spans");
+        let take = |spans| {
+            take_prefetched(
+                &reader,
+                Source::Lazy(reader.byte_source()),
+                Arc::clone(&metadata),
+                spans,
+                &[3, 0],
+                &["title"],
+                None,
+            )
+        };
+        let before = take_prefetch_fallbacks();
+        let whole = take(Some(spans.clone())).await.expect("take");
+        assert_eq!(titles_of(&whole), vec!["delta", "alpha"]);
+        assert_eq!(
+            take_prefetch_fallbacks(),
+            before,
+            "a whole prefetch decodes"
+        );
+
+        // A prefetch missing its last span cannot decode on its own.
+        let last = spans.pop().expect("a span");
+        spans.push(last.start..last.end - 1);
+        let partial = take(Some(spans)).await.expect("take");
+        assert_eq!(partial, whole);
+        assert!(
+            take_prefetch_fallbacks() > before,
+            "the fallback is counted"
+        );
     }
 
     #[tokio::test]

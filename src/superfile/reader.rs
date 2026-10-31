@@ -103,7 +103,7 @@ const SIDECAR_MIN_ROW_SHARE: u64 = 2;
 /// Gap between two stable-id sidecar blocks a lookup reads in one span
 /// rather than two: past a block's few KB, a round trip costs more than
 /// this many bytes of transfer.
-const ID_BLOCK_GAP_BYTES: usize = if cfg!(test) { 0 } else { 128 * 1024 };
+pub(crate) const ID_BLOCK_GAP_BYTES: usize = 128 * 1024;
 
 /// A take of at least one row in this many of the file, over fixed-width
 /// columns only, reads each projected column whole and gathers the rows
@@ -1604,10 +1604,12 @@ impl SuperfileReader {
     /// packed sidecar or its sidecar was found broken; a read that fails is
     /// an error the caller answers from Parquet instead, and a block that
     /// does not decode marks the sidecar broken, as a whole-sidecar read
-    /// would, so later reads skip it.
+    /// would, so later reads skip it. Blocks at most `gap` bytes apart share
+    /// one read ([`ID_BLOCK_GAP_BYTES`]).
     pub(crate) async fn ids_from_sidecar_blocks(
         &self,
         local_doc_ids: &[u32],
+        gap: usize,
     ) -> Result<Option<ArrayRef>, ReadError> {
         let Some(loc) = self.id_sidecar else {
             return Ok(None);
@@ -1666,14 +1668,12 @@ impl SuperfileReader {
         }
         // Exact reads, since a block is a few KB and a cache widening each to
         // its read window downloaded hundreds of KB per hit; blocks closer
-        // than `ID_BLOCK_GAP_BYTES` share one read, so a superfile with many
+        // than `gap` share one read, so a superfile with many
         // hits costs a few reads rather than one per block.
         let mut spans: Vec<Range<usize>> = Vec::new();
         for r in &ranges {
             match spans.last_mut() {
-                Some(span) if r.start <= span.end + ID_BLOCK_GAP_BYTES => {
-                    span.end = span.end.max(r.end)
-                }
+                Some(span) if r.start <= span.end + gap => span.end = span.end.max(r.end),
                 _ => spans.push(r.clone()),
             }
         }
@@ -3518,12 +3518,14 @@ mod tests {
     /// error, and marks the sidecar broken so later reads go to Parquet.
     #[tokio::test]
     async fn stable_id_sidecar_blocks_serve_a_few_rows_of_a_lazy_reader() {
+        use crate::supertable::query::read_ahead::fixture::Superfile;
+
         let (bytes, ids) = build_shuffled_id_superfile();
         let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
         let lazy = lazy_shuffled_id_reader(bytes.clone()).await;
         let got = lazy
-            .ids_from_sidecar_blocks(&locals)
+            .ids_from_sidecar_blocks(&locals, ID_BLOCK_GAP_BYTES)
             .await
             .expect("read")
             .expect("a packed sidecar serves");
@@ -3534,21 +3536,41 @@ mod tests {
         let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
         assert_eq!(got, expected, "ids from the blocks match the oracle");
 
-        // Blocks next to each other share a read and blocks apart do not;
-        // either way each block's ids come out of its own slice.
-        for locals in [vec![5u32, 1030], vec![5, 4100], vec![1030, 5, 4100, 2050]] {
-            let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
-            let got = lazy
-                .ids_from_sidecar_blocks(&locals)
-                .await
-                .expect("read")
-                .expect("a packed sidecar serves");
-            let got = got
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .expect("decimal ids");
-            let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
-            assert_eq!(got, expected, "rows {locals:?}");
+        // With no gap only blocks that touch share a read; with the
+        // production gap this small sidecar's blocks all share one. Either
+        // way each block's ids come out of its own slice.
+        let runs = |locals: &[u32]| {
+            let mut b: Vec<usize> = locals
+                .iter()
+                .map(|&l| l as usize / ids::BLOCK_DOCS)
+                .collect();
+            b.sort_unstable();
+            b.dedup();
+            1 + b.windows(2).filter(|w| w[1] > w[0] + 1).count()
+        };
+        for (gap, one_read) in [(0, false), (ID_BLOCK_GAP_BYTES, true)] {
+            for locals in [vec![5u32, 1030], vec![5, 4100], vec![1030, 5, 4100, 2050]] {
+                let source = Superfile::new(bytes.clone(), false);
+                let src: Arc<dyn LazyByteSource> = Arc::clone(&source) as _;
+                let lazy = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+                let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+                source.clear();
+                let got = lazy
+                    .ids_from_sidecar_blocks(&locals, gap)
+                    .await
+                    .expect("read")
+                    .expect("a packed sidecar serves");
+                let got = got
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal ids");
+                let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
+                assert_eq!(got, expected, "rows {locals:?}, gap {gap}");
+                // One read for the directory, then the blocks'.
+                let block_reads = source.reads().len() - 1;
+                let want = if one_read { 1 } else { runs(&locals) };
+                assert_eq!(block_reads, want, "rows {locals:?}, gap {gap}");
+            }
         }
 
         // A directory that starts block 2 where block 0 starts is malformed,
@@ -3556,7 +3578,7 @@ mod tests {
         let reordered = Bytes::from(ids::with_out_of_order_id_block(&bytes, 2, 0));
         let lazy = lazy_shuffled_id_reader(reordered).await;
         assert!(
-            lazy.ids_from_sidecar_blocks(&[5, 2050]).await.is_err(),
+            lazy.ids_from_sidecar_blocks(&[5, 2050], 0).await.is_err(),
             "an out-of-order block is an error, for the Parquet fallback"
         );
 
@@ -3564,11 +3586,11 @@ mod tests {
         let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));
         let lazy = lazy_shuffled_id_reader(damaged).await;
         assert!(
-            lazy.ids_from_sidecar_blocks(&[4999]).await.is_err(),
+            lazy.ids_from_sidecar_blocks(&[4999], 0).await.is_err(),
             "a row in the damaged block is an error, for the Parquet fallback"
         );
         assert!(
-            lazy.ids_from_sidecar_blocks(&[0, 37])
+            lazy.ids_from_sidecar_blocks(&[0, 37], 0)
                 .await
                 .expect("read")
                 .is_none(),
