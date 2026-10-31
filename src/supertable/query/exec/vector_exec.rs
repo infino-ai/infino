@@ -42,6 +42,7 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::Statistics,
     error::{DataFusionError, Result as DfResult},
     execution::{TaskContext, context::SessionContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
@@ -66,7 +67,7 @@ use crate::{
             exec::common::{
                 PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                 exact_scope, fill_top_k, fill_top_k_within, live_reader, output_schema_with_score,
-                over_fetch_ceiling, resolve_hits, scope_to_call, traced_tvf,
+                over_fetch_ceiling, resolve_hits, scope_to_call, top_k_statistics, traced_tvf,
             },
             vector::{
                 hits_id_score_batch, sql_id_score_projection, user_placement_for_scalar_resolve,
@@ -256,6 +257,9 @@ struct VectorSearchExec {
     /// Output schema after `projection`.
     projected_schema: SchemaRef,
     cache: Arc<PlanProperties>,
+    /// What the planner is told about this search's size, built once:
+    /// DataFusion asks on every optimizer pass. See [`top_k_statistics`].
+    statistics: Arc<Statistics>,
 }
 
 impl VectorSearchExec {
@@ -285,6 +289,7 @@ impl VectorSearchExec {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let statistics = top_k_statistics(&projected_schema, k, reader.manifest().n_docs_total());
         Ok(Self {
             reader,
             column,
@@ -297,6 +302,7 @@ impl VectorSearchExec {
             projection,
             projected_schema,
             cache,
+            statistics,
         })
     }
 }
@@ -343,6 +349,10 @@ impl ExecutionPlan for VectorSearchExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        Ok(Arc::clone(&self.statistics))
     }
 
     fn execute(

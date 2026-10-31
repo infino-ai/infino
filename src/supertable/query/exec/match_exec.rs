@@ -501,8 +501,10 @@ mod tests {
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{builder::FtsConfig, fts::reader::BoolMode},
         supertable::{
-            Supertable, SupertableOptions, error::QueryError, handle::SupertableReader,
-            query::exec::common::output_schema_with_score,
+            Supertable, SupertableOptions,
+            error::QueryError,
+            handle::SupertableReader,
+            query::exec::common::{output_schema_with_score, test_support::sql_row_count},
         },
     };
 
@@ -539,16 +541,6 @@ mod tests {
         st
     }
 
-    fn rows(st: &Supertable, sql: &str) -> usize {
-        st.reader()
-            .expect("reader")
-            .query_sql(sql)
-            .expect("query_sql")
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum()
-    }
-
     fn demo() -> Supertable {
         supertable_with_titles(&[
             "rust async runtime",       // 0
@@ -581,7 +573,7 @@ mod tests {
     fn assert_aggregates_equal_the_rows(st: &Supertable) {
         for query in AGGREGATED_QUERIES {
             let tvf = format!("token_match('title', '{query}')");
-            let counted = rows(st, &format!("SELECT _id FROM {tvf}"));
+            let counted = sql_row_count(st, &format!("SELECT _id FROM {tvf}"));
             let batches = st
                 .reader()
                 .expect("reader")
@@ -637,7 +629,7 @@ mod tests {
                 format!("{grouped_via_rows:?}"),
                 "grouped aggregate over {tvf}"
             );
-            let twice = rows(st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
+            let twice = sql_row_count(st, &format!("SELECT title AS a, title AS b FROM {tvf}"));
             assert_eq!(twice, counted, "a column named twice over {tvf}");
         }
     }
@@ -714,7 +706,7 @@ mod tests {
         for query in SLICED_QUERIES {
             let slices = column_batch_rows(st, query, BoolMode::Or);
             assert!(slices.len() > 1, "{query}: {slices:?} is one batch");
-            let matched = rows(
+            let matched = sql_row_count(
                 st,
                 &format!("SELECT _id FROM token_match('title', '{query}')"),
             );
@@ -769,12 +761,12 @@ mod tests {
         let st = demo();
         // OR (default): rows containing `rust` OR `python` → 0, 1, 2.
         assert_eq!(
-            rows(&st, "SELECT _id FROM token_match('title', 'rust python')"),
+            sql_row_count(&st, "SELECT _id FROM token_match('title', 'rust python')"),
             3
         );
         // AND: rows containing both `rust` and `systems` → only doc 2.
         assert_eq!(
-            rows(
+            sql_row_count(
                 &st,
                 "SELECT _id FROM token_match('title', 'rust systems', 'and')"
             ),
@@ -787,17 +779,20 @@ mod tests {
         let st = supertable_with_titles(&["rust async", "rust async runtime"]);
         // Both rows contain {rust, async}, but only one equals the string.
         assert_eq!(
-            rows(&st, "SELECT _id FROM exact_match('title', 'rust async')"),
+            sql_row_count(&st, "SELECT _id FROM exact_match('title', 'rust async')"),
             1
         );
         assert_eq!(
-            rows(
+            sql_row_count(
                 &st,
                 "SELECT _id FROM exact_match('title', 'rust async runtime')"
             ),
             1
         );
-        assert_eq!(rows(&st, "SELECT _id FROM exact_match('title', 'rust')"), 0);
+        assert_eq!(
+            sql_row_count(&st, "SELECT _id FROM exact_match('title', 'rust')"),
+            0
+        );
     }
 
     #[test]

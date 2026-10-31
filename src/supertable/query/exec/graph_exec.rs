@@ -47,6 +47,7 @@ use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableFunctionArgs, TableFunctionImpl, TableProvider},
+    common::Statistics,
     error::{DataFusionError, Result as DfResult},
     execution::TaskContext,
     logical_expr::{Cast, Expr, TableType, TryCast},
@@ -70,7 +71,8 @@ use crate::{
             SuperfileHit,
             dispatch::apply_tombstone_filter,
             exec::common::{
-                arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits, traced_tvf,
+                arg_to_string, arg_to_usize, output_schema_with_score, resolve_hits,
+                top_k_statistics, traced_tvf,
             },
             vector::{MissingRow, place_for_scalar_resolve},
         },
@@ -251,6 +253,11 @@ impl TableProvider for GraphTable {
             EmissionType::Incremental,
             Boundedness::Bounded,
         ));
+        let statistics = top_k_statistics(
+            &projected_schema,
+            self.k,
+            self.target.manifest().n_docs_total(),
+        );
         Ok(Arc::new(GraphExec {
             graph: Arc::clone(&self.graph),
             target: Arc::clone(&self.target),
@@ -265,6 +272,7 @@ impl TableProvider for GraphTable {
             projection: projection.cloned(),
             projected_schema,
             cache,
+            statistics,
         }))
     }
 }
@@ -286,6 +294,9 @@ struct GraphExec {
     projection: Option<Vec<usize>>,
     projected_schema: SchemaRef,
     cache: Arc<PlanProperties>,
+    /// What the planner is told about this search's size, built once:
+    /// DataFusion asks on every optimizer pass. See [`top_k_statistics`].
+    statistics: Arc<Statistics>,
 }
 
 impl GraphExec {
@@ -332,6 +343,10 @@ impl ExecutionPlan for GraphExec {
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> DfResult<Arc<Statistics>> {
+        Ok(Arc::clone(&self.statistics))
     }
 
     fn execute(
@@ -824,6 +839,33 @@ mod tests {
             db.query_sql("SELECT name FROM graph_walk('things', 'things', 'things', [1], 2, 10)")
                 .is_err(),
             "a table without an adjacency index is refused"
+        );
+    }
+
+    /// A walk joined back to its table on `_id` builds the join's hash table
+    /// on the walk's at most `k` rows, not on the table, as a search does.
+    #[test]
+    fn a_walk_joined_back_on_id_builds_on_its_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let db = connect(format!("file://{}", dir.path().display())).expect("connect");
+        let ids = things(&db);
+        edges(&db, &ids);
+
+        let join = format!(
+            "SELECT t.name FROM graph_walk('edges', 'things', 'things', [{}], 1, 1) g \
+             JOIN things t ON t._id = g._id",
+            ids[0]
+        );
+        let plan = db.query_sql(&format!("EXPLAIN {join}")).expect("explain");
+        let plan = column_strings(&plan, 1).concat();
+        // A hash join prints its build side first.
+        let below_join = &plan[plan.find("HashJoinExec").expect("a hash join")..];
+        let build = below_join.find("GraphExec").expect("the walk");
+        let probe = below_join.find("DataSourceExec").expect("the table scan");
+        assert!(build < probe, "the join must build on the walk:\n{plan}");
+        assert_eq!(
+            column_strings(&db.query_sql(&join).expect("join"), 0),
+            vec!["one"]
         );
     }
 
