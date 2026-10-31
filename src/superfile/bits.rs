@@ -5,12 +5,18 @@
 //! a `width`-bit stream occupies bits `i·width .. (i+1)·width`, least
 //! significant bit first. Shared by the frame-of-reference id sidecar
 //! and the position groups; both need random access to one value at a
-//! fixed cost, which this gives with one unaligned load per value.
+//! fixed cost, which this gives with one unaligned 8-byte load per value
+//! (plus the bytes past it for a value wider than [`ONE_LOAD_MAX_WIDTH`]
+//! bits that starts mid-byte).
 
 use std::mem::swap;
 
 /// Widest value the stream carries: a full `u64`.
 pub(crate) const MAX_WIDTH: u8 = 64;
+
+/// Widest value one 8-byte load holds wherever it starts in its first
+/// byte: the load keeps `64 - bit % 8` of the value's bits, at worst 57.
+pub(crate) const ONE_LOAD_MAX_WIDTH: u8 = 57;
 
 /// Bits needed to hold `v` (zero for zero).
 #[inline]
@@ -61,9 +67,9 @@ pub(crate) fn get_bits(payload: &[u8], i: usize, width: u8) -> Option<u64> {
     let bit = i * width as usize;
     let byte = bit / 8;
     let shift = (bit % 8) as u32;
-    // One unaligned `u64` load covers any value of up to 57 bits that
-    // does not sit in the stream's last bytes; the tail and the widest
-    // values take the byte loop below.
+    // One unaligned `u64` load covers any value of up to
+    // `ONE_LOAD_MAX_WIDTH` bits that does not sit in the stream's last
+    // bytes; the tail and the widest values take the byte loop below.
     if shift as usize + width as usize <= u64::BITS as usize
         && let Some(chunk) = payload.get(byte..byte + 8)
     {
@@ -148,8 +154,10 @@ pub(crate) fn plan_exceptions(
 
 /// Lanes `from..from + n` of a `width`-bit stream, one 64-bit load per
 /// lane after a single bounds check for the run, to `sink`. `None` when
-/// the run ends past the payload. The id sidecar's block decode reads its
-/// streams this way; the position streams take [`unpack_lanes_u32`].
+/// the run ends past the payload. A run wider than [`ONE_LOAD_MAX_WIDTH`]
+/// bits also reads the ninth byte a lane spills into (see [`sink_lanes`]);
+/// a narrower run never tests for it. The id sidecar's block decode reads
+/// its streams this way; the position streams take [`unpack_lanes_u32`].
 #[inline]
 pub(crate) fn for_each_lane(
     payload: &[u8],
@@ -170,9 +178,47 @@ pub(crate) fn for_each_lane(
     if end_bit.div_ceil(8) > payload.len() {
         return None;
     }
-    let mut bit = from * width;
+    let bit = from * width;
+    if width <= ONE_LOAD_MAX_WIDTH as usize {
+        sink_lanes::<false>(payload, bit, n, width, mask, &mut sink);
+    } else {
+        sink_lanes::<true>(payload, bit, n, width, mask, &mut sink);
+    }
+    Some(())
+}
+
+/// [`for_each_lane`]'s loop over `n` lanes of `width` bits (`mask` their
+/// low bits set) from bit `bit`, a run the caller has checked ends inside
+/// `payload`.
+///
+/// One unaligned 8-byte load from a lane's first byte, shifted down, holds
+/// the lane's first `64 - bit % 8` bits: all of it when it is at most
+/// [`ONE_LOAD_MAX_WIDTH`] bits wide. A wider lane that starts mid-byte ends
+/// in the ninth byte, which `SPILL` reads too:
+///
+/// ```text
+///   a 63-bit lane starting at bit 3 of its first byte:
+///     byte 0      bits 3..8    5 bits  ┐
+///     bytes 1..8  all         56 bits  ├ the 8-byte load: 61 bits
+///     byte 8      bits 0..2    2 bits  ─ the ninth byte
+/// ```
+///
+/// The loop is built twice so a narrow run, the common case, carries no
+/// test for the ninth byte: in a shared loop that test slows every width,
+/// not only the wide ones. In the payload's last 8 bytes the load is
+/// zero-padded; a lane that ends there never reaches a ninth byte.
+#[inline(always)]
+fn sink_lanes<const SPILL: bool>(
+    payload: &[u8],
+    mut bit: usize,
+    n: usize,
+    width: usize,
+    mask: u64,
+    sink: &mut impl FnMut(u64),
+) {
     for _ in 0..n {
         let byte = bit / 8;
+        let shift = bit % 8;
         let word = match payload.get(byte..byte + 8) {
             Some(chunk) => u64::from_le_bytes(chunk.try_into().expect("8 bytes")),
             None => {
@@ -183,10 +229,15 @@ pub(crate) fn for_each_lane(
                 u64::from_le_bytes(tail)
             }
         };
-        sink((word >> (bit % 8)) & mask);
+        let mut v = word >> shift;
+        // The lane's last bit lies past the load, in byte `byte + 8`, which
+        // the caller's check put inside the payload.
+        if SPILL && shift + width > u64::BITS as usize {
+            v |= u64::from(payload[byte + 8]) << (u64::BITS as usize - shift);
+        }
+        sink(v & mask);
         bit += width;
     }
-    Some(())
 }
 
 /// Lanes `from..from + out.len()` of a `width`-bit stream (`width <= 32`)
@@ -720,26 +771,51 @@ mod tests {
         }
     }
 
+    /// A stream long enough that narrow lanes are read through the plain
+    /// 8-byte load, not only the zero-padded one at the payload's end.
+    const LONG_STREAM_LANES: usize = 41;
+
+    /// Stream lengths the lane readers are checked at: 1 to 16 lanes end
+    /// the payload at every bit phase (eight lanes end on a byte boundary),
+    /// so a wide lane spilling into the payload's last byte is read; one
+    /// long stream covers the plain load.
+    fn stream_lengths() -> impl Iterator<Item = usize> {
+        (1..=2 * LANE_GROUP).chain([LONG_STREAM_LANES])
+    }
+
+    /// `n` values of `width` bits, high bits set in most, and their stream.
+    fn packed_stream(n: usize, width: u8) -> (Vec<u64>, Vec<u8>) {
+        let values: Vec<u64> = (0..n as u64)
+            .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & low_mask(width))
+            .collect();
+        let mut buf = vec![0u8; payload_bytes(n, width)];
+        for (i, &v) in values.iter().enumerate() {
+            put_bits(&mut buf, i * width as usize, v, width);
+        }
+        (values, buf)
+    }
+
     #[test]
     fn for_each_lane_reads_runs_at_every_width_and_refuses_overruns() {
-        for width in [0u8, 1, 5, 8, 13, 32, 64] {
-            let n = 41;
-            let values: Vec<u64> = (0..n as u64)
-                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & low_mask(width))
-                .collect();
-            let mut buf = vec![0u8; payload_bytes(n, width)];
-            for (i, &v) in values.iter().enumerate() {
-                put_bits(&mut buf, i * width as usize, v, width);
-            }
-            for (from, count) in [(0usize, n), (7, 9), (n - 1, 1), (n, 0)] {
-                let mut got = Vec::new();
-                for_each_lane(&buf, from, count, width, |v| got.push(v)).expect("in range");
-                assert_eq!(got, values[from..from + count], "width {width} from {from}");
-            }
-            // The check is byte-granular — lanes inside the last byte's
-            // padding read as zeros — so overrun by a couple of bytes' worth.
-            if width > 0 {
-                assert!(for_each_lane(&buf, n, 16, width, |_| {}).is_none());
+        for width in 0..=MAX_WIDTH {
+            for n in stream_lengths() {
+                let (values, buf) = packed_stream(n, width);
+                for from in 0..=n {
+                    for count in 0..=n - from {
+                        let mut got = Vec::new();
+                        for_each_lane(&buf, from, count, width, |v| got.push(v)).expect("in range");
+                        assert_eq!(
+                            got,
+                            values[from..from + count],
+                            "width {width} lanes {n} from {from} count {count}"
+                        );
+                    }
+                }
+                // The check is byte-granular — lanes inside the last byte's
+                // padding read as zeros — so overrun by a couple of bytes' worth.
+                if width > 0 {
+                    assert!(for_each_lane(&buf, n, 16, width, |_| {}).is_none());
+                }
             }
         }
     }
@@ -803,20 +879,19 @@ mod tests {
     #[test]
     fn every_width_round_trips_at_every_alignment() {
         for width in 0..=MAX_WIDTH {
-            let n = 37;
-            let values: Vec<u64> = (0..n as u64)
-                .map(|i| (i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) & low_mask(width))
-                .collect();
-            let mut buf = vec![0u8; payload_bytes(n, width)];
-            for (i, &v) in values.iter().enumerate() {
-                put_bits(&mut buf, i * width as usize, v, width);
+            for n in stream_lengths() {
+                let (values, buf) = packed_stream(n, width);
+                for (i, &v) in values.iter().enumerate() {
+                    assert_eq!(
+                        get_bits(&buf, i, width),
+                        Some(v),
+                        "width {width} lanes {n} value {i}"
+                    );
+                }
+                // A value a whole byte past the stream is out of range (a
+                // zero-width stream has no end to run past).
+                assert_eq!(get_bits(&buf, n + 8, width).is_some(), width == 0);
             }
-            for (i, &v) in values.iter().enumerate() {
-                assert_eq!(get_bits(&buf, i, width), Some(v), "width {width} value {i}");
-            }
-            // A value a whole byte past the stream is out of range (a
-            // zero-width stream has no end to run past).
-            assert_eq!(get_bits(&buf, n + 8, width).is_some(), width == 0);
         }
         assert_eq!(width_of(0), 0);
         assert_eq!(width_of(1), 1);
