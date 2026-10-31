@@ -244,7 +244,7 @@ export interface PlannedRepair {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
+  /** Columns to return, e.g. `["_id", "body"]`; omit for the engine-native `_id` + `score` only. */
   projection?: string[];
   /** BM25 `k1` for this search only, overriding the column's declared value.
    * Pass `k1` and `b` together or neither. Results stay exact; only pruning
