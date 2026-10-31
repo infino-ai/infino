@@ -2339,6 +2339,7 @@ mod tests {
     use std::{
         collections::HashMap,
         hash::{DefaultHasher, Hash, Hasher},
+        ops::Range,
         slice::from_ref,
         time::Duration,
     };
@@ -2357,6 +2358,7 @@ mod tests {
         prelude::{SessionContext, cast, col, lit},
         scalar::ScalarValue,
     };
+    use object_store::OBJECT_STORE_COALESCE_DEFAULT;
     use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use rayon::ThreadPoolBuilder;
@@ -2367,6 +2369,7 @@ mod tests {
     use crate::{
         config::{CompactionSettings, OptimizeOptions},
         memory::ConnectionMemoryBudget,
+        runtime_metrics::op_stats::{current, with_op_stats},
         storage::{LocalFsStorageProvider, StorageProvider},
         superfile::{
             builder::FtsConfig,
@@ -2380,7 +2383,10 @@ mod tests {
             Supertable, SupertableOptions,
             hydrate::hydrate_from_reader,
             manifest::{ScalarStatsAgg, SuperfileUri, column_hll},
-            query::{read_ahead::fixture, sql::sql_session_context},
+            query::{
+                read_ahead::{PAGE_READ_THROUGH_BYTES, fixture},
+                sql::sql_session_context,
+            },
         },
         test_helpers::{
             build_title_batch, default_supertable_options, default_tokenizer, fid,
@@ -3800,6 +3806,11 @@ mod tests {
         fetched: u64,
         /// GETs the cache made to object storage.
         gets: usize,
+        /// The byte range of each of those GETs.
+        reads: Vec<Range<u64>>,
+        /// Page bytes the scan's work stats counted, which must not depend on
+        /// what the cache held.
+        page_bytes: u64,
     }
 
     impl ScanRun {
@@ -3840,6 +3851,15 @@ mod tests {
     const WIDE_ROWS_PER_GROUP: usize = 20_000;
     /// Rows per page in the wide file, so the page index can narrow a chunk.
     const WIDE_PAGE_ROWS: usize = 2_000;
+    /// Rows per row group in the read-through test's file: twenty pages of
+    /// `b`, so its pages 0 and 10 lie between object_store's merge gap and
+    /// [`PAGE_READ_THROUGH_BYTES`] apart, and pages 0 and 19 further.
+    const SPREAD_ROWS_PER_GROUP: usize = 40_000;
+    /// The kept pages of the read-through test, near and far apart.
+    const NEAR_PAGES: [usize; 2] = [0, 10];
+    const FAR_PAGES: [usize; 2] = [0, 19];
+    /// A page between the far pages, which the scan must not download.
+    const SKIPPED_PAGE: usize = 9;
     /// Where the page-index test's range starts and ends, in tenths of a row
     /// group: the last tenth of row group 1 to the first tenth of row group 5,
     /// so most of both is left unread.
@@ -3909,7 +3929,10 @@ mod tests {
         superfile.clear();
 
         let path = ObjPath::from("t/sf.parquet");
-        let store = Arc::new(SuperfileObjectStore::new());
+        let ((store, stats), _) = with_op_stats(|| {
+            let store = Arc::new(SuperfileObjectStore::new());
+            (store, current().expect("a work stats scope"))
+        });
         store.insert_source(path.clone(), source);
         let footers: Arc<ScanFooters> = Arc::new(DashMap::new());
         footers.insert(path.clone(), Arc::new(ScanFooter::new(Arc::clone(&meta))));
@@ -3967,6 +3990,8 @@ mod tests {
             answer: answer_of(&batches),
             fetched: superfile.fetched_bytes(),
             gets: superfile.reads().len(),
+            reads: superfile.reads(),
+            page_bytes: stats.snapshot().sql_page_bytes,
         };
         assert_eq!(budget.used(), 0, "every byte held ahead is given back");
         (run, budget.peak())
@@ -4055,6 +4080,81 @@ mod tests {
             );
             assert!(held > 0, "{name}: reads ahead");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn kept_pages_a_little_apart_in_one_chunk_are_read_in_one_get() {
+        // A filter on `a` the page index narrows to two pages of row group 1,
+        // the way a join's `_id`s land on pages apart from each other. Scanned
+        // cold through DataFusion's opener and the disk cache:
+        //  - two pages of `b` closer than `PAGE_READ_THROUGH_BYTES` come down
+        //    in one GET, the skipped pages between them included;
+        //  - two pages further apart do not, and the pages between them are
+        //    never downloaded;
+        //  - either way the scan keeps exactly the two pages' rows.
+        let file = fixture::wide_file(SPREAD_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let offsets = file.1.offset_index().expect("page index");
+        let b_pages = offsets[1][1].page_locations();
+        let page = |p: usize| {
+            let start = b_pages[p].offset as u64;
+            start..start + b_pages[p].compressed_page_size as u64
+        };
+        let shape = |name, kept: [usize; 2]| ScanShape {
+            name,
+            projection: None,
+            filter: Some(
+                col("a").in_list(
+                    kept.iter()
+                        .map(|&p| lit((SPREAD_ROWS_PER_GROUP + p * WIDE_PAGE_ROWS) as i64))
+                        .collect(),
+                    false,
+                ),
+            ),
+            row_filter: false,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: Vec::new(),
+        };
+
+        let [first, last] = NEAR_PAGES;
+        let gap = page(last).start - page(first).end;
+        assert!(
+            OBJECT_STORE_COALESCE_DEFAULT < gap && gap <= PAGE_READ_THROUGH_BYTES,
+            "the near pages sit between the two gaps: {gap}"
+        );
+        let (near, _) =
+            scan_through_the_cache(true, &shape("near", NEAR_PAGES), &file, GET_LATENCY).await;
+        assert_eq!(near.rows, 2 * WIDE_PAGE_ROWS, "near: the two pages' rows");
+        assert!(
+            near.reads
+                .iter()
+                .any(|r| r.start <= page(first).start && page(last).end <= r.end),
+            "near: one GET reads both pages and the gap: {near:?}"
+        );
+        let warm = ScanShape {
+            cached_row_groups: vec![1],
+            ..shape("warm", NEAR_PAGES)
+        };
+        let (warm, _) = scan_through_the_cache(true, &warm, &file, GET_LATENCY).await;
+        assert_eq!(warm.gets, 0, "warm: every page is local");
+        assert_eq!(
+            near.page_bytes, warm.page_bytes,
+            "the pages counted don't depend on what was read through"
+        );
+
+        let [first, last] = FAR_PAGES;
+        assert!(page(last).start - page(first).end > PAGE_READ_THROUGH_BYTES);
+        let (far, _) =
+            scan_through_the_cache(true, &shape("far", FAR_PAGES), &file, GET_LATENCY).await;
+        assert_eq!(far.rows, 2 * WIDE_PAGE_ROWS, "far: the two pages' rows");
+        assert!(near.gets < far.gets, "near: fewer GETs than far apart");
+        let skipped = page(SKIPPED_PAGE);
+        assert!(
+            !far.reads
+                .iter()
+                .any(|r| r.start < skipped.end && skipped.start < r.end),
+            "far: a page between them is not downloaded: {far:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
