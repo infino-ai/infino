@@ -339,6 +339,29 @@ impl ConnectionMemoryBudget {
         self.used.fetch_sub(n, Ordering::Relaxed);
     }
 
+    /// Reserve `n` bytes for something held only to save work later, read
+    /// ahead of its use, or `None` if that takes the budget past `percent` of
+    /// its limit. Checked before and after reserving, so holders racing for
+    /// the last of the share can't all get through. Never asks the others to
+    /// give memory back.
+    pub(crate) fn try_reserve_within_share(
+        self: &Arc<Self>,
+        n: usize,
+        percent: usize,
+    ) -> Option<Reservation> {
+        let over_share = |extra: usize| {
+            self.limit.is_some_and(|limit| {
+                self.used().saturating_add(extra).saturating_mul(100)
+                    > limit.saturating_mul(percent)
+            })
+        };
+        if over_share(n) {
+            return None;
+        }
+        let reservation = self.try_reserve_without_reclaim(n).ok()?;
+        (!over_share(0)).then_some(reservation)
+    }
+
     /// Bytes currently reserved.
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)

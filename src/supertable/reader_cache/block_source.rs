@@ -2146,6 +2146,18 @@ impl LazyByteSource for BlockCachedSource {
         bytes
     }
 
+    async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        let bytes = match self.read_sync(start, len) {
+            Some(bytes) => Ok(bytes),
+            None => match self.whole_file() {
+                Some(file) => file.range(start, len).await,
+                None => self.inner.range(start, len).await,
+            },
+        };
+        self.note_read(start, len);
+        bytes
+    }
+
     async fn tail(&self, len: u64) -> Result<(Bytes, u64), LazyByteSourceError> {
         // Pass through: `tail` both fetches and (on unknown-size sources)
         // discovers the object size, which the inner source caches. Tail
@@ -4396,6 +4408,41 @@ mod tests {
         }
         assert_eq!(src.range(start, len).await.expect("windowed"), want);
         assert_eq!(inner.calls(), 1, "repeats come from the kept blocks");
+    }
+
+    /// An uncached read fetches just its bytes and keeps nothing, so a repeat
+    /// fetches again; blocks the cache already holds come from it.
+    #[tokio::test]
+    async fn an_uncached_read_keeps_nothing_and_uses_what_is_kept() {
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let (_uri, inner, src) = counting_source(dir.path(), &store, 64 * UNIT as usize);
+        let (start, len) = (10 * UNIT + 100, 4096);
+        let want = inner.blob.slice(start as usize..(start + len) as usize);
+
+        assert_eq!(
+            src.range_uncached(start, len).await.expect("uncached"),
+            want
+        );
+        assert_eq!(inner.fetched_bytes(), len, "just the bytes asked for");
+        assert_eq!(src.range_uncached(start, len).await.expect("repeat"), want);
+        assert_eq!(inner.calls(), 2, "nothing was kept");
+
+        assert_eq!(src.range_exact(start, len).await.expect("kept"), want);
+        let (b0, b1) = BlockCachedSource::block_span(start, len);
+        wait_until(
+            || src.all_filled(b0, b1),
+            "the exact read's blocks are written",
+        )
+        .await;
+        let calls = inner.calls();
+        assert_eq!(
+            src.range_uncached(start, len)
+                .await
+                .expect("from the cache"),
+            want
+        );
+        assert_eq!(inner.calls(), calls, "kept blocks come from the cache");
     }
 
     /// A read whose block write is held:

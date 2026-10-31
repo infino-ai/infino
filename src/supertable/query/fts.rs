@@ -3267,6 +3267,7 @@ impl SupertableReader {
         let tokens_arc = Arc::new(term_strings);
         let op_stats = self.op_stats.clone();
         let reader_pool = Arc::clone(&self.manifest().options.reader_pool);
+        let budget = Arc::clone(&self.manifest().options.connection_memory_budget);
         let body = move |r: Arc<SuperfileReader>,
                          entry: Arc<SuperfileEntry>,
                          tombstone_cache: Option<Arc<SidecarCache>>,
@@ -3278,6 +3279,7 @@ impl SupertableReader {
             let locations = Arc::clone(&locations);
             let op_stats = op_stats.clone();
             let reader_pool = Arc::clone(&reader_pool);
+            let budget = Arc::clone(&budget);
             async move {
                 // A file written before a rename labels the column as it was
                 // then, and its dictionary is keyed by that label; the id is
@@ -3336,6 +3338,7 @@ impl SupertableReader {
                         &candidates,
                         &[column_arc.as_str()],
                         Some(&reader_pool),
+                        Some(&budget),
                     )
                     .await
                     .map_err(QueryError::DataFusion)?,

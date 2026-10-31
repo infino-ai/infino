@@ -2155,6 +2155,7 @@ async fn read_ids_for_locals(
         local_ids,
         &[id_column],
         Some(&manifest.options.reader_pool),
+        Some(&manifest.options.connection_memory_budget),
     )
     .await
     .map_err(QueryError::DataFusion)?;
@@ -9966,6 +9967,7 @@ mod tests {
             &reader,
             &locals,
             &[manifest.options.id_column.as_str()],
+            None,
             None,
         ))
         .expect("read the `_id` column");

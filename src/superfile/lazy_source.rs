@@ -173,6 +173,13 @@ pub trait LazyByteSource: Send + Sync {
         self.range(start, len).await
     }
 
+    /// [`Self::range_exact`] for a caller the cache has no room for: bytes the
+    /// cache holds come from it, the rest is fetched and not kept. Defaults to
+    /// [`Self::range_exact`].
+    async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.range_exact(start, len).await
+    }
+
     /// Count `[start, start + len)` as read, for a reader served those bytes
     /// from what it downloaded ahead, so a cache that tracks which way reads
     /// move still follows it. Downloads nothing. Does nothing by default.
@@ -495,6 +502,20 @@ impl Source {
         }
     }
 
+    /// [`Self::range_exact_async`] through [`LazyByteSource::range_uncached`].
+    pub async fn range_uncached_async(
+        &self,
+        range: Range<usize>,
+    ) -> Result<Bytes, LazyByteSourceError> {
+        match self.resident_or_lazy(&range)? {
+            Fetch::Resident(bytes) => Ok(bytes),
+            Fetch::Lazy(s) => {
+                s.range_uncached(range.start as u64, range.len() as u64)
+                    .await
+            }
+        }
+    }
+
     /// Async concurrent multi-range fetch. Sync-resident ranges are
     /// served immediately; cold `Lazy` misses are dispatched as one
     /// `try_join_all` batch and `await`ed on the caller's runtime.
@@ -678,6 +699,12 @@ impl LazyByteSource for LazySubSource {
             .await
     }
 
+    async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        self.inner
+            .range_uncached(self.inner_offset(start, len)?, len)
+            .await
+    }
+
     fn try_get_range_sync(&self, start: u64, len: u64) -> Option<Bytes> {
         if start.saturating_add(len) > self.len {
             return None;
@@ -806,6 +833,13 @@ impl LazyByteSource for PrefetchedSource {
             return Ok(b);
         }
         self.inner.range_exact(start, len).await
+    }
+
+    async fn range_uncached(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+        if let Some(b) = self.lookup(start, len) {
+            return Ok(b);
+        }
+        self.inner.range_uncached(start, len).await
     }
 
     fn note_read(&self, start: u64, len: u64) {

@@ -72,7 +72,10 @@ use tokio::sync::Semaphore;
 use tracing::{Instrument, Span, warn};
 
 use crate::{
-    memory::{over_process_limit, process_limit, process_limit_exceeded, process_over_limit},
+    memory::{
+        ConnectionMemoryBudget, over_process_limit, process_limit, process_limit_exceeded,
+        process_over_limit,
+    },
     runtime_bridge::{run_on_pool, run_on_pool_unless_blocking},
     runtime_metrics::{
         op_stats::{OpStatsCollector, timed_section},
@@ -82,7 +85,7 @@ use crate::{
         ReadError, SuperfileReader,
         lazy_source::Source,
         reader::{
-            ID_BLOCK_GAP_BYTES, WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
+            WHOLE_COLUMN_TAKE_DIVISOR, in_projection_order, rank_back_indices,
             row_selection_for_ids, view_read_options, whole_row_group,
         },
     },
@@ -93,8 +96,10 @@ use crate::{
         query::{
             SuperfileHit,
             candidate::{CandidatePlan, CandidateScope},
+            df_object_store::{EXACT_MERGE_GAP_BYTES, merged_within},
             dispatch::{ReplanFuture, fanout_with_ordered, tombstone_deny_set},
             exec::metered_exec::MeteredExec,
+            read_ahead::BUDGET_SHARE_PERCENT,
             superfile_reader::superfile_reader,
             vector::row_id_from_manifest_entry,
         },
@@ -1398,6 +1403,7 @@ async fn resolve_columns(
                     &adapter,
                     &out_schema,
                     &manifest.options.reader_pool,
+                    &manifest.options.connection_memory_budget,
                 )
                 .await?;
                 Ok(Resolved::Taken(index, batch))
@@ -1514,12 +1520,14 @@ async fn take_lazy_file(
     adapter: &Option<FileSchemaMap>,
     out_schema: &SchemaRef,
     pool: &ThreadPool,
+    budget: &Arc<ConnectionMemoryBudget>,
 ) -> DfResult<RecordBatch> {
     match adapter {
-        None => take_rows_byte_source(rd, locals, names, Some(pool)).await,
+        None => take_rows_byte_source(rd, locals, names, Some(pool), Some(budget)).await,
         Some(map) => {
             let physical = map.stored_names(names);
-            let read = take_rows_byte_source(rd, locals, &physical, Some(pool)).await?;
+            let read =
+                take_rows_byte_source(rd, locals, &physical, Some(pool), Some(budget)).await?;
             map.adapt(&read, out_schema)
                 .map_err(|e| DataFusionError::Execution(e.to_string()))
         }
@@ -1548,6 +1556,7 @@ pub(crate) async fn take_file_columns(
             &adapter,
             out_schema,
             &manifest.options.reader_pool,
+            &manifest.options.connection_memory_budget,
         )
         .await;
     }
@@ -1748,18 +1757,20 @@ impl ChunkReader for PrefetchedChunks {
 /// Most bytes a take fetches ahead for one superfile; past this it streams
 /// row group by row group as before.
 const TAKE_PREFETCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// Take prefetch spans this close share one read: fewer GETs for a few
-/// unrequested bytes.
-const TAKE_PREFETCH_GAP_BYTES: u64 = 128 * 1024;
 /// Spans of one superfile's take prefetch in flight at once.
 const TAKE_PREFETCH_CONCURRENCY: usize = 16;
+/// Take prefetch reads in flight at once across the process, shared by every
+/// query. On 100B rows a 4M-row take ran as fast under 1024 as with no cap,
+/// and 1.7x slower under 256; eight takes at once under 1024 saw no timeouts.
+const TAKE_PREFETCH_READS_IN_FLIGHT: usize = 1024;
 /// The share of the host's memory every take's prefetch together may hold.
 const TAKE_PREFETCH_MEMORY_SHARE: u64 = 16;
 
 /// Prefetched bytes every take in the process holds at once, in KiB: a share
 /// of the host's memory, never less than one take's
 /// [`TAKE_PREFETCH_MAX_BYTES`]. A take waits for room, and holds it until
-/// its decode is done.
+/// its decode is done. The ceiling for a connection whose budget has no
+/// limit, as the scan's read-ahead has its per-scan cap.
 fn take_prefetch_budget() -> &'static Semaphore {
     static BUDGET: OnceLock<Semaphore> = OnceLock::new();
     BUDGET.get_or_init(|| {
@@ -1770,6 +1781,13 @@ fn take_prefetch_budget() -> &'static Semaphore {
             .max(TAKE_PREFETCH_MAX_BYTES);
         Semaphore::new((bytes / 1024) as usize)
     })
+}
+
+/// The process's [`TAKE_PREFETCH_READS_IN_FLIGHT`] permits; each prefetch read
+/// holds one while it runs.
+fn take_prefetch_reads() -> &'static Semaphore {
+    static READS: OnceLock<Semaphore> = OnceLock::new();
+    READS.get_or_init(|| Semaphore::new(TAKE_PREFETCH_READS_IN_FLIGHT))
 }
 
 /// The column chunks of the `roots` columns (top-level, as the Arrow
@@ -1821,14 +1839,7 @@ fn take_prefetch_spans(
         }
         first_row = end_row;
     }
-    spans.sort_unstable_by_key(|r| r.start);
-    let mut merged: Vec<Range<u64>> = Vec::with_capacity(spans.len());
-    for span in spans {
-        match merged.last_mut() {
-            Some(last) if span.start <= last.end + gap => last.end = last.end.max(span.end),
-            _ => merged.push(span),
-        }
-    }
+    let merged = merged_within(&spans, gap);
     let bytes: u64 = merged.iter().map(|r| r.end - r.start).sum();
     (bytes <= max_bytes).then_some(merged)
 }
@@ -1948,7 +1959,7 @@ pub(crate) async fn take_rows(
     pool: &ThreadPool,
 ) -> DfResult<RecordBatch> {
     if !reader.can_take_by_local_doc_ids() {
-        return take_rows_byte_source(reader, local_doc_ids, names, Some(pool)).await;
+        return take_rows_byte_source(reader, local_doc_ids, names, Some(pool), None).await;
     }
     let owned_reader = Arc::clone(reader);
     let ids = local_doc_ids.to_vec();
@@ -1978,6 +1989,7 @@ pub(crate) async fn take_rows_byte_source(
     local_doc_ids: &[u32],
     names: &[&str],
     pool: Option<&ThreadPool>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
 ) -> DfResult<RecordBatch> {
     // The bare `_id` projection of a few rows comes from the packed sidecar's
     // blocks when the superfile carries one: a couple of kilobytes a block,
@@ -1989,7 +2001,7 @@ pub(crate) async fn take_rows_byte_source(
         && !reader.id_sidecar_serves(local_doc_ids, name)
     {
         match reader
-            .ids_from_sidecar_blocks(local_doc_ids, ID_BLOCK_GAP_BYTES)
+            .ids_from_sidecar_blocks(local_doc_ids, EXACT_MERGE_GAP_BYTES)
             .await
         {
             Ok(Some(ids)) => {
@@ -2027,9 +2039,19 @@ pub(crate) async fn take_rows_byte_source(
         &sorted,
         &roots,
         TAKE_PREFETCH_MAX_BYTES,
-        TAKE_PREFETCH_GAP_BYTES,
+        EXACT_MERGE_GAP_BYTES,
     );
-    take_prefetched(reader, source, metadata, spans, local_doc_ids, names, pool).await
+    take_prefetched(
+        reader,
+        source,
+        metadata,
+        spans,
+        local_doc_ids,
+        names,
+        pool,
+        budget,
+    )
+    .await
 }
 
 /// Takes whose decode read outside their prefetch and decoded again through
@@ -2045,7 +2067,10 @@ fn take_prefetch_fallbacks() -> u64 {
 
 /// Fetch `spans` of the take at once and decode from them on the reader
 /// pool, or with no spans stream through `source`, as does a decode that
-/// reads outside them.
+/// reads outside them. The prefetch is reserved from `budget` (at most
+/// [`BUDGET_SHARE_PERCENT`] of it, as the scan's read-ahead), and streams
+/// without room there; without room in the cache's write queue it is fetched
+/// but not cached.
 async fn take_prefetched(
     reader: &SuperfileReader,
     source: Source,
@@ -2054,30 +2079,54 @@ async fn take_prefetched(
     local_doc_ids: &[u32],
     names: &[&str],
     pool: Option<&ThreadPool>,
+    budget: Option<&Arc<ConnectionMemoryBudget>>,
 ) -> DfResult<RecordBatch> {
     let mut prefetched = Vec::new();
     // Held until the decode is done: the prefetched bytes live that long.
-    let mut _room = None;
-    if let Some(spans) = spans.filter(|s| !s.is_empty()) {
-        let bytes: u64 = spans.iter().map(|r| r.end - r.start).sum();
+    let (mut _reserved, mut _room) = (None, None);
+    let spans = spans.filter(|s| !s.is_empty());
+    let bytes: u64 = spans.iter().flatten().map(|r| r.end - r.start).sum();
+    // Bytes the connection's budget has no room for are streamed instead, as
+    // the scan's read-ahead leaves them to the scan. Bytes the cache's write
+    // queue has no room for are still fetched at once, but not cached: a
+    // full queue would drop them anyway, and streaming them reads several
+    // times the bytes.
+    let reserved = match budget {
+        Some(budget) if spans.is_some() => budget
+            .try_reserve_within_share(bytes as usize, BUDGET_SHARE_PERCENT)
+            .map(Some),
+        _ => Some(None),
+    };
+    if let (Some(spans), Some(reserved)) = (spans, reserved) {
+        _reserved = reserved;
         _room = Some(
             take_prefetch_budget()
                 .acquire_many(bytes.div_ceil(1024) as u32)
                 .await
                 .map_err(QueryError::internal)?,
         );
+        let cache_room = reader.byte_source().cache_room_ahead(bytes);
+        let cached = cache_room.is_some();
         let fetched: Vec<Bytes> = stream::iter(spans.iter().cloned().map(|span| {
             let source = source.clone();
             async move {
-                source
-                    .range_exact_async(span.start as usize..span.end as usize)
+                let _read = take_prefetch_reads()
+                    .acquire()
                     .await
-                    .map_err(|e| QueryError::Internal(format!("take prefetch: {e}")))
+                    .map_err(QueryError::internal)?;
+                let span = span.start as usize..span.end as usize;
+                match cached {
+                    true => source.range_exact_async(span).await,
+                    false => source.range_uncached_async(span).await,
+                }
+                .map_err(|e| QueryError::Internal(format!("take prefetch: {e}")))
             }
         }))
         .buffered(TAKE_PREFETCH_CONCURRENCY)
         .try_collect()
         .await?;
+        // The cache holds room only until the download ends.
+        drop(cache_room);
         prefetched = spans.into_iter().zip(fetched).collect();
         // The fetch was the I/O; the decode is CPU, and goes to the reader
         // pool, reading only the prefetched bytes.
@@ -3402,6 +3451,7 @@ mod tests {
                 &[3, 0],
                 &["title"],
                 None,
+                None,
             )
         };
         let before = take_prefetch_fallbacks();
@@ -3422,6 +3472,58 @@ mod tests {
             take_prefetch_fallbacks() > before,
             "the fallback is counted"
         );
+    }
+
+    /// A take reserves its prefetch from the connection's budget and gives it
+    /// back when done; with no room there it streams instead. With no room
+    /// in the cache's write queue it still prefetches. The same rows either
+    /// way.
+    #[tokio::test]
+    async fn a_take_without_room_streams_the_same_rows() {
+        use crate::supertable::query::read_ahead::fixture::Superfile;
+
+        let source = Superfile::new(titled_superfile_bytes(), false);
+        let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
+            .await
+            .expect("open lazy");
+        let metadata = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("metadata");
+        let root = reader.schema().index_of("title").expect("title");
+        let spans = take_prefetch_spans(&metadata, &[0, 3], &[root], u64::MAX, 0);
+        let take = |budget| {
+            let (reader, metadata, spans) = (&reader, Arc::clone(&metadata), spans.clone());
+            async move {
+                take_prefetched(
+                    reader,
+                    Source::Lazy(reader.byte_source()),
+                    metadata,
+                    spans,
+                    &[3, 0],
+                    &["title"],
+                    None,
+                    Some(&budget),
+                )
+                .await
+                .expect("take")
+            }
+        };
+
+        let roomy = ConnectionMemoryBudget::measured();
+        let batch = take(Arc::clone(&roomy)).await;
+        assert_eq!(titles_of(&batch), vec!["delta", "alpha"]);
+        assert!(roomy.peak() > 0, "the prefetch was reserved");
+        assert_eq!(roomy.used_bytes(), 0, "and given back");
+
+        let full = ConnectionMemoryBudget::with_limit(1);
+        assert_eq!(take(Arc::clone(&full)).await, batch);
+        assert_eq!(full.peak(), 0, "no room in the budget: nothing reserved");
+
+        source.keeps.store(false, Ordering::Relaxed);
+        let roomy = ConnectionMemoryBudget::measured();
+        assert_eq!(take(Arc::clone(&roomy)).await, batch);
+        assert!(roomy.peak() > 0, "no room in the cache: still prefetched");
     }
 
     #[tokio::test]
