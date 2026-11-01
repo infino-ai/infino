@@ -1602,7 +1602,8 @@ mod tests {
     /// A search's row count is an estimate the planner may act on, never a
     /// fact it may answer from: `COUNT(*)` counts the rows the search finds,
     /// not its `k`, and a `k` near `i64::MAX` plans a join-back without
-    /// overflowing DataFusion's join-size arithmetic.
+    /// overflowing DataFusion's join-size arithmetic, because the count it
+    /// reports is bounded by the table's rows.
     #[test]
     fn a_search_reports_its_k_as_an_estimate_only() {
         let st = demo(16);

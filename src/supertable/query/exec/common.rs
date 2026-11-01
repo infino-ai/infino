@@ -183,12 +183,14 @@ const EXACT_SCOPE_TAKE_BYTES: usize = 32 << 20;
 
 /// The most rows a search tells the planner it returns (see
 /// [`top_k_statistics`]), whatever its `k`. DataFusion sizes a join by
-/// multiplying its two sides' row counts unchecked, so reporting a `k` near
-/// `i64::MAX` overflows that product: a panic in a debug build, a garbage
-/// estimate in release. 2^20 keeps the product inside `usize` for tables
-/// up to 2^44 rows (17 trillion), and sits above the 128K rows under which
-/// DataFusion's default collects a join's build side into one hash table, so
-/// a search this large still builds partitioned.
+/// multiplying its two sides' row counts unchecked: an overflow is a panic
+/// in a debug build, a garbage estimate in release. The table's row count
+/// already bounds a huge `k`, but a search joined back to a table past 2^32
+/// rows (about 4.3 billion) still overflows the product at that bound.
+/// 2^20 keeps the product inside `usize` for tables up to 2^44 rows (17
+/// trillion), and sits above the 128K rows under which DataFusion's default
+/// collects a join's build side into one hash table, so a search this large
+/// still builds partitioned.
 const MAX_REPORTED_HITS: usize = 1 << 20;
 
 /// The most hits one fill will ask a kernel for: [`OVER_FETCH_MAX_K_MULTIPLE`]
@@ -2044,6 +2046,16 @@ mod tests {
     /// limit in the ceiling tests below.
     const HUGE_TABLE: usize = 100_000_000;
 
+    /// Rows past 2^32, where a search's count bounded only by the table's
+    /// rows would overflow the join-size product against that table.
+    const TABLE_PAST_THE_ROW_BOUND: u64 = 1 << 40;
+
+    /// A table small enough that its row count binds a search's count.
+    const SMALL_TABLE_ROWS: usize = 16;
+
+    /// A `k` below every cap.
+    const SMALL_K: usize = 10;
+
     /// The over-fetch ceiling is bounded from above in every direction a
     /// caller can push it, and never below the `k` that was asked for.
     /// Before it existed the fill grew to the table's row count, so an
@@ -2065,6 +2077,27 @@ mod tests {
         // The table is always the last word.
         assert_eq!(over_fetch_ceiling(10, 7), 7);
         assert_eq!(over_fetch_ceiling(0, 0), 0);
+    }
+
+    /// On a table too large for its row count to bound the join-size
+    /// product, a search reports at most [`MAX_REPORTED_HITS`]. A small
+    /// table never reaches this cap: its row count binds first.
+    #[test]
+    fn a_search_on_a_huge_table_reports_at_most_the_hit_cap() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let reported = |k, table_rows| top_k_statistics(&schema, k, table_rows).num_rows;
+        assert_eq!(
+            reported(usize::MAX, TABLE_PAST_THE_ROW_BOUND),
+            Precision::Inexact(MAX_REPORTED_HITS)
+        );
+        assert_eq!(
+            reported(SMALL_K, TABLE_PAST_THE_ROW_BOUND),
+            Precision::Inexact(SMALL_K)
+        );
+        assert_eq!(
+            reported(usize::MAX, SMALL_TABLE_ROWS as u64),
+            Precision::Inexact(SMALL_TABLE_ROWS)
+        );
     }
 
     #[test]
