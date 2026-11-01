@@ -59,7 +59,14 @@ const SIGN_BIT: u32 = 0x8000_0000;
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
-const MIN_PARTITION: usize = 32;
+///
+/// Two posting blocks of documents. The splits below that were measured
+/// on two 5M-document corpora, encyclopedia prose and web crawl, each
+/// compacted to 1 GiB superfiles: they took 2–4% of the compaction's
+/// time and left the index 0.05–0.07% *larger* than stopping here — in a
+/// partition that small the pairs a round moves share terms, so the
+/// swaps undo each other's grouping more than they add to it.
+const MIN_PARTITION: usize = 256;
 
 /// Reorder convergence ratio.
 ///
