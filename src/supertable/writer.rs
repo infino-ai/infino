@@ -78,7 +78,8 @@ use arrow::{
     ipc::writer::StreamWriter,
 };
 use arrow_array::{
-    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array,
+    Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, LargeStringArray,
+    RecordBatch, UInt32Array,
 };
 use arrow_schema::{Field, Schema};
 use blake3::Hasher as Blake3Hasher;
@@ -750,15 +751,69 @@ fn superfiles_per_commit(
     by_bytes.min(pool_threads.max(1)).min(total_rows.max(1))
 }
 
-/// Row-balanced split of the writer's buffered batches into `n_superfiles` build inputs, each
+/// Append each row's weight for cutting a commit into pieces: the bytes of
+/// text the build indexes from the row, which is what a piece's build time
+/// follows. A table that indexes no text weighs every row the same.
+fn piece_row_weights(scalar: &RecordBatch, options: &SupertableOptions, out: &mut Vec<u64>) {
+    let text: Vec<&LargeStringArray> = options
+        .fts_columns
+        .iter()
+        .filter_map(|fc| scalar.schema().index_of(&fc.column).ok())
+        .filter_map(|idx| {
+            scalar
+                .column(idx)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+        })
+        .collect();
+    out.extend((0..scalar.num_rows()).map(|row| {
+        text.iter()
+            .map(|col| u64::try_from(col.value_length(row)).unwrap_or(0))
+            .sum::<u64>()
+    }));
+}
+
+/// Where `n` pieces of a commit of `weights.len()` rows begin and end:
+/// `bounds[i]..bounds[i + 1]` is piece `i`. Each piece takes an equal
+/// share of the rows' total weight, so pieces built side by side finish
+/// together and the commit waits for none of them; rows of no weight at
+/// all are cut evenly by count. A piece is empty only when the commit has
+/// fewer rows than pieces, and then only the trailing ones are.
+fn piece_bounds(weights: &[u64], n: usize) -> Vec<usize> {
+    let rows = weights.len();
+    let n = n.max(1);
+    if rows < n {
+        return (0..=n).map(|i| i.min(rows)).collect();
+    }
+    let total: u64 = weights.iter().sum();
+    let weight = |row: usize| if total == 0 { 1 } else { weights[row] };
+    let total = if total == 0 { rows as u64 } else { total };
+    let mut bounds = Vec::with_capacity(n + 1);
+    bounds.push(0usize);
+    let mut at = 0usize;
+    let mut taken = 0u64;
+    for i in 1..n {
+        let target = total * i as u64 / n as u64;
+        // At least one row, a row left for each later piece, and
+        // otherwise the row that brings the piece nearest its share.
+        let (first, last) = (bounds[i - 1] + 1, rows - (n - i));
+        while at < last && (at < first || taken * 2 + weight(at) < target * 2) {
+            taken += weight(at);
+            at += 1;
+        }
+        bounds.push(at);
+    }
+    bounds.push(rows);
+    bounds
+}
+
+/// Split of the writer's buffered batches into `n_superfiles` build inputs, each
 /// shaped as a `Vec<BufferedBatch>` that [`build_one_shard_with_layout`] can consume directly.
-/// The split walks rows across the original buffer in order and emits zero-copy Arrow slices
-/// (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying memory
-/// stays Arc-counted), so no payload bytes are copied even when a split boundary falls in the
-/// middle of a `BufferedBatch`.
-///
-/// Row imbalance across pieces is ≤ 1: with `total_rows = q·n + r`, the first `r` pieces get
-/// `q+1` rows and the rest get `q`.
+/// The pieces are cut where [`piece_bounds`] puts them, so each holds an equal share of the text
+/// to index. The split walks rows across the original buffer in order and emits zero-copy Arrow
+/// slices (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying
+/// memory stays Arc-counted), so no payload bytes are copied even when a split boundary falls in
+/// the middle of a `BufferedBatch`.
 ///
 /// Trailing empty pieces (only possible when `total_rows < n_superfiles`) are dropped before
 /// return; callers see exactly the pieces that will produce a non-empty superfile.
@@ -766,15 +821,19 @@ fn split_buffer_into_superfile_inputs(
     buffer: Vec<BufferedBatch>,
     n_superfiles: usize,
     vector_dims: &[usize],
+    options: &SupertableOptions,
 ) -> Vec<Vec<BufferedBatch>> {
     debug_assert!(n_superfiles > 0);
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
     if total_rows == 0 {
         return Vec::new();
     }
-    let base = total_rows / n_superfiles;
-    let remainder = total_rows % n_superfiles;
-    let target = |i: usize| if i < remainder { base + 1 } else { base };
+    let mut weights = Vec::with_capacity(total_rows);
+    for batch in &buffer {
+        piece_row_weights(&batch.scalar, options, &mut weights);
+    }
+    let bounds = piece_bounds(&weights, n_superfiles);
+    let target = |i: usize| bounds[i + 1] - bounds[i];
 
     let mut pieces: Vec<Vec<BufferedBatch>> = (0..n_superfiles).map(|_| Vec::new()).collect();
     let mut piece_idx = 0usize;
@@ -2531,7 +2590,7 @@ impl SupertableWriter {
         }
         let options = Arc::clone(&self.inner.options);
         // The pieces a commit-time build would cut these rows into: the
-        // same count, by the same rule, and the same even runs of rows.
+        // same count, by the same rule, cut at the same rows.
         let buffered_bytes: usize = buffer
             .iter()
             .map(|b| b.scalar.get_array_memory_size())
@@ -2539,8 +2598,13 @@ impl SupertableWriter {
         let target_bytes = (options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
         let n_threads = options.writer_pool.current_num_threads().max(1);
         let n_pieces = superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
+        let mut weights = Vec::with_capacity(total_rows);
+        for b in buffer {
+            piece_row_weights(&b.scalar, &options, &mut weights);
+        }
+        let bounds = piece_bounds(&weights, n_pieces);
         let pieces: Vec<Range<u32>> = (0..n_pieces)
-            .map(|i| (total_rows * i / n_pieces) as u32..(total_rows * (i + 1) / n_pieces) as u32)
+            .map(|i| bounds[i] as u32..bounds[i + 1] as u32)
             .collect();
         let payload_bytes = buffered_payload_bytes(buffer);
         let list_metadata = CommitListMetadata {
@@ -2583,7 +2647,7 @@ impl SupertableWriter {
                 .into_par_iter()
                 .map(|i| {
                     timed_kernel(&stats, || {
-                        let slices = piece_batches(&batches, total_rows, i, n_pieces);
+                        let slices = piece_batches(&batches, bounds[i], bounds[i + 1]);
                         let text_bytes: u64 = slices
                             .iter()
                             .map(|b| ingested_byte_legs(b, 0, &options).2)
@@ -3125,13 +3189,22 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards =
-                        split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
+                    let shards = split_buffer_into_superfile_inputs(
+                        owned,
+                        n_superfiles,
+                        &vector_dims,
+                        &self.inner.options,
+                    );
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_superfile_inputs(owned, n_superfiles, &vector_dims);
+                let shards = split_buffer_into_superfile_inputs(
+                    owned,
+                    n_superfiles,
+                    &vector_dims,
+                    &self.inner.options,
+                );
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
@@ -3559,13 +3632,9 @@ impl LiveLanes {
     }
 }
 
-/// The rows `[rows * i / n, rows * (i + 1) / n)` of a commit of `rows`
-/// rows, as `batches` hold them: the slices of the batches that fall in
-/// the range, in order. The pieces of a commit are cut this way, so a
-/// commit-time build's row split and a live build's seal agree on where
-/// the pieces are.
-fn piece_batches(batches: &[RecordBatch], rows: usize, i: usize, n: usize) -> Vec<RecordBatch> {
-    let (start, end) = (rows * i / n, rows * (i + 1) / n);
+/// The rows `start..end` of a commit, as `batches` hold them: the slices
+/// of the batches that fall in the range, in order.
+fn piece_batches(batches: &[RecordBatch], start: usize, end: usize) -> Vec<RecordBatch> {
     let mut slices = Vec::new();
     let mut at = 0usize;
     for batch in batches {
@@ -14489,6 +14558,27 @@ mod tests {
         // Never more shards than rows, and never zero.
         assert_eq!(superfiles_per_commit(3, 1 << 30, 192, T), 3);
         assert_eq!(superfiles_per_commit(1, 1, 0, T), 1);
+    }
+
+    /// Pieces are cut at equal shares of the rows' text, never empty while
+    /// there are rows enough, and evenly by count when nothing weighs.
+    #[test]
+    fn piece_bounds_share_the_text_evenly() {
+        // One heavy row at the front takes a piece of its own.
+        assert_eq!(
+            piece_bounds(&[10, 1, 1, 1, 1, 1, 1, 1, 1, 1], 2),
+            vec![0, 1, 10]
+        );
+        // Three equal shares of a ramp.
+        assert_eq!(piece_bounds(&[1, 2, 3, 4, 5, 6], 3), vec![0, 3, 5, 6]);
+        // A heavy tail still leaves every earlier piece a row.
+        assert_eq!(piece_bounds(&[1, 1, 1, 100], 3), vec![0, 2, 3, 4]);
+        // Nothing weighs: even by count.
+        assert_eq!(piece_bounds(&[0; 10], 4), vec![0, 2, 5, 7, 10]);
+        // Fewer rows than pieces: the trailing pieces are empty.
+        assert_eq!(piece_bounds(&[5, 5], 4), vec![0, 1, 2, 2, 2]);
+        assert_eq!(piece_bounds(&[], 3), vec![0, 0, 0, 0]);
+        assert_eq!(piece_bounds(&[7, 7, 7], 1), vec![0, 3]);
     }
 
     /// Boundary behavior of the ceiling division: a buffer at the target is one shard, one
