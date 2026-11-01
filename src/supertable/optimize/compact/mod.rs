@@ -62,7 +62,7 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::disk::mmap_readonly_bytes,
+        reader_cache::disk::mmap_temp_file_bytes,
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -810,7 +810,9 @@ impl Supertable {
             // Vec — the allocation that OOMs compaction on a memory-tight host.
             // Mapped pages are file-backed and reclaimable; downstream publish
             // takes `Bytes` unchanged (large superfiles already stream via
-            // put_multipart).
+            // put_multipart). The file stays behind the bytes, so a publish
+            // to a directory on this host links it into place instead of
+            // writing the output a second time.
             let mut output = NamedTempFile::new_in(scratch_root())
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
@@ -830,7 +832,7 @@ impl Supertable {
                     .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
                 stats
             };
-            let bytes = mmap_readonly_bytes(output.path())
+            let bytes = mmap_temp_file_bytes(output)
                 .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
             record("output_bytes", bytes.len() as u64);
             usage.finish();
