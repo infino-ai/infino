@@ -4191,27 +4191,53 @@ fn lane_doc_range(lane: &FrozenLane, rows: &Range<u32>) -> (usize, usize) {
     )
 }
 
-/// The bytes of postings `lo..hi` of list `id`'s position runs: the
-/// nearest recorded end before each bound, then the runs between skipped.
-fn run_bytes(col: &FrozenColumn, id: u32, lo: usize, hi: usize) -> &[u8] {
+/// One lane's share of the term being emitted: postings `pos..hi` of
+/// list `id` still to take, and the lane's row stretch the next one is in.
+struct Holder<'a> {
+    lane: usize,
+    col: &'a FrozenColumn,
+    id: u32,
+    pos: usize,
+    hi: usize,
+    /// Where posting `pos`'s position run begins, in a positional column.
+    read: usize,
+    cursor: usize,
+}
+
+impl Holder<'_> {
+    /// Advance `read` to posting `to`'s run: a short way is walked from the
+    /// current run, a long way is looked up from the recorded run ends.
+    fn read_to(&mut self, to: usize) {
+        if to - self.pos <= RUN_END_STRIDE {
+            let runs = &self.col.pos_runs[self.id as usize];
+            for &(_, tf) in &self.col.postings[self.id as usize][self.pos..to] {
+                skip_run(runs, &mut self.read, tf).expect("builder-encoded run");
+            }
+        } else {
+            self.read = run_offset(self.col, self.id, to);
+        }
+    }
+}
+
+/// Where posting `p` of list `id`'s position runs begins: the nearest
+/// recorded end before it, then the runs between skipped. A stretch's
+/// bytes are located this way instead of by walking its postings, so a
+/// long stretch of a common term costs a lookup, not a scan.
+fn run_offset(col: &FrozenColumn, id: u32, p: usize) -> usize {
     let list = &col.postings[id as usize];
     let runs = &col.pos_runs[id as usize];
-    let ends = &col.run_ends[id as usize];
-    let offset_of = |p: usize| -> usize {
-        if p == list.len() {
-            return runs.len();
-        }
-        let block = p / RUN_END_STRIDE;
-        let mut at = match block {
-            0 => 0,
-            _ => ends[block - 1] as usize,
-        };
-        for &(_, tf) in &list[block * RUN_END_STRIDE..p] {
-            skip_run(runs, &mut at, tf).expect("builder-encoded run");
-        }
-        at
+    if p == list.len() {
+        return runs.len();
+    }
+    let block = p / RUN_END_STRIDE;
+    let mut at = match block {
+        0 => 0,
+        _ => col.run_ends[id as usize][block - 1] as usize,
     };
-    &runs[offset_of(lo)..offset_of(hi)]
+    for &(_, tf) in &list[block * RUN_END_STRIDE..p] {
+        skip_run(runs, &mut at, tf).expect("builder-encoded run");
+    }
+    at
 }
 
 /// Emit one column from a lane view, merged term by term over the view's
@@ -4258,10 +4284,10 @@ fn emit_lanes_column<W: Write>(
     // The runs of a term several lanes hold, in merged posting order: a
     // byte range of one lane's runs per stretch taken, copied as they are.
     let mut merged_runs: Vec<u8> = Vec::new();
-    // The lanes holding the current term: the stretch of the list in the
-    // view, its run bytes, how far into both the merge has read, and the
-    // lane's row stretch its next document is in.
-    let mut holders: Vec<(usize, &[(u32, u32)], &[u8], usize, usize, usize)> = Vec::new();
+    // The lanes holding the current term: the list, the postings of it in
+    // the view, how far the merge has read, and the lane's row stretch its
+    // next document is in.
+    let mut holders: Vec<Holder> = Vec::new();
     let mut n_emitted = 0usize;
     let mut at = 0usize;
     while at < order.len() {
@@ -4270,10 +4296,6 @@ fn emit_lanes_column<W: Write>(
             .iter()
             .position(|entry| entry.first)
             .map_or(order.len(), |n| at + 1 + n);
-        let term = {
-            let entry = order[at];
-            lanes[entry.lane as usize].columns[column].term(entry.id)
-        };
         holders.clear();
         for entry in &order[at..group_end] {
             let lane = entry.lane as usize;
@@ -4283,55 +4305,78 @@ fn emit_lanes_column<W: Write>(
                 continue;
             }
             let col = &lanes[lane].columns[column];
-            let list = &col.postings[entry.id as usize];
             // A list within the piece is taken whole; one that spans pieces
             // has its cuts recorded.
-            let (lo, hi) = match (
-                first >= range.start && last < range.end,
-                col.cut_at[entry.id as usize],
-            ) {
-                (true, _) => (0, list.len()),
-                (false, at) => {
-                    let at = at as usize + view.piece;
-                    (col.cuts[at] as usize, col.cuts[at + 1] as usize)
-                }
+            let (lo, hi) = if first >= range.start && last < range.end {
+                (0, col.postings[entry.id as usize].len())
+            } else {
+                let at = col.cut_at[entry.id as usize] as usize + view.piece;
+                (col.cuts[at] as usize, col.cuts[at + 1] as usize)
             };
             if lo == hi {
                 continue;
             }
-            let runs: &[u8] = match col_positions {
-                true => run_bytes(col, entry.id, lo, hi),
-                false => &[],
-            };
-            holders.push((lane, &list[lo..hi], runs, 0, 0, 0));
+            holders.push(Holder {
+                lane,
+                col,
+                id: entry.id,
+                pos: lo,
+                hi,
+                read: match col_positions {
+                    true => run_offset(col, entry.id, lo),
+                    false => 0,
+                },
+                cursor: 0,
+            });
         }
         at = group_end;
         if holders.is_empty() {
             continue;
         }
+        let term = {
+            let entry = order[at - 1];
+            lanes[entry.lane as usize].columns[column].term(entry.id)
+        };
         pairs.clear();
         let term_positions: Option<(&mut PositionsSink, TermRuns<'_>)> = if holders.len() == 1 {
-            let (lane, list, runs, _, _, _) = holders[0];
+            let Holder {
+                lane,
+                col,
+                id,
+                pos: lo,
+                hi,
+                ..
+            } = holders[0];
             let stretches = &lanes[lane].stretches;
             let mut cursor = 0usize;
             pairs.extend(
-                list.iter()
+                col.postings[id as usize][lo..hi]
+                    .iter()
                     .map(|&(doc, tf)| (row_of(stretches, &mut cursor, doc) - first_row, tf)),
             );
-            col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(runs)))
+            // Only a positional column has runs to slice.
+            let from = holders[0].read;
+            col_positions.then(|| {
+                (
+                    &mut *positions_sink,
+                    TermRuns::Encoded(&col.pos_runs[id as usize][from..run_offset(col, id, hi)]),
+                )
+            })
         } else {
             // A merge of ascending runs. A lane's documents of a batch are
             // one stretch of rows, so the holder with the lowest next row
             // is taken in a stretch, up to the next row any other holder
             // has, before the holders are compared again; its runs for the
-            // stretch are one byte range, copied without decoding.
+            // stretch are one byte range, located by the recorded run
+            // ends and copied without decoding.
             merged_runs.clear();
             loop {
                 let mut lowest: Option<(usize, u32)> = None;
                 let mut bound = u32::MAX;
-                for (h, (lane, list, _, pos, _, cursor)) in holders.iter_mut().enumerate() {
-                    if let Some(&(doc, _)) = list.get(*pos) {
-                        let row = row_of(&lanes[*lane].stretches, cursor, doc);
+                for (h, holder) in holders.iter_mut().enumerate() {
+                    if holder.pos < holder.hi {
+                        let (doc, _) = holder.col.postings[holder.id as usize][holder.pos];
+                        let row = row_of(&lanes[holder.lane].stretches, &mut holder.cursor, doc);
                         match lowest {
                             Some((_, r)) if row >= r => bound = bound.min(row),
                             Some((_, r)) => {
@@ -4345,23 +4390,27 @@ fn emit_lanes_column<W: Write>(
                 let Some((h, _)) = lowest else {
                     break;
                 };
-                let (lane, list, runs, pos, read, cursor) = &mut holders[h];
-                let stretches = &lanes[*lane].stretches;
-                let from = *read;
-                while let Some(&(doc, tf)) = list.get(*pos) {
-                    let row = row_of(stretches, cursor, doc);
+                let holder = &mut holders[h];
+                let stretches = &lanes[holder.lane].stretches;
+                let list = &holder.col.postings[holder.id as usize];
+                let mut to = holder.pos;
+                while to < holder.hi {
+                    let (doc, tf) = list[to];
+                    let row = row_of(stretches, &mut holder.cursor, doc);
                     if row >= bound {
                         break;
                     }
                     pairs.push((row - first_row, tf));
-                    if col_positions {
-                        skip_run(runs, read, tf).expect("builder-encoded run");
-                    }
-                    *pos += 1;
+                    to += 1;
                 }
                 if col_positions {
-                    merged_runs.extend_from_slice(&runs[from..*read]);
+                    let from = holder.read;
+                    holder.read_to(to);
+                    merged_runs.extend_from_slice(
+                        &holder.col.pos_runs[holder.id as usize][from..holder.read],
+                    );
                 }
+                holder.pos = to;
             }
             col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(&merged_runs)))
         };
