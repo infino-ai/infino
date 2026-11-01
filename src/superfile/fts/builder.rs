@@ -98,6 +98,7 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
+use rayon::{current_num_threads, prelude::*};
 use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
@@ -1553,7 +1554,10 @@ pub(crate) struct FrozenLanes {
 }
 
 /// Merge `lanes`' dictionaries, column by column, into the order the
-/// pieces walk. The lanes must hold the same columns.
+/// pieces walk. The lanes must hold the same columns. The term space is
+/// cut into as many ranges as the pool has threads, at terms taken from
+/// the longest lane's dictionary, and the ranges merge side by side: a
+/// term is one value in every lane, so no term straddles a cut.
 pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildError> {
     if lanes.len() > usize::from(u8::MAX) {
         return Err(BuildError::Io(Error::other("too many fts lanes")));
@@ -1566,40 +1570,91 @@ pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildE
         )));
     }
     let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
+    let ranges = current_num_threads().max(1);
     let order = (0..n_columns)
         .map(|column| {
-            // A min-heap of each lane's next term; ties pop in lane order.
-            let mut heap: BinaryHeap<Reverse<(&str, u8, u32)>> = BinaryHeap::new();
-            let mut next = vec![0usize; lanes.len()];
-            for (i, lane) in lanes.iter().enumerate() {
-                let col = &lane.columns[column];
-                if let Some(&id) = col.by_lex.first() {
-                    heap.push(Reverse((col.term(id), i as u8, id)));
-                }
-            }
-            let total: usize = lanes
+            let longest = lanes
                 .iter()
-                .map(|lane| lane.columns[column].by_lex.len())
-                .sum();
-            let mut order = Vec::with_capacity(total);
-            let mut last: Option<&str> = None;
-            while let Some(Reverse((term, lane, id))) = heap.pop() {
-                order.push(OrderedTerm {
-                    id,
-                    lane,
-                    first: last != Some(term),
-                });
-                last = Some(term);
-                let col = &lanes[lane as usize].columns[column];
-                next[lane as usize] += 1;
-                if let Some(&id) = col.by_lex.get(next[lane as usize]) {
-                    heap.push(Reverse((col.term(id), lane, id)));
-                }
-            }
-            order
+                .map(|lane| &lane.columns[column])
+                .max_by_key(|col| col.by_lex.len());
+            let Some(longest) = longest else {
+                return Vec::new();
+            };
+            // The terms the ranges start at, after the first.
+            let pivots: Vec<&str> = (1..ranges)
+                .map(|r| longest.by_lex.len() * r / ranges)
+                .filter_map(|at| longest.by_lex.get(at))
+                .map(|&id| longest.term(id))
+                .collect();
+            // Each lane's dictionary index at every cut.
+            let cuts: Vec<Vec<usize>> = lanes
+                .iter()
+                .map(|lane| {
+                    let col = &lane.columns[column];
+                    let mut cuts = vec![0usize];
+                    cuts.extend(
+                        pivots
+                            .iter()
+                            .map(|pivot| col.by_lex.partition_point(|&id| col.term(id) < *pivot)),
+                    );
+                    cuts.push(col.by_lex.len());
+                    cuts
+                })
+                .collect();
+            let merged: Vec<Vec<OrderedTerm>> = (0..pivots.len() + 1)
+                .into_par_iter()
+                .map(|range| {
+                    merge_term_range(
+                        &lanes,
+                        column,
+                        &cuts
+                            .iter()
+                            .map(|c| c[range]..c[range + 1])
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            merged.concat()
         })
         .collect();
     Ok(FrozenLanes { lanes, order })
+}
+
+/// Merge the dictionary entries `spans[lane]` of every lane's `column`
+/// into one order, ties adjacent in lane order with the first flagged.
+fn merge_term_range(
+    lanes: &[FrozenLane],
+    column: usize,
+    spans: &[Range<usize>],
+) -> Vec<OrderedTerm> {
+    // A min-heap of each lane's next term; ties pop in lane order.
+    let mut heap: BinaryHeap<Reverse<(&str, u8, u32)>> = BinaryHeap::new();
+    let mut next: Vec<usize> = spans.iter().map(|span| span.start).collect();
+    for (i, lane) in lanes.iter().enumerate() {
+        let col = &lane.columns[column];
+        if next[i] < spans[i].end {
+            let id = col.by_lex[next[i]];
+            heap.push(Reverse((col.term(id), i as u8, id)));
+        }
+    }
+    let mut order = Vec::with_capacity(spans.iter().map(ExactSizeIterator::len).sum());
+    let mut last: Option<&str> = None;
+    while let Some(Reverse((term, lane, id))) = heap.pop() {
+        order.push(OrderedTerm {
+            id,
+            lane,
+            first: last != Some(term),
+        });
+        last = Some(term);
+        let i = lane as usize;
+        let col = &lanes[i].columns[column];
+        next[i] += 1;
+        if next[i] < spans[i].end {
+            let id = col.by_lex[next[i]];
+            heap.push(Reverse((col.term(id), lane, id)));
+        }
+    }
+    order
 }
 
 /// What a build finishes from in place of its own accumulator: the
@@ -4135,31 +4190,45 @@ fn emit_lanes_column<W: Write>(
             );
             col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(runs)))
         } else {
-            // A merge of ascending runs: the holder whose next posting is
-            // the lowest row goes next.
+            // A merge of ascending runs. A lane's documents of a batch are
+            // one stretch of rows, so the holder with the lowest next row
+            // is taken in a stretch, up to the next row any other holder
+            // has, before the holders are compared again.
             values.clear();
             starts.clear();
             loop {
                 let mut lowest: Option<(usize, u32)> = None;
+                let mut bound = u32::MAX;
                 for (h, (lane, list, _, pos, _)) in holders.iter().enumerate() {
                     if let Some(&(doc, _)) = list.get(*pos) {
                         let row = lanes[*lane].rows[doc as usize];
-                        if lowest.is_none_or(|(_, r)| row < r) {
-                            lowest = Some((h, row));
+                        match lowest {
+                            Some((_, r)) if row >= r => bound = bound.min(row),
+                            Some((_, r)) => {
+                                bound = r;
+                                lowest = Some((h, row));
+                            }
+                            None => lowest = Some((h, row)),
                         }
                     }
                 }
-                let Some((h, row)) = lowest else {
+                let Some((h, _)) = lowest else {
                     break;
                 };
-                let (_, list, runs, pos, read) = &mut holders[h];
-                let (_, tf) = list[*pos];
-                pairs.push((row - first_row, tf));
-                if col_positions {
-                    starts.push(values.len());
-                    TermRuns::Encoded(runs).push_run(*pos, tf, read, &mut values);
+                let (lane, list, runs, pos, read) = &mut holders[h];
+                let rows = &lanes[*lane].rows;
+                while let Some(&(doc, tf)) = list.get(*pos) {
+                    let row = rows[doc as usize];
+                    if row >= bound {
+                        break;
+                    }
+                    pairs.push((row - first_row, tf));
+                    if col_positions {
+                        starts.push(values.len());
+                        TermRuns::Encoded(runs).push_run(*pos, tf, read, &mut values);
+                    }
+                    *pos += 1;
                 }
-                *pos += 1;
             }
             col_positions.then_some((
                 &mut *positions_sink,
