@@ -873,6 +873,18 @@ pub(crate) async fn load_state(
         .entries)
 }
 
+/// Whether the blob at `uri` holds a pending drain checkpoint, from its first bytes.
+pub(crate) async fn has_pending_drain(
+    storage: &dyn StorageProvider,
+    uri: &str,
+) -> Result<bool, SlowVectorStateError> {
+    let head = storage
+        .get_range(uri, 0..CHECKPOINT_MAGIC.len() as u64)
+        .await
+        .map_err(|error| SlowVectorStateError::Storage(error.to_string()))?;
+    Ok(head.as_ref() == CHECKPOINT_MAGIC)
+}
+
 pub(crate) async fn load_full_state(
     storage: &dyn StorageProvider,
     uri: &str,
@@ -1333,6 +1345,31 @@ mod tests {
                 .clusters
                 .vectors_resident(),
             "pending entries keep fp32 inline for drain resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_pending_drain_reads_only_the_checkpoint_marker() {
+        let dir = tempdir().expect("tempdir");
+        let storage = LocalFsStorageProvider::new(dir.path()).expect("provider");
+        let entries = vec![entry_with_summary(FIRST_N_DOCS, 1)];
+        let settled = write_state(&storage, &entries, None).await.expect("write");
+        assert!(
+            !has_pending_drain(&storage, &settled.uri)
+                .await
+                .expect("settled")
+        );
+        let pending = PendingDrainState {
+            metadata: b"epoch".to_vec(),
+            entries: vec![entry_with_summary(SECOND_N_DOCS, 2)],
+        };
+        let checkpoint = write_state_with_pending_drain(&storage, &entries, &pending, None)
+            .await
+            .expect("checkpoint write");
+        assert!(
+            has_pending_drain(&storage, &checkpoint.uri)
+                .await
+                .expect("checkpoint")
         );
     }
 

@@ -140,6 +140,15 @@ fn flat_visible_bytes(column: &dyn Array) -> u64 {
         .unwrap_or_else(|_| column.get_array_memory_size()) as u64
 }
 
+/// The first and last of a window's offsets: the range of child values, or
+/// string bytes, its rows address.
+pub(crate) fn offset_window<O: OffsetSizeTrait>(offsets: &[O]) -> (usize, usize) {
+    match (offsets.first(), offsets.last()) {
+        (Some(first), Some(last)) => (first.as_usize(), last.as_usize()),
+        _ => (0, 0),
+    }
+}
+
 /// A list column's own buffers plus only the slice of its values array
 /// that this window addresses.
 fn list_window_bytes<O: OffsetSizeTrait>(column: &dyn Array) -> u64 {
@@ -149,10 +158,7 @@ fn list_window_bytes<O: OffsetSizeTrait>(column: &dyn Array) -> u64 {
     let offsets = list.value_offsets();
     // An empty window addresses no child rows; its own offset buffer still
     // costs something, which `own` below covers.
-    let (start, end) = match (offsets.first(), offsets.last()) {
-        (Some(first), Some(last)) => (first.as_usize(), last.as_usize()),
-        _ => (0, 0),
-    };
+    let (start, end) = offset_window(offsets);
     let own = mem::size_of_val(offsets) as u64 + null_bitmap_visible_bytes(column);
     let child = if end > start {
         visible_array_bytes(list.values().slice(start, end - start).as_ref())

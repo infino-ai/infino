@@ -174,8 +174,8 @@ pub(crate) fn verify_superfile_vector_codecs(
     Ok(())
 }
 
-/// Open one superfile for **compaction**, with its bytes locally available for
-/// *synchronous* reads.
+/// Open one whole superfile with its bytes locally available for *synchronous*
+/// reads.
 ///
 /// Compaction's Sq8 IVF merge reads each input's centroid/code subsection via
 /// `VectorReader::try_get_range_sync` and its id column via
@@ -190,7 +190,7 @@ pub(crate) fn verify_superfile_vector_codecs(
 /// `MADV_DONTNEED` sweep — so this does **not** pull whole superfiles into the
 /// heap (the whole point of the streamed/mmap design). Falls back to the query
 /// opener when no disk cache is configured.
-pub(crate) async fn open_compaction_input(
+pub(crate) async fn open_whole_superfile(
     store: &Arc<dyn SuperfileReaderCache>,
     disk_cache: Option<&Arc<DiskCacheStore>>,
     storage: Option<&Arc<dyn StorageProvider>>,

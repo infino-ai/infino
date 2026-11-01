@@ -522,7 +522,7 @@ resident it is served from a local memory-mapped file. The cache tracks
 residency per superfile and is bounded by a configurable budget, evicting
 cold superfiles when the budget is reached.
 
-Between those two states, the ranges a cold query reads are kept in a sparse local block file, in 512 KiB blocks, so reading them again is local. The query gets its bytes as soon as they are fetched; writing them to the block file happens afterwards, off the query's thread, so a query doesn't wait on a disk busy with background downloads. The block file's index lists only blocks already safely on disk, so after a restart the cache reuses them and fetches only what was not written yet.
+Between those two states, the ranges a cold query reads are kept in a sparse local block file, in 64 KiB blocks, so reading them again is local. The query gets its bytes as soon as they are fetched; writing them to the block file happens afterwards, off the query's thread, so a query doesn't wait on a disk busy with background downloads. The block file's index lists only blocks already safely on disk, so after a restart the cache reuses them and fetches only what was not written yet. The index also names the block file it was written for, so it is never trusted for a newer file created at the same path.
 
 The cache distinguishes on-disk residency from memory residency. An
 optional memory budget bounds the mapped working set rather than the

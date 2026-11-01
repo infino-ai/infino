@@ -63,7 +63,6 @@ pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
 use rebase::{OrdinalShift, rebase_layer, remove_spilled};
-use tempfile::Builder as TempDirBuilder;
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet};
@@ -759,9 +758,7 @@ pub(crate) async fn fold_tail(
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
     while let Some(run) = next_fold(root, policy) {
-        let scratch = TempDirBuilder::new()
-            .prefix("infino-term-index-fold-")
-            .tempdir()?;
+        let scratch = scratch_dir(policy.scratch_root.as_deref())?;
         let sources = download_layers(storage, &root.layers[run.clone()], scratch.path()).await?;
         // Every ordinal keeps its place: the fold renumbers nothing.
         let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();

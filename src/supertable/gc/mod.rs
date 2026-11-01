@@ -278,7 +278,7 @@ async fn refresh_to_committed(inner: &SupertableInner) -> Result<(), GcError> {
 /// Keep-set for the manifest this handle currently holds. Callers run [`refresh_to_committed`]
 /// first; this reads no pointer of its own.
 ///
-/// Not cheap on a table carrying slow-CAS vector state: hydrating the pending drain re-fetches that
+/// Not cheap on a table with a pending drain checkpoint: hydrating the pending drain re-fetches that
 /// blob and re-hashes it, which is multi-GiB work on a large table. Build it once per manifest
 /// version, never speculatively.
 async fn live_set(
@@ -288,7 +288,11 @@ async fn live_set(
     let manifest = inner.manifest.load_full();
     let (mut uris, superfiles_complete) = build_live_set(&manifest);
 
-    if let Some((uri, hash)) = manifest.slow_vector_state_blob() {
+    if let Some((uri, hash)) = manifest.slow_vector_state_blob()
+        && slow_vector_state::has_pending_drain(storage.as_ref(), uri)
+            .await
+            .unwrap_or(true)
+    {
         // An unreadable slow-state blob is a permanent storage-level failure
         // on that URI (missing, corrupt, or hash-mismatched bytes) — surface
         // it through the existing `Storage` variant rather than a dedicated
@@ -944,6 +948,45 @@ mod tests {
         let (live, superfiles_complete) = build_live_set(&bare);
         assert!(superfiles_complete);
         assert!(!live.contains(&uri));
+    }
+
+    /// Files named by a pending drain checkpoint stay live; a settled blob adds none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_set_keeps_pending_checkpoint_files_only() {
+        let dir = tempdir().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(Arc::clone(&storage)))
+                .expect("create");
+        let pinned = sf_entry(SuperfileUri(Uuid::new_v4()));
+        let pending = slow_vector_state::PendingDrainState {
+            metadata: b"epoch".to_vec(),
+            entries: vec![Arc::clone(&pinned)],
+        };
+        let checkpoint = slow_vector_state::write_state_with_pending_drain(
+            storage.as_ref(),
+            &[],
+            &pending,
+            None,
+        )
+        .await
+        .expect("checkpoint");
+        let settled = slow_vector_state::write_state(storage.as_ref(), &[], None)
+            .await
+            .expect("settled");
+        for (published, kept) in [(checkpoint, true), (settled, false)] {
+            let manifest = st.inner().manifest.load_full().with_slow_vector_state(
+                published.uri,
+                published.content_hash,
+                published.centroids,
+                None,
+                None,
+            );
+            st.inner().manifest.store(Arc::new(manifest));
+            let live = live_set(st.inner(), &storage).await.expect("live set");
+            assert_eq!(live.uris.contains(&pinned.storage_path()), kept);
+        }
     }
 
     /// A referenced centroid-router section is live and survives a sweep. The

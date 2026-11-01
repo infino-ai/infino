@@ -6,6 +6,7 @@
 
 use std::{
     fs,
+    os::unix::fs::MetadataExt,
     path::Path,
     sync::{Arc, atomic::Ordering},
     time::SystemTime,
@@ -266,7 +267,7 @@ impl DiskCacheStore {
             return None;
         }
         let idx_bytes = fs::read(self.blocks_idx_path(uri)).ok()?;
-        let (_, filled) = indexed_filled_bytes(size, &idx_bytes)?;
+        let (_, filled) = indexed_filled_bytes(size, &idx_bytes, meta.ino())?;
         if filled == 0 {
             return None;
         }
@@ -412,7 +413,9 @@ impl DiskCacheStore {
 
     /// Keep charging the `.blocks` file of a dropped lazy entry's `source`. The source releases its
     /// own bytes on drop but leaves the file for a later open to adopt; untracked, the file would
-    /// sit on disk outside the budget, where eviction cannot reach it.
+    /// sit on disk outside the budget, where eviction cannot reach it. Skipped when the path no
+    /// longer names the source's file: a newer generation replaced it, and a record left for the
+    /// old file would later be evicted and unlink the newer one.
     pub(crate) fn retain_block_file(
         &self,
         uri: &SuperfileUri,
@@ -420,7 +423,7 @@ impl DiskCacheStore {
         now_us: u64,
     ) {
         let filled = source.filled_bytes_handle().load(Ordering::Acquire);
-        if filled == 0 {
+        if filled == 0 || !source.path_names_its_file() {
             return;
         }
         self.current_bytes.fetch_add(filled, Ordering::Release);
@@ -437,8 +440,7 @@ impl DiskCacheStore {
     /// [`Self::retain_block_file`] for a block source dropped before its entry was admitted (an
     /// open that failed, was cancelled, or lost its slot to a whole file). Such a source writes no
     /// blocks, so what it holds is a file it adopted, whose record it took over. Skipped when a
-    /// lazy entry holds `uri`, whose own source owns the path, and when the path no longer names
-    /// the file this source adopted.
+    /// lazy entry holds `uri`, whose own source owns the path.
     pub(crate) fn retain_unadmitted_block_file(
         &self,
         uri: &SuperfileUri,
@@ -448,7 +450,7 @@ impl DiskCacheStore {
             .cached
             .get(uri)
             .is_some_and(|entry| entry.block_source().is_some());
-        if !lazy_entry_owns_path && source.path_names_its_file() {
+        if !lazy_entry_owns_path {
             self.retain_block_file(uri, source, self.now_us());
         }
     }
@@ -856,7 +858,7 @@ mod tests {
         supertable::{
             manifest::SuperfileUri,
             reader_cache::{
-                block_source::CACHE_BLOCK_BYTES,
+                block_source::{CACHE_BLOCK_BYTES, serialize_index},
                 config::DiskCacheConfig,
                 disk::{store_files::*, test_support::*},
             },
@@ -1160,6 +1162,25 @@ mod tests {
         assert_eq!(reopened.stats().current_bytes, 0);
     }
 
+    /// An index that names another file (left by a generation that lost a rename
+    /// race to a newer file at the path) is not trusted at restart: both files
+    /// go and nothing is charged.
+    #[tokio::test]
+    async fn restart_scan_deletes_a_block_file_whose_index_names_another_file() {
+        let (_dir, store) = test_store();
+        let uri = SuperfileUri::new_v4();
+        seed_valid_block_file(&store, &uri, 2 * CACHE_BLOCK_BYTES, &[0]);
+        let ino = fs::metadata(store.blocks_path(&uri)).expect("blocks").ino();
+        let stale = serialize_index(&RoaringBitmap::from_iter([0]), ino + 1);
+        fs::write(store.blocks_idx_path(&uri), stale).expect("idx");
+
+        let reopened = reopen_store(&store, |_| {});
+
+        assert!(!reopened.blocks_path(&uri).exists());
+        assert!(!reopened.blocks_idx_path(&uri).exists());
+        assert_eq!(reopened.stats().current_bytes, 0);
+    }
+
     #[tokio::test]
     async fn restart_scan_sweeps_stale_index_tempfiles_and_spares_fresh_ones() {
         let (_dir, store) = test_store();
@@ -1197,37 +1218,25 @@ mod tests {
         );
     }
 
-    /// The block size older builds indexed block files with.
-    const OLDER_BLOCK_BYTES: u64 = 512 * 1024;
-
-    /// A block file an older build indexed with larger blocks is kept by the
-    /// restart scan and counted at the bytes it holds, its last block clipped to
-    /// the file.
+    /// A block file an older build indexed is deleted by the restart scan and
+    /// not counted, whatever block size the index names: such an index names no
+    /// file, so it may describe an earlier file at the path.
     #[tokio::test]
-    async fn restart_scan_counts_a_block_file_indexed_with_larger_blocks() {
-        let (_dir, store) = test_store();
-        let uri = SuperfileUri::new_v4();
-        let size = OLDER_BLOCK_BYTES + 1000;
-        let f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(store.blocks_path(&uri))
-            .expect("blocks");
-        f.set_len(size).expect("set_len");
-        let mut idx = OLDER_BLOCK_BYTES.to_le_bytes().to_vec();
-        RoaringBitmap::from_iter([0u32, 1])
-            .serialize_into(&mut idx)
-            .expect("serialize");
-        fs::write(store.blocks_idx_path(&uri), idx).expect("idx");
+    async fn restart_scan_deletes_a_block_file_an_older_build_indexed() {
+        for block in OLDER_BUILD_BLOCK_BYTES {
+            let (_dir, store) = test_store();
+            let uri = SuperfileUri::new_v4();
+            fs::File::create(store.blocks_path(&uri))
+                .expect("blocks")
+                .set_len(2 * block)
+                .expect("set_len");
+            fs::write(store.blocks_idx_path(&uri), unstamped_index(block, &[0, 1])).expect("idx");
 
-        let reopened = reopen_store(&store, |_| {});
-        assert!(reopened.blocks_path(&uri).exists(), "kept for adoption");
-        assert_eq!(
-            reopened.stats().current_bytes,
-            size,
-            "both older blocks, the second clipped to the file"
-        );
+            let reopened = reopen_store(&store, |_| {});
+            assert!(!reopened.blocks_path(&uri).exists(), "{block}-byte blocks");
+            assert!(!reopened.blocks_idx_path(&uri).exists());
+            assert_eq!(reopened.stats().current_bytes, 0);
+        }
     }
 
     #[tokio::test]

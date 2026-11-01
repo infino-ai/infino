@@ -46,6 +46,7 @@ use datafusion::{
 use crate::{
     memory::ConnectionMemoryBudget,
     supertable::query::{
+        join_build_size::RightSizeJoinBuild,
         limit_stage::StageLimitGathers,
         read_ahead_rule::ReadAheadOff,
         sorted_root::{KeepSortedRoot, OrderUnderScalarSubquery},
@@ -164,6 +165,13 @@ pub(crate) fn budgeted_session_context(
     //  - `OrderUnderScalarSubquery` before DataFusion's `OutputRequirements`,
     //    which on DataFusion 54 loses the `ORDER BY` of a query under a
     //    `ScalarSubqueryExec` root.
+    //  - `RightSizeJoinBuild` after DataFusion's, for two reasons: its node
+    //    passes no filter or projection down, so it must not be in the plan
+    //    while DataFusion pushes those into a join's build side, and
+    //    `JoinSelection` swaps join sides, which would carry a node placed
+    //    earlier onto the probe side. It copies build columns whose buffers
+    //    are much larger than their rows, so the join is charged for the rows
+    //    it keeps.
     //  - `KeepSortedRoot` after DataFusion's rules, to remove the round-robin
     //    repartition that `EnforceDistribution` adds above a sorted result,
     //    which would return an `ORDER BY` out of order.
@@ -175,6 +183,7 @@ pub(crate) fn budgeted_session_context(
     let mut rules = PhysicalOptimizer::new().rules;
     rules.insert(0, Arc::new(RowFilterUnderTopK));
     rules.insert(1, Arc::new(OrderUnderScalarSubquery));
+    rules.push(Arc::new(RightSizeJoinBuild));
     rules.push(Arc::new(KeepSortedRoot));
     rules.push(Arc::new(StageLimitGathers));
     rules.push(Arc::new(ReadAheadOff));
@@ -194,19 +203,25 @@ pub(crate) fn budgeted_session_context(
 mod tests {
     use datafusion::{
         arrow::{
-            array::{Int64Array, StringArray, StringViewArray},
-            datatypes::{DataType, Field, Schema},
+            array::{AsArray, Int64Array, StringArray, StringViewArray},
+            datatypes::{DataType, Field, Int64Type, Schema},
             record_batch::RecordBatch,
             util::display::array_value_to_string,
         },
-        datasource::MemTable,
+        datasource::{MemTable, TableProvider},
         execution::memory_pool::MemoryConsumer,
-        physical_plan::{ExecutionPlan, collect},
+        physical_plan::{ExecutionPlan, collect, displayable, metrics::MetricsSet},
     };
     use tokio::runtime::Runtime;
 
     use super::*;
-    use crate::memory::tests::Holder;
+    use crate::{memory::tests::Holder, supertable::query::join_build_size::RIGHT_SIZED_BATCHES};
+
+    /// Rows per input batch in the tests below: DataFusion's default batch
+    /// size.
+    const BATCH_ROWS: usize = 8 * 1024;
+    /// Partitions the partitioned hash join test runs on.
+    const JOIN_PARTITIONS: usize = 4;
 
     #[test]
     fn measured_pool_never_refuses() {
@@ -286,13 +301,16 @@ mod tests {
         assert_eq!(pool.reserved(), 5000);
     }
 
-    // Total `spill_count` across the plan tree; the sort reports it on its node.
-    fn total_spill_count(plan: &dyn ExecutionPlan) -> usize {
-        let here = plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0);
+    // Sum, over the whole plan tree, of the metric `read` picks from each node.
+    fn total_metric(
+        plan: &dyn ExecutionPlan,
+        read: &dyn Fn(&MetricsSet) -> Option<usize>,
+    ) -> usize {
+        let here = plan.metrics().and_then(|m| read(&m)).unwrap_or(0);
         here + plan
             .children()
             .iter()
-            .map(|c| total_spill_count(c.as_ref()))
+            .map(|c| total_metric(c.as_ref(), read))
             .sum::<usize>()
     }
 
@@ -341,7 +359,11 @@ mod tests {
             .await
             .expect("collect");
         let rows: usize = out.iter().map(|b| b.num_rows()).sum();
-        (rows, is_sorted(&out), total_spill_count(plan.as_ref()))
+        (
+            rows,
+            is_sorted(&out),
+            total_metric(plan.as_ref(), &MetricsSet::spill_count),
+        )
     }
 
     #[test]
@@ -356,7 +378,6 @@ mod tests {
         //   sort buffer         8.8 MiB   (gate - reservation)
         //   data               32 MiB     (524,288 rows x 64 B)
         const ROWS: usize = 512 * 1024; // 524,288 rows
-        const CHUNK: usize = 8 * 1024; // 8,192/batch -> 512 KiB, 64 batches
         const RESERVATION: usize = 20 * 1024 * 1024; // big, to shrink the buffer
 
         // Column `s`: 8-digit key + 56 B filler = 64 B/row, keys counting DOWN so
@@ -367,8 +388,9 @@ mod tests {
         let filler = "x".repeat(56);
         let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
         let mut batches = Vec::new();
-        for start in (0..ROWS).step_by(CHUNK) {
-            let vals: Vec<String> = (start..(start + CHUNK).min(ROWS))
+        // BATCH_ROWS per batch -> 512 KiB, 64 batches.
+        for start in (0..ROWS).step_by(BATCH_ROWS) {
+            let vals: Vec<String> = (start..(start + BATCH_ROWS).min(ROWS))
                 .map(|i| format!("{:08}{filler}", ROWS - 1 - i))
                 .collect();
             batches.push(
@@ -587,6 +609,130 @@ mod tests {
                 .await;
             let err = result.expect_err("a many-row scalar subquery fails");
             assert!(err.to_string().contains("more than one row"), "{err}");
+        });
+    }
+
+    /// Runs `sql` over tables `a` (`small`) and `b` (`large`) with its hash
+    /// join in `mode`: one partition for `CollectLeft`, or `JOIN_PARTITIONS`
+    /// partitions with every build too big to collect for `Partitioned`.
+    /// Returns the result and the plan's total `RIGHT_SIZED_BATCHES`.
+    async fn run_join(
+        ctx: SessionContext,
+        tables: &[(&str, Arc<MemTable>)],
+        mode: &str,
+        sql: &str,
+    ) -> DfResult<(Vec<RecordBatch>, usize)> {
+        let partitions = if mode == "Partitioned" {
+            JOIN_PARTITIONS
+        } else {
+            1
+        };
+        ctx.sql(&format!(
+            "SET datafusion.execution.target_partitions = {partitions}"
+        ))
+        .await?;
+        if mode == "Partitioned" {
+            for threshold in [
+                "hash_join_single_partition_threshold",
+                "hash_join_single_partition_threshold_rows",
+            ] {
+                ctx.sql(&format!("SET datafusion.optimizer.{threshold} = 0"))
+                    .await?;
+            }
+        }
+        for (name, table) in tables {
+            ctx.register_table(*name, Arc::clone(table) as Arc<dyn TableProvider>)?;
+        }
+        let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+        let shape = displayable(plan.as_ref()).indent(true).to_string();
+        assert!(shape.contains(&format!("mode={mode}")), "{shape}");
+        let out = collect(Arc::clone(&plan), ctx.task_ctx()).await?;
+        let right_sized = total_metric(plan.as_ref(), &|m| {
+            m.sum_by_name(RIGHT_SIZED_BATCHES).map(|v| v.as_usize())
+        });
+        Ok((out, right_sized))
+    }
+
+    /// An aggregate's result feeding a hash join's build side fits a 64 MiB
+    /// budget only with `RightSizeJoinBuild`, with the join collecting one
+    /// build and with it partitioned: without the rule every 8,192-row slice
+    /// of the aggregate's result is charged for the whole buffers behind it.
+    /// The outer query reads both `g.k` and `g.s`, so the build holds both
+    /// columns:
+    ///
+    ///   aggregate result  300,000 groups, key + sum buffers of ~4 MiB capacity each
+    ///   build, charged    37 slices x ~8 MiB ≈ 300 MiB without the rule
+    ///   build, real       ~5 MB
+    ///   gate              57.6 MiB (90% of 64 MiB configured)
+    ///
+    /// The second session is plain DataFusion on the same budgeted runtime, so
+    /// it has none of our rules or settings; it shows the budget is too small
+    /// for the uncopied build. On DataFusion 55, which counts a
+    /// buffer shared by several batches once, it fits too and this half fails;
+    /// revisit the rule then (see its module docs).
+    #[test]
+    fn an_aggregate_feeding_a_join_build_fits_once_its_slices_are_copied() {
+        const GROUPS: usize = 300_000;
+        const PROBE_REPEATS: usize = 4;
+        const CONFIGURED: u64 = 64 * 1024 * 1024;
+        const SQL: &str = "SELECT COUNT(*), SUM(g.s) \
+                           FROM (SELECT k, SUM(v) AS s FROM a GROUP BY k) g \
+                           JOIN b ON g.k = b.k";
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        // Row `i` has key `i % GROUPS` and value `i`.
+        let table_of = |rows: usize| -> Arc<MemTable> {
+            let batches = (0..rows)
+                .step_by(BATCH_ROWS)
+                .map(|start| {
+                    let rows = start..(start + BATCH_ROWS).min(rows);
+                    let keys =
+                        Int64Array::from_iter_values(rows.clone().map(|i| (i % GROUPS) as i64));
+                    let vals = Int64Array::from_iter_values(rows.map(|i| i as i64));
+                    RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(keys), Arc::new(vals)])
+                        .expect("batch")
+                })
+                .collect();
+            Arc::new(MemTable::try_new(Arc::clone(&schema), vec![batches]).expect("memtable"))
+        };
+        let tables = [
+            ("a", table_of(GROUPS)),
+            ("b", table_of(GROUPS * PROBE_REPEATS)),
+        ];
+        // In `a` each key is one row whose value is the key, so each group's
+        // sum is its key, and every group meets `PROBE_REPEATS` rows of `b`.
+        let expected_count = (GROUPS * PROBE_REPEATS) as i64;
+        let expected_sum = (PROBE_REPEATS * GROUPS * (GROUPS - 1) / 2) as i64;
+
+        let runtime = Runtime::new().expect("tokio runtime");
+        runtime.block_on(async {
+            for mode in ["CollectLeft", "Partitioned"] {
+                let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
+                let with_rule = budgeted_session_context(&budget).expect("session");
+                let (out, right_sized) = run_join(with_rule, &tables, mode, SQL)
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode}: fits with the rule: {e}"));
+                let column = |i: usize| out[0].column(i).as_primitive::<Int64Type>().value(0);
+                assert_eq!(column(0), expected_count, "{mode}");
+                assert_eq!(column(1), expected_sum, "{mode}");
+                assert!(right_sized > 0, "{mode}: the build's slices were copied");
+
+                let budget = ConnectionMemoryBudget::with_limit(CONFIGURED);
+                let without_rule = SessionContext::new_with_config_rt(
+                    SessionConfig::new(),
+                    budgeted_runtime(&budget).expect("runtime"),
+                );
+                let err = run_join(without_rule, &tables, mode, SQL)
+                    .await
+                    .expect_err("the same build overruns the budget without the rule");
+                assert!(
+                    matches!(err.find_root(), DataFusionError::ResourcesExhausted(_)),
+                    "{mode}: {err}"
+                );
+            }
         });
     }
 }
