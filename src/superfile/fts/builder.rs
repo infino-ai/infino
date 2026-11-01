@@ -1502,13 +1502,15 @@ pub struct FtsBuilder {
 }
 
 /// One column of a frozen lane: its terms, each id's postings with the
-/// runs' end offsets, and its per-document lengths; plus the ids in
-/// dictionary order, so a finish can walk the lanes' terms in step.
+/// runs' end offsets, and its per-document lengths. The ids here are the
+/// column's dictionary ranks: the freeze lays every table out in term
+/// order, so a finish walking the lanes' terms in step reads each lane's
+/// tables front to back instead of jumping about them in the order the
+/// terms were first seen.
 pub(crate) struct FrozenColumn {
     /// Every term's bytes, back to back, with each id's span.
     term_bytes: String,
     term_spans: Vec<(u32, u32)>,
-    by_lex: Vec<u32>,
     postings: Vec<Vec<(u32, u32)>>,
     run_ends: Vec<Vec<u32>>,
     pos_runs: Vec<Vec<u8>>,
@@ -1528,6 +1530,38 @@ impl FrozenColumn {
         let (start, len) = self.term_spans[id as usize];
         &self.term_bytes[start as usize..start as usize + len as usize]
     }
+
+    /// How many terms the column holds.
+    fn n_terms(&self) -> usize {
+        self.term_spans.len()
+    }
+
+    /// The id of the first term not before `pivot`, in dictionary order.
+    fn lower_bound(&self, pivot: &str) -> usize {
+        let (mut lo, mut hi) = (0usize, self.n_terms());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.term(mid as u32) < pivot {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
+
+/// `table` reordered so that entry `r` is the old entry `by_lex[r]`; an
+/// empty table (a store without that table) stays empty.
+fn in_lex_order<T: Default>(table: Vec<T>, by_lex: &[u32]) -> Vec<T> {
+    if table.is_empty() {
+        return table;
+    }
+    let mut table = table;
+    by_lex
+        .iter()
+        .map(|&id| mem::take(&mut table[id as usize]))
+        .collect()
 }
 
 /// A run of a lane's documents that are consecutive rows of the commit:
@@ -1661,15 +1695,15 @@ pub(crate) fn freeze_lanes(
             let longest = lanes
                 .iter()
                 .map(|lane| &lane.columns[column])
-                .max_by_key(|col| col.by_lex.len());
+                .max_by_key(|col| col.n_terms());
             let Some(longest) = longest else {
                 return Vec::new();
             };
             // The terms the ranges start at, after the first.
             let pivots: Vec<&str> = (1..ranges)
-                .map(|r| longest.by_lex.len() * r / ranges)
-                .filter_map(|at| longest.by_lex.get(at))
-                .map(|&id| longest.term(id))
+                .map(|r| longest.n_terms() * r / ranges)
+                .filter(|&at| at < longest.n_terms())
+                .map(|at| longest.term(at as u32))
                 .collect();
             // Each lane's dictionary index at every cut.
             let cuts: Vec<Vec<usize>> = lanes
@@ -1677,12 +1711,8 @@ pub(crate) fn freeze_lanes(
                 .map(|lane| {
                     let col = &lane.columns[column];
                     let mut cuts = vec![0usize];
-                    cuts.extend(
-                        pivots
-                            .iter()
-                            .map(|pivot| col.by_lex.partition_point(|&id| col.term(id) < *pivot)),
-                    );
-                    cuts.push(col.by_lex.len());
+                    cuts.extend(pivots.iter().map(|pivot| col.lower_bound(pivot)));
+                    cuts.push(col.n_terms());
                     cuts
                 })
                 .collect();
@@ -1722,7 +1752,7 @@ fn merge_term_range(
     for (i, lane) in lanes.iter().enumerate() {
         let col = &lane.columns[column];
         if next[i] < spans[i].end {
-            let id = col.by_lex[next[i]];
+            let id = next[i] as u32;
             heap.push(Reverse((col.term(id), i as u8, id)));
         }
     }
@@ -1742,7 +1772,7 @@ fn merge_term_range(
         let col = &lanes[i].columns[column];
         next[i] += 1;
         if next[i] < spans[i].end {
-            let id = col.by_lex[next[i]];
+            let id = next[i] as u32;
             heap.push(Reverse((col.term(id), lane, id)));
         }
     }
@@ -2690,12 +2720,15 @@ impl FtsBuilder {
                     ..
                 } = vocab;
                 drop(term_to_id);
+                // Every table in dictionary order: the merged walk at the
+                // finish then reads each lane front to back.
                 let (_, by_lex) = build_lex_rank(&id_to_term);
                 let mut term_bytes =
                     String::with_capacity(id_to_term.iter().map(|t| t.len()).sum());
-                let term_spans = id_to_term
+                let term_spans = by_lex
                     .iter()
-                    .map(|t| {
+                    .map(|&id| {
+                        let t = id_to_term[id as usize];
                         let start = term_bytes.len() as u32;
                         term_bytes.push_str(t);
                         (start, t.len() as u32)
@@ -2707,10 +2740,9 @@ impl FtsBuilder {
                 FrozenColumn {
                     term_bytes,
                     term_spans,
-                    by_lex,
-                    postings: ram.postings,
-                    run_ends: ram.run_ends,
-                    pos_runs: ram.pos_runs,
+                    postings: in_lex_order(ram.postings, &by_lex),
+                    run_ends: in_lex_order(ram.run_ends, &by_lex),
+                    pos_runs: in_lex_order(ram.pos_runs, &by_lex),
                     doc_lengths: col.doc_lengths,
                     tokens: col.tokens,
                     cut_at: Vec::new(),
