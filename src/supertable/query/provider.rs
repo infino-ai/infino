@@ -4206,6 +4206,50 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_column_the_scan_skips_is_never_read_through() {
+        // A scan of `a` and `c` reads both chunks whole and leaves `b`'s chunk
+        // between them unread. `b`'s chunk is wider than object_store's merge
+        // gap but within `PAGE_READ_THROUGH_BYTES`, so the gap between the two
+        // reads is exactly `b`'s chunk: still not read through, since no byte
+        // of it is wanted.
+        let file = fixture::wide_file(WIDE_ROWS_PER_GROUP, WIDE_PAGE_ROWS);
+        let skipped: Vec<Range<u64>> = file
+            .1
+            .row_groups()
+            .iter()
+            .map(|row_group| {
+                let (start, len) = row_group.column(1).byte_range();
+                start..start + len
+            })
+            .collect();
+        assert!(
+            skipped.iter().all(|chunk| {
+                let len = chunk.end - chunk.start;
+                OBJECT_STORE_COALESCE_DEFAULT < len && len <= PAGE_READ_THROUGH_BYTES
+            }),
+            "b's chunks sit between the two gaps: {skipped:?}"
+        );
+        let shape = ScanShape {
+            name: "a and c",
+            projection: Some(vec![0, 2]),
+            filter: None,
+            row_filter: false,
+            plan: None,
+            partitions: 1,
+            cached_row_groups: Vec::new(),
+        };
+        // Without read-ahead every read is fetched on demand.
+        let (run, _) = scan_through_the_cache(false, &shape, &file, GET_LATENCY).await;
+        assert_eq!(run.rows, WIDE_ROWS_PER_GROUP * fixture::GROUPS);
+        assert!(
+            !run.reads.iter().any(|read| skipped
+                .iter()
+                .any(|chunk| read.start <= chunk.start && chunk.end <= read.end)),
+            "a GET read b's whole chunk: {run:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_row_filter_reading_in_turns_downloads_each_block_once() {
         // Under a row filter the scan reads a row group's columns in turns:
         //  - a batch starts on the first of those reads;
