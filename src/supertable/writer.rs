@@ -136,8 +136,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             builder::{
-                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FtsBuilder, doc_lengths_entry_size,
-                freeze_lanes,
+                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FtsBuilder, Stretch,
+                doc_lengths_entry_size, freeze_lanes,
             },
         },
         reader::vector_layout_from_kv,
@@ -2519,7 +2519,10 @@ impl SupertableWriter {
         let lanes = live.join()?;
         let joined_ms = sealing.elapsed().as_millis();
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
-        let fed: usize = lanes.iter().map(|lane| lane.rows.len()).sum();
+        let fed: usize = lanes
+            .iter()
+            .flat_map(|lane| lane.stretches.iter().map(|s| s.len as usize))
+            .sum();
         if fed != total_rows || live.rows_fed != total_rows {
             return Err(BuildError::Store(format!(
                 "live lanes hold {fed} rows but the buffer holds {total_rows}"
@@ -2563,7 +2566,9 @@ impl SupertableWriter {
                 .into_par_iter()
                 .map(|lane| {
                     timed_kernel(&stats, || {
-                        lane.builder.freeze(lane.rows).map_err(BuildError::from)
+                        lane.builder
+                            .freeze(lane.stretches)
+                            .map_err(BuildError::from)
                     })
                 })
                 .collect::<Result<_, BuildError>>()?;
@@ -3439,11 +3444,12 @@ struct LiveLanes {
     reservations: Vec<Reservation>,
 }
 
-/// One lane: its accumulator, and the commit row each of its documents
-/// is, ascending.
+/// One lane: its accumulator, and the commit rows its documents are, as
+/// stretches — one per batch, since a lane's share of a batch is one run
+/// of rows.
 struct LiveLane {
     builder: FtsBuilder,
-    rows: Vec<u32>,
+    stretches: Vec<Stretch>,
 }
 
 impl LiveLanes {
@@ -3462,7 +3468,7 @@ impl LiveLanes {
                     .ok_or_else(|| BuildError::Store("live lanes need a text column".into()))?;
                 Ok(LiveLane {
                     builder,
-                    rows: Vec::new(),
+                    stretches: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>, BuildError>>()?;
@@ -3517,15 +3523,24 @@ impl LiveLanes {
                             let rows = batch.num_rows();
                             let (start, end) = (rows * i / n, rows * (i + 1) / n);
                             if start < end {
-                                let first_doc = lane.rows.len() as u32;
+                                let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
                                 index_fts_rows(
                                     &mut lane.builder,
                                     &col_idxs,
                                     &batch.slice(start, end - start),
                                     first_doc,
                                 )?;
-                                lane.rows
-                                    .extend(((base + start) as u32)..((base + end) as u32));
+                                let (row, len) = ((base + start) as u32, (end - start) as u32);
+                                match lane.stretches.last_mut() {
+                                    // Rows that carry straight on from the last
+                                    // stretch extend it.
+                                    Some(s) if s.row + s.len == row => s.len += len,
+                                    _ => lane.stretches.push(Stretch {
+                                        doc: first_doc,
+                                        row,
+                                        len,
+                                    }),
+                                }
                             }
                             base += rows;
                         }
@@ -16633,7 +16648,7 @@ mod tests {
             assert_eq!(w.live.is_some(), live);
             if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
                 assert_eq!(lanes.len(), THREADS, "one lane per thread");
-                assert!(lanes.iter().all(|lane| !lane.rows.is_empty()));
+                assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
                 w.live.as_mut().expect("live").lanes = Some(lanes);
             }
             w.commit().expect("commit");

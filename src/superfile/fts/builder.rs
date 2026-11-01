@@ -1525,24 +1525,64 @@ impl FrozenColumn {
     }
 }
 
+/// A run of a lane's documents that are consecutive rows of the commit:
+/// documents `doc..doc + len` are rows `row..row + len`. A lane's
+/// documents of one batch are one such run, so a lane's whole row map is
+/// a few hundred of these rather than an entry per document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stretch {
+    pub(crate) doc: u32,
+    pub(crate) row: u32,
+    pub(crate) len: u32,
+}
+
+/// The first document of `stretches` at or past row `row`, as a document
+/// index; the document count when none is. The stretches ascend in both
+/// documents and rows.
+fn docs_before_row(stretches: &[Stretch], row: u32) -> usize {
+    let i = stretches.partition_point(|s| s.row + s.len <= row);
+    match stretches.get(i) {
+        None => stretches.last().map_or(0, |s| (s.doc + s.len) as usize),
+        Some(s) if s.row >= row => s.doc as usize,
+        Some(s) => (s.doc + (row - s.row)) as usize,
+    }
+}
+
+/// The row document `doc` is, walking `stretches` from `*cursor`, which
+/// is left at the stretch holding it: a walk over ascending documents
+/// reads each stretch once.
+#[inline]
+fn row_of(stretches: &[Stretch], cursor: &mut usize, doc: u32) -> u32 {
+    while doc >= stretches[*cursor].doc + stretches[*cursor].len {
+        *cursor += 1;
+    }
+    let s = &stretches[*cursor];
+    s.row + (doc - s.doc)
+}
+
 /// A lane of a build fed as its rows arrived, frozen for the finish: the
-/// accumulator's lists, now read-only, and the commit row each of its
-/// documents is, ascending. Any stretch of the commit's rows can be cut
-/// out of a lane by row, which is what lets a commit decide how many
-/// superfiles to write once it knows how many rows it holds.
+/// accumulator's lists, now read-only, and the commit rows its documents
+/// are, as stretches. Any stretch of the commit's rows can be cut out of
+/// a lane by row, which is what lets a commit decide how many superfiles
+/// to write once it knows how many rows it holds.
 pub(crate) struct FrozenLane {
     columns: Vec<FrozenColumn>,
     shape: Vec<(String, bool)>,
-    rows: Vec<u32>,
+    stretches: Vec<Stretch>,
 }
 
 /// One term of one lane, in the merged dictionary order of a column; the
 /// entries of one term across the lanes are adjacent, the first flagged.
+/// The first and last document of the lane's list ride along, so a
+/// piece can pass over a list that misses its rows without a look at
+/// the list itself.
 #[derive(Clone, Copy)]
 struct OrderedTerm {
     id: u32,
     lane: u8,
     first: bool,
+    first_doc: u32,
+    last_doc: u32,
 }
 
 /// A commit's frozen lanes with, per column, every lane's terms in one
@@ -1640,10 +1680,13 @@ fn merge_term_range(
     let mut order = Vec::with_capacity(spans.iter().map(ExactSizeIterator::len).sum());
     let mut last: Option<&str> = None;
     while let Some(Reverse((term, lane, id))) = heap.pop() {
+        let list = &lanes[lane as usize].columns[column].postings[id as usize];
         order.push(OrderedTerm {
             id,
             lane,
             first: last != Some(term),
+            first_doc: list.first().map_or(u32::MAX, |&(d, _)| d),
+            last_doc: list.last().map_or(0, |&(d, _)| d),
         });
         last = Some(term);
         let i = lane as usize;
@@ -2536,10 +2579,11 @@ impl FtsBuilder {
         self.spill_threshold_bytes = usize::MAX;
     }
 
-    /// Freeze this lane for the finish: `rows[d]` is the commit row its
-    /// document `d` is, ascending. The vocabulary's map and arena go; the
-    /// lists stay as they are.
-    pub(crate) fn freeze(self, rows: Vec<u32>) -> Result<FrozenLane, BuildError> {
+    /// Freeze this lane for the finish: `stretches` are the commit rows
+    /// its documents are, covering documents `0..n_docs` in order with the
+    /// rows ascending. The vocabulary's map and arena go; the lists stay as
+    /// they are.
+    pub(crate) fn freeze(self, stretches: Vec<Stretch>) -> Result<FrozenLane, BuildError> {
         if !self.lane_mode {
             return Err(BuildError::Io(Error::other(
                 "only a builder in lane mode can be frozen",
@@ -2553,9 +2597,20 @@ impl FtsBuilder {
                 "an fts lane that spilled cannot be frozen",
             )));
         }
-        if rows.len() != self.n_docs as usize || !rows.is_sorted_by(|a, b| a < b) {
+        let mut docs = 0u32;
+        let mut row_end = 0u32;
+        for s in &stretches {
+            if s.doc != docs || s.len == 0 || s.row < row_end {
+                return Err(BuildError::Io(Error::other(
+                    "an fts lane's stretches must cover its documents in order, rows ascending",
+                )));
+            }
+            docs += s.len;
+            row_end = s.row + s.len;
+        }
+        if docs != self.n_docs {
             return Err(BuildError::Io(Error::other(
-                "an fts lane's rows must be one ascending row per document",
+                "an fts lane's stretches must cover exactly its documents",
             )));
         }
         let shape = self
@@ -2608,7 +2663,7 @@ impl FtsBuilder {
         Ok(FrozenLane {
             columns,
             shape,
-            rows,
+            stretches,
         })
     }
 
@@ -2647,8 +2702,10 @@ impl FtsBuilder {
             for lane in view.lanes.lanes.iter() {
                 let (dlo, dhi) = lane_doc_range(lane, &view.rows);
                 let lane_col = &lane.columns[c];
+                let mut cursor = 0usize;
                 for d in dlo..dhi {
-                    lengths[(lane.rows[d] - view.rows.start) as usize] = lane_col.doc_lengths[d];
+                    let row = row_of(&lane.stretches, &mut cursor, d as u32);
+                    lengths[(row - view.rows.start) as usize] = lane_col.doc_lengths[d];
                     total_tokens += u64::from(lane_col.tokens[d]);
                 }
             }
@@ -4067,11 +4124,12 @@ fn merge_sorted_spill<const N: usize, W: Write>(
 /// resident bytes shrink as the emit proceeds. Returns the number of
 /// terms written.
 /// The documents of `lane` whose rows fall in `rows`, as a range of its
-/// document indexes: its rows ascend, so two binary searches find it.
+/// document indexes: its stretches ascend, so two binary searches find it.
 fn lane_doc_range(lane: &FrozenLane, rows: &Range<u32>) -> (usize, usize) {
-    let lo = lane.rows.partition_point(|&r| r < rows.start);
-    let hi = lane.rows.partition_point(|&r| r < rows.end);
-    (lo, hi)
+    (
+        docs_before_row(&lane.stretches, rows.start),
+        docs_before_row(&lane.stretches, rows.end),
+    )
 }
 
 /// The bytes of postings `lo..hi` of list `id`'s position runs: the
@@ -4139,8 +4197,9 @@ fn emit_lanes_column<W: Write>(
     let mut values: Vec<u32> = Vec::new();
     let mut starts: Vec<usize> = Vec::new();
     // The lanes holding the current term: the stretch of the list in the
-    // view, its run bytes, and how far into both the merge has read.
-    let mut holders: Vec<(usize, &[(u32, u32)], &[u8], usize, usize)> = Vec::new();
+    // view, its run bytes, how far into both the merge has read, and the
+    // lane's row stretch its next document is in.
+    let mut holders: Vec<(usize, &[(u32, u32)], &[u8], usize, usize, usize)> = Vec::new();
     let mut n_emitted = 0usize;
     let mut at = 0usize;
     while at < order.len() {
@@ -4156,15 +4215,12 @@ fn emit_lanes_column<W: Write>(
         holders.clear();
         for entry in &order[at..group_end] {
             let lane = entry.lane as usize;
-            let col = &lanes[lane].columns[column];
-            let list = &col.postings[entry.id as usize];
             let range = &docs[lane];
-            let (Some(&(first_doc, _)), Some(&(last_doc, _))) = (list.first(), list.last()) else {
-                continue;
-            };
-            if first_doc as usize >= range.end || (last_doc as usize) < range.start {
+            if entry.first_doc as usize >= range.end || (entry.last_doc as usize) < range.start {
                 continue;
             }
+            let col = &lanes[lane].columns[column];
+            let list = &col.postings[entry.id as usize];
             let lo = list.partition_point(|&(d, _)| (d as usize) < range.start);
             let hi = list.partition_point(|&(d, _)| (d as usize) < range.end);
             if lo == hi {
@@ -4174,7 +4230,7 @@ fn emit_lanes_column<W: Write>(
                 true => run_bytes(col, entry.id, lo, hi),
                 false => &[],
             };
-            holders.push((lane, &list[lo..hi], runs, 0, 0));
+            holders.push((lane, &list[lo..hi], runs, 0, 0, 0));
         }
         at = group_end;
         if holders.is_empty() {
@@ -4182,11 +4238,12 @@ fn emit_lanes_column<W: Write>(
         }
         pairs.clear();
         let term_positions: Option<(&mut PositionsSink, TermRuns<'_>)> = if holders.len() == 1 {
-            let (lane, list, runs, _, _) = holders[0];
-            let rows = &lanes[lane].rows;
+            let (lane, list, runs, _, _, _) = holders[0];
+            let stretches = &lanes[lane].stretches;
+            let mut cursor = 0usize;
             pairs.extend(
                 list.iter()
-                    .map(|&(doc, tf)| (rows[doc as usize] - first_row, tf)),
+                    .map(|&(doc, tf)| (row_of(stretches, &mut cursor, doc) - first_row, tf)),
             );
             col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(runs)))
         } else {
@@ -4199,9 +4256,9 @@ fn emit_lanes_column<W: Write>(
             loop {
                 let mut lowest: Option<(usize, u32)> = None;
                 let mut bound = u32::MAX;
-                for (h, (lane, list, _, pos, _)) in holders.iter().enumerate() {
+                for (h, (lane, list, _, pos, _, cursor)) in holders.iter_mut().enumerate() {
                     if let Some(&(doc, _)) = list.get(*pos) {
-                        let row = lanes[*lane].rows[doc as usize];
+                        let row = row_of(&lanes[*lane].stretches, cursor, doc);
                         match lowest {
                             Some((_, r)) if row >= r => bound = bound.min(row),
                             Some((_, r)) => {
@@ -4215,10 +4272,10 @@ fn emit_lanes_column<W: Write>(
                 let Some((h, _)) = lowest else {
                     break;
                 };
-                let (lane, list, runs, pos, read) = &mut holders[h];
-                let rows = &lanes[*lane].rows;
+                let (lane, list, runs, pos, read, cursor) = &mut holders[h];
+                let stretches = &lanes[*lane].stretches;
                 while let Some(&(doc, tf)) = list.get(*pos) {
-                    let row = rows[doc as usize];
+                    let row = row_of(stretches, cursor, doc);
                     if row >= bound {
                         break;
                     }
@@ -5067,11 +5124,26 @@ mod tests {
             lane.add_doc(1, doc, &text_of(i)).expect("add flat");
             rows.push(i);
         }
+        // Consecutive rows of a lane fold into one stretch.
+        let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
+            let mut out: Vec<Stretch> = Vec::new();
+            for (doc, &row) in rows.iter().enumerate() {
+                match out.last_mut() {
+                    Some(s) if s.row + s.len == row => s.len += 1,
+                    _ => out.push(Stretch {
+                        doc: doc as u32,
+                        row,
+                        len: 1,
+                    }),
+                }
+            }
+            out
+        };
         let frozen = Arc::new(
             freeze_lanes(
                 lanes
                     .into_iter()
-                    .map(|(lane, rows)| lane.freeze(rows).expect("freeze"))
+                    .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
                     .collect(),
             )
             .expect("merge the lanes' terms"),
@@ -5088,12 +5160,19 @@ mod tests {
         assert_eq!(from_view(0..CUT), single(0, CUT), "first piece");
         assert_eq!(from_view(CUT..N_DOCS), single(CUT, N_DOCS), "second piece");
 
-        // A lane whose rows do not match its documents is refused.
+        // A lane whose stretches do not cover its documents is refused.
         let mut lane = fresh();
         lane.set_lane_mode();
         lane.add_doc(0, 0, "a").expect("add");
         lane.add_doc(1, 0, "a").expect("add");
-        assert!(lane.freeze(vec![0, 2]).is_err());
+        assert!(
+            lane.freeze(vec![Stretch {
+                doc: 0,
+                row: 5,
+                len: 2
+            }])
+            .is_err()
+        );
         // A builder not in lane mode cannot be frozen.
         assert!(fresh().freeze(Vec::new()).is_err());
     }
