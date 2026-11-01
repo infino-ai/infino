@@ -137,7 +137,7 @@ use crate::{
 /// per-column `term_arena: bumpalo::Bump`** stored alongside the
 /// map in the column's [`Vocab`]. The `'static`
 /// lifetime tag is a lie maintained by `unsafe` `std::mem::
-/// transmute` at insertion (see [`intern_term_id_arena`]) and
+/// transmute` at insertion (see [`intern_term_id`]) and
 /// kept sound by two structural invariants:
 ///
 /// 1. The arena outlives the map. [`Vocab`] declares `term_arena`
@@ -933,23 +933,30 @@ fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> 
 ///
 /// Returns `(term_id, is_new)`. `is_new == true` iff this call minted
 /// a brand-new id (`term_to_id` previously had no entry for `term`).
-/// Callers that keep a per-id parallel array (e.g. `dense_doc_tf` on
-/// the spill path) use this to gate the grow check off the hot path:
-/// after the InRam→Spilled transition pre-grows the parallel array
-/// to `id_to_term.len()`, the array only needs to be extended when a
-/// fresh id is minted, which is once per novel term per column —
-/// not once per token.
+/// Callers that keep a per-id parallel array (the [`Vocab`]'s
+/// `dense_doc_tf` and `dense_doc_poshead`, and the in-RAM store's
+/// per-id lists) use this to gate the grow check off the hot path:
+/// an array only needs to be extended when a fresh id is minted,
+/// which is once per novel term per column — not once per token.
 ///
-/// SAFETY (invariants enforced by callers and the `Spilled` variant
-/// struct layout, see [`TermIdMap`] doc): the `'static` lifetime tag
-/// on the keys is a lie — the real lifetime is that of `arena`. The
+/// SAFETY (invariants enforced by callers and the [`Vocab`] struct
+/// layout, see [`TermIdMap`] doc): the `'static` lifetime tag on the
+/// keys is a lie — the real lifetime is that of `arena`. The
 /// transmute below is sound iff (a) `arena` outlives both
 /// `term_to_id` and `id_to_term`, and (b) no key dereference happens
 /// after `arena`'s `Drop` runs. Both hold by construction: `arena`
-/// is declared *after* the map and reverse-vec in `Spilled` so it
+/// is declared *after* the map and reverse-vec in [`Vocab`] so it
 /// drops *last*, and the `Drop` impls for `HbHashMap<&'static str,
 /// u32, _>` and `Vec<&'static str>` never dereference their
 /// `&str` keys/entries (no `Drop` to run on a reference).
+/// The error every call on a builder whose `add_doc` failed partway
+/// through a document returns.
+fn failed_builder() -> BuildError {
+    BuildError::Io(Error::other(
+        "the fts builder is unusable after a document failed to index",
+    ))
+}
+
 #[inline(always)]
 fn intern_term_id(
     term_to_id: &mut TermIdMap,
@@ -1456,6 +1463,11 @@ pub struct FtsBuilder {
     head_sink: Option<Box<dyn TermHeadSink>>,
     /// Best documents per term handed to the sink; `0` keeps none.
     head_depth: usize,
+    /// Set once an `add_doc` failed partway through a document. The
+    /// store may then hold part of that document, so the builder refuses
+    /// further documents and refuses to finish: a caller that retries on
+    /// the same builder gets an error, not a blob with a torn document.
+    failed: bool,
 }
 
 /// Receives each term's facts as the blob is written: what a table-level
@@ -1609,6 +1621,7 @@ impl FtsBuilder {
             spill_partitions: DEFAULT_SPILL_PARTITIONS,
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
+            failed: false,
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
             run_scratch: Vec::new(),
@@ -1870,6 +1883,9 @@ impl FtsBuilder {
                 actual: "n/a".to_string(),
             });
         }
+        if self.failed {
+            return Err(failed_builder());
+        }
 
         // The contract is that `local_doc_id` increments by 1 per
         // (per-column) call, starting at 0. `finish()` indexes
@@ -2045,6 +2061,18 @@ impl FtsBuilder {
             };
         }
         if pos_overflow {
+            // The document's counts and position heads are cleared, as the
+            // drain below would have cleared them, and the builder is marked
+            // unusable: the in-RAM store already holds part of this
+            // document's position runs, which nothing can take back out.
+            for &term_id in updated_terms.iter() {
+                dense_doc_tf[term_id as usize] = 0;
+                if positional {
+                    dense_doc_poshead[term_id as usize] = CHAIN_END;
+                }
+            }
+            updated_terms.clear();
+            self.failed = true;
             return Err(BuildError::PositionOverflow {
                 column: self.columns[col_idx].name.clone(),
             });
@@ -2316,6 +2344,9 @@ impl FtsBuilder {
                 "fts builders with different columns cannot be folded together",
             )));
         }
+        if self.failed || other.failed {
+            return Err(failed_builder());
+        }
         if !self.is_in_ram() || !other.is_in_ram() {
             return Err(BuildError::Io(Error::other(
                 "an fts builder that spilled to scratch cannot be folded",
@@ -2410,6 +2441,9 @@ impl FtsBuilder {
     /// (regression-gated by
     /// `build_above_threshold_spills_and_matches_in_ram_byte_for_byte`).
     pub fn finish_to<W: Write>(self, w: W) -> Result<(), BuildError> {
+        if self.failed {
+            return Err(failed_builder());
+        }
         // Dispatch to the path that matches the builder's current
         // state. The two paths share `assemble_and_write_blob` as
         // their tail, so the output blob is byte-identical for
@@ -2456,6 +2490,7 @@ impl FtsBuilder {
             sorted_inputs: _,
             mut head_sink,
             head_depth,
+            failed: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -2609,6 +2644,7 @@ impl FtsBuilder {
             sorted_inputs,
             mut head_sink,
             head_depth,
+            failed: _,
         } = self;
 
         let n_columns = columns.len() as u32;
@@ -4393,6 +4429,8 @@ fn sort_partition_to_file<const N: usize>(
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use bytes::Bytes;
     use tempfile::tempdir;
 
@@ -4791,6 +4829,87 @@ mod tests {
         // Sanity: finish_to still produces a working blob via the
         // in-RAM path.
         let _blob = b.finish().expect("finish");
+    }
+
+    /// A positional column that crosses the spill threshold partway
+    /// through the corpus writes the blob the in-RAM build writes, byte
+    /// for byte: the run the scan wrote gap by gap onto the term's list
+    /// and the run the spilled drain writes whole from the document's
+    /// chain are the same bytes, and the dictionary and positions
+    /// regions assemble the same either way.
+    #[test]
+    fn a_positional_build_that_spills_partway_matches_in_ram_byte_for_byte() {
+        fn build_corpus(b: &mut FtsBuilder) {
+            b.register_column("body".into(), true)
+                .expect("register col");
+            for i in 0..1000u32 {
+                // Repeats within a document give runs with gaps; the
+                // unique terms keep the vocabulary growing so the
+                // threshold is crossed in the middle of the corpus.
+                b.add_doc(
+                    0,
+                    i,
+                    &format!(
+                        "common shared common term{i:04} payload{} common extra word{i:04} shared",
+                        i % 37
+                    ),
+                )
+                .expect("add doc");
+            }
+        }
+        let mut baseline = FtsBuilder::new();
+        build_corpus(&mut baseline);
+        assert!(baseline.is_in_ram(), "baseline must stay in RAM");
+        let baseline_blob = baseline.finish().expect("finish baseline");
+
+        for threshold in [4 * 1024, 16 * 1024, 64 * 1024] {
+            let mut spilled = FtsBuilder::new();
+            spilled.set_spill_threshold_bytes(threshold);
+            build_corpus(&mut spilled);
+            assert!(
+                !spilled.is_in_ram(),
+                "threshold {threshold} must force a spill"
+            );
+            let blob = spilled.finish().expect("finish spilled");
+            assert_eq!(blob, baseline_blob, "threshold {threshold}");
+        }
+    }
+
+    /// A document whose positions overflow leaves the builder unusable
+    /// rather than holding a torn document.
+    #[test]
+    fn a_failed_document_poisons_the_builder() {
+        #[derive(Debug)]
+        struct Overflowing;
+        impl Tokenizer for Overflowing {
+            fn name(&self) -> &'static str {
+                "overflowing_test"
+            }
+            fn tokenize<'a>(&'a self, _text: &'a str) -> Box<dyn Iterator<Item = String> + 'a> {
+                Box::new(["a".to_string(), "b".to_string()].into_iter())
+            }
+            fn tokenize_each_positioned(&self, _text: &str, f: &mut dyn FnMut(&str, u64)) {
+                f("a", 0);
+                f("b", u64::from(u32::MAX) + 1);
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        let mut b = FtsBuilder::new();
+        b.register_column_with_tokenizer(
+            "body".into(),
+            true,
+            Arc::new(Overflowing),
+            bm25::Bm25Params::default(),
+        )
+        .expect("register");
+        assert!(matches!(
+            b.add_doc(0, 0, "x"),
+            Err(BuildError::PositionOverflow { .. })
+        ));
+        assert!(b.add_doc(0, 1, "x").is_err(), "no more documents");
+        assert!(b.finish().is_err(), "no blob");
     }
 
     #[test]

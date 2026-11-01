@@ -62,12 +62,13 @@ pub(crate) fn mmap_readonly_with_handle(path: &Path) -> io::Result<(Arc<Mmap>, B
 }
 
 /// The sealed files behind live temp-backed [`Bytes`], keyed by the
-/// mapping's address: where a publish to local-filesystem storage finds the
-/// file to link into place instead of copying the bytes out again. An
-/// entry lives exactly as long as the bytes do.
-static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
+/// mapping's address, with the mapping's length: where a publish to
+/// local-filesystem storage finds the file to link into place instead of
+/// copying the bytes out again. An entry lives exactly as long as the
+/// bytes do.
+static TEMP_BACKED: OnceLock<Mutex<HashMap<usize, (PathBuf, usize)>>> = OnceLock::new();
 
-fn temp_backed() -> &'static Mutex<HashMap<usize, PathBuf>> {
+fn temp_backed() -> &'static Mutex<HashMap<usize, (PathBuf, usize)>> {
     TEMP_BACKED.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -103,7 +104,7 @@ pub(crate) fn mmap_temp_file_bytes(file: NamedTempFile) -> io::Result<Bytes> {
     if let Ok(mut map) = temp_backed().lock() {
         map.insert(
             owner.mmap.as_ptr() as usize,
-            owner.file.path().to_path_buf(),
+            (owner.file.path().to_path_buf(), owner.mmap.len()),
         );
     }
     Ok(Bytes::from_owner(owner))
@@ -111,11 +112,10 @@ pub(crate) fn mmap_temp_file_bytes(file: NamedTempFile) -> io::Result<Bytes> {
 
 /// The still-present temp file `bytes` were mapped from by
 /// [`mmap_temp_file_bytes`], for the whole (unsliced) bytes; `None` for any
-/// other bytes.
+/// other bytes, a slice of the mapping included: a prefix starts at the
+/// same address, so the length is checked too.
 pub(crate) fn temp_file_behind(bytes: &Bytes) -> Option<PathBuf> {
-    temp_backed()
-        .lock()
-        .ok()?
-        .get(&(bytes.as_ptr() as usize))
-        .cloned()
+    let map = temp_backed().lock().ok()?;
+    let (path, len) = map.get(&(bytes.as_ptr() as usize))?;
+    (*len == bytes.len()).then(|| path.clone())
 }
