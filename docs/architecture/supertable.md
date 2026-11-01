@@ -383,21 +383,23 @@ writes a superfile hands each term's best documents to a sink as it
 writes the term's postings, and the sink spills them as the superfile's
 contribution; a superfile built without the sink has its heads read
 from its own index with the single-term kernel instead, which gives the
-same bytes. The delta layer pools the contributions into tiers, and
-the maintenance rebuild re-pools every layer's tiers table-wide. A
-superfile's bytes are not changed by any of this. An index written by
-the layout before tiers is still read: its bounds, scores at each
-superfile's own idf, serve ceilings as they did, and the next
-maintenance rebuild writes the current layout.
+same bytes. The delta layer pools the contributions into tiers, and a
+fold re-pools the tiers of the layers it merges. A superfile's bytes are
+not changed by any of this. An index written by the layout before tiers
+is still read: its bounds, scores at each superfile's own idf, serve
+ceilings as they did until a fold rewrites them in the current layout.
 
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new
 superfiles — the manifest marks it incomplete, and part loading keeps
-the summary-based choice until a maintenance pass rebuilds the index
-over every superfile. Nothing requires old code to read a new manifest.
+the summary-based choice until maintenance has indexed every superfile.
+Maintenance indexes the superfiles the index does not list a batch at a
+time, each batch published as a commit publishes its own postings, so
+its cost is bounded by the batch and a stopped pass keeps what it
+published. Nothing requires old code to read a new manifest.
 
 A table can keep no term index at all (`SupertableOptions::term_index`
-off): its commits publish nothing, its maintenance rebuilds nothing, and
+off): its commits publish nothing, its maintenance indexes nothing, and
 no index object is written beside its superfiles. Nothing takes the
 index's place: a table on storage records no per-superfile term filter,
 so a query probes every superfile. That is worth it only where the

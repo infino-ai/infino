@@ -26,7 +26,9 @@ use uuid::Uuid;
 mod build;
 
 use crate::{
-    config::{self, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex},
+    config::{
+        self, CompactionSettings, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex,
+    },
     runtime_bridge::bridge_on_runtime,
     superfile::{
         format::footer::{BlobRegion, has_duplicated_region_key, resolved_regions},
@@ -37,16 +39,16 @@ use crate::{
         Supertable,
         error::{CompactionError, ReindexError},
         manifest::SubsectionOffsets,
-        optimize::compact::{CompactionJob, JobOutcome, SuperfileMerge},
+        optimize::compact::{CompactionJob, JobOutcome, SuperfileMerge, max_merge_input_bytes},
         query::dispatch::open_whole_superfile,
     },
 };
 
-/// Rewrites between term-index rebuilds.
+/// Rewrites between term-index refreshes.
 ///
 /// Every rewrite adds a superfile, and with it a delta layer the index
-/// lookups must also search. Rebuilding every few rewrites folds those deltas
-/// into one layer; rebuilding after each would repeat the work for little gain.
+/// lookups must also search. Refreshing every few rewrites folds those
+/// deltas; refreshing after each would repeat the work for little gain.
 const REWRITES_PER_TERM_INDEX_REFRESH: usize = 16;
 
 /// Superfiles opened at once while deciding which are stale.
@@ -763,11 +765,12 @@ impl Supertable {
         Ok(report)
     }
 
-    /// Rebuild the term index, logging rather than failing: queries stay
-    /// correct on an index that is behind, so a failed rebuild must not abort
-    /// a migration.
+    /// Index the superfiles the term index does not list, logging rather
+    /// than failing: queries stay correct on an index that is behind, so a
+    /// failed pass must not abort a migration.
     fn refresh_term_index_best_effort(&self) {
-        if let Err(e) = self.refresh_term_index_sync() {
+        let fold_max_bytes = max_merge_input_bytes(&CompactionSettings::default());
+        if let Err(e) = self.refresh_term_index_sync(fold_max_bytes) {
             warn!("[supertable reindex] term-index refresh failed: {e}");
         }
     }

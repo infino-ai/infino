@@ -62,7 +62,10 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     str::from_utf8,
-    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, atomic::Ordering},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::available_parallelism,
     time,
 };
@@ -11053,30 +11056,37 @@ where
     )))
 }
 
-/// Build and publish the table-level term index over the CURRENT
-/// membership, stamping its root reference on a successor manifest (see
-/// `manifest::term_index`). Maintenance-only: optimize calls it after
-/// compaction so the base layer describes the post-merge superfile set.
-/// A table that keeps no term index is left as it is.
+/// Superfiles one maintenance publish indexes: one wave of
+/// [`CONTRIBUTION_WALKS_MAX`] walks, published as a commit publishes its
+/// own postings. A batch bounds the build to what that many superfiles
+/// contribute, whatever the size of the table, and each publish keeps the
+/// work done so far should the process stop.
+pub(in crate::supertable) const TERM_INDEX_BATCH_SUPERFILES: usize = CONTRIBUTION_WALKS_MAX;
+
+/// Keep the table-level term index (see `manifest::term_index`) whole and
+/// its layers few, with the machinery commits use, in steps of bounded
+/// size, each published on a successor manifest. Maintenance-only: optimize
+/// calls it after compaction. A table that keeps no term index is left as
+/// it is.
 ///
-/// The index is rebuilt from its own layers ([`merge_term_index`]): a
-/// posting depends only on its superfile, which never changes, so copying
-/// it out of the layer that holds it gives what walking the superfile
-/// again would. Only superfiles no layer lists are walked. Every
-/// superfile is walked instead ([`collect_and_build_term_index`]) when the
-/// current root will never load (gone, corrupt, or in a layout this engine
-/// no longer reads) or a slice it names is gone or corrupt. A root that
-/// fails to load for now fails the stamp, unless a retry holds its own
-/// earlier build to catch up from.
+/// - The live superfiles the index does not list are indexed
+///   [`TERM_INDEX_BATCH_SUPERFILES`] at a time, each batch published the
+///   way a commit publishes its own postings ([`term_index::append_delta`]).
+///   Superfiles reach the index through their commits; what is left here
+///   was committed without postings, before the table kept an index or by
+///   a writer that keeps none.
+/// - With none left to index, layers fold in runs of at most
+///   `fold_max_bytes` ([`term_index::fold_at_optimize`]), dropping the
+///   postings of superfiles no longer live from the layers a fold rewrites.
+/// - A root that will never load (gone, corrupt, or in a layout this engine
+///   no longer reads), or that names a slice or tier object no longer on
+///   storage, is started again from an empty root, a batch at a time. A
+///   root that failed to load for now fails the pass.
 ///
-/// The full build runs once. When commits land before it publishes, a retry
-/// stacks their delta layers on it as they are (`term_index::rebase`),
-/// which writes only a root. When the build lists more superfiles than the
-/// root it was made from, it folds them in instead ([`fold_term_index`]).
-/// When neither lists every live superfile, it indexes only the superfiles
-/// the last build lacks on top of it.
+/// The index is marked complete once it lists every live superfile.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
+    fold_max_bytes: u64,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
         return Ok(());
@@ -11084,117 +11094,87 @@ pub(in crate::supertable) async fn stamp_term_index(
     if !inner.options.term_index || inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
-    // The last build's root, and the root it was built from. A retry
-    // reuses its slices without PUTting them again: were one reclaimed in
-    // between, queries that need it would fail until a rebuild.
-    let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
-    stamp_with_retries(inner, &storage, "term-index", |old| {
-        let storage = &storage;
-        let last_build = &last_build;
-        async move {
-            let entries = old
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            let last = last_build.lock().expect("term-index build lock").clone();
-            // A root that failed to load for now is waited out: a rebuild
-            // reads every superfile's dictionary to repair nothing. A retry
-            // holding its own build catches up from that.
-            match old.needs_term_index_rebuild(&entries).await {
-                Ok(false) => return Ok(None),
-                Ok(true) => {}
-                Err(_) if last.is_some() => {}
-                Err(e) => return Err(e.into()),
-            }
-            let current = match referenced_root(&old).await {
-                Ok(current) => current,
-                Err(_) if last.is_some() => None,
-                Err(e) => return Err(e.into()),
-            };
-            let folded = match (&last, &current) {
-                (Some((base, Some(prior))), Some(current)) => {
-                    // Merging the new deltas in costs time in proportion to
-                    // them, so under steady commits each retry falls further
-                    // behind. Stacking them on the build costs one root.
-                    match term_index::rebase(base, prior, current) {
-                        // The rebase lists every superfile a fold would, so
-                        // a fold would miss the same ones: catch up instead.
-                        Some(root) if !unlisted(&root, &entries).is_empty() => None,
-                        Some(root) => {
-                            let deltas = root.layers.len() - base.layers.len();
-                            if deltas > 0 {
-                                info!(
-                                    deltas,
-                                    "term index: publish lost a race, rebased the build onto the commits since"
-                                );
-                            }
-                            // The rebased root is made of layers already on
-                            // storage, their slices and tier objects with them.
-                            Some(term_index::Built {
-                                root,
-                                slices: Vec::new(),
-                                tiers: Vec::new(),
-                            })
-                        }
-                        None => match fold_term_index(&old, base, prior, current, &entries).await
-                        {
-                            Ok(folded) => folded,
-                            Err(e) => {
-                                warn!("term index: folding new commits failed, catching up instead: {e}");
-                                None
-                            }
-                        },
+    let seen = &inner.term_index_objects_seen;
+    loop {
+        let published = AtomicBool::new(false);
+        stamp_with_retries(inner, &storage, "term-index", |old| {
+            let storage = &storage;
+            let published = &published;
+            async move {
+                published.store(false, Ordering::Relaxed);
+                let entries = old
+                    .get_all_superfiles_loaded()
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                let root = match referenced_root(&old).await? {
+                    Some(root) if term_index::objects_present(storage, &root, seen).await? => root,
+                    Some(_) => {
+                        warn!(
+                            "term index: an object the root names is gone; indexing every superfile again"
+                        );
+                        Root::default()
                     }
-                }
-                _ => None,
-            }
-            .filter(|built| unlisted(&built.root, &entries).is_empty());
-            let built = match (folded, last, &current) {
-                (Some(built), _, _) => built,
-                (None, Some((base, _)), _) => {
-                    // Only what committed since the last build.
-                    let missing = unlisted(&base, &entries);
-                    // Already lists every live superfile: an empty layer
-                    // would add nothing.
-                    if missing.is_empty() {
-                        term_index::Built {
-                            root: base,
-                            slices: Vec::new(),
-                            tiers: Vec::new(),
+                    None => Root::default(),
+                };
+                let policy = term_index::BuildPolicy {
+                    scoring_by_superfile: Arc::new(scoring_by_superfile(&old)),
+                    ..old.options.term_index_build_policy()
+                };
+                let pool = Some(&*old.options.reader_pool);
+                let mut listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+                let missing: Vec<Arc<SuperfileEntry>> = entries
+                    .iter()
+                    .filter(|e| listed.insert(e.superfile_id))
+                    .cloned()
+                    .collect();
+                let (reference, complete) = if !missing.is_empty() {
+                    let batch = &missing[..missing.len().min(TERM_INDEX_BATCH_SUPERFILES)];
+                    let scratch = term_index_scratch(&policy).map_err(TermIndexError::from)?;
+                    let contributions = collect_contributions(&old, batch, scratch.path()).await?;
+                    let reference =
+                        term_index::append_delta(storage, Some(root), &contributions, &policy, pool)
+                            .instrument(detail_span!(
+                                "term_index.append",
+                                contributions = contributions.len(),
+                            ))
+                            .await?;
+                    (reference, batch.len() == missing.len())
+                } else if term_index::fold_at_optimize_due(&root, fold_max_bytes) {
+                    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+                    let span = detail_span!("term_index.fold", layers = root.layers.len());
+                    let mut root = root;
+                    let policy = term_index::BuildPolicy {
+                        scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, &root.superfiles)),
+                        ..policy
+                    };
+                    term_index::fold_at_optimize(
+                        storage,
+                        &mut root,
+                        &policy,
+                        pool,
+                        &live,
+                        fold_max_bytes,
+                    )
+                    .instrument(span)
+                    .await?;
+                    (term_index::write_root(storage.as_ref(), &root).await?, true)
+                } else {
+                    return Ok(match old.term_index_ref() {
+                        Some(reference) if !old.term_index_complete() => {
+                            Some(old.with_term_index(reference.clone(), true))
                         }
-                    } else {
-                        collect_and_build_term_index(&old, &missing, base).await?
-                    }
-                }
-                (None, None, Some(current)) if !current.layers.is_empty() => {
-                    match merge_term_index(&old, current, &entries).await {
-                        Ok(built) => built,
-                        Err(e) if e.calls_for_rebuild() => {
-                            warn!("term index: cannot merge the current index, rebuilding from the superfiles: {e}");
-                            collect_and_build_term_index(&old, &entries, Root::default()).await?
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                (None, None, _) => {
-                    collect_and_build_term_index(&old, &entries, Root::default()).await?
-                }
-            };
-            let root = built.root;
-            term_index::write_tiers(storage, built.tiers).await?;
-            term_index::write_slices(storage, built.slices).await?;
-            *last_build.lock().expect("term-index build lock") = Some((root.clone(), current));
-            let reference = term_index::write_root(storage.as_ref(), &root).await?;
-            // The root is content-addressed, so an unchanged reference can
-            // still sit beside a stale "incomplete" mark; this build covers
-            // the whole membership, so publish whenever that mark is wrong.
-            if old.term_index_ref() == Some(&reference) && old.term_index_complete() {
-                return Ok(None);
+                        _ => None,
+                    });
+                };
+                published.store(true, Ordering::Relaxed);
+                Ok(Some(old.with_term_index(reference, complete)))
             }
-            Ok(Some(old.with_term_index(reference)))
+        })
+        .await?;
+        if !published.load(Ordering::Relaxed) {
+            return Ok(());
         }
-    })
-    .await
+    }
 }
 
 /// The root `manifest` references: empty when it has none, `None` when it
@@ -11210,224 +11190,12 @@ async fn referenced_root(manifest: &ManifestSnapshot) -> Result<Option<Root>, Te
     }
 }
 
-/// The `entries` that `root` does not list.
-fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEntry>> {
-    let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-    entries
-        .iter()
-        .filter(|e| !listed.contains(&e.superfile_id))
-        .cloned()
-        .collect()
-}
-
-/// Rebuild the index over `entries` from the layers of `current`, into
-/// one layer, reading superfiles only for the `entries` that `current`
-/// does not list.
-///
-/// Superfiles take ordinals in `entries` order, as
-/// [`collect_and_build_term_index`] gives them, and postings for superfiles
-/// no longer live, or for padding, are dropped. So the result is byte for
-/// byte the index walking every superfile would build.
-async fn merge_term_index(
-    manifest: &ManifestSnapshot,
-    current: &Root,
-    entries: &[Arc<SuperfileEntry>],
-) -> Result<term_index::Built, TermIndexError> {
-    let storage = manifest
-        .options
-        .storage
-        .as_ref()
-        .ok_or_else(|| TermIndexError::Build("term index merge needs storage".into()))?;
-    let policy = manifest.options.term_index_build_policy();
-    let scratch = term_index_scratch(&policy)?;
-    // Superfiles no layer lists get one layer of their own, numbered
-    // past the ones `current` lists, and merge like the rest.
-    let missing = unlisted(current, entries);
-    // When nothing `current` lists is still live — a compaction that
-    // replaced every superfile — its layers hold only postings the merge
-    // would drop, so they are not fetched: the fresh build over `entries`
-    // is the index, in `entries` order, as the merge would have numbered it.
-    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-    if !current.superfiles.iter().any(|id| live.contains(id)) {
-        let mut seen: HashSet<Uuid> = HashSet::new();
-        let fresh: Vec<Arc<SuperfileEntry>> = missing
-            .iter()
-            .filter(|e| seen.insert(e.superfile_id))
-            .cloned()
-            .collect();
-        let contributions = collect_contributions(manifest, &fresh, scratch.path()).await?;
-        return run_on_pool(
-            Some(&manifest.options.reader_pool),
-            "term-index build",
-            move || term_index::build(&contributions, &policy),
-        )
-        .instrument(detail_span!("term_index.build", superfiles = fresh.len(),))
-        .await
-        .map_err(|e| TermIndexError::Build(e.to_string()))?;
-    }
-    let mut sources = term_index::download_layers(storage, &current.layers, scratch.path())
-        .instrument(detail_span!(
-            "term_index.download",
-            layers = current.layers.len(),
-        ))
-        .await?;
-    let mut old = Root {
-        superfiles: current.superfiles.clone(),
-        id_mins: current.id_mins.clone(),
-        layers: Vec::new(),
-    };
-    if !missing.is_empty() {
-        let contributions = collect_contributions(manifest, &missing, scratch.path()).await?;
-        let built = term_index::build_onto(old, &contributions, &policy)?;
-        let fresh = built
-            .root
-            .layers
-            .last()
-            .expect("a build onto a root appends its layer");
-        term_index::spill_tiers(scratch.path(), &fresh.slices, built.tiers)?;
-        sources.push(term_index::spill_slices(
-            scratch.path(),
-            &fresh.slices,
-            built.slices,
-        )?);
-        old = built.root;
-    }
-
-    let mut root = Root::default();
-    let mut new_ordinal: HashMap<Uuid, u32> = HashMap::new();
-    for entry in entries {
-        if let Entry::Vacant(slot) = new_ordinal.entry(entry.superfile_id) {
-            slot.insert(root.superfiles.len() as u32);
-            root.superfiles.push(entry.superfile_id);
-            root.id_mins.push(entry.id_min);
-        }
-    }
-    // A superfile listed twice keeps the postings of its first listing:
-    // both are the same superfile's, so either would do.
-    let mut claimed: HashSet<Uuid> = HashSet::new();
-    let ordinals: Vec<Option<u32>> = old
-        .superfiles
-        .iter()
-        .map(|id| new_ordinal.get(id).copied().filter(|_| claimed.insert(*id)))
-        .collect();
-
-    let policy = term_index::BuildPolicy {
-        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
-        ..policy
-    };
-    let merged = run_on_pool(
-        Some(&manifest.options.reader_pool),
-        "term-index merge",
-        move || term_index::merge_layers(&sources, &ordinals, &policy),
-    )
-    .instrument(detail_span!(
-        "term_index.merge",
-        superfiles = root.superfiles.len(),
-        walked = missing.len(),
-    ))
-    .await
-    .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.layers.push(merged.layer);
-    Ok(term_index::Built {
-        root,
-        slices: merged.slices,
-        tiers: merged.tiers,
-    })
-}
-
-/// Fold the delta layers committed since `prior` onto `base`, the build
-/// made from `prior`, for a retry after a lost race. The deltas merge into
-/// one layer appended to `base`; their superfiles take the ordinals
-/// after `base`'s, and those no longer live are dropped, so no padding is
-/// left behind.
-///
-/// `None` when `current` was not built on `prior`. Relies on the deltas
-/// naming only ordinals at or past `prior`'s length (see
-/// `term_index::layers_since`).
-async fn fold_term_index(
-    manifest: &ManifestSnapshot,
-    base: &Root,
-    prior: &Root,
-    current: &Root,
-    entries: &[Arc<SuperfileEntry>],
-) -> Result<Option<term_index::Built>, TermIndexError> {
-    let Some(deltas) = term_index::layers_since(prior, current) else {
-        return Ok(None);
-    };
-    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-    let mut root = base.clone();
-    let mut ordinals: Vec<Option<u32>> = vec![None; current.superfiles.len()];
-    for (i, (id, id_min)) in current
-        .superfiles
-        .iter()
-        .zip(&current.id_mins)
-        .enumerate()
-        .skip(prior.superfiles.len())
-    {
-        if live.contains(id) {
-            ordinals[i] = Some(root.superfiles.len() as u32);
-            root.superfiles.push(*id);
-            root.id_mins.push(*id_min);
-        }
-    }
-    if root.superfiles.len() == base.superfiles.len() {
-        return Ok(Some(term_index::Built {
-            root,
-            slices: Vec::new(),
-            tiers: Vec::new(),
-        }));
-    }
-    let storage = manifest
-        .options
-        .storage
-        .as_ref()
-        .ok_or_else(|| TermIndexError::Build("term index fold needs storage".into()))?;
-    let policy = manifest.options.term_index_build_policy();
-    let policy = term_index::BuildPolicy {
-        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
-        ..policy
-    };
-    let scratch = term_index_scratch(&policy)?;
-    let sources = term_index::download_layers(storage, deltas, scratch.path()).await?;
-    let merged = run_on_pool(
-        Some(&manifest.options.reader_pool),
-        "term-index fold",
-        move || term_index::merge_layers(&sources, &ordinals, &policy),
-    )
-    .instrument(detail_span!("term_index.fold", deltas = deltas.len()))
-    .await
-    .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    root.layers.push(merged.layer);
-    Ok(Some(term_index::Built {
-        root,
-        slices: merged.slices,
-        tiers: merged.tiers,
-    }))
-}
-
 /// A scratch directory for one term-index build, removed when dropped:
 /// on the table's disk when it has one (see `BuildPolicy::scratch_root`).
 fn term_index_scratch(policy: &term_index::BuildPolicy) -> io::Result<TempDir> {
     term_index::scratch_dir(policy.scratch_root.as_deref())
 }
 
-/// Walk every superfile's dictionary once, spilling a contribution per
-/// superfile into one scratch directory, then merge them into one layer
-/// on top of `onto`. The scratch directory goes with the contributions when
-/// this returns.
-async fn collect_and_build_term_index(
-    manifest: &ManifestSnapshot,
-    entries: &[Arc<SuperfileEntry>],
-    onto: Root,
-) -> Result<term_index::Built, TermIndexError> {
-    let policy = manifest.options.term_index_build_policy();
-    let scratch = term_index_scratch(&policy)?;
-    let contributions = collect_contributions(manifest, entries, scratch.path()).await?;
-    term_index::build_onto(onto, &contributions, &policy)
-}
-
-/// Walk each of `entries`' dictionaries, one superfile at a time, spilling
-/// its contribution under `dir`.
 /// Per superfile of `superfiles`, by position, the average length and
 /// parameters each text column scores at, as the manifest records them:
 /// what a merge keys the superfile's tier entries at. A superfile the
@@ -12580,8 +12348,8 @@ pub(crate) async fn try_commit_attempt(
     //     the index from this commit's superfiles alone, marked incomplete;
     //     a read that merely failed keeps the reference and the layers it
     //     has accumulated, and marks the index incomplete because this
-    //     commit's superfiles are not listed. A maintenance rebuild makes
-    //     either whole.
+    //     commit's superfiles are not listed. Maintenance indexes what
+    //     either leaves out (`stamp_term_index`).
     //
     //     The index is complete only while it lists every live superfile.
     //     A commit that publishes a superfile without postings (a path that
@@ -12620,7 +12388,7 @@ pub(crate) async fn try_commit_attempt(
     } else if !term_contributions.is_empty() {
         // A delta on top of a complete index stays complete; the first
         // index on a table that already held superfiles covers only this
-        // commit's, and stays incomplete until a maintenance rebuild.
+        // commit's, and stays incomplete until maintenance indexes the rest.
         let complete = every_new_covered
             && match prior.is_some() {
                 true => current_manifest.term_index_complete(),
@@ -12634,8 +12402,7 @@ pub(crate) async fn try_commit_attempt(
             ..current_manifest.options.term_index_build_policy()
         };
         let store = &storage;
-        // A fold the root calls for is CPU work, merged on the reader pool as
-        // optimize's rebuild and fold merge theirs.
+        // A fold the root calls for is CPU work, merged on the reader pool.
         let pool = Some(&*current_manifest.options.reader_pool);
         let reference = async move {
             match reserved_layer {
@@ -13340,7 +13107,7 @@ mod tests {
                     .term_index_ref()
                     .cloned()
                     .expect("the commits publish a term index");
-                Ok(Some(old.with_term_index(reference)))
+                Ok(Some(old.with_term_index(reference, true)))
             }
         })
         .await

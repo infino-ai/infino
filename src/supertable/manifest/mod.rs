@@ -1548,37 +1548,6 @@ impl ManifestSnapshot {
         self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
-    /// Whether a term-index rebuild would change anything: false when the
-    /// table is empty, or when the index is complete, has one layer, and
-    /// lists exactly the live superfiles. An index that will never load is
-    /// rebuilt; one that failed to load for now is an error.
-    pub(crate) async fn needs_term_index_rebuild(
-        &self,
-        entries: &[Arc<SuperfileEntry>],
-    ) -> Result<bool, TermIndexError> {
-        if entries.is_empty() {
-            return Ok(false);
-        }
-        if !self.term_index_complete() {
-            return Ok(true);
-        }
-        let index = match self.term_index().await {
-            Ok(Some(index)) => index,
-            Ok(None) => return Ok(true),
-            Err(e) if e.calls_for_rebuild() => return Ok(true),
-            Err(e) => return Err(e),
-        };
-        let root = index.root();
-        // Every commit since the last rebuild appends a layer.
-        if root.layers.len() != 1 {
-            return Ok(true);
-        }
-        // A commit that only removes superfiles appends no layer, so the
-        // root can still list superfiles that are gone.
-        Ok(root.superfiles.len() != entries.len()
-            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))
-    }
-
     /// The superfiles among `candidates`, as `index` names them, that are
     /// live in this snapshot. Loads only the parts whose id range covers a
     /// candidate, and nothing when the resident view is the whole table.
@@ -1802,12 +1771,12 @@ impl ManifestSnapshot {
     }
 
     /// Successor manifest (bumped id) with the term-index root reference
-    /// stamped — the maintenance publish. A maintenance build covers the
-    /// whole membership.
-    pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {
+    /// stamped — the maintenance publish. `complete` records whether the
+    /// index lists every live superfile.
+    pub(crate) fn with_term_index(&self, reference: RoutingRef, complete: bool) -> Self {
         self.with_list_edited(true, |list| {
             list.term_index = Some(reference);
-            list.term_index_complete = true;
+            list.term_index_complete = complete;
         })
     }
 

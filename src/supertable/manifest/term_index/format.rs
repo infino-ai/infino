@@ -100,8 +100,9 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// layers by. A root at version `4` decodes with every length zero, so
 /// its layers fold at the first commit that gathers enough of them; one
 /// at version `3` still decodes — its slices are at version 1 and serve
-/// ceilings until the next maintenance rebuild writes the current layout;
-/// anything older does not, and the index is rebuilt, not translated.
+/// ceilings until a fold rewrites them in the current layout; anything
+/// older does not, and the index is built again from the superfiles, not
+/// translated.
 pub(crate) const ROOT_FORMAT_VERSION: u32 = 5;
 /// The root version that named tiers but not slice lengths.
 pub(crate) const UNSIZED_ROOT_FORMAT_VERSION: u32 = 4;

@@ -29,6 +29,12 @@ use crate::{
 /// Bytes in a mebibyte, the unit the settings are expressed in.
 pub(super) const MIB: u64 = 1024 * 1024;
 
+/// The most input bytes one merge takes under `cfg`: a compaction job's,
+/// and a term-index fold's at optimize.
+pub(crate) fn max_merge_input_bytes(cfg: &CompactionSettings) -> u64 {
+    cfg.max_merge_input_mb.saturating_mul(MIB)
+}
+
 /// Stats for one superfile. The caller fills these in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuperfileStats {
@@ -135,7 +141,7 @@ pub fn select(superfiles: &[SuperfileStats], cfg: &CompactionSettings) -> Vec<Co
     // Clamped to >= 2 — merging fewer than two inputs is a no-op rewrite, so a
     // misconfigured smaller value is raised rather than rejected.
     let min_superfiles_for_merge = cfg.min_superfiles_for_merge.max(2) as usize;
-    let max_input_bytes = cfg.max_merge_input_mb.saturating_mul(MIB);
+    let max_input_bytes = max_merge_input_bytes(cfg);
 
     let mut by_partition: BTreeMap<&[u8], Vec<&SuperfileStats>> = BTreeMap::new();
     for s in superfiles {

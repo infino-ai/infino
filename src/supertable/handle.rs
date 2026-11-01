@@ -40,6 +40,7 @@ use super::{
     manifest::{
         ManifestSnapshot,
         list::{CellRoutingParams, PartitionStrategy, decode as decode_list},
+        part::ContentHash,
     },
     options::SupertableOptions,
     schema::LegacyNames,
@@ -259,6 +260,10 @@ pub(super) struct SupertableInner {
     /// top: decode the inline bytes once per manifest version, not once per
     /// query. Keyed by `manifest_id`, which bumps on every deleted-id stamp.
     pub(super) hidden_deleted_cache: Mutex<Option<(u64, Arc<Vec<i128>>)>>,
+    /// Term-index slice and tier objects this handle has found on storage,
+    /// by content hash: maintenance checks that the objects its root names
+    /// are there, and asks storage only about the ones not found before.
+    pub(super) term_index_objects_seen: Mutex<HashSet<ContentHash>>,
 }
 
 /// What a table handle knows of one hidden companion table.
@@ -1142,12 +1147,13 @@ impl Supertable {
         bridge_on_runtime(fut, &self.query_runtime())
     }
 
-    /// Rebuild the table-level term index over the current superfiles (see
-    /// `manifest::term_index`), so it covers every superfile in one segment.
-    /// [`Supertable::optimize`] calls this after compaction.
+    /// Index the superfiles the table-level term index does not list and
+    /// fold its layers in runs of at most `fold_max_bytes` (see
+    /// `writer::stamp_term_index`). [`Supertable::optimize`] calls this
+    /// after compaction.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
-    pub(crate) fn refresh_term_index_sync(&self) -> Result<(), BuildError> {
-        self.block_on_query(super::writer::stamp_term_index(&self.inner))
+    pub(crate) fn refresh_term_index_sync(&self, fold_max_bytes: u64) -> Result<(), BuildError> {
+        self.block_on_query(super::writer::stamp_term_index(&self.inner, fold_max_bytes))
     }
 
     /// Whether `spec` names four columns of this table of the right types
@@ -2245,6 +2251,7 @@ async fn build_handle(
         pointer_vanished: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: ArcSwapOption::empty(),
+        term_index_objects_seen: Mutex::default(),
     });
     install_disk_cache_pinning(&inner);
     let st = Supertable { inner };

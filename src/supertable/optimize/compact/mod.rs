@@ -267,7 +267,7 @@ impl SuperfileMerge for CompactionMerge {
 
 pub(crate) mod plan;
 
-pub(crate) use plan::{CompactionJob, SuperfileStats, select};
+pub(crate) use plan::{CompactionJob, SuperfileStats, max_merge_input_bytes, select};
 use plan::{MIB, split_stats_at_drain_watermark};
 
 /// Cap on compaction input opens in flight, counted across the whole process
