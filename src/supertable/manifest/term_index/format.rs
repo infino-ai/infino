@@ -372,7 +372,10 @@ pub(crate) const SLICE_VERSION_PREFIX_LEN: u64 = (MAGIC_LEN + U32_LEN) as u64;
 /// `prefix` is of the layout before tiers, refusing a magic or version
 /// [`Slice::open`] would refuse.
 pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexError> {
-    let mut c = Cursor { bytes: prefix, at: 0 };
+    let mut c = Cursor {
+        bytes: prefix,
+        at: 0,
+    };
     let version = check_magic_version(
         &mut c,
         SLICE_MAGIC,
