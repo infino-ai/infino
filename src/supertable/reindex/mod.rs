@@ -26,9 +26,7 @@ use uuid::Uuid;
 mod build;
 
 use crate::{
-    config::{
-        self, CompactionSettings, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex,
-    },
+    config::{self, ReindexMode, ReindexOptions, ReindexTarget, SuperfileIndex},
     runtime_bridge::bridge_on_runtime,
     superfile::{
         format::footer::{BlobRegion, has_duplicated_region_key, resolved_regions},
@@ -767,9 +765,10 @@ impl Supertable {
 
     /// Index the superfiles the term index does not list, logging rather
     /// than failing: queries stay correct on an index that is behind, so a
-    /// failed pass must not abort a migration.
+    /// failed pass must not abort a migration. Folds keep to the merge
+    /// input the configured compaction keeps to.
     fn refresh_term_index_best_effort(&self) {
-        let fold_max_bytes = max_merge_input_bytes(&CompactionSettings::default());
+        let fold_max_bytes = max_merge_input_bytes(&config::global().compaction);
         if let Err(e) = self.refresh_term_index_sync(fold_max_bytes) {
             warn!("[supertable reindex] term-index refresh failed: {e}");
         }

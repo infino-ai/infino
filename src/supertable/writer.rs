@@ -11064,6 +11064,24 @@ where
 /// work done so far should the process stop.
 pub(in crate::supertable) const TERM_INDEX_BATCH_SUPERFILES: usize = CONTRIBUTION_WALKS_MAX;
 
+/// A batch of superfiles indexed once and kept across its publish's
+/// retries, as a commit keeps its delta (see `term_index::append_reserved`):
+/// the superfiles, the scratch directory their contributions spilled into,
+/// the contributions, and the layer built from them.
+struct KeptBatch {
+    superfiles: Vec<Uuid>,
+    _scratch: TempDir,
+    contributions: Vec<TermContribution>,
+    layer: Option<ReservedLayer>,
+}
+
+/// A fold kept across its publish's retries: the root it was made of, and
+/// the folded root (see `term_index::rebase`).
+struct KeptFold {
+    prior: Root,
+    folded: Root,
+}
+
 /// Keep the table-level term index (see `manifest::term_index`) whole and
 /// its layers few, with the machinery commits use, in steps of bounded
 /// size, each published on a successor manifest. Maintenance-only: optimize
@@ -11072,21 +11090,27 @@ pub(in crate::supertable) const TERM_INDEX_BATCH_SUPERFILES: usize = CONTRIBUTIO
 ///
 /// - The live superfiles the index does not list are indexed
 ///   [`TERM_INDEX_BATCH_SUPERFILES`] at a time, each batch published the
-///   way a commit publishes its own postings ([`term_index::append_delta`]).
+///   way a commit publishes its own postings, its layer built once and
+///   appended to whichever root wins ([`term_index::append_reserved`]).
 ///   Superfiles reach the index through their commits; what is left here
 ///   was committed without postings, before the table kept an index or by
 ///   a writer that keeps none.
-/// - With none left to index, layers fold in runs of at most
-///   `fold_max_bytes` ([`term_index::fold_at_optimize`]), dropping the
-///   postings of superfiles no longer live from the layers a fold rewrites.
+/// - With none left to index, layers fold one run per publish, as
+///   [`term_index::plan_fold_at_optimize`] picks them, of at most
+///   `fold_max_bytes` together. A fold that loses its publish to commits
+///   has their layers stacked on it ([`term_index::rebase`]), so a retry
+///   writes one root.
 /// - A root that will never load (gone, corrupt, or in a layout this engine
-///   no longer reads), that names a slice or tier object no longer on
-///   storage, or that holds a slice written before tiers on a table that
-///   keeps them ([`term_index::check_objects`]), is started again from an
-///   empty root, a batch at a time. A root that failed to load for now
-///   fails the pass.
+///   no longer reads), that names a slice or tier object that will not
+///   ([`term_index::check_objects`]), or whose layers a fold cannot read,
+///   is started again from an empty root, a batch at a time. A root that
+///   failed to load for now fails the pass. A root written before slice
+///   lengths were recorded is written again with them.
 ///
-/// The index is marked complete once it lists every live superfile.
+/// The index is marked complete once it lists every live superfile. The
+/// passes are bounded by what the first one finds (see `budget`), so
+/// writers that keep adding superfiles without postings, or commits that
+/// keep a fold due, do not keep one call going.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
     fold_max_bytes: u64,
@@ -11098,11 +11122,23 @@ pub(in crate::supertable) async fn stamp_term_index(
         return Ok(());
     }
     let seen = &inner.term_index_objects_seen;
+    // Passes this call makes at most, set by the first: one per batch the
+    // index lacks, and one per fold, of which there are no more than the
+    // layers the root holds plus the one each batch adds, since every fold
+    // leaves fewer layers than it found.
+    let budget: OnceLock<usize> = OnceLock::new();
+    // One renumbering fold per call. Commits that land while it runs are
+    // stacked on it past nil padding, which would call for another at once;
+    // the next optimize's drops it.
+    let renumbered = AtomicBool::new(false);
+    let mut passes = 0;
     loop {
         let published = AtomicBool::new(false);
+        let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
+        let kept_fold: Mutex<Option<KeptFold>> = Mutex::new(None);
         stamp_with_retries(inner, &storage, "term-index", |old| {
-            let storage = &storage;
-            let published = &published;
+            let (storage, published, budget) = (&storage, &published, &budget);
+            let (kept_batch, kept_fold, renumbered) = (&kept_batch, &kept_fold, &renumbered);
             async move {
                 published.store(false, Ordering::Relaxed);
                 let entries = old
@@ -11113,81 +11149,180 @@ pub(in crate::supertable) async fn stamp_term_index(
                     scoring_by_superfile: Arc::new(scoring_by_superfile(&old)),
                     ..old.options.term_index_build_policy()
                 };
-                let root = match referenced_root(&old).await? {
-                    Some(root) => {
-                        match term_index::check_objects(storage, &root, &policy, seen).await? {
-                            RootObjects::Present => root,
+                let (mut root, mut repaired, sized, before_tiers) = match referenced_root(&old)
+                    .await?
+                {
+                    Some(mut root) => {
+                        match term_index::check_objects(storage, &mut root, seen).await? {
+                            RootObjects::Present {
+                                sized,
+                                before_tiers,
+                            } => (root, false, sized, before_tiers),
                             RootObjects::Missing => {
                                 warn!(
-                                    "term index: an object the root names is gone; indexing every superfile again"
+                                    "term index: an object the root names will not load; indexing every superfile again"
                                 );
-                                Root::default()
-                            }
-                            RootObjects::BeforeTiers => {
-                                info!(
-                                    "term index: a slice predates tiers; indexing every superfile again in the current layout"
-                                );
-                                Root::default()
+                                (Root::default(), true, false, false)
                             }
                         }
                     }
-                    None => Root::default(),
+                    None => (Root::default(), true, false, false),
                 };
                 let pool = Some(&*old.options.reader_pool);
-                let mut listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-                let missing: Vec<Arc<SuperfileEntry>> = entries
-                    .iter()
-                    .filter(|e| listed.insert(e.superfile_id))
-                    .cloned()
-                    .collect();
-                let (reference, complete) = if !missing.is_empty() {
-                    let batch = &missing[..missing.len().min(TERM_INDEX_BATCH_SUPERFILES)];
-                    let scratch = term_index_scratch(&policy).map_err(TermIndexError::from)?;
-                    let contributions = collect_contributions(&old, batch, scratch.path()).await?;
-                    let reference =
-                        term_index::append_delta(storage, Some(root), &contributions, &policy, pool)
-                            .instrument(detail_span!(
-                                "term_index.append",
-                                contributions = contributions.len(),
-                            ))
-                            .await?;
-                    (reference, batch.len() == missing.len())
-                } else if term_index::fold_at_optimize_due(&root, fold_max_bytes) {
+                let mut missing = unlisted(&root, &entries);
+                        let batches = missing.len().div_ceil(TERM_INDEX_BATCH_SUPERFILES);
+                budget.get_or_init(|| 2 * batches + root.layers.len() + 1);
+                if missing.is_empty() {
+                    let kept = kept_fold.lock().expect("kept fold").take();
+                    if let Some(rebased) =
+                        kept.and_then(|kept| term_index::rebase(&kept.folded, &kept.prior, &root))
+                    {
+                        info!("term index: a fold lost its publish to commits; stacked them on it");
+                        let reference = write_fold(storage, kept_fold, root, rebased).await?;
+                        published.store(true, Ordering::Relaxed);
+                        return Ok(Some(old.with_term_index(reference, true)));
+                    }
                     let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
-                    let span = detail_span!("term_index.fold", layers = root.layers.len());
-                    let mut root = root;
-                    let policy = term_index::BuildPolicy {
-                        scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, &root.superfiles)),
-                        ..policy
-                    };
-                    term_index::fold_at_optimize(
-                        storage,
-                        &mut root,
-                        &policy,
-                        pool,
+                    let renumber = !renumbered.load(Ordering::Relaxed);
+                    if let Some(fold) = term_index::plan_fold_at_optimize(
+                        &root,
                         &live,
                         fold_max_bytes,
-                    )
-                    .instrument(span)
-                    .await?;
-                    (term_index::write_root(storage.as_ref(), &root).await?, true)
-                } else {
-                    return Ok(match old.term_index_ref() {
-                        Some(reference) if !old.term_index_complete() => {
-                            Some(old.with_term_index(reference.clone(), true))
+                        renumber,
+                        before_tiers,
+                    ) {
+                        let policy = term_index::BuildPolicy {
+                            scoring_by_ordinal: Arc::new(scoring_by_ordinal(&old, fold.superfiles())),
+                            ..policy.clone()
+                        };
+                        let renumbers = fold.renumbers();
+                        let span = detail_span!("term_index.fold", layers = root.layers.len());
+                        match term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
+                            .instrument(span)
+                            .await
+                        {
+                            Ok(folded) => {
+                                let reference = write_fold(storage, kept_fold, root, folded).await?;
+                                renumbered.fetch_or(renumbers, Ordering::Relaxed);
+                                published.store(true, Ordering::Relaxed);
+                                return Ok(Some(old.with_term_index(reference, true)));
+                            }
+                            Err(e) if e.calls_for_rebuild() => {
+                                warn!(
+                                    "term index: a fold cannot read the index ({e}); indexing every superfile again"
+                                );
+                                root = Root::default();
+                                repaired = true;
+                                missing = unlisted(&root, &entries);
+                            }
+                            Err(e) => return Err(e.into()),
                         }
-                        _ => None,
-                    });
+                    }
+                }
+                if missing.is_empty() {
+                    // Nothing to index or fold. A root started again, or one
+                    // whose slice lengths were filled in, is written as it
+                    // now stands; otherwise only a stale mark is corrected.
+                    if !repaired && !sized {
+                        return Ok(match old.term_index_ref() {
+                            Some(reference) if !old.term_index_complete() => {
+                                Some(old.with_term_index(reference.clone(), true))
+                            }
+                            _ => None,
+                        });
+                    }
+                    let reference = term_index::write_root(storage.as_ref(), &root).await?;
+                    published.store(true, Ordering::Relaxed);
+                    return Ok(Some(old.with_term_index(reference, true)));
+                }
+                let batch = &missing[..missing.len().min(TERM_INDEX_BATCH_SUPERFILES)];
+                let ids: Vec<Uuid> = batch.iter().map(|e| e.superfile_id).collect();
+                // The batch an earlier attempt indexed, when it is this one.
+                let kept = kept_batch
+                    .lock()
+                    .expect("kept batch")
+                    .take()
+                    .filter(|kept| kept.superfiles == ids);
+                let mut kept = match kept {
+                    Some(kept) => kept,
+                    None => {
+                        let scratch = term_index_scratch(&policy).map_err(TermIndexError::from)?;
+                        let contributions =
+                            collect_contributions(&old, batch, scratch.path()).await?;
+                        KeptBatch {
+                            superfiles: ids,
+                            _scratch: scratch,
+                            contributions,
+                            layer: None,
+                        }
+                    }
                 };
+                if kept.layer.is_none() {
+                    kept.layer = Some(
+                        term_index::reserve_layer(
+                            storage,
+                            &kept.contributions,
+                            &policy,
+                            root.superfiles.len() as u32,
+                            true,
+                        )
+                        .await?,
+                    );
+                }
+                let reference = term_index::append_reserved(
+                    storage,
+                    Some(root),
+                    &kept.contributions,
+                    &policy,
+                    &mut kept.layer,
+                    pool,
+                )
+                .instrument(detail_span!(
+                    "term_index.append",
+                    contributions = kept.contributions.len(),
+                ))
+                .await?;
+                *kept_batch.lock().expect("kept batch") = Some(kept);
                 published.store(true, Ordering::Relaxed);
-                Ok(Some(old.with_term_index(reference, complete)))
+                Ok(Some(old.with_term_index(reference, batch.len() == missing.len())))
             }
         })
         .await?;
         if !published.load(Ordering::Relaxed) {
             return Ok(());
         }
+        passes += 1;
+        if passes >= *budget.get().expect("set by the first pass") {
+            info!(
+                passes,
+                "term index: stopping after the passes the index called for; the next optimize takes up the rest"
+            );
+            return Ok(());
+        }
     }
+}
+
+/// The `entries` `root` does not list, each once, in `entries` order.
+fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEntry>> {
+    let mut listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+    entries
+        .iter()
+        .filter(|e| listed.insert(e.superfile_id))
+        .cloned()
+        .collect()
+}
+
+/// Write `folded`, a fold made of `prior`, and keep both in `kept` for a
+/// retry should its publish lose to a commit.
+async fn write_fold(
+    storage: &Arc<dyn StorageProvider>,
+    kept: &Mutex<Option<KeptFold>>,
+    prior: Root,
+    folded: Root,
+) -> Result<RoutingRef, TermIndexError> {
+    let reference = term_index::write_root(storage.as_ref(), &folded).await?;
+    *kept.lock().expect("kept fold") = Some(KeptFold { prior, folded });
+    Ok(reference)
 }
 
 /// The root `manifest` references: empty when it has none, `None` when it
@@ -16553,37 +16688,29 @@ supertable:
         );
     }
 
-    /// A root that optimize indexes again from scratch, after a compaction
-    /// left it listing removed superfiles, is shorter than the one it
-    /// replaces; the next append numbers from it without padding.
+    /// A compaction leaves the root listing the superfiles it removed, so
+    /// optimize renumbers it shorter; the next append numbers from it
+    /// without padding.
     #[test]
     fn an_append_after_optimize_shrinks_the_root_does_not_pad_it_back() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let options = || options_id_title().with_storage(Arc::clone(&storage));
-        let st = Supertable::create(options()).expect("create");
+        let st = Supertable::create(options_id_title().with_storage(Arc::clone(&storage)))
+            .expect("create");
         for i in 0..40 {
             st.append(&row(&format!("doc {i}"))).expect("append");
         }
-        let compact = OptimizeOptions::compact(CompactionSettings {
+        st.optimize(&OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             ..CompactionSettings::default()
-        });
-        st.optimize(&compact).expect("optimize");
-        let listed = term_root(&st, &storage).superfiles.len();
-        // A slice gone from storage has the next optimize index every
-        // superfile again; a fresh handle has seen none of the objects.
-        let slice = term_root(&st, &storage).layers[0].slices[0].content_hash;
-        drop(st);
-        fs::remove_file(dir.path().join(term_index::slice_uri(&slice))).expect("remove slice");
-        let st = Supertable::open(options()).expect("reopen");
-        st.optimize(&compact).expect("optimize");
+        }))
+        .expect("optimize");
         let shrunk = term_root(&st, &storage).superfiles.len();
         assert!(
-            shrunk < listed,
-            "precondition: the index lists only the live superfiles"
+            shrunk < 40,
+            "precondition: optimize renumbered a shorter root"
         );
 
         st.append(&row("after")).expect("append");

@@ -301,13 +301,17 @@ stamps the root's reference on the manifest before the pointer swap.
 So a visible superfile always has postings, a crash between the writes
 and the swap leaves only orphans for garbage collection, and a lost
 race is retried against the winner with re-puts of already-written
-slices as no-ops. A maintenance pass folds every delta into one base
-layer. Deltas committed while it runs stay after that base, padded so
-their ordinals hold; when they cannot (an incomplete or replaced prior
-index, or one that cannot be read), their superfiles are re-indexed on
-top of the base instead. The next pass folds either. A posting is
-followed only if its superfile is still live in the reader's manifest,
-so a removal never invalidates the index.
+slices as no-ops. A commit folds runs of small layers as they pile up;
+a maintenance pass folds the larger runs commits leave, one run per
+publish and no more than one compaction merge's input at a time. Once
+at least half of the root's list of superfiles is dead and the whole
+index fits that bound, the pass folds every layer into one and numbers
+the live superfiles afresh, which is the only way the list shortens.
+Deltas committed while a fold runs are stacked after it as they were
+committed, padded so their ordinals hold, so its retry writes one root;
+a later renumbering drops the padding. A posting is followed only if
+its superfile is still live in the reader's manifest, so a removal never
+invalidates the index.
 
 Queries use it at every tier. Superfile selection for a term or prefix
 is exact for every superfile the index lists. The choice of which

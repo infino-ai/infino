@@ -97,8 +97,8 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// `3` keys terms by the column's field id instead of its name; `4` names
 /// each slice's tier object beside the slice; `5` records each slice's
 /// byte length again beside its tier, which the fold at commit sizes
-/// layers by. A root at version `4` decodes with every length zero, so
-/// its layers fold at the first commit that gathers enough of them; one
+/// layers by. A root at version `4` decodes with every length zero, until
+/// optimize reads each slice's length from storage and writes it in; one
 /// at version `3` still decodes — its slices are at version 1 and serve
 /// ceilings until a fold rewrites them in the current layout; anything
 /// older does not, and the index is built again from the superfiles, not
