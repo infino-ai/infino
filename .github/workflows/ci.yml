@@ -125,14 +125,16 @@ jobs:
   public-api:
     name: Public API surface
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    env:
       # cargo-public-api builds rustdoc JSON, which requires nightly.
       # Pinned: the 2026-11-01 nightly fails to compile datafusion-expr
       # ("cycle detected when computing when `Alias` needs async drop").
+      PUBLIC_API_NIGHTLY: nightly-2026-10-31
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-10-31
+          toolchain: ${{ env.PUBLIC_API_NIGHTLY }}
       - uses: Swatinem/rust-cache@v2
         with:
           cache-directories: |
@@ -145,7 +147,12 @@ jobs:
       # Fails if the curated public surface drifts from the committed
       # `public-api.txt` snapshot. The snapshot is taken without
       # `test-helpers`, so internal modules stay off the contract.
+      # cargo-public-api uses the toolchain `cargo` reports, and falls back
+      # to the floating `nightly` when that is the stable one pinned by
+      # `rust-toolchain.toml`; RUSTUP_TOOLCHAIN makes it the pinned nightly.
       - run: make public-api
+        env:
+          RUSTUP_TOOLCHAIN: ${{ env.PUBLIC_API_NIGHTLY }}
 
   python:
     name: Python wheel & tests (${{ matrix.os }})
