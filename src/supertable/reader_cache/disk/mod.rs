@@ -3,7 +3,9 @@
 
 //! [`DiskCacheStore`] — Tier 1 cache wrapping a [`StorageProvider`] with parallel cold-fetch and LRU
 //! eviction. Split across sibling files: `read` (open a superfile), `fetch` (cold-fetch it in), `budget`
-//! (reserve and evict), `store_files` (the on-disk directory), and `sources` (mmap).
+//! (reserve and evict), `fill_wait` (when a background fill may download: its defer window, and
+//! parking it until a query lets go of its file), `store_files` (the on-disk directory), and
+//! `sources` (mmap).
 
 use std::{
     collections::HashSet,
@@ -32,6 +34,7 @@ use crate::{
         reader_cache::{
             block_source::BlockCachedSource,
             config::{ColdFetchMode, DiskCacheConfig},
+            disk::fill_wait::FillWaiters,
         },
     },
 };
@@ -51,9 +54,6 @@ const FTS_OPEN_HEADER_FALLBACK_BYTES: u64 = 48;
 /// superfile. Short so the waiter picks up the promotion promptly
 /// without busy-spinning.
 const MMAP_PROMOTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Yield cadence while a background fill waits for its foreground reader.
-const STORE_UPGRADE_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Most bytes of fetched runs a store holds in memory before they are written to block files. Past
 /// this, reads still get their bytes but don't cache them, so a slow disk costs refetches later,
@@ -92,8 +92,8 @@ static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
 /// begins and can re-check its per-URI pause condition; it is **not** a
 /// process-wide pause signal (unrelated URI fills keep running).
 static FOREGROUND_QUERIES: AtomicU64 = AtomicU64::new(0);
-/// Wakes background fills so they re-check per-URI quiescence when a
-/// foreground query arrives.
+/// Wakes downloading background fills so they re-check per-URI quiescence when a
+/// foreground query arrives. Fills not yet downloading wait in `fill_wait` instead.
 static FOREGROUND_NOTIFY: OnceLock<Notify> = OnceLock::new();
 
 fn foreground_notify() -> &'static Notify {
@@ -102,8 +102,8 @@ fn foreground_notify() -> &'static Notify {
 
 /// RAII guard marking a foreground query in flight for its lifetime.
 ///
-/// Entering the guard notifies waiting fills so a same-URI fill can yield
-/// to lazy query reads. Unrelated URI fills are not paused by this guard —
+/// Entering the guard notifies downloading fills so a same-URI fill can pause
+/// for lazy query reads. Unrelated URI fills are not paused by this guard —
 /// only by that URI's own reader hold ([`reader_blocks_background_fill`]).
 pub struct ForegroundQueryGuard(());
 
@@ -118,8 +118,8 @@ impl ForegroundQueryGuard {
 impl Drop for ForegroundQueryGuard {
     fn drop(&mut self) {
         FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
-        // Wake fills waiting on the notify so they can resume after the
-        // query releases same-URI readers.
+        // Downloads re-check on the notify; a fill that already paused is woken by
+        // its store's ticker once the reader is free (see `fill_wait`).
         foreground_notify().notify_waiters();
     }
 }
@@ -412,6 +412,8 @@ pub struct DiskCacheStore {
     pinned_fn: std::sync::Mutex<Arc<dyn Fn() -> HashSet<SuperfileUri> + Send + Sync>>,
     /// Global cap on concurrent background full-superfile fills.
     prefetch_semaphore: Arc<Semaphore>,
+    /// Background fills waiting for a query to let go of their file.
+    fill_waiters: FillWaiters,
 }
 
 impl fmt::Debug for DiskCacheStore {
@@ -431,6 +433,7 @@ impl fmt::Debug for DiskCacheStore {
 
 mod budget;
 mod fetch;
+mod fill_wait;
 mod read;
 mod sources;
 mod store_files;
@@ -498,6 +501,7 @@ impl DiskCacheStore {
             n_promotion_waiters: AtomicU64::new(0),
             pinned_fn: std::sync::Mutex::new(pinned_fn),
             prefetch_semaphore,
+            fill_waiters: FillWaiters::default(),
         });
 
         // Record what is already on disk so the budget is correct from the start. Files are opened
