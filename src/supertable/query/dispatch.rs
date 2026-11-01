@@ -74,7 +74,9 @@ use crate::{
             superfile_reader::{OpenTierCounts, superfile_reader_tiered},
             vector::row_id_from_manifest_entry,
         },
-        reader_cache::{DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache},
+        reader_cache::{
+            DiskCacheStore, OpenTier, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
+        },
         tombstones::SidecarCache,
     },
     utils::join::try_join_bounded,
@@ -197,6 +199,17 @@ pub(crate) async fn open_whole_superfile(
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     if let Some(storage) = storage {
+        // A file already on this host's disk is mapped where it lies. Going
+        // through the disk cache would copy it into the cache first: a
+        // second write of every input, on the path every merge waits on
+        // before it can start, for a file the merge is about to replace.
+        // Anything that stops the map takes the ordinary path below.
+        if let Some(local) = storage.local_path(&entry.storage_path())
+            && let Ok(bytes) = mmap_readonly_bytes(&local)
+        {
+            let reader = SuperfileReader::open(bytes)?;
+            return Ok(Arc::new(reader));
+        }
         if let Some(cache) = disk_cache {
             let reader = cache
                 .reader_synchronous_with_storage(
