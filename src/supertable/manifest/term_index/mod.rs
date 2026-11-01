@@ -137,15 +137,6 @@ const LAYER_FETCH_CONCURRENCY: usize = 16;
 /// object is read back only as its upload starts.
 const SLICE_WRITE_CONCURRENCY: usize = 16;
 
-/// Ordinals a reserved layer leaves free past the root it was built
-/// against, for the deltas other commits append while its own commit
-/// retries. Ingest commits land a few times a second and a retrying commit
-/// gives up within a minute, so this is rarely outgrown; outgrowing it
-/// costs one rebuild of the layer, never correctness. Each unused slot
-/// is a nil entry (32 bytes) in the root until optimize renumbers it away
-/// (see [`plan_fold_at_optimize`]).
-const RESERVED_ORDINAL_SLACK: u32 = 256;
-
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
 /// ever appended would cost one slice per commit since the last optimize;
@@ -504,12 +495,12 @@ pub(crate) async fn append_delta(
     publish_root(storage, built.root, policy, pool).await
 }
 
-/// A delta layer built and written once, numbered from a reserved
-/// ordinal past the root it was built against. A commit that loses its race
-/// appends the same layer to the winner's root, padding up to its first
-/// ordinal, instead of building and uploading it again. When the winner's
-/// root has grown past that ordinal, the layer is moved to new ordinals
-/// from the bytes it keeps (see [`rebase`]) rather than built again.
+/// A delta layer built and written once, numbered from the length of the
+/// root it was built against. A commit that loses its race to a commit
+/// that left the root's list as it was appends the same layer to the
+/// winner's root; when the winner's list is longer, the layer is moved to
+/// its length from the bytes it keeps (see `rebase_layer`) rather than
+/// built again. Either way the root is never padded on its account.
 pub(crate) struct ReservedLayer {
     /// The ordinal its first superfile takes. Its postings name
     /// `base + i` for the `i`-th of `superfiles`.
@@ -519,9 +510,6 @@ pub(crate) struct ReservedLayer {
     layer: Layer,
     /// The layer's slice and tier bytes, kept to move it.
     bytes: Arc<LayerBytes>,
-    /// Appended only at exactly the root's length, and moved there
-    /// otherwise, so the root is never padded on its account.
-    exact: bool,
 }
 
 /// The slice and tier objects of a layer, by content hash.
@@ -554,7 +542,6 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
     base: u32,
-    exact: bool,
 ) -> Result<ReservedLayer, TermIndexError> {
     let built = detail_span!(
         "term_index.build_layer",
@@ -573,7 +560,6 @@ pub(crate) async fn reserve_layer(
             slices: built.slices,
             tiers: built.tiers,
         }),
-        exact,
     })
 }
 
@@ -628,23 +614,19 @@ async fn move_reserved(
             slices: moved.slices,
             tiers: moved.tiers,
         }),
-        exact: reserved.exact,
     }))
 }
 
 /// [`append_delta`] for a commit that may retry: the layer is built once,
-/// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
-/// `reserved`. Each call pads `prior` with nil entries up to the reserved
-/// ordinal and appends it, writing only the root unless the root's layers
-/// make a run [`fold_tail`] merges, on `pool`. When `prior` has grown past
-/// the reserved ordinal, the layer is moved to new ordinals, the slack past
-/// `prior`'s length, and its moved slices written; it is built again only
-/// when it cannot be moved, or the contributions are not the ones it was
-/// built from. An `exact` layer is never padded: it is reused only at
-/// `prior`'s exact length and otherwise moved there, without the slack.
+/// numbered from `prior`'s length, and kept in `reserved`. A call at that
+/// length appends it, writing only the root unless the root's layers make a
+/// run [`fold_tail`] merges, on `pool`. When `prior`'s list has grown since,
+/// the layer is moved to its length and the moved slices written; it is
+/// built again only when it cannot be moved, or the contributions are not
+/// the ones it was built from.
 ///
 /// Like every delta, it names only ordinals at or past the length of the
-/// root it extends. The padding stays in the root, named by no posting.
+/// root it extends, and the root it appends to is never padded.
 pub(crate) async fn append_reserved(
     storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
@@ -654,14 +636,11 @@ pub(crate) async fn append_reserved(
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
-    let len = root.superfiles.len();
-    let exact = reserved.as_ref().is_some_and(|r| r.exact);
-    let reusable = reserved.as_ref().is_some_and(|r| {
-        (r.base as usize == len || (!exact && r.base as usize > len)) && r.built_from(contributions)
-    });
+    let base = root.superfiles.len() as u32;
+    let reusable = reserved
+        .as_ref()
+        .is_some_and(|r| r.base == base && r.built_from(contributions));
     if !reusable {
-        let slack = if exact { 0 } else { RESERVED_ORDINAL_SLACK };
-        let base = len as u32 + slack;
         let moved = match reserved
             .as_ref()
             .filter(|kept| kept.built_from(contributions))
@@ -671,7 +650,7 @@ pub(crate) async fn append_reserved(
         };
         let next = match moved {
             Some(moved) => moved,
-            None => reserve_layer(storage, contributions, policy, base, exact).await?,
+            None => reserve_layer(storage, contributions, policy, base).await?,
         };
         // The replaced layer's objects are written; its spilled copies are
         // read by nothing again.
@@ -681,10 +660,7 @@ pub(crate) async fn append_reserved(
         }
     }
     let layer = reserved.as_ref().expect("reserved above");
-    let padding = layer.base as usize - len;
-    root.superfiles.extend(repeat_n(Uuid::nil(), padding));
     root.superfiles.extend_from_slice(&layer.superfiles);
-    root.id_mins.extend(repeat_n(0, padding));
     root.id_mins.extend_from_slice(&layer.id_mins);
     root.layers.push(layer.layer.clone());
     publish_root(storage, root, policy, pool).await
@@ -7471,11 +7447,11 @@ mod tests {
     }
 
     /// A retry that appends its reserved layer onto a winner's root folds
-    /// the run beneath it like any delta: the reserved layer stays as
-    /// built and newest, the padding up to its ordinal is kept, and every
+    /// the run beneath it like any delta: the reserved layer, moved to the
+    /// winner's length, stays newest, the root is not padded, and every
     /// term routes to its superfile.
     #[tokio::test]
-    async fn a_fold_on_the_retry_path_keeps_the_reserved_layer_and_padding() {
+    async fn a_fold_on_the_retry_path_keeps_the_reserved_layer_newest() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
@@ -7523,11 +7499,14 @@ mod tests {
         assert_eq!(
             root.layers.last(),
             Some(layer),
-            "the reserved layer is appended as it was built"
+            "the reserved layer is appended as it was moved"
         );
-        let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
-        let ordinal = reserved.as_ref().expect("reserved").base as usize;
-        assert_eq!(padding, ordinal - winner.superfiles.len());
+        assert_eq!(
+            reserved.as_ref().expect("reserved").base as usize,
+            winner.superfiles.len(),
+            "moved to the winner's length"
+        );
+        assert!(!root.superfiles.contains(&Uuid::nil()), "no padding");
         let mut expected: Vec<Uuid> = (1..=winner_id).map(Uuid::from_u128).collect();
         expected.push(Uuid::from_u128(RESERVED_ID));
         assert_eq!(posted_superfiles(&root, &local, "shared").await, expected);
@@ -7537,11 +7516,12 @@ mod tests {
         );
     }
 
-    /// A retry appends the layer it already built onto the winner's root:
-    /// no slice is written again, the root is padded up to the reserved
-    /// ordinal, and every posting names the right superfile.
+    /// A retry that lost to a commit which left the root's list as it was —
+    /// one that only removed superfiles — appends the layer it already
+    /// built: no slice is written again, nothing is padded, and every
+    /// posting names the right superfile.
     #[tokio::test]
-    async fn append_reserved_reuses_its_layer_on_a_longer_root() {
+    async fn append_reserved_reuses_its_layer_on_an_unchanged_list() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -7561,25 +7541,11 @@ mod tests {
         )
         .await
         .expect("first attempt");
-
-        // Another commit publishes a delta first.
-        let winner = append_delta(
-            &local,
-            Some(prior.clone()),
-            &[contribution(&dir, 2, &[("body", "shared", 4)])],
-            &policy,
-            None,
-        )
-        .await
-        .expect("winner's delta");
-        let winner = load_root(local.as_ref(), &winner)
-            .await
-            .expect("winner root");
         let slices_before_retry = slice_objects(&store_dir);
 
         let reference = append_reserved(
             &local,
-            Some(winner.clone()),
+            Some(prior.clone()),
             &merged,
             &policy,
             &mut reserved,
@@ -7594,15 +7560,14 @@ mod tests {
             "the retry writes no slice"
         );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let base = prior.superfiles.len() + RESERVED_ORDINAL_SLACK as usize;
+        let base = prior.superfiles.len();
         assert_eq!(root.superfiles.len(), base + 1);
         assert_eq!(root.superfiles[base], Uuid::from_u128(9));
-        let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
-        assert_eq!(padding, base - winner.superfiles.len());
+        assert!(!root.superfiles.contains(&Uuid::nil()), "no padding");
         assert_eq!(
             posted_superfiles(&root, &local, "shared").await,
-            [1, 2, 9].map(Uuid::from_u128),
-            "base, winner, then the reserved layer"
+            [1, 9].map(Uuid::from_u128),
+            "base, then the reserved layer"
         );
         assert_eq!(
             posted_superfiles(&root, &local, "merged").await,
@@ -7610,9 +7575,9 @@ mod tests {
         );
     }
 
-    /// A root grown past the reserved ordinal gets the layer moved, other
-    /// contributions get one built again; either way its postings name the
-    /// right superfile.
+    /// A root whose list grew since the layer was built gets the layer
+    /// moved to its length, other contributions get one built again; either
+    /// way its postings name the right superfile.
     #[tokio::test]
     async fn append_reserved_moves_or_rebuilds_when_it_cannot_reuse() {
         let dir = TempDir::new().expect("tempdir");
@@ -7631,9 +7596,9 @@ mod tests {
         .await
         .expect("first attempt");
 
-        // More commits than the reservation leaves room for.
+        // Commits landed first.
         let mut outgrown = prior.clone();
-        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
+        let extra = LANDED_FIRST;
         outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
         outgrown.id_mins.extend(repeat_n(0, extra));
         let slices_before = slice_objects(&store_dir);
@@ -7653,10 +7618,7 @@ mod tests {
             "moved slices written"
         );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        assert_eq!(
-            root.superfiles.len(),
-            outgrown.superfiles.len() + RESERVED_ORDINAL_SLACK as usize + 1
-        );
+        assert_eq!(root.superfiles.len(), outgrown.superfiles.len() + 1);
         assert_eq!(
             posted_superfiles(&root, &local, "merged").await,
             [Uuid::from_u128(9)]
@@ -7674,6 +7636,9 @@ mod tests {
         );
         assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
     }
+
+    /// Superfiles other commits list before a retry in the move tests.
+    const LANDED_FIRST: usize = 3;
 
     /// A slice target small enough that a few terms make several slices.
     const SMALL_SLICE_TARGET_BYTES: usize = 64;
@@ -7784,10 +7749,9 @@ mod tests {
         assert_eq!(built.slices, before, "kept bytes untouched");
     }
 
-    /// A retry whose root outgrew the reservation moves the layer it built
-    /// rather than building it again: it succeeds with the contributions'
-    /// spill gone, and publishes the layer a build at the new ordinals
-    /// would.
+    /// A retry whose root's list grew moves the layer it built rather than
+    /// building it again: it succeeds with the contributions' spill gone,
+    /// and publishes the layer a build at the new ordinals would.
     #[tokio::test]
     async fn append_reserved_moves_its_layer_without_its_contributions() {
         let dir = TempDir::new().expect("tempdir");
@@ -7807,10 +7771,11 @@ mod tests {
         .expect("first attempt");
 
         let mut outgrown = prior;
-        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
-        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
-        outgrown.id_mins.extend(repeat_n(0, extra));
-        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        outgrown
+            .superfiles
+            .extend(repeat_n(Uuid::nil(), LANDED_FIRST));
+        outgrown.id_mins.extend(repeat_n(0, LANDED_FIRST));
+        let base = outgrown.superfiles.len() as u32;
         let expected = build_layer(&merged, &policy, base).expect("build at the new base");
         for c in &merged {
             fs::remove_file(&c.path).expect("drop the contribution spill");
@@ -7870,7 +7835,7 @@ mod tests {
         .await
         .expect("built again");
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        let base = outgrown.superfiles.len() as u32;
         let expected = build_layer(&merged, &policy, base).expect("build at the new base");
         assert_eq!(root.layers.last(), Some(&expected.layer));
 
@@ -7907,12 +7872,12 @@ mod tests {
         prior
     }
 
-    /// A compaction that loses its commit to an ingest commit appends the
-    /// term-index layer it already built: every slice on storage is one
-    /// the root names, the index stays complete, and the merged superfile's
-    /// terms route to it. Optimize's rebuild then drops the padding.
+    /// A compaction that loses its commit to an ingest commit moves the
+    /// term-index layer it already built to the winner's length, as an
+    /// append does: the root carries no padding, the index stays complete,
+    /// and the merged superfile's terms route to it.
     #[test]
-    fn a_compaction_retry_reuses_its_term_index_layer() {
+    fn a_compaction_retry_moves_its_term_index_layer_without_padding() {
         let (dir, faults, storage, st) = fault_table();
         for layer in 0..LAYERS {
             commit_layer(&st, layer);
@@ -7940,24 +7905,9 @@ mod tests {
         // lost and its commit landed on a retry.
         assert_eq!(live.len(), 2, "the merged superfile and the peer's");
         assert!(live.is_disjoint(&before), "every input was merged");
-        let named: HashSet<String> = root
-            .layers
-            .iter()
-            .flat_map(|s| &s.slices)
-            .map(|s| {
-                slice_uri(&s.content_hash)
-                    .trim_start_matches(STORAGE_PREFIX)
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            slice_objects(&dir),
-            named,
-            "the retry wrote no slice of its own"
-        );
         assert!(
-            root.superfiles.iter().any(Uuid::is_nil),
-            "the root is padded up to the reserved ordinal"
+            !root.superfiles.iter().any(Uuid::is_nil),
+            "the root is not padded"
         );
         assert!(
             st.reader()

@@ -316,7 +316,7 @@ pub(crate) struct Layer {
 pub(crate) struct Root {
     /// Superfiles with postings in some layer; postings name them by
     /// ordinal. Never reordered — a delta appends. May hold nil padding,
-    /// which no posting names (see `append_reserved`).
+    /// which no posting names (see `rebase`).
     pub(crate) superfiles: Vec<Uuid>,
     /// Each superfile's smallest doc id, parallel to `superfiles`.
     pub(crate) id_mins: Vec<i128>,

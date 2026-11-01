@@ -2941,7 +2941,6 @@ impl SupertableWriter {
                                 contributions,
                                 &self.inner.options.term_index_build_policy(),
                                 base,
-                                true,
                             ),
                             &runtime,
                         )
@@ -11257,18 +11256,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                         }
                     }
                 };
-                if kept.layer.is_none() {
-                    kept.layer = Some(
-                        term_index::reserve_layer(
-                            storage,
-                            &kept.contributions,
-                            &policy,
-                            root.superfiles.len() as u32,
-                            true,
-                        )
-                        .await?,
-                    );
-                }
                 let reference = term_index::append_reserved(
                     storage,
                     Some(root),
