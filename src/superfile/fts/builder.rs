@@ -430,6 +430,10 @@ struct ColumnState {
     /// Total token count across every doc in this column. Used for
     /// `avgdl = total_tokens / documents with tokens`.
     total_tokens: u64,
+    /// Each doc's token count before storage clamps it, so a stretch of
+    /// a lane's documents can total its tokens exactly. Kept only by a
+    /// lane (see [`FtsBuilder::set_lane_mode`]); empty otherwise.
+    tokens: Vec<u32>,
     /// Record token positions for this column (phrase support). Set
     /// at registration from `FtsConfig::positions`; selects the
     /// positional capture path in `add_doc` and the extended
@@ -546,6 +550,10 @@ struct RamStore {
     postings: Vec<Vec<(u32, u32)>>,
     /// Empty for a positionless column.
     pos_runs: Vec<Vec<u8>>,
+    /// Where each posting's run ends in `pos_runs`, per id, so a stretch
+    /// of a list's postings can take its runs by byte range. Kept only by
+    /// a lane (see [`FtsBuilder::set_lane_mode`]); empty otherwise.
+    run_ends: Vec<Vec<u32>>,
     /// Estimated bytes held (see `ACCUM_*_BYTES`); drives the spill check.
     bytes: usize,
 }
@@ -555,18 +563,25 @@ impl RamStore {
         Self {
             postings: Vec::new(),
             pos_runs: Vec::new(),
+            run_ends: Vec::new(),
             bytes: 0,
         }
     }
 
     /// Give every interned id its slot. Amortized O(1) per new id.
     #[inline(always)]
-    fn grow_to(&mut self, n_terms: usize, positional: bool) {
+    fn grow_to(&mut self, n_terms: usize, positional: bool, run_ends: bool) {
+        // Each table on its own: the positional scan grows the lists and
+        // the runs itself as it interns, and only the drain grows the run
+        // ends.
         if self.postings.len() < n_terms {
             self.postings.resize_with(n_terms, Vec::new);
-            if positional {
-                self.pos_runs.resize_with(n_terms, Vec::new);
-            }
+        }
+        if positional && self.pos_runs.len() < n_terms {
+            self.pos_runs.resize_with(n_terms, Vec::new);
+        }
+        if positional && run_ends && self.run_ends.len() < n_terms {
+            self.run_ends.resize_with(n_terms, Vec::new);
         }
     }
 }
@@ -1463,6 +1478,14 @@ pub struct FtsBuilder {
     head_sink: Option<Box<dyn TermHeadSink>>,
     /// Best documents per term handed to the sink; `0` keeps none.
     head_depth: usize,
+    /// Whether this builder is a lane of a build fed as its rows arrive
+    /// (see [`Self::set_lane_mode`]): it then keeps what cutting its
+    /// lists by row needs.
+    lane_mode: bool,
+    /// Lanes the finish merges instead of reading this builder's own
+    /// accumulator, over a range of their rows; `None` for every other
+    /// build. See [`Self::set_lane_view`].
+    lane_view: Option<LaneView>,
     /// Set once an `add_doc` failed partway through a document. The
     /// store may then hold part of that document, so the builder refuses
     /// further documents and refuses to finish: a caller that retries on
@@ -1470,7 +1493,50 @@ pub struct FtsBuilder {
     failed: bool,
 }
 
-/// Receives each term's facts as the blob is written: what a table-level
+/// One column of a frozen lane: its terms, each id's postings with the
+/// runs' end offsets, and its per-document lengths; plus the ids in
+/// dictionary order, so a finish can walk the lanes' terms in step.
+pub(crate) struct FrozenColumn {
+    /// Every term's bytes, back to back, with each id's span.
+    term_bytes: String,
+    term_spans: Vec<(u32, u32)>,
+    by_lex: Vec<u32>,
+    postings: Vec<Vec<(u32, u32)>>,
+    run_ends: Vec<Vec<u32>>,
+    pos_runs: Vec<Vec<u8>>,
+    /// Stored lengths and exact token counts, per document.
+    doc_lengths: Vec<u32>,
+    tokens: Vec<u32>,
+}
+
+impl FrozenColumn {
+    fn term(&self, id: u32) -> &str {
+        let (start, len) = self.term_spans[id as usize];
+        &self.term_bytes[start as usize..start as usize + len as usize]
+    }
+}
+
+/// A lane of a build fed as its rows arrived, frozen for the finish: the
+/// accumulator's lists, now read-only, and the commit row each of its
+/// documents is, ascending. Any stretch of the commit's rows can be cut
+/// out of a lane by row, which is what lets a commit decide how many
+/// superfiles to write once it knows how many rows it holds.
+pub(crate) struct FrozenLane {
+    columns: Vec<FrozenColumn>,
+    shape: Vec<(String, bool)>,
+    rows: Vec<u32>,
+}
+
+/// What a build finishes from in place of its own accumulator: the
+/// commit's lanes, restricted to the rows `rows` — the superfile's own,
+/// numbered from `rows.start`.
+#[derive(Clone)]
+pub(crate) struct LaneView {
+    pub(crate) lanes: Arc<Vec<FrozenLane>>,
+    pub(crate) rows: Range<u32>,
+}
+
+/// Receives each term's facts as the blob is written: what a table-level/// Receives each term's facts as the blob is written: what a table-level
 /// term index records per `(term, superfile)`, produced in the pass that
 /// writes the postings instead of a second pass that reads them back.
 /// Terms arrive in dictionary order within a column, columns in the
@@ -1621,6 +1687,8 @@ impl FtsBuilder {
             spill_partitions: DEFAULT_SPILL_PARTITIONS,
             max_partition_bytes: DEFAULT_MAX_PARTITION_BYTES,
             n_docs: 0,
+            lane_mode: false,
+            lane_view: None,
             failed: false,
             doc_pos_chain: Vec::new(),
             pos_scratch: Vec::new(),
@@ -1744,6 +1812,7 @@ impl FtsBuilder {
             name,
             doc_lengths: Vec::new(),
             total_tokens: 0,
+            tokens: Vec::new(),
             positions,
             params,
             corpus: ColumnLengthStats::default(),
@@ -1917,6 +1986,7 @@ impl FtsBuilder {
         // unfiltered tokens.
         let chain_tok = tokenizer.as_ref().as_any().downcast_ref::<ChainTokenizer>();
         let positional = self.columns[col_idx].positions;
+        let lane_mode = self.lane_mode;
         let mut tokens_in_doc: u64 = 0;
 
         let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
@@ -2084,6 +2154,9 @@ impl FtsBuilder {
         let dl_clamped: u32 = stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
         col.doc_lengths.push(dl_clamped);
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
+        if lane_mode {
+            col.tokens.push(tokens_in_doc.min(u32::MAX as u64) as u32);
+        }
         let docs_now = local_doc_id.saturating_add(1);
         if docs_now > self.n_docs {
             self.n_docs = docs_now;
@@ -2105,7 +2178,7 @@ impl FtsBuilder {
         let run_buf = &mut self.run_scratch;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(id_to_term.len(), positional);
+                ram.grow_to(id_to_term.len(), positional, lane_mode);
                 let mut new_bytes: usize = 0;
                 for &term_id in updated_terms.iter() {
                     let idx = term_id as usize;
@@ -2121,6 +2194,9 @@ impl FtsBuilder {
                     new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                     // A positional column's run for this (term, doc) was
                     // written by the scan, gap by gap, as the tokens came.
+                    if lane_mode && positional {
+                        ram.run_ends[idx].push(ram.pos_runs[idx].len() as u32);
+                    }
                 }
                 ram.bytes = ram
                     .bytes
@@ -2231,12 +2307,13 @@ impl FtsBuilder {
         let doc_id = doc_id.get();
         let col_idx = column_id as usize;
         let positional = self.columns[col_idx].positions;
+        let lane_mode = self.lane_mode;
         let ColumnPostings { vocab, store } = &mut self.postings[col_idx];
         let term_id = vocab.intern(term, positional);
         let idx = term_id as usize;
         match store {
             PostingStore::Ram(ram) => {
-                ram.grow_to(vocab.len(), positional);
+                ram.grow_to(vocab.len(), positional, lane_mode);
                 let mut new_bytes: usize = 0;
                 let list = &mut ram.postings[idx];
                 if list.is_empty() {
@@ -2313,94 +2390,142 @@ impl FtsBuilder {
         self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
-    /// Whether every column's postings are still in RAM, which is what
-    /// [`Self::absorb`] needs of both sides.
+    /// Whether every column's postings are still in RAM.
     pub(crate) fn is_in_ram(&self) -> bool {
         self.postings.iter().all(|cp| !cp.is_spilled())
     }
 
-    /// Take `other`'s documents in behind this builder's own: its documents
-    /// become ids `self.n_docs..`, its terms are interned here and its
-    /// posting lists appended, doc ids offset, to the lists they fall
-    /// under. Both builders must hold the same columns, be fed in row
-    /// order (no document map) and still hold their postings in RAM;
-    /// nothing is decoded or re-encoded, so the cost is a pass over
-    /// `other`'s vocabulary and a copy of its lists. The blob the result
-    /// writes is the one a single builder fed both document sequences in
-    /// turn would write.
-    ///
-    /// This is what lets a commit cut its rows into as many builders as
-    /// it has threads to tokenize on and still write as many superfiles
-    /// as its rows warrant: the builders fold together at the end.
-    pub(crate) fn absorb(&mut self, other: FtsBuilder) -> Result<(), BuildError> {
-        let shape = |b: &FtsBuilder| {
-            b.columns
-                .iter()
-                .map(|c| (c.name.clone(), c.positions))
-                .collect::<Vec<_>>()
-        };
-        if shape(self) != shape(&other) {
+    /// Make this builder a lane of a build fed as its rows arrive. A lane
+    /// keeps, beside its lists, where each posting's position run ends and
+    /// each document's exact token count, so that once frozen any stretch
+    /// of its rows can be cut out by row (see [`FrozenLane`]). A lane never
+    /// spills: it holds a share of one commit's rows, and the finish reads
+    /// it out of RAM.
+    pub(crate) fn set_lane_mode(&mut self) {
+        self.lane_mode = true;
+        self.spill_threshold_bytes = usize::MAX;
+    }
+
+    /// Freeze this lane for the finish: `rows[d]` is the commit row its
+    /// document `d` is, ascending. The vocabulary's map and arena go; the
+    /// lists stay as they are.
+    pub(crate) fn freeze(self, rows: Vec<u32>) -> Result<FrozenLane, BuildError> {
+        if !self.lane_mode {
             return Err(BuildError::Io(Error::other(
-                "fts builders with different columns cannot be folded together",
+                "only a builder in lane mode can be frozen",
             )));
         }
-        if self.failed || other.failed {
+        if self.failed {
             return Err(failed_builder());
         }
-        if !self.is_in_ram() || !other.is_in_ram() {
+        if !self.is_in_ram() {
             return Err(BuildError::Io(Error::other(
-                "an fts builder that spilled to scratch cannot be folded",
+                "an fts lane that spilled cannot be frozen",
             )));
         }
-        if self.doc_map.is_some()
-            || other.doc_map.is_some()
-            || !self.sorted_inputs.is_empty()
-            || !other.sorted_inputs.is_empty()
-        {
+        if rows.len() != self.n_docs as usize || !rows.is_sorted_by(|a, b| a < b) {
             return Err(BuildError::Io(Error::other(
-                "only builders fed in row order can be folded together",
+                "an fts lane's rows must be one ascending row per document",
             )));
         }
-        let offset = self.n_docs;
-        let FtsBuilder {
-            columns: other_columns,
-            postings: other_postings,
-            n_docs: other_n_docs,
-            ..
-        } = other;
-        for ((col, cp), (other_col, other_cp)) in self
+        let shape = self
             .columns
-            .iter_mut()
-            .zip(&mut self.postings)
-            .zip(other_columns.into_iter().zip(other_postings))
-        {
-            col.doc_lengths.extend_from_slice(&other_col.doc_lengths);
-            col.total_tokens = col.total_tokens.saturating_add(other_col.total_tokens);
-            let positional = col.positions;
-            let (PostingStore::Ram(ram), PostingStore::Ram(other_ram)) =
-                (&mut cp.store, other_cp.store)
-            else {
-                unreachable!("both stores were checked to be in RAM");
-            };
-            let other_vocab = other_cp.vocab;
-            for (other_id, term) in other_vocab.id_to_term.iter().enumerate() {
-                let id = cp.vocab.intern(term, positional) as usize;
-                ram.grow_to(cp.vocab.len(), positional);
-                ram.postings[id].extend(
-                    other_ram.postings[other_id]
-                        .iter()
-                        .map(|&(doc, tf)| (doc + offset, tf)),
-                );
-                if positional {
-                    ram.pos_runs[id].extend_from_slice(&other_ram.pos_runs[other_id]);
+            .iter()
+            .map(|c| (c.name.clone(), c.positions))
+            .collect();
+        let columns = self
+            .columns
+            .into_iter()
+            .zip(self.postings)
+            .map(|(col, cp)| {
+                let ColumnPostings { vocab, store } = cp;
+                let PostingStore::Ram(ram) = store else {
+                    unreachable!("checked to be in RAM above");
+                };
+                let Vocab {
+                    term_to_id,
+                    id_to_term,
+                    term_arena,
+                    ..
+                } = vocab;
+                drop(term_to_id);
+                let (_, by_lex) = build_lex_rank(&id_to_term);
+                let mut term_bytes =
+                    String::with_capacity(id_to_term.iter().map(|t| t.len()).sum());
+                let term_spans = id_to_term
+                    .iter()
+                    .map(|t| {
+                        let start = term_bytes.len() as u32;
+                        term_bytes.push_str(t);
+                        (start, t.len() as u32)
+                    })
+                    .collect();
+                // The arena outlives every read of `id_to_term` above.
+                drop(id_to_term);
+                drop(term_arena);
+                FrozenColumn {
+                    term_bytes,
+                    term_spans,
+                    by_lex,
+                    postings: ram.postings,
+                    run_ends: ram.run_ends,
+                    pos_runs: ram.pos_runs,
+                    doc_lengths: col.doc_lengths,
+                    tokens: col.tokens,
+                }
+            })
+            .collect();
+        Ok(FrozenLane {
+            columns,
+            shape,
+            rows,
+        })
+    }
+
+    /// Finish from `view` rather than from this builder's own accumulator:
+    /// the lanes tokenized the commit's rows between them, and this
+    /// builder's superfile holds the rows `view.rows` of it. The finish
+    /// merges the lanes' lists over those rows, term by term, so the blob
+    /// is the one this builder would write had it been fed those rows in
+    /// order itself. The lanes must hold this builder's columns, and this
+    /// builder must not have accumulated postings of its own.
+    pub(crate) fn set_lane_view(&mut self, view: LaneView) {
+        self.lane_view = Some(view);
+    }
+
+    /// Fill this builder's document lengths and count from its lane view:
+    /// each lane's lengths placed at the rows its documents are, numbered
+    /// from the view's first row, the token totals summed exactly.
+    fn take_lane_lengths(&mut self) -> Result<(), BuildError> {
+        let view = self.lane_view.as_ref().expect("the caller checked");
+        let shape: Vec<(String, bool)> = self
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.positions))
+            .collect();
+        let n_docs = view.rows.len();
+        for lane in view.lanes.iter() {
+            if lane.shape != shape {
+                return Err(BuildError::Io(Error::other(
+                    "fts lanes must hold the builder's columns",
+                )));
+            }
+        }
+        for (c, col) in self.columns.iter_mut().enumerate() {
+            let mut lengths = vec![0u32; n_docs];
+            let mut total_tokens = 0u64;
+            for lane in view.lanes.iter() {
+                let (dlo, dhi) = lane_doc_range(lane, &view.rows);
+                let lane_col = &lane.columns[c];
+                for d in dlo..dhi {
+                    lengths[(lane.rows[d] - view.rows.start) as usize] = lane_col.doc_lengths[d];
+                    total_tokens += u64::from(lane_col.tokens[d]);
                 }
             }
-            ram.bytes = ram.bytes.saturating_add(other_ram.bytes);
-            // `other_vocab` owns the term bytes the loop just copied; it is
-            // dropped here, after the last read of them.
-            drop(other_vocab);
+            col.doc_lengths = lengths;
+            col.total_tokens = total_tokens;
         }
-        self.n_docs = self.n_docs.saturating_add(other_n_docs);
+        self.n_docs = n_docs as u32;
         Ok(())
     }
 
@@ -2440,7 +2565,7 @@ impl FtsBuilder {
     /// Final blob assembly is byte-identical between the two paths
     /// (regression-gated by
     /// `build_above_threshold_spills_and_matches_in_ram_byte_for_byte`).
-    pub fn finish_to<W: Write>(self, w: W) -> Result<(), BuildError> {
+    pub fn finish_to<W: Write>(mut self, w: W) -> Result<(), BuildError> {
         if self.failed {
             return Err(failed_builder());
         }
@@ -2456,6 +2581,15 @@ impl FtsBuilder {
             return Err(BuildError::Io(Error::other(
                 "fts: sorted merge inputs set on a builder that also accumulated postings",
             )));
+        }
+        if self.lane_view.is_some() {
+            if self.postings.iter().any(|c| !c.is_empty()) {
+                return Err(BuildError::Io(Error::other(
+                    "fts: a lane view set on a builder that also accumulated postings",
+                )));
+            }
+            self.take_lane_lengths()?;
+            return self.finish_to_spilled(w);
         }
         if !self.sorted_inputs.is_empty() || self.postings.iter().any(|c| c.is_spilled()) {
             self.finish_to_spilled(w)
@@ -2490,6 +2624,8 @@ impl FtsBuilder {
             sorted_inputs: _,
             mut head_sink,
             head_depth,
+            lane_mode: _,
+            lane_view: _,
             failed: _,
         } = self;
 
@@ -2543,6 +2679,7 @@ impl FtsBuilder {
                 name: col_name,
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
+                tokens: _,
                 positions: col_positions,
                 params,
                 corpus: _,
@@ -2644,6 +2781,8 @@ impl FtsBuilder {
             sorted_inputs,
             mut head_sink,
             head_depth,
+            lane_mode: _,
+            lane_view,
             failed: _,
         } = self;
 
@@ -2736,6 +2875,7 @@ impl FtsBuilder {
                 name: col_name,
                 doc_lengths: col_doc_lengths_owned,
                 total_tokens: _,
+                tokens: _,
                 positions: col_positions,
                 params,
                 corpus: _,
@@ -2756,9 +2896,28 @@ impl FtsBuilder {
                 rows: doc_map.as_deref(),
             };
 
-            // The compaction merge: the accumulator is empty (checked in
-            // `finish_to`) and the inputs are merged term by term.
-            if !sorted_inputs.is_empty() {
+            // A build fed by lanes: the accumulator is empty (checked in
+            // `finish_to`) and the lanes are merged term by term.
+            if let Some(view) = lane_view.as_ref() {
+                n_terms_total_usize += emit_lanes_column(
+                    view,
+                    orig_col_idx,
+                    col_positions,
+                    col_name_bytes,
+                    &enc,
+                    &mut key_buf,
+                    &mut postings_writer,
+                    &mut postings_crc_acc,
+                    &mut postings_len,
+                    Some(&mut dict_streaming),
+                    &mut positions_sink,
+                    &mut finish_profile,
+                    &mut term_scratch,
+                    &mut head_sink,
+                )?;
+            } else if !sorted_inputs.is_empty() {
+                // The compaction merge: the accumulator is empty (checked in
+                // `finish_to`) and the inputs are merged term by term.
                 let merge_span = detail_span!(
                     "fts_sorted_merge",
                     column = col_name.as_str(),
@@ -3777,6 +3936,179 @@ fn merge_sorted_spill<const N: usize, W: Write>(
 /// list is taken out of the store as it is emitted, so the column's
 /// resident bytes shrink as the emit proceeds. Returns the number of
 /// terms written.
+/// The documents of `lane` whose rows fall in `rows`, as a range of its
+/// document indexes: its rows ascend, so two binary searches find it.
+fn lane_doc_range(lane: &FrozenLane, rows: &Range<u32>) -> (usize, usize) {
+    let lo = lane.rows.partition_point(|&r| r < rows.start);
+    let hi = lane.rows.partition_point(|&r| r < rows.end);
+    (lo, hi)
+}
+
+/// Emit one column from a lane view, merged term by term over the view's
+/// rows: a term held by one lane is encoded from the stretch of that
+/// lane's list that falls in the rows, its documents mapped to their rows;
+/// a term several lanes hold has their stretches merged by row, which is
+/// a merge of ascending runs since every lane's documents are in row
+/// order, with each posting's positions brought along. Each stretch is
+/// found by two binary searches on the list, and its runs are the byte
+/// range the lane recorded for it.
+#[allow(clippy::too_many_arguments)]
+fn emit_lanes_column<W: Write>(
+    view: &LaneView,
+    column: usize,
+    col_positions: bool,
+    col_name_bytes: &[u8],
+    enc: &TermEncoding<'_>,
+    key_buf: &mut Vec<u8>,
+    postings_writer: &mut W,
+    postings_crc_acc: &mut u32,
+    postings_len: &mut u64,
+    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
+    positions_sink: &mut PositionsSink,
+    finish_profile: &mut FinishProfile,
+    term_scratch: &mut TermScratch,
+    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+) -> Result<usize, BuildError> {
+    /// One lane's column over the view's rows.
+    struct Source<'a> {
+        col: &'a FrozenColumn,
+        rows: &'a [u32],
+        /// The lane's documents in the view, as document indexes.
+        docs: Range<usize>,
+        /// Where the walk is in `col.by_lex`.
+        next: usize,
+    }
+    let first_row = view.rows.start;
+    let mut sources: Vec<Source<'_>> = view
+        .lanes
+        .iter()
+        .map(|lane| {
+            let (lo, hi) = lane_doc_range(lane, &view.rows);
+            Source {
+                col: &lane.columns[column],
+                rows: &lane.rows,
+                docs: lo..hi,
+                next: 0,
+            }
+        })
+        .collect();
+
+    let mut pairs: Vec<(u32, u32)> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
+    // The lanes holding the current term: the stretch of the list in the
+    // view, its run bytes, and how far into both the merge has read.
+    let mut holders: Vec<(usize, &[(u32, u32)], &[u8], usize, usize)> = Vec::new();
+    let mut n_emitted = 0usize;
+    loop {
+        let mut term: Option<&str> = None;
+        for source in &sources {
+            if let Some(&id) = source.col.by_lex.get(source.next) {
+                let candidate = source.col.term(id);
+                if term.is_none_or(|t| candidate < t) {
+                    term = Some(candidate);
+                }
+            }
+        }
+        let Some(term) = term else {
+            break;
+        };
+        holders.clear();
+        for (i, source) in sources.iter_mut().enumerate() {
+            let Some(&id) = source.col.by_lex.get(source.next) else {
+                continue;
+            };
+            if source.col.term(id) != term {
+                continue;
+            }
+            source.next += 1;
+            let list = &source.col.postings[id as usize];
+            let lo = list.partition_point(|&(d, _)| (d as usize) < source.docs.start);
+            let hi = list.partition_point(|&(d, _)| (d as usize) < source.docs.end);
+            if lo == hi {
+                continue;
+            }
+            let runs: &[u8] = match col_positions {
+                true => {
+                    let ends = &source.col.run_ends[id as usize];
+                    let start = match lo {
+                        0 => 0,
+                        _ => ends[lo - 1] as usize,
+                    };
+                    &source.col.pos_runs[id as usize][start..ends[hi - 1] as usize]
+                }
+                false => &[],
+            };
+            holders.push((i, &list[lo..hi], runs, 0, 0));
+        }
+        if holders.is_empty() {
+            continue;
+        }
+        pairs.clear();
+        let term_positions: Option<(&mut PositionsSink, TermRuns<'_>)> = if holders.len() == 1 {
+            let (i, list, runs, _, _) = holders[0];
+            let rows = sources[i].rows;
+            pairs.extend(
+                list.iter()
+                    .map(|&(doc, tf)| (rows[doc as usize] - first_row, tf)),
+            );
+            col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(runs)))
+        } else {
+            // A merge of ascending runs: the holder whose next posting is
+            // the lowest row goes next.
+            values.clear();
+            starts.clear();
+            loop {
+                let mut lowest: Option<(usize, u32)> = None;
+                for (h, (i, list, _, pos, _)) in holders.iter().enumerate() {
+                    if let Some(&(doc, _)) = list.get(*pos) {
+                        let row = sources[*i].rows[doc as usize];
+                        if lowest.is_none_or(|(_, r)| row < r) {
+                            lowest = Some((h, row));
+                        }
+                    }
+                }
+                let Some((h, row)) = lowest else {
+                    break;
+                };
+                let (_, list, runs, pos, at) = &mut holders[h];
+                let (_, tf) = list[*pos];
+                pairs.push((row - first_row, tf));
+                if col_positions {
+                    starts.push(values.len());
+                    TermRuns::Encoded(runs).push_run(*pos, tf, at, &mut values);
+                }
+                *pos += 1;
+            }
+            col_positions.then_some((
+                &mut *positions_sink,
+                TermRuns::Values {
+                    values: &values,
+                    starts: &starts,
+                },
+            ))
+        };
+        encode_and_emit_term(
+            term,
+            &pairs,
+            col_name_bytes,
+            enc,
+            key_buf,
+            postings_writer,
+            postings_crc_acc,
+            postings_len,
+            None,
+            dict_streaming.as_deref_mut(),
+            term_positions,
+            finish_profile,
+            term_scratch,
+            head_sink,
+        )?;
+        n_emitted += 1;
+    }
+    Ok(n_emitted)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_ram_column<W: Write>(
     vocab: Vocab,
@@ -4529,32 +4861,30 @@ mod tests {
         assert!(sorted, "triples must come out in (lex_rank, doc_id) order");
     }
 
-    /// Two builders fed the halves of a corpus and folded together write
-    /// the blob one builder fed the whole corpus writes, on a positional
-    /// and a plain column, with the terms the halves share, the terms
-    /// only one holds, and a term of one document each.
+    /// Lanes that tokenized interleaved shares of a corpus, frozen and
+    /// merged at the finish over a range of rows, write the blob one
+    /// builder fed those rows in order writes, on a positional and a plain
+    /// column: over the whole corpus, and cut into two superfiles' worth
+    /// of rows, with terms the lanes share, terms only one holds, a term
+    /// of one document each, and a term that straddles the cut.
     #[test]
-    fn folded_builders_write_the_blob_one_builder_writes() {
+    fn lanes_cut_at_the_finish_write_the_blobs_single_builders_write() {
         const N_DOCS: u32 = 500;
-        const SPLIT: u32 = 180;
+        const LANES: u32 = 3;
+        const SLICE: u32 = 7;
+        const CUT: u32 = 213;
         let text_of = |i: u32| {
             let mut text = format!("every every u{i} shared{}", i % 7);
             if i.is_multiple_of(3) {
                 text.push_str(" some some");
             }
-            if i < SPLIT && i.is_multiple_of(50) {
-                text.push_str(" early");
+            if i.is_multiple_of(50) {
+                text.push_str(" rare");
             }
-            if i >= SPLIT && i.is_multiple_of(40) {
-                text.push_str(" late late");
+            if (CUT - 1..=CUT).contains(&i) {
+                text.push_str(" straddle straddle");
             }
             text
-        };
-        let feed = |b: &mut FtsBuilder, first: u32, past: u32| {
-            for i in first..past {
-                b.add_doc(0, i - first, &text_of(i)).expect("add pos");
-                b.add_doc(1, i - first, &text_of(i)).expect("add flat");
-            }
         };
         let fresh = || {
             let mut b = FtsBuilder::new();
@@ -4562,27 +4892,57 @@ mod tests {
             b.register_column("flat".into(), false).expect("register");
             b
         };
+        let single = |first: u32, past: u32| {
+            let mut b = fresh();
+            for i in first..past {
+                b.add_doc(0, i - first, &text_of(i)).expect("add pos");
+                b.add_doc(1, i - first, &text_of(i)).expect("add flat");
+            }
+            b.finish().expect("finish single")
+        };
 
-        let mut whole = fresh();
-        feed(&mut whole, 0, N_DOCS);
-        let expected = whole.finish().expect("finish whole");
+        // Row `i` goes to lane `(i / SLICE) % LANES`: each lane holds runs
+        // of rows, interleaved with the other lanes', in row order.
+        let mut lanes: Vec<(FtsBuilder, Vec<u32>)> = (0..LANES)
+            .map(|_| {
+                let mut b = fresh();
+                b.set_lane_mode();
+                (b, Vec::new())
+            })
+            .collect();
+        for i in 0..N_DOCS {
+            let (lane, rows) = &mut lanes[((i / SLICE) % LANES) as usize];
+            let doc = rows.len() as u32;
+            lane.add_doc(0, doc, &text_of(i)).expect("add pos");
+            lane.add_doc(1, doc, &text_of(i)).expect("add flat");
+            rows.push(i);
+        }
+        let frozen: Arc<Vec<FrozenLane>> = Arc::new(
+            lanes
+                .into_iter()
+                .map(|(lane, rows)| lane.freeze(rows).expect("freeze"))
+                .collect(),
+        );
+        let from_view = |rows: std::ops::Range<u32>| {
+            let mut b = fresh();
+            b.set_lane_view(LaneView {
+                lanes: Arc::clone(&frozen),
+                rows,
+            });
+            b.finish().expect("finish view")
+        };
+        assert_eq!(from_view(0..N_DOCS), single(0, N_DOCS), "whole");
+        assert_eq!(from_view(0..CUT), single(0, CUT), "first piece");
+        assert_eq!(from_view(CUT..N_DOCS), single(CUT, N_DOCS), "second piece");
 
-        let mut first = fresh();
-        feed(&mut first, 0, SPLIT);
-        let mut second = fresh();
-        feed(&mut second, SPLIT, N_DOCS);
-        first.absorb(second).expect("fold");
-        let folded = first.finish().expect("finish folded");
-        assert_eq!(folded, expected, "the folded blob differs");
-
-        // A spilled builder refuses to fold.
-        let mut spilled = fresh();
-        spilled.set_spill_threshold_bytes(1);
-        feed(&mut spilled, 0, SPLIT);
-        assert!(!spilled.is_in_ram());
-        let mut other = fresh();
-        feed(&mut other, SPLIT, N_DOCS);
-        assert!(other.absorb(spilled).is_err());
+        // A lane whose rows do not match its documents is refused.
+        let mut lane = fresh();
+        lane.set_lane_mode();
+        lane.add_doc(0, 0, "a").expect("add");
+        lane.add_doc(1, 0, "a").expect("add");
+        assert!(lane.freeze(vec![0, 2]).is_err());
+        // A builder not in lane mode cannot be frozen.
+        assert!(fresh().freeze(Vec::new()).is_err());
     }
 
     #[test]
