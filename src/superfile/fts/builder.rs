@@ -44,11 +44,16 @@
 //!   spill: no per-record framing, no variable-length payload, no
 //!   per-record allocation on read.
 //!
-//! `finish_to<W: Write>` correspondingly has two paths:
+//! `finish_to<W: Write>` correspondingly has three paths:
 //!
-//! - **In-RAM finish**: no column spilled. Per-column maps are
-//!   drained, sorted, encoded into a posting-region scratch file,
-//!   and the term dictionary is built in RAM (small).
+//! - **In-RAM finish**: no column spilled. Each column's ids are
+//!   sorted by their term bytes once and every list is encoded in
+//!   place into a posting-region scratch file; the term dictionary
+//!   is built in RAM (small).
+//! - **Lane finish**: a builder given a [`LaneView`] holds no
+//!   postings of its own; the commit's frozen lanes are merged over
+//!   this superfile's rows, term by term, through the spilled
+//!   finish's streaming dictionary.
 //! - **Spilled finish**: at least one column has spilled. The
 //!   spilled column's `id_to_term` builds a lex-rank lookup
 //!   (`term_id → rank in lex order`, one `Vec<u32>` per column,
@@ -79,6 +84,11 @@
 //!    Caller passes monotonically-increasing `local_doc_id`s.
 //! 4. `finish()` (returns `Vec<u8>`) or `finish_to(impl Write)`
 //!    (streams the blob progressively to any sink).
+//!
+//! A supertable commit fed as its rows arrive runs several builders in
+//! lane mode instead (`set_lane_mode`, then `add_doc`, then `freeze`),
+//! merges the frozen lanes once (`freeze_lanes`), and gives each
+//! superfile's builder its rows of them (`set_lane_view`) before step 4.
 
 use std::{
     cmp::{Ordering, Reverse},
@@ -931,10 +941,18 @@ fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> 
     hash_builder.hash_one(key)
 }
 
-/// Intern `term` in the spill-mode column vocabulary and return its
-/// stable `term_id`.
+/// The error every call on a builder whose `add_doc` failed partway
+/// through a document returns.
+fn failed_builder() -> BuildError {
+    BuildError::Io(Error::other(
+        "the fts builder is unusable after a document failed to index",
+    ))
+}
+
+/// Intern `term` in a column's vocabulary and return its stable
+/// `term_id`.
 ///
-/// This is the hot spill `add_doc` lookup. Use hashbrown's raw entry
+/// This is the hot `add_doc` lookup. Use hashbrown's raw entry
 /// API so miss handling reuses the hash computed for lookup instead
 /// of doing `get(term)` (probe once) followed by `insert(boxed, id)`
 /// (rehash + probe again). Hit behaviour remains one borrowed lookup
@@ -972,14 +990,6 @@ fn compute_hash<Q: Hash + ?Sized, S: BuildHasher>(hash_builder: &S, key: &Q) -> 
 /// drops *last*, and the `Drop` impls for `HbHashMap<&'static str,
 /// u32, _>` and `Vec<&'static str>` never dereference their
 /// `&str` keys/entries (no `Drop` to run on a reference).
-/// The error every call on a builder whose `add_doc` failed partway
-/// through a document returns.
-fn failed_builder() -> BuildError {
-    BuildError::Io(Error::other(
-        "the fts builder is unusable after a document failed to index",
-    ))
-}
-
 #[inline(always)]
 fn intern_term_id(
     term_to_id: &mut TermIdMap,
@@ -1000,9 +1010,9 @@ fn intern_term_id(
             // to `&arena`'s borrow scope.
             let arena_str: &str = arena.alloc_str(term);
             // SAFETY: see function-level doc. The `'static` tag is
-            // a lie; the real lifetime is `arena`'s, which the
-            // `Spilled` variant guarantees outlives the map +
-            // id_to_term via field drop order.
+            // a lie; the real lifetime is `arena`'s, which [`Vocab`]
+            // guarantees outlives the map + id_to_term via field
+            // drop order.
             let static_str: &'static str = unsafe { std::mem::transmute(arena_str) };
             id_to_term.push(static_str);
             entry.insert_hashed_nocheck(hash, static_str, id);
@@ -1514,8 +1524,8 @@ pub(crate) struct FrozenColumn {
     postings: Vec<Vec<(u32, u32)>>,
     run_ends: Vec<Vec<u32>>,
     pos_runs: Vec<Vec<u8>>,
-    /// Stored lengths and exact token counts, per document.
-    doc_lengths: Vec<u32>,
+    /// Exact token count per document; a document's stored length is
+    /// derived from it.
     tokens: Vec<u32>,
     /// For a list that spans several pieces, where each piece's postings
     /// start in it: `cuts[cut_at[id] + p]..cuts[cut_at[id] + p + 1]` are
@@ -1795,7 +1805,7 @@ impl LaneView {
     }
 }
 
-/// Receives each term's facts as the blob is written: what a table-level/// Receives each term's facts as the blob is written: what a table-level
+/// Receives each term's facts as the blob is written: what a table-level
 /// term index records per `(term, superfile)`, produced in the pass that
 /// writes the postings instead of a second pass that reads them back.
 /// Terms arrive in dictionary order within a column, columns in the
@@ -2410,11 +2420,11 @@ impl FtsBuilder {
         // `self.columns[col_idx]` is a disjoint field from
         // `self.postings[col_idx]`, so split-borrow legal.
         let col = &mut self.columns[col_idx];
-        let dl_clamped: u32 = stored_doc_length(tokens_in_doc.min(u32::MAX as u64) as u32);
-        col.doc_lengths.push(dl_clamped);
+        let tokens_clamped = u32::try_from(tokens_in_doc).unwrap_or(u32::MAX);
+        col.doc_lengths.push(stored_doc_length(tokens_clamped));
         col.total_tokens = col.total_tokens.saturating_add(tokens_in_doc);
         if lane_mode {
-            col.tokens.push(tokens_in_doc.min(u32::MAX as u64) as u32);
+            col.tokens.push(tokens_clamped);
         }
         let docs_now = local_doc_id.saturating_add(1);
         if docs_now > self.n_docs {
@@ -2423,10 +2433,11 @@ impl FtsBuilder {
 
         // Per-doc drain: one posting per touched term, then zero the
         // dense slot to restore the `dense_doc_tf[tid] != 0 iff in
-        // updated_terms` invariant. A positional column additionally
-        // walks the term's chain (positions come out descending — the
-        // chain heads at the LAST occurrence), reverses it, and
-        // delta-varint encodes the run.
+        // updated_terms` invariant. A positional column that has spilled
+        // additionally walks the term's chain (positions come out
+        // descending — the chain heads at the LAST occurrence), reverses
+        // it, and delta-varint encodes the run; in RAM the run was
+        // written during the scan.
         //
         // SAFETY (every `get_unchecked` below): `idx` was validated in
         // the scan above; `p = term_id & mask` where `mask =
@@ -2465,13 +2476,21 @@ impl FtsBuilder {
                     // Crossed the threshold: move the postings to spill
                     // files, keyed by the ids already assigned, and run
                     // the rest of the build in spill mode.
-                    let spilled = Self::spill_ram_store(
+                    // The store is taken before the spill can fail, so a
+                    // failed spill leaves the builder unusable, not empty.
+                    let spilled = match Self::spill_ram_store(
                         self.scratch_dir.path(),
                         column_id,
                         self.spill_partitions,
                         positional,
                         mem::replace(ram, RamStore::new()),
-                    )?;
+                    ) {
+                        Ok(spilled) => spilled,
+                        Err(error) => {
+                            self.failed = true;
+                            return Err(error);
+                        }
+                    };
                     *store = PostingStore::Spilled(spilled);
                     // In RAM the per-id state held last positions; the
                     // spilled scan reads it as chain heads.
@@ -2588,13 +2607,21 @@ impl FtsBuilder {
                 }
                 ram.bytes = ram.bytes.saturating_add(new_bytes);
                 if ram.bytes > self.spill_threshold_bytes {
-                    let spilled = Self::spill_ram_store(
+                    // The store is taken before the spill can fail, so a
+                    // failed spill leaves the builder unusable, not empty.
+                    let spilled = match Self::spill_ram_store(
                         self.scratch_dir.path(),
                         column_id,
                         self.spill_partitions,
                         positional,
                         mem::replace(ram, RamStore::new()),
-                    )?;
+                    ) {
+                        Ok(spilled) => spilled,
+                        Err(error) => {
+                            self.failed = true;
+                            return Err(error);
+                        }
+                    };
                     *store = PostingStore::Spilled(spilled);
                     vocab.dense_doc_poshead.fill(CHAIN_END);
                 }
@@ -2699,11 +2726,7 @@ impl FtsBuilder {
                 "an fts lane's stretches must cover exactly its documents",
             )));
         }
-        let shape = self
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.positions))
-            .collect();
+        let shape = self.shape();
         let columns = self
             .columns
             .into_iter()
@@ -2743,7 +2766,6 @@ impl FtsBuilder {
                     postings: in_lex_order(ram.postings, &by_lex),
                     run_ends: in_lex_order(ram.run_ends, &by_lex),
                     pos_runs: in_lex_order(ram.pos_runs, &by_lex),
-                    doc_lengths: col.doc_lengths,
                     tokens: col.tokens,
                     cut_at: Vec::new(),
                     cuts: Vec::new(),
@@ -2768,16 +2790,21 @@ impl FtsBuilder {
         self.lane_view = Some(view);
     }
 
+    /// The builder's columns as a lane records them: each name and
+    /// whether it keeps positions.
+    fn shape(&self) -> Vec<(String, bool)> {
+        self.columns
+            .iter()
+            .map(|c| (c.name.clone(), c.positions))
+            .collect()
+    }
+
     /// Fill this builder's document lengths and count from its lane view:
     /// each lane's lengths placed at the rows its documents are, numbered
     /// from the view's first row, the token totals summed exactly.
     fn take_lane_lengths(&mut self) -> Result<(), BuildError> {
         let view = self.lane_view.as_ref().expect("the caller checked");
-        let shape: Vec<(String, bool)> = self
-            .columns
-            .iter()
-            .map(|c| (c.name.clone(), c.positions))
-            .collect();
+        let shape = self.shape();
         let rows = view.rows().clone();
         let n_docs = rows.len();
         for lane in view.lanes.lanes.iter() {
@@ -2796,8 +2823,9 @@ impl FtsBuilder {
                 let mut cursor = 0usize;
                 for d in dlo..dhi {
                     let row = row_of(&lane.stretches, &mut cursor, d as u32);
-                    lengths[(row - rows.start) as usize] = lane_col.doc_lengths[d];
-                    total_tokens += u64::from(lane_col.tokens[d]);
+                    let tokens = lane_col.tokens[d];
+                    lengths[(row - rows.start) as usize] = stored_doc_length(tokens);
+                    total_tokens += u64::from(tokens);
                 }
             }
             col.doc_lengths = lengths;
@@ -2822,14 +2850,18 @@ impl FtsBuilder {
 
     /// Streaming variant: write the final FTS blob progressively to `w`.
     ///
-    /// Two finish paths, picked automatically by inspecting whether
-    /// any column has spilled:
+    /// Three finish paths, picked automatically:
     ///
-    /// - **In-RAM finish** (no column spilled): per-column term maps
-    ///   are sorted and drained term-by-term, encoded postings flow
-    ///   to a posting-region scratch file, and the term dictionary is
-    ///   built in RAM via `TermDictBuilder`. Small-build path; mirrors
-    ///   the in-RAM `VectorBuilder` finish.
+    /// - **In-RAM finish** (no column spilled): each column's ids are
+    ///   sorted by their term bytes once and drained term by term,
+    ///   encoded postings flow to a posting-region scratch file, and
+    ///   the term dictionary is built in RAM via `TermDictBuilder`.
+    ///   Small-build path; mirrors the in-RAM `VectorBuilder` finish.
+    ///
+    /// - **Lane finish** (a [`LaneView`] was set): the builder's own
+    ///   accumulator is empty; the commit's frozen lanes are merged
+    ///   over this superfile's rows, term by term, through the spilled
+    ///   finish below.
     ///
     /// - **Spilled finish** (any column spilled): every column's
     ///   posting source — in-RAM map (for columns that stayed below
@@ -2840,9 +2872,10 @@ impl FtsBuilder {
     ///   in RAM.
     ///   Mirrors the spilled `VectorBuilder` finish.
     ///
-    /// Final blob assembly is byte-identical between the two paths
+    /// Final blob assembly is byte-identical between the paths
     /// (regression-gated by
-    /// `build_above_threshold_spills_and_matches_in_ram_byte_for_byte`).
+    /// `build_above_threshold_spills_and_matches_in_ram_byte_for_byte` and
+    /// `lanes_cut_at_the_finish_write_the_blobs_single_builders_write`).
     pub fn finish_to<W: Write>(mut self, w: W) -> Result<(), BuildError> {
         if self.failed {
             return Err(failed_builder());
@@ -2988,22 +3021,24 @@ impl FtsBuilder {
                      a spilled column cannot appear here"
                 ),
             };
+            let mut sink = TermSink {
+                col_name_bytes,
+                col_positions,
+                key_buf: &mut key_buf,
+                postings_writer: &mut postings_writer,
+                postings_crc_acc: &mut postings_crc_acc,
+                postings_len: &mut postings_len,
+                positions_sink: &mut positions_sink,
+                dict: DictSink::InRam(&mut dict_inram),
+                head_sink: &mut head_sink,
+            };
             n_terms_total_usize += emit_ram_column(
                 vocab,
                 ram,
-                col_positions,
-                col_name_bytes,
                 &enc,
-                &mut key_buf,
-                &mut postings_writer,
-                &mut postings_crc_acc,
-                &mut postings_len,
-                Some(&mut dict_inram),
-                None,
-                &mut positions_sink,
                 &mut finish_profile,
                 &mut term_scratch,
-                &mut head_sink,
+                &mut sink,
             )?;
 
             doc_lengths_by_orig_col[orig_col_idx] = Some(col_doc_lengths_owned);
@@ -3174,24 +3209,27 @@ impl FtsBuilder {
                 rows: doc_map.as_deref(),
             };
 
+            let mut sink = TermSink {
+                col_name_bytes,
+                col_positions,
+                key_buf: &mut key_buf,
+                postings_writer: &mut postings_writer,
+                postings_crc_acc: &mut postings_crc_acc,
+                postings_len: &mut postings_len,
+                positions_sink: &mut positions_sink,
+                dict: DictSink::Streaming(&mut dict_streaming),
+                head_sink: &mut head_sink,
+            };
             // A build fed by lanes: the accumulator is empty (checked in
             // `finish_to`) and the lanes are merged term by term.
             if let Some(view) = lane_view.as_ref() {
                 n_terms_total_usize += emit_lanes_column(
                     view,
                     orig_col_idx,
-                    col_positions,
-                    col_name_bytes,
                     &enc,
-                    &mut key_buf,
-                    &mut postings_writer,
-                    &mut postings_crc_acc,
-                    &mut postings_len,
-                    Some(&mut dict_streaming),
-                    &mut positions_sink,
                     &mut finish_profile,
                     &mut term_scratch,
-                    &mut head_sink,
+                    &mut sink,
                 )?;
             } else if !sorted_inputs.is_empty() {
                 // The compaction merge: the accumulator is empty (checked in
@@ -3251,17 +3289,9 @@ impl FtsBuilder {
                             merged.encoded,
                             &mut merged.body,
                             &merged.positions,
-                            col_name_bytes,
-                            &mut key_buf,
-                            &mut postings_writer,
-                            &mut postings_crc_acc,
-                            &mut postings_len,
-                            None,
-                            Some(&mut dict_streaming),
-                            col_positions.then_some(&mut positions_sink),
-                            &mut finish_profile,
                             &merged.head,
-                            &mut head_sink,
+                            &mut finish_profile,
+                            &mut sink,
                         )
                     },
                 )?;
@@ -3281,19 +3311,10 @@ impl FtsBuilder {
                         n_terms_total_usize += emit_ram_column(
                             vocab,
                             ram,
-                            col_positions,
-                            col_name_bytes,
                             &enc,
-                            &mut key_buf,
-                            &mut postings_writer,
-                            &mut postings_crc_acc,
-                            &mut postings_len,
-                            None,
-                            Some(&mut dict_streaming),
-                            &mut positions_sink,
                             &mut finish_profile,
                             &mut term_scratch,
-                            &mut head_sink,
+                            &mut sink,
                         )?;
                     }
                     PostingStore::Spilled(partitions) => {
@@ -3445,17 +3466,10 @@ impl FtsBuilder {
                                 None,
                                 &term_id_in_lex_order,
                                 &id_to_term,
-                                col_name_bytes,
                                 &enc,
-                                &mut key_buf,
-                                &mut postings_writer,
-                                &mut postings_crc_acc,
-                                &mut postings_len,
-                                &mut dict_streaming,
-                                &mut positions_sink,
                                 &mut finish_profile,
                                 &mut term_scratch,
-                                &mut head_sink,
+                                &mut sink,
                             )?,
                             SpillStore::Positional { blobs, .. } => {
                                 // mmap each partition's positions blob so
@@ -3481,17 +3495,10 @@ impl FtsBuilder {
                                     Some(&blob_mmaps),
                                     &term_id_in_lex_order,
                                     &id_to_term,
-                                    col_name_bytes,
                                     &enc,
-                                    &mut key_buf,
-                                    &mut postings_writer,
-                                    &mut postings_crc_acc,
-                                    &mut postings_len,
-                                    &mut dict_streaming,
-                                    &mut positions_sink,
                                     &mut finish_profile,
                                     &mut term_scratch,
-                                    &mut head_sink,
+                                    &mut sink,
                                 )?
                             }
                         };
@@ -4070,17 +4077,10 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     blob_mmaps: Option<&[Option<Mmap>]>,
     term_id_in_lex_order: &[u32],
     id_to_term: &[&'static str],
-    col_name_bytes: &[u8],
     enc: &TermEncoding<'_>,
-    key_buf: &mut Vec<u8>,
-    postings_writer: &mut W,
-    postings_crc_acc: &mut u32,
-    postings_len: &mut u64,
-    dict_streaming: &mut TermBlockWriter<BufWriter<File>>,
-    positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
-    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+    sink: &mut TermSink<'_, W>,
 ) -> Result<usize, BuildError> {
     let mmap_start = finish_profile.enabled.then(Instant::now);
     let mut mmaps: Vec<Mmap> = Vec::with_capacity(sorted_files.len());
@@ -4171,7 +4171,7 @@ fn merge_sorted_spill<const N: usize, W: Write>(
                     skip_run(blob, &mut at, tf).expect("builder-encoded blob runs are well-formed");
                     term_run.extend_from_slice(&blob[start..at]);
                 }
-                Some((&mut *positions_sink, TermRuns::Encoded(term_run.as_slice())))
+                Some(TermRuns::Encoded(term_run.as_slice()))
             }
             false => None,
         };
@@ -4179,18 +4179,11 @@ fn merge_sorted_spill<const N: usize, W: Write>(
         encode_and_emit_term(
             term_bytes,
             &group,
-            col_name_bytes,
-            enc,
-            key_buf,
-            postings_writer,
-            postings_crc_acc,
-            postings_len,
-            None,
-            Some(dict_streaming),
             term_positions,
+            enc,
             finish_profile,
             term_scratch,
-            head_sink,
+            sink,
         )?;
         n_emitted += 1;
     }
@@ -4207,13 +4200,6 @@ fn merge_sorted_spill<const N: usize, W: Write>(
     Ok(n_emitted)
 }
 
-/// Emit one in-RAM column's terms in dictionary order: the ids are
-/// sorted by their term bytes once, then each id's postings and runs
-/// are encoded straight out of the store — the lists are already in
-/// ascending doc order, so no per-list or partition sort runs. Each
-/// list is taken out of the store as it is emitted, so the column's
-/// resident bytes shrink as the emit proceeds. Returns the number of
-/// terms written.
 /// The documents of `lane` whose rows fall in `rows`, as a range of its
 /// document indexes: its stretches ascend, so two binary searches find it.
 fn lane_doc_range(lane: &FrozenLane, rows: &Range<u32>) -> (usize, usize) {
@@ -4241,13 +4227,19 @@ impl Holder<'_> {
     /// current run, a long way is looked up from the recorded run ends.
     fn read_to(&mut self, to: usize) {
         if to - self.pos <= RUN_END_STRIDE {
-            let runs = &self.col.pos_runs[self.id as usize];
-            for &(_, tf) in &self.col.postings[self.id as usize][self.pos..to] {
-                skip_run(runs, &mut self.read, tf).expect("builder-encoded run");
-            }
+            skip_runs(self.col, self.id, self.pos..to, &mut self.read);
         } else {
             self.read = run_offset(self.col, self.id, to);
         }
+    }
+}
+
+/// Advance `at`, a byte offset into list `id`'s position runs, past the
+/// runs of postings `span`.
+fn skip_runs(col: &FrozenColumn, id: u32, span: Range<usize>, at: &mut usize) {
+    let runs = &col.pos_runs[id as usize];
+    for &(_, tf) in &col.postings[id as usize][span] {
+        skip_run(runs, at, tf).expect("builder-encoded run");
     }
 }
 
@@ -4256,19 +4248,15 @@ impl Holder<'_> {
 /// bytes are located this way instead of by walking its postings, so a
 /// long stretch of a common term costs a lookup, not a scan.
 fn run_offset(col: &FrozenColumn, id: u32, p: usize) -> usize {
-    let list = &col.postings[id as usize];
-    let runs = &col.pos_runs[id as usize];
-    if p == list.len() {
-        return runs.len();
+    if p == col.postings[id as usize].len() {
+        return col.pos_runs[id as usize].len();
     }
     let block = p / RUN_END_STRIDE;
     let mut at = match block {
         0 => 0,
         _ => col.run_ends[id as usize][block - 1] as usize,
     };
-    for &(_, tf) in &list[block * RUN_END_STRIDE..p] {
-        skip_run(runs, &mut at, tf).expect("builder-encoded run");
-    }
+    skip_runs(col, id, block * RUN_END_STRIDE..p, &mut at);
     at
 }
 
@@ -4282,23 +4270,15 @@ fn run_offset(col: &FrozenColumn, id: u32, p: usize) -> usize {
 /// the rows is passed over at once, one within them is taken whole, and
 /// one spanning several pieces is cut where [`freeze_lanes`] recorded;
 /// its runs come by byte range.
-#[allow(clippy::too_many_arguments)]
 fn emit_lanes_column<W: Write>(
     view: &LaneView,
     column: usize,
-    col_positions: bool,
-    col_name_bytes: &[u8],
     enc: &TermEncoding<'_>,
-    key_buf: &mut Vec<u8>,
-    postings_writer: &mut W,
-    postings_crc_acc: &mut u32,
-    postings_len: &mut u64,
-    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
-    positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
-    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+    sink: &mut TermSink<'_, W>,
 ) -> Result<usize, BuildError> {
+    let col_positions = sink.col_positions;
     let rows = view.rows();
     let first_row = rows.start;
     let lanes = &view.lanes.lanes;
@@ -4370,7 +4350,7 @@ fn emit_lanes_column<W: Write>(
             lanes[entry.lane as usize].columns[column].term(entry.id)
         };
         pairs.clear();
-        let term_positions: Option<(&mut PositionsSink, TermRuns<'_>)> = if holders.len() == 1 {
+        let runs: Option<TermRuns<'_>> = if holders.len() == 1 {
             let Holder {
                 lane,
                 col,
@@ -4389,10 +4369,7 @@ fn emit_lanes_column<W: Write>(
             // Only a positional column has runs to slice.
             let from = holders[0].read;
             col_positions.then(|| {
-                (
-                    &mut *positions_sink,
-                    TermRuns::Encoded(&col.pos_runs[id as usize][from..run_offset(col, id, hi)]),
-                )
+                TermRuns::Encoded(&col.pos_runs[id as usize][from..run_offset(col, id, hi)])
             })
         } else {
             // A merge of ascending runs. A lane's documents of a batch are
@@ -4444,47 +4421,30 @@ fn emit_lanes_column<W: Write>(
                 }
                 holder.pos = to;
             }
-            col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(&merged_runs)))
+            col_positions.then_some(TermRuns::Encoded(&merged_runs))
         };
-        encode_and_emit_term(
-            term,
-            &pairs,
-            col_name_bytes,
-            enc,
-            key_buf,
-            postings_writer,
-            postings_crc_acc,
-            postings_len,
-            None,
-            dict_streaming.as_deref_mut(),
-            term_positions,
-            finish_profile,
-            term_scratch,
-            head_sink,
-        )?;
+        encode_and_emit_term(term, &pairs, runs, enc, finish_profile, term_scratch, sink)?;
         n_emitted += 1;
     }
     Ok(n_emitted)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Emit one in-RAM column's terms in dictionary order: the ids are
+/// sorted by their term bytes once, then each id's postings and runs
+/// are encoded straight out of the store — the lists are already in
+/// ascending doc order, so no per-list or partition sort runs. Each
+/// list is taken out of the store as it is emitted, so the column's
+/// resident bytes shrink as the emit proceeds. Returns the number of
+/// terms written.
 fn emit_ram_column<W: Write>(
     vocab: Vocab,
     ram: RamStore,
-    col_positions: bool,
-    col_name_bytes: &[u8],
     enc: &TermEncoding<'_>,
-    key_buf: &mut Vec<u8>,
-    postings_writer: &mut W,
-    postings_crc_acc: &mut u32,
-    postings_len: &mut u64,
-    mut dict_entries_inram: Option<&mut TermDictBuilder>,
-    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
-    positions_sink: &mut PositionsSink,
     finish_profile: &mut FinishProfile,
     term_scratch: &mut TermScratch,
-    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+    sink: &mut TermSink<'_, W>,
 ) -> Result<usize, BuildError> {
+    let col_positions = sink.col_positions;
     let Vocab {
         term_to_id,
         id_to_term,
@@ -4514,25 +4474,15 @@ fn emit_ram_column<W: Write>(
             true => mem::take(&mut pos_runs[idx]),
             false => Vec::new(),
         };
-        let term_positions = match col_positions {
-            true => Some((&mut *positions_sink, TermRuns::Encoded(runs.as_slice()))),
-            false => None,
-        };
+        let runs = col_positions.then_some(TermRuns::Encoded(runs.as_slice()));
         encode_and_emit_term(
             id_to_term[idx],
             &pairs,
-            col_name_bytes,
+            runs,
             enc,
-            key_buf,
-            postings_writer,
-            postings_crc_acc,
-            postings_len,
-            dict_entries_inram.as_deref_mut(),
-            dict_streaming.as_deref_mut(),
-            term_positions,
             finish_profile,
             term_scratch,
-            head_sink,
+            sink,
         )?;
         n_emitted += 1;
     }
@@ -4541,52 +4491,58 @@ fn emit_ram_column<W: Write>(
     Ok(n_emitted)
 }
 
+/// Where a finish writes one column's terms: the postings region with
+/// its running CRC and length, the positions region, the dictionary
+/// (built in RAM or streamed to scratch), the term-index sink, and the key
+/// scratch the writes share. Built per column, in place of a dozen
+/// arguments on every emit; the finish's profile travels beside it.
+struct TermSink<'a, W> {
+    col_name_bytes: &'a [u8],
+    /// Whether the column keeps positions: only then does a term carry
+    /// runs into the positions region.
+    col_positions: bool,
+    key_buf: &'a mut Vec<u8>,
+    postings_writer: &'a mut W,
+    postings_crc_acc: &'a mut u32,
+    postings_len: &'a mut u64,
+    positions_sink: &'a mut PositionsSink,
+    dict: DictSink<'a>,
+    head_sink: &'a mut Option<Box<dyn TermHeadSink>>,
+}
+
+/// The dictionary a finish adds its terms to.
+enum DictSink<'a> {
+    /// Built in RAM, for a build no column of which spilled.
+    InRam(&'a mut TermDictBuilder),
+    /// Streamed to a scratch file in term order.
+    Streaming(&'a mut TermBlockWriter<BufWriter<File>>),
+}
+
 /// Encode one term's posting list and emit the resulting dictionary entry
-/// into whichever sink the finish path uses. Exactly one of
-/// `dict_entries_inram` / `dict_streaming` is `Some`; the function
-/// dispatches accordingly.
+/// into the finish's sink. `runs` is `Some` exactly for a positional
+/// column.
 ///
 /// Owns the per-term encoding policy (df=1 inline value, df≥2 PFOR
 /// blocks via `encode_posting_group`): [`encode_term`] builds the term's
 /// bytes and [`write_term`] places them.
-#[allow(clippy::too_many_arguments)]
 fn encode_and_emit_term<W: Write>(
     term: &str,
     pairs: &[(u32, u32)],
-    col_name_bytes: &[u8],
+    runs: Option<TermRuns<'_>>,
     enc: &TermEncoding<'_>,
-    key_buf: &mut Vec<u8>,
-    postings_writer: &mut W,
-    postings_crc_acc: &mut u32,
-    postings_len: &mut u64,
-    dict_entries_inram: Option<&mut TermDictBuilder>,
-    dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
-    term_positions: Option<(&mut PositionsSink, TermRuns<'_>)>,
     profile: &mut FinishProfile,
     scratch: &mut TermScratch,
-    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+    sink: &mut TermSink<'_, W>,
 ) -> Result<(), BuildError> {
-    let (sink, runs) = match term_positions {
-        Some((sink, runs)) => (Some(sink), Some(runs)),
-        None => (None, None),
-    };
     let encoded = encode_term_timed(pairs, runs, enc, profile, scratch)?;
     write_term(
         term,
         encoded,
         &mut scratch.term_buf,
         &scratch.pos_out,
-        col_name_bytes,
-        key_buf,
-        postings_writer,
-        postings_crc_acc,
-        postings_len,
-        dict_entries_inram,
-        dict_streaming,
-        sink,
-        profile,
         &scratch.head,
-        head_sink,
+        profile,
+        sink,
     )
 }
 
@@ -4965,45 +4921,42 @@ fn encode_term(
 /// Place an encoded term: fill in its header's offsets, append its bytes
 /// to the postings and, for a long positional term, the positions region,
 /// and add its dictionary entry. Terms must arrive in term order.
-#[allow(clippy::too_many_arguments)]
 fn write_term<W: Write>(
     term: &str,
     encoded: EncodedTerm,
     body: &mut [u8],
     positions: &[u8],
-    col_name_bytes: &[u8],
-    key_buf: &mut Vec<u8>,
-    postings_writer: &mut W,
-    postings_crc_acc: &mut u32,
-    postings_len: &mut u64,
-    dict_entries_inram: Option<&mut TermDictBuilder>,
-    mut dict_streaming: Option<&mut TermBlockWriter<BufWriter<File>>>,
-    positions_sink: Option<&mut PositionsSink>,
-    profile: &mut FinishProfile,
     head: &HeadOut,
-    head_sink: &mut Option<Box<dyn TermHeadSink>>,
+    profile: &mut FinishProfile,
+    sink: &mut TermSink<'_, W>,
 ) -> Result<(), BuildError> {
     let write_start = profile.enabled.then(Instant::now);
-    key_buf.clear();
-    key_buf.extend_from_slice(col_name_bytes);
-    key_buf.push(KEY_SEPARATOR);
-    key_buf.extend_from_slice(term.as_bytes());
+    sink.key_buf.clear();
+    sink.key_buf.extend_from_slice(sink.col_name_bytes);
+    sink.key_buf.push(KEY_SEPARATOR);
+    sink.key_buf.extend_from_slice(term.as_bytes());
 
     let dict_entry = match encoded {
         EncodedTerm::Inline(value) => value,
         EncodedTerm::Short | EncodedTerm::Long => {
-            let metadata_offset = *postings_len;
+            let metadata_offset = *sink.postings_len;
             let long = matches!(encoded, EncodedTerm::Long);
             if long {
                 body[HEADER_POSTINGS_OFFSET].copy_from_slice(&metadata_offset.to_le_bytes());
-                if let Some(sink) = &positions_sink {
-                    body[HEADER_POSITIONS_OFFSET].copy_from_slice(&sink.len.to_le_bytes());
+                if sink.col_positions {
+                    body[HEADER_POSITIONS_OFFSET]
+                        .copy_from_slice(&sink.positions_sink.len.to_le_bytes());
                 }
             }
             let block_write_start = (profile.enabled && long).then(Instant::now);
-            write_counted(postings_writer, postings_crc_acc, postings_len, body)?;
-            if long && let Some(sink) = positions_sink {
-                sink.write(positions)?;
+            write_counted(
+                sink.postings_writer,
+                sink.postings_crc_acc,
+                sink.postings_len,
+                body,
+            )?;
+            if long && sink.col_positions {
+                sink.positions_sink.write(positions)?;
             }
             if let Some(start) = block_write_start {
                 profile.encode_block_write += start.elapsed();
@@ -5016,10 +4969,10 @@ fn write_term<W: Write>(
         }
     };
 
-    if let Some(sink) = head_sink.as_mut() {
-        let column = std::str::from_utf8(col_name_bytes)
+    if let Some(head_sink) = sink.head_sink.as_mut() {
+        let column = std::str::from_utf8(sink.col_name_bytes)
             .map_err(|_| BuildError::Io(Error::other("fts: non-utf8 column name")))?;
-        sink.term(
+        head_sink.term(
             column,
             term,
             &TermHeadFacts {
@@ -5034,10 +4987,9 @@ fn write_term<W: Write>(
         )?;
     }
     let dict_insert_start = profile.enabled.then(Instant::now);
-    if let Some(db) = dict_entries_inram {
-        db.insert(key_buf, dict_entry);
-    } else if let Some(sb) = dict_streaming.as_mut() {
-        sb.insert_sorted(key_buf, dict_entry)?;
+    match &mut sink.dict {
+        DictSink::InRam(dict) => dict.insert(sink.key_buf, dict_entry),
+        DictSink::Streaming(dict) => dict.insert_sorted(sink.key_buf, dict_entry)?,
     }
     if let Some(start) = dict_insert_start {
         profile.dict_insert += start.elapsed();
@@ -5659,6 +5611,146 @@ mod tests {
         ));
         assert!(b.add_doc(0, 1, "x").is_err(), "no more documents");
         assert!(b.finish().is_err(), "no blob");
+
+        // A lane fails the same way, and cannot be frozen.
+        let mut lane = FtsBuilder::new();
+        lane.register_column_with_tokenizer(
+            "body".into(),
+            true,
+            Arc::new(Overflowing),
+            bm25::Bm25Params::default(),
+        )
+        .expect("register");
+        lane.set_lane_mode();
+        assert!(lane.add_doc(0, 0, "x").is_err());
+        assert!(
+            lane.freeze(vec![Stretch {
+                doc: 0,
+                row: 0,
+                len: 1,
+            }])
+            .is_err(),
+            "no frozen lane"
+        );
+    }
+
+    /// A spill that fails leaves the builder unusable, not emptied: the
+    /// in-RAM store was taken before the spill could fail, so a later
+    /// finish must refuse rather than write a column with no postings.
+    #[test]
+    fn a_failed_spill_poisons_the_builder() {
+        let scratch = tempdir().expect("scratch");
+        let mut b = FtsBuilder::with_scratch(scratch.path().to_path_buf()).expect("builder");
+        b.register_column("body".into(), false).expect("register");
+        // Spill on the first document's drain.
+        b.set_spill_threshold_bytes(1);
+        // The spill's partition files then have nowhere to go.
+        fs::remove_dir_all(b.scratch_dir.path()).expect("remove the scratch directory");
+        assert!(
+            b.add_doc(0, 0, "alpha beta gamma").is_err(),
+            "the spill fails"
+        );
+        assert!(b.add_doc(0, 1, "delta").is_err(), "no more documents");
+        assert!(b.finish().is_err(), "no blob");
+    }
+
+    #[tokio::test]
+    async fn add_doc_accumulates_tf_within_doc() {
+        let mut b = FtsBuilder::new();
+        b.register_column("title".into(), false)
+            .expect("register column");
+        b.add_doc(0, 0, "rust rust rust async").expect("add doc");
+
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let r = FtsReader::open(
+            blob,
+            r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75}]"#,
+        )
+        .expect("open");
+        let rust_hits = r
+            .search("title", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("rust search");
+        let async_hits = r
+            .search("title", &["async"], 10, BoolMode::Or)
+            .await
+            .expect("async search");
+        assert_eq!(rust_hits.len(), 1);
+        assert_eq!(rust_hits[0].0, 0);
+        assert_eq!(async_hits.len(), 1);
+        assert_eq!(async_hits[0].0, 0);
+    }
+
+    #[tokio::test]
+    async fn cross_column_same_term_stays_isolated_through_round_trip() {
+        // A term that appears in two different columns must keep its
+        // posting lists scoped per column in the emitted term dictionary +
+        // posting region: each column has its own vocabulary and ids, and
+        // the final dictionary key is `<col>\x1F<term>`.
+        let mut b = FtsBuilder::new();
+        let title_id = b
+            .register_column("title".into(), false)
+            .expect("register title");
+        let body_id = b
+            .register_column("body".into(), false)
+            .expect("register body");
+
+        // Doc 0: "rust" + "tokio" in title, "rust" + "async" in body.
+        // Doc 1: "rust" in both.
+        b.add_doc(title_id, 0, "rust tokio")
+            .expect("add title doc 0");
+        b.add_doc(body_id, 0, "rust async").expect("add body doc 0");
+        b.add_doc(body_id, 1, "rust").expect("add body doc 1");
+        b.add_doc(title_id, 1, "rust").expect("add title doc 1");
+
+        // Round-trip through finish() + FtsReader::search. The reader looks
+        // up via `dict::make_key(column, term)`, so this is the strict
+        // on-disk equivalent of "two columns share a term — does each see
+        // its own postings?"
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"title","tokenizer":"standard","k1":1.2,"b":0.75},{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        // "rust" in title returns title's docs (0, 1) and no others.
+        let hits_t = r
+            .search("title", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("title search");
+        let ids_t: Vec<u32> = hits_t.iter().map(|(d, _)| d.get()).collect();
+        assert_eq!(ids_t.len(), 2, "title 'rust' hit count");
+        assert!(ids_t.contains(&0));
+        assert!(ids_t.contains(&1));
+
+        // "rust" in body also returns its own docs (0, 1). Same ids by
+        // coincidence; what matters is the search is scoped to body's
+        // posting list, not title's.
+        let hits_b = r
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("body search");
+        let ids_b: Vec<u32> = hits_b.iter().map(|(d, _)| d.get()).collect();
+        assert_eq!(ids_b.len(), 2, "body 'rust' hit count");
+        assert!(ids_b.contains(&0));
+        assert!(ids_b.contains(&1));
+
+        // Cross-leak negative: a term that lives only in body (`async`)
+        // must NOT be findable in title, and vice versa (`tokio` in body).
+        let hits_async_in_title = r
+            .search("title", &["async"], 10, BoolMode::Or)
+            .await
+            .expect("title async search");
+        assert!(
+            hits_async_in_title.is_empty(),
+            "title must not return 'async' (lives only in body)"
+        );
+        let hits_tokio_in_body = r
+            .search("body", &["tokio"], 10, BoolMode::Or)
+            .await
+            .expect("body tokio search");
+        assert!(
+            hits_tokio_in_body.is_empty(),
+            "body must not return 'tokio' (lives only in title)"
+        );
     }
 
     #[test]

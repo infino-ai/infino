@@ -1593,6 +1593,7 @@ impl SuperfileBuilder {
             fb.set_lane_view(LaneView { lanes, piece });
         }
     }
+
     /// Override the FTS builder's in-RAM spill threshold (forwarded
     /// to [`FtsBuilder::set_spill_threshold_bytes`]). No-op if this
     /// `SuperfileBuilder` was constructed without any FTS columns.
@@ -4084,11 +4085,6 @@ fn scalar_batches_in_stable_id_order(
     Ok(out)
 }
 
-/// Finalize the FTS + vector blobs to two scratch temp files. At corpus scale
-/// the positional FTS blob is multi-GB; streaming it (and the vector blob) to
-/// disk instead of a `Vec` keeps a memory-tight build or merge under its RSS
-/// budget. `reopen()` gives an independent handle at offset 0, so the write
-/// handle here and the read handle at splice time don't share a cursor.
 /// The FTS builder `opts` describes, with every text column registered
 /// under its analysis chain and the table's length statistics; `None`
 /// for a build without text columns.
@@ -4144,6 +4140,11 @@ pub(crate) fn index_fts_rows(
     Ok(())
 }
 
+/// Finalize the FTS + vector blobs to two scratch temp files. At corpus scale
+/// the positional FTS blob is multi-GB; streaming it (and the vector blob) to
+/// disk instead of a `Vec` keeps a memory-tight build or merge under its RSS
+/// budget. `reopen()` gives an independent handle at offset 0, so the write
+/// handle here and the read handle at splice time don't share a cursor.
 fn stream_index_blobs_to_scratch(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
