@@ -114,9 +114,15 @@ pub struct PackScratch {
 /// where a width costs `base(width)` for its packed low bits plus
 /// `per_exception(lane, hi)` for each lane whose high bits do not fit —
 /// at most `max_exceptions` of them. The plain width's plan when nothing
-/// beats it. `candidates` is scratch for the width under trial; a
-/// winning width's list is swapped into `plan`, so neither grows past
-/// the block's lane count.
+/// beats it. `candidates` is scratch for the lanes under trial; it never
+/// grows past the block's lane count.
+///
+/// One pass over the lanes counts how many sit at each bit width, which
+/// says at once how many exceptions every width would list; the widths
+/// over the cap are dropped without a look at a lane, and the lanes the
+/// remaining widths could list — those wider than the narrowest width
+/// in reach, at most the cap of them — are gathered once, so each width
+/// is then costed over those alone rather than over the whole block.
 pub(crate) fn plan_exceptions(
     lanes: &[u32],
     max_exceptions: usize,
@@ -129,25 +135,55 @@ pub(crate) fn plan_exceptions(
     plan.width = plain;
     plan.exceptions.clear();
     plan.bytes = base(plain);
-    for width in 0..plain {
-        candidates.clear();
+    // Lanes at each bit width; a width's exceptions are the lanes wider
+    // than it, so the narrowest width in reach is found from the counts.
+    let mut at_width = [0usize; u32::BITS as usize + 1];
+    for &v in lanes {
+        at_width[width_of(v.into()) as usize] += 1;
+    }
+    let mut wider = 0usize;
+    let mut narrowest = plain;
+    for width in (0..plain).rev() {
+        wider += at_width[width as usize + 1];
+        if wider > max_exceptions {
+            break;
+        }
+        narrowest = width;
+    }
+    if narrowest == plain {
+        return;
+    }
+    candidates.clear();
+    candidates.extend(
+        lanes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| width_of(v.into()) > narrowest)
+            .map(|(i, &v)| (i as u32, v)),
+    );
+    for width in narrowest..plain {
         let mut bytes = base(width);
         let mut beaten = bytes >= plan.bytes;
-        for (i, &v) in lanes.iter().enumerate() {
+        for &(i, v) in candidates.iter() {
             if beaten {
                 break;
             }
-            let hi = if width == 0 { v } else { v >> width };
+            let hi = v >> width;
             if hi != 0 {
-                candidates.push((i as u32, hi));
-                bytes += per_exception(i as u32, hi);
-                beaten = candidates.len() > max_exceptions || bytes >= plan.bytes;
+                bytes += per_exception(i, hi);
+                beaten = bytes >= plan.bytes;
             }
         }
         if !beaten {
             plan.width = width;
             plan.bytes = bytes;
-            swap(&mut plan.exceptions, candidates);
+            plan.exceptions.clear();
+            plan.exceptions.extend(
+                candidates
+                    .iter()
+                    .map(|&(i, v)| (i, v >> width))
+                    .filter(|&(_, hi)| hi != 0),
+            );
         }
     }
 }
