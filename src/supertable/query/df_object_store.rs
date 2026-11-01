@@ -161,10 +161,18 @@ impl SuperfileObjectStore {
                 .is_ok_and(|source| source.is_local(range.start, range.end - range.start))
     }
 
+    /// Whether no byte of `range` in `location` is local or being downloaded by
+    /// another read. See [`LazyByteSource::is_untouched`]: `false` for a file
+    /// whose source can't tell.
+    pub(crate) fn is_untouched(&self, location: &ObjPath, range: &Range<u64>) -> bool {
+        self.source(location)
+            .is_ok_and(|source| source.is_untouched(range.start, range.end - range.start))
+    }
+
     /// Fetch `ranges` the way object_store's own `get_ranges` does
     /// ([`coalesce_ranges`]), without counting them as page reads. Callers
-    /// count first: [`ObjectStore::get_ranges`], and read-ahead for the part
-    /// of a request a batch didn't cover.
+    /// count first: [`ObjectStore::get_ranges`], and read-ahead, for the part
+    /// of a request a batch didn't cover and for a scan's own fetches.
     pub(crate) async fn get_ranges_uncounted(
         &self,
         location: &ObjPath,
@@ -293,7 +301,9 @@ async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsRes
 
 /// How the store merges `ranges` into reads: sorted, and merged where the
 /// gap between two is at most object_store's default coalesce distance. The
-/// one merge rule for fetching, counting and charging. It matches
+/// one merge rule for counting and charging, and for fetching, except that a
+/// scan's own reads may also join cold pages of one column chunk up to 2 MiB
+/// apart (see the read-ahead module). It matches
 /// object_store's own `coalesce_ranges` (pinned by a test), so merging is the
 /// same as the default `get_ranges`.
 pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
