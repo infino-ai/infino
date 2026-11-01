@@ -177,9 +177,8 @@ const CHAIN_END: u32 = u32::MAX;
 /// A lane records where a term's position runs end once every this many
 /// postings (see [`FtsBuilder::set_lane_mode`]). Cutting a list at an
 /// arbitrary posting then skips at most this many runs from the nearest
-/// recorded end, for a table a sixteenth the size of one entry per
-/// posting.
-const RUN_END_STRIDE: usize = 16;
+/// recorded end, for a table a quarter the size of one entry per posting.
+const RUN_END_STRIDE: usize = 4;
 
 #[derive(Default)]
 struct FinishProfile {
@@ -4194,8 +4193,9 @@ fn emit_lanes_column<W: Write>(
     let order = &view.lanes.order[column];
 
     let mut pairs: Vec<(u32, u32)> = Vec::new();
-    let mut values: Vec<u32> = Vec::new();
-    let mut starts: Vec<usize> = Vec::new();
+    // The runs of a term several lanes hold, in merged posting order: a
+    // byte range of one lane's runs per stretch taken, copied as they are.
+    let mut merged_runs: Vec<u8> = Vec::new();
     // The lanes holding the current term: the stretch of the list in the
     // view, its run bytes, how far into both the merge has read, and the
     // lane's row stretch its next document is in.
@@ -4250,9 +4250,9 @@ fn emit_lanes_column<W: Write>(
             // A merge of ascending runs. A lane's documents of a batch are
             // one stretch of rows, so the holder with the lowest next row
             // is taken in a stretch, up to the next row any other holder
-            // has, before the holders are compared again.
-            values.clear();
-            starts.clear();
+            // has, before the holders are compared again; its runs for the
+            // stretch are one byte range, copied without decoding.
+            merged_runs.clear();
             loop {
                 let mut lowest: Option<(usize, u32)> = None;
                 let mut bound = u32::MAX;
@@ -4274,6 +4274,7 @@ fn emit_lanes_column<W: Write>(
                 };
                 let (lane, list, runs, pos, read, cursor) = &mut holders[h];
                 let stretches = &lanes[*lane].stretches;
+                let from = *read;
                 while let Some(&(doc, tf)) = list.get(*pos) {
                     let row = row_of(stretches, cursor, doc);
                     if row >= bound {
@@ -4281,19 +4282,15 @@ fn emit_lanes_column<W: Write>(
                     }
                     pairs.push((row - first_row, tf));
                     if col_positions {
-                        starts.push(values.len());
-                        TermRuns::Encoded(runs).push_run(*pos, tf, read, &mut values);
+                        skip_run(runs, read, tf).expect("builder-encoded run");
                     }
                     *pos += 1;
                 }
+                if col_positions {
+                    merged_runs.extend_from_slice(&runs[from..*read]);
+                }
             }
-            col_positions.then_some((
-                &mut *positions_sink,
-                TermRuns::Values {
-                    values: &values,
-                    starts: &starts,
-                },
-            ))
+            col_positions.then_some((&mut *positions_sink, TermRuns::Encoded(&merged_runs)))
         };
         encode_and_emit_term(
             term,
