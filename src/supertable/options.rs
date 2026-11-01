@@ -91,7 +91,7 @@ use crate::{
             SuperfileUri, UserCentroidCache,
             disk_cache::ManifestDiskCache,
             list::PartitionStrategy,
-            term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX},
+            term_index::{BuildPolicy, HEAD_DEPTH, HEAD_DEPTH_MAX, WHOLE_REFRESH_MAX_BYTES},
         },
         schema::{FieldId, TableSchema},
         slow_vector_state::{CentroidSection, ResidentVectorIndex},
@@ -445,6 +445,10 @@ pub struct SupertableOptions {
     /// what lets a query rule the superfile out without opening it. To
     /// keep no tiers, set `term_tier_entries_per_term` to zero.
     pub term_head_depth: Option<usize>,
+    /// Slice bytes past which optimize refreshes the term index in tiers
+    /// instead of merging it whole. `None` is the engine's threshold
+    /// ([`WHOLE_REFRESH_MAX_BYTES`]).
+    pub term_whole_refresh_max_bytes: Option<u64>,
     /// Whether a ranked query merges its terms' tiers only when that is
     /// measured to pay on this table: a running cost per tier entry
     /// against the opens the merge could save, and per class of query the
@@ -895,6 +899,7 @@ impl SupertableOptions {
             bound_ordered_open_window: DEFAULT_BOUND_ORDERED_OPEN_WINDOW,
             term_tier_entries_per_term: None,
             term_head_depth: None,
+            term_whole_refresh_max_bytes: None,
             tier_merge_gate: true,
             term_index: true,
             superfiles_in_flight: default_superfiles_in_flight(),
@@ -1076,6 +1081,20 @@ impl SupertableOptions {
     pub fn with_term_head_depth(mut self, depth: usize) -> Self {
         self.term_head_depth = Some(depth);
         self
+    }
+
+    /// Slice bytes past which optimize refreshes the term index in tiers
+    /// (see [`Self::term_whole_refresh_max_bytes`]).
+    pub fn with_term_whole_refresh_max_bytes(mut self, bytes: u64) -> Self {
+        self.term_whole_refresh_max_bytes = Some(bytes);
+        self
+    }
+
+    /// The slice bytes past which optimize refreshes the term index in
+    /// tiers: [`Self::term_whole_refresh_max_bytes`], or the engine's.
+    pub(crate) fn whole_refresh_max_bytes(&self) -> u64 {
+        self.term_whole_refresh_max_bytes
+            .unwrap_or(WHOLE_REFRESH_MAX_BYTES)
     }
 
     /// Whether the table keeps a term index (see [`Self::term_index`]).

@@ -162,6 +162,15 @@ const FOLD_FAN_OUT: usize = 8;
 /// group it came from.
 const FOLD_LEVEL_SPAN: f64 = 0.75;
 
+/// Slice bytes past which optimize refreshes the term index in tiers
+/// ([`fold_for_refresh`]) rather than merging it whole into one layer. A
+/// whole merge rewrites every posting the table holds: below this it is a
+/// minute's work and leaves one layer, the cheapest to look up; past it its
+/// time and memory grow with the table rather than with what changed since
+/// the last refresh, and a table that keeps taking commits or compactions
+/// would pay that on every optimize.
+pub(crate) const WHOLE_REFRESH_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
 /// Errors from building, storing or reading the term index.
 #[derive(Debug, Error)]
 pub enum TermIndexError {
@@ -757,13 +766,76 @@ pub(crate) async fn fold_tail(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
-    while let Some(run) = next_fold(root, policy) {
+    // Every ordinal keeps its place: the fold renumbers nothing.
+    let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+    fold_runs(storage, root, policy, pool, &ordinals, |root| {
+        next_fold(root, policy)
+    })
+    .await
+}
+
+/// Fold `root`'s layers for optimize's refresh of an index too large to
+/// merge whole ([`WHOLE_REFRESH_MAX_BYTES`]): the runs [`fold_run`] picks
+/// among all its layers, of any size, so the runs a commit's fold leaves
+/// for being past a slice fold here. Every layer is one the published root
+/// names, so the slices a fold retires are the sweep's to reclaim.
+///
+/// A fold drops the postings of superfiles `live` does not hold, and of a
+/// superfile's later listings. Their ordinals stay in the root, named by
+/// nothing, so every other posting keeps its number and no layer outside a
+/// fold is rewritten. A posting for a removed superfile in a layer no fold
+/// reaches stays until one does; a query follows only live superfiles.
+pub(crate) async fn fold_for_refresh(
+    storage: &Arc<dyn StorageProvider>,
+    root: &mut Root,
+    policy: &BuildPolicy,
+    pool: Option<&ThreadPool>,
+    live: &HashSet<Uuid>,
+) -> Result<(), TermIndexError> {
+    let mut claimed: HashSet<Uuid> = HashSet::new();
+    let ordinals: Vec<Option<u32>> = root
+        .superfiles
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (live.contains(id) && claimed.insert(*id)).then_some(i as u32))
+        .collect();
+    fold_runs(storage, root, policy, pool, &ordinals, |root| {
+        fold_run(&root.layers, u64::MAX)
+    })
+    .await
+}
+
+/// Whether [`fold_for_refresh`] would fold any of `root`'s layers.
+pub(crate) fn refresh_fold_due(root: &Root) -> bool {
+    fold_run(&root.layers, u64::MAX).is_some()
+}
+
+/// The slice bytes all of `root`'s layers hold, as it records them.
+pub(crate) fn root_bytes(root: &Root) -> u64 {
+    root.layers
+        .iter()
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size))
+}
+
+/// Merge each run of layers `next` picks into one, the merge on `pool`,
+/// until it picks none, renumbering each posting through `ordinals` (by
+/// the root's ordinal; `None` drops it). `root` changes only once a fold's
+/// merged slices are written.
+async fn fold_runs(
+    storage: &Arc<dyn StorageProvider>,
+    root: &mut Root,
+    policy: &BuildPolicy,
+    pool: Option<&ThreadPool>,
+    ordinals: &[Option<u32>],
+    next: impl Fn(&Root) -> Option<Range<usize>>,
+) -> Result<(), TermIndexError> {
+    while let Some(run) = next(root) {
         let scratch = scratch_dir(policy.scratch_root.as_deref())?;
         let sources = download_layers(storage, &root.layers[run.clone()], scratch.path()).await?;
-        // Every ordinal keeps its place: the fold renumbers nothing.
-        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let ordinals = ordinals.to_vec();
         let policy = policy.clone();
-        let merged = run_on_pool(pool, "term-index fold at commit", move || {
+        let merged = run_on_pool(pool, "term-index fold", move || {
             let merged = merge_layers(&sources, &ordinals, &policy);
             // The slice files are read; the scratch directory can go with
             // the task rather than outlive the fold.
@@ -807,10 +879,16 @@ pub(crate) async fn fold_tail(
 /// sweep reclaims from that root.
 fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
     let beneath = root.layers.len().checked_sub(1)?;
-    let layers = &root.layers[..beneath];
+    fold_run(&root.layers[..beneath], policy.slice_target_bytes as u64)
+}
+
+/// The first run of [`FOLD_FAN_OUT`] consecutive `layers` of one size level
+/// whose bytes together are at most `bound`, grouped as [`next_fold`]
+/// describes; `None` when there is no such run.
+fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
+    let beneath = layers.len();
     let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
     let levels: Vec<f64> = layers.iter().map(layer_level).collect();
-    let bound = policy.slice_target_bytes as u64;
     let mut start = 0;
     while start < beneath {
         let top = levels[start..]
@@ -3449,6 +3527,80 @@ mod tests {
             live_after.contains(&routed[0].superfile_id),
             "and that superfile is the live, merged one"
         );
+    }
+
+    /// A whole-refresh threshold every index in these tests passes, so
+    /// optimize refreshes in tiers.
+    const TIERED_REFRESH_BYTES: u64 = 1;
+
+    /// Optimize refreshes an index past the whole-refresh threshold by what
+    /// changed rather than merging it whole. Superfiles a writer that kept
+    /// no index committed are walked into one layer on top of the layers
+    /// already there, which are kept as they are. After a compaction the
+    /// removed inputs stay listed, and that alone calls for no refresh.
+    /// Every row is found throughout.
+    #[test]
+    fn optimize_refreshes_a_large_index_by_what_changed() {
+        use crate::CompactionSettings;
+
+        let (_dir, storage, unindexed) = table_with(|o| o.with_term_index(false));
+        for layer in 0..LAYERS - 1 {
+            commit_layer(&unindexed, layer);
+        }
+        drop(unindexed);
+        let st = crate::supertable::Supertable::open(
+            fresh_options(&storage).with_term_whole_refresh_max_bytes(TIERED_REFRESH_BYTES),
+        )
+        .expect("open");
+        commit_layer(&st, LAYERS - 1);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let every_row = DOCS_PER_LAYER * LAYERS;
+
+        let (live, before) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            live.iter().any(|id| !before.superfiles.contains(id)),
+            "the unindexed writer's superfiles are missing from the index"
+        );
+        maintenance_only_optimize(&st);
+        let (live_after, after) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(live_after, live);
+        assert_eq!(
+            after.layers.len(),
+            before.layers.len() + 1,
+            "one layer for what was missing"
+        );
+        assert_eq!(
+            after.layers[..before.layers.len()],
+            before.layers[..],
+            "the layers already there are kept"
+        );
+        assert!(live.iter().all(|id| after.superfiles.contains(id)));
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        assert_eq!(ranked_titles(&st, "shared").len(), every_row);
+
+        st.compact(&CompactionSettings {
+            min_fill_percent: 1,
+            min_superfiles_for_merge: 2,
+            ..CompactionSettings::default()
+        })
+        .expect("compact");
+        let (live_compacted, compacted) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            compacted.superfiles.len() > live_compacted.len(),
+            "the compaction's inputs are still listed"
+        );
+        maintenance_only_optimize(&st);
+        let (_, refreshed) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            refreshed, compacted,
+            "removed superfiles alone call for no refresh"
+        );
+        assert_eq!(ranked_titles(&st, "shared").len(), every_row);
     }
 
     /// Titles ranked for `query`, in result order, over the whole table.
@@ -6832,6 +6984,69 @@ mod tests {
             "no run fits one slice, so every commit keeps its layer"
         );
         assert_routes_every_commit(&root, &local, commits).await;
+    }
+
+    /// The superfile the refresh-fold test treats as removed: one whose
+    /// layer is in the run the fold rewrites.
+    const REMOVED_ID: u128 = 3;
+
+    /// Optimize's refresh of a large index folds the run a commit left for
+    /// being past one slice, and drops the postings of a superfile no
+    /// longer live from the layers it rewrites. Ordinals are untouched, so
+    /// every other term routes as it did.
+    #[tokio::test]
+    async fn a_refresh_folds_the_runs_commits_leave_and_drops_removed_superfiles() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: TINY_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
+        };
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let mut root = base;
+        let commits = FOLD_FAN_OUT as u128;
+        for id in 2..=commits {
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
+        }
+        assert_eq!(root.layers.len(), FOLD_FAN_OUT, "no commit folded");
+        assert!(refresh_fold_due(&root));
+        let removed = Uuid::from_u128(REMOVED_ID);
+        let live: HashSet<Uuid> = root
+            .superfiles
+            .iter()
+            .copied()
+            .filter(|id| *id != removed)
+            .collect();
+        let listed = root.superfiles.clone();
+
+        fold_for_refresh(&local, &mut root, &policy, None, &live)
+            .await
+            .expect("fold");
+
+        assert_eq!(root.layers.len(), 1, "the run folds into one layer");
+        assert!(!refresh_fold_due(&root));
+        assert_eq!(root.superfiles, listed, "ordinals are untouched");
+        let expected: Vec<Uuid> = (1..=commits)
+            .map(Uuid::from_u128)
+            .filter(|id| *id != removed)
+            .collect();
+        assert_eq!(
+            posted_superfiles(&root, &local, "shared").await,
+            expected,
+            "a term in every commit routes to every live superfile in commit order"
+        );
+        assert!(
+            posted_superfiles(&root, &local, &format!("own{REMOVED_ID}"))
+                .await
+                .is_empty(),
+            "the removed superfile's postings are dropped"
+        );
+        for id in (2..=commits).filter(|&id| id != REMOVED_ID) {
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                [Uuid::from_u128(id)],
+                "a term of one commit routes to that superfile alone"
+            );
+        }
     }
 
     /// A fold that cannot read the slices it would merge does not fail the

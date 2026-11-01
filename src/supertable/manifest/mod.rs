@@ -36,7 +36,7 @@ pub mod partition;
 pub mod summaries;
 pub(crate) mod term_index;
 use arrow_schema::Schema;
-use term_index::{PermanentLoadFailure, TermIndex, TermIndexError};
+use term_index::{PermanentLoadFailure, TermIndex, TermIndexError, refresh_fold_due, root_bytes};
 
 use crate::{
     superfile::{
@@ -1548,10 +1548,14 @@ impl ManifestSnapshot {
         self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
-    /// Whether a term-index rebuild would change anything: false when the
+    /// Whether a term-index refresh would change anything: false when the
     /// table is empty, or when the index is complete, has one layer, and
-    /// lists exactly the live superfiles. An index that will never load is
-    /// rebuilt; one that failed to load for now is an error.
+    /// lists exactly the live superfiles. An index too large to merge whole
+    /// is refreshed in tiers instead, and needs it only when a live
+    /// superfile is missing from it or its layers are due a fold: the
+    /// superfiles it still lists that are gone are followed by nothing. An
+    /// index that will never load is rebuilt; one that failed to load for
+    /// now is an error.
     pub(crate) async fn needs_term_index_rebuild(
         &self,
         entries: &[Arc<SuperfileEntry>],
@@ -1569,14 +1573,17 @@ impl ManifestSnapshot {
             Err(e) => return Err(e),
         };
         let root = index.root();
+        let missing = !entries.iter().all(|e| index.is_indexed(&e.superfile_id));
+        if root_bytes(root) > self.options.whole_refresh_max_bytes() {
+            return Ok(missing || refresh_fold_due(root));
+        }
         // Every commit since the last rebuild appends a layer.
         if root.layers.len() != 1 {
             return Ok(true);
         }
         // A commit that only removes superfiles appends no layer, so the
         // root can still list superfiles that are gone.
-        Ok(root.superfiles.len() != entries.len()
-            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))
+        Ok(root.superfiles.len() != entries.len() || missing)
     }
 
     /// The superfiles among `candidates`, as `index` names them, that are

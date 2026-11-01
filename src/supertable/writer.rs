@@ -11062,7 +11062,10 @@ where
 /// The index is rebuilt from its own layers ([`merge_term_index`]): a
 /// posting depends only on its superfile, which never changes, so copying
 /// it out of the layer that holds it gives what walking the superfile
-/// again would. Only superfiles no layer lists are walked. Every
+/// again would. Only superfiles no layer lists are walked. An index past
+/// [`term_index::WHOLE_REFRESH_MAX_BYTES`] is not merged whole but
+/// refreshed in tiers ([`refresh_term_index_in_tiers`]), at a cost that
+/// follows what changed rather than the size of the table. Every
 /// superfile is walked instead ([`collect_and_build_term_index`]) when the
 /// current root will never load (gone, corrupt, or in a layout this engine
 /// no longer reads) or a slice it names is gone or corrupt. A root that
@@ -11167,7 +11170,14 @@ pub(in crate::supertable) async fn stamp_term_index(
                     }
                 }
                 (None, None, Some(current)) if !current.layers.is_empty() => {
-                    match merge_term_index(&old, current, &entries).await {
+                    let refreshed = if term_index::root_bytes(current)
+                        > old.options.whole_refresh_max_bytes()
+                    {
+                        refresh_term_index_in_tiers(&old, current, &entries).await
+                    } else {
+                        merge_term_index(&old, current, &entries).await
+                    };
+                    match refreshed {
                         Ok(built) => built,
                         Err(e) if e.calls_for_rebuild() => {
                             warn!("term index: cannot merge the current index, rebuilding from the superfiles: {e}");
@@ -11333,6 +11343,57 @@ async fn merge_term_index(
         slices: merged.slices,
         tiers: merged.tiers,
     })
+}
+
+/// Refresh `current`, an index too large to merge whole
+/// ([`term_index::WHOLE_REFRESH_MAX_BYTES`]), in proportion to what changed
+/// rather than to the table: fold its layers where they have piled up,
+/// dropping the postings of superfiles no longer live from the layers a
+/// fold rewrites ([`term_index::fold_for_refresh`]), then index the live
+/// superfiles it lacks in one layer on top. Ordinals are never renumbered,
+/// so the root keeps an entry for each superfile it has listed; a query
+/// follows only the live ones.
+async fn refresh_term_index_in_tiers(
+    manifest: &ManifestSnapshot,
+    current: &Root,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<term_index::Built, TermIndexError> {
+    let storage = manifest
+        .options
+        .storage
+        .as_ref()
+        .ok_or_else(|| TermIndexError::Build("term index refresh needs storage".into()))?;
+    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
+    let mut root = current.clone();
+    let policy = term_index::BuildPolicy {
+        scoring_by_ordinal: Arc::new(scoring_by_ordinal(manifest, &root.superfiles)),
+        ..manifest.options.term_index_build_policy()
+    };
+    term_index::fold_for_refresh(
+        storage,
+        &mut root,
+        &policy,
+        Some(&manifest.options.reader_pool),
+        &live,
+    )
+    .instrument(detail_span!(
+        "term_index.refresh_fold",
+        layers = current.layers.len(),
+    ))
+    .await?;
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    let missing: Vec<Arc<SuperfileEntry>> = unlisted(&root, entries)
+        .into_iter()
+        .filter(|e| seen.insert(e.superfile_id))
+        .collect();
+    if missing.is_empty() {
+        return Ok(term_index::Built {
+            root,
+            slices: Vec::new(),
+            tiers: Vec::new(),
+        });
+    }
+    collect_and_build_term_index(manifest, &missing, root).await
 }
 
 /// Fold the delta layers committed since `prior` onto `base`, the build
