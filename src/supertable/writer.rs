@@ -27,11 +27,17 @@
 //!
 //! - `append(batch)` runs schema + null validation via
 //!   `vector_split`, pushes a `BufferedBatch` onto the writer's
-//!   buffer, and triggers an internal `commit()` if the running
+//!   buffer, hands the batch to the live lanes (text-only tables, once
+//!   the buffer holds a superfile's worth of rows: every pool thread
+//!   tokenizes its share while the caller reads the next batch — see
+//!   [`LiveLanes`]), and triggers an internal `commit()` if the running
 //!   buffer-byte estimate crosses the configured threshold.
-//! - `commit()` drains the buffer, splits it by buffered bytes (capped
-//!   by the writer pool), builds each piece in parallel, and publishes
-//!   them all as new superfiles in one manifest swap. Idempotent on
+//! - `commit()` drains the buffer, counts its pieces by buffered bytes
+//!   (capped by the writer pool) and cuts them at equal shares of the
+//!   text to index, builds each piece in parallel — from the lanes when
+//!   they hold every buffered row under the current schema, from the
+//!   buffer otherwise — and publishes them all as new superfiles in one
+//!   manifest swap. Idempotent on
 //!   an empty buffer (no-op return Ok). The writer slot is
 //!   released on `Drop`; callers don't need a separate `finish()`
 //!   call.
@@ -138,7 +144,7 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             builder::{
-                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FtsBuilder, Stretch,
+                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, Stretch,
                 doc_lengths_entry_size, freeze_lanes,
             },
         },
@@ -807,69 +813,99 @@ fn piece_bounds(weights: &[u64], n: usize) -> Vec<usize> {
     bounds
 }
 
-/// Split of the writer's buffered batches into `n_superfiles` build inputs, each
-/// shaped as a `Vec<BufferedBatch>` that [`build_one_shard_with_layout`] can consume directly.
-/// The pieces are cut where [`piece_bounds`] puts them, so each holds an equal share of the text
-/// to index. The split walks rows across the original buffer in order and emits zero-copy Arrow
-/// slices (`RecordBatch::slice` + `Float32Array::slice` — adjust buffer offsets only; underlying
-/// memory stays Arc-counted), so no payload bytes are copied even when a split boundary falls in
-/// the middle of a `BufferedBatch`.
-///
-/// Trailing empty pieces (only possible when `total_rows < n_superfiles`) are dropped before
-/// return; callers see exactly the pieces that will produce a non-empty superfile.
-fn split_buffer_into_superfile_inputs(
-    buffer: Vec<BufferedBatch>,
-    n_superfiles: usize,
-    vector_dims: &[usize],
-    options: &SupertableOptions,
-) -> Vec<Vec<BufferedBatch>> {
-    debug_assert!(n_superfiles > 0);
+/// The buffered bytes one superfile of a commit is cut at, from
+/// [`SupertableOptions::superfile_buffer_split_mb`].
+fn split_target_bytes(options: &SupertableOptions) -> usize {
+    (options.superfile_buffer_split_mb as usize).saturating_mul(MIB)
+}
+
+/// Where a commit of `buffer` is cut into superfiles: `bounds[i]..bounds[i + 1]`
+/// are piece `i`'s rows. The count is [`superfiles_per_commit`]'s, from the
+/// buffered bytes (Arrow reports capacity, not logical bytes — fine for a
+/// fanout heuristic that is clamped to the pool anyway); the cuts are
+/// [`piece_bounds`]'s, at equal shares of the text to index. The one rule for
+/// a commit-time build and for a seal from the live lanes, so the two cut at
+/// the same rows.
+fn commit_piece_bounds(buffer: &[BufferedBatch], options: &SupertableOptions) -> Vec<usize> {
     let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
-    if total_rows == 0 {
-        return Vec::new();
-    }
+    let buffered_bytes: usize = buffer
+        .iter()
+        .map(|b| b.scalar.get_array_memory_size())
+        .sum();
+    let n_threads = options.writer_pool.current_num_threads().max(1);
+    let n_pieces = superfiles_per_commit(
+        total_rows,
+        buffered_bytes,
+        n_threads,
+        split_target_bytes(options),
+    );
     let mut weights = Vec::with_capacity(total_rows);
-    for batch in &buffer {
+    for batch in buffer {
         piece_row_weights(&batch.scalar, options, &mut weights);
     }
-    let bounds = piece_bounds(&weights, n_superfiles);
-    let target = |i: usize| bounds[i + 1] - bounds[i];
+    piece_bounds(&weights, n_pieces)
+}
 
-    let mut pieces: Vec<Vec<BufferedBatch>> = (0..n_superfiles).map(|_| Vec::new()).collect();
-    let mut piece_idx = 0usize;
-    let mut piece_remaining = target(0);
-
-    for batch in buffer {
-        let n_rows = batch.scalar.num_rows();
-        if n_rows == 0 {
-            continue;
-        }
-        let mut row_cursor = 0;
-        while row_cursor < n_rows {
-            // Skip ahead over any zero-target pieces (only happens
-            // when total_rows < n_superfiles, leaving trailing pieces
-            // with target == 0).
-            while piece_remaining == 0 && piece_idx + 1 < n_superfiles {
-                piece_idx += 1;
-                piece_remaining = target(piece_idx);
-            }
-            let take = cmp::min(piece_remaining, n_rows - row_cursor);
-            let scalar = batch.scalar.slice(row_cursor, take);
-            let vectors: Vec<Arc<Float32Array>> = batch
-                .vectors
-                .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let dim = vector_dims[i];
-                    Arc::new(v.slice(row_cursor * dim, take * dim))
-                })
-                .collect();
-            pieces[piece_idx].push(BufferedBatch { scalar, vectors });
-            row_cursor += take;
-            piece_remaining -= take;
+/// The rows `start..end` of a commit, as `items` hold them: the slices of
+/// the items that fall in the range, in order. `rows_of` is an item's row
+/// count and `slice(item, offset, len)` its zero-copy slice. The one
+/// slicer for a commit-time build and for a seal from the live lanes.
+fn slice_rows<T>(
+    items: &[T],
+    start: usize,
+    end: usize,
+    rows_of: impl Fn(&T) -> usize,
+    slice: impl Fn(&T, usize, usize) -> T,
+) -> Vec<T> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for item in items {
+        let (item_start, item_end) = (at, at + rows_of(item));
+        at = item_end;
+        let (lo, hi) = (start.max(item_start), end.min(item_end));
+        if lo < hi {
+            out.push(slice(item, lo - item_start, hi - lo));
         }
     }
-    pieces.retain(|s| !s.is_empty());
+    out
+}
+
+/// Split of the writer's buffered batches into build inputs cut at `bounds`
+/// ([`commit_piece_bounds`]), each shaped as a `Vec<BufferedBatch>` that
+/// [`build_piece`] can consume directly. The slices are zero-copy
+/// (`RecordBatch::slice` + `Float32Array::slice` adjust buffer offsets only;
+/// underlying memory stays Arc-counted), so no payload bytes are copied even
+/// when a boundary falls in the middle of a `BufferedBatch`.
+///
+/// Empty pieces (only possible when the buffer holds fewer rows than pieces)
+/// are dropped; callers see exactly the pieces that will produce a non-empty
+/// superfile.
+fn split_buffer_into_superfile_inputs(
+    buffer: &[BufferedBatch],
+    bounds: &[usize],
+    vector_dims: &[usize],
+) -> Vec<Vec<BufferedBatch>> {
+    let mut pieces: Vec<Vec<BufferedBatch>> = bounds
+        .windows(2)
+        .map(|piece| {
+            slice_rows(
+                buffer,
+                piece[0],
+                piece[1],
+                |b| b.scalar.num_rows(),
+                |b, offset, len| BufferedBatch {
+                    scalar: b.scalar.slice(offset, len),
+                    vectors: b
+                        .vectors
+                        .iter()
+                        .zip(vector_dims)
+                        .map(|(v, &dim)| Arc::new(v.slice(offset * dim, len * dim)))
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+    pieces.retain(|piece| !piece.is_empty());
     pieces
 }
 
@@ -1730,10 +1766,9 @@ impl SupertableWriter {
         self.pending_ingest.fts_text_bytes += fts_bytes_u64;
 
         // Tokenize this batch now, on the pool, while the caller reads the
-        // next one; a commit that finds the shards current seals them
-        // instead of rebuilding.
-        let manifest_arc: Arc<ManifestSnapshot> = Arc::clone(&manifest);
-        self.feed_live(&manifest_arc, scalar_bytes_u64, fts_bytes_u64);
+        // next one; a commit that finds the lanes current seals its pieces
+        // from them instead of rebuilding.
+        self.feed_live(&manifest, scalar_bytes_u64, fts_bytes_u64);
 
         // Auto-flush on held bytes (scalar + vector); the FTS weighting is a
         // reserve-time concern, not held memory.
@@ -2366,9 +2401,10 @@ impl SupertableWriter {
     /// [`SupertableWriter::commit`] calls this first before
     /// driving pending mutations.
     ///
-    /// Rows are balanced evenly across shards regardless of the
-    /// caller's `append()` cadence — many small appends followed by
-    /// one `commit` produce the same shard layout as one large append.
+    /// The pieces take equal shares of the text to index (rows alone
+    /// when nothing is indexed) regardless of the caller's `append()`
+    /// cadence — many small appends followed by one `commit` produce the
+    /// same superfile layout as one large append.
     #[cfg_attr(
         feature = "detailed-tracing",
         tracing::instrument(skip_all, fields(buffered = self.buffer.len()))
@@ -2380,7 +2416,7 @@ impl SupertableWriter {
 
         // The live lanes, if this buffer has them: they hold the build
         // scratch for the batches they were fed, so the commit reserves
-        // nothing on top. Taken here so a failed commit cannot seal shards
+        // nothing on top. Taken here so a failed commit cannot seal lanes
         // a later retry would also rebuild from the buffer.
         let live = self.live.take();
         // Try reserving the transient heap from the ConnectionMemoryBudget before draining the buffer.
@@ -2442,9 +2478,12 @@ impl SupertableWriter {
 
     /// Hand the batch just buffered to the live lanes, opening them when
     /// the buffer has grown to a superfile's worth of rows. Any failure
-    /// here only disables the live lanes for this buffer: the commit then
-    /// rebuilds from the buffer and reports whatever the build reports, so
-    /// an append never fails for work it only did early.
+    /// seen here only disables the live lanes for this buffer: the commit
+    /// then rebuilds from the buffer and reports whatever the build
+    /// reports, so an append never fails for work it only did early. (A
+    /// feed still running when the commit comes is joined by the commit,
+    /// and its error fails that commit; the retry rebuilds from the
+    /// restored buffer.)
     fn feed_live(&mut self, manifest: &Arc<ManifestSnapshot>, scalar_bytes: u64, fts_bytes: u64) {
         if self.live_disabled {
             return;
@@ -2483,7 +2522,7 @@ impl SupertableWriter {
                 .map(|b| try_conform(&b.scalar, &scalar_schema))
                 .collect()
         };
-        let target_bytes = (options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
+        let target_bytes = split_target_bytes(options);
         let (batches, reservation) = match &self.live {
             Some(_) => {
                 // The guard for this batch alone; the earlier ones are held.
@@ -2577,7 +2616,6 @@ impl SupertableWriter {
         let manifest = Arc::clone(&live.manifest);
         let sealing = Instant::now();
         let lanes = live.join()?;
-        let joined_ms = sealing.elapsed().as_millis();
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         let fed: usize = lanes
             .iter()
@@ -2589,22 +2627,12 @@ impl SupertableWriter {
             )));
         }
         let options = Arc::clone(&self.inner.options);
-        // The pieces a commit-time build would cut these rows into: the
-        // same count, by the same rule, cut at the same rows.
-        let buffered_bytes: usize = buffer
-            .iter()
-            .map(|b| b.scalar.get_array_memory_size())
-            .sum();
-        let target_bytes = (options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
-        let n_threads = options.writer_pool.current_num_threads().max(1);
-        let n_pieces = superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
-        let mut weights = Vec::with_capacity(total_rows);
-        for b in buffer {
-            piece_row_weights(&b.scalar, &options, &mut weights);
-        }
-        let bounds = piece_bounds(&weights, n_pieces);
-        let pieces: Vec<Range<u32>> = (0..n_pieces)
-            .map(|i| bounds[i] as u32..bounds[i + 1] as u32)
+        // The pieces a commit-time build would cut these rows into.
+        let bounds = commit_piece_bounds(buffer, &options);
+        let n_pieces = bounds.len() - 1;
+        let pieces: Vec<Range<u32>> = bounds
+            .windows(2)
+            .map(|piece| piece[0] as u32..piece[1] as u32)
             .collect();
         let payload_bytes = buffered_payload_bytes(buffer);
         let list_metadata = CommitListMetadata {
@@ -2627,56 +2655,38 @@ impl SupertableWriter {
         // The seal is the append's own CPU, measured on the pool threads
         // that run it like a commit-time build's pieces: the lanes frozen
         // side by side, then every piece built from its rows of them.
-        let conformed_ms = sealing.elapsed().as_millis();
-        let (mut frozen_ms, mut merged_ms) = (0u128, 0u128);
         let outputs: Vec<ShardOutput> = options.writer_pool.install(|| {
             let frozen: Vec<FrozenLane> = lanes
                 .into_par_iter()
-                .map(|lane| {
-                    timed_kernel(&stats, || {
-                        lane.builder
-                            .freeze(lane.stretches)
-                            .map_err(BuildError::from)
-                    })
-                })
+                .map(|lane| timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?)))
                 .collect::<Result<_, BuildError>>()?;
-            frozen_ms = sealing.elapsed().as_millis();
-            let frozen = Arc::new(freeze_lanes(frozen, pieces.clone()).map_err(BuildError::from)?);
-            merged_ms = sealing.elapsed().as_millis();
+            let frozen = Arc::new(freeze_lanes(frozen, pieces)?);
             (0..n_pieces)
                 .into_par_iter()
                 .map(|i| {
                     timed_kernel(&stats, || {
-                        let slices = piece_batches(&batches, bounds[i], bounds[i + 1]);
-                        let text_bytes: u64 = slices
-                            .iter()
-                            .map(|b| ingested_byte_legs(b, 0, &options).2)
-                            .sum();
-                        let (mut builder, superfile_id, head_sink) = open_shard_builder(
+                        let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
+                        build_piece(
+                            PieceRows::Lanes {
+                                batches: &rows,
+                                lanes: Arc::clone(&frozen),
+                                piece: i,
+                            },
+                            &options,
                             &manifest,
                             options.vector_layout,
                             None,
-                            usize::try_from(text_bytes).unwrap_or(usize::MAX),
-                        )?;
-                        // The body in row order; the postings come from the
-                        // lanes, merged at the finish.
-                        for slice in &slices {
-                            builder.add_rows_unindexed(slice)?;
-                        }
-                        builder.set_fts_lane_view(Arc::clone(&frozen), i);
-                        let bounds = id_bounds(slices.iter(), &options)?;
-                        let refs: Vec<&RecordBatch> = slices.iter().collect();
-                        let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &refs);
-                        seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats)
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         })?;
-        let sealed_ms = sealing.elapsed().as_millis();
+        let sealed = sealing.elapsed();
         let superfiles = outputs.len();
         let cell_hints = vec![None; superfiles];
         let user_batch =
             prepare_user_superfile_batch(&self.inner, &manifest, outputs, cell_hints, stem)?;
+        let prepared = sealing.elapsed();
         let output_stats = self
             .op_stats
             .as_ref()
@@ -2691,16 +2701,15 @@ impl SupertableWriter {
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
-        debug!(
-            superfiles,
-            joined_ms,
-            conformed_ms,
-            frozen_ms,
-            merged_ms,
-            sealed_ms,
-            published_ms = sealing.elapsed().as_millis(),
-            "published appended superfiles from live lanes"
-        );
+        if crate::storage::io_counters::timeline_enabled() {
+            info!(
+                "[supertable commit] live seal {:.1}ms ({superfiles} superfiles) + prepare \
+                 {:.1}ms + publish {:.1}ms",
+                sealed.as_secs_f64() * 1e3,
+                (prepared - sealed).as_secs_f64() * 1e3,
+                (sealing.elapsed() - prepared).as_secs_f64() * 1e3,
+            );
+        }
         // Released here, after the publish, like a commit-time build's guard.
         drop(live);
         Ok(())
@@ -2865,10 +2874,10 @@ impl SupertableWriter {
         };
         let buffer: &[BufferedBatch] = &buffer;
 
-        // Shards already fed every buffered row under the schema this commit
-        // builds under seal straight away. Built against an older schema, or
-        // for a buffer that grew a column since, they are dropped and the
-        // buffer is rebuilt below as before.
+        // Lanes fed every buffered row under the schema this commit builds
+        // under seal its pieces straight away. Built against an older
+        // schema, or for a buffer that grew a column since, they are
+        // dropped and the buffer is rebuilt below as before.
         if let Some(live) = live {
             if schema_change.is_none()
                 && live.manifest.table_schema().schema_id() == built_against
@@ -3123,19 +3132,10 @@ impl SupertableWriter {
         }
 
         let writer_pool = Arc::clone(&self.inner.options.writer_pool);
-        let n_threads = writer_pool.current_num_threads().max(1);
 
         // `scalar` is the whole buffer here: vector tables took the drain branch above, and text
-        // columns live inside `scalar`. Arrow reports capacity, not logical bytes — fine for a
-        // fanout heuristic that is clamped to the pool anyway.
-        let buffered_bytes: usize = buffer
-            .iter()
-            .map(|b| b.scalar.get_array_memory_size())
-            .sum();
-        let target_bytes =
-            (self.inner.options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
-        let n_superfiles =
-            superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
+        // columns live inside `scalar`.
+        let bounds = commit_piece_bounds(buffer, &self.inner.options);
 
         let vector_dims: Vec<usize> = self
             .inner
@@ -3189,27 +3189,16 @@ impl SupertableWriter {
                         .collect();
                     (shards, hints)
                 } else {
-                    let shards = split_buffer_into_superfile_inputs(
-                        owned,
-                        n_superfiles,
-                        &vector_dims,
-                        &self.inner.options,
-                    );
+                    let shards = split_buffer_into_superfile_inputs(&owned, &bounds, &vector_dims);
                     let hints = vec![None; shards.len()];
                     (shards, hints)
                 }
             } else {
-                let shards = split_buffer_into_superfile_inputs(
-                    owned,
-                    n_superfiles,
-                    &vector_dims,
-                    &self.inner.options,
-                );
+                let shards = split_buffer_into_superfile_inputs(&owned, &bounds, &vector_dims);
                 let hints = vec![None; shards.len()];
                 (shards, hints)
             };
 
-        let user_inner = Arc::clone(&self.inner);
         let user_options = Arc::clone(&self.inner.options);
         // A/B knob (`vector.user_centroids: global`): build user superfiles
         // aligned to the GLOBAL cell grid (cluster c == cell c) instead of local
@@ -3233,9 +3222,9 @@ impl SupertableWriter {
         // The shard build is the append's own CPU — measured on the pool
         // threads that run it, folded into the op's collector.
         let outputs = fanout_shards_metered(&writer_pool, &self.op_stats, &shards, |slice| {
-            build_one_shard_with_layout(
-                slice.as_slice(),
-                &user_inner,
+            build_piece(
+                PieceRows::Buffered(slice.as_slice()),
+                &user_options,
                 &manifest,
                 user_options.vector_layout,
                 user_global_centroids.clone(),
@@ -3492,10 +3481,12 @@ fn reserve_build_scratch(
 /// tokenizing is as wide as the pool whatever that count.
 ///
 /// The buffer keeps every batch regardless: a commit whose schema moved,
-/// a feed that failed, or a buffer these lanes never covered rebuilds
-/// from the buffer exactly as before, and the lanes are dropped. Only a
-/// commit that finds its lanes whole and current seals from them
-/// instead of rebuilding.
+/// a feed whose failure an append saw, or a buffer these lanes never
+/// covered rebuilds from the buffer exactly as before, and the lanes are
+/// dropped. Only a commit that finds its lanes whole and current seals
+/// from them instead of rebuilding; an error in that seal (the feed it
+/// joins included) fails the commit like any other, and the retry
+/// rebuilds from the restored buffer.
 ///
 /// One feed is in flight at a time. Each append hands the pool the batch
 /// it just buffered and returns; the next append (or the commit) first
@@ -3635,17 +3626,13 @@ impl LiveLanes {
 /// The rows `start..end` of a commit, as `batches` hold them: the slices
 /// of the batches that fall in the range, in order.
 fn piece_batches(batches: &[RecordBatch], start: usize, end: usize) -> Vec<RecordBatch> {
-    let mut slices = Vec::new();
-    let mut at = 0usize;
-    for batch in batches {
-        let (batch_start, batch_end) = (at, at + batch.num_rows());
-        at = batch_end;
-        let (lo, hi) = (start.max(batch_start), end.min(batch_end));
-        if lo < hi {
-            slices.push(batch.slice(lo - batch_start, hi - lo));
-        }
-    }
-    slices
+    slice_rows(
+        batches,
+        start,
+        end,
+        RecordBatch::num_rows,
+        RecordBatch::slice,
+    )
 }
 
 /// Open one shard builder against `manifest`: the builder, the id its
@@ -3769,40 +3756,82 @@ fn seal_shard(
     })
 }
 
-/// Build one superfile from one slice of buffered batches with an explicit
-/// vector layout override. Runs on a rayon worker thread inside the writer
-/// pool's `install`. The commit path always passes an explicit layout +
-/// optional global centroids.
-fn build_one_shard_with_layout(
-    slice: &[BufferedBatch],
-    inner: &SupertableInner,
+/// The rows one piece of a commit is built from: buffered batches the
+/// builder tokenizes itself (a commit-time build), or conformed batches
+/// whose postings come from the commit's frozen lanes at the finish (a seal
+/// from the live lanes).
+enum PieceRows<'a> {
+    Buffered(&'a [BufferedBatch]),
+    Lanes {
+        batches: &'a [RecordBatch],
+        lanes: Arc<FrozenLanes>,
+        piece: usize,
+    },
+}
+
+impl<'a> PieceRows<'a> {
+    /// The piece's scalar batches, in row order.
+    fn scalars(&self) -> Vec<&'a RecordBatch> {
+        match self {
+            Self::Buffered(slice) => slice.iter().map(|b| &b.scalar).collect(),
+            Self::Lanes { batches, .. } => batches.iter().collect(),
+        }
+    }
+}
+
+/// Build one superfile from one piece of a commit with an explicit vector
+/// layout override. Runs on a rayon worker thread inside the writer pool's
+/// `install`. The commit path always passes an explicit layout + optional
+/// global centroids.
+fn build_piece(
+    rows: PieceRows<'_>,
+    options: &SupertableOptions,
     manifest: &ManifestSnapshot,
     vector_layout: VectorLayout,
     provided_centroids: Option<Arc<[f32]>>,
 ) -> Result<ShardOutput, BuildError> {
-    let options = &inner.options;
-    let fts_text_bytes: usize = slice
+    let scalars = rows.scalars();
+    let fts_text_bytes: u64 = scalars
         .iter()
-        .map(|b| ingested_byte_legs(&b.scalar, 0, options).2 as usize)
+        .map(|b| ingested_byte_legs(b, 0, options).2)
         .sum();
-    let (mut builder, superfile_id, head_sink) =
-        open_shard_builder(manifest, vector_layout, provided_centroids, fts_text_bytes)?;
-    for buffered in slice {
-        // Float32Array::values() returns &ScalarBuffer<f32>;
-        // ScalarBuffer derefs to &[f32], so AsRef does the slice
-        // view without a copy.
-        let vector_slices: Vec<&[f32]> = buffered
-            .vectors
-            .iter()
-            .map(|fa| fa.values().as_ref())
-            .collect();
-        builder.add_batch(&buffered.scalar, &vector_slices)?;
+    let (mut builder, superfile_id, head_sink) = open_shard_builder(
+        manifest,
+        vector_layout,
+        provided_centroids,
+        usize::try_from(fts_text_bytes).unwrap_or(usize::MAX),
+    )?;
+    match rows {
+        PieceRows::Buffered(slice) => {
+            for buffered in slice {
+                // Float32Array::values() returns &ScalarBuffer<f32>;
+                // ScalarBuffer derefs to &[f32], so AsRef does the slice
+                // view without a copy.
+                let vector_slices: Vec<&[f32]> = buffered
+                    .vectors
+                    .iter()
+                    .map(|fa| fa.values().as_ref())
+                    .collect();
+                builder.add_batch(&buffered.scalar, &vector_slices)?;
+            }
+        }
+        PieceRows::Lanes {
+            batches,
+            lanes,
+            piece,
+        } => {
+            // The body in row order; the postings come from the lanes,
+            // merged at the finish.
+            for batch in batches {
+                builder.add_rows_unindexed(batch)?;
+            }
+            builder.set_fts_lane_view(lanes, piece);
+        }
     }
-    let bounds = id_bounds(slice.iter().map(|b| &b.scalar), options)?;
-    // Per-scalar-column min/max from the slice's batches; `from_batches`
+    let bounds = id_bounds(scalars.iter().copied(), options)?;
+    // Per-scalar-column min/max from the piece's batches; `from_batches`
     // borrows them.
-    let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
-    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &scalar_batches);
+    let scalar_stats = ScalarStatsAgg::from_batches(&manifest.scalar_schema(), &scalars);
     seal_shard(builder, superfile_id, head_sink, bounds, scalar_stats)
 }
 
@@ -13839,7 +13868,10 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::{
+        fs,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -13880,6 +13912,7 @@ mod tests {
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
+            reader_cache::disk::test_support::test_store,
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::LocalFsStorageProvider,
@@ -16633,72 +16666,183 @@ mod tests {
         }
     }
 
-    /// Live pieces: a buffer wide enough to open them is fed as it is
-    /// appended and sealed at commit, and the table reads the same as one
-    /// built at commit time — every row present, the same documents under
-    /// every term — with each superfile holding a run of rows no other's
-    /// overlaps, as a commit-time build's do.
+    /// Rows for the live-versus-plain builds. A marker term every
+    /// `MARKER_PERIOD` rows gives a search a few hundred hits across the
+    /// pieces; every `HEAVY_PERIOD`th row carries `HEAVY_BYTES` more text
+    /// and the word `heavy`, so the pieces are cut by text, not by rows,
+    /// and a cut that fell elsewhere would move a superfile's id range.
+    const MARKER_PERIOD: usize = 97;
+    const PADDING_BYTES: usize = 200;
+    const HEAVY_PERIOD: usize = 7;
+    const HEAVY_BYTES: usize = 3_000;
+
+    fn live_titles(batch: usize, rows_per_batch: usize) -> LargeStringArray {
+        LargeStringArray::from(
+            (0..rows_per_batch)
+                .map(|i| {
+                    let row = batch * rows_per_batch + i;
+                    let heavy = row.is_multiple_of(HEAVY_PERIOD);
+                    format!(
+                        "doc {row} word{} {}{}",
+                        row % MARKER_PERIOD,
+                        if heavy { "heavy " } else { "" },
+                        "x".repeat(PADDING_BYTES + if heavy { HEAVY_BYTES } else { 0 })
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn live_batch(batch: usize, rows_per_batch: usize) -> RecordBatch {
+        RecordBatch::try_new(
+            schema_id_title(),
+            vec![Arc::new(live_titles(batch, rows_per_batch))],
+        )
+        .expect("batch")
+    }
+
+    /// Options for a table whose live lanes open early: `threads` lanes, a
+    /// `split_mb` split and a `threshold_mb` flush threshold.
+    fn live_options(
+        threads: usize,
+        split_mb: u64,
+        threshold_mb: u64,
+        positional: bool,
+    ) -> SupertableOptions {
+        SupertableOptions::new(
+            schema_id_title(),
+            vec![FtsConfig::new("title").positions(positional)],
+            vec![],
+        )
+        .expect("valid options")
+        .with_writer_pool(writer_pool_with(threads))
+        .with_superfile_buffer_split_mb(split_mb)
+        .with_commit_threshold_size_mb(threshold_mb)
+    }
+
+    /// Build a table from `batches` batches of `rows_per_batch` rows under
+    /// `opts`, through the live lanes or, with `live` false, the
+    /// commit-time build alone; `before_commit` sees the writer with the
+    /// rows appended.
+    fn build_live_or_plain(
+        opts: SupertableOptions,
+        rows_per_batch: usize,
+        batches: usize,
+        live: bool,
+        before_commit: impl FnOnce(&mut SupertableWriter),
+    ) -> Supertable {
+        let st = Supertable::create(opts).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.live_disabled = !live;
+        for b in 0..batches {
+            w.append(&live_batch(b, rows_per_batch)).expect("append");
+        }
+        before_commit(&mut w);
+        w.commit().expect("commit");
+        assert!(w.live.is_none(), "the commit consumes the live lanes");
+        drop(w);
+        st
+    }
+
+    /// How many rows each superfile holds, in id order: the rows the
+    /// commits were cut at. (Ids themselves are minted per table, so two
+    /// tables of the same rows compare by their runs' lengths.)
+    fn piece_sizes(st: &Supertable) -> Vec<u64> {
+        let reader = st.reader().expect("reader");
+        let mut runs: Vec<(i128, u64)> = reader
+            .manifest()
+            .superfiles
+            .iter()
+            .map(|e| (e.id_min, e.n_docs))
+            .collect();
+        runs.sort_unstable();
+        runs.into_iter().map(|(_, n_docs)| n_docs).collect()
+    }
+
+    /// The titles `term` hits, with their scores.
+    fn scored_hits(st: &Supertable, term: &str, k: usize) -> BTreeSet<(String, u32)> {
+        st.bm25_search(
+            "title",
+            term,
+            k,
+            Bm25SearchOptions::new().with_mode(BoolMode::Or),
+            Some(&["title", "score"]),
+        )
+        .expect("bm25")
+        .iter()
+        .flat_map(|batch| {
+            let titles = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("title column");
+            let scores = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("score column");
+            (0..titles.len())
+                .map(|i| (titles.value(i).to_string(), scores.value(i).to_bits()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+    }
+
+    /// Live lanes: a buffer wide enough to open them is fed as it is
+    /// appended and sealed at commit, and the table is the one a
+    /// commit-time build makes — the same superfiles by id range and
+    /// document count, every row present, the same documents under every
+    /// term with the same scores — with each superfile holding a run of
+    /// rows no other's overlaps. Positions are on and the rows are skewed,
+    /// so a document length at the wrong row or a cut at the wrong row
+    /// shows.
     #[test]
     fn live_pieces_seal_the_same_table_a_commit_time_build_makes() {
         const ROWS_PER_BATCH: usize = 2_000;
         const BATCHES: usize = 20;
-        /// Spreads a marker term over the rows so a search has a few
-        /// hundred hits across the pieces.
-        const MARKER_PERIOD: usize = 97;
-        let titles_of = |b: usize| {
-            LargeStringArray::from(
-                (0..ROWS_PER_BATCH)
-                    .map(|i| {
-                        let row = b * ROWS_PER_BATCH + i;
-                        format!("doc {row} word{} {}", row % MARKER_PERIOD, "x".repeat(200))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        // A 1 MiB split opens the live pieces after the first batch or two,
+        // A 1 MiB split opens the live lanes after the first batch or two,
         // and a 4 MiB threshold on a 2-thread pool makes a piece 2 MiB of
-        // text, so the ~9 MiB of rows commit in several pieces each, some
+        // text, so the ~17 MiB of rows commit in several pieces each, some
         // commits flushed by the threshold and the last explicit.
         let build = |live: bool| {
-            let opts = options_id_title()
-                .with_writer_pool(writer_pool_with(2))
-                .with_superfile_buffer_split_mb(1)
-                .with_commit_threshold_size_mb(4);
-            let st = Supertable::create(opts).expect("create");
-            let mut w = st.writer().expect("writer");
-            w.live_disabled = !live;
-            for b in 0..BATCHES {
-                let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles_of(b))])
-                    .expect("batch");
-                w.append(&batch).expect("append");
-            }
-            if live {
-                assert!(
-                    !w.live_disabled,
-                    "a committed buffer re-arms the live pieces"
-                );
-            }
-            w.commit().expect("commit");
-            assert!(w.live.is_none(), "the commit consumes the live pieces");
-            st
+            build_live_or_plain(
+                live_options(2, 1, 4, true),
+                ROWS_PER_BATCH,
+                BATCHES,
+                live,
+                |w| {
+                    if live {
+                        assert!(
+                            !w.live_disabled,
+                            "a committed buffer re-arms the live lanes"
+                        );
+                    }
+                },
+            )
         };
         let live = build(true);
         let plain = build(false);
 
         let r_live = live.reader().expect("reader");
-        let r_plain = plain.reader().expect("reader");
         assert_eq!(r_live.n_docs_total(), (ROWS_PER_BATCH * BATCHES) as u64);
-        assert_eq!(r_live.n_docs_total(), r_plain.n_docs_total());
         assert!(
             r_live.n_superfiles() > 1,
             "the rows fill more than one 2 MiB piece"
         );
         assert_disjoint_id_runs(&live);
-        for term in ["word5", "word42", "doc"] {
-            let from_live = hit_titles(&live, term, ROWS_PER_BATCH * BATCHES);
-            let from_plain = hit_titles(&plain, term, ROWS_PER_BATCH * BATCHES);
+        assert_eq!(
+            piece_sizes(&live),
+            piece_sizes(&plain),
+            "the same superfiles, cut at the same rows"
+        );
+        for term in ["word5", "word42", "heavy", "doc"] {
+            let from_live = scored_hits(&live, term, ROWS_PER_BATCH * BATCHES);
             assert!(!from_live.is_empty(), "{term}: no hits");
-            assert_eq!(from_live, from_plain, "{term}: hit sets differ");
+            assert_eq!(
+                from_live,
+                scored_hits(&plain, term, ROWS_PER_BATCH * BATCHES),
+                "{term}: hits or scores differ"
+            );
         }
     }
 
@@ -16709,57 +16853,40 @@ mod tests {
     #[test]
     fn an_early_commit_cuts_the_pieces_a_commit_time_build_cuts() {
         const ROWS_PER_BATCH: usize = 2_000;
-        const BATCHES: usize = 6;
+        const BATCHES: usize = 3;
         const THREADS: usize = 8;
-        let titles_of = |b: usize| {
-            LargeStringArray::from(
-                (0..ROWS_PER_BATCH)
-                    .map(|i| {
-                        let row = b * ROWS_PER_BATCH + i;
-                        format!("doc {row} word{} {}", row % 53, "y".repeat(200))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
         // About 2.5 MiB of rows against a 1 MiB split: a commit-time build
         // cuts them into a few pieces, while eight threads tokenize them in
         // eight lanes.
         let build = |live: bool| {
-            let opts = options_id_title()
-                .with_writer_pool(writer_pool_with(THREADS))
-                .with_superfile_buffer_split_mb(1)
-                .with_commit_threshold_size_mb(4096);
-            let st = Supertable::create(opts).expect("create");
-            let mut w = st.writer().expect("writer");
-            w.live_disabled = !live;
-            for b in 0..BATCHES {
-                let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles_of(b))])
-                    .expect("batch");
-                w.append(&batch).expect("append");
-            }
-            assert_eq!(w.live.is_some(), live);
-            if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
-                assert_eq!(lanes.len(), THREADS, "one lane per thread");
-                assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
-                w.live.as_mut().expect("live").lanes = Some(lanes);
-            }
-            w.commit().expect("commit");
-            st
+            build_live_or_plain(
+                live_options(THREADS, 1, 4096, false),
+                ROWS_PER_BATCH,
+                BATCHES,
+                live,
+                |w| {
+                    assert_eq!(w.live.is_some(), live);
+                    if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
+                        assert_eq!(lanes.len(), THREADS, "one lane per thread");
+                        assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
+                        w.live.as_mut().expect("live").lanes = Some(lanes);
+                    }
+                },
+            )
         };
         let live = build(true);
         let plain = build(false);
         let r_live = live.reader().expect("reader");
         let r_plain = plain.reader().expect("reader");
         assert_eq!(r_live.n_docs_total(), (ROWS_PER_BATCH * BATCHES) as u64);
-        assert_eq!(r_plain.n_docs_total(), r_live.n_docs_total());
         assert!(
             r_plain.n_superfiles() < THREADS,
             "the buffer is too small for a piece per thread"
         );
         assert_eq!(
-            r_live.n_superfiles(),
-            r_plain.n_superfiles(),
-            "the lanes are cut to the commit-time count"
+            piece_sizes(&live),
+            piece_sizes(&plain),
+            "the lanes are cut to the commit-time pieces"
         );
         assert_disjoint_id_runs(&live);
         for term in ["word7", "word52", "doc"] {
@@ -16767,6 +16894,238 @@ mod tests {
                 hit_titles(&live, term, ROWS_PER_BATCH * BATCHES),
                 hit_titles(&plain, term, ROWS_PER_BATCH * BATCHES),
                 "term {term}"
+            );
+        }
+    }
+
+    /// A batch that adds a column after the lanes opened drops them for
+    /// this buffer — the commit needs the schema union — and the commit
+    /// rebuilds every buffered row from the buffer, new column included;
+    /// the next buffer may open lanes again.
+    #[test]
+    fn a_batch_that_adds_a_column_drops_the_lanes_and_the_commit_rebuilds() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 4;
+        let wider = || {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("title", DataType::LargeUtf8, false),
+                    Field::new("extra", DataType::LargeUtf8, true),
+                ])),
+                vec![
+                    Arc::new(live_titles(BATCHES, ROWS_PER_BATCH)),
+                    Arc::new(LargeStringArray::from(vec!["x"; ROWS_PER_BATCH])),
+                ],
+            )
+            .expect("wider batch")
+        };
+        let build = |live: bool| {
+            let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.live_disabled = !live;
+            for b in 0..BATCHES {
+                w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+            }
+            assert_eq!(w.live.is_some(), live, "the lanes opened");
+            w.append(&wider()).expect("append the wider batch");
+            assert!(w.live.is_none(), "the lanes are dropped for this buffer");
+            assert!(w.live_disabled);
+            w.commit().expect("the commit rebuilds from the buffer");
+            assert!(!w.live_disabled, "the next buffer may open lanes");
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        let reader = live.reader().expect("reader");
+        assert_eq!(
+            reader.n_docs_total(),
+            ((BATCHES + 1) * ROWS_PER_BATCH) as u64
+        );
+        assert!(
+            reader.manifest().scalar_schema().index_of("extra").is_ok(),
+            "the new column is in the schema"
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        for term in ["word5", "heavy"] {
+            assert_eq!(
+                hit_titles(&live, term, usize::MAX),
+                hit_titles(&plain, term, usize::MAX),
+                "term {term}"
+            );
+        }
+    }
+
+    /// A commit that fails after it took the lanes restores the buffer and
+    /// disarms the lanes; the rows appended after the failure join the
+    /// restored buffer, and the retry rebuilds all of them from it.
+    #[test]
+    fn a_failed_live_commit_restores_the_buffer_and_the_retry_rebuilds_it() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 4;
+        /// Where the manifest pointer lives; the first commit's write of it
+        /// is made to fail.
+        const POINTER_URI_FRAGMENT: &str = "_supertable/current";
+        let dir = TempDir::new().expect("tempdir");
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let faults = FaultStorage::wrap(local);
+        let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+        let st = Supertable::create(live_options(2, 1, 4096, false).with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        for b in 0..BATCHES {
+            w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+        }
+        assert!(w.live.is_some(), "the lanes opened");
+        faults.fail(FaultOp::PutIfMatch, POINTER_URI_FRAGMENT, usize::MAX);
+        w.commit().expect_err("the pointer write fails");
+        assert!(faults.fired() > 0, "the failure came from the injection");
+        faults.clear();
+        assert_eq!(w.buffer.len(), BATCHES, "the buffer is restored");
+        assert!(w.live.is_none() && w.live_disabled, "the lanes are gone");
+        w.append(&live_batch(BATCHES, ROWS_PER_BATCH))
+            .expect("append after the failure");
+        assert!(w.live.is_none(), "no lanes for the restored buffer");
+        w.commit().expect("the retry rebuilds from the buffer");
+        assert!(!w.live_disabled, "the next buffer may open lanes");
+        drop(w);
+        assert_eq!(
+            st.reader().expect("reader").n_docs_total(),
+            ((BATCHES + 1) * ROWS_PER_BATCH) as u64
+        );
+        let plain = build_live_or_plain(
+            live_options(2, 1, 4096, false),
+            ROWS_PER_BATCH,
+            BATCHES + 1,
+            false,
+            |_| {},
+        );
+        assert_eq!(piece_sizes(&st), piece_sizes(&plain));
+        for term in ["word5", "heavy"] {
+            assert_eq!(
+                hit_titles(&st, term, usize::MAX),
+                hit_titles(&plain, term, usize::MAX),
+                "term {term}"
+            );
+        }
+    }
+
+    /// A commit to a directory on this host with a disk cache attached
+    /// writes each sealed superfile once: the storage copy and the cache
+    /// copy are links to the same file.
+    #[cfg(unix)]
+    #[test]
+    fn a_local_commit_links_the_sealed_file_into_storage_and_the_cache() {
+        const ROWS_PER_BATCH: usize = 500;
+        const BATCHES: usize = 2;
+        let (dir, cache) = test_store();
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(
+            options_id_title()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(cache),
+        )
+        .expect("create");
+        let mut w = st.writer().expect("writer");
+        for b in 0..BATCHES {
+            w.append(&live_batch(b, ROWS_PER_BATCH)).expect("append");
+        }
+        w.commit().expect("commit");
+        drop(w);
+        let reader = st.reader().expect("reader");
+        let entries = &reader.manifest().superfiles;
+        assert!(!entries.is_empty());
+        let cache = st
+            .inner()
+            .options
+            .disk_cache
+            .as_ref()
+            .expect("cache attached");
+        for entry in entries.iter() {
+            let stored = storage
+                .local_path(&entry.storage_path())
+                .expect("a directory on this host");
+            let stored = fs::metadata(&stored).expect("storage file");
+            let cached = fs::metadata(cache.cache_path(&entry.uri)).expect("cache file");
+            assert_eq!(stored.ino(), cached.ino(), "one file behind both");
+            assert!(stored.nlink() >= 2, "linked, not copied");
+        }
+    }
+
+    /// The commit-time split cuts the buffer where [`piece_bounds`] puts
+    /// the cuts, across batch boundaries, dropping and duplicating no row,
+    /// and the live seal's slicer cuts the same rows.
+    #[test]
+    fn the_commit_time_split_cuts_where_the_piece_bounds_fall() {
+        // Title lengths are the rows' weights; three batches of four.
+        let lens: [[usize; 4]; 3] = [[1, 1, 1, 100], [1, 1, 1, 1], [50, 1, 1, 1]];
+        let buffer: Vec<BufferedBatch> = lens
+            .iter()
+            .map(|batch| BufferedBatch {
+                scalar: RecordBatch::try_new(
+                    schema_id_title(),
+                    vec![Arc::new(LargeStringArray::from(
+                        batch.iter().map(|&n| "x".repeat(n)).collect::<Vec<_>>(),
+                    ))],
+                )
+                .expect("batch"),
+                vectors: vec![],
+            })
+            .collect();
+        let options = options_id_title();
+        let mut weights = Vec::new();
+        for batch in &buffer {
+            piece_row_weights(&batch.scalar, &options, &mut weights);
+        }
+        assert_eq!(
+            weights,
+            lens.iter().flatten().map(|&n| n as u64).collect::<Vec<_>>()
+        );
+        let bounds = piece_bounds(&weights, 3);
+        assert_eq!(
+            bounds,
+            vec![0, 3, 7, 12],
+            "light rows, the heavy row, the rest"
+        );
+
+        let pieces = split_buffer_into_superfile_inputs(&buffer, &bounds, &[]);
+        let piece_lens = |piece: &[BufferedBatch]| -> Vec<usize> {
+            piece
+                .iter()
+                .flat_map(|b| {
+                    let titles = b
+                        .scalar
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("titles");
+                    (0..titles.len())
+                        .map(|i| titles.value(i).len())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let cut: Vec<Vec<usize>> = pieces.iter().map(|p| piece_lens(p)).collect();
+        assert_eq!(
+            cut,
+            vec![vec![1, 1, 1], vec![100, 1, 1, 1], vec![1, 50, 1, 1, 1]],
+            "every row once, in order, cut at the bounds"
+        );
+        let scalars: Vec<RecordBatch> = buffer.iter().map(|b| b.scalar.clone()).collect();
+        for (i, piece) in cut.iter().enumerate() {
+            let live: Vec<BufferedBatch> = piece_batches(&scalars, bounds[i], bounds[i + 1])
+                .into_iter()
+                .map(|scalar| BufferedBatch {
+                    scalar,
+                    vectors: vec![],
+                })
+                .collect();
+            assert_eq!(
+                &piece_lens(&live),
+                piece,
+                "piece {i}: the seal cuts the same rows"
             );
         }
     }
