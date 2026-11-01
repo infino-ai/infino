@@ -128,7 +128,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # cargo-public-api builds rustdoc JSON, which requires nightly.
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pinned: the 2026-11-01 nightly fails to compile datafusion-expr
+      # ("cycle detected when computing when `Alias` needs async drop").
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-31
       - uses: Swatinem/rust-cache@v2
         with:
           cache-directories: |
