@@ -1584,13 +1584,13 @@ impl SuperfileBuilder {
         self.add_batch_inner(batch, &[], false)
     }
 
-    /// Hand the finish the commit's frozen lanes and the rows of them this
-    /// builder's superfile holds; see [`FtsBuilder::set_lane_view`]. The
+    /// Hand the finish the commit's frozen lanes and which piece of them
+    /// this builder's superfile is; see [`FtsBuilder::set_lane_view`]. The
     /// rows themselves go in through [`Self::add_rows_unindexed`], in row
     /// order.
-    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<FrozenLanes>, rows: Range<u32>) {
+    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<FrozenLanes>, piece: usize) {
         if let Some(fb) = self.fts_builder.as_mut() {
-            fb.set_lane_view(LaneView { lanes, rows });
+            fb.set_lane_view(LaneView { lanes, piece });
         }
     }
     /// Override the FTS builder's in-RAM spill threshold (forwarded

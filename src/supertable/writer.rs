@@ -60,6 +60,7 @@ use std::{
     marker::PhantomData,
     mem,
     num::NonZeroUsize,
+    ops::Range,
     path::{Path, PathBuf},
     str::from_utf8,
     sync::{
@@ -2538,6 +2539,9 @@ impl SupertableWriter {
         let target_bytes = (options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
         let n_threads = options.writer_pool.current_num_threads().max(1);
         let n_pieces = superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
+        let pieces: Vec<Range<u32>> = (0..n_pieces)
+            .map(|i| (total_rows * i / n_pieces) as u32..(total_rows * (i + 1) / n_pieces) as u32)
+            .collect();
         let payload_bytes = buffered_payload_bytes(buffer);
         let list_metadata = CommitListMetadata {
             partition_strategy: None,
@@ -2573,15 +2577,13 @@ impl SupertableWriter {
                 })
                 .collect::<Result<_, BuildError>>()?;
             frozen_ms = sealing.elapsed().as_millis();
-            let frozen = Arc::new(freeze_lanes(frozen).map_err(BuildError::from)?);
+            let frozen = Arc::new(freeze_lanes(frozen, pieces.clone()).map_err(BuildError::from)?);
             merged_ms = sealing.elapsed().as_millis();
             (0..n_pieces)
                 .into_par_iter()
                 .map(|i| {
                     timed_kernel(&stats, || {
                         let slices = piece_batches(&batches, total_rows, i, n_pieces);
-                        let rows = (total_rows * i / n_pieces) as u32
-                            ..(total_rows * (i + 1) / n_pieces) as u32;
                         let text_bytes: u64 = slices
                             .iter()
                             .map(|b| ingested_byte_legs(b, 0, &options).2)
@@ -2597,7 +2599,7 @@ impl SupertableWriter {
                         for slice in &slices {
                             builder.add_rows_unindexed(slice)?;
                         }
-                        builder.set_fts_lane_view(Arc::clone(&frozen), rows);
+                        builder.set_fts_lane_view(Arc::clone(&frozen), i);
                         let bounds = id_bounds(slices.iter(), &options)?;
                         let refs: Vec<&RecordBatch> = slices.iter().collect();
                         let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &refs);

@@ -1515,6 +1515,12 @@ pub(crate) struct FrozenColumn {
     /// Stored lengths and exact token counts, per document.
     doc_lengths: Vec<u32>,
     tokens: Vec<u32>,
+    /// For a list that spans several pieces, where each piece's postings
+    /// start in it: `cuts[cut_at[id] + p]..cuts[cut_at[id] + p + 1]` are
+    /// piece `p`'s. `u32::MAX` for a list within one piece, whose whole
+    /// extent the piece takes. Filled by [`freeze_lanes`].
+    cut_at: Vec<u32>,
+    cuts: Vec<u32>,
 }
 
 impl FrozenColumn {
@@ -1590,6 +1596,8 @@ struct OrderedTerm {
 pub(crate) struct FrozenLanes {
     lanes: Vec<FrozenLane>,
     order: Vec<Vec<OrderedTerm>>,
+    /// The rows of each superfile the commit writes, in order.
+    pieces: Vec<Range<u32>>,
 }
 
 /// Merge `lanes`' dictionaries, column by column, into the order the
@@ -1597,7 +1605,10 @@ pub(crate) struct FrozenLanes {
 /// cut into as many ranges as the pool has threads, at terms taken from
 /// the longest lane's dictionary, and the ranges merge side by side: a
 /// term is one value in every lane, so no term straddles a cut.
-pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildError> {
+pub(crate) fn freeze_lanes(
+    mut lanes: Vec<FrozenLane>,
+    pieces: Vec<Range<u32>>,
+) -> Result<FrozenLanes, BuildError> {
     if lanes.len() > usize::from(u8::MAX) {
         return Err(BuildError::Io(Error::other("too many fts lanes")));
     }
@@ -1609,6 +1620,41 @@ pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildE
         )));
     }
     let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
+    // Where each piece's postings start in every list that spans more
+    // than one piece: one pass over the list, in step with the pieces,
+    // in place of a search per piece at the seal.
+    lanes.par_iter_mut().for_each(|lane| {
+        let bounds: Vec<usize> = pieces
+            .iter()
+            .map(|piece| docs_before_row(&lane.stretches, piece.start))
+            .chain(
+                pieces
+                    .last()
+                    .map(|last| docs_before_row(&lane.stretches, last.end)),
+            )
+            .collect();
+        let piece_of = |doc: u32| bounds.partition_point(|&b| b <= doc as usize) - 1;
+        for col in &mut lane.columns {
+            col.cut_at = vec![u32::MAX; col.postings.len()];
+            col.cuts.clear();
+            for (id, list) in col.postings.iter().enumerate() {
+                let (Some(&(first, _)), Some(&(last, _))) = (list.first(), list.last()) else {
+                    continue;
+                };
+                if piece_of(first) == piece_of(last) {
+                    continue;
+                }
+                col.cut_at[id] = col.cuts.len() as u32;
+                let mut at = 0usize;
+                for &bound in &bounds {
+                    while at < list.len() && (list[at].0 as usize) < bound {
+                        at += 1;
+                    }
+                    col.cuts.push(at as u32);
+                }
+            }
+        }
+    });
     let ranges = current_num_threads().max(1);
     let order = (0..n_columns)
         .map(|column| {
@@ -1656,7 +1702,11 @@ pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildE
             merged.concat()
         })
         .collect();
-    Ok(FrozenLanes { lanes, order })
+    Ok(FrozenLanes {
+        lanes,
+        order,
+        pieces,
+    })
 }
 
 /// Merge the dictionary entries `spans[lane]` of every lane's `column`
@@ -1700,12 +1750,19 @@ fn merge_term_range(
 }
 
 /// What a build finishes from in place of its own accumulator: the
-/// commit's lanes, restricted to the rows `rows` — the superfile's own,
-/// numbered from `rows.start`.
+/// commit's lanes, restricted to piece `piece` of them — the superfile's
+/// own rows, numbered from the piece's first row.
 #[derive(Clone)]
 pub(crate) struct LaneView {
     pub(crate) lanes: Arc<FrozenLanes>,
-    pub(crate) rows: Range<u32>,
+    pub(crate) piece: usize,
+}
+
+impl LaneView {
+    /// The commit rows this view's superfile holds.
+    fn rows(&self) -> &Range<u32> {
+        &self.lanes.pieces[self.piece]
+    }
 }
 
 /// Receives each term's facts as the blob is written: what a table-level/// Receives each term's facts as the blob is written: what a table-level
@@ -2656,6 +2713,8 @@ impl FtsBuilder {
                     pos_runs: ram.pos_runs,
                     doc_lengths: col.doc_lengths,
                     tokens: col.tokens,
+                    cut_at: Vec::new(),
+                    cuts: Vec::new(),
                 }
             })
             .collect();
@@ -2687,7 +2746,8 @@ impl FtsBuilder {
             .iter()
             .map(|c| (c.name.clone(), c.positions))
             .collect();
-        let n_docs = view.rows.len();
+        let rows = view.rows().clone();
+        let n_docs = rows.len();
         for lane in view.lanes.lanes.iter() {
             if lane.shape != shape {
                 return Err(BuildError::Io(Error::other(
@@ -2699,12 +2759,12 @@ impl FtsBuilder {
             let mut lengths = vec![0u32; n_docs];
             let mut total_tokens = 0u64;
             for lane in view.lanes.lanes.iter() {
-                let (dlo, dhi) = lane_doc_range(lane, &view.rows);
+                let (dlo, dhi) = lane_doc_range(lane, &rows);
                 let lane_col = &lane.columns[c];
                 let mut cursor = 0usize;
                 for d in dlo..dhi {
                     let row = row_of(&lane.stretches, &mut cursor, d as u32);
-                    lengths[(row - view.rows.start) as usize] = lane_col.doc_lengths[d];
+                    lengths[(row - rows.start) as usize] = lane_col.doc_lengths[d];
                     total_tokens += u64::from(lane_col.tokens[d]);
                 }
             }
@@ -4161,8 +4221,9 @@ fn run_bytes(col: &FrozenColumn, id: u32, lo: usize, hi: usize) -> &[u8] {
 /// has their stretches merged by row, which is a merge of ascending runs
 /// since every lane's documents are in row order, with each posting's
 /// positions brought along. A list whose first and last documents miss
-/// the rows is passed over at once; otherwise two binary searches find
-/// the stretch, and its runs come by byte range.
+/// the rows is passed over at once, one within them is taken whole, and
+/// one spanning several pieces is cut where [`freeze_lanes`] recorded;
+/// its runs come by byte range.
 #[allow(clippy::too_many_arguments)]
 fn emit_lanes_column<W: Write>(
     view: &LaneView,
@@ -4180,13 +4241,14 @@ fn emit_lanes_column<W: Write>(
     term_scratch: &mut TermScratch,
     head_sink: &mut Option<Box<dyn TermHeadSink>>,
 ) -> Result<usize, BuildError> {
-    let first_row = view.rows.start;
+    let rows = view.rows();
+    let first_row = rows.start;
     let lanes = &view.lanes.lanes;
     // Each lane's documents in the view, as document indexes.
     let docs: Vec<Range<usize>> = lanes
         .iter()
         .map(|lane| {
-            let (lo, hi) = lane_doc_range(lane, &view.rows);
+            let (lo, hi) = lane_doc_range(lane, rows);
             lo..hi
         })
         .collect();
@@ -4216,13 +4278,24 @@ fn emit_lanes_column<W: Write>(
         for entry in &order[at..group_end] {
             let lane = entry.lane as usize;
             let range = &docs[lane];
-            if entry.first_doc as usize >= range.end || (entry.last_doc as usize) < range.start {
+            let (first, last) = (entry.first_doc as usize, entry.last_doc as usize);
+            if first >= range.end || last < range.start {
                 continue;
             }
             let col = &lanes[lane].columns[column];
             let list = &col.postings[entry.id as usize];
-            let lo = list.partition_point(|&(d, _)| (d as usize) < range.start);
-            let hi = list.partition_point(|&(d, _)| (d as usize) < range.end);
+            // A list within the piece is taken whole; one that spans pieces
+            // has its cuts recorded.
+            let (lo, hi) = match (
+                first >= range.start && last < range.end,
+                col.cut_at[entry.id as usize],
+            ) {
+                (true, _) => (0, list.len()),
+                (false, at) => {
+                    let at = at as usize + view.piece;
+                    (col.cuts[at] as usize, col.cuts[at + 1] as usize)
+                }
+            };
             if lo == hi {
                 continue;
             }
@@ -5107,20 +5180,6 @@ mod tests {
 
         // Row `i` goes to lane `(i / SLICE) % LANES`: each lane holds runs
         // of rows, interleaved with the other lanes', in row order.
-        let mut lanes: Vec<(FtsBuilder, Vec<u32>)> = (0..LANES)
-            .map(|_| {
-                let mut b = fresh();
-                b.set_lane_mode();
-                (b, Vec::new())
-            })
-            .collect();
-        for i in 0..N_DOCS {
-            let (lane, rows) = &mut lanes[((i / SLICE) % LANES) as usize];
-            let doc = rows.len() as u32;
-            lane.add_doc(0, doc, &text_of(i)).expect("add pos");
-            lane.add_doc(1, doc, &text_of(i)).expect("add flat");
-            rows.push(i);
-        }
         // Consecutive rows of a lane fold into one stretch.
         let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
             let mut out: Vec<Stretch> = Vec::new();
@@ -5136,26 +5195,46 @@ mod tests {
             }
             out
         };
-        let frozen = Arc::new(
-            freeze_lanes(
-                lanes
-                    .into_iter()
-                    .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
-                    .collect(),
-            )
-            .expect("merge the lanes' terms"),
-        );
-        let from_view = |rows: std::ops::Range<u32>| {
+        let build_lanes = || -> Vec<FrozenLane> {
+            let mut lanes: Vec<(FtsBuilder, Vec<u32>)> = (0..LANES)
+                .map(|_| {
+                    let mut b = fresh();
+                    b.set_lane_mode();
+                    (b, Vec::new())
+                })
+                .collect();
+            for i in 0..N_DOCS {
+                let (lane, rows) = &mut lanes[((i / SLICE) % LANES) as usize];
+                let doc = rows.len() as u32;
+                lane.add_doc(0, doc, &text_of(i)).expect("add pos");
+                lane.add_doc(1, doc, &text_of(i)).expect("add flat");
+                rows.push(i);
+            }
+            lanes
+                .into_iter()
+                .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
+                .collect()
+        };
+        let from_view = |pieces: Vec<std::ops::Range<u32>>, piece: usize| {
+            let frozen = Arc::new(freeze_lanes(build_lanes(), pieces).expect("merge the lanes"));
             let mut b = fresh();
             b.set_lane_view(LaneView {
-                lanes: Arc::clone(&frozen),
-                rows,
+                lanes: frozen,
+                piece,
             });
             b.finish().expect("finish view")
         };
-        assert_eq!(from_view(0..N_DOCS), single(0, N_DOCS), "whole");
-        assert_eq!(from_view(0..CUT), single(0, CUT), "first piece");
-        assert_eq!(from_view(CUT..N_DOCS), single(CUT, N_DOCS), "second piece");
+        assert_eq!(from_view(Vec::from([0..N_DOCS]), 0), single(0, N_DOCS), "whole");
+        assert_eq!(
+            from_view(vec![0..CUT, CUT..N_DOCS], 0),
+            single(0, CUT),
+            "first piece"
+        );
+        assert_eq!(
+            from_view(vec![0..CUT, CUT..N_DOCS], 1),
+            single(CUT, N_DOCS),
+            "second piece"
+        );
 
         // A lane whose stretches do not cover its documents is refused.
         let mut lane = fresh();
