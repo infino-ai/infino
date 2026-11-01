@@ -1887,6 +1887,67 @@ impl FtsReader {
         failed.map_or(Ok(()), Err)
     }
 
+    /// Walk `column_id`'s dictionary and hand each term's document count to
+    /// `on_df`, without decoding a posting: a long term's header states it,
+    /// a short term's body leads with it and an inline term has one.
+    /// `on_term(term)` returns a carry for a wanted term or `None` to skip
+    /// it, as in [`Self::for_each_term_doc`], whose walk this replaces
+    /// when a merge drops no document, so every posting counts.
+    pub(crate) fn for_each_term_df<K>(
+        &self,
+        column_id: u32,
+        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        mut on_df: impl FnMut(&K, u32),
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
+        let prefix = make_key(&col_meta.name, "");
+        let mut doc_ids = [0u32; BLOCK_LEN];
+        let mut tfs = [0u32; BLOCK_LEN];
+        let mut failed = None;
+        dict.for_each_prefix(&prefix, |key, packed| {
+            let Some(carry) = on_term(&key[prefix.len()..]) else {
+                return true;
+            };
+            let df = match packed {
+                DictEntry::Inline { .. } => Ok(1),
+                DictEntry::Pfor {
+                    metadata_offset,
+                    postings_length,
+                    short: true,
+                } => self
+                    .term_bytes_sync(metadata_offset, postings_length)
+                    .and_then(|term_bytes| {
+                        decode_short(
+                            term_bytes.as_ref(),
+                            col_meta.positions,
+                            &mut doc_ids,
+                            &mut tfs,
+                        )
+                        .map(|decoded| decoded.n as u32)
+                        .ok_or_else(|| {
+                            FtsError::Read(ReadError::Malformed(
+                                "short-form term body does not decode".into(),
+                            ))
+                        })
+                    }),
+                long => self.term_postings_at_most(long),
+            };
+            match df {
+                Ok(df) => {
+                    on_df(&carry, df);
+                    true
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    false
+                }
+            }
+        });
+        failed.map_or(Ok(()), Err)
+    }
+
     /// One PFOR term's bytes, from its metadata header to its end.
     fn term_bytes_sync(
         &self,
@@ -3796,6 +3857,64 @@ mod tests {
             got.get(&t("c")).expect("term streamed").as_slice(),
             &[(1, 1, vec![2])]
         );
+    }
+
+    /// The header walk states, for every term, the number of documents the
+    /// full walk visits for it, over inline, short and long terms, and a
+    /// term it is told to skip is not counted.
+    #[test]
+    fn for_each_term_df_matches_the_full_walk_and_skips_terms() {
+        const N_DOCS: u32 = 700;
+        let mut b = FtsBuilder::new();
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = format!("every every u{i}");
+            if i.is_multiple_of(3) {
+                text.push_str(" some");
+            }
+            if i.is_multiple_of(50) {
+                text.push_str(" few");
+            }
+            b.add_doc(0, i, &text).expect("add pos");
+            b.add_doc(1, i, &text).expect("add flat");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"pos","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true},{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        for column_id in 0..2 {
+            let mut counted: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_posting(column_id, |term, _, _, _| {
+                match counted.last_mut() {
+                    Some((last, n)) if last.as_slice() == term => *n += 1,
+                    _ => counted.push((term.to_vec(), 1)),
+                }
+                Ok(())
+            })
+            .expect("full walk");
+            let mut stated: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_df(
+                column_id,
+                |term| Some(term.to_vec()),
+                |term, df| stated.push((term.clone(), df)),
+            )
+            .expect("header walk");
+            assert_eq!(
+                stated, counted,
+                "column {column_id}: same counts, same order"
+            );
+
+            let skipped = b"some".as_slice();
+            let mut kept: Vec<Vec<u8>> = Vec::new();
+            r.for_each_term_df(
+                column_id,
+                |term| (term != skipped).then(|| term.to_vec()),
+                |term, _| kept.push(term.clone()),
+            )
+            .expect("header walk with a skip");
+            assert!(!kept.iter().any(|t| t == skipped));
+            assert_eq!(kept.len(), counted.len() - 1);
+        }
     }
 
     /// The doc-only walk visits exactly the `(term, doc)` pairs the full

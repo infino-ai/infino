@@ -264,6 +264,17 @@ fn reorder_plan(
     })
 }
 
+/// What the term picking knows about one output row: how many of its
+/// slots hold a term, which of them holds the most common one, and that
+/// term's document count. Kept beside each other so the test a posting
+/// makes touches one place, not the slots and the count table too.
+#[derive(Clone, Copy, Default)]
+struct RowPick {
+    filled: u8,
+    worst: u8,
+    worst_df: u32,
+}
+
 /// Keeps each document's most selective terms for the bisection: what the
 /// second pass of `merge_doc_order` does for one input over one stretch of
 /// output rows.
@@ -276,11 +287,11 @@ struct TermPicker<'a, E: Fn(u32) -> bool> {
 
 impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
     /// Fill the slots of output rows `first_row..past_row` from `reader`'s
-    /// terms. `slots`, `filled` and `worst` cover exactly those rows. A slot
-    /// list holds the terms carried by the fewest documents; `worst` points
-    /// at its most common one, so a term that cannot displace it costs one
-    /// comparison.
-    #[allow(clippy::too_many_arguments)]
+    /// terms. `slots` and `picks` cover exactly those rows. A slot list
+    /// holds the terms carried by the fewest documents; the row's pick
+    /// points at its most common one and remembers that count, so a term
+    /// that cannot displace it costs one comparison and reads nothing else.
+    /// The count table is read once per term, not once per posting.
     fn pick(
         &self,
         reader: &SuperfileReader,
@@ -288,8 +299,7 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
         first_row: usize,
         past_row: usize,
         slots: &mut [u32],
-        filled: &mut [u8],
-        worst: &mut [u8],
+        picks: &mut [RowPick],
     ) -> Result<(), BuildError> {
         let (terms_per_doc, df) = (self.terms_per_doc, self.df);
         let fts = reader.fts().expect("checked by the caller");
@@ -297,9 +307,9 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
             // An ineligible term is skipped before its postings are read.
             let on_term = |term: &[u8]| {
                 let t = term_bucket(term);
-                (self.eligible)(t).then_some(t)
+                (self.eligible)(t).then(|| (t, df[t as usize]))
             };
-            fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+            fts.for_each_term_doc(column_id, on_term, |&(t, term_df), local_doc| {
                 let Some(row) = rows[local_doc as usize] else {
                     return;
                 };
@@ -309,32 +319,32 @@ impl<E: Fn(u32) -> bool + Sync> TermPicker<'_, E> {
                 }
                 let row = row - first_row;
                 let slot_base = row * terms_per_doc;
-                let used = filled[row] as usize;
+                let pick = &mut picks[row];
+                let used = pick.filled as usize;
                 if used < terms_per_doc {
                     slots[slot_base + used] = t;
-                    if used == 0
-                        || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
-                    {
-                        worst[row] = used as u8;
+                    if used == 0 || term_df > pick.worst_df {
+                        pick.worst = used as u8;
+                        pick.worst_df = term_df;
                     }
-                    filled[row] = (used + 1) as u8;
+                    pick.filled = (used + 1) as u8;
                     return;
                 }
-                let worst_slot = slot_base + worst[row] as usize;
-                if df[t as usize] >= df[slots[worst_slot] as usize] {
+                if term_df >= pick.worst_df {
                     return;
                 }
-                slots[worst_slot] = t;
+                slots[slot_base + pick.worst as usize] = t;
 
                 // The worst moved; find it again over the fixed, small slot
                 // count.
-                let mut w = 0usize;
+                let (mut w, mut w_df) = (0usize, df[slots[slot_base] as usize]);
                 for i in 1..terms_per_doc {
-                    if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
-                        w = i;
+                    let d = df[slots[slot_base + i] as usize];
+                    if d > w_df {
+                        (w, w_df) = (i, d);
                     }
                 }
-                worst[row] = w as u8;
+                (pick.worst, pick.worst_df) = (w as u8, w_df);
             })
             .map_err(|e| {
                 BuildError::Io(Error::other(format!(
@@ -2800,6 +2810,15 @@ impl SuperfileBuilder {
             .collect::<Result<_, _>>()?;
         // The inputs are counted side by side, each thread into its own table,
         // and the tables summed: counts come out the same in any order.
+        // An input that keeps every document contributes each term's stored
+        // count, read from the term's header, so no posting is decoded for
+        // it; one that drops documents has its postings walked, since only
+        // the surviving ones count.
+        let count_failed = |e: FtsError| {
+            BuildError::Io(Error::other(format!(
+                "fts merge: counting terms for the document order failed: {e}"
+            )))
+        };
         let df: Vec<u32> = readers
             .par_iter()
             .zip(rows_by_blob.par_iter())
@@ -2807,21 +2826,25 @@ impl SuperfileBuilder {
                 || vec![0u32; n_buckets],
                 |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
                     let fts = reader.fts().expect("checked above");
+                    let keeps_every_doc = rows.iter().all(Option::is_some);
                     for column_id in 0..n_fts_columns {
-                        fts.for_each_term_doc(
-                            column_id,
-                            |term| Some(term_bucket(term)),
-                            |&t, local_doc| {
-                                if rows[local_doc as usize].is_some() {
-                                    df[t as usize] += 1;
-                                }
-                            },
-                        )
-                        .map_err(|e| {
-                            BuildError::Io(Error::other(format!(
-                                "fts merge: counting terms for the document order failed: {e}"
-                            )))
-                        })?;
+                        match keeps_every_doc {
+                            true => fts.for_each_term_df(
+                                column_id,
+                                |term| Some(term_bucket(term)),
+                                |&t, term_df| df[t as usize] += term_df,
+                            ),
+                            false => fts.for_each_term_doc(
+                                column_id,
+                                |term| Some(term_bucket(term)),
+                                |&t, local_doc| {
+                                    if rows[local_doc as usize].is_some() {
+                                        df[t as usize] += 1;
+                                    }
+                                },
+                            ),
+                        }
+                        .map_err(count_failed)?;
                     }
                     Ok(df)
                 },
@@ -2876,9 +2899,9 @@ impl SuperfileBuilder {
             .collect();
 
         // Pass two: keep each document's most selective terms, in a
-        // fixed number of slots per document. `worst` tracks the slot
-        // holding the least selective term kept so far, so a posting
-        // that cannot displace it costs one comparison.
+        // fixed number of slots per document. Each row's pick tracks the
+        // slot holding the least selective term kept so far and its count,
+        // so a posting that cannot displace it costs one comparison.
         // An ineligible term is skipped before its postings are read.
         let pick_span = detail_span!(
             "merge_order_pick_terms",
@@ -2898,8 +2921,7 @@ impl SuperfileBuilder {
             let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
             let run = past_row - first_row;
             let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
-            let mut filled: Vec<u8> = vec![0; run];
-            let mut worst: Vec<u8> = vec![0; run];
+            let mut picks: Vec<RowPick> = vec![RowPick::default(); run];
             let collect_span = detail_span!("merge_order_collect", docs = run).entered();
             let picker = TermPicker {
                 n_fts_columns,
@@ -2924,8 +2946,7 @@ impl SuperfileBuilder {
                 // Every row belongs to one input, so inputs whose rows do not
                 // interleave fill disjoint stretches of the slots, side by side;
                 // each still reads its own terms in the order it always did.
-                let (mut slots_rest, mut filled_rest, mut worst_rest) =
-                    (&mut slots[..], &mut filled[..], &mut worst[..]);
+                let (mut slots_rest, mut picks_rest) = (&mut slots[..], &mut picks[..]);
                 let mut at = first_row;
                 let mut windows = Vec::with_capacity(covering.len());
                 for &(i, start, end) in &covering {
@@ -2934,19 +2955,16 @@ impl SuperfileBuilder {
                     let (_, rest) = slots_rest.split_at_mut(skip * terms_per_doc);
                     let (s, rest) = rest.split_at_mut(take * terms_per_doc);
                     slots_rest = rest;
-                    let (_, rest) = filled_rest.split_at_mut(skip);
-                    let (f, rest) = rest.split_at_mut(take);
-                    filled_rest = rest;
-                    let (_, rest) = worst_rest.split_at_mut(skip);
-                    let (w, rest) = rest.split_at_mut(take);
-                    worst_rest = rest;
-                    windows.push((i, start, end, s, f, w));
+                    let (_, rest) = picks_rest.split_at_mut(skip);
+                    let (p, rest) = rest.split_at_mut(take);
+                    picks_rest = rest;
+                    windows.push((i, start, end, s, p));
                     at = end;
                 }
                 windows
                     .into_par_iter()
-                    .try_for_each(|(i, start, end, s, f, w)| {
-                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, f, w)
+                    .try_for_each(|(i, start, end, s, p)| {
+                        picker.pick(&readers[i].0, &rows_by_blob[i], start, end, s, p)
                     })?;
             } else {
                 for &(i, _, _) in &covering {
@@ -2956,8 +2974,7 @@ impl SuperfileBuilder {
                         first_row,
                         past_row,
                         &mut slots,
-                        &mut filled,
-                        &mut worst,
+                        &mut picks,
                     )?;
                 }
             }
@@ -2967,7 +2984,7 @@ impl SuperfileBuilder {
             let docs: Vec<&[u32]> = (0..run)
                 .map(|row| {
                     let lo = row * terms_per_doc;
-                    &slots[lo..lo + filled[row] as usize]
+                    &slots[lo..lo + picks[row].filled as usize]
                 })
                 .collect();
             match docs.iter().all(|d| d.is_empty()) {
