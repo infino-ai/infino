@@ -618,25 +618,27 @@ fusion. Whatever the index could not bound (a scalar column, a
 negation, a token superset that the exact predicate trims), the
 function makes up by applying the exact predicate to its own resolved
 rows and widening the search — doubling k each round — until k rows
-survive or a bounded ceiling is reached. `bm25_search` and
-`vector_search` go one step further when that widening ends short at a
-ceiling below the table's size: they evaluate the predicate over the
-rows they can return (`bm25_search` the rows the query's terms match,
-`vector_search` the scope's rows), keep exactly the rows it holds on,
-and rank once more within those (`vector_search` through its filtered
-kernel, over those rows' allow-sets). For `bm25_search` the answer is
+survive or a bounded ceiling is reached. `bm25_search`,
+`vector_search` and `hybrid_search` go one step further when that
+widening ends short at a ceiling below the table's size: they evaluate
+the predicate over the rows they can return (`bm25_search` the rows the
+query's terms match, `vector_search` and `hybrid_search` the scope's
+rows), keep exactly the rows it holds on, and rank once more within
+those (`vector_search` through its filtered kernel, over those rows'
+allow-sets; `hybrid_search` runs both of its retrievers that way and
+fuses them). For `bm25_search` the answer is
 then the top k among matching rows however far below the unfiltered
 top-k they rank. `vector_search`'s stays approximate: the filtered
 kernel probes a bounded number of clusters, so a matching row in a
 cluster it never reaches is missed, but rows the predicate rejects no
-longer use up the probes. The cost of that pass is a decode of the
+longer use up the probes; `hybrid_search`'s vector retriever is the
+same filtered kernel. The cost of that pass is a decode of the
 predicate's columns over those rows, read in bounded chunks against the
 connection's memory budget, and paid only by a predicate the widening
 could not fill. With no index to narrow the rows, that is a read of the
 predicate's columns over every row the statistics keep.
-`hybrid_search` and prefix search stop at the widening, and prefix
-search takes only that tier: its term set is known per superfile, not
-per query.
+Prefix search stops at the widening and takes only that tier: its term
+set is known per superfile, not per query.
 
 ## Concurrency
 
