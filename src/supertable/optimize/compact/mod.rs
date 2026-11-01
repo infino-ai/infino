@@ -9,6 +9,7 @@
 //! re-compacted.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     mem,
@@ -127,12 +128,53 @@ impl Supertable {
     }
 }
 
-/// Threads in each merge's own pool: the maintenance width shared out among
-/// the merges that can run at once. A pass of fewer jobs than its width gives
-/// each the larger share, and rounding down keeps the pool's width a ceiling
-/// on all of them together.
-fn merge_pool_width(maintenance_threads: usize, concurrency: usize, jobs: usize) -> usize {
-    (maintenance_threads / concurrency.min(jobs).max(1)).max(1)
+/// Threads in each merge's own pool, by plan index: the maintenance width
+/// shared out among the merges that can run at once.
+///
+/// A pass whose jobs all run at once shares the width by documents: a
+/// merge's time goes with its documents, the pass takes as long as its
+/// largest merge, and an even share leaves the largest merge short while
+/// the smallest finishes early and idles its threads. The shares are
+/// rounded so they add up to the width exactly, largest remainders first,
+/// and every merge gets at least one thread. A pass with more jobs than
+/// can run at once gives each the even share, rounded down, so the merges
+/// in flight never hold more threads together than the pool has.
+fn merge_pool_widths(
+    maintenance_threads: usize,
+    concurrency: usize,
+    jobs: &[CompactionJob],
+) -> Vec<usize> {
+    let threads = maintenance_threads.max(1);
+    let concurrency = concurrency.max(1);
+    if jobs.len() > concurrency || jobs.len() <= 1 {
+        let even = (threads / concurrency.min(jobs.len()).max(1)).max(1);
+        return vec![even; jobs.len()];
+    }
+    let total_docs: u128 = jobs.iter().map(|j| u128::from(j.live_docs)).sum();
+    if total_docs == 0 || threads <= jobs.len() {
+        return vec![1; jobs.len()];
+    }
+    // Each job's share in thread units, scaled so the largest remainders
+    // can be ranked without floating point: `scaled / total_docs` threads.
+    let scaled: Vec<u128> = jobs
+        .iter()
+        .map(|j| u128::from(j.live_docs) * threads as u128)
+        .collect();
+    let mut widths: Vec<usize> = scaled
+        .iter()
+        .map(|&s| ((s / total_docs) as usize).max(1))
+        .collect();
+    let mut spare = threads.saturating_sub(widths.iter().sum::<usize>());
+    let mut by_remainder: Vec<usize> = (0..jobs.len()).collect();
+    by_remainder.sort_by_key(|&i| Reverse(scaled[i] % total_docs));
+    for i in by_remainder {
+        if spare == 0 {
+            break;
+        }
+        widths[i] += 1;
+        spare -= 1;
+    }
+    widths
 }
 
 /// What running a job actually did.
@@ -1482,11 +1524,13 @@ impl Supertable {
         host_memory: fn() -> Option<(u64, u64)>,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        let merge_threads =
-            merge_pool_width(maint_pool()?.current_num_threads(), concurrency, jobs.len());
         let settings = MergeSettings {
             stale_seal_timeout,
-            merge_threads,
+            merge_threads: merge_pool_widths(
+                maint_pool()?.current_num_threads(),
+                concurrency,
+                &jobs,
+            ),
         };
         // Whether merges here keep per-row bookkeeping, which is part of
         // what each one is charged for until its allocation shows up in
@@ -1718,10 +1762,8 @@ impl Supertable {
         let table = self.clone();
         let pass = Span::current();
         let job = job.clone();
-        let MergeSettings {
-            stale_seal_timeout,
-            merge_threads,
-        } = *settings;
+        let stale_seal_timeout = settings.stale_seal_timeout;
+        let merge_threads = settings.merge_threads[plan_index];
         let task = merging.spawn(async move {
             // Each merge is a trace of its own, linked back to the pass, so
             // a pass of many merges does not grow into one huge trace.
@@ -1856,10 +1898,11 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
 }
 
 /// The per-pass settings every merge of a pass runs under.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MergeSettings {
     stale_seal_timeout: Duration,
-    merge_threads: usize,
+    /// Threads in each merge's own pool, by plan index.
+    merge_threads: Vec<usize>,
 }
 
 /// What one admitted merge is charged: its expected footprint while it
@@ -4372,17 +4415,55 @@ mod tests {
         }
     }
 
+    /// Jobs of the given document counts, as the planner would hand them
+    /// to the runner.
+    fn jobs_of(docs: &[u64]) -> Vec<CompactionJob> {
+        docs.iter()
+            .map(|&live_docs| CompactionJob {
+                partition_key: Vec::new(),
+                inputs: Vec::new(),
+                estimated_output_bytes: 0,
+                input_bytes: 0,
+                live_docs,
+                merge_input_mb: None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_merge_pool_shares_the_maintenance_width_among_the_merges_that_run() {
         // One job takes the whole pool, whatever the configured width.
-        assert_eq!(merge_pool_width(10, 10, 1), 10);
-        assert_eq!(merge_pool_width(10, 10, 2), 5);
-        // Many jobs never take more threads together than the pool has.
-        assert_eq!(merge_pool_width(88, 60, 1_000), 1);
-        assert_eq!(merge_pool_width(88, 32, 1_000), 2);
-        // Never fewer than one.
-        assert_eq!(merge_pool_width(4, 16, 1_000), 1);
-        assert_eq!(merge_pool_width(4, 16, 0), 4);
+        assert_eq!(merge_pool_widths(10, 10, &jobs_of(&[5])), vec![10]);
+        assert_eq!(merge_pool_widths(10, 10, &jobs_of(&[5, 5])), vec![5, 5]);
+        // Jobs that run at once share the width by documents, adding up
+        // to the width exactly, largest remainders first.
+        assert_eq!(
+            merge_pool_widths(8, 8, &jobs_of(&[1_850, 1_650, 1_530])),
+            vec![3, 3, 2]
+        );
+        assert_eq!(merge_pool_widths(8, 8, &jobs_of(&[7, 1])), vec![7, 1]);
+        // A tiny job still gets a thread, out of the largest's share.
+        assert_eq!(merge_pool_widths(4, 4, &jobs_of(&[1_000, 1])), vec![3, 1]);
+        // More jobs than can run at once take the even share, rounded
+        // down, so the merges in flight never exceed the pool together.
+        assert_eq!(
+            merge_pool_widths(88, 60, &jobs_of(&[1; 1_000])),
+            vec![1; 1_000]
+        );
+        assert_eq!(
+            merge_pool_widths(88, 32, &jobs_of(&[1; 1_000])),
+            vec![2; 1_000]
+        );
+        // Never fewer than one, and more jobs than threads get one each.
+        assert_eq!(
+            merge_pool_widths(4, 16, &jobs_of(&[1; 1_000])),
+            vec![1; 1_000]
+        );
+        assert_eq!(
+            merge_pool_widths(4, 16, &jobs_of(&[9, 9, 9, 9, 9])),
+            vec![1; 5]
+        );
+        assert_eq!(merge_pool_widths(4, 16, &jobs_of(&[])), Vec::<usize>::new());
     }
 
     fn commit_titles(st: &Supertable, titles: &[&str]) {
