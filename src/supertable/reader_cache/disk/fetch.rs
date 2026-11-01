@@ -15,7 +15,6 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -49,7 +48,11 @@ use crate::{
         reader_cache::{
             block_source::{BlockCachedSource, SourceLayout},
             config::ColdFetchMode,
-            disk::{sources::mmap_readonly_with_handle, *},
+            disk::{
+                fill_wait::{FillWait, FillWaiters, PromotionDefer},
+                sources::mmap_readonly_with_handle,
+                *,
+            },
         },
     },
     utils::trace::{OpOrigin, detached},
@@ -1171,110 +1174,6 @@ fn background_store_abandoned(store: &Arc<DiskCacheStore>) -> bool {
     Arc::strong_count(store) == 1
 }
 
-/// How long a background fill keeps yielding to foreground queries holding
-/// the same superfile's lazy reader.
-///
-/// Yielding keeps the fill from competing for I/O with the query that
-/// triggered it. Left unbounded, a superfile under continuous load never
-/// goes idle, so the fill never runs and the reader stays lazy for the life
-/// of the process — holding its term dictionary and doc-lengths tail on the
-/// heap, and serving reads as per-block range fetches instead of slices of
-/// an mmap. Once the window closes the fill proceeds alongside the running
-/// query: it writes a temp file and swaps the cache entry, so an in-flight
-/// query keeps reading through the `Arc` it already holds.
-#[derive(Clone, Copy, Debug)]
-enum PromotionDefer {
-    /// Yield for as long as the reader stays busy.
-    Forever,
-    /// Yield until this instant, then fill regardless.
-    Until(Instant),
-}
-
-impl PromotionDefer {
-    /// Open a window of `timeout` starting now. A `timeout` that overflows
-    /// the clock (notably [`Duration::MAX`]) yields indefinitely.
-    fn start(timeout: Duration) -> Self {
-        match Instant::now().checked_add(timeout) {
-            Some(deadline) => Self::Until(deadline),
-            None => Self::Forever,
-        }
-    }
-
-    /// Whether the window is still open.
-    fn open(self) -> bool {
-        match self {
-            Self::Forever => true,
-            Self::Until(deadline) => Instant::now() < deadline,
-        }
-    }
-
-    /// Whether the fill should still yield to `reader` being held by a
-    /// caller other than the cache entry.
-    fn yields_to(self, reader: &Weak<SuperfileReader>) -> bool {
-        self.open() && reader_blocks_background_fill(reader)
-    }
-}
-
-async fn wait_for_lazy_foreground_release(
-    store: &Weak<DiskCacheStore>,
-    reader: &Weak<SuperfileReader>,
-    defer: PromotionDefer,
-) -> Option<Arc<DiskCacheStore>> {
-    loop {
-        if store.strong_count() == 0 || reader.strong_count() == 0 {
-            return None;
-        }
-        if let Some(strong) = store.upgrade()
-            && strong.n_promotion_waiters.load(Ordering::Acquire) > 0
-        {
-            return Some(strong);
-        }
-        if !defer.open() {
-            // Window closed: fill alongside the running query rather than
-            // leave this superfile lazy for the life of the process.
-            return store.upgrade();
-        }
-        if reader.strong_count() <= 1 {
-            // `strong_count == 1` also occurs briefly while a caller is
-            // acquiring the cache entry, so re-check after one scheduler turn.
-            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-            if reader.strong_count() <= 1 {
-                return store.upgrade();
-            }
-            continue;
-        }
-        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-    }
-}
-
-/// Wait until this URI's lazy reader is held only by the cache entry.
-/// Unrelated table/URI fills are not gated here — only this reader's
-/// strong-count. A grace re-check covers the open→query handoff.
-async fn wait_for_reader_quiescence(
-    store: &Arc<DiskCacheStore>,
-    reader: &Weak<SuperfileReader>,
-    defer: PromotionDefer,
-) -> bool {
-    loop {
-        while defer.yields_to(reader) {
-            if background_store_abandoned(store) {
-                return false;
-            }
-            tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-        }
-        if reader.strong_count() == 0 {
-            return false;
-        }
-        tokio::time::sleep(STORE_UPGRADE_RETRY_INTERVAL).await;
-        if reader.strong_count() == 0 {
-            return false;
-        }
-        if !defer.yields_to(reader) {
-            return !background_store_abandoned(store);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackgroundFillOutcome {
     Complete,
@@ -1486,7 +1385,7 @@ pub(crate) fn skip_background_fill() -> bool {
 /// vector blob is left out of the file and read through the block cache instead (see
 /// [`HoleFallbackSource`]).
 async fn lazy_background_fill(
-    store: Weak<DiskCacheStore>,
+    weak_store: Weak<DiskCacheStore>,
     reader: Weak<SuperfileReader>,
     uri: SuperfileUri,
     storage_uri: String,
@@ -1496,12 +1395,17 @@ async fn lazy_background_fill(
     skip_vec: Option<(u64, u64)>,
     defer: PromotionDefer,
 ) -> Result<(), DiskCacheError> {
-    let Some(store) = wait_for_lazy_foreground_release(&store, &reader, defer).await else {
+    // A parked fill holds only a weak reference to the store, so dropping the store ends the fill
+    // instead of the fill keeping the store alive.
+    // A dropped store took the reservation with it, and nothing is on disk yet.
+    let Some(store) = FillWaiters::park(&weak_store, &reader, defer, FillWait::Release).await
+    else {
         return Ok(());
     };
     let tmp = store.tmp_path(&uri);
-
-    if background_store_abandoned(&store) {
+    // The reader is gone (the entry was evicted or replaced), or nobody but this fill holds the
+    // store: give the reservation back.
+    if reader.strong_count() == 0 || background_store_abandoned(&store) {
         rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
         return Ok(());
     }
@@ -1515,22 +1419,26 @@ async fn lazy_background_fill(
             )));
         }
     };
+    drop(store);
     // Resume cursor: chunks durably written so far, preserved across
     // pause/resume so a same-URI reader interrupting the fill costs only
     // the unfinished chunks rather than a re-download of the whole object.
     let mut filled: Vec<bool> = Vec::new();
-    loop {
-        if !wait_for_reader_quiescence(&store, &reader, defer).await {
-            rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
-
+    let store = loop {
+        let Some(store) =
+            FillWaiters::park(&weak_store, &reader, defer, FillWait::Quiescence).await
+        else {
+            // The reservation went with the store; only the partial download is left to delete.
+            let _ = fs::remove_file(&tmp);
             return Ok(());
-        }
-        // Evicted, or someone else's whole file is there: the download would be thrown away.
+        };
+        // Evicted, or someone else's whole file is there: the download would be thrown away. A
+        // gone reader or an abandoned store is caught by the download itself.
         if !store.fill_can_install(&uri, &reader) {
             rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
             return Ok(());
         }
-        match cold_fetch_to_disk_cancelable(
+        let outcome = cold_fetch_to_disk_cancelable(
             &store,
             &reader,
             &fetch_storage,
@@ -1541,18 +1449,27 @@ async fn lazy_background_fill(
             skip_vec,
             defer,
         )
-        .await?
-        {
-            BackgroundFillOutcome::Complete => break,
-            // Keep the partial `tmp` and the `filled` cursor: the next attempt
-            // resumes from the first unwritten chunk.
-            BackgroundFillOutcome::Paused => {}
-            BackgroundFillOutcome::Abandoned => {
+        .await;
+        match outcome {
+            Ok(BackgroundFillOutcome::Complete) => break store,
+            // Keep the partial `tmp` and the `filled` cursor: the next attempt resumes from the
+            // first unwritten chunk. The store is dropped here, so it is not held while parked.
+            Ok(BackgroundFillOutcome::Paused) => {}
+            Ok(BackgroundFillOutcome::Abandoned) => {
                 rollback_lazy_background_fill(&store, &uri, &tmp, &reader, own_reservation);
                 return Ok(());
             }
+            // Give the reservation back but keep the entry: it still serves reads lazily, and
+            // evicting it would only make the next query open the file again.
+            Err(error) => {
+                if let Some(bytes) = own_reservation {
+                    store.release_block_bytes(bytes);
+                }
+                let _ = fs::remove_file(&tmp);
+                return Err(error);
+            }
         }
-    }
+    };
 
     let result: Result<(), DiskCacheError> = async {
         if background_store_abandoned(&store) {
@@ -1785,15 +1702,22 @@ mod tests {
     use std::{
         collections::HashSet,
         fs,
+        future::poll_fn,
         os::unix::fs::MetadataExt,
         path::PathBuf,
-        sync::{Arc, atomic::Ordering},
-        time::Duration,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        thread,
+        time::{Duration, Instant},
     };
 
     use bytes::Bytes;
+    use futures::FutureExt;
     use tempfile::TempDir;
     use tokio::{
+        runtime::Builder,
         spawn,
         task::yield_now,
         time::{sleep, timeout},
@@ -1821,6 +1745,21 @@ mod tests {
         },
         test_helpers::fault_storage::{FaultOp, FaultStorage},
     };
+
+    /// Fills parked behind one held reader in the polling test.
+    const PARKED_FILLS: usize = 64;
+
+    /// How long the short-lived runtime in the runtime-shutdown test lives.
+    const SHORT_RUNTIME_LIFE: Duration = Duration::from_millis(50);
+
+    /// How long a test watches a parked fill: many ticks of the store's ticker.
+    const HELD_FOR: Duration = Duration::from_millis(200);
+
+    /// A defer window short enough for a test to wait out.
+    const SHORT_WINDOW: Duration = Duration::from_millis(100);
+
+    /// Bytes a fill test reserves, and the size of the file it pretends to fill.
+    const RESERVED_BYTES: u64 = 4096;
 
     /// Poll cadence while a test waits for a background fill to finish.
     const FILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -2817,26 +2756,320 @@ mod tests {
         );
     }
 
-    /// The window is a deadline, and `Duration::MAX` is the "never stop
-    /// yielding" sentinel rather than an overflow panic.
+    /// A store, and a lazy reader opened outside it and held twice: once as its cache entry would
+    /// hold it, once as a query would. Opening it outside the store keeps the store's own
+    /// background fill out of the waiting list, so a test sees only the fills it parks.
+    fn store_with_held_reader() -> (
+        TempDir,
+        Arc<DiskCacheStore>,
+        Arc<SuperfileReader>,
+        Arc<SuperfileReader>,
+    ) {
+        let (dir, store) = test_store();
+        let entry = Arc::new(SuperfileReader::open(tiny_superfile_bytes()).expect("reader"));
+        let query = Arc::clone(&entry);
+        (dir, store, entry, query)
+    }
+
+    /// Wait until `n` fills are parked on `store`.
+    async fn until_parked(store: &DiskCacheStore, n: usize) {
+        timeout(PROMOTE_TIMEOUT, async {
+            while store.fill_waiters.parked() != n {
+                sleep(FILL_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("fills parked");
+    }
+
+    /// A fill parked behind a held reader is not polled again until the reader is free, however
+    /// many fills wait: they cost the runtime no wake-ups of their own. Each one then goes after
+    /// the reader is released, and the list empties.
+    #[tokio::test]
+    async fn waiting_fills_are_not_polled_while_the_reader_is_held() {
+        let (_dir, store, entry, query) = store_with_held_reader();
+        let mut waits = Vec::new();
+        for _ in 0..PARKED_FILLS {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&polls);
+            let (store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+            let mut wait = Box::pin(async move {
+                FillWaiters::park(
+                    &store,
+                    &reader,
+                    PromotionDefer::Forever,
+                    FillWait::Quiescence,
+                )
+                .await
+            });
+            let task = spawn(poll_fn(move |cx| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                wait.as_mut().poll(cx)
+            }));
+            waits.push((polls, task));
+        }
+        until_parked(&store, PARKED_FILLS).await;
+
+        sleep(HELD_FOR).await;
+        for (polls, _) in &waits {
+            assert_eq!(
+                polls.load(Ordering::Relaxed),
+                1,
+                "a parked fill is polled once, then not again while the reader is held"
+            );
+        }
+
+        drop(query);
+        for (_, task) in waits {
+            timeout(PROMOTE_TIMEOUT, task)
+                .await
+                .expect("a released reader wakes the fill")
+                .expect("join");
+        }
+        assert_eq!(
+            store.fill_waiters.parked(),
+            0,
+            "every woken fill left the list"
+        );
+    }
+
+    /// A fill can park from a short-lived runtime, and that one starts the store's ticker. The
+    /// ticker must not die with that runtime, or every fill parked after it would wait for good.
+    #[tokio::test]
+    async fn fills_parked_after_another_runtime_shuts_down_still_wake() {
+        let (_dir, store, entry, query) = store_with_held_reader();
+
+        let (first_store, first_reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        thread::spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            // The timer is built inside `block_on`: it needs the runtime's clock.
+            let parked = runtime.block_on(async {
+                timeout(
+                    SHORT_RUNTIME_LIFE,
+                    FillWaiters::park(
+                        &first_store,
+                        &first_reader,
+                        PromotionDefer::Forever,
+                        FillWait::Quiescence,
+                    ),
+                )
+                .await
+            });
+            assert!(
+                parked.is_err(),
+                "the reader is held, so the fill stays parked"
+            );
+        })
+        .join()
+        .expect("short-lived runtime");
+
+        let (weak_store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        let wait = spawn(async move {
+            FillWaiters::park(
+                &weak_store,
+                &reader,
+                PromotionDefer::Forever,
+                FillWait::Quiescence,
+            )
+            .await
+        });
+        until_parked(&store, 1).await;
+        drop(query);
+        timeout(PROMOTE_TIMEOUT, wait)
+            .await
+            .expect("the ticker outlives the runtime that started it")
+            .expect("join");
+    }
+
+    /// Dropping the store wakes the fills parked on it, rather than leaving them parked forever.
+    #[tokio::test]
+    async fn dropping_the_store_wakes_its_parked_fills() {
+        let (_dir, store, entry, _query) = store_with_held_reader();
+        let (weak_store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        let wait = spawn(async move {
+            FillWaiters::park(
+                &weak_store,
+                &reader,
+                PromotionDefer::Forever,
+                FillWait::Release,
+            )
+            .await
+        });
+        until_parked(&store, 1).await;
+        drop(store);
+        timeout(PROMOTE_TIMEOUT, wait)
+            .await
+            .expect("a dropped store wakes the fill")
+            .expect("join");
+    }
+
+    /// A parked fill goes once its defer window closes, even though the query still holds the
+    /// reader: a file under steady load must not stay lazy for good.
+    #[tokio::test]
+    async fn a_closed_defer_window_wakes_a_parked_fill() {
+        let (_dir, store, entry, _query) = store_with_held_reader();
+        let start = Instant::now();
+        let defer = PromotionDefer::start(SHORT_WINDOW);
+        let (weak_store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        timeout(
+            PROMOTE_TIMEOUT,
+            FillWaiters::park(&weak_store, &reader, defer, FillWait::Quiescence),
+        )
+        .await
+        .expect("the closed window wakes the fill");
+        assert!(
+            start.elapsed() >= SHORT_WINDOW,
+            "the fill waits out the window first"
+        );
+    }
+
+    /// A fill whose reader is dropped (its entry evicted or replaced) is woken, not left parked.
+    #[tokio::test]
+    async fn a_dropped_reader_wakes_a_parked_fill() {
+        let (_dir, store, entry, query) = store_with_held_reader();
+        let (weak_store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        let wait = spawn(async move {
+            FillWaiters::park(
+                &weak_store,
+                &reader,
+                PromotionDefer::Forever,
+                FillWait::Release,
+            )
+            .await
+        });
+        until_parked(&store, 1).await;
+        drop((entry, query));
+        timeout(PROMOTE_TIMEOUT, wait)
+            .await
+            .expect("a dropped reader wakes the fill")
+            .expect("join");
+    }
+
+    /// A fill whose reader is already gone does not park at all: it returns at once, without
+    /// waiting two ticks for the reader to look free.
     #[test]
-    fn promotion_defer_window_opens_and_closes() {
+    fn a_fill_whose_reader_is_already_gone_does_not_park() {
+        let (_dir, store) = test_store();
+        let gone = Arc::downgrade(&Arc::new(
+            SuperfileReader::open(tiny_superfile_bytes()).expect("reader"),
+        ));
         assert!(
-            !PromotionDefer::start(Duration::ZERO).open(),
-            "a zero window is closed on arrival"
+            FillWaiters::park(
+                &Arc::downgrade(&store),
+                &gone,
+                PromotionDefer::Forever,
+                FillWait::Quiescence,
+            )
+            .now_or_never()
+            .is_some(),
+            "a gone reader lets the fill go without parking"
         );
-        assert!(
-            PromotionDefer::start(Duration::from_secs(3600)).open(),
-            "a long window is open"
-        );
-        assert!(
-            matches!(
-                PromotionDefer::start(Duration::MAX),
-                PromotionDefer::Forever
+        assert_eq!(store.fill_waiters.parked(), 0);
+    }
+
+    /// A caller waiting for promotion lets a fill past its first wait at once, but not past the
+    /// wait before a download: the download would pause for the held reader again straight away.
+    #[tokio::test]
+    async fn a_promotion_waiter_releases_only_the_first_wait() {
+        let (_dir, store, entry, query) = store_with_held_reader();
+        store.n_promotion_waiters.fetch_add(1, Ordering::AcqRel);
+        let (weak_store, reader) = (Arc::downgrade(&store), Arc::downgrade(&entry));
+        timeout(
+            PROMOTE_TIMEOUT,
+            FillWaiters::park(
+                &weak_store,
+                &reader,
+                PromotionDefer::Forever,
+                FillWait::Release,
             ),
-            "Duration::MAX overflows the clock and means unbounded yielding"
+        )
+        .await
+        .expect("a promotion waiter releases the first wait");
+
+        let wait = spawn(async move {
+            FillWaiters::park(
+                &weak_store,
+                &reader,
+                PromotionDefer::Forever,
+                FillWait::Quiescence,
+            )
+            .await
+        });
+        until_parked(&store, 1).await;
+        sleep(HELD_FOR).await;
+        assert!(
+            !wait.is_finished(),
+            "the wait before a download ignores promotion waiters"
         );
-        assert!(PromotionDefer::Forever.open());
+        store.n_promotion_waiters.fetch_sub(1, Ordering::AcqRel);
+        drop(query);
+        timeout(PROMOTE_TIMEOUT, wait)
+            .await
+            .expect("a released reader wakes the fill")
+            .expect("join");
+    }
+
+    /// A fill that wakes to find its reader gone gives back the bytes it reserved for the file,
+    /// rather than leaving them charged to the budget for the life of the store.
+    #[tokio::test]
+    async fn a_fill_whose_reader_is_gone_gives_its_reservation_back() {
+        let (_dir, store) = test_store();
+        let before = store.current_bytes.load(Ordering::Acquire);
+        store.reserve_manual(RESERVED_BYTES).await.expect("reserve");
+        let gone = Arc::downgrade(&Arc::new(
+            SuperfileReader::open(tiny_superfile_bytes()).expect("reader"),
+        ));
+        let uri = SuperfileUri::new_v4();
+        lazy_background_fill(
+            Arc::downgrade(&store),
+            gone,
+            uri,
+            uri.storage_path(),
+            RESERVED_BYTES,
+            Some(RESERVED_BYTES),
+            Arc::clone(&store.storage),
+            None,
+            PromotionDefer::Forever,
+        )
+        .await
+        .expect("fill");
+        assert_eq!(
+            store.current_bytes.load(Ordering::Acquire),
+            before,
+            "the reservation is released"
+        );
+    }
+
+    /// A fill waiting to download holds only a weak reference to its store, so dropping the store
+    /// ends the fill instead of the fill keeping the whole store alive while a query holds the
+    /// reader.
+    #[tokio::test]
+    async fn a_waiting_fill_does_not_keep_a_dropped_store_alive() {
+        let (_dir, store, entry, _query) = store_with_held_reader();
+        // Let the fill past its first wait, so it parks in the wait before a download.
+        store.n_promotion_waiters.fetch_add(1, Ordering::AcqRel);
+        let uri = SuperfileUri::new_v4();
+        let fill = spawn(lazy_background_fill(
+            Arc::downgrade(&store),
+            Arc::downgrade(&entry),
+            uri,
+            uri.storage_path(),
+            RESERVED_BYTES,
+            None,
+            Arc::clone(&store.storage),
+            None,
+            PromotionDefer::Forever,
+        ));
+        until_parked(&store, 1).await;
+        drop(store);
+        timeout(PROMOTE_TIMEOUT, fill)
+            .await
+            .expect("the fill ends once its store is dropped")
+            .expect("join")
+            .expect("fill");
     }
 
     #[test]

@@ -433,8 +433,8 @@ impl DiskCacheStore {
     ///
     /// Scoped to work the caller's own opens actually caused: entries that
     /// never spawned a fill (vector opens) and superfiles never opened at
-    /// all are not waited on. Registering as a promotion waiter releases
-    /// fills that are politely waiting on a held foreground reader.
+    /// all are not waited on. Registering as a promotion waiter lets fills
+    /// still in their first wait go without waiting out the defer window.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn wait_until_fills_settled(
         self: &Arc<Self>,
