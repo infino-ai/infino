@@ -81,7 +81,7 @@
 //!    (streams the blob progressively to any sink).
 
 use std::{
-    cmp::Ordering,
+    cmp::{Ordering, Reverse},
     collections::BinaryHeap,
     fs,
     fs::File,
@@ -172,6 +172,13 @@ type TermIdMap = HbHashMap<&'static str, u32, FxBuildHasher>;
 /// Chain terminator for the per-doc position chains
 /// (`FtsBuilder::doc_pos_chain`): no previous occurrence.
 const CHAIN_END: u32 = u32::MAX;
+
+/// A lane records where a term's position runs end once every this many
+/// postings (see [`FtsBuilder::set_lane_mode`]). Cutting a list at an
+/// arbitrary posting then skips at most this many runs from the nearest
+/// recorded end, for a table a sixteenth the size of one entry per
+/// posting.
+const RUN_END_STRIDE: usize = 16;
 
 #[derive(Default)]
 struct FinishProfile {
@@ -550,9 +557,10 @@ struct RamStore {
     postings: Vec<Vec<(u32, u32)>>,
     /// Empty for a positionless column.
     pos_runs: Vec<Vec<u8>>,
-    /// Where each posting's run ends in `pos_runs`, per id, so a stretch
-    /// of a list's postings can take its runs by byte range. Kept only by
-    /// a lane (see [`FtsBuilder::set_lane_mode`]); empty otherwise.
+    /// Where a list's position runs end in `pos_runs` after every
+    /// [`RUN_END_STRIDE`] postings, per id, so a stretch of a list's
+    /// postings can take its runs by byte range. Kept only by a lane (see
+    /// [`FtsBuilder::set_lane_mode`]); empty otherwise.
     run_ends: Vec<Vec<u32>>,
     /// Estimated bytes held (see `ACCUM_*_BYTES`); drives the spill check.
     bytes: usize,
@@ -1527,12 +1535,79 @@ pub(crate) struct FrozenLane {
     rows: Vec<u32>,
 }
 
+/// One term of one lane, in the merged dictionary order of a column; the
+/// entries of one term across the lanes are adjacent, the first flagged.
+#[derive(Clone, Copy)]
+struct OrderedTerm {
+    id: u32,
+    lane: u8,
+    first: bool,
+}
+
+/// A commit's frozen lanes with, per column, every lane's terms in one
+/// merged dictionary order. The merge is done once for the commit; the
+/// pieces then walk it with no term comparison of their own.
+pub(crate) struct FrozenLanes {
+    lanes: Vec<FrozenLane>,
+    order: Vec<Vec<OrderedTerm>>,
+}
+
+/// Merge `lanes`' dictionaries, column by column, into the order the
+/// pieces walk. The lanes must hold the same columns.
+pub(crate) fn freeze_lanes(lanes: Vec<FrozenLane>) -> Result<FrozenLanes, BuildError> {
+    if lanes.len() > usize::from(u8::MAX) {
+        return Err(BuildError::Io(Error::other("too many fts lanes")));
+    }
+    if let Some(first) = lanes.first()
+        && lanes.iter().any(|lane| lane.shape != first.shape)
+    {
+        return Err(BuildError::Io(Error::other(
+            "fts lanes must hold the same columns",
+        )));
+    }
+    let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
+    let order = (0..n_columns)
+        .map(|column| {
+            // A min-heap of each lane's next term; ties pop in lane order.
+            let mut heap: BinaryHeap<Reverse<(&str, u8, u32)>> = BinaryHeap::new();
+            let mut next = vec![0usize; lanes.len()];
+            for (i, lane) in lanes.iter().enumerate() {
+                let col = &lane.columns[column];
+                if let Some(&id) = col.by_lex.first() {
+                    heap.push(Reverse((col.term(id), i as u8, id)));
+                }
+            }
+            let total: usize = lanes
+                .iter()
+                .map(|lane| lane.columns[column].by_lex.len())
+                .sum();
+            let mut order = Vec::with_capacity(total);
+            let mut last: Option<&str> = None;
+            while let Some(Reverse((term, lane, id))) = heap.pop() {
+                order.push(OrderedTerm {
+                    id,
+                    lane,
+                    first: last != Some(term),
+                });
+                last = Some(term);
+                let col = &lanes[lane as usize].columns[column];
+                next[lane as usize] += 1;
+                if let Some(&id) = col.by_lex.get(next[lane as usize]) {
+                    heap.push(Reverse((col.term(id), lane, id)));
+                }
+            }
+            order
+        })
+        .collect();
+    Ok(FrozenLanes { lanes, order })
+}
+
 /// What a build finishes from in place of its own accumulator: the
 /// commit's lanes, restricted to the rows `rows` — the superfile's own,
 /// numbered from `rows.start`.
 #[derive(Clone)]
 pub(crate) struct LaneView {
-    pub(crate) lanes: Arc<Vec<FrozenLane>>,
+    pub(crate) lanes: Arc<FrozenLanes>,
     pub(crate) rows: Range<u32>,
 }
 
@@ -2194,7 +2269,7 @@ impl FtsBuilder {
                     new_bytes = new_bytes.saturating_add(ACCUM_POSTING_BYTES);
                     // A positional column's run for this (term, doc) was
                     // written by the scan, gap by gap, as the tokens came.
-                    if lane_mode && positional {
+                    if lane_mode && positional && list.len().is_multiple_of(RUN_END_STRIDE) {
                         ram.run_ends[idx].push(ram.pos_runs[idx].len() as u32);
                     }
                 }
@@ -2504,7 +2579,7 @@ impl FtsBuilder {
             .map(|c| (c.name.clone(), c.positions))
             .collect();
         let n_docs = view.rows.len();
-        for lane in view.lanes.iter() {
+        for lane in view.lanes.lanes.iter() {
             if lane.shape != shape {
                 return Err(BuildError::Io(Error::other(
                     "fts lanes must hold the builder's columns",
@@ -2514,7 +2589,7 @@ impl FtsBuilder {
         for (c, col) in self.columns.iter_mut().enumerate() {
             let mut lengths = vec![0u32; n_docs];
             let mut total_tokens = 0u64;
-            for lane in view.lanes.iter() {
+            for lane in view.lanes.lanes.iter() {
                 let (dlo, dhi) = lane_doc_range(lane, &view.rows);
                 let lane_col = &lane.columns[c];
                 for d in dlo..dhi {
@@ -3944,14 +4019,38 @@ fn lane_doc_range(lane: &FrozenLane, rows: &Range<u32>) -> (usize, usize) {
     (lo, hi)
 }
 
+/// The bytes of postings `lo..hi` of list `id`'s position runs: the
+/// nearest recorded end before each bound, then the runs between skipped.
+fn run_bytes(col: &FrozenColumn, id: u32, lo: usize, hi: usize) -> &[u8] {
+    let list = &col.postings[id as usize];
+    let runs = &col.pos_runs[id as usize];
+    let ends = &col.run_ends[id as usize];
+    let offset_of = |p: usize| -> usize {
+        if p == list.len() {
+            return runs.len();
+        }
+        let block = p / RUN_END_STRIDE;
+        let mut at = match block {
+            0 => 0,
+            _ => ends[block - 1] as usize,
+        };
+        for &(_, tf) in &list[block * RUN_END_STRIDE..p] {
+            skip_run(runs, &mut at, tf).expect("builder-encoded run");
+        }
+        at
+    };
+    &runs[offset_of(lo)..offset_of(hi)]
+}
+
 /// Emit one column from a lane view, merged term by term over the view's
-/// rows: a term held by one lane is encoded from the stretch of that
-/// lane's list that falls in the rows, its documents mapped to their rows;
-/// a term several lanes hold has their stretches merged by row, which is
-/// a merge of ascending runs since every lane's documents are in row
-/// order, with each posting's positions brought along. Each stretch is
-/// found by two binary searches on the list, and its runs are the byte
-/// range the lane recorded for it.
+/// rows, walking the commit's merged dictionary order: a term held by one
+/// lane is encoded from the stretch of that lane's list that falls in the
+/// rows, its documents mapped to their rows; a term several lanes hold
+/// has their stretches merged by row, which is a merge of ascending runs
+/// since every lane's documents are in row order, with each posting's
+/// positions brought along. A list whose first and last documents miss
+/// the rows is passed over at once; otherwise two binary searches find
+/// the stretch, and its runs come by byte range.
 #[allow(clippy::too_many_arguments)]
 fn emit_lanes_column<W: Write>(
     view: &LaneView,
@@ -3969,29 +4068,17 @@ fn emit_lanes_column<W: Write>(
     term_scratch: &mut TermScratch,
     head_sink: &mut Option<Box<dyn TermHeadSink>>,
 ) -> Result<usize, BuildError> {
-    /// One lane's column over the view's rows.
-    struct Source<'a> {
-        col: &'a FrozenColumn,
-        rows: &'a [u32],
-        /// The lane's documents in the view, as document indexes.
-        docs: Range<usize>,
-        /// Where the walk is in `col.by_lex`.
-        next: usize,
-    }
     let first_row = view.rows.start;
-    let mut sources: Vec<Source<'_>> = view
-        .lanes
+    let lanes = &view.lanes.lanes;
+    // Each lane's documents in the view, as document indexes.
+    let docs: Vec<Range<usize>> = lanes
         .iter()
         .map(|lane| {
             let (lo, hi) = lane_doc_range(lane, &view.rows);
-            Source {
-                col: &lane.columns[column],
-                rows: &lane.rows,
-                docs: lo..hi,
-                next: 0,
-            }
+            lo..hi
         })
         .collect();
+    let order = &view.lanes.order[column];
 
     let mut pairs: Vec<(u32, u32)> = Vec::new();
     let mut values: Vec<u32> = Vec::new();
@@ -4000,54 +4087,48 @@ fn emit_lanes_column<W: Write>(
     // view, its run bytes, and how far into both the merge has read.
     let mut holders: Vec<(usize, &[(u32, u32)], &[u8], usize, usize)> = Vec::new();
     let mut n_emitted = 0usize;
-    loop {
-        let mut term: Option<&str> = None;
-        for source in &sources {
-            if let Some(&id) = source.col.by_lex.get(source.next) {
-                let candidate = source.col.term(id);
-                if term.is_none_or(|t| candidate < t) {
-                    term = Some(candidate);
-                }
-            }
-        }
-        let Some(term) = term else {
-            break;
+    let mut at = 0usize;
+    while at < order.len() {
+        // The entries of one term: from a first-flagged entry to the next.
+        let group_end = order[at + 1..]
+            .iter()
+            .position(|entry| entry.first)
+            .map_or(order.len(), |n| at + 1 + n);
+        let term = {
+            let entry = order[at];
+            lanes[entry.lane as usize].columns[column].term(entry.id)
         };
         holders.clear();
-        for (i, source) in sources.iter_mut().enumerate() {
-            let Some(&id) = source.col.by_lex.get(source.next) else {
+        for entry in &order[at..group_end] {
+            let lane = entry.lane as usize;
+            let col = &lanes[lane].columns[column];
+            let list = &col.postings[entry.id as usize];
+            let range = &docs[lane];
+            let (Some(&(first_doc, _)), Some(&(last_doc, _))) = (list.first(), list.last()) else {
                 continue;
             };
-            if source.col.term(id) != term {
+            if first_doc as usize >= range.end || (last_doc as usize) < range.start {
                 continue;
             }
-            source.next += 1;
-            let list = &source.col.postings[id as usize];
-            let lo = list.partition_point(|&(d, _)| (d as usize) < source.docs.start);
-            let hi = list.partition_point(|&(d, _)| (d as usize) < source.docs.end);
+            let lo = list.partition_point(|&(d, _)| (d as usize) < range.start);
+            let hi = list.partition_point(|&(d, _)| (d as usize) < range.end);
             if lo == hi {
                 continue;
             }
             let runs: &[u8] = match col_positions {
-                true => {
-                    let ends = &source.col.run_ends[id as usize];
-                    let start = match lo {
-                        0 => 0,
-                        _ => ends[lo - 1] as usize,
-                    };
-                    &source.col.pos_runs[id as usize][start..ends[hi - 1] as usize]
-                }
+                true => run_bytes(col, entry.id, lo, hi),
                 false => &[],
             };
-            holders.push((i, &list[lo..hi], runs, 0, 0));
+            holders.push((lane, &list[lo..hi], runs, 0, 0));
         }
+        at = group_end;
         if holders.is_empty() {
             continue;
         }
         pairs.clear();
         let term_positions: Option<(&mut PositionsSink, TermRuns<'_>)> = if holders.len() == 1 {
-            let (i, list, runs, _, _) = holders[0];
-            let rows = sources[i].rows;
+            let (lane, list, runs, _, _) = holders[0];
+            let rows = &lanes[lane].rows;
             pairs.extend(
                 list.iter()
                     .map(|&(doc, tf)| (rows[doc as usize] - first_row, tf)),
@@ -4060,9 +4141,9 @@ fn emit_lanes_column<W: Write>(
             starts.clear();
             loop {
                 let mut lowest: Option<(usize, u32)> = None;
-                for (h, (i, list, _, pos, _)) in holders.iter().enumerate() {
+                for (h, (lane, list, _, pos, _)) in holders.iter().enumerate() {
                     if let Some(&(doc, _)) = list.get(*pos) {
-                        let row = sources[*i].rows[doc as usize];
+                        let row = lanes[*lane].rows[doc as usize];
                         if lowest.is_none_or(|(_, r)| row < r) {
                             lowest = Some((h, row));
                         }
@@ -4071,12 +4152,12 @@ fn emit_lanes_column<W: Write>(
                 let Some((h, row)) = lowest else {
                     break;
                 };
-                let (_, list, runs, pos, at) = &mut holders[h];
+                let (_, list, runs, pos, read) = &mut holders[h];
                 let (_, tf) = list[*pos];
                 pairs.push((row - first_row, tf));
                 if col_positions {
                     starts.push(values.len());
-                    TermRuns::Encoded(runs).push_run(*pos, tf, at, &mut values);
+                    TermRuns::Encoded(runs).push_run(*pos, tf, read, &mut values);
                 }
                 *pos += 1;
             }
@@ -4917,11 +4998,14 @@ mod tests {
             lane.add_doc(1, doc, &text_of(i)).expect("add flat");
             rows.push(i);
         }
-        let frozen: Arc<Vec<FrozenLane>> = Arc::new(
-            lanes
-                .into_iter()
-                .map(|(lane, rows)| lane.freeze(rows).expect("freeze"))
-                .collect(),
+        let frozen = Arc::new(
+            freeze_lanes(
+                lanes
+                    .into_iter()
+                    .map(|(lane, rows)| lane.freeze(rows).expect("freeze"))
+                    .collect(),
+            )
+            .expect("merge the lanes' terms"),
         );
         let from_view = |rows: std::ops::Range<u32>| {
             let mut b = fresh();

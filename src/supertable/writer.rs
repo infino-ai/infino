@@ -136,6 +136,7 @@ use crate::{
             bm25::Bm25Params,
             builder::{
                 DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FtsBuilder, doc_lengths_entry_size,
+                freeze_lanes,
             },
         },
         reader::vector_layout_from_kv,
@@ -2561,7 +2562,7 @@ impl SupertableWriter {
                     })
                 })
                 .collect::<Result<_, BuildError>>()?;
-            let frozen = Arc::new(frozen);
+            let frozen = Arc::new(freeze_lanes(frozen).map_err(BuildError::from)?);
             (0..n_pieces)
                 .into_par_iter()
                 .map(|i| {

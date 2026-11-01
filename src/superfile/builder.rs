@@ -107,7 +107,7 @@ use crate::{
                 chain_tokenizer,
             },
             bm25,
-            builder::{FrozenLane, FtsBuilder, LaneView, TermHeadSink},
+            builder::{FrozenLanes, FtsBuilder, LaneView, TermHeadSink},
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{BisectParams, ForwardIndex, bisect_order_reported},
             sorted_merge::SortedInput,
@@ -1588,7 +1588,7 @@ impl SuperfileBuilder {
     /// builder's superfile holds; see [`FtsBuilder::set_lane_view`]. The
     /// rows themselves go in through [`Self::add_rows_unindexed`], in row
     /// order.
-    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<Vec<FrozenLane>>, rows: Range<u32>) {
+    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<FrozenLanes>, rows: Range<u32>) {
         if let Some(fb) = self.fts_builder.as_mut() {
             fb.set_lane_view(LaneView { lanes, rows });
         }
