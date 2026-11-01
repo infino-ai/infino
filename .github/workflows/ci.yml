@@ -127,8 +127,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # cargo-public-api builds rustdoc JSON, which requires nightly.
-      - uses: dtolnay/rust-toolchain@nightly
+      # cargo-public-api builds rustdoc JSON, which requires nightly. The
+      # nightly is pinned by date so a broken nightly cannot fail every PR:
+      # nightly-2026-11-01 hits a compiler cycle error building datafusion.
+      # Move the date forward deliberately, checking this job still passes.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-30
       - uses: Swatinem/rust-cache@v2
         with:
           cache-directories: |
