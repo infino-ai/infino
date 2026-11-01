@@ -119,3 +119,43 @@ pub(crate) fn temp_file_behind(bytes: &Bytes) -> Option<PathBuf> {
     let (path, len) = map.get(&(bytes.as_ptr() as usize))?;
     (*len == bytes.len()).then(|| path.clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use tempfile::{NamedTempFile, TempDir};
+
+    use super::*;
+
+    /// The sealed file is found behind the whole mapping only — a slice
+    /// of it would link the whole file for a part — and is forgotten with
+    /// the bytes.
+    #[test]
+    fn temp_file_behind_the_whole_mapping_only_while_the_bytes_live() {
+        let dir = TempDir::new().expect("tempdir");
+        let mut file = NamedTempFile::new_in(dir.path()).expect("temp file");
+        file.write_all(b"sealed superfile bytes").expect("write");
+        file.flush().expect("flush");
+        let path = file.path().to_path_buf();
+
+        let bytes = mmap_temp_file_bytes(file).expect("map");
+        assert_eq!(temp_file_behind(&bytes).as_deref(), Some(path.as_path()));
+        assert!(
+            temp_file_behind(&bytes.clone()).is_some(),
+            "a clone is the same mapping"
+        );
+        assert!(
+            temp_file_behind(&bytes.slice(1..)).is_none(),
+            "an offset slice"
+        );
+        assert!(
+            temp_file_behind(&bytes.slice(..bytes.len() - 1)).is_none(),
+            "a prefix starts at the same address"
+        );
+        assert!(temp_file_behind(&Bytes::from_static(b"other")).is_none());
+
+        drop(bytes);
+        assert!(!path.exists(), "the temp file goes with the bytes");
+    }
+}

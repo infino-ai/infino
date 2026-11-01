@@ -165,7 +165,11 @@ const WRITER_POOL_CORES_LEFT_FOR_QUERIES: usize = 2;
 /// machine and leaves a fixed slice, not a fraction, for concurrent
 /// queries; ETL-shaped overrides via [`SupertableOptions::with_writer_pool`].
 fn default_writer_thread_count() -> usize {
-    let cores = num_cpus::get().max(1);
+    writer_threads_for(num_cpus::get().max(1))
+}
+
+/// The default writer-pool size on a host of `cores` logical cores.
+fn writer_threads_for(cores: usize) -> usize {
     if cores <= WRITER_POOL_CORES_LEFT_FOR_QUERIES {
         cores
     } else {
@@ -2022,18 +2026,17 @@ supertable:
     }
 
     /// The default writer pool takes every core on a small host and leaves
-    /// a fixed two on a bigger one, so the arithmetic is pinned here rather
-    /// than only compared against itself above.
+    /// a fixed two on a bigger one: pinned at fixed points, so a change to
+    /// the constant or the comparison fails here on any host.
     #[test]
     fn default_writer_threads_leave_two_cores_above_two() {
-        let cores = num_cpus::get().max(1);
-        let expected = if cores <= WRITER_POOL_CORES_LEFT_FOR_QUERIES {
-            cores
-        } else {
-            cores - WRITER_POOL_CORES_LEFT_FOR_QUERIES
-        };
-        assert_eq!(default_writer_thread_count(), expected);
-        assert!(default_writer_thread_count() >= 1);
+        for (cores, threads) in [(1, 1), (2, 2), (3, 1), (4, 2), (8, 6), (96, 94)] {
+            assert_eq!(writer_threads_for(cores), threads, "{cores} cores");
+        }
+        assert_eq!(
+            default_writer_thread_count(),
+            writer_threads_for(num_cpus::get().max(1))
+        );
     }
 
     #[test]

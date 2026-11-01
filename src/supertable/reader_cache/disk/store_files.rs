@@ -108,7 +108,11 @@ impl DiskCacheStore {
             // the copy here was the whole cost of a commit's publish on a
             // local-disk table. A link that is refused (another filesystem)
             // falls through to the copy. The cache only ever adds and
-            // removes whole files, so sharing the inode with storage is safe.
+            // removes whole files, so sharing the inode with storage is
+            // safe. The sealed file is not fsynced here: the storage copy it
+            // shares an inode with was never fsynced by the local-filesystem
+            // put either, so the cache's copy is no less durable than the
+            // table's own.
             let linked = match temp_file_behind(&bytes) {
                 Some(sealed) => {
                     let _ = fs::remove_file(&tmp);
@@ -860,11 +864,13 @@ mod landing_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    use std::{fs, io::Write, sync::Arc};
 
     use bytes::Bytes;
     use roaring::RoaringBitmap;
-    use tempfile::TempDir;
+    use tempfile::{NamedTempFile, TempDir};
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -873,7 +879,7 @@ mod tests {
             reader_cache::{
                 block_source::CACHE_BLOCK_BYTES,
                 config::DiskCacheConfig,
-                disk::{store_files::*, test_support::*},
+                disk::{mmap_temp_file_bytes, store_files::*, test_support::*},
             },
         },
     };
@@ -908,12 +914,6 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn insert_warm_links_a_sealed_file_instead_of_copying_it() {
-        use std::{io::Write, os::unix::fs::MetadataExt};
-
-        use tempfile::NamedTempFile;
-
-        use crate::supertable::reader_cache::disk::mmap_temp_file_bytes;
-
         let (dir, store) = test_store();
         let mut sealed = NamedTempFile::new_in(dir.path()).expect("temp file");
         sealed
@@ -930,8 +930,8 @@ mod tests {
             .await
             .expect("insert_warm");
 
-        let cached = std::fs::metadata(store.cache_path(&uri)).expect("cache file");
-        let sealed = std::fs::metadata(&sealed_path).expect("sealed file");
+        let cached = fs::metadata(store.cache_path(&uri)).expect("cache file");
+        let sealed = fs::metadata(&sealed_path).expect("sealed file");
         assert_eq!(
             cached.ino(),
             sealed.ino(),
