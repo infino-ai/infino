@@ -69,6 +69,7 @@ use std::{
     },
     thread::available_parallelism,
     time,
+    time::Instant,
 };
 
 use arrow::{
@@ -2514,7 +2515,9 @@ impl SupertableWriter {
         built_against: u32,
     ) -> Result<(), BuildError> {
         let manifest = Arc::clone(&live.manifest);
+        let sealing = Instant::now();
         let lanes = live.join()?;
+        let joined_ms = sealing.elapsed().as_millis();
         let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
         let fed: usize = lanes.iter().map(|lane| lane.rows.len()).sum();
         if fed != total_rows || live.rows_fed != total_rows {
@@ -2553,6 +2556,8 @@ impl SupertableWriter {
         // The seal is the append's own CPU, measured on the pool threads
         // that run it like a commit-time build's pieces: the lanes frozen
         // side by side, then every piece built from its rows of them.
+        let conformed_ms = sealing.elapsed().as_millis();
+        let (mut frozen_ms, mut merged_ms) = (0u128, 0u128);
         let outputs: Vec<ShardOutput> = options.writer_pool.install(|| {
             let frozen: Vec<FrozenLane> = lanes
                 .into_par_iter()
@@ -2562,7 +2567,9 @@ impl SupertableWriter {
                     })
                 })
                 .collect::<Result<_, BuildError>>()?;
+            frozen_ms = sealing.elapsed().as_millis();
             let frozen = Arc::new(freeze_lanes(frozen).map_err(BuildError::from)?);
+            merged_ms = sealing.elapsed().as_millis();
             (0..n_pieces)
                 .into_par_iter()
                 .map(|i| {
@@ -2594,6 +2601,7 @@ impl SupertableWriter {
                 })
                 .collect::<Result<Vec<_>, BuildError>>()
         })?;
+        let sealed_ms = sealing.elapsed().as_millis();
         let superfiles = outputs.len();
         let cell_hints = vec![None; superfiles];
         let user_batch =
@@ -2612,7 +2620,16 @@ impl SupertableWriter {
         if self.inner.options.storage.is_some() {
             schedule_background_storage_reclaim(Arc::clone(&self.inner));
         }
-        debug!(superfiles, "published appended superfiles from live lanes");
+        debug!(
+            superfiles,
+            joined_ms,
+            conformed_ms,
+            frozen_ms,
+            merged_ms,
+            sealed_ms,
+            published_ms = sealing.elapsed().as_millis(),
+            "published appended superfiles from live lanes"
+        );
         // Released here, after the publish, like a commit-time build's guard.
         drop(live);
         Ok(())
