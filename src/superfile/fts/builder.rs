@@ -5224,7 +5224,7 @@ mod tests {
             });
             b.finish().expect("finish view")
         };
-        assert_eq!(from_view(Vec::from([0..N_DOCS]), 0), single(0, N_DOCS), "whole");
+        assert_eq!(from_view(vec![0..N_DOCS; 1], 0), single(0, N_DOCS), "whole");
         assert_eq!(
             from_view(vec![0..CUT, CUT..N_DOCS], 0),
             single(0, CUT),
