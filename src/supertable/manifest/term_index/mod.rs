@@ -37,24 +37,25 @@ pub(crate) mod format;
 mod rebase;
 pub(crate) mod tier;
 
+#[cfg(test)]
+use std::fs;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     future::Future,
     io,
     iter::repeat_n,
     ops::Range,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use build::build_layer;
-#[cfg(test)]
-pub(crate) use build::first_contribution_difference;
 pub(crate) use build::{
-    BuildPolicy, Built, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, SliceFile, build, build_onto, merge_layers, scratch_dir, tier_path,
+    BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
+    HeadSink, SliceFile, build_onto, merge_layers, scratch_dir, tier_path,
 };
+#[cfg(test)]
+pub(crate) use build::{Built, build, first_contribution_difference};
 use bytes::Bytes;
 use format::Layer;
 #[cfg(test)]
@@ -135,14 +136,6 @@ const LAYER_FETCH_CONCURRENCY: usize = 16;
 /// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
 /// object is read back only as its upload starts.
 const SLICE_WRITE_CONCURRENCY: usize = 16;
-
-/// Ordinals a reserved layer leaves free past the root it was built
-/// against, for the deltas other commits append while its own commit
-/// retries. Ingest commits land a few times a second and a retrying commit
-/// gives up within a minute, so this is rarely outgrown; outgrowing it
-/// costs one rebuild of the layer, never correctness. Each unused slot
-/// is a nil entry (32 bytes) in the root until the next full rebuild.
-const RESERVED_ORDINAL_SLACK: u32 = 256;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -502,12 +495,12 @@ pub(crate) async fn append_delta(
     publish_root(storage, built.root, policy, pool).await
 }
 
-/// A delta layer built and written once, numbered from a reserved
-/// ordinal past the root it was built against. A commit that loses its race
-/// appends the same layer to the winner's root, padding up to its first
-/// ordinal, instead of building and uploading it again. When the winner's
-/// root has grown past that ordinal, the layer is moved to new ordinals
-/// from the bytes it keeps (see [`rebase`]) rather than built again.
+/// A delta layer built and written once, numbered from the length of the
+/// root it was built against. A commit that loses its race to a commit
+/// that left the root's list as it was appends the same layer to the
+/// winner's root; when the winner's list is longer, the layer is moved to
+/// its length from the bytes it keeps (see `rebase_layer`) rather than
+/// built again. Either way the root is never padded on its account.
 pub(crate) struct ReservedLayer {
     /// The ordinal its first superfile takes. Its postings name
     /// `base + i` for the `i`-th of `superfiles`.
@@ -517,9 +510,6 @@ pub(crate) struct ReservedLayer {
     layer: Layer,
     /// The layer's slice and tier bytes, kept to move it.
     bytes: Arc<LayerBytes>,
-    /// Appended only at exactly the root's length, and moved there
-    /// otherwise, so the root is never padded on its account.
-    exact: bool,
 }
 
 /// The slice and tier objects of a layer, by content hash.
@@ -552,7 +542,6 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
     base: u32,
-    exact: bool,
 ) -> Result<ReservedLayer, TermIndexError> {
     let built = detail_span!(
         "term_index.build_layer",
@@ -571,7 +560,6 @@ pub(crate) async fn reserve_layer(
             slices: built.slices,
             tiers: built.tiers,
         }),
-        exact,
     })
 }
 
@@ -626,24 +614,19 @@ async fn move_reserved(
             slices: moved.slices,
             tiers: moved.tiers,
         }),
-        exact: reserved.exact,
     }))
 }
 
 /// [`append_delta`] for a commit that may retry: the layer is built once,
-/// [`RESERVED_ORDINAL_SLACK`] ordinals past `prior`'s length, and kept in
-/// `reserved`. Each call pads `prior` with nil entries up to the reserved
-/// ordinal and appends it, writing only the root unless the root's layers
-/// make a run [`fold_tail`] merges, on `pool`. When `prior` has grown past
-/// the reserved ordinal, the layer is moved to new ordinals, the slack past
-/// `prior`'s length, and its moved slices written; it is built again only
-/// when it cannot be moved, or the contributions are not the ones it was
-/// built from. An `exact` layer is never padded: it is reused only at
-/// `prior`'s exact length and otherwise moved there, without the slack.
+/// numbered from `prior`'s length, and kept in `reserved`. A call at that
+/// length appends it, writing only the root unless the root's layers make a
+/// run [`fold_tail`] merges, on `pool`. When `prior`'s list has grown since,
+/// the layer is moved to its length and the moved slices written; it is
+/// built again only when it cannot be moved, or the contributions are not
+/// the ones it was built from.
 ///
 /// Like every delta, it names only ordinals at or past the length of the
-/// root it extends, which `layers_since` relies on. Optimize's rebuild
-/// drops the padding.
+/// root it extends, and the root it appends to is never padded.
 pub(crate) async fn append_reserved(
     storage: &Arc<dyn StorageProvider>,
     prior: Option<Root>,
@@ -653,14 +636,11 @@ pub(crate) async fn append_reserved(
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
-    let len = root.superfiles.len();
-    let exact = reserved.as_ref().is_some_and(|r| r.exact);
-    let reusable = reserved.as_ref().is_some_and(|r| {
-        (r.base as usize == len || (!exact && r.base as usize > len)) && r.built_from(contributions)
-    });
+    let base = root.superfiles.len() as u32;
+    let reusable = reserved
+        .as_ref()
+        .is_some_and(|r| r.base == base && r.built_from(contributions));
     if !reusable {
-        let slack = if exact { 0 } else { RESERVED_ORDINAL_SLACK };
-        let base = len as u32 + slack;
         let moved = match reserved
             .as_ref()
             .filter(|kept| kept.built_from(contributions))
@@ -670,7 +650,7 @@ pub(crate) async fn append_reserved(
         };
         let next = match moved {
             Some(moved) => moved,
-            None => reserve_layer(storage, contributions, policy, base, exact).await?,
+            None => reserve_layer(storage, contributions, policy, base).await?,
         };
         // The replaced layer's objects are written; its spilled copies are
         // read by nothing again.
@@ -680,10 +660,7 @@ pub(crate) async fn append_reserved(
         }
     }
     let layer = reserved.as_ref().expect("reserved above");
-    let padding = layer.base as usize - len;
-    root.superfiles.extend(repeat_n(Uuid::nil(), padding));
     root.superfiles.extend_from_slice(&layer.superfiles);
-    root.id_mins.extend(repeat_n(0, padding));
     root.id_mins.extend_from_slice(&layer.id_mins);
     root.layers.push(layer.layer.clone());
     publish_root(storage, root, policy, pool).await
@@ -735,49 +712,202 @@ async fn publish_root(
 /// reader of the folded root answers as it did, in the same order.
 ///
 /// This is what keeps a lookup cheap on a table taking a stream of
-/// commits: each commit appends one layer, a lookup opens one slice per
-/// layer, and only optimize rebuilds the index whole. Folded this way the
-/// count stays logarithmic in the bytes committed since the last optimize,
-/// whatever mix of sizes the commits come in; the merge work a commit pays
-/// is amortized to the same logarithm, as each posting is rewritten about
-/// once per level it climbs.
+/// commits: each commit appends one layer and a lookup opens one slice per
+/// layer. Folded this way the count stays logarithmic in the bytes
+/// committed, whatever mix of sizes the commits come in; the merge work a
+/// commit pays is amortized to the same logarithm, as each posting is
+/// rewritten about once per level it climbs.
 ///
 /// `root` changes only once a fold's merged slices are written, so a fold
 /// that fails leaves it as the last one that succeeded made it.
-///
-/// A rebuild racing these commits stacks the layers committed since its
-/// prior root (`layers_since`) only while that root is still a prefix of
-/// the current one: a fold wholly above it leaves it one and is stacked as
-/// a layer like any other, while a fold that reached into it does not,
-/// and the rebuild catches up by reading the superfiles it lacks instead,
-/// its existing fallback.
 pub(crate) async fn fold_tail(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
+    // Every ordinal keeps its place: the fold renumbers nothing.
+    let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
     while let Some(run) = next_fold(root, policy) {
-        let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-        let sources = download_layers(storage, &root.layers[run.clone()], scratch.path()).await?;
-        // Every ordinal keeps its place: the fold renumbers nothing.
-        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
-        let policy = policy.clone();
-        let merged = run_on_pool(pool, "term-index fold at commit", move || {
-            let merged = merge_layers(&sources, &ordinals, &policy);
-            // The slice files are read; the scratch directory can go with
-            // the task rather than outlive the fold.
-            drop(scratch);
-            merged
-        })
-        .await
-        .map_err(|e| TermIndexError::Build(e.to_string()))??;
-        write_slices(storage, merged.slices).await?;
-        write_tiers(storage, merged.tiers).await?;
+        let merged =
+            fold_layers(storage, &root.layers[run.clone()], &ordinals, policy, pool).await?;
         root.layers.drain(run.clone());
-        root.layers.insert(run.start, merged.layer);
+        root.layers.insert(run.start, merged);
     }
     Ok(())
+}
+
+/// One fold optimize makes of a root (see [`plan_fold_at_optimize`]): the
+/// run of layers it merges, and the list of the root it folds into.
+pub(crate) struct OptimizeFold {
+    run: Range<usize>,
+    /// Each of the root's ordinals as the folded root numbers it; `None`
+    /// drops its postings.
+    ordinals: Vec<Option<u32>>,
+    /// The folded root's superfiles and their smallest doc ids.
+    superfiles: Vec<Uuid>,
+    id_mins: Vec<i128>,
+    /// Whether it numbers the live superfiles afresh.
+    renumbers: bool,
+}
+
+impl OptimizeFold {
+    /// The superfiles the folded root lists, by ordinal: what the merge
+    /// keys the tiers it rewrites by.
+    pub(crate) fn superfiles(&self) -> &[Uuid] {
+        &self.superfiles
+    }
+
+    /// Whether it folds every layer and numbers the live superfiles afresh.
+    pub(crate) fn renumbers(&self) -> bool {
+        self.renumbers
+    }
+}
+
+/// The fold optimize makes of `root` next, or `None` when it makes none.
+///
+/// When `renumber` allows it, at least half of the root's list is dead —
+/// padding, superfiles `live` does not hold, a superfile's later listings —
+/// and its layers fit in `max_bytes` together, every layer folds into one
+/// and the live superfiles are numbered afresh, in the root's order. That
+/// is the only fold that shortens the list: an ordinal names postings in
+/// every layer, so it can change only when every layer is rewritten.
+/// Waiting until half the list is dead keeps that rewrite to once per
+/// doubling of the list.
+///
+/// Otherwise, when some layer holds a slice of the layout before tiers
+/// (`before_tiers`) and the layers fit in `max_bytes`
+/// together, every layer folds into one: the old layout's postings are
+/// written in the current one, bounds as keys, in runs beside the other
+/// superfiles' heads, so a term's tier serves. Left as they are, they serve
+/// ceilings and no tier. Failing that, the run [`fold_run`] picks among
+/// all the layers, of at most `max_bytes` together, the bound a compaction
+/// merge keeps to. A commit's fold stops at one slice to keep the commit
+/// quick; this takes the larger runs it leaves. The run's dead postings
+/// are dropped, but their ordinals stay in the list, so no layer outside
+/// the run is rewritten.
+pub(crate) fn plan_fold_at_optimize(
+    root: &Root,
+    live: &HashSet<Uuid>,
+    max_bytes: u64,
+    renumber: bool,
+    before_tiers: bool,
+) -> Option<OptimizeFold> {
+    let mut claimed: HashSet<Uuid> = HashSet::new();
+    let kept: Vec<bool> = root
+        .superfiles
+        .iter()
+        .map(|id| live.contains(id) && claimed.insert(*id))
+        .collect();
+    let dead = kept.iter().filter(|keep| !**keep).count();
+    let bytes = root
+        .layers
+        .iter()
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size));
+    if renumber
+        && !root.layers.is_empty()
+        && dead > 0
+        && 2 * dead >= kept.len()
+        && bytes <= max_bytes
+    {
+        let mut fold = OptimizeFold {
+            run: 0..root.layers.len(),
+            ordinals: Vec::with_capacity(kept.len()),
+            superfiles: Vec::new(),
+            id_mins: Vec::new(),
+            renumbers: true,
+        };
+        for ((&keep, id), id_min) in kept.iter().zip(&root.superfiles).zip(&root.id_mins) {
+            fold.ordinals
+                .push(keep.then_some(fold.superfiles.len() as u32));
+            if keep {
+                fold.superfiles.push(*id);
+                fold.id_mins.push(*id_min);
+            }
+        }
+        return Some(fold);
+    }
+    let run = match before_tiers && bytes <= max_bytes {
+        true => 0..root.layers.len(),
+        false => fold_run(&root.layers, max_bytes)?,
+    };
+    Some(OptimizeFold {
+        run,
+        ordinals: kept
+            .iter()
+            .enumerate()
+            .map(|(i, &keep)| keep.then_some(i as u32))
+            .collect(),
+        superfiles: root.superfiles.clone(),
+        id_mins: root.id_mins.clone(),
+        renumbers: false,
+    })
+}
+
+/// `root` with `fold` made: its run merged into one layer on `pool`,
+/// spilling to disk as it goes, and the merged slices written. `policy`
+/// keys the tiers it rewrites by the folded root's ordinals
+/// ([`OptimizeFold::superfiles`]). Every layer of the run is one the
+/// published root names, so the slices a fold retires are the sweep's to
+/// reclaim.
+pub(crate) async fn fold_at_optimize(
+    storage: &Arc<dyn StorageProvider>,
+    root: &Root,
+    fold: OptimizeFold,
+    policy: &BuildPolicy,
+    pool: Option<&ThreadPool>,
+) -> Result<Root, TermIndexError> {
+    // Nothing is kept, so every posting would be dropped.
+    if fold.superfiles.is_empty() {
+        return Ok(Root::default());
+    }
+    let merged = fold_layers(
+        storage,
+        &root.layers[fold.run.clone()],
+        &fold.ordinals,
+        policy,
+        pool,
+    )
+    .await?;
+    let mut layers = root.layers.clone();
+    layers.drain(fold.run.clone());
+    layers.insert(fold.run.start, merged);
+    Ok(Root {
+        superfiles: fold.superfiles,
+        id_mins: fold.id_mins,
+        layers,
+    })
+}
+
+/// Merge `layers` into one on `pool`, numbering each posting through
+/// `ordinals` (by its ordinal in the root the layers belong to; `None`
+/// drops it), write the merged slices and tier objects, and return the
+/// merged layer. The layers are downloaded to a scratch directory and
+/// merged from there.
+async fn fold_layers(
+    storage: &Arc<dyn StorageProvider>,
+    layers: &[Layer],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+    pool: Option<&ThreadPool>,
+) -> Result<Layer, TermIndexError> {
+    let scratch = scratch_dir(policy.scratch_root.as_deref())?;
+    let sources = download_layers(storage, layers, scratch.path()).await?;
+    let ordinals = ordinals.to_vec();
+    let policy = policy.clone();
+    let merged = run_on_pool(pool, "term-index fold", move || {
+        let merged = merge_layers(&sources, &ordinals, &policy);
+        // The slice files are read; the scratch directory can go with the
+        // task rather than outlive the fold.
+        drop(scratch);
+        merged
+    })
+    .await
+    .map_err(|e| TermIndexError::Build(e.to_string()))??;
+    write_slices(storage, merged.slices).await?;
+    write_tiers(storage, merged.tiers).await?;
+    Ok(merged.layer)
 }
 
 /// The run of layers [`fold_tail`] merges next: [`FOLD_FAN_OUT`]
@@ -796,8 +926,7 @@ pub(crate) async fn fold_tail(
 /// The bound keeps a fold, which downloads, merges and uploads inside the
 /// commit before its fence check, to the slice a cold lookup reads: a
 /// larger fold would be commit latency and a wider window for a concurrent
-/// writer to win, so a run past it is left to optimize's rebuild, as every
-/// layer was before folding.
+/// writer to win, so a run past it is left to optimize ([`fold_at_optimize`]).
 ///
 /// The newest layer is never in a run. Its slices were written by the
 /// publish that is still under way and no root names them yet; a fold that
@@ -807,18 +936,23 @@ pub(crate) async fn fold_tail(
 /// sweep reclaims from that root.
 fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
     let beneath = root.layers.len().checked_sub(1)?;
-    let layers = &root.layers[..beneath];
+    fold_run(&root.layers[..beneath], policy.slice_target_bytes as u64)
+}
+
+/// The first run of [`FOLD_FAN_OUT`] consecutive `layers` of one size level
+/// whose bytes together are at most `bound`, grouped as [`next_fold`]
+/// describes; `None` when there is no such run.
+fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
     let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
     let levels: Vec<f64> = layers.iter().map(layer_level).collect();
-    let bound = policy.slice_target_bytes as u64;
     let mut start = 0;
-    while start < beneath {
+    while start < layers.len() {
         let top = levels[start..]
             .iter()
             .copied()
             .fold(f64::NEG_INFINITY, f64::max);
         let end = 1
-            + (start..beneath)
+            + (start..layers.len())
                 .rev()
                 .find(|&i| levels[i] >= top - FOLD_LEVEL_SPAN)?;
         let mut first = start;
@@ -837,19 +971,129 @@ fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
     None
 }
 
-/// The slice bytes `layer` holds, as the root records them.
-fn layer_bytes(layer: &Layer) -> u64 {
-    layer.slices.iter().map(|slice| slice.len).sum()
+/// What [`check_objects`] found of the objects a root names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootObjects {
+    /// Every slice and tier object is on storage. `sized` when a slice's
+    /// length, which a root written before lengths were recorded lacks, was
+    /// filled in from storage; `before_tiers` when some slice is of the
+    /// layout before tiers.
+    Present { sized: bool, before_tiers: bool },
+    /// Some slice or tier object will never load.
+    Missing,
 }
 
-/// `layer`'s size level: its bytes as a power of [`FOLD_FAN_OUT`].
-fn layer_level(layer: &Layer) -> f64 {
-    (layer_bytes(layer).max(1) as f64).log(FOLD_FAN_OUT as f64)
+/// One request [`check_objects`] makes of storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ObjectCheck {
+    /// A slice's first bytes, which name its layout.
+    SliceLayout,
+    /// A slice's length.
+    SliceSize,
+    /// That a tier object is there.
+    Tier,
+}
+
+/// Whether every slice and tier object `root` names is on storage, filling
+/// in each slice length `root` lacks from what storage reports, and which
+/// layers hold a slice of the layout before tiers. One request per object
+/// `seen` lacks — a slice's first bytes, a tier object's metadata — and one
+/// for the length of each slice whose length is unknown. Objects found in
+/// the current layout are added to `seen`. The objects are
+/// content-addressed and the sweep keeps every object a live root names,
+/// so one found stays so for the life of the process; a pass asks about
+/// the objects new since the last one. (Whether a slice names a tier
+/// object does not tell its layout: a slice whose terms' tiers are small
+/// keeps them inline and names none.)
+pub(crate) async fn check_objects(
+    storage: &Arc<dyn StorageProvider>,
+    root: &mut Root,
+    seen: &Mutex<HashSet<ContentHash>>,
+) -> Result<RootObjects, TermIndexError> {
+    let wanted: HashSet<(ContentHash, ObjectCheck)> = {
+        let seen = seen.lock().expect("term-index objects seen");
+        let mut wanted = HashSet::new();
+        for slice in root.layers.iter().flat_map(|layer| &layer.slices) {
+            if !seen.contains(&slice.content_hash) {
+                wanted.insert((slice.content_hash, ObjectCheck::SliceLayout));
+            }
+            if slice.len == 0 {
+                wanted.insert((slice.content_hash, ObjectCheck::SliceSize));
+            }
+            if let Some(tier) = slice.tier.filter(|tier| !seen.contains(tier)) {
+                wanted.insert((tier, ObjectCheck::Tier));
+            }
+        }
+        wanted
+    };
+    let mut checks = stream::iter(wanted)
+        .map(|(hash, check)| async move {
+            let found = match check {
+                ObjectCheck::SliceLayout => storage
+                    .get_range(&slice_uri(&hash), 0..format::SLICE_VERSION_PREFIX_LEN)
+                    .await
+                    .map_err(TermIndexError::Storage)
+                    .and_then(|prefix| format::slice_is_before_tiers(&prefix))
+                    .map(|before_tiers| (Some(before_tiers), None)),
+                ObjectCheck::SliceSize => storage
+                    .head(&slice_uri(&hash))
+                    .await
+                    .map_err(TermIndexError::Storage)
+                    .map(|meta| (None, Some(meta.size))),
+                ObjectCheck::Tier => storage
+                    .head(&tier_uri(&hash))
+                    .await
+                    .map_err(TermIndexError::Storage)
+                    .map(|_| (Some(false), None)),
+            };
+            (hash, found)
+        })
+        .buffer_unordered(LAYER_FETCH_CONCURRENCY);
+    let mut sizes: HashMap<ContentHash, u64> = HashMap::new();
+    let mut legacy: HashSet<ContentHash> = HashSet::new();
+    while let Some((hash, found)) = checks.next().await {
+        match found {
+            Ok((before_tiers, size)) => {
+                match before_tiers {
+                    // Asked again on the next pass, until a fold rewrites it.
+                    Some(true) => {
+                        legacy.insert(hash);
+                    }
+                    Some(false) => {
+                        seen.lock().expect("term-index objects seen").insert(hash);
+                    }
+                    None => {}
+                }
+                if let Some(size) = size {
+                    sizes.insert(hash, size);
+                }
+            }
+            Err(e) if e.calls_for_rebuild() => return Ok(RootObjects::Missing),
+            Err(e) => return Err(e),
+        }
+    }
+    let before_tiers = !legacy.is_empty();
+    let mut sized = false;
+    for slice in root
+        .layers
+        .iter_mut()
+        .flat_map(|layer| &mut layer.slices)
+        .filter(|slice| slice.len == 0)
+    {
+        if let Some(&size) = sizes.get(&slice.content_hash) {
+            slice.len = size;
+            sized = true;
+        }
+    }
+    Ok(RootObjects::Present {
+        sized,
+        before_tiers,
+    })
 }
 
 /// The delta layers committed on top of `prior` to reach `current`, or
-/// `None` when `current` was not built on `prior` (e.g. another rebuild
-/// replaced it).
+/// `None` when `current` was not built on `prior` (e.g. another optimize
+/// replaced it, or a commit folded layers `prior` holds).
 ///
 /// Those deltas name superfiles only by ordinals at or past `prior`'s
 /// length. The checks below cannot see posting ordinals; it holds because
@@ -863,8 +1107,8 @@ pub(crate) fn layers_since<'a>(prior: &Root, current: &'a Root) -> Option<&'a [L
     .then(|| &current.layers[prior.layers.len()..])
 }
 
-/// `base`, a rebuild made from `prior`, with the delta layers committed on
-/// top of `prior` to reach `current` appended as they are. For a rebuild
+/// `base`, a fold optimize made of `prior`, with the delta layers committed
+/// on top of `prior` to reach `current` appended as they are. For a fold
 /// that lost its publish to those commits: no slice is read or written, so
 /// a retry costs one root however fast commits land.
 ///
@@ -879,7 +1123,7 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
     if base.superfiles.len() > len {
         return None;
     }
-    // Nothing landed on top of `prior`: the rebuild stands alone, unpadded.
+    // Nothing landed on top of `prior`: the fold stands alone, unpadded.
     if deltas.is_empty() && current.superfiles.len() == len {
         return Some(base.clone());
     }
@@ -892,6 +1136,16 @@ pub(crate) fn rebase(base: &Root, prior: &Root, current: &Root) -> Option<Root> 
     root.id_mins.extend_from_slice(&current.id_mins[len..]);
     root.layers.extend_from_slice(deltas);
     Some(root)
+}
+
+/// The slice bytes `layer` holds, as the root records them.
+fn layer_bytes(layer: &Layer) -> u64 {
+    layer.slices.iter().map(|slice| slice.len).sum()
+}
+
+/// `layer`'s size level: its bytes as a power of [`FOLD_FAN_OUT`].
+fn layer_level(layer: &Layer) -> f64 {
+    (layer_bytes(layer).max(1) as f64).log(FOLD_FAN_OUT as f64)
 }
 
 /// Download every slice of `layers` into `dir`, verified against its
@@ -961,6 +1215,7 @@ pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
 /// Write freshly built slices into `dir`, each with the key range its
 /// layer entry in `refs` records, so a merge finds them where
 /// [`download_layers`] would have put them.
+#[cfg(test)]
 pub(crate) fn spill_slices(
     dir: &Path,
     refs: &[format::SliceRef],
@@ -994,6 +1249,7 @@ pub(crate) fn spill_slices(
 
 /// Put `built` at `path`: a resident object is written, a spilled one is
 /// linked or copied from where the build left it.
+#[cfg(test)]
 fn place_built(path: &Path, built: BuiltBytes) -> Result<(), TermIndexError> {
     match built {
         BuiltBytes::Resident(bytes) => fs::write(path, bytes)?,
@@ -1052,6 +1308,7 @@ async fn read_span(
 /// Write freshly built tier objects into `dir`, each beside the spilled
 /// slice of `slices` that names it, so a merge finds them where
 /// [`download_layers`] would have put them.
+#[cfg(test)]
 pub(crate) fn spill_tiers(
     dir: &Path,
     slices: &[format::SliceRef],
@@ -1791,7 +2048,7 @@ mod tests {
         fs,
         ops::Range,
         sync::{
-            Arc, Mutex,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         thread,
@@ -1816,9 +2073,10 @@ mod tests {
                 list,
                 options_hash::compute_options_hash,
             },
+            optimize::compact::max_merge_input_bytes,
             query::prune::select_superfiles,
             schema::{LegacyNames, TableSchema},
-            writer::stamp_with_retries,
+            writer::{TERM_INDEX_BATCH_SUPERFILES, stamp_with_retries},
         },
         test_helpers::{
             copy_dir_recursive,
@@ -3139,9 +3397,9 @@ mod tests {
 
     /// Every commit publishes its superfiles' postings in the same manifest
     /// as the entries: after each commit the root covers exactly the live
-    /// set, one delta layer per commit, with per-superfile `df` right —
-    /// and a later optimize folds the deltas into one base layer that
-    /// answers identically.
+    /// set, one delta layer per commit, with per-superfile `df` right. A
+    /// later optimize, with nothing to index and fewer layers than a fold
+    /// takes, leaves the index as the commits wrote it, answering the same.
     #[test]
     fn commit_publishes_postings_with_the_manifest() {
         let (_dir, storage, st) = fresh_table();
@@ -3181,10 +3439,15 @@ mod tests {
                 assert_eq!(p.df, n_docs[&id]);
             }
         }
-        // Optimize folds every delta into one base layer with the same answers.
+        // Optimize leaves the commits' layers as they are, with the same answers.
+        let (_, root_before) = live_and_covered(&st, &storage, &rt);
         let before: Vec<u64> = {
-            let (_, root) = live_and_covered(&st, &storage, &rt);
-            let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+            let index = TermIndex::new(
+                root_before.clone(),
+                String::new(),
+                Arc::clone(&storage),
+                None,
+            );
             let mut v: Vec<u64> = rt
                 .block_on(index.postings(title_id(), "alpha"))
                 .expect("lookup")
@@ -3196,7 +3459,7 @@ mod tests {
         };
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 1, "optimize rebuilds one base layer");
+        assert_eq!(root, root_before, "nothing to index and no run to fold");
         assert_eq!(
             root.superfiles
                 .iter()
@@ -3239,11 +3502,7 @@ mod tests {
             covered, live,
             "every live superfile contributes, and nothing else"
         );
-        assert_eq!(
-            root.layers.len(),
-            1,
-            "a maintenance build is one base layer"
-        );
+        assert!(manifest.term_index_complete());
 
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
         let shared = rt
@@ -3451,6 +3710,114 @@ mod tests {
         );
     }
 
+    /// Superfiles a writer that keeps no index commits in the batch tests:
+    /// one past a batch, so indexing them takes two.
+    const UNINDEXED_SUPERFILES: usize = TERM_INDEX_BATCH_SUPERFILES + 1;
+
+    /// A table on fault-injectable storage whose first
+    /// [`UNINDEXED_SUPERFILES`] superfiles were committed by a writer that
+    /// keeps no term index, reopened with the index on.
+    fn table_with_unindexed_superfiles() -> (
+        TempDir,
+        Arc<FaultStorage>,
+        Arc<dyn StorageProvider>,
+        crate::supertable::Supertable,
+    ) {
+        let dir = TempDir::new().expect("tempdir");
+        let inner: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let faults = FaultStorage::wrap(inner);
+        let storage: Arc<dyn StorageProvider> = Arc::clone(&faults) as Arc<dyn StorageProvider>;
+        let unindexed =
+            crate::supertable::Supertable::create(fresh_options(&storage).with_term_index(false))
+                .expect("create");
+        for layer in 0..UNINDEXED_SUPERFILES {
+            commit_layer(&unindexed, layer);
+        }
+        drop(unindexed);
+        let st = crate::supertable::Supertable::open(fresh_options(&storage)).expect("open");
+        (dir, faults, storage, st)
+    }
+
+    /// The superfiles `shared` routes to through `root`.
+    fn shared_superfiles(
+        root: Root,
+        storage: &Arc<dyn StorageProvider>,
+        rt: &tokio::runtime::Runtime,
+    ) -> HashSet<Uuid> {
+        let index = TermIndex::new(root, String::new(), Arc::clone(storage), None);
+        rt.block_on(index.postings(title_id(), "shared"))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect()
+    }
+
+    /// Optimize indexes the superfiles the index does not list a batch at a
+    /// time, each published as a commit publishes its own: more than one
+    /// batch's worth takes a layer per batch, and the index ends complete.
+    #[test]
+    fn optimize_indexes_missing_superfiles_a_batch_at_a_time() {
+        let (_dir, _faults, storage, st) = table_with_unindexed_superfiles();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        maintenance_only_optimize(&st);
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(live.len(), UNINDEXED_SUPERFILES);
+        assert_eq!(root.layers.len(), 2, "one layer per batch");
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        assert_eq!(shared_superfiles(root, &storage, &rt), live);
+    }
+
+    /// A pass that stops after its first batch keeps it: the index lists
+    /// that batch and stays incomplete, and the next optimize indexes only
+    /// the rest.
+    #[test]
+    fn a_stopped_pass_keeps_the_batches_it_published() {
+        let (_dir, faults, storage, st) = table_with_unindexed_superfiles();
+        // Once the first batch's root is written, every slice write fails,
+        // so the second batch cannot publish.
+        let hook_faults = Arc::clone(&faults);
+        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+            hook_faults.fail(FaultOp::PutAtomic, "term-index/slice-", usize::MAX);
+        });
+        assert!(st.optimize(&maintenance_only_options()).is_err());
+        faults.clear();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root.superfiles.len(),
+            TERM_INDEX_BATCH_SUPERFILES,
+            "the first batch is kept"
+        );
+        assert!(
+            !st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let first = root.layers.clone();
+
+        maintenance_only_optimize(&st);
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root.layers[..first.len()],
+            first[..],
+            "the kept batch is built on"
+        );
+        assert_eq!(root.superfiles.len(), live.len());
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        assert_eq!(shared_superfiles(root, &storage, &rt), live);
+    }
     /// Titles ranked for `query`, in result order, over the whole table.
     fn ranked_titles(st: &crate::supertable::Supertable, query: &str) -> Vec<String> {
         use arrow_array::{Array, LargeStringArray};
@@ -3691,10 +4058,10 @@ mod tests {
     }
 
     /// Run a compaction-free optimize with term-index writes failing, and
-    /// return whether it tried to write one, i.e. whether it rebuilt the
-    /// index. A rebuild always writes, even when it reproduces the same
-    /// content-addressed objects.
-    fn optimize_rebuilds_term_index(
+    /// return whether it tried to write one: a batch of postings, a fold,
+    /// or a root. Every one of them writes, even when it reproduces the
+    /// same content-addressed objects.
+    fn optimize_writes_term_index(
         st: &crate::supertable::Supertable,
         faults: &FaultStorage,
     ) -> bool {
@@ -3702,15 +4069,14 @@ mod tests {
         faults.fail(FaultOp::PutAtomic, STORAGE_PREFIX, 1);
         let result = st.optimize(&maintenance_only_options());
         faults.clear();
-        let rebuilt = faults.fired() > fired_before;
-        if !rebuilt {
+        let wrote = faults.fired() > fired_before;
+        if !wrote {
             result.expect("optimize");
         }
-        rebuilt
+        wrote
     }
 
-    /// A fragmented table, optimized once so its index is one layer over
-    /// exactly the live superfiles.
+    /// A fragmented table, optimized once.
     fn optimized_fault_table() -> (
         TempDir,
         Arc<FaultStorage>,
@@ -3725,10 +4091,10 @@ mod tests {
         (dir, faults, storage, st)
     }
 
-    /// A second optimize over an unchanged table finds the index already in
-    /// the shape a rebuild would produce, and writes nothing.
+    /// A second optimize over an unchanged table finds nothing to index and
+    /// nothing to fold, and writes nothing.
     #[test]
-    fn a_repeat_optimize_skips_the_term_index_rebuild() {
+    fn a_repeat_optimize_writes_no_term_index() {
         let (_dir, faults, _storage, st) = optimized_fault_table();
         let reference = st
             .reader()
@@ -3737,8 +4103,8 @@ mod tests {
             .term_index_ref()
             .cloned();
         assert!(
-            !optimize_rebuilds_term_index(&st, &faults),
-            "nothing changed, so nothing is rebuilt"
+            !optimize_writes_term_index(&st, &faults),
+            "nothing changed, so nothing is written"
         );
         assert_eq!(
             st.reader()
@@ -3750,149 +4116,161 @@ mod tests {
         );
     }
 
-    /// An append after the last rebuild adds a delta layer, which the next
-    /// optimize folds back in.
+    /// An append after the last optimize publishes its own delta layer, so
+    /// the next optimize, with fewer layers than a fold takes, has nothing
+    /// to index or fold and writes nothing.
     #[test]
-    fn an_appended_delta_layer_triggers_the_rebuild() {
+    fn an_appended_delta_layer_needs_no_term_index_write() {
         let (_dir, faults, storage, st) = optimized_fault_table();
-        commit_layer(&st, LAYERS);
         let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let (_, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 2, "the append added a delta");
-        assert!(optimize_rebuilds_term_index(&st, &faults));
+        let (_, before) = live_and_covered(&st, &storage, &rt);
+        commit_layer(&st, LAYERS);
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(
+            root.layers.len(),
+            before.layers.len() + 1,
+            "the append added a delta"
+        );
+        assert!(live.iter().all(|id| root.superfiles.contains(id)));
+        assert!(!optimize_writes_term_index(&st, &faults));
     }
 
     #[test]
     fn optimize_keeps_the_delta_layer_when_the_refresh_step_is_off() {
         let (_dir, _faults, storage, st) = optimized_fault_table();
         commit_layer(&st, LAYERS);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, before) = live_and_covered(&st, &storage, &rt);
         let steps = OptimizeSteps {
             refresh_term_index: false,
             ..OptimizeSteps::default()
         };
         st.optimize(&maintenance_only_options().with_steps(steps))
             .expect("optimize");
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (_, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 2, "the delta must not be folded in");
-    }
-
-    /// A one-slice layer, told apart by `tag`.
-    fn tagged_layer(tag: u8) -> Layer {
-        Layer {
-            slices: vec![SliceRef {
-                first_key: vec![tag],
-                last_key: vec![tag],
-                content_hash: ContentHash::of(&[tag]),
-                tier: None,
-                len: 0,
-            }],
-        }
-    }
-
-    /// A root listing `ids` (each its own `id_min`; `0` is padding) over
-    /// one tagged layer per `tags`.
-    fn tagged_root(ids: &[u128], tags: &[u8]) -> Root {
-        Root {
-            superfiles: ids.iter().map(|&id| Uuid::from_u128(id)).collect(),
-            id_mins: ids.iter().map(|&id| id as i128).collect(),
-            layers: tags.iter().map(|&tag| tagged_layer(tag)).collect(),
-        }
-    }
-
-    /// The layers committed on top of `prior` are the ones `current` adds;
-    /// none when nothing was committed.
-    #[test]
-    fn layers_since_are_the_deltas_committed_on_top_of_prior() {
-        let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
-        // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
-        let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
         assert_eq!(
-            layers_since(&prior, &current),
-            Some(&[tagged_layer(2), tagged_layer(3)][..])
-        );
-        assert_eq!(layers_since(&prior, &prior), Some(&[][..]));
-    }
-
-    /// A root not built on `prior` has no deltas on top of it.
-    #[test]
-    fn layers_since_refuses_a_root_not_built_on_prior() {
-        let prior = tagged_root(&[1, 2], &[0]);
-        let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
-        assert_eq!(layers_since(&prior, &rebuilt_elsewhere), None);
-
-        let mut id_mins_differ = tagged_root(&[1, 2, 4], &[0, 1]);
-        id_mins_differ.id_mins[0] += 1;
-        assert_eq!(layers_since(&prior, &id_mins_differ), None);
-    }
-
-    /// The rebuild is padded to `prior`'s length and the deltas committed
-    /// since go on top as they are, so their ordinals still name their
-    /// superfiles.
-    #[test]
-    fn rebase_stacks_the_deltas_on_the_padded_rebuild() {
-        let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
-        // The rebuild dropped 1 and 4, which were removed.
-        let base = tagged_root(&[2, 3], &[9]);
-        // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
-        let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
-        assert_eq!(
-            rebase(&base, &prior, &current),
-            Some(tagged_root(&[2, 3, 0, 0, 5, 6], &[9, 2, 3]))
+            root, before,
+            "the index must be left as the commits wrote it"
         );
     }
 
-    /// With nothing committed on top of `prior`, the rebuild stands as it is.
+    /// An incomplete index is completed by indexing only the superfiles it
+    /// does not list, and a commit that lands while a batch publishes is
+    /// kept: the retry indexes the batch on top of the root that commit
+    /// published.
     #[test]
-    fn rebase_without_new_commits_is_the_rebuild() {
-        let prior = tagged_root(&[1, 2, 3], &[0, 1]);
-        let base = tagged_root(&[2, 3], &[9]);
-        assert_eq!(rebase(&base, &prior, &prior), Some(base));
-    }
-
-    /// No rebase onto a root not built on `prior`, nor of a rebuild listing
-    /// more superfiles than `prior`, whose ordinals would collide with the
-    /// deltas'.
-    #[test]
-    fn rebase_refuses_what_it_cannot_stack() {
-        let prior = tagged_root(&[1, 2], &[0]);
-        let base = tagged_root(&[1, 2], &[9]);
-        let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
-        assert_eq!(rebase(&base, &prior, &rebuilt_elsewhere), None);
-
-        let longer = tagged_root(&[1, 2, 7], &[9]);
-        let current = tagged_root(&[1, 2, 5], &[0, 1]);
-        assert_eq!(rebase(&longer, &prior, &current), None);
-    }
-
-    /// A commit that lands while optimize rebuilds the index is stacked on
-    /// the rebuild as it was committed, not merged in: the retry writes no
-    /// slice, the delta's ordinals still name its superfile, and the
-    /// removed superfile leaves padding until the next rebuild drops it.
-    #[test]
-    fn a_commit_during_the_rebuild_is_rebased_onto() {
+    fn a_commit_while_an_incomplete_index_is_completed_is_kept() {
         let (dir, faults, storage, st) = fault_table();
         for layer in 0..LAYERS {
             commit_layer(&st, layer);
         }
-        // A removed superfile stays listed, so the rebuild is shorter than
-        // the index it replaces.
-        let reader = st.reader().expect("reader");
-        let entries = reader.manifest().get_all_superfiles();
-        commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
-        st.block_on_query(st.refresh()).expect("refresh");
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let (before, _) = live_and_covered(&st, &storage, &rt);
+        // With its root gone, the next commit restarts the index from its
+        // own superfile alone.
+        let reference = st
+            .reader()
+            .expect("reader")
+            .manifest()
+            .term_index_ref()
+            .cloned()
+            .expect("the commits publish a root");
+        st.block_on_query(storage.delete(&reference.uri))
+            .expect("delete root");
+        commit_layer(&st, LAYERS);
+        assert!(
+            !st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
 
-        // Another process commits just before the rebuild publishes. From
-        // then on a slice write fails, so the retry must not write one.
+        // Another process commits just before the batch publishes.
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+            thread::spawn(move || commit_layer(&other, LAYERS + 1))
+                .join()
+                .expect("peer commit");
+        });
+        maintenance_only_optimize(&st);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root.superfiles.len(), live.len(), "each listed once");
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let found: HashSet<Uuid> = rt
+            .block_on(index.postings(title_id(), "shared"))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect();
+        assert_eq!(found, live, "`shared` is found in every live superfile");
+    }
+
+    /// Superfile objects end with this, whatever their stem.
+    const SUPERFILE_SUFFIX: &str = ".sf.parquet";
+
+    /// A fault-injectable table of [`LAYERS`] commits with every superfile
+    /// but the last removed: more than half the root's list is dead, so the
+    /// next optimize folds every layer into one and numbers the live
+    /// superfile afresh.
+    fn table_due_a_renumbering_fold() -> (
+        TempDir,
+        Arc<FaultStorage>,
+        Arc<dyn StorageProvider>,
+        Supertable,
+    ) {
+        let (dir, faults, storage, st) = fault_table();
+        for layer in 0..LAYERS {
+            commit_layer(&st, layer);
+        }
+        let reader = st.reader().expect("reader");
+        let entries = reader.manifest().get_all_superfiles();
+        commit_without_postings(&st, &storage, Vec::new(), &entries[..LAYERS - 1]);
+        st.block_on_query(st.refresh()).expect("refresh");
+        (dir, faults, storage, st)
+    }
+
+    /// The superfiles `term` routes to through `root`.
+    fn term_superfiles(
+        root: &Root,
+        storage: &Arc<dyn StorageProvider>,
+        rt: &tokio::runtime::Runtime,
+        term: &str,
+    ) -> HashSet<Uuid> {
+        let index = TermIndex::new(root.clone(), String::new(), Arc::clone(storage), None);
+        rt.block_on(index.postings(title_id(), term))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect()
+    }
+
+    /// A commit that lands while optimize folds the index is stacked on the
+    /// fold as it was committed, not merged in: the retry writes no slice,
+    /// the delta's ordinals still name its superfile, and the removed
+    /// superfiles leave padding until the next optimize's fold drops it.
+    #[test]
+    fn a_commit_during_a_fold_is_stacked_on_it() {
+        let (dir, faults, storage, st) = table_due_a_renumbering_fold();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (before, prior) = live_and_covered(&st, &storage, &rt);
+
+        // Another process commits just before the fold publishes. From then
+        // on a slice write fails, so the retry must not write one.
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let other = Supertable::open(fresh_options(&local)).expect("open");
         let peer_ref = Arc::new(Mutex::new(None));
         let hook_peer_ref = Arc::clone(&peer_ref);
         let hook_faults = Arc::clone(&faults);
-        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+        faults.before(FaultOp::PutAtomic, ROOT_URI_FRAGMENT, move || {
             let reference = thread::spawn(move || {
                 commit_layer(&other, LAYERS);
                 other
@@ -3921,10 +4299,10 @@ mod tests {
         assert_eq!(listed, live, "every live superfile, and nothing removed");
         assert_eq!(
             root.superfiles.len(),
-            live.len() + 1,
-            "the removed superfile's ordinal is padded"
+            prior.superfiles.len() + 1,
+            "the fold is padded to the root it was made of, the commit's superfile after"
         );
-        assert_eq!(root.layers.len(), 2, "the rebuild, then the commit's delta");
+        assert_eq!(root.layers.len(), 2, "the fold, then the commit's delta");
         let peer_ref = peer_ref
             .lock()
             .expect("peer ref")
@@ -3944,31 +4322,21 @@ mod tests {
                 .manifest()
                 .term_index_complete()
         );
-        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let found: HashSet<Uuid> = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("lookup")
-            .iter()
-            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
-            .collect();
-        assert_eq!(found, live, "`shared` is found in every live superfile");
+        assert_eq!(term_superfiles(&root, &storage, &rt, "shared"), live);
         // A term only the peer's superfile holds resolves to it alone, so
         // its delta's ordinal names the right superfile.
         let peer: HashSet<Uuid> = live.difference(&before).copied().collect();
         assert_eq!(peer.len(), 1, "the peer added one superfile");
-        let peer_term = format!("s{LAYERS}d00");
-        let found: HashSet<Uuid> = rt
-            .block_on(index.postings(title_id(), &peer_term))
-            .expect("lookup")
-            .iter()
-            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
-            .collect();
-        assert_eq!(found, peer, "the peer's own term resolves to its superfile");
+        assert_eq!(
+            term_superfiles(&root, &storage, &rt, &format!("s{LAYERS}d00")),
+            peer,
+            "the peer's own term resolves to its superfile"
+        );
 
         maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 1, "the next rebuild is one layer");
-        assert_eq!(root.superfiles.len(), live.len());
+        assert_eq!(root.layers.len(), 1, "the next optimize folds every layer");
+        assert_eq!(root.superfiles.len(), live.len(), "and drops the padding");
     }
 
     /// Arm `faults` so that a peer commits layer `next`, then `next + 1`,
@@ -3977,7 +4345,7 @@ mod tests {
     /// fails.
     fn commit_before_each_root_write(
         faults: &Arc<FaultStorage>,
-        peer: crate::supertable::Supertable,
+        peer: Supertable,
         next: usize,
         rounds: usize,
     ) {
@@ -3985,7 +4353,7 @@ mod tests {
             return;
         }
         let hook_faults = Arc::clone(faults);
-        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
+        faults.before(FaultOp::PutAtomic, ROOT_URI_FRAGMENT, move || {
             let committer = peer.clone();
             thread::spawn(move || commit_layer(&committer, next))
                 .join()
@@ -3995,40 +4363,34 @@ mod tests {
         });
     }
 
-    /// Commits landing before every publish do not starve the rebuild: each
+    /// Commits landing before every publish do not starve the fold: each
     /// retry stacks what landed and writes only a root, and the index it
     /// finally publishes resolves every commit's terms.
     #[test]
-    fn a_rebuild_publishes_while_commits_keep_landing() {
+    fn a_fold_publishes_while_commits_keep_landing() {
+        /// Commits that land, one before each publish of the fold.
         const ROUNDS: usize = 4;
-        let (dir, faults, storage, st) = fault_table();
-        for layer in 0..LAYERS {
-            commit_layer(&st, layer);
-        }
-        // A removed superfile stays listed, so every rebase pads.
-        let reader = st.reader().expect("reader");
-        let entries = reader.manifest().get_all_superfiles();
-        commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
-        st.block_on_query(st.refresh()).expect("refresh");
+        let (dir, faults, storage, st) = table_due_a_renumbering_fold();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, prior) = live_and_covered(&st, &storage, &rt);
         let local: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
+        let other = Supertable::open(fresh_options(&local)).expect("open");
         commit_before_each_root_write(&faults, other, LAYERS, ROUNDS);
         maintenance_only_optimize(&st);
         faults.clear();
         assert_eq!(faults.fired(), 0, "no retry wrote a slice");
 
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(
             root.layers.len(),
             1 + ROUNDS,
-            "the rebuild, then each commit's delta"
+            "the fold, then each commit's delta"
         );
         assert_eq!(
             root.superfiles.len(),
-            live.len() + 1,
-            "the removed superfile's ordinal is padded"
+            prior.superfiles.len() + ROUNDS,
+            "the fold is padded to the root it was made of"
         );
         assert!(
             st.reader()
@@ -4036,21 +4398,9 @@ mod tests {
                 .manifest()
                 .term_index_complete()
         );
-        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let resolve = |term: &str| -> HashSet<Uuid> {
-            rt.block_on(index.postings(title_id(), term))
-                .expect("lookup")
-                .iter()
-                .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
-                .collect()
-        };
-        assert_eq!(
-            resolve("shared"),
-            live,
-            "`shared` is in every live superfile"
-        );
+        assert_eq!(term_superfiles(&root, &storage, &rt, "shared"), live);
         for layer in LAYERS..LAYERS + ROUNDS {
-            let found = resolve(&format!("s{layer}d00"));
+            let found = term_superfiles(&root, &storage, &rt, &format!("s{layer}d00"));
             assert_eq!(
                 found.len(),
                 1,
@@ -4060,77 +4410,143 @@ mod tests {
         }
     }
 
-    /// An incomplete index is rebuilt by walking only the superfiles it
-    /// does not list, and a commit during the rebuild is folded in on top
-    /// of it rather than everything being rebuilt again.
+    /// A slice whose bytes no longer match its hash fails the fold that
+    /// reads it, so optimize indexes every superfile again from an empty
+    /// root rather than failing on every pass.
     #[test]
-    fn a_commit_during_the_rebuild_of_an_incomplete_index_is_caught_up() {
-        let (dir, faults, storage, st) = fault_table();
-        for layer in 0..LAYERS {
-            commit_layer(&st, layer);
-        }
-        // With its root gone, the next commit restarts the index from its
-        // own superfile alone.
-        let reference = st
-            .reader()
-            .expect("reader")
-            .manifest()
-            .term_index_ref()
-            .cloned()
-            .expect("the commits publish a root");
-        st.block_on_query(storage.delete(&reference.uri))
-            .expect("delete root");
-        commit_layer(&st, LAYERS);
-        assert!(
-            !st.reader()
-                .expect("reader")
-                .manifest()
-                .term_index_complete()
-        );
-
-        // Another process commits just before the rebuild publishes.
-        let local: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
-        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
-            thread::spawn(move || commit_layer(&other, LAYERS + 1))
-                .join()
-                .expect("peer commit");
-        });
-        maintenance_only_optimize(&st);
-
+    fn a_corrupt_slice_a_fold_reads_is_repaired_by_indexing_again() {
+        let (dir, _faults, storage, st) = table_due_a_renumbering_fold();
         let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let path = dir
+            .path()
+            .join(slice_uri(&root.layers[0].slices[0].content_hash));
+        let mut bytes = fs::read(&path).expect("read slice");
+        let last = bytes.len() - 1;
+        bytes[last] ^= u8::MAX;
+        fs::write(&path, bytes).expect("corrupt slice");
+
+        maintenance_only_optimize(&st);
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert_eq!(
-            root.layers.len(),
-            2,
-            "the rebuild, then the caught-up commit"
+            root.superfiles.len(),
+            live.len(),
+            "indexed again from empty"
         );
-        assert_eq!(root.superfiles.len(), live.len(), "no padding");
         assert!(
             st.reader()
                 .expect("reader")
                 .manifest()
                 .term_index_complete()
         );
-        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let found: HashSet<Uuid> = rt
-            .block_on(index.postings(title_id(), "shared"))
-            .expect("lookup")
-            .iter()
-            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
-            .collect();
-        assert_eq!(found, live, "`shared` is found in every live superfile");
+        assert_eq!(term_superfiles(&root, &storage, &rt, "shared"), live);
     }
 
-    /// Superfile objects end with this, whatever their stem.
-    const SUPERFILE_SUFFIX: &str = ".sf.parquet";
-
-    /// Optimize rebuilds the index from its own layers and reads no
-    /// superfile: with every superfile read failing, it still publishes one
-    /// layer over exactly the live superfiles.
+    /// A root written before slice lengths were recorded is written again
+    /// by optimize with each slice's length read from storage, so folds
+    /// size its layers by their bytes.
     #[test]
-    fn optimize_rebuilds_the_index_without_reading_superfiles() {
+    fn optimize_writes_an_unsized_root_again_with_its_slice_lengths() {
+        let (_dir, storage, st, _) = optimized_fragmented_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, sized) = live_and_covered(&st, &storage, &rt);
+        let bytes = format::encode_unsized_root(&sized);
+        let store = &storage;
+        st.block_on_query(stamp_with_retries(
+            st.inner(),
+            store,
+            "unsized root",
+            |old| {
+                let bytes = bytes.clone();
+                async move {
+                    let reference = put_content_addressed(store.as_ref(), "root", bytes).await?;
+                    Ok(Some(old.with_term_index(reference, true)))
+                }
+            },
+        ))
+        .expect("publish the unsized root");
+        let (_, planted) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            planted
+                .layers
+                .iter()
+                .flat_map(|layer| &layer.slices)
+                .all(|slice| slice.len == 0),
+            "the planted root records no lengths"
+        );
+
+        maintenance_only_optimize(&st);
+        let (_, root) = live_and_covered(&st, &storage, &rt);
+        assert_eq!(root, sized, "every length is filled in from storage");
+    }
+
+    /// Arm `faults` so that, before each of the next `rounds` batches writes
+    /// its slices, a peer that keeps no term index commits
+    /// [`UNINDEXED_SUPERFILES`] superfiles, from layer `next` on: more than
+    /// a batch indexes.
+    fn commit_unindexed_before_each_batch(
+        faults: &Arc<FaultStorage>,
+        peer: Supertable,
+        next: usize,
+        rounds: usize,
+    ) {
+        if rounds == 0 {
+            return;
+        }
+        let hook_faults = Arc::clone(faults);
+        faults.before(FaultOp::PutAtomic, "term-index/slice-", move || {
+            let committer = peer.clone();
+            thread::spawn(move || {
+                for layer in next..next + UNINDEXED_SUPERFILES {
+                    commit_layer(&committer, layer);
+                }
+            })
+            .join()
+            .expect("peer commits");
+            commit_unindexed_before_each_batch(
+                &hook_faults,
+                peer,
+                next + UNINDEXED_SUPERFILES,
+                rounds - 1,
+            );
+        });
+    }
+
+    /// Rounds of commits the peer in the pass-bound test makes: more than
+    /// the passes the first one allows, so that without the bound the call
+    /// would run on until the peer stops and the index is whole.
+    const PEER_ROUNDS: usize = 8;
+
+    /// A writer that adds superfiles without postings faster than a batch
+    /// indexes them does not keep optimize going: it stops after the passes
+    /// the index first called for, leaving the rest for the next optimize.
+    #[test]
+    fn optimize_stops_after_the_passes_the_index_first_called_for() {
+        let (dir, faults, storage, st) = table_with_unindexed_superfiles();
+        let local: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let peer = Supertable::open(fresh_options(&local).with_term_index(false)).expect("open");
+        commit_unindexed_before_each_batch(&faults, peer, UNINDEXED_SUPERFILES, PEER_ROUNDS);
+        maintenance_only_optimize(&st);
+
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (live, root) = live_and_covered(&st, &storage, &rt);
+        assert!(
+            !st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete(),
+            "superfiles were still being added when it stopped"
+        );
+        assert!(root.superfiles.len() < live.len());
+    }
+
+    /// Optimize reads no superfile when the index already lists every live
+    /// one: after a removal there is nothing to index, so with every
+    /// superfile read failing it still completes, and every live superfile
+    /// is found.
+    #[test]
+    fn optimize_reads_no_superfile_when_every_one_is_indexed() {
         let (_dir, faults, storage, st) = fault_table();
         for layer in 0..LAYERS {
             commit_layer(&st, layer);
@@ -4140,8 +4556,8 @@ mod tests {
         commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
         drop(reader);
         drop(st);
-        // A fresh handle holds no superfile in memory, so a walk would have
-        // to read them from storage.
+        // A fresh handle holds no superfile in memory, so indexing one would
+        // read it from storage.
         let st = crate::supertable::Supertable::open(fresh_options(&storage)).expect("open");
         faults.fail(FaultOp::Get, SUPERFILE_SUFFIX, usize::MAX);
         faults.fail(FaultOp::GetRange, SUPERFILE_SUFFIX, usize::MAX);
@@ -4151,8 +4567,6 @@ mod tests {
 
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 1);
-        assert_eq!(root.superfiles.len(), live.len());
         assert!(
             st.reader()
                 .expect("reader")
@@ -4160,72 +4574,18 @@ mod tests {
                 .term_index_complete()
         );
         let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
-        let found: HashSet<Uuid> = rt
+        let posted: HashSet<Uuid> = rt
             .block_on(index.postings(title_id(), "shared"))
             .expect("lookup")
             .iter()
             .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
             .collect();
-        assert_eq!(found, live, "`shared` is found in every live superfile");
+        assert!(posted.is_superset(&live), "every live superfile is found");
     }
 
-    /// The merged index is byte for byte the one walking every superfile
-    /// builds. The table has been compacted (so the merge copied the
-    /// compaction's delta), appended to and had a superfile removed; the
-    /// walk, forced by deleting the published root, publishes that same
-    /// root again.
-    #[test]
-    fn the_merged_index_is_the_one_walking_every_superfile_builds() {
-        let (dir, storage, st) = fresh_table();
-        for layer in 0..LAYERS {
-            commit_layer(&st, layer);
-        }
-        let before = st.reader().expect("reader").n_superfiles();
-        st.optimize(&OptimizeOptions::compact(CompactionSettings {
-            min_fill_percent: 1,
-            min_superfiles_for_merge: 2,
-            ..CompactionSettings::default()
-        }))
-        .expect("compacting optimize");
-        assert!(
-            st.reader().expect("reader").n_superfiles() < before,
-            "compaction must have merged"
-        );
-        commit_layer(&st, LAYERS);
-        commit_layer(&st, LAYERS + 1);
-        let reader = st.reader().expect("reader");
-        let entries = reader.manifest().get_all_superfiles();
-        commit_without_postings(&st, &storage, Vec::new(), &entries[entries.len() - 1..]);
-        drop(reader);
-        st.block_on_query(st.refresh()).expect("refresh");
-        maintenance_only_optimize(&st);
-        let merged = st
-            .reader()
-            .expect("reader")
-            .manifest()
-            .term_index_ref()
-            .cloned()
-            .expect("the merge publishes a root");
-        drop(st);
-
-        let root_path = dir.path().join(&merged.uri);
-        fs::remove_file(&root_path).expect("remove root");
-        let st = crate::supertable::Supertable::open(fresh_options(&storage)).expect("open");
-        maintenance_only_optimize(&st);
-        assert!(root_path.exists(), "the walk wrote its root");
-        assert_eq!(
-            st.reader()
-                .expect("reader")
-                .manifest()
-                .term_index_ref()
-                .cloned(),
-            Some(merged),
-            "walking every superfile builds the same root"
-        );
-    }
-
-    /// A slice the root names that is gone cannot be merged, so the rebuild
-    /// walks every superfile instead and still publishes a whole index.
+    /// A slice the root names that is gone leaves the index unusable, so
+    /// optimize indexes every superfile again from an empty root, a batch
+    /// at a time, and publishes a whole index.
     #[test]
     fn a_missing_slice_falls_back_to_walking_every_superfile() {
         let (dir, storage, st) = fresh_table();
@@ -4251,63 +4611,20 @@ mod tests {
         assert_eq!(found, live, "`shared` is found in every live superfile");
     }
 
-    /// When the retry cannot read the current root, it falls back to the
-    /// last build. If that already lists every live superfile, it is
-    /// published as it is, without an empty layer.
-    #[test]
-    fn a_retry_with_nothing_to_catch_up_adds_no_layer() {
-        let (dir, faults, storage, st) = fault_table();
-        for layer in 0..LAYERS {
-            commit_layer(&st, layer);
-        }
-
-        // Just before the rebuild publishes, another process removes a
-        // superfile, and the root then fails to load twice: once for the
-        // retry's rebuild check, once for the fold.
-        let local: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
-        let other = crate::supertable::Supertable::open(fresh_options(&local)).expect("open");
-        let hook_faults = Arc::clone(&faults);
-        faults.before(FaultOp::PutAtomic, "term-index/root-", move || {
-            thread::spawn(move || {
-                let reader = other.reader().expect("reader");
-                let entries = reader.manifest().get_all_superfiles();
-                commit_without_postings(&other, &local, Vec::new(), &entries[..1]);
-            })
-            .join()
-            .expect("peer commit");
-            hook_faults.fail(FaultOp::Get, "term-index/root-", 2);
-        });
-        maintenance_only_optimize(&st);
-        // The retry loads the root twice, for the rebuild check and the
-        // fold, because a failure that may pass is not cached.
-        assert_eq!(faults.fired(), 2, "both root loads failed");
-
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 1, "the build alone, no empty layer");
-        let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-        assert!(listed.is_superset(&live), "every live superfile is listed");
-        assert!(
-            st.reader()
-                .expect("reader")
-                .manifest()
-                .term_index_complete()
-        );
-    }
-
     /// A commit that only removes superfiles appends no layer and leaves
-    /// the index complete, but the root still lists the removed superfile.
-    /// Only the live-set check sees it.
+    /// the index complete, with the removed superfile still listed. That
+    /// calls for no term-index write: its postings are followed by nothing,
+    /// and every live superfile is still found.
     #[test]
-    fn a_removal_only_commit_triggers_the_rebuild() {
+    fn a_removal_only_commit_calls_for_no_term_index_write() {
         let (_dir, faults, storage, st) = optimized_fault_table();
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let (_, before) = live_and_covered(&st, &storage, &rt);
         let reader = st.reader().expect("reader");
         let entries = reader.manifest().get_all_superfiles();
         commit_without_postings(&st, &storage, Vec::new(), &entries[..1]);
         // A direct commit does not advance the handle; adopt it.
         st.block_on_query(st.refresh()).expect("refresh");
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
         let (live, root) = live_and_covered(&st, &storage, &rt);
         assert!(
             st.reader()
@@ -4315,24 +4632,28 @@ mod tests {
                 .manifest()
                 .term_index_complete()
         );
-        assert_eq!(root.layers.len(), 1, "a removal appends no delta");
+        assert_eq!(root, before, "a removal appends no delta");
         assert_eq!(
             root.superfiles.len(),
             live.len() + 1,
             "the removed one is still listed"
         );
 
-        assert!(optimize_rebuilds_term_index(&st, &faults));
-        maintenance_only_optimize(&st);
-        let (live, root) = live_and_covered(&st, &storage, &rt);
-        let covered: HashSet<Uuid> = root.superfiles.iter().copied().collect();
-        assert_eq!(covered, live, "the rebuild drops the removed superfile");
+        assert!(!optimize_writes_term_index(&st, &faults));
+        let index = TermIndex::new(root, String::new(), Arc::clone(&storage), None);
+        let posted: HashSet<Uuid> = rt
+            .block_on(index.postings(title_id(), "shared"))
+            .expect("lookup")
+            .iter()
+            .map(|p| index.superfile_id(p.superfile).expect("ordinal resolves"))
+            .collect();
+        assert!(posted.is_superset(&live), "every live superfile is found");
     }
 
-    /// An index marked incomplete is rebuilt even when its root already has
-    /// one layer over exactly the live superfiles.
+    /// An index marked incomplete whose root already lists every live
+    /// superfile is marked complete, with no term-index object written.
     #[test]
-    fn an_incomplete_index_triggers_the_rebuild() {
+    fn an_incomplete_index_listing_every_superfile_is_marked_complete() {
         let (_dir, faults, storage, st) = fault_table();
         commit_layer(&st, 0);
         // Adding then removing an unindexed superfile leaves the root as it
@@ -4347,7 +4668,13 @@ mod tests {
                 .manifest()
                 .term_index_complete()
         );
-        assert!(optimize_rebuilds_term_index(&st, &faults));
+        assert!(!optimize_writes_term_index(&st, &faults));
+        assert!(
+            st.reader()
+                .expect("reader")
+                .manifest()
+                .term_index_complete()
+        );
     }
 
     /// A root that is gone is rebuilt.
@@ -4365,7 +4692,7 @@ mod tests {
         fs::remove_file(dir.path().join(&reference.uri)).expect("remove root");
         // A fresh handle, so no loaded index is cached in memory.
         let st = crate::supertable::Supertable::open(fresh_options(&storage)).expect("open");
-        assert!(optimize_rebuilds_term_index(&st, &faults));
+        assert!(optimize_writes_term_index(&st, &faults));
     }
 
     /// Every ceiling the index computes is an upper bound on the score any
@@ -4860,10 +5187,11 @@ mod tests {
     }
 
     /// Every commit writes its layer's tier chunks and names them from the
-    /// root; the rebuild carries them into the base; a sweep past the gap
-    /// keeps what the current root names and nothing a replaced root named.
+    /// root; optimize, with nothing to index or fold, keeps them as they
+    /// are; a sweep past the gap keeps what the current root names and
+    /// nothing a replaced root named.
     #[test]
-    fn commits_write_tiers_the_rebuild_keeps_and_the_sweep_respects() {
+    fn commits_write_tiers_optimize_keeps_and_the_sweep_respects() {
         let (dir, storage, st) = fresh_table();
         commit_layer(&st, 0);
         commit_layer(&st, 1);
@@ -4924,47 +5252,19 @@ mod tests {
         );
 
         st.optimize(&maintenance_only_options()).expect("optimize");
-        let rebuilt = rt
+        let kept_root = rt
             .block_on(load_root(storage.as_ref(), &current_ref()))
             .expect("root");
-        assert_eq!(rebuilt.layers.len(), 1, "the rebuild folds the deltas");
-        assert!(
-            rebuilt.layers[0]
-                .slices
-                .iter()
-                .any(|slice| slice.tier.is_some())
-        );
-        let index = TermIndex::new(rebuilt.clone(), String::new(), Arc::clone(&storage), None);
-        let runs = rt
-            .block_on(index.runs_many(title_id(), &["shared"]))
-            .expect("runs")
-            .remove(0);
-        assert_eq!(runs.len(), 1, "one run in the rebuilt base");
-        let object = runs[0].tier_object.expect("the slice has a tier object");
-        let tier = runs[0]
-            .run
-            .tier
-            .as_ref()
-            .expect("the merged run has a tier");
-        let entries = rt
-            .block_on(index.tier_entries(&object, tier))
-            .expect("tier entries");
         assert_eq!(
-            entries.len(),
-            2 * DOCS_PER_LAYER,
-            "the base tier covers every document"
-        );
-        assert!(
-            entries
-                .iter()
-                .all(|e| index.superfile_id(e.superfile).is_some()),
-            "every tier entry names a listed superfile"
+            objects_named_by(&kept_root),
+            named,
+            "optimize keeps the tier objects the commits wrote"
         );
 
         st.gc(Duration::ZERO).expect("gc");
         let kept = tier_objects(&dir);
         let named: HashSet<String> = rt
-            .block_on(async { objects_named_by(&rebuilt) })
+            .block_on(async { objects_named_by(&kept_root) })
             .into_iter()
             .filter(|o| o.starts_with("tier-"))
             .collect();
@@ -5283,7 +5583,8 @@ mod tests {
             w.append(&batch).expect("append");
             w.commit().expect("commit");
         }
-        st.refresh_term_index_sync().expect("maintenance rebuild");
+        st.refresh_term_index_sync(max_merge_input_bytes(&CompactionSettings::default()))
+            .expect("maintenance refresh");
         let rt = tokio::runtime::Runtime::new().expect("rt");
         let reader = st.reader().expect("reader");
         let manifest = reader.manifest();
@@ -5293,7 +5594,11 @@ mod tests {
             .block_on(manifest.term_index())
             .expect("index")
             .expect("indexed");
-        assert_eq!(index.root().layers.len(), 1, "one folded layer");
+        assert!(
+            index.root().layers.len() < 9,
+            "the commits' layers folded: {}",
+            index.root().layers.len()
+        );
         let run = rt
             .block_on(index.postings(title_id(), "shared"))
             .expect("postings");
@@ -6659,8 +6964,7 @@ mod tests {
     /// A slice target below any slice's size, so the bound on what a commit
     /// folds refuses every run.
     const TINY_SLICE_TARGET_BYTES: usize = 64;
-    /// Large commits that make a prior root's layers a level of their own.
-    const LARGE_PRIOR_COMMITS: u128 = 3;
+
     /// Commit ids beyond any stream's, for a reserved layer's superfile.
     const RESERVED_ID: u128 = 99;
 
@@ -6834,6 +7138,285 @@ mod tests {
         assert_routes_every_commit(&root, &local, commits).await;
     }
 
+    /// The superfile the optimize-fold test treats as removed: one whose
+    /// layer is in the run the fold rewrites.
+    const REMOVED_ID: u128 = 3;
+
+    /// Optimize folds a run a commit left for being past one slice, and
+    /// drops the postings of a superfile no longer live from the layers it
+    /// rewrites. Ordinals are untouched, so every other term routes as it
+    /// did. A run past the bound it is given is left as it is.
+    #[tokio::test]
+    async fn optimize_folds_the_runs_commits_leave_and_drops_removed_superfiles() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: TINY_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
+        };
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let mut root = base;
+        let commits = FOLD_FAN_OUT as u128;
+        for id in 2..=commits {
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
+        }
+        assert_eq!(root.layers.len(), FOLD_FAN_OUT, "no commit folded");
+        let run_bytes = root_bytes(&root);
+        let removed = Uuid::from_u128(REMOVED_ID);
+        let live: HashSet<Uuid> = root
+            .superfiles
+            .iter()
+            .copied()
+            .filter(|id| *id != removed)
+            .collect();
+        assert!(
+            plan_fold_at_optimize(&root, &live, run_bytes - 1, true, false).is_none(),
+            "a run past the bound waits"
+        );
+        let fold =
+            plan_fold_at_optimize(&root, &live, run_bytes, true, false).expect("a fold is due");
+        let listed = root.superfiles.clone();
+
+        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+            .await
+            .expect("fold");
+
+        assert_eq!(root.layers.len(), 1, "the run folds into one layer");
+        assert!(plan_fold_at_optimize(&root, &live, run_bytes, true, false).is_none());
+        assert_eq!(root.superfiles, listed, "ordinals are untouched");
+        let expected: Vec<Uuid> = (1..=commits)
+            .map(Uuid::from_u128)
+            .filter(|id| *id != removed)
+            .collect();
+        assert_eq!(
+            posted_superfiles(&root, &local, "shared").await,
+            expected,
+            "a term in every commit routes to every live superfile in commit order"
+        );
+        assert!(
+            posted_superfiles(&root, &local, &format!("own{REMOVED_ID}"))
+                .await
+                .is_empty(),
+            "the removed superfile's postings are dropped"
+        );
+        for id in (2..=commits).filter(|&id| id != REMOVED_ID) {
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                [Uuid::from_u128(id)],
+                "a term of one commit routes to that superfile alone"
+            );
+        }
+    }
+
+    /// Superfiles the renumbering test keeps live: fewer than half of the
+    /// fan-out's commits, so at least half the root's list is dead.
+    const LIVE_AFTER_REMOVALS: u128 = 3;
+
+    /// Once at least half of the root's list is dead, optimize folds every
+    /// layer into one and numbers the live superfiles afresh, so the list
+    /// shrinks to them and every live term routes as before. An index past
+    /// the bound is not renumbered, and its run waits.
+    #[tokio::test]
+    async fn optimize_renumbers_a_mostly_dead_root_into_one_layer() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            slice_target_bytes: TINY_SLICE_TARGET_BYTES,
+            ..BuildPolicy::default()
+        };
+        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let mut root = base;
+        let commits = FOLD_FAN_OUT as u128;
+        for id in 2..=commits {
+            root = commit_delta(&dir, &local, root, id, false, &policy).await;
+        }
+        let index_bytes = root_bytes(&root);
+        let kept: Vec<Uuid> = (1..=LIVE_AFTER_REMOVALS).map(Uuid::from_u128).collect();
+        let live: HashSet<Uuid> = kept.iter().copied().collect();
+        assert!(
+            plan_fold_at_optimize(&root, &live, index_bytes - 1, true, false).is_none(),
+            "an index past the bound is neither renumbered nor folded"
+        );
+        let run =
+            plan_fold_at_optimize(&root, &live, index_bytes, false, false).expect("a run is due");
+        assert!(
+            !run.renumbers(),
+            "without leave to renumber, the run folds alone"
+        );
+        let fold =
+            plan_fold_at_optimize(&root, &live, index_bytes, true, false).expect("a fold is due");
+        assert!(fold.renumbers());
+        assert_eq!(
+            fold.superfiles(),
+            &kept[..],
+            "the live superfiles, in order"
+        );
+
+        let root = fold_at_optimize(&local, &root, fold, &policy, None)
+            .await
+            .expect("fold");
+
+        assert_eq!(root.layers.len(), 1, "every layer folds into one");
+        assert_eq!(
+            root.superfiles, kept,
+            "the list holds the live superfiles alone"
+        );
+        assert!(plan_fold_at_optimize(&root, &live, index_bytes, true, false).is_none());
+        assert_eq!(posted_superfiles(&root, &local, "shared").await, kept);
+        for id in 2..=commits {
+            let expected: Vec<Uuid> = match id <= LIVE_AFTER_REMOVALS {
+                true => vec![Uuid::from_u128(id)],
+                false => Vec::new(),
+            };
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                expected,
+                "a live commit's term routes to it alone; a removed one's is dropped"
+            );
+        }
+    }
+
+    /// `check_objects` finds every object a root names and fills in the
+    /// slice lengths a root written before they were recorded lacks, asking
+    /// again only about those; an object gone from storage makes the root
+    /// missing.
+    #[tokio::test]
+    async fn check_objects_fills_in_slice_lengths_and_finds_a_missing_object() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (store_dir, local, base) = store_with_base(&dir, &policy).await;
+        let root = commit_delta(&dir, &local, base, 2, false, &policy).await;
+        let seen = Mutex::new(HashSet::new());
+        let mut unsized_root = root.clone();
+        for slice in unsized_root
+            .layers
+            .iter_mut()
+            .flat_map(|layer| &mut layer.slices)
+        {
+            slice.len = 0;
+        }
+        assert_eq!(
+            check_objects(&local, &mut unsized_root, &seen)
+                .await
+                .expect("check"),
+            RootObjects::Present {
+                sized: true,
+                before_tiers: false
+            }
+        );
+        assert_eq!(unsized_root, root, "each length is the slice's on storage");
+        let mut sized_root = root.clone();
+        assert_eq!(
+            check_objects(&local, &mut sized_root, &seen)
+                .await
+                .expect("check"),
+            RootObjects::Present {
+                sized: false,
+                before_tiers: false
+            }
+        );
+
+        let slice = &root.layers[0].slices[0];
+        fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash))).expect("remove");
+        let mut root = root.clone();
+        assert_eq!(
+            check_objects(&local, &mut root, &Mutex::new(HashSet::new()))
+                .await
+                .expect("check"),
+            RootObjects::Missing
+        );
+    }
+
+    /// A one-slice layer, told apart by `tag`.
+    fn tagged_layer(tag: u8) -> Layer {
+        Layer {
+            slices: vec![format::SliceRef {
+                first_key: vec![tag],
+                last_key: vec![tag],
+                content_hash: ContentHash::of(&[tag]),
+                tier: None,
+                len: 0,
+            }],
+        }
+    }
+
+    /// A root listing `ids` (each its own `id_min`; `0` is padding) over
+    /// one tagged layer per `tags`.
+    fn tagged_root(ids: &[u128], tags: &[u8]) -> Root {
+        Root {
+            superfiles: ids.iter().map(|&id| Uuid::from_u128(id)).collect(),
+            id_mins: ids.iter().map(|&id| id as i128).collect(),
+            layers: tags.iter().map(|&tag| tagged_layer(tag)).collect(),
+        }
+    }
+
+    /// The layers committed on top of `prior` are the ones `current` adds;
+    /// none when nothing was committed.
+    #[test]
+    fn layers_since_are_the_deltas_committed_on_top_of_prior() {
+        let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
+        // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
+        let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
+        assert_eq!(
+            layers_since(&prior, &current),
+            Some(&[tagged_layer(2), tagged_layer(3)][..])
+        );
+        assert_eq!(layers_since(&prior, &prior), Some(&[][..]));
+    }
+
+    /// A root not built on `prior` has no deltas on top of it.
+    #[test]
+    fn layers_since_refuses_a_root_not_built_on_prior() {
+        let prior = tagged_root(&[1, 2], &[0]);
+        let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
+        assert_eq!(layers_since(&prior, &rebuilt_elsewhere), None);
+
+        let mut id_mins_differ = tagged_root(&[1, 2, 4], &[0, 1]);
+        id_mins_differ.id_mins[0] += 1;
+        assert_eq!(layers_since(&prior, &id_mins_differ), None);
+    }
+
+    /// The fold is padded to `prior`'s length and the deltas committed
+    /// since go on top as they are, so their ordinals still name their
+    /// superfiles.
+    #[test]
+    fn rebase_stacks_the_deltas_on_the_padded_fold() {
+        let prior = tagged_root(&[1, 2, 3, 4], &[0, 1]);
+        // The fold renumbered, dropping 1 and 4, which were removed.
+        let base = tagged_root(&[2, 3], &[9]);
+        // Two commits since: 5 at ordinal 4, 6 at ordinal 5.
+        let current = tagged_root(&[1, 2, 3, 4, 5, 6], &[0, 1, 2, 3]);
+        assert_eq!(
+            rebase(&base, &prior, &current),
+            Some(tagged_root(&[2, 3, 0, 0, 5, 6], &[9, 2, 3]))
+        );
+    }
+
+    /// With nothing committed on top of `prior`, the fold stands as it is.
+    #[test]
+    fn rebase_without_new_commits_is_the_fold() {
+        let prior = tagged_root(&[1, 2, 3], &[0, 1]);
+        let base = tagged_root(&[2, 3], &[9]);
+        assert_eq!(rebase(&base, &prior, &prior), Some(base));
+    }
+
+    /// No rebase onto a root not built on `prior`, nor of a fold listing
+    /// more superfiles than `prior`, whose ordinals would collide with the
+    /// deltas'.
+    #[test]
+    fn rebase_refuses_what_it_cannot_stack() {
+        let prior = tagged_root(&[1, 2], &[0]);
+        let base = tagged_root(&[1, 2], &[9]);
+        let rebuilt_elsewhere = tagged_root(&[1, 3], &[7, 8]);
+        assert_eq!(rebase(&base, &prior, &rebuilt_elsewhere), None);
+
+        let longer = tagged_root(&[1, 2, 7], &[9]);
+        let current = tagged_root(&[1, 2, 5], &[0, 1]);
+        assert_eq!(rebase(&longer, &prior, &current), None);
+    }
+
+    /// The slice bytes all of `root`'s layers hold.
+    fn root_bytes(root: &Root) -> u64 {
+        root.layers.iter().map(layer_bytes).sum()
+    }
     /// A fold that cannot read the slices it would merge does not fail the
     /// commit: the root is published unfolded, every layer in it, and
     /// routes as before.
@@ -6864,11 +7447,11 @@ mod tests {
     }
 
     /// A retry that appends its reserved layer onto a winner's root folds
-    /// the run beneath it like any delta: the reserved layer stays as
-    /// built and newest, the padding up to its ordinal is kept, and every
+    /// the run beneath it like any delta: the reserved layer, moved to the
+    /// winner's length, stays newest, the root is not padded, and every
     /// term routes to its superfile.
     #[tokio::test]
-    async fn a_fold_on_the_retry_path_keeps_the_reserved_layer_and_padding() {
+    async fn a_fold_on_the_retry_path_keeps_the_reserved_layer_newest() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
@@ -6916,11 +7499,14 @@ mod tests {
         assert_eq!(
             root.layers.last(),
             Some(layer),
-            "the reserved layer is appended as it was built"
+            "the reserved layer is appended as it was moved"
         );
-        let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
-        let ordinal = reserved.as_ref().expect("reserved").base as usize;
-        assert_eq!(padding, ordinal - winner.superfiles.len());
+        assert_eq!(
+            reserved.as_ref().expect("reserved").base as usize,
+            winner.superfiles.len(),
+            "moved to the winner's length"
+        );
+        assert!(!root.superfiles.contains(&Uuid::nil()), "no padding");
         let mut expected: Vec<Uuid> = (1..=winner_id).map(Uuid::from_u128).collect();
         expected.push(Uuid::from_u128(RESERVED_ID));
         assert_eq!(posted_superfiles(&root, &local, "shared").await, expected);
@@ -6930,63 +7516,12 @@ mod tests {
         );
     }
 
-    /// A rebuild made from a prior root stacks the layers committed since
-    /// it when a fold stayed wholly above it: a prior of large commits is a
-    /// level of its own, the small commits after it fold among themselves,
-    /// and the prior is still a prefix of the folded root.
+    /// A retry that lost to a commit which left the root's list as it was —
+    /// one that only removed superfiles — appends the layer it already
+    /// built: no slice is written again, nothing is padded, and every
+    /// posting names the right superfile.
     #[tokio::test]
-    async fn a_rebuild_stacks_a_fold_wholly_above_its_prior() {
-        let dir = TempDir::new().expect("tempdir");
-        let policy = BuildPolicy::default();
-        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
-        let mut prior = base;
-        let last_prior = 1 + LARGE_PRIOR_COMMITS;
-        for id in 2..=last_prior {
-            prior = commit_delta(&dir, &local, prior, id, true, &policy).await;
-        }
-        let mut current = prior.clone();
-        let last = last_prior + FOLD_FAN_OUT as u128 + 1;
-        for id in last_prior + 1..=last {
-            current = commit_delta(&dir, &local, current, id, false, &policy).await;
-        }
-        assert_eq!(
-            current.layers.len(),
-            prior.layers.len() + 2,
-            "the small commits folded into one layer beneath the newest"
-        );
-        assert!(layers_since(&prior, &current).is_some());
-        let stacked = rebase(&prior, &prior, &current).expect("stacked onto the rebuild");
-        assert_routes_every_commit(&stacked, &local, last).await;
-    }
-
-    /// A fold that reached into a rebuild's prior root leaves no prefix to
-    /// stack on: the rebuild is told so, and catches up instead.
-    #[tokio::test]
-    async fn a_rebuild_catches_up_when_a_fold_reached_into_its_prior() {
-        let dir = TempDir::new().expect("tempdir");
-        let policy = BuildPolicy::default();
-        let (_store_dir, local, base) = store_with_base(&dir, &policy).await;
-        let mut prior = base;
-        let last_prior = 3;
-        for id in 2..=last_prior {
-            prior = commit_delta(&dir, &local, prior, id, false, &policy).await;
-        }
-        let mut current = prior.clone();
-        let last = FOLD_FAN_OUT as u128 + 1;
-        for id in last_prior + 1..=last {
-            current = commit_delta(&dir, &local, current, id, false, &policy).await;
-        }
-        assert_eq!(current.layers.len(), 2, "the fold took the prior's layers");
-        assert_eq!(layers_since(&prior, &current), None);
-        assert_eq!(rebase(&prior, &prior, &current), None);
-        assert_routes_every_commit(&current, &local, last).await;
-    }
-
-    /// A retry appends the layer it already built onto the winner's root:
-    /// no slice is written again, the root is padded up to the reserved
-    /// ordinal, and every posting names the right superfile.
-    #[tokio::test]
-    async fn append_reserved_reuses_its_layer_on_a_longer_root() {
+    async fn append_reserved_reuses_its_layer_on_an_unchanged_list() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -7006,25 +7541,11 @@ mod tests {
         )
         .await
         .expect("first attempt");
-
-        // Another commit publishes a delta first.
-        let winner = append_delta(
-            &local,
-            Some(prior.clone()),
-            &[contribution(&dir, 2, &[("body", "shared", 4)])],
-            &policy,
-            None,
-        )
-        .await
-        .expect("winner's delta");
-        let winner = load_root(local.as_ref(), &winner)
-            .await
-            .expect("winner root");
         let slices_before_retry = slice_objects(&store_dir);
 
         let reference = append_reserved(
             &local,
-            Some(winner.clone()),
+            Some(prior.clone()),
             &merged,
             &policy,
             &mut reserved,
@@ -7039,15 +7560,14 @@ mod tests {
             "the retry writes no slice"
         );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let base = prior.superfiles.len() + RESERVED_ORDINAL_SLACK as usize;
+        let base = prior.superfiles.len();
         assert_eq!(root.superfiles.len(), base + 1);
         assert_eq!(root.superfiles[base], Uuid::from_u128(9));
-        let padding = root.superfiles.iter().filter(|id| id.is_nil()).count();
-        assert_eq!(padding, base - winner.superfiles.len());
+        assert!(!root.superfiles.contains(&Uuid::nil()), "no padding");
         assert_eq!(
             posted_superfiles(&root, &local, "shared").await,
-            [1, 2, 9].map(Uuid::from_u128),
-            "base, winner, then the reserved layer"
+            [1, 9].map(Uuid::from_u128),
+            "base, then the reserved layer"
         );
         assert_eq!(
             posted_superfiles(&root, &local, "merged").await,
@@ -7055,9 +7575,9 @@ mod tests {
         );
     }
 
-    /// A root grown past the reserved ordinal gets the layer moved, other
-    /// contributions get one built again; either way its postings name the
-    /// right superfile.
+    /// A root whose list grew since the layer was built gets the layer
+    /// moved to its length, other contributions get one built again; either
+    /// way its postings name the right superfile.
     #[tokio::test]
     async fn append_reserved_moves_or_rebuilds_when_it_cannot_reuse() {
         let dir = TempDir::new().expect("tempdir");
@@ -7076,9 +7596,9 @@ mod tests {
         .await
         .expect("first attempt");
 
-        // More commits than the reservation leaves room for.
+        // Commits landed first.
         let mut outgrown = prior.clone();
-        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
+        let extra = LANDED_FIRST;
         outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
         outgrown.id_mins.extend(repeat_n(0, extra));
         let slices_before = slice_objects(&store_dir);
@@ -7098,10 +7618,7 @@ mod tests {
             "moved slices written"
         );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        assert_eq!(
-            root.superfiles.len(),
-            outgrown.superfiles.len() + RESERVED_ORDINAL_SLACK as usize + 1
-        );
+        assert_eq!(root.superfiles.len(), outgrown.superfiles.len() + 1);
         assert_eq!(
             posted_superfiles(&root, &local, "merged").await,
             [Uuid::from_u128(9)]
@@ -7119,6 +7636,9 @@ mod tests {
         );
         assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
     }
+
+    /// Superfiles other commits list before a retry in the move tests.
+    const LANDED_FIRST: usize = 3;
 
     /// A slice target small enough that a few terms make several slices.
     const SMALL_SLICE_TARGET_BYTES: usize = 64;
@@ -7229,10 +7749,9 @@ mod tests {
         assert_eq!(built.slices, before, "kept bytes untouched");
     }
 
-    /// A retry whose root outgrew the reservation moves the layer it built
-    /// rather than building it again: it succeeds with the contributions'
-    /// spill gone, and publishes the layer a build at the new ordinals
-    /// would.
+    /// A retry whose root's list grew moves the layer it built rather than
+    /// building it again: it succeeds with the contributions' spill gone,
+    /// and publishes the layer a build at the new ordinals would.
     #[tokio::test]
     async fn append_reserved_moves_its_layer_without_its_contributions() {
         let dir = TempDir::new().expect("tempdir");
@@ -7252,10 +7771,11 @@ mod tests {
         .expect("first attempt");
 
         let mut outgrown = prior;
-        let extra = RESERVED_ORDINAL_SLACK as usize + 1;
-        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
-        outgrown.id_mins.extend(repeat_n(0, extra));
-        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        outgrown
+            .superfiles
+            .extend(repeat_n(Uuid::nil(), LANDED_FIRST));
+        outgrown.id_mins.extend(repeat_n(0, LANDED_FIRST));
+        let base = outgrown.superfiles.len() as u32;
         let expected = build_layer(&merged, &policy, base).expect("build at the new base");
         for c in &merged {
             fs::remove_file(&c.path).expect("drop the contribution spill");
@@ -7315,7 +7835,7 @@ mod tests {
         .await
         .expect("built again");
         let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let base = outgrown.superfiles.len() as u32 + RESERVED_ORDINAL_SLACK;
+        let base = outgrown.superfiles.len() as u32;
         let expected = build_layer(&merged, &policy, base).expect("build at the new base");
         assert_eq!(root.layers.last(), Some(&expected.layer));
 
@@ -7352,12 +7872,12 @@ mod tests {
         prior
     }
 
-    /// A compaction that loses its commit to an ingest commit appends the
-    /// term-index layer it already built: every slice on storage is one
-    /// the root names, the index stays complete, and the merged superfile's
-    /// terms route to it. Optimize's rebuild then drops the padding.
+    /// A compaction that loses its commit to an ingest commit moves the
+    /// term-index layer it already built to the winner's length, as an
+    /// append does: the root carries no padding, the index stays complete,
+    /// and the merged superfile's terms route to it.
     #[test]
-    fn a_compaction_retry_reuses_its_term_index_layer() {
+    fn a_compaction_retry_moves_its_term_index_layer_without_padding() {
         let (dir, faults, storage, st) = fault_table();
         for layer in 0..LAYERS {
             commit_layer(&st, layer);
@@ -7385,24 +7905,9 @@ mod tests {
         // lost and its commit landed on a retry.
         assert_eq!(live.len(), 2, "the merged superfile and the peer's");
         assert!(live.is_disjoint(&before), "every input was merged");
-        let named: HashSet<String> = root
-            .layers
-            .iter()
-            .flat_map(|s| &s.slices)
-            .map(|s| {
-                slice_uri(&s.content_hash)
-                    .trim_start_matches(STORAGE_PREFIX)
-                    .to_string()
-            })
-            .collect();
-        assert_eq!(
-            slice_objects(&dir),
-            named,
-            "the retry wrote no slice of its own"
-        );
         assert!(
-            root.superfiles.iter().any(Uuid::is_nil),
-            "the root is padded up to the reserved ordinal"
+            !root.superfiles.iter().any(Uuid::is_nil),
+            "the root is not padded"
         );
         assert!(
             st.reader()
@@ -7419,15 +7924,6 @@ mod tests {
             .filter(|id| live.contains(id))
             .collect();
         assert_eq!(found, live, "`shared` routes to every live superfile");
-
-        maintenance_only_optimize(&st);
-        let (live, root) = live_and_covered(&st, &storage, &rt);
-        assert_eq!(root.layers.len(), 1);
-        assert!(
-            root.superfiles.iter().all(|id| !id.is_nil()),
-            "the rebuild drops the padding"
-        );
-        assert_eq!(root.superfiles.len(), live.len());
     }
 
     /// A root layout version older than the one this engine reads.
@@ -7461,7 +7957,7 @@ mod tests {
                 let bytes = bytes.clone();
                 async move {
                     let reference = put_content_addressed(storage.as_ref(), "root", bytes).await?;
-                    Ok(Some(old.with_term_index(reference)))
+                    Ok(Some(old.with_term_index(reference, true)))
                 }
             },
         ))
@@ -7565,13 +8061,12 @@ mod tests {
     }
 
     /// A root that fails to load for now fails the optimize and writes no
-    /// index object; the next optimize, with the root readable, folds the
-    /// index as usual.
+    /// index object; the next optimize, with the root readable, finds the
+    /// appended delta already indexed and writes nothing either.
     #[test]
-    fn a_transient_root_failure_fails_optimize_without_rebuilding() {
+    fn a_transient_root_failure_fails_optimize_and_writes_nothing() {
         let (_dir, faults, storage, st) = optimized_fault_table();
-        // An appended delta, so the next optimize has to load the root to
-        // decide whether to rebuild.
+        // An appended delta, so the next optimize has a root to load.
         commit_layer(&st, LAYERS);
         drop(st);
         let st = Supertable::open(fresh_options(&storage)).expect("open");
@@ -7585,7 +8080,7 @@ mod tests {
             fired_before + 1,
             "the root GET failed and no index object was written"
         );
-        assert!(optimize_rebuilds_term_index(&st, &faults));
+        assert!(!optimize_writes_term_index(&st, &faults));
     }
 
     /// A slice the root names that is gone fails the read.

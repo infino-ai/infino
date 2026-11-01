@@ -226,7 +226,7 @@ pub struct Manifest {
     pub term_index: Option<RoutingRef>,
     /// Whether `term_index` lists every live superfile. A table whose first
     /// index was built after it already held superfiles (an upgrade) is
-    /// incomplete until a maintenance rebuild; a query then routes parts
+    /// incomplete until maintenance indexes the rest; a query then routes parts
     /// by their summaries rather than by the index.
     pub term_index_complete: bool,
     /// Entries — one per manifest part referenced by this
