@@ -2285,6 +2285,94 @@ impl FtsBuilder {
         self.n_docs = self.n_docs.max(col.doc_lengths.len() as u32);
     }
 
+    /// Whether every column's postings are still in RAM, which is what
+    /// [`Self::absorb`] needs of both sides.
+    pub(crate) fn is_in_ram(&self) -> bool {
+        self.postings.iter().all(|cp| !cp.is_spilled())
+    }
+
+    /// Take `other`'s documents in behind this builder's own: its documents
+    /// become ids `self.n_docs..`, its terms are interned here and its
+    /// posting lists appended, doc ids offset, to the lists they fall
+    /// under. Both builders must hold the same columns, be fed in row
+    /// order (no document map) and still hold their postings in RAM;
+    /// nothing is decoded or re-encoded, so the cost is a pass over
+    /// `other`'s vocabulary and a copy of its lists. The blob the result
+    /// writes is the one a single builder fed both document sequences in
+    /// turn would write.
+    ///
+    /// This is what lets a commit cut its rows into as many builders as
+    /// it has threads to tokenize on and still write as many superfiles
+    /// as its rows warrant: the builders fold together at the end.
+    pub(crate) fn absorb(&mut self, other: FtsBuilder) -> Result<(), BuildError> {
+        let shape = |b: &FtsBuilder| {
+            b.columns
+                .iter()
+                .map(|c| (c.name.clone(), c.positions))
+                .collect::<Vec<_>>()
+        };
+        if shape(self) != shape(&other) {
+            return Err(BuildError::Io(Error::other(
+                "fts builders with different columns cannot be folded together",
+            )));
+        }
+        if !self.is_in_ram() || !other.is_in_ram() {
+            return Err(BuildError::Io(Error::other(
+                "an fts builder that spilled to scratch cannot be folded",
+            )));
+        }
+        if self.doc_map.is_some()
+            || other.doc_map.is_some()
+            || !self.sorted_inputs.is_empty()
+            || !other.sorted_inputs.is_empty()
+        {
+            return Err(BuildError::Io(Error::other(
+                "only builders fed in row order can be folded together",
+            )));
+        }
+        let offset = self.n_docs;
+        let FtsBuilder {
+            columns: other_columns,
+            postings: other_postings,
+            n_docs: other_n_docs,
+            ..
+        } = other;
+        for ((col, cp), (other_col, other_cp)) in self
+            .columns
+            .iter_mut()
+            .zip(&mut self.postings)
+            .zip(other_columns.into_iter().zip(other_postings))
+        {
+            col.doc_lengths.extend_from_slice(&other_col.doc_lengths);
+            col.total_tokens = col.total_tokens.saturating_add(other_col.total_tokens);
+            let positional = col.positions;
+            let (PostingStore::Ram(ram), PostingStore::Ram(other_ram)) =
+                (&mut cp.store, other_cp.store)
+            else {
+                unreachable!("both stores were checked to be in RAM");
+            };
+            let other_vocab = other_cp.vocab;
+            for (other_id, term) in other_vocab.id_to_term.iter().enumerate() {
+                let id = cp.vocab.intern(term, positional) as usize;
+                ram.grow_to(cp.vocab.len(), positional);
+                ram.postings[id].extend(
+                    other_ram.postings[other_id]
+                        .iter()
+                        .map(|&(doc, tf)| (doc + offset, tf)),
+                );
+                if positional {
+                    ram.pos_runs[id].extend_from_slice(&other_ram.pos_runs[other_id]);
+                }
+            }
+            ram.bytes = ram.bytes.saturating_add(other_ram.bytes);
+            // `other_vocab` owns the term bytes the loop just copied; it is
+            // dropped here, after the last read of them.
+            drop(other_vocab);
+        }
+        self.n_docs = self.n_docs.saturating_add(other_n_docs);
+        Ok(())
+    }
+
     /// Finalise and emit the FTS blob bytes. Consumes the builder.
     ///
     /// Returns `BuildError::Io` for scratch IO failures that can
@@ -4401,6 +4489,62 @@ mod tests {
             ka < kb
         });
         assert!(sorted, "triples must come out in (lex_rank, doc_id) order");
+    }
+
+    /// Two builders fed the halves of a corpus and folded together write
+    /// the blob one builder fed the whole corpus writes, on a positional
+    /// and a plain column, with the terms the halves share, the terms
+    /// only one holds, and a term of one document each.
+    #[test]
+    fn folded_builders_write_the_blob_one_builder_writes() {
+        const N_DOCS: u32 = 500;
+        const SPLIT: u32 = 180;
+        let text_of = |i: u32| {
+            let mut text = format!("every every u{i} shared{}", i % 7);
+            if i.is_multiple_of(3) {
+                text.push_str(" some some");
+            }
+            if i < SPLIT && i.is_multiple_of(50) {
+                text.push_str(" early");
+            }
+            if i >= SPLIT && i.is_multiple_of(40) {
+                text.push_str(" late late");
+            }
+            text
+        };
+        let feed = |b: &mut FtsBuilder, first: u32, past: u32| {
+            for i in first..past {
+                b.add_doc(0, i - first, &text_of(i)).expect("add pos");
+                b.add_doc(1, i - first, &text_of(i)).expect("add flat");
+            }
+        };
+        let fresh = || {
+            let mut b = FtsBuilder::new();
+            b.register_column("pos".into(), true).expect("register");
+            b.register_column("flat".into(), false).expect("register");
+            b
+        };
+
+        let mut whole = fresh();
+        feed(&mut whole, 0, N_DOCS);
+        let expected = whole.finish().expect("finish whole");
+
+        let mut first = fresh();
+        feed(&mut first, 0, SPLIT);
+        let mut second = fresh();
+        feed(&mut second, SPLIT, N_DOCS);
+        first.absorb(second).expect("fold");
+        let folded = first.finish().expect("finish folded");
+        assert_eq!(folded, expected, "the folded blob differs");
+
+        // A spilled builder refuses to fold.
+        let mut spilled = fresh();
+        spilled.set_spill_threshold_bytes(1);
+        feed(&mut spilled, 0, SPLIT);
+        assert!(!spilled.is_in_ram());
+        let mut other = fresh();
+        feed(&mut other, SPLIT, N_DOCS);
+        assert!(other.absorb(spilled).is_err());
     }
 
     #[test]

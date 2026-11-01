@@ -1581,6 +1581,53 @@ impl SuperfileBuilder {
         }
     }
 
+    /// Whether this builder can take another's rows in with
+    /// [`Self::absorb`]: a text-only build whose postings are still in
+    /// RAM.
+    pub(crate) fn can_absorb(&self) -> bool {
+        self.vec_builder.is_none()
+            && self.cell_posting_builder.is_none()
+            && self.prebuilt_multi_cell.is_none()
+            && self.fts_builder.as_ref().is_none_or(FtsBuilder::is_in_ram)
+    }
+
+    /// Take `other`'s rows in behind this builder's own, as if they had
+    /// been appended here after them: its batches follow, its documents
+    /// take the ids after this builder's last, and its postings fold into
+    /// this builder's accumulator (see [`FtsBuilder::absorb`]). Both must
+    /// have been opened with the same options and both must satisfy
+    /// [`Self::can_absorb`].
+    pub(crate) fn absorb(&mut self, other: SuperfileBuilder) -> Result<(), BuildError> {
+        if !self.can_absorb() || !other.can_absorb() {
+            return Err(BuildError::Io(Error::other(
+                "only text-only builders still in RAM can be folded together",
+            )));
+        }
+        if self.parquet_schema != other.parquet_schema {
+            return Err(BuildError::Io(Error::other(
+                "builders with different schemas cannot be folded together",
+            )));
+        }
+        let SuperfileBuilder {
+            batches: other_batches,
+            fts_builder: other_fts,
+            next_local_doc_id: other_rows,
+            ..
+        } = other;
+        match (self.fts_builder.as_mut(), other_fts) {
+            (Some(fb), Some(other_fb)) => fb.absorb(other_fb)?,
+            (None, None) => {}
+            _ => {
+                return Err(BuildError::Io(Error::other(
+                    "builders with and without a text index cannot be folded together",
+                )));
+            }
+        }
+        self.batches.extend(other_batches);
+        self.next_local_doc_id = self.next_local_doc_id.saturating_add(other_rows);
+        Ok(())
+    }
+
     /// Override the FTS builder's in-RAM spill threshold (forwarded
     /// to [`FtsBuilder::set_spill_threshold_bytes`]). No-op if this
     /// `SuperfileBuilder` was constructed without any FTS columns.

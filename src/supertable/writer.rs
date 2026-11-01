@@ -2539,6 +2539,7 @@ impl SupertableWriter {
                 "live shards hold {fed} rows but the buffer holds {total_rows}"
             )));
         }
+        let shards = fold_live_shards(shards, buffer, &self.inner.options)?;
         let payload_bytes = buffered_payload_bytes(buffer);
         let list_metadata = CommitListMetadata {
             partition_strategy: None,
@@ -3481,6 +3482,58 @@ impl LiveShards {
         self.pending = Some(rx);
         Ok(())
     }
+}
+
+/// Fold the live shards down to the superfile count the buffer warrants.
+///
+/// The shards opened at the count a buffer at the flush threshold gets,
+/// which is what the commit would have cut it into had it reached the
+/// threshold, and what let every thread tokenize as the rows arrived. A
+/// commit that comes early holds fewer bytes than that, and a commit-time
+/// build would have cut it into fewer, larger pieces; so the shards are
+/// grouped, neighbours together, into that many, and each group folds into
+/// its first shard (see [`SuperfileBuilder::absorb`]) before sealing. The
+/// superfile count then follows the bytes committed, however the caller
+/// paces its commits. A shard that spilled to scratch holds more text than
+/// a piece anyway and is never folded; the shards stay as they are if any
+/// cannot fold.
+fn fold_live_shards(
+    mut shards: Vec<LiveShard>,
+    buffer: &[BufferedBatch],
+    options: &SupertableOptions,
+) -> Result<Vec<LiveShard>, BuildError> {
+    let total_rows: usize = buffer.iter().map(|b| b.scalar.num_rows()).sum();
+    let buffered_bytes: usize = buffer
+        .iter()
+        .map(|b| b.scalar.get_array_memory_size())
+        .sum();
+    let target_bytes = (options.superfile_buffer_split_mb as usize).saturating_mul(MIB);
+    let n_threads = options.writer_pool.current_num_threads().max(1);
+    let wanted = superfiles_per_commit(total_rows, buffered_bytes, n_threads, target_bytes);
+    let n = shards.len();
+    if wanted >= n || !shards.iter().all(|s| s.builder.can_absorb()) {
+        return Ok(shards);
+    }
+    let mut folded = Vec::with_capacity(wanted);
+    for group in 0..wanted {
+        let (start, end) = (n * group / wanted, n * (group + 1) / wanted);
+        let mut members = shards.drain(..end - start);
+        let mut first = members.next().expect("a group holds at least one shard");
+        for LiveShard {
+            builder, batches, ..
+        } in members
+        {
+            first.builder.absorb(builder)?;
+            first.batches.extend(batches);
+        }
+        folded.push(first);
+    }
+    debug!(
+        from = n,
+        to = wanted,
+        "live shards folded to the superfile count the buffer warrants"
+    );
+    Ok(folded)
 }
 
 /// Rows `[rows * i / n, rows * (i + 1) / n)` of `batch`: shard `i`'s share
@@ -16412,6 +16465,90 @@ mod tests {
     }
 
     /// Live shards: a buffer wide enough to open them is fed as it is
+    /// A commit that comes well under the flush threshold writes as many
+    /// superfiles through the live shards as a commit-time build cuts it
+    /// into, not as many as there were threads to tokenize on: the shards
+    /// fold to that count at the seal, and the table reads the same.
+    #[test]
+    fn an_early_commit_folds_the_live_shards_to_the_pieces_its_bytes_warrant() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        const BATCHES: usize = 6;
+        const THREADS: usize = 8;
+        let titles_of = |b: usize| {
+            LargeStringArray::from(
+                (0..ROWS_PER_BATCH)
+                    .map(|i| {
+                        let row = b * ROWS_PER_BATCH + i;
+                        format!("doc {row} word{} {}", row % 53, "y".repeat(200))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // About 2.5 MiB of rows against a 1 MiB split: a commit-time build
+        // cuts them into a few pieces, while eight threads open eight live
+        // shards (the count a 4 GiB buffer would get, capped by the pool).
+        let build = |live: bool| {
+            let opts = options_id_title()
+                .with_writer_pool(writer_pool_with(THREADS))
+                .with_superfile_buffer_split_mb(1)
+                .with_commit_threshold_size_mb(4096);
+            let st = Supertable::create(opts).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.live_disabled = !live;
+            for b in 0..BATCHES {
+                let batch = RecordBatch::try_new(schema_id_title(), vec![Arc::new(titles_of(b))])
+                    .expect("batch");
+                w.append(&batch).expect("append");
+            }
+            assert_eq!(w.live.is_some(), live);
+            if let Some(shards) = w.live.as_ref().and_then(|l| l.shards.as_ref()) {
+                assert_eq!(shards.len(), THREADS, "one live shard per thread");
+            }
+            w.commit().expect("commit");
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        let r_live = live.reader().expect("reader");
+        let r_plain = plain.reader().expect("reader");
+        assert_eq!(r_live.n_docs_total(), (ROWS_PER_BATCH * BATCHES) as u64);
+        assert_eq!(r_plain.n_docs_total(), r_live.n_docs_total());
+        assert!(
+            r_plain.n_superfiles() < THREADS,
+            "the buffer is too small for a piece per thread"
+        );
+        assert_eq!(
+            r_live.n_superfiles(),
+            r_plain.n_superfiles(),
+            "the live shards fold to the commit-time count"
+        );
+        for term in ["word7", "word52", "doc"] {
+            let hits = |st: &Supertable| -> BTreeSet<String> {
+                st.bm25_search(
+                    "title",
+                    term,
+                    ROWS_PER_BATCH * BATCHES,
+                    Bm25SearchOptions::new().with_mode(BoolMode::Or),
+                    Some(&["title"]),
+                )
+                .expect("bm25")
+                .iter()
+                .flat_map(|batch| {
+                    let col = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<LargeStringArray>()
+                        .expect("title column");
+                    (0..col.len())
+                        .map(|i| col.value(i).to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+            };
+            assert_eq!(hits(&live), hits(&plain), "term {term}");
+        }
+    }
+
     /// appended and sealed at commit, and the table reads the same as one
     /// built at commit time — every row present, the same documents under
     /// every term.
