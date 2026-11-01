@@ -945,9 +945,9 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        // The cost before the last round that moved documents, until the next
-        // gain pass measures what that round really bought.
-        let mut cost_before: Option<f64> = None;
+        // The cost as the round begins, so the round is judged by what it
+        // really lowered the cost by once its swaps are in.
+        let mut cost_before = self.partition_cost(n_left, n_right);
 
         // Taken out of `self` so the ranking can borrow the move-gain
         // tables while writing them, and put back before returning so the
@@ -955,19 +955,21 @@ impl BisectState {
         let mut left_gains = mem::take(&mut self.left_gains);
         let mut right_gains = mem::take(&mut self.right_gains);
         let mut last_swaps = 0usize;
-        // A round's realised gain is the sum of the pair gains it accepted,
-        // in the units of the cost this is minimising. The swap loop already
-        // computes them, so the convergence test is a running total and a
-        // comparison.
+        // A round is judged by its realised gain: the cost before it less
+        // the cost after, read off the degree tables the swaps just moved.
+        // The pair gains the swap loop adds up predict that only while the
+        // moves are few and far apart; where a partition is small the pairs
+        // moved in one round share terms, and their summed gains run to
+        // many times what the round actually buys, which kept the leaf
+        // splits rounding long after they had stopped paying. The reading
+        // costs a pass over the partition's terms, a small fraction of a
+        // round's pass over its postings in a large partition and about
+        // one round's worth in a leaf.
         for round in 0..run.params.max_rounds {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
-            let (moved, round_gain, round_cost) = {
-                let cost = REPORT.then(|| self.partition_cost(n_left, n_right));
-                if let (Some(before), Some(cost)) = (cost_before.take(), cost) {
-                    level.record_actual(before - cost);
-                }
+            let moved = {
                 let step = timed.then(Instant::now);
                 let cpu = timed.then(thread_cpu_ns).flatten();
                 self.compute_move_gains(n_left, n_right, parallel);
@@ -1066,7 +1068,8 @@ impl BisectState {
                     level.swap_ns += ns_since(step);
                     level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
                 }
-                (swaps, gain, cost)
+                level.predicted_gain += gain;
+                swaps
             };
             last_swaps = moved;
             level.rounds += 1;
@@ -1075,8 +1078,12 @@ impl BisectState {
                 break;
             }
             level.swaps += moved as u64;
-            level.predicted_gain += round_gain;
-            cost_before = round_cost;
+            let cost_after = self.partition_cost(n_left, n_right);
+            let round_gain = cost_before - cost_after;
+            cost_before = cost_after;
+            if REPORT {
+                level.record_actual(round_gain);
+            }
             if round == 0 {
                 if depth == 0 {
                     run.offer_reference(round_gain, order.len());
@@ -1089,9 +1096,6 @@ impl BisectState {
                 end = SplitEnd::Converged;
                 break;
             }
-        }
-        if let Some(before) = cost_before {
-            level.record_actual(before - self.partition_cost(n_left, n_right));
         }
 
         self.left_gains = left_gains;
