@@ -888,41 +888,77 @@ fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
     None
 }
 
-/// Whether every slice and tier object `root` names is on storage, asking
-/// storage only about the objects `seen` lacks and adding those it finds.
-/// The objects are content-addressed and the sweep keeps every object a
-/// live root names, so one found present stays so for the life of the
-/// process; a pass asks about the objects new since the last one.
-pub(crate) async fn objects_present(
+/// What [`check_objects`] found of the objects a root names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootObjects {
+    /// Every slice and tier object is on storage, in a layout kept as is.
+    Present,
+    /// Some slice or tier object is no longer on storage.
+    Missing,
+    /// Some slice is of the layout before tiers, on a table that keeps
+    /// tiers. Its postings carry no heads and no fold gives them any; only
+    /// indexing its superfiles again does.
+    BeforeTiers,
+}
+
+/// Whether every slice and tier object `root` names is on storage, and
+/// whether a slice is of the layout before tiers on a table whose `policy`
+/// keeps them. A slice is asked for the bytes that name its layout, a tier
+/// object for its metadata: one request each, and only for the objects
+/// `seen` lacks; those found, in a layout kept as is, are added. The
+/// objects are content-addressed and the sweep keeps every object a live
+/// root names, so one found stays so for the life of the process; a pass
+/// asks about the objects new since the last one. (Whether a slice names a
+/// tier object does not tell its layout: a slice whose terms' tiers are
+/// small keeps them inline and names none.)
+pub(crate) async fn check_objects(
     storage: &Arc<dyn StorageProvider>,
     root: &Root,
+    policy: &BuildPolicy,
     seen: &Mutex<HashSet<ContentHash>>,
-) -> Result<bool, TermIndexError> {
-    let unseen: HashMap<ContentHash, String> = {
+) -> Result<RootObjects, TermIndexError> {
+    let unseen: HashMap<ContentHash, bool> = {
         let seen = seen.lock().expect("term-index objects seen");
         root.layers
             .iter()
             .flat_map(|layer| layer.slices.iter())
             .flat_map(|slice| {
-                once((slice.content_hash, slice_uri(&slice.content_hash)))
-                    .chain(slice.tier.map(|tier| (tier, tier_uri(&tier))))
+                once((slice.content_hash, true)).chain(slice.tier.map(|tier| (tier, false)))
             })
             .filter(|(hash, _)| !seen.contains(hash))
             .collect()
     };
-    let mut heads = stream::iter(unseen)
-        .map(|(hash, uri)| async move { (hash, storage.head(&uri).await) })
+    let keeps_tiers = policy.tier_entries_per_term != 0;
+    let mut checks = stream::iter(unseen)
+        .map(|(hash, is_slice)| async move {
+            let found = match is_slice {
+                true => storage
+                    .get_range(&slice_uri(&hash), 0..format::SLICE_VERSION_PREFIX_LEN)
+                    .await
+                    .map_err(TermIndexError::Storage)
+                    .and_then(|prefix| format::slice_is_before_tiers(&prefix)),
+                false => storage
+                    .head(&tier_uri(&hash))
+                    .await
+                    .map(|_| false)
+                    .map_err(TermIndexError::Storage),
+            };
+            (hash, found)
+        })
         .buffer_unordered(LAYER_FETCH_CONCURRENCY);
-    while let Some((hash, head)) = heads.next().await {
-        match head {
+    while let Some((hash, found)) = checks.next().await {
+        match found {
+            Ok(true) if keeps_tiers => return Ok(RootObjects::BeforeTiers),
             Ok(_) => {
                 seen.lock().expect("term-index objects seen").insert(hash);
             }
-            Err(StorageError::NotFound { .. }) => return Ok(false),
-            Err(e) => return Err(TermIndexError::Storage(e)),
+            Err(TermIndexError::Storage(StorageError::NotFound { .. })) => {
+                return Ok(RootObjects::Missing);
+            }
+            Err(e) => return Err(e),
         }
     }
-    Ok(true)
+    Ok(RootObjects::Present)
 }
 
 /// The slice bytes `layer` holds, as the root records them.

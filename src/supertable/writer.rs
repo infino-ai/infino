@@ -178,7 +178,8 @@ use crate::{
             part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{
-                self, Contribution as TermContribution, ReservedLayer, Root, TermIndexError,
+                self, Contribution as TermContribution, ReservedLayer, Root, RootObjects,
+                TermIndexError,
             },
         },
         mutations::{
@@ -11079,9 +11080,11 @@ pub(in crate::supertable) const TERM_INDEX_BATCH_SUPERFILES: usize = CONTRIBUTIO
 ///   `fold_max_bytes` ([`term_index::fold_at_optimize`]), dropping the
 ///   postings of superfiles no longer live from the layers a fold rewrites.
 /// - A root that will never load (gone, corrupt, or in a layout this engine
-///   no longer reads), or that names a slice or tier object no longer on
-///   storage, is started again from an empty root, a batch at a time. A
-///   root that failed to load for now fails the pass.
+///   no longer reads), that names a slice or tier object no longer on
+///   storage, or that holds a slice written before tiers on a table that
+///   keeps them ([`term_index::check_objects`]), is started again from an
+///   empty root, a batch at a time. A root that failed to load for now
+///   fails the pass.
 ///
 /// The index is marked complete once it lists every live superfile.
 pub(in crate::supertable) async fn stamp_term_index(
@@ -11106,19 +11109,29 @@ pub(in crate::supertable) async fn stamp_term_index(
                     .get_all_superfiles_loaded()
                     .await
                     .map_err(|e| BuildError::Store(e.to_string()))?;
-                let root = match referenced_root(&old).await? {
-                    Some(root) if term_index::objects_present(storage, &root, seen).await? => root,
-                    Some(_) => {
-                        warn!(
-                            "term index: an object the root names is gone; indexing every superfile again"
-                        );
-                        Root::default()
-                    }
-                    None => Root::default(),
-                };
                 let policy = term_index::BuildPolicy {
                     scoring_by_superfile: Arc::new(scoring_by_superfile(&old)),
                     ..old.options.term_index_build_policy()
+                };
+                let root = match referenced_root(&old).await? {
+                    Some(root) => {
+                        match term_index::check_objects(storage, &root, &policy, seen).await? {
+                            RootObjects::Present => root,
+                            RootObjects::Missing => {
+                                warn!(
+                                    "term index: an object the root names is gone; indexing every superfile again"
+                                );
+                                Root::default()
+                            }
+                            RootObjects::BeforeTiers => {
+                                info!(
+                                    "term index: a slice predates tiers; indexing every superfile again in the current layout"
+                                );
+                                Root::default()
+                            }
+                        }
+                    }
+                    None => Root::default(),
                 };
                 let pool = Some(&*old.options.reader_pool);
                 let mut listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
@@ -16540,24 +16553,38 @@ supertable:
         );
     }
 
+    /// A root that optimize indexes again from scratch, after a compaction
+    /// left it listing removed superfiles, is shorter than the one it
+    /// replaces; the next append numbers from it without padding.
     #[test]
     fn an_append_after_optimize_shrinks_the_root_does_not_pad_it_back() {
         let dir = TempDir::new().expect("tempdir");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let st = Supertable::create(options_id_title().with_storage(Arc::clone(&storage)))
-            .expect("create");
+        let options = || options_id_title().with_storage(Arc::clone(&storage));
+        let st = Supertable::create(options()).expect("create");
         for i in 0..40 {
             st.append(&row(&format!("doc {i}"))).expect("append");
         }
-        st.optimize(&OptimizeOptions::compact(CompactionSettings {
+        let compact = OptimizeOptions::compact(CompactionSettings {
             min_fill_percent: 1,
             min_superfiles_for_merge: 2,
             ..CompactionSettings::default()
-        }))
-        .expect("optimize");
+        });
+        st.optimize(&compact).expect("optimize");
+        let listed = term_root(&st, &storage).superfiles.len();
+        // A slice gone from storage has the next optimize index every
+        // superfile again; a fresh handle has seen none of the objects.
+        let slice = term_root(&st, &storage).layers[0].slices[0].content_hash;
+        drop(st);
+        fs::remove_file(dir.path().join(term_index::slice_uri(&slice))).expect("remove slice");
+        let st = Supertable::open(options()).expect("reopen");
+        st.optimize(&compact).expect("optimize");
         let shrunk = term_root(&st, &storage).superfiles.len();
-        assert!(shrunk < 40, "precondition: optimize rebuilt a shorter root");
+        assert!(
+            shrunk < listed,
+            "precondition: the index lists only the live superfiles"
+        );
 
         st.append(&row("after")).expect("append");
 

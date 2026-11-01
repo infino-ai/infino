@@ -365,6 +365,23 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Bytes at the front of a slice that name its layout: magic, then version.
+pub(crate) const SLICE_VERSION_PREFIX_LEN: u64 = (MAGIC_LEN + U32_LEN) as u64;
+
+/// Whether a slice whose first [`SLICE_VERSION_PREFIX_LEN`] bytes are
+/// `prefix` is of the layout before tiers, refusing a magic or version
+/// [`Slice::open`] would refuse.
+pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexError> {
+    let mut c = Cursor { bytes: prefix, at: 0 };
+    let version = check_magic_version(
+        &mut c,
+        SLICE_MAGIC,
+        &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
+        "slice",
+    )?;
+    Ok(version == LEGACY_SLICE_FORMAT_VERSION)
+}
+
 /// Check the magic and read the version, which must be the current one
 /// (`accepted[0]`) or a legacy one still read; the version found.
 fn check_magic_version(
