@@ -108,7 +108,7 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
-use rayon::{ThreadPool, current_num_threads, prelude::*};
+use rayon::ThreadPool;
 use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
@@ -1660,47 +1660,22 @@ pub(crate) struct FrozenLanes {
     pieces: Vec<Range<u32>>,
 }
 
+/// The most lanes a commit may be fed through: a merged order names each
+/// entry's lane in a byte.
+pub(crate) const MAX_LANES: usize = u8::MAX as usize;
+
 /// Merge `lanes`' dictionaries, column by column, into the order the
 /// pieces walk. The lanes must hold the same columns. The term space is
 /// cut into as many ranges as the pool has threads, at terms taken from
 /// the longest lane's dictionary, and the ranges merge side by side: a
 /// term is one value in every lane, so no term straddles a cut.
-/// The most lanes a commit may be fed through: a merged order names each
-/// entry's lane in a byte.
-pub(crate) const MAX_LANES: usize = u8::MAX as usize;
-
+///
+/// For a caller outside `pool`: the cuts and the range merges go to the
+/// pool as spawned tasks the caller waits for, so no pool thread waits for
+/// another's work. Run under `install`, the merge's own waits ran other
+/// commits' seals meanwhile, and a merge of two seconds' work took
+/// seventeen.
 pub(crate) fn freeze_lanes(
-    mut lanes: Vec<FrozenLane>,
-    pieces: Vec<Range<u32>>,
-) -> Result<FrozenLanes, BuildError> {
-    check_lanes(&lanes)?;
-    let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
-    lanes
-        .par_iter_mut()
-        .for_each(|lane| cut_lane(lane, &pieces));
-    let ranges = current_num_threads().max(1);
-    let order = (0..n_columns)
-        .map(|column| {
-            let merged: Vec<Vec<OrderedTerm>> = merge_spans(&lanes, column, ranges)
-                .into_par_iter()
-                .map(|spans| merge_term_range(&lanes, column, &spans))
-                .collect();
-            merged.concat()
-        })
-        .collect();
-    Ok(FrozenLanes {
-        lanes,
-        order,
-        pieces,
-    })
-}
-
-/// [`freeze_lanes`] for a caller outside `pool`: the cuts and the range
-/// merges go to the pool as spawned tasks the caller waits for, so no pool
-/// thread waits for another's work. Run under `install`, the merge's own
-/// waits ran other commits' seals meanwhile, and a merge of two seconds'
-/// work took seventeen.
-pub(crate) fn freeze_lanes_spawned(
     pool: &ThreadPool,
     lanes: Vec<FrozenLane>,
     pieces: Vec<Range<u32>>,
@@ -5161,6 +5136,7 @@ mod tests {
     use std::any::Any;
 
     use bytes::Bytes;
+    use rayon::ThreadPoolBuilder;
     use tempfile::tempdir;
 
     use super::*;
@@ -5327,7 +5303,11 @@ mod tests {
             .into_iter()
             .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
             .collect();
-        let frozen = Arc::new(freeze_lanes(frozen, pieces).expect("merge the lanes"));
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let frozen = Arc::new(freeze_lanes(&pool, frozen, pieces).expect("merge the lanes"));
         let mut b = two_column_builder();
         b.set_lane_view(LaneView {
             lanes: frozen,

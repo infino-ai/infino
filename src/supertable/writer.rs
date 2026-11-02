@@ -145,7 +145,7 @@ use crate::{
             bm25::Bm25Params,
             builder::{
                 DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, MAX_LANES,
-                Stretch, doc_lengths_entry_size, freeze_lanes, freeze_lanes_spawned,
+                Stretch, doc_lengths_entry_size, freeze_lanes,
             },
         },
         reader::vector_layout_from_kv,
@@ -2784,7 +2784,7 @@ impl SupertableWriter {
         )?;
         drop(freeze_span);
         let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
-        let frozen = Arc::new(freeze_lanes_spawned(pool, frozen, pieces)?);
+        let frozen = Arc::new(freeze_lanes(pool, frozen, pieces)?);
         drop(merge_span);
         let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
         let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
