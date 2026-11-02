@@ -169,6 +169,10 @@ pub(crate) const DEFAULT_VECTOR_INDEX_PREFIX: &str = "_vector_index";
 /// attempt that wrote them, so what this bounds is how much stays alive
 /// between attempts. A part past it is rebuilt on each attempt, as before.
 const REBUILT_PARTS_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// Headroom over a list's part bytes when sizing the manifest disk cache, in
+/// divisor form (`bytes + bytes / this`), for the term-index slices and
+/// routing siblings that share the cache.
+const MANIFEST_CACHE_HEADROOM_DIVISOR: u64 = 10;
 
 /// One immutable point-in-time view of the supertable.
 ///
@@ -1548,37 +1552,6 @@ impl ManifestSnapshot {
         self.list.as_ref().is_some_and(|l| l.term_index_complete)
     }
 
-    /// Whether a term-index rebuild would change anything: false when the
-    /// table is empty, or when the index is complete, has one layer, and
-    /// lists exactly the live superfiles. An index that will never load is
-    /// rebuilt; one that failed to load for now is an error.
-    pub(crate) async fn needs_term_index_rebuild(
-        &self,
-        entries: &[Arc<SuperfileEntry>],
-    ) -> Result<bool, TermIndexError> {
-        if entries.is_empty() {
-            return Ok(false);
-        }
-        if !self.term_index_complete() {
-            return Ok(true);
-        }
-        let index = match self.term_index().await {
-            Ok(Some(index)) => index,
-            Ok(None) => return Ok(true),
-            Err(e) if e.calls_for_rebuild() => return Ok(true),
-            Err(e) => return Err(e),
-        };
-        let root = index.root();
-        // Every commit since the last rebuild appends a layer.
-        if root.layers.len() != 1 {
-            return Ok(true);
-        }
-        // A commit that only removes superfiles appends no layer, so the
-        // root can still list superfiles that are gone.
-        Ok(root.superfiles.len() != entries.len()
-            || !entries.iter().all(|e| index.is_indexed(&e.superfile_id)))
-    }
-
     /// The superfiles among `candidates`, as `index` names them, that are
     /// live in this snapshot. Loads only the parts whose id range covers a
     /// candidate, and nothing when the resident view is the whole table.
@@ -1802,12 +1775,12 @@ impl ManifestSnapshot {
     }
 
     /// Successor manifest (bumped id) with the term-index root reference
-    /// stamped — the maintenance publish. A maintenance build covers the
-    /// whole membership.
-    pub(crate) fn with_term_index(&self, reference: RoutingRef) -> Self {
+    /// stamped — the maintenance publish. `complete` records whether the
+    /// index lists every live superfile.
+    pub(crate) fn with_term_index(&self, reference: RoutingRef, complete: bool) -> Self {
         self.with_list_edited(true, |list| {
             list.term_index = Some(reference);
-            list.term_index_complete = true;
+            list.term_index_complete = complete;
         })
     }
 
@@ -3386,7 +3359,11 @@ impl ManifestPartLoader {
         legacy: LegacyNames,
     ) -> Self {
         let mut idx = HashMap::with_capacity(list.parts.len());
+        let mut part_bytes: u64 = 0;
         for entry in &list.parts {
+            part_bytes = part_bytes
+                .saturating_add(entry.size_bytes_compressed)
+                .saturating_add(entry.summaries.as_ref().map_or(0, |s| s.size_bytes));
             idx.insert(
                 entry.part_id,
                 PartRefs {
@@ -3395,6 +3372,13 @@ impl ManifestPartLoader {
                     routing: entry.routing.clone(),
                     summaries: entry.summaries.clone(),
                 },
+            );
+        }
+        // Holds every part of the list, so a full load reuses the cache
+        // instead of evicting parts before the next load reads them.
+        if let Some(cache) = &manifest_disk_cache {
+            cache.raise_budget(
+                part_bytes.saturating_add(part_bytes / MANIFEST_CACHE_HEADROOM_DIVISOR),
             );
         }
         Self {
@@ -7328,6 +7312,39 @@ mod tests {
                 "disk-cache hit ⇒ no additional storage.get"
             );
             assert!(cache.stats().n_hits >= 1, "recorded a cache hit");
+
+            let _ = std::fs::remove_dir_all(&cache_root);
+        }
+
+        #[tokio::test]
+        async fn a_cache_smaller_than_the_list_grows_to_hold_every_part() {
+            // A cache that starts at one byte must still hold the whole list,
+            // so a second full load reads nothing from storage.
+            let parts: Vec<ManifestPart> = (31..34).map(make_test_part).collect();
+            let (objects, entries) = encode_and_index(&parts);
+            let storage = Arc::new(CountingMockStorage::new(objects));
+            let storage_dyn = Arc::clone(&storage) as Arc<dyn StorageProvider>;
+            let list = fresh_list(entries);
+            let cache_root = std::env::temp_dir()
+                .join("infino-manifest-cache-loader-test-grows_to_hold_every_part");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            let cache = ManifestDiskCache::new(cache_root.clone(), 1).expect("cache");
+
+            for _ in 0..2 {
+                let loader = ManifestPartLoader::new_with_cache(
+                    Arc::clone(&storage_dyn),
+                    &list,
+                    Some(Arc::clone(&cache)),
+                );
+                for part in &parts {
+                    loader.load(part.part_id).await.expect("load");
+                }
+            }
+            assert_eq!(
+                storage.get_call_count(),
+                parts.len(),
+                "the second load is served from the cache"
+            );
 
             let _ = std::fs::remove_dir_all(&cache_root);
         }

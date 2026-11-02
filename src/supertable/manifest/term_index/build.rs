@@ -1532,6 +1532,7 @@ pub(crate) struct BuiltLayer {
 }
 
 /// Merge contributions into a base root: one layer, ordinals from zero.
+#[cfg(test)]
 pub(crate) fn build(
     contributions: &[Contribution],
     policy: &BuildPolicy,

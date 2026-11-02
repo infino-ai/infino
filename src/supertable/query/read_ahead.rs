@@ -139,6 +139,23 @@ const MIN_CHUNK_READ_PERCENT: u64 = 75;
 /// take's prefetch is held to the same share.
 pub(crate) const BUDGET_SHARE_PERCENT: usize = 50;
 
+/// Widest run of skipped pages inside one column chunk that the scan reads
+/// through to fetch the cold kept pages on either side in one GET. The store
+/// already reads through gaps up to 1 MiB (see [`merged_ranges`]); inside one
+/// chunk this goes to 2 MiB, about what one stream moves while a GET waits for
+/// its first byte (25 to 45 ms on GCS, at about 60 MB/s: 1.5 to 2.7 MB). It
+/// saves GETs, which are billed while in-region bytes are not, rather than
+/// time: the two GETs would have run side by side, and the one GET now streams
+/// the gap too.
+pub(super) const PAGE_READ_THROUGH_BYTES: u64 = 2 << 20;
+
+/// Longest span a chain of read-throughs may grow to. One stream carries the
+/// whole span, where the GETs it replaces would have run side by side, so a
+/// longer chain trades time for GETs; at 16 MiB a span is a large GET of the
+/// size object stores serve at full speed, and the memory one download holds
+/// beyond the pages it keeps stays bounded.
+const MAX_READ_THROUGH_SPAN_BYTES: u64 = 16 << 20;
+
 /// Shared by every reader of one scan: the store, the memory budget and the
 /// scan's filter.
 pub(crate) struct ScanReadAhead {
@@ -808,8 +825,37 @@ impl ReadAhead {
         order.get_or_insert_with(|| planned_order(scan, file, meta))
     }
 
+    /// The bytes of `ranges`, downloaded now and counted as read.
     async fn fetch(&self, ranges: &[Range<u64>]) -> ParquetResult<Vec<Bytes>> {
-        Ok(self.scan.store.get_ranges(self.location(), ranges).await?)
+        let clamped = self.scan.store.clamped(self.location(), ranges)?;
+        // Counted as the ranges asked for, the way the store counts them: what
+        // is read through depends on what the cache holds, and the counts must
+        // not.
+        self.scan.store.count_page_reads(&clamped);
+        self.download(&clamped).await
+    }
+
+    /// The bytes of `ranges`, already clamped and counted, downloaded now. Cold
+    /// kept pages of one column chunk a little apart come down in one span (see
+    /// [`read_through_spans`]).
+    async fn download(&self, ranges: &[Range<u64>]) -> ParquetResult<Vec<Bytes>> {
+        let store = &self.scan.store;
+        let location = self.location();
+        let spans = read_through_spans(
+            ranges,
+            |gap| chunk_holding(&self.meta, gap),
+            |around| store.is_untouched(location, around),
+        );
+        let Some(spans) = spans else {
+            return Ok(store.get_ranges_uncounted(location, ranges).await?);
+        };
+        let downloads: Vec<Range<u64>> = spans.iter().map(|span| span.bytes.clone()).collect();
+        let fetched = store.get_ranges_uncounted(location, &downloads).await?;
+        cut(ranges, &spans, &fetched).map_err(|range| {
+            ParquetError::General(format!(
+                "{location}: range {range:?} came back short from its read-through download"
+            ))
+        })
     }
 
     /// `ranges` of `row_group`: what `batch` holds comes from it, the rest is
@@ -853,12 +899,7 @@ impl ReadAhead {
             })
             .collect();
         // Not counted again: the whole request was counted above.
-        let mut fetched = self
-            .scan
-            .store
-            .get_ranges_uncounted(self.location(), &missing)
-            .await?
-            .into_iter();
+        let mut fetched = self.download(&missing).await?.into_iter();
         pieces
             .into_iter()
             .map(|pieces| {
@@ -1161,6 +1202,118 @@ fn planned_order(scan: &ScanReadAhead, file: &PartitionedFile, meta: &ParquetMet
         plan,
         elsewhere,
     }
+}
+
+/// One download of a scan's fetch: a span of the file, and whether it reads
+/// through skipped pages (see [`read_through_spans`]).
+#[derive(Debug, PartialEq, Eq)]
+struct Span {
+    bytes: Range<u64>,
+    read_through: bool,
+}
+
+/// The spans to download for `ranges`: the store's own merges (gaps up to 1
+/// MiB, see [`merged_ranges`]), then neighbours joined across a gap of up to
+/// [`PAGE_READ_THROUGH_BYTES`] of skipped pages, so the kept pages on both
+/// sides come down in one GET. `None` when nothing is joined, so the store
+/// fetches `ranges` as it always has.
+///
+/// ```text
+///   kept pages of one chunk:  [p0]---- > 1 MiB, <= 2 MiB ----[p10]
+///   the store alone:          GET p0                         GET p10
+///   read through:             GET p0 ................................ p10
+/// ```
+///
+/// Two neighbours join only when:
+/// - `chunk_holding(gap)` is a column chunk that holds the gap and is not just
+///   the gap, so the gap is skipped pages of a column the scan reads, never a
+///   column it skips.
+/// - `untouched(around)` holds for the gap and the byte on each side of it:
+///   none of it is local or being downloaded by another read. The cache splits
+///   a download at the blocks it holds and waits for the blocks another read
+///   is fetching, so this is what makes the two GETs one. Blocks it holds
+///   further inside either side split the download the same way joined or not.
+///   A block another read starts on between this check and the download can
+///   still split it: rare, and at worst one GET more than not joining.
+///
+/// Joins chain, so kept pages each a little apart come down as one span, up to
+/// [`MAX_READ_THROUGH_SPAN_BYTES`]: past that, one stream would take longer than
+/// the GETs it saves would have taken side by side.
+fn read_through_spans(
+    ranges: &[Range<u64>],
+    chunk_holding: impl Fn(&Range<u64>) -> Option<Range<u64>>,
+    untouched: impl Fn(&Range<u64>) -> bool,
+) -> Option<Vec<Span>> {
+    let merged = merged_ranges(ranges);
+    let mut spans: Vec<Span> = Vec::with_capacity(merged.len());
+    for next in merged {
+        // `last` ends where the merged span before `next` ends, and merged
+        // spans are sorted and more than 1 MiB apart.
+        let joins = spans.last().is_some_and(|last| {
+            let gap = last.bytes.end..next.start;
+            let around = gap.start.saturating_sub(1)..gap.end + 1;
+            gap.end - gap.start <= PAGE_READ_THROUGH_BYTES
+                && next.end - last.bytes.start <= MAX_READ_THROUGH_SPAN_BYTES
+                && chunk_holding(&gap).is_some_and(|chunk| chunk != gap)
+                && untouched(&around)
+        });
+        match spans.last_mut() {
+            Some(last) if joins => {
+                last.bytes.end = next.end;
+                last.read_through = true;
+            }
+            _ => spans.push(Span {
+                bytes: next,
+                read_through: false,
+            }),
+        }
+    }
+    spans.iter().any(|span| span.read_through).then_some(spans)
+}
+
+/// The column chunk of `meta` that holds all of `range`, if one does.
+fn chunk_holding(meta: &ParquetMetaData, range: &Range<u64>) -> Option<Range<u64>> {
+    let row_group = meta.row_group(row_group_holding(meta, range.start)?);
+    column_of(row_group, range).map(|column| chunk_range(row_group, column))
+}
+
+/// The row group whose bytes hold `offset`, or `None` outside every row group
+/// (the footer, page indexes, bloom filters).
+fn row_group_holding(meta: &ParquetMetaData, offset: u64) -> Option<usize> {
+    let groups = meta.row_groups();
+    let i = groups.partition_point(|rg| row_group_span(rg).end <= offset);
+    groups
+        .get(i)
+        .filter(|rg| row_group_span(rg).contains(&offset))
+        .map(|_| i)
+}
+
+/// Each of `ranges`, out of the downloaded `spans`: `fetched[i]` holds
+/// `spans[i]`, and the spans are sorted and apart. A range in a span that read
+/// through skipped pages is copied, so the pages the scan holds don't keep
+/// those skipped pages alive; any other range is a slice, as the store would
+/// serve it. `Err` holds a range no span served in full, which only a short
+/// download leaves.
+fn cut(ranges: &[Range<u64>], spans: &[Span], fetched: &[Bytes]) -> Result<Vec<Bytes>, Range<u64>> {
+    ranges
+        .iter()
+        .map(|range| {
+            let i = spans.partition_point(|span| span.bytes.end < range.end);
+            let (span, bytes) = spans.get(i).zip(fetched.get(i)).ok_or(range.clone())?;
+            let served = span.bytes.start <= range.start
+                && bytes.len() as u64 == span.bytes.end - span.bytes.start;
+            if !served {
+                return Err(range.clone());
+            }
+            let piece =
+                (range.start - span.bytes.start) as usize..(range.end - span.bytes.start) as usize;
+            Ok(if span.read_through {
+                Bytes::copy_from_slice(&bytes[piece])
+            } else {
+                bytes.slice(piece)
+            })
+        })
+        .collect()
 }
 
 /// The column whose chunk in `row_group` holds all of `range`, if one does.
@@ -1481,6 +1634,7 @@ mod tests {
     };
 
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
+    use bytes::Bytes;
     use datafusion::{
         common::DFSchema,
         datasource::{
@@ -1495,6 +1649,7 @@ mod tests {
             expressions::{Column, DynamicFilterPhysicalExpr},
         },
     };
+    use object_store::OBJECT_STORE_COALESCE_DEFAULT;
     use parquet::{
         arrow::{
             arrow_reader::{RowSelection, RowSelector},
@@ -1511,12 +1666,13 @@ mod tests {
         supertable::query::{
             df_object_store::SuperfileObjectStore,
             read_ahead::{
-                Batch, Held, READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead, ScanReadAhead, chunk_range,
+                Batch, Held, MAX_READ_THROUGH_SPAN_BYTES, PAGE_READ_THROUGH_BYTES,
+                READ_AHEAD_BATCHES_IN_FLIGHT, ReadAhead, ScanReadAhead, Span, chunk_range, cut,
                 download_bytes, fetch_spans,
                 fixture::{
                     GROUPS, ROWS_PER_GROUP, Superfile, block_cached, schema, small_file, wide_file,
                 },
-                leave_shared_ends, lock, row_group_span,
+                leave_shared_ends, lock, read_through_spans, row_group_span,
             },
         },
     };
@@ -1539,6 +1695,8 @@ mod tests {
     const SLOW_DOWNLOAD: Duration = Duration::from_millis(200);
     /// How long a test waits for downloads ahead from an in-memory source.
     const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+    /// A page's bytes in the read-through tests.
+    const PAGE: u64 = 64 * 1024;
 
     /// The superfile, a store serving it, its path and its footer.
     fn setup(
@@ -1950,6 +2108,234 @@ mod tests {
             spans(leave_shared_ends(short_first(), BLOCKS, &[])),
             spans(short_first())
         );
+    }
+
+    /// `read_through_spans` over `pages` of a file whose column chunks are
+    /// `chunks` and whose cache holds `local`.
+    fn read_through(
+        pages: &[Range<u64>],
+        chunks: &[Range<u64>],
+        local: &[Range<u64>],
+    ) -> Option<Vec<Span>> {
+        read_through_spans(
+            pages,
+            |gap| {
+                chunks
+                    .iter()
+                    .find(|chunk| chunk.start <= gap.start && gap.end <= chunk.end)
+                    .cloned()
+            },
+            |around| {
+                !local
+                    .iter()
+                    .any(|held| held.start < around.end && around.start < held.end)
+            },
+        )
+    }
+
+    fn span(bytes: Range<u64>, read_through: bool) -> Span {
+        Span {
+            bytes,
+            read_through,
+        }
+    }
+
+    /// A page starting `gap` bytes after `before` ends.
+    fn page_after(before: &Range<u64>, gap: u64) -> Range<u64> {
+        let start = before.end + gap;
+        start..start + PAGE
+    }
+
+    #[test]
+    fn cold_kept_pages_of_one_chunk_a_little_apart_are_read_through() {
+        let first = 0..PAGE;
+        for gap in [OBJECT_STORE_COALESCE_DEFAULT + 1, PAGE_READ_THROUGH_BYTES] {
+            let next = page_after(&first, gap);
+            let both = first.start..next.end;
+            assert_eq!(
+                read_through(&[first.clone(), next.clone()], from_ref(&both), &[]),
+                Some(vec![span(both, true)]),
+                "a gap of {gap} bytes is read through"
+            );
+        }
+        // Only the gap's edges must be cold: a block the cache holds deep inside
+        // a side splits that side's download whether or not it joins.
+        let long = 0..4 * PAGE;
+        let held = 0..PAGE;
+        let next = page_after(&long, OBJECT_STORE_COALESCE_DEFAULT + 1);
+        let both = long.start..next.end;
+        assert_eq!(
+            read_through(&[long.clone(), next], from_ref(&both), from_ref(&held)),
+            Some(vec![span(both, true)]),
+            "a block held at the far end of a side"
+        );
+    }
+
+    #[test]
+    fn every_other_gap_is_left_to_the_store() {
+        let first = 0..PAGE;
+        let near = page_after(&first, OBJECT_STORE_COALESCE_DEFAULT + 1);
+        let chunk = first.start..u64::MAX;
+        let split = first.end + OBJECT_STORE_COALESCE_DEFAULT / 2;
+        let island = split..split + PAGE;
+        let cases = [
+            (
+                "the store merges it already",
+                page_after(&first, OBJECT_STORE_COALESCE_DEFAULT),
+                vec![chunk.clone()],
+                vec![],
+            ),
+            (
+                "it costs more than a GET",
+                page_after(&first, PAGE_READ_THROUGH_BYTES + 1),
+                vec![chunk.clone()],
+                vec![],
+            ),
+            (
+                "the gap crosses into another column's chunk",
+                near.clone(),
+                vec![0..split, split..u64::MAX],
+                vec![],
+            ),
+            (
+                "the gap is another column's whole chunk",
+                near.clone(),
+                vec![0..first.end, first.end..near.start, near.start..u64::MAX],
+                vec![],
+            ),
+            ("outside every chunk", near.clone(), vec![], vec![]),
+            (
+                "the first page is local",
+                near.clone(),
+                vec![chunk.clone()],
+                vec![first.clone()],
+            ),
+            (
+                "the next page is local",
+                near.clone(),
+                vec![chunk.clone()],
+                vec![near.clone()],
+            ),
+            (
+                "the cache holds bytes inside the gap",
+                near,
+                vec![chunk],
+                vec![island],
+            ),
+        ];
+        for (name, next, chunks, local) in cases {
+            let pages = [first.clone(), next];
+            let spans = read_through(&pages, &chunks, &local);
+            assert_eq!(spans, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn read_through_keeps_the_stores_merges_in_any_order() {
+        // p0 and p1 merge as the store would, p2 is read through after them,
+        // and the other column's page far away stays a span of its own.
+        let p0 = 0..PAGE;
+        let p1 = page_after(&p0, PAGE);
+        let p2 = page_after(&p1, OBJECT_STORE_COALESCE_DEFAULT + 1);
+        let other = page_after(&p2, PAGE_READ_THROUGH_BYTES + 1);
+        let pages = [p2.clone(), other.clone(), p0.clone(), p1];
+        let chunks = [p0.start..p2.end, other.clone()];
+        assert_eq!(
+            read_through(&pages, &chunks, &[]),
+            Some(vec![span(p0.start..p2.end, true), span(other, false)])
+        );
+    }
+
+    #[test]
+    fn a_chain_of_read_throughs_stops_at_the_longest_span() {
+        // Kept pages each a little more than the store's merge gap apart, over
+        // twice the longest span: they come down as a few long spans, never
+        // one span longer than the cap.
+        let gap = OBJECT_STORE_COALESCE_DEFAULT + 1;
+        let first = 0..PAGE;
+        let mut pages = vec![first];
+        while pages[pages.len() - 1].end < 2 * MAX_READ_THROUGH_SPAN_BYTES {
+            let next = page_after(&pages[pages.len() - 1], gap);
+            pages.push(next);
+        }
+        let chunk = 0..u64::MAX;
+        let spans = read_through(&pages, from_ref(&chunk), &[]).expect("pages join");
+        assert!(spans.len() > 2, "the chain is cut: {spans:?}");
+        for span in &spans {
+            assert!(span.bytes.end - span.bytes.start <= MAX_READ_THROUGH_SPAN_BYTES);
+        }
+        for page in &pages {
+            assert!(
+                spans
+                    .iter()
+                    .any(|span| span.bytes.start <= page.start && page.end <= span.bytes.end),
+                "page {page:?} is in no span"
+            );
+        }
+    }
+
+    #[test]
+    fn each_range_is_cut_from_its_span_or_fails_when_one_came_back_short() {
+        let bytes = Bytes::from(
+            (0..=u8::MAX)
+                .cycle()
+                .take(4 * PAGE as usize)
+                .collect::<Vec<_>>(),
+        );
+        let spans = [span(0..2 * PAGE, true), span(3 * PAGE..4 * PAGE, false)];
+        let fetched: Vec<Bytes> = spans
+            .iter()
+            .map(|span| bytes.slice(span.bytes.start as usize..span.bytes.end as usize))
+            .collect();
+        let ranges = [PAGE..2 * PAGE, 0..PAGE / 2, 3 * PAGE..4 * PAGE];
+        let cut_out = cut(&ranges, &spans, &fetched).expect("every range is served");
+        for (range, got) in ranges.iter().zip(&cut_out) {
+            assert_eq!(got, &bytes.slice(range.start as usize..range.end as usize));
+            let copied = !bytes.as_ptr_range().contains(&got.as_ptr());
+            assert_eq!(
+                copied,
+                range.end <= 2 * PAGE,
+                "{range:?}: copied only out of the span that read through"
+            );
+        }
+        let short = [fetched[0].clone(), fetched[1].slice(..PAGE as usize - 1)];
+        assert_eq!(cut(&ranges, &spans, &short), Err(3 * PAGE..4 * PAGE));
+    }
+
+    #[tokio::test]
+    async fn a_range_with_any_cached_block_is_not_untouched() {
+        // One short read leaves a window of blocks cached in the middle of a
+        // range whose ends are still cold.
+        let (bytes, _) = wide_file(WIDE_ROWS, WIDE_ROWS);
+        let island = OBJECT_STORE_COALESCE_DEFAULT * 3;
+        let range = 0..island + OBJECT_STORE_COALESCE_DEFAULT;
+        assert!(bytes.len() as u64 >= range.end, "the file holds the range");
+        let superfile = Superfile::new(bytes, false);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (_cache, source) = block_cached(&superfile, dir.path());
+        let path = ObjPath::from("t/sf.parquet");
+        let store = SuperfileObjectStore::from_sources(HashMap::from([(
+            path.clone(),
+            Arc::clone(&source),
+        )]));
+        assert!(store.is_untouched(&path, &range), "a cold file");
+        source.range(island, PAGE).await.expect("warm");
+        assert!(!store.is_local(&path, &range), "the ends are cold");
+        assert!(!store.is_untouched(&path, &range), "the middle is cached");
+        assert!(store.is_untouched(&path, &(0..OBJECT_STORE_COALESCE_DEFAULT)));
+    }
+
+    #[test]
+    fn nothing_is_untouched_without_a_cache_that_tracks_blocks() {
+        // A source with no cache can't say no byte is local, so its files keep
+        // the store's own merges and are never read through.
+        let (bytes, _) = wide_file(WIDE_ROWS, WIDE_ROWS);
+        let size = bytes.len() as u64;
+        let source: Arc<dyn LazyByteSource> = Superfile::new(bytes, false);
+        let path = ObjPath::from("t/sf.parquet");
+        let store = SuperfileObjectStore::from_sources(HashMap::from([(path.clone(), source)]));
+        assert!(!store.is_local(&path, &(0..size)), "nothing is local");
+        assert!(!store.is_untouched(&path, &(0..size)));
     }
 
     #[tokio::test]

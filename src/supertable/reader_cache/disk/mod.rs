@@ -442,7 +442,9 @@ mod store_files;
 pub(crate) use budget::BlockWriteTicket;
 pub(crate) use budget::Reservation;
 pub(crate) use fetch::{open_batch_overlay, skip_background_fill};
-pub(crate) use sources::{ArcMmapOwner, mmap_readonly_bytes};
+pub(crate) use sources::{
+    ArcMmapOwner, mmap_readonly_bytes, mmap_temp_file_bytes, temp_file_behind,
+};
 
 impl DiskCacheStore {
     /// Where a build may spill its scratch: beside the cache, on the disk

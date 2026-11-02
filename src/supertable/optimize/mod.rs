@@ -5,13 +5,15 @@
 //!
 //! Compaction is the one phase this module owns outright; it lives in
 //! [`compact`]. Every other phase (the hidden-cell drain, the
-//! centroid-router refresh, the term-index rebuild, gc) is a maintenance
+//! centroid-router refresh, the term-index upkeep, gc) is a maintenance
 //! operation with callers of its own, sequenced here rather than
 //! implemented here.
 
 pub(crate) mod compact;
 
 use std::time::Instant;
+
+use compact::max_merge_input_bytes;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
@@ -90,10 +92,12 @@ impl Supertable {
                 );
             }
         }
-        // Rebuild the term index over the merged superfiles. Runs before gc
-        // so the sweep keeps the fresh index and removes the one it replaced.
+        // Index the superfiles the term index does not list, a batch at a
+        // time, and fold its layers in runs no larger than a compaction
+        // merge's input. Runs before gc so the sweep keeps the roots it
+        // publishes.
         if opts.steps.refresh_term_index {
-            self.refresh_term_index_sync()
+            self.refresh_term_index_sync(max_merge_input_bytes(&opts.compaction))
                 .map_err(OptimizeError::from)?;
         }
 

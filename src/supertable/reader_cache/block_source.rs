@@ -2167,6 +2167,25 @@ impl LazyByteSource for BlockCachedSource {
         self.holds(start, len) || self.whole_file().is_some()
     }
 
+    /// No block of the range is on the block file, in memory or in a run
+    /// another read is fetching. Never creates the block file: with none yet,
+    /// nothing is held.
+    fn is_untouched(&self, start: u64, len: u64) -> bool {
+        if self.whole_file().is_some() {
+            return false;
+        }
+        let Some(bf) = self.created_block_file() else {
+            return true;
+        };
+        if len == 0 || start.saturating_add(len) > bf.size {
+            return false;
+        }
+        let (b0, b1) = Self::block_span(start, len);
+        self.segments(b0, b1)
+            .iter()
+            .all(|segment| matches!(segment, Segment::Missing { .. }))
+    }
+
     async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
         self.read(start, len, Window::Grown).await
     }
@@ -4899,6 +4918,39 @@ mod tests {
             0,
             "its share of the cap came back"
         );
+        store.remove_block_entry_for_test(&uri);
+    }
+
+    /// A range is untouched only while no block of it is held or being fetched
+    /// by another read: a read joined across another read's GET would wait on
+    /// it and save no GET.
+    #[tokio::test]
+    async fn a_range_is_untouched_only_while_nothing_holds_or_fetches_it() {
+        let b = UNIT;
+        let dir = tempdir().expect("tempdir");
+        let store = test_store(dir.path(), u64::MAX);
+        let inner = held_source(4 * b as usize);
+        let (uri, src) = installed_source(
+            dir.path(),
+            &store,
+            Arc::clone(&inner) as Arc<dyn LazyByteSource>,
+        );
+        assert!(src.is_untouched(0, 4 * b), "a cold file");
+
+        let mut read = pin!(src.range(0, 64));
+        assert!(poll!(read.as_mut()).is_pending(), "the read GETs");
+        assert!(!src.is_untouched(0, 64), "being fetched");
+        assert!(!src.is_untouched(b - 1, 2), "partly being fetched");
+        assert!(src.is_untouched(2 * b, b), "past the fetched run");
+
+        inner.release();
+        timeout(NO_WAIT_DEADLINE, read)
+            .await
+            .expect("the read finishes")
+            .expect("read");
+        store.block_writes_settled().await;
+        assert!(!src.is_untouched(0, 64), "held");
+        assert!(src.is_untouched(2 * b, b), "still cold");
         store.remove_block_entry_for_test(&uri);
     }
 

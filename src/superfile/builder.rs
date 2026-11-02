@@ -107,7 +107,7 @@ use crate::{
                 chain_tokenizer,
             },
             bm25,
-            builder::{FtsBuilder, TermHeadSink},
+            builder::{FrozenLanes, FtsBuilder, LaneView, TermHeadSink},
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
             reorder::{BisectParams, ForwardIndex, bisect_order_reported},
             sorted_merge::SortedInput,
@@ -1514,28 +1514,7 @@ impl SuperfileBuilder {
 
         // 4 + 5. Build each FTS column's analysis chain and wire up the
         //        unified FTS + vector sub-builders.
-        let fts_builder = if opts.fts_columns.is_empty() {
-            None
-        } else {
-            let mut fb = FtsBuilder::new();
-            for fc in &opts.fts_columns {
-                // The whole chain, not just the base: a column that
-                // declares a stopword set or a stemmer must be indexed
-                // through them, or the postings would hold unfiltered
-                // terms while every query filtered.
-                let tok = chain_tokenizer(fc.stopwords, fc.stemmer);
-                let id = fb.register_column_with_tokenizer(
-                    fc.column.clone(),
-                    fc.positions,
-                    tok,
-                    fc.bm25,
-                )?;
-                if let Some(corpus) = opts.fts_corpus_stats.get(&fc.column) {
-                    fb.set_corpus_length_stats(id, *corpus);
-                }
-            }
-            Some(fb)
-        };
+        let fts_builder = fts_builder_for(&opts)?;
 
         let (vec_builder, cell_posting_builder) = if opts.vector_columns.is_empty() {
             (None, None)
@@ -1578,6 +1557,40 @@ impl SuperfileBuilder {
     pub(crate) fn set_term_head_sink(&mut self, sink: Box<dyn TermHeadSink>, depth: usize) {
         if let Some(fb) = self.fts_builder.as_mut() {
             fb.set_term_head_sink(sink, depth);
+        }
+    }
+
+    /// A text-only accumulator with this builder's columns and analysis,
+    /// in lane mode, for a lane of a build fed as its rows arrive (see
+    /// [`Self::set_fts_lane_view`]).
+    pub(crate) fn lane_builder(&self) -> Result<Option<FtsBuilder>, BuildError> {
+        let mut lane = fts_builder_for(&self.opts)?;
+        if let Some(fb) = lane.as_mut() {
+            fb.set_lane_mode();
+        }
+        Ok(lane)
+    }
+
+    /// Where each FTS column sits in a batch's schema, for
+    /// [`index_fts_rows`] on a lane of this builder's rows.
+    pub(crate) fn fts_column_indexes(&self) -> Vec<Option<usize>> {
+        self.fts_col_idxs.clone()
+    }
+
+    /// Append `batch`'s rows to the body without indexing them: their
+    /// postings arrive by another route, the lanes of a build fed as its
+    /// rows arrived.
+    pub(crate) fn add_rows_unindexed(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
+        self.add_batch_inner(batch, &[], false)
+    }
+
+    /// Hand the finish the commit's frozen lanes and which piece of them
+    /// this builder's superfile is; see [`FtsBuilder::set_lane_view`]. The
+    /// rows themselves go in through [`Self::add_rows_unindexed`], in row
+    /// order.
+    pub(crate) fn set_fts_lane_view(&mut self, lanes: Arc<FrozenLanes>, piece: usize) {
+        if let Some(fb) = self.fts_builder.as_mut() {
+            fb.set_lane_view(LaneView { lanes, piece });
         }
     }
 
@@ -1712,28 +1725,8 @@ impl SuperfileBuilder {
         let Some(fb) = self.fts_builder.as_mut() else {
             return Ok(());
         };
-        for (col_id, idx) in self.fts_col_idxs.iter().enumerate() {
-            // An unstored column absent from the schema (merge-source
-            // shape) has no text here; its postings arrive prebuilt.
-            let Some(schema_idx) = *idx else {
-                continue;
-            };
-            let arr = batch.column(schema_idx);
-            let strs = arr
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .expect("schema validated as LargeUtf8");
-            for row in 0..(n_rows as usize) {
-                let local_doc_id = self.next_local_doc_id + row as u32;
-                let text = if strs.is_null(row) {
-                    ""
-                } else {
-                    strs.value(row)
-                };
-                fb.add_doc(col_id as u32, local_doc_id, text)?;
-            }
-        }
-        Ok(())
+        debug_assert_eq!(n_rows as usize, batch.num_rows());
+        index_fts_rows(fb, &self.fts_col_idxs, batch, self.next_local_doc_id)
     }
 
     /// Carry an input superfile's existing FTS postings into this builder,
@@ -4090,6 +4083,61 @@ fn scalar_batches_in_stable_id_order(
         out.push(batch);
     }
     Ok(out)
+}
+
+/// The FTS builder `opts` describes, with every text column registered
+/// under its analysis chain and the table's length statistics; `None`
+/// for a build without text columns.
+fn fts_builder_for(opts: &BuilderOptions) -> Result<Option<FtsBuilder>, BuildError> {
+    if opts.fts_columns.is_empty() {
+        return Ok(None);
+    }
+    let mut fb = FtsBuilder::new();
+    for fc in &opts.fts_columns {
+        // The whole chain, not just the base: a column that declares a
+        // stopword set or a stemmer must be indexed through them, or the
+        // postings would hold unfiltered terms while every query filtered.
+        let tok = chain_tokenizer(fc.stopwords, fc.stemmer);
+        let id =
+            fb.register_column_with_tokenizer(fc.column.clone(), fc.positions, tok, fc.bm25)?;
+        if let Some(corpus) = opts.fts_corpus_stats.get(&fc.column) {
+            fb.set_corpus_length_stats(id, *corpus);
+        }
+    }
+    Ok(Some(fb))
+}
+
+/// Tokenize `batch`'s rows into `fb`, column by column, the rows taking
+/// document ids from `first_doc` on. `fts_col_idxs` is where each FTS
+/// column sits in the batch's schema; an unstored column absent from the
+/// schema (the merge-source shape) has no text here, and its postings
+/// arrive prebuilt.
+pub(crate) fn index_fts_rows(
+    fb: &mut FtsBuilder,
+    fts_col_idxs: &[Option<usize>],
+    batch: &RecordBatch,
+    first_doc: u32,
+) -> Result<(), BuildError> {
+    for (col_id, idx) in fts_col_idxs.iter().enumerate() {
+        let Some(schema_idx) = *idx else {
+            continue;
+        };
+        let arr = batch.column(schema_idx);
+        let strs = arr
+            .as_any()
+            .downcast_ref::<LargeStringArray>()
+            .expect("schema validated as LargeUtf8");
+        for row in 0..batch.num_rows() {
+            let local_doc_id = first_doc + row as u32;
+            let text = if strs.is_null(row) {
+                ""
+            } else {
+                strs.value(row)
+            };
+            fb.add_doc(col_id as u32, local_doc_id, text)?;
+        }
+    }
+    Ok(())
 }
 
 /// Finalize the FTS + vector blobs to two scratch temp files. At corpus scale

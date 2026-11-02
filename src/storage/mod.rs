@@ -651,8 +651,10 @@ pub trait StorageProvider: Send + Sync + fmt::Debug {
     /// local directory (LocalFs). `Some(path)` lets an open-time caller mmap a
     /// large immutable object zero-copy — sharing one physical page-cache copy
     /// across processes — instead of assembling it into private heap via
-    /// range-GETs. `None` for object-store backends (S3/Azure/GCS) and test
-    /// doubles; those callers keep the buffered fetch path.
+    /// range-GETs, and lets a writer with a finished file on the same host
+    /// put it there by linking it into place rather than writing its bytes
+    /// a second time. `None` for object-store backends (S3/Azure/GCS) and
+    /// test doubles; those callers keep the buffered fetch and put paths.
     fn local_path(&self, _uri: &str) -> Option<PathBuf> {
         None
     }

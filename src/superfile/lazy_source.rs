@@ -158,6 +158,14 @@ pub trait LazyByteSource: Send + Sync {
         self.try_get_range_sync(start, len).is_some()
     }
 
+    /// Whether no byte of `[start, start + len)` is local or being downloaded
+    /// by another read, so a read of it downloads all of it in one go. Like
+    /// [`Self::is_local`] it's only a question. Only a cache that tracks its
+    /// blocks can tell; the default says no.
+    fn is_untouched(&self, _start: u64, _len: u64) -> bool {
+        false
+    }
+
     /// [`Self::range`] for bytes downloaded ahead of the reader. A cache that
     /// tracks which way reads move doesn't count it, since the reader's next
     /// reads come from behind it. Defaults to [`Self::range`].
@@ -716,6 +724,10 @@ impl LazyByteSource for LazySubSource {
         start.saturating_add(len) <= self.len && self.inner.is_local(self.offset + start, len)
     }
 
+    fn is_untouched(&self, start: u64, len: u64) -> bool {
+        start.saturating_add(len) <= self.len && self.inner.is_untouched(self.offset + start, len)
+    }
+
     fn note_read(&self, start: u64, len: u64) {
         if start.saturating_add(len) <= self.len {
             self.inner.note_read(self.offset + start, len);
@@ -819,6 +831,10 @@ impl LazyByteSource for PrefetchedSource {
 
     fn is_local(&self, start: u64, len: u64) -> bool {
         self.lookup(start, len).is_some() || self.inner.is_local(start, len)
+    }
+
+    fn is_untouched(&self, start: u64, len: u64) -> bool {
+        self.lookup(start, len).is_none() && self.inner.is_untouched(start, len)
     }
 
     async fn range_ahead(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
