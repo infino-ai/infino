@@ -7147,8 +7147,17 @@ mod tests {
         ];
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            ENCODE_FAULT.with(|f| f.set(true));
-            let _ = done.send(SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err());
+            // The copy runs wherever `join` places it, so the fault is
+            // armed on the one thread a single-worker pool has.
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool");
+            let failed = pool.install(|| {
+                ENCODE_FAULT.with(|f| f.set(true));
+                SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err()
+            });
+            let _ = done.send(failed);
         });
         let failed = finished
             .recv_timeout(std::time::Duration::from_secs(60))
