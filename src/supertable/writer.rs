@@ -2746,10 +2746,14 @@ impl SupertableWriter {
         let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
         let (piece_options, piece_manifest, piece_stats) =
             (Arc::clone(&options), Arc::clone(&manifest), stats.clone());
+        // A spawned task starts no span of its own, so each piece's is
+        // parented here to read beside its append's.
+        let parent = Span::current();
         let outputs: Vec<ShardOutput> = run_spawned(
             pool,
             (0..n_pieces).collect(),
             move |i, _| {
+                let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
                 timed_kernel(&piece_stats, || {
                     let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
                     build_piece(
