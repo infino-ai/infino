@@ -931,9 +931,12 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::superfile::{
-        BytesLazyByteSource, LazyByteSource, SuperfileReader,
-        builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+    use crate::{
+        superfile::{
+            BytesLazyByteSource, LazyByteSource, SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        },
+        supertable::schema::{FieldId, with_field_id},
     };
 
     /// Rows of the superfile-level fixture: past three blocks, so ranges
@@ -1351,6 +1354,53 @@ mod tests {
             .expect("carry");
         let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
         assert_ranges(&carried, &opts, "carried").await;
+    }
+
+    #[tokio::test]
+    async fn a_carried_body_finds_its_range_columns_by_id() {
+        // The table renamed `qty` to `quantity` and added a range-indexed
+        // `added` after the fixture was written. The carried body holds
+        // `qty` under its old name and no `added` at all: the rewrite indexes
+        // `qty` under its id and leaves `added` out, instead of failing.
+        let (opts, bytes) = fixture_superfile();
+        let source = SuperfileReader::open(bytes).expect("open");
+        let id = |column: &str| opts.field_id_of_column(column).expect("field id");
+        let added_id = FieldId(id("title").0 + 1);
+        let mut fields: Vec<Field> = opts
+            .schema
+            .fields()
+            .iter()
+            .map(|f| match f.name().as_str() {
+                "qty" => f.as_ref().clone().with_name("quantity"),
+                _ => f.as_ref().clone(),
+            })
+            .collect();
+        fields.push(with_field_id(
+            &Field::new("added", DataType::Int64, true),
+            added_id,
+        ));
+        let table = BuilderOptions::new(
+            Arc::new(Schema::new(fields)),
+            "_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        )
+        .with_range_columns(vec!["price".into(), "quantity".into(), "added".into()]);
+
+        let mut carry = SuperfileBuilder::new(table).expect("carry builder");
+        carry.reanalyze_fts_from_reader(&source).expect("reanalyze");
+        carry.set_carried_doc_count(source.n_docs());
+        let mut out = Vec::new();
+        carry
+            .finish_carrying_body_to(&source, &mut out)
+            .expect("a range column the body lacks is left out");
+        let carried = SuperfileReader::open(Bytes::from(out)).expect("open carried");
+        assert_ranges(&carried, &opts, "carried under the new schema").await;
+        let added = carried
+            .range_rows(added_id, KeyKind::Signed, 0, u64::MAX, None)
+            .await
+            .expect("rows");
+        assert!(added.is_none(), "a column the body lacks is not indexed");
     }
 
     #[tokio::test]
