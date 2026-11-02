@@ -126,11 +126,13 @@ const SLICE_FETCH_CONCURRENCY: usize = 8;
 
 /// Objects a merge downloads at once. A rebuild at a billion documents
 /// reads over a hundred gigabytes of slices and tier objects, and at eight
-/// in flight the transfer ran at a fraction of the host's bandwidth; the
+/// in flight the transfer ran at a fraction of the host's bandwidth; at
+/// sixteen a fold of fifty layers still spent four seconds awaiting reads
+/// for every second it merged, with 3,600 ranged reads of 80 ms each. The
 /// client keeps far more warm connections than this. Each task holds one
 /// object at a time, so this many of the largest tier object bounds the
 /// transfer's memory.
-const LAYER_FETCH_CONCURRENCY: usize = 16;
+const LAYER_FETCH_CONCURRENCY: usize = 64;
 
 /// Objects one build writes at once; the write-side twin of
 /// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
@@ -830,7 +832,7 @@ pub(crate) fn plan_fold_at_optimize(
     }
     let run = match before_tiers && bytes <= max_bytes {
         true => 0..root.layers.len(),
-        false => fold_run(&root.layers, max_bytes)?,
+        false => fold_run_at_optimize(&root.layers, max_bytes)?,
     };
     Some(OptimizeFold {
         run,
@@ -963,6 +965,46 @@ fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
                 .fold(0u64, |sum, &size| sum.saturating_add(size));
             if bytes <= bound {
                 return Some(run);
+            }
+            first += FOLD_FAN_OUT;
+        }
+        start = end;
+    }
+    None
+}
+
+/// The longest run of consecutive `layers` of one size level that fit in
+/// `bound` together, at least [`FOLD_FAN_OUT`] of them; `None` when no such
+/// run exists. A commit's fold takes exactly [`FOLD_FAN_OUT`] layers to stay
+/// quick ([`fold_run`]); optimize is maintenance and can take a whole level
+/// at once, so a root of fifty layers folds in one or two passes instead of
+/// one pass per eight, each pass reading its layers from storage and
+/// publishing a root. Grouped by level like [`fold_run`], so a fold still
+/// merges layers of about one size.
+fn fold_run_at_optimize(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
+    let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
+    let levels: Vec<f64> = layers.iter().map(layer_level).collect();
+    let mut start = 0;
+    while start < layers.len() {
+        let top = levels[start..]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let end = 1
+            + (start..layers.len())
+                .rev()
+                .find(|&i| levels[i] >= top - FOLD_LEVEL_SPAN)?;
+        let mut first = start;
+        while first + FOLD_FAN_OUT <= end {
+            // Grow the run from `first` while the bytes allow.
+            let mut last = first;
+            let mut bytes = 0u64;
+            while last < end && bytes.saturating_add(sizes[last]) <= bound {
+                bytes = bytes.saturating_add(sizes[last]);
+                last += 1;
+            }
+            if last - first >= FOLD_FAN_OUT {
+                return Some(first..last);
             }
             first += FOLD_FAN_OUT;
         }
@@ -7338,6 +7380,39 @@ mod tests {
                 len: 0,
             }],
         }
+    }
+
+    /// A layer of one slice of `bytes`, for the fold-run tests.
+    fn sized_layer(bytes: u64) -> Layer {
+        Layer {
+            slices: vec![format::SliceRef {
+                first_key: vec![0],
+                last_key: vec![0],
+                content_hash: ContentHash::of(&bytes.to_le_bytes()),
+                tier: None,
+                len: bytes,
+            }],
+        }
+    }
+
+    #[test]
+    fn an_optimize_fold_takes_a_whole_level_where_a_commit_fold_takes_eight() {
+        // Fifty-two layers of one size level, as a commit-heavy table leaves
+        // behind: a commit's fold takes the first eight; optimize takes them
+        // all while the bytes allow, and only eight at a time once they
+        // don't.
+        let layers: Vec<Layer> = (0..52).map(|_| sized_layer(1 << 20)).collect();
+        assert_eq!(fold_run(&layers, 1 << 40), Some(0..FOLD_FAN_OUT));
+        assert_eq!(fold_run_at_optimize(&layers, 1 << 40), Some(0..52));
+        // A bound of twenty layers' bytes: the run stops there.
+        assert_eq!(fold_run_at_optimize(&layers, 20 << 20), Some(0..20));
+        // Fewer than a fan-out's worth within the bound: nothing to fold here.
+        assert_eq!(fold_run_at_optimize(&layers, 3 << 20), None);
+        // Two size levels: the run stays within the larger level's span and
+        // does not cross into the small layers behind it.
+        let mut mixed: Vec<Layer> = (0..10).map(|_| sized_layer(1 << 30)).collect();
+        mixed.extend((0..10).map(|_| sized_layer(1 << 10)));
+        assert_eq!(fold_run_at_optimize(&mixed, 1 << 40), Some(0..10));
     }
 
     /// A root listing `ids` (each its own `id_min`; `0` is padding) over
