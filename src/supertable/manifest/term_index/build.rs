@@ -1618,9 +1618,18 @@ pub(crate) fn build_layer(
     })
 }
 
+/// Ranges a build from contributions is cut into at most. A range holds a
+/// reader per contribution and the writer's open slice and tier chunk, a
+/// few tens of megabytes, so a wide host's pool is the bound in practice
+/// and this only keeps a very wide one to a few gigabytes. An optimize's
+/// final build of 13 GB of contributions ran in 32 ranges of 7–9 s each on
+/// a 180-thread pool under the merge's cap; its work is per posting, not
+/// per byte, and spreads over whatever width it is given.
+const BUILD_RANGES_MAX: usize = 256;
+
 /// Bytes of contributions one key range of a layer build takes: a build of
 /// `n` times this runs in `n` ranges side by side, up to the pool's width
-/// and [`MERGE_RANGES_MAX`]. A commit's 5M-row append brings about 100 MiB
+/// and [`BUILD_RANGES_MAX`]. A commit's 5M-row append brings about 100 MiB
 /// of contributions and built them on one writer for three to five
 /// seconds while the pool idled; at this size it runs in a handful of
 /// ranges, a rebuild over thousands of superfiles in the full width, and a
@@ -2185,9 +2194,9 @@ fn run_ranges(
 
 /// How many key ranges a build of `bytes` of contributions is cut into: the
 /// policy's count when set, else one per [`BUILD_RANGE_BYTES`], at least
-/// one and at most the pool's width and [`MERGE_RANGES_MAX`].
+/// one and at most the pool's width and [`BUILD_RANGES_MAX`].
 fn build_range_count(policy: &BuildPolicy, bytes: u64) -> Result<usize, TermIndexError> {
-    let width = range_count(policy, 0, || Ok(bytes))?;
+    let width = range_count(policy, 0, BUILD_RANGES_MAX, || Ok(bytes))?;
     if policy.merge_ranges.is_some() {
         return Ok(width);
     }
@@ -2197,10 +2206,11 @@ fn build_range_count(policy: &BuildPolicy, bytes: u64) -> Result<usize, TermInde
 
 /// How many key ranges to cut work of `bytes` into: the policy's count when
 /// set, one when the work is under `min_bytes`, else the pool's width, at
-/// most [`MERGE_RANGES_MAX`].
+/// most `cap`.
 fn range_count(
     policy: &BuildPolicy,
     min_bytes: u64,
+    cap: usize,
     bytes: impl FnOnce() -> Result<u64, TermIndexError>,
 ) -> Result<usize, TermIndexError> {
     Ok(match policy.merge_ranges {
@@ -2210,7 +2220,7 @@ fn range_count(
             .pool
             .as_deref()
             .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
-            .clamp(1, MERGE_RANGES_MAX),
+            .clamp(1, cap),
     })
 }
 
@@ -2278,7 +2288,7 @@ pub(crate) fn key_ranges(
     policy: &BuildPolicy,
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
-    let want = range_count(policy, MERGE_RANGE_MIN_BYTES, || {
+    let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
         let mut bytes = 0u64;
         for file in &files {
             bytes += fs::metadata(&file.path)?.len();
