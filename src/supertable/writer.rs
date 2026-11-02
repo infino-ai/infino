@@ -2543,10 +2543,15 @@ impl SupertableWriter {
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
-                let n_lanes = options
-                    .writer_pool
-                    .current_num_threads()
-                    .clamp(1, MAX_LANES);
+                // One lane per pool thread, but no more than the rows can
+                // use: every lane is a builder with its own dictionary, and
+                // the freeze merges all of them, so a 5M-row append fed
+                // through 180 lanes on a wide host pays for 180 small
+                // dictionaries and a 180-way term merge for tokenisation it
+                // could do on a few dozen threads. Concurrent appends fill
+                // the pool between them.
+                let buffered_rows: usize = self.buffer.iter().map(|b| b.scalar.num_rows()).sum();
+                let n_lanes = lane_count(options.writer_pool.current_num_threads(), buffered_rows);
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
                     Ok(live) => live,
@@ -3510,6 +3515,20 @@ fn reserve_build_scratch(
 /// it just buffered and returns; the next append (or the commit) first
 /// waits for that feed to finish, so the caller blocks only when
 /// tokenizing is slower than its own reading.
+/// Rows a live lane should tokenise at the least. Lanes cost a dictionary
+/// each and a lane-wide term merge at the freeze, so a buffer is fed through
+/// as many lanes as hold this many rows, up to the pool's width: a wide host
+/// does not open a lane per thread for a buffer that cannot fill them.
+const LANE_MIN_ROWS: usize = 1 << 16;
+
+/// How many live lanes a buffer of `rows` rows is fed through on a pool of
+/// `threads` threads: one per [`LANE_MIN_ROWS`] rows, at least one, at most
+/// the pool's width and [`MAX_LANES`].
+fn lane_count(threads: usize, rows: usize) -> usize {
+    let by_rows = rows.div_ceil(LANE_MIN_ROWS).max(1);
+    by_rows.min(threads.max(1)).min(MAX_LANES)
+}
+
 struct LiveLanes {
     /// The manifest the lanes were opened against. A commit under a
     /// different schema cannot seal them.
@@ -13781,6 +13800,21 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 #[cfg(test)]
 mod tests {
     use crate::supertable::manifest::ScalarStats;
+    #[test]
+    fn lane_count_follows_the_rows_up_to_the_pool() {
+        // A small buffer gets one lane however wide the pool.
+        assert_eq!(lane_count(180, 1_000), 1);
+        // One lane per LANE_MIN_ROWS rows while the pool has threads to spare.
+        assert_eq!(
+            lane_count(180, 5_000_000),
+            5_000_000usize.div_ceil(LANE_MIN_ROWS)
+        );
+        // Never more lanes than threads, nor than a merged order can name.
+        assert_eq!(lane_count(8, 5_000_000), 8);
+        assert_eq!(lane_count(1_000, 1_000_000_000), MAX_LANES);
+        assert_eq!(lane_count(0, 0), 1);
+    }
+
     #[test]
     fn open_blob_inlines_each_open_range_only_while_it_is_small() {
         // A 16 MiB "superfile": the parquet tail is the last 64 KiB; an
