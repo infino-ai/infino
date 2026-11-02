@@ -1101,8 +1101,8 @@ impl SupertableOptions {
         self
     }
 
-    /// Whether commits publish into a term index and maintenance rebuilds
-    /// one: the option is on and storage is attached, since the index lives
+    /// Whether commits publish into a term index and maintenance indexes
+    /// what they left out: the option is on and storage is attached, since the index lives
     /// beside the superfiles on storage. A table with no text column has no
     /// terms to index; its callers check that themselves.
     pub(crate) fn keeps_term_index(&self) -> bool {

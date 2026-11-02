@@ -7,7 +7,9 @@
 //! Ids are Snowflake-style — a millisecond timestamp in the high half, a
 //! worker id and counter in the low half — minted by one generator per
 //! writer and appended in order, so within a run of consecutive docs the
-//! high halves sit in a narrow band and the low halves in another. The
+//! high halves sit in a narrow band and the low halves in another. A block
+//! that mixes writers, as a merge of their files does, is the exception:
+//! its low halves differ in the worker id and pack at up to 64 bits. The
 //! sidecar splits every id into its two `u64` halves and stores each
 //! block of [`BLOCK_DOCS`] docs as two frame-of-reference streams: a
 //! base (the block's minimum) plus each doc's offset from it, bit-packed
@@ -557,6 +559,24 @@ fn id_sidecar_range(superfile: &[u8]) -> Range<usize> {
     off..off + at(kv::IDS_LENGTH)
 }
 
+/// Test-only: `n` ids from two writers taking turns, as a merge of their
+/// files leaves them: a millisecond high half, and a low half of a 40-bit
+/// worker id above a 24-bit counter. The worker ids differ in bit 38, so a
+/// block's low halves pack at 63 bits, wider than one 8-byte load holds
+/// from a mid-byte start.
+#[cfg(test)]
+pub(crate) fn two_writer_ids(n: usize) -> Vec<i128> {
+    const MS: u64 = 1_700_000_000_000;
+    const WORKERS: [u64; 2] = [0x12_3456_789A, 0x52_3456_789A];
+    const COUNTER_BITS: u32 = 24;
+    (0..n as u64)
+        .map(|i| {
+            let lo = (WORKERS[(i % 2) as usize] << COUNTER_BITS) | (i / 2);
+            ((((MS + i % 3) as u128) << 64) | lo as u128) as i128
+        })
+        .collect()
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
 test_visible! {
     /// Test-only: a copy of `superfile` with block `b` of its id sidecar
@@ -604,6 +624,7 @@ const BULK_DENSITY: usize = 4;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::superfile::bits::ONE_LOAD_MAX_WIDTH;
 
     fn raw(ids: &[i128]) -> Vec<u8> {
         ids.iter().flat_map(|id| id.to_le_bytes()).collect()
@@ -734,6 +755,27 @@ mod tests {
         round_trip(&ids);
         round_trip(&[42]);
         assert!(encode_packed(&[]).is_empty());
+    }
+
+    /// Ids from two writers in one block ([`two_writer_ids`]): most of the
+    /// block's 63-bit low halves start mid-byte and end in a ninth byte.
+    /// Both reads must return every id as written: `round_trip` reads one
+    /// doc at a time, and asking for every doc reads the block whole (see
+    /// `BULK_DENSITY`).
+    #[test]
+    fn a_block_mixing_two_writers_decodes_the_same_whole_as_one_at_a_time() {
+        let ids = two_writer_ids(BLOCK_DOCS);
+        let packed = round_trip(&ids);
+        let p = PackedIds::open(&packed, ids.len()).expect("opens");
+        let lo_width = p.block(0).expect("block 0").lo_width;
+        assert!(
+            (ONE_LOAD_MAX_WIDTH + 1..MAX_WIDTH).contains(&lo_width),
+            "low halves pack at {lo_width} bits, past one 8-byte load from a mid-byte start"
+        );
+        let all: Vec<u32> = (0..ids.len() as u32).collect();
+        let mut got = Vec::new();
+        p.get_many(&all, &mut got).expect("in range");
+        assert_eq!(got, ids, "the whole-block read returns the ids written");
     }
 
     #[test]

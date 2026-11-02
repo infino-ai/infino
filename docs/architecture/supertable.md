@@ -301,13 +301,17 @@ stamps the root's reference on the manifest before the pointer swap.
 So a visible superfile always has postings, a crash between the writes
 and the swap leaves only orphans for garbage collection, and a lost
 race is retried against the winner with re-puts of already-written
-slices as no-ops. A maintenance pass folds every delta into one base
-layer. Deltas committed while it runs stay after that base, padded so
-their ordinals hold; when they cannot (an incomplete or replaced prior
-index, or one that cannot be read), their superfiles are re-indexed on
-top of the base instead. The next pass folds either. A posting is
-followed only if its superfile is still live in the reader's manifest,
-so a removal never invalidates the index.
+slices as no-ops. A commit folds runs of small layers as they pile up;
+a maintenance pass folds the larger runs commits leave, one run per
+publish and no more than one compaction merge's input at a time. Once
+at least half of the root's list of superfiles is dead and the whole
+index fits that bound, the pass folds every layer into one and numbers
+the live superfiles afresh, which is the only way the list shortens.
+Deltas committed while a fold runs are stacked after it as they were
+committed, padded so their ordinals hold, so its retry writes one root;
+a later renumbering drops the padding. A posting is followed only if
+its superfile is still live in the reader's manifest, so a removal never
+invalidates the index.
 
 Queries use it at every tier. Superfile selection for a term or prefix
 is exact for every superfile the index lists. The choice of which
@@ -383,21 +387,23 @@ writes a superfile hands each term's best documents to a sink as it
 writes the term's postings, and the sink spills them as the superfile's
 contribution; a superfile built without the sink has its heads read
 from its own index with the single-term kernel instead, which gives the
-same bytes. The delta layer pools the contributions into tiers, and
-the maintenance rebuild re-pools every layer's tiers table-wide. A
-superfile's bytes are not changed by any of this. An index written by
-the layout before tiers is still read: its bounds, scores at each
-superfile's own idf, serve ceilings as they did, and the next
-maintenance rebuild writes the current layout.
+same bytes. The delta layer pools the contributions into tiers, and a
+fold re-pools the tiers of the layers it merges. A superfile's bytes are
+not changed by any of this. An index written by the layout before tiers
+is still read: its bounds, scores at each superfile's own idf, serve
+ceilings as they did until a fold rewrites them in the current layout.
 
 A table whose term index is absent or incomplete routes by its entries'
 blooms, and its next commit publishes an index that covers only the new
 superfiles — the manifest marks it incomplete, and part loading keeps
-the summary-based choice until a maintenance pass rebuilds the index
-over every superfile. Nothing requires old code to read a new manifest.
+the summary-based choice until maintenance has indexed every superfile.
+Maintenance indexes the superfiles the index does not list a batch at a
+time, each batch published as a commit publishes its own postings, so
+its cost is bounded by the batch and a stopped pass keeps what it
+published. Nothing requires old code to read a new manifest.
 
 A table can keep no term index at all (`SupertableOptions::term_index`
-off): its commits publish nothing, its maintenance rebuilds nothing, and
+off): its commits publish nothing, its maintenance indexes nothing, and
 no index object is written beside its superfiles. Nothing takes the
 index's place: a table on storage records no per-superfile term filter,
 so a query probes every superfile. That is worth it only where the
@@ -522,7 +528,7 @@ resident it is served from a local memory-mapped file. The cache tracks
 residency per superfile and is bounded by a configurable budget, evicting
 cold superfiles when the budget is reached.
 
-Between those two states, the ranges a cold query reads are kept in a sparse local block file, in 512 KiB blocks, so reading them again is local. The query gets its bytes as soon as they are fetched; writing them to the block file happens afterwards, off the query's thread, so a query doesn't wait on a disk busy with background downloads. The block file's index lists only blocks already safely on disk, so after a restart the cache reuses them and fetches only what was not written yet.
+Between those two states, the ranges a cold query reads are kept in a sparse local block file, in 64 KiB blocks, so reading them again is local. The query gets its bytes as soon as they are fetched; writing them to the block file happens afterwards, off the query's thread, so a query doesn't wait on a disk busy with background downloads. The block file's index lists only blocks already safely on disk, so after a restart the cache reuses them and fetches only what was not written yet. The index also names the block file it was written for, so it is never trusted for a newer file created at the same path.
 
 The cache distinguishes on-disk residency from memory residency. An
 optional memory budget bounds the mapped working set rather than the

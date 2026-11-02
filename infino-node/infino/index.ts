@@ -244,7 +244,7 @@ export interface PlannedRepair {
 
 export interface Bm25SearchOptions {
   mode?: BoolMode;
-  /** Columns to return, e.g. `["_id", "score"]`; omit for full rows. */
+  /** Columns to return, e.g. `["_id", "body"]`; omit for `_id` + `score` only. */
   projection?: string[];
   /** BM25 `k1` for this search only, overriding the column's declared value.
    * Pass `k1` and `b` together or neither. Results stay exact; only pruning
@@ -739,7 +739,8 @@ export class Connection {
    * by `id` when it carries one and by `name` otherwise; an unmatched field
    * is added, a different type changes the column, `dropped: true` retires
    * it, and a field not mentioned is untouched. `expectedSchemaId` is a
-   * compare-and-set against the current `schema_id`.
+   * compare-and-set against the current `schema_id`. Not yet available on a
+   * hosted (`https://`) connection; it raises an error there.
    */
   schema(name: string, patch?: SchemaPatch, expectedSchemaId?: number): TableSchema {
     const text = guard(this.remote, () =>

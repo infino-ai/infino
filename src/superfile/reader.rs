@@ -3238,12 +3238,16 @@ mod tests {
     }
 
     fn build_shuffled_id_superfile_with(opts: BuilderOptions) -> (Bytes, Vec<i128>) {
-        let schema = schema_with_text();
-        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-
         let ids: Vec<i128> = (0..SHUFFLED_ID_ROWS)
             .map(|i| SHUFFLED_ID_BASE + (i * SHUFFLED_ID_STRIDE % SHUFFLED_ID_ROWS) as i128)
             .collect();
+        (build_superfile_with_ids(opts, &ids), ids)
+    }
+
+    /// A superfile of `ids` in row order, each row titled after its id.
+    fn build_superfile_with_ids(opts: BuilderOptions, ids: &[i128]) -> Bytes {
+        let schema = schema_with_text();
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
         let id_arr = Decimal128Array::from_iter_values(ids.iter().copied())
             .with_precision_and_scale(38, 0)
             .expect("Decimal128(38,0)");
@@ -3252,7 +3256,7 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(id_arr), Arc::new(title)])
             .expect("build RecordBatch");
         b.add_batch(&batch, &[]).expect("add_batch");
-        (Bytes::from(b.finish().expect("finish builder")), ids)
+        Bytes::from(b.finish().expect("finish builder"))
     }
 
     /// Independent oracle: the first row offset at which each target
@@ -3424,6 +3428,33 @@ mod tests {
             .expect("decimal ids");
         assert_eq!(ids.value(0), 10_i128);
         assert_eq!(ids.value(3), 13_i128);
+    }
+
+    /// Every `_id` of a fully resident superfile, the read a drain makes to
+    /// route a file's rows into the hidden vector index: it comes from the
+    /// id sidecar, so ids from two writers, whose sidecar blocks pack wider
+    /// than one 8-byte load holds, must come back as the file was built.
+    #[test]
+    fn take_by_local_doc_ids_returns_two_writer_ids_from_the_sidecar() {
+        let ids = ids::two_writer_ids(3 * ids::BLOCK_DOCS);
+        let opts = BuilderOptions::new(schema_with_text(), "doc_id", vec![], vec![]);
+        let r = SuperfileReader::open(build_superfile_with_ids(opts, &ids)).expect("open");
+        assert!(
+            r.id_sidecar.is_some_and(|loc| loc.packed),
+            "a packed sidecar"
+        );
+        let every: Vec<u32> = (0..ids.len() as u32).collect();
+        let batch = r.take_by_local_doc_ids(&every, &["doc_id"]).expect("take");
+        assert!(
+            !r.id_sidecar_broken.load(Ordering::Relaxed),
+            "the ids came from the sidecar, not the Parquet fallback"
+        );
+        let got = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal ids");
+        assert_eq!(got.values().to_vec(), ids);
     }
 
     /// A fresh build writes the stable-id sidecar, and resolving `_id`

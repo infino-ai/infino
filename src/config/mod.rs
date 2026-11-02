@@ -1258,7 +1258,7 @@ pub struct OptimizeSteps {
     pub compact: bool,
     /// Pre-build the vector router so the next query doesn't have to.
     pub router_cache_warmup: bool,
-    /// Rebuild the term index.
+    /// Index the superfiles the term index does not list.
     pub refresh_term_index: bool,
     /// Rebuild the graph adjacency index.
     #[cfg(feature = "graph-index")]

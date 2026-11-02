@@ -97,11 +97,12 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// `3` keys terms by the column's field id instead of its name; `4` names
 /// each slice's tier object beside the slice; `5` records each slice's
 /// byte length again beside its tier, which the fold at commit sizes
-/// layers by. A root at version `4` decodes with every length zero, so
-/// its layers fold at the first commit that gathers enough of them; one
+/// layers by. A root at version `4` decodes with every length zero, until
+/// optimize reads each slice's length from storage and writes it in; one
 /// at version `3` still decodes — its slices are at version 1 and serve
-/// ceilings until the next maintenance rebuild writes the current layout;
-/// anything older does not, and the index is rebuilt, not translated.
+/// ceilings until a fold rewrites them in the current layout; anything
+/// older does not, and the index is built again from the superfiles, not
+/// translated.
 pub(crate) const ROOT_FORMAT_VERSION: u32 = 5;
 /// The root version that named tiers but not slice lengths.
 pub(crate) const UNSIZED_ROOT_FORMAT_VERSION: u32 = 4;
@@ -315,7 +316,7 @@ pub(crate) struct Layer {
 pub(crate) struct Root {
     /// Superfiles with postings in some layer; postings name them by
     /// ordinal. Never reordered — a delta appends. May hold nil padding,
-    /// which no posting names (see `append_reserved`).
+    /// which no posting names (see `rebase`).
     pub(crate) superfiles: Vec<Uuid>,
     /// Each superfile's smallest doc id, parallel to `superfiles`.
     pub(crate) id_mins: Vec<i128>,
@@ -362,6 +363,26 @@ impl<'a> Cursor<'a> {
         let n = self.u32(what)? as usize;
         self.take(n, what)
     }
+}
+
+/// Bytes at the front of a slice that name its layout: magic, then version.
+pub(crate) const SLICE_VERSION_PREFIX_LEN: u64 = (MAGIC_LEN + U32_LEN) as u64;
+
+/// Whether a slice whose first [`SLICE_VERSION_PREFIX_LEN`] bytes are
+/// `prefix` is of the layout before tiers, refusing a magic or version
+/// [`Slice::open`] would refuse.
+pub(crate) fn slice_is_before_tiers(prefix: &[u8]) -> Result<bool, TermIndexError> {
+    let mut c = Cursor {
+        bytes: prefix,
+        at: 0,
+    };
+    let version = check_magic_version(
+        &mut c,
+        SLICE_MAGIC,
+        &[SLICE_FORMAT_VERSION, LEGACY_SLICE_FORMAT_VERSION],
+        "slice",
+    )?;
+    Ok(version == LEGACY_SLICE_FORMAT_VERSION)
 }
 
 /// Check the magic and read the version, which must be the current one
