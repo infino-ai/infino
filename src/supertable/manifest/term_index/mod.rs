@@ -1005,6 +1005,7 @@ enum ObjectCheck {
 /// the objects new since the last one. (Whether a slice names a tier
 /// object does not tell its layout: a slice whose terms' tiers are small
 /// keeps them inline and names none.)
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(crate) async fn check_objects(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
@@ -1362,6 +1363,7 @@ async fn fetch_verified(
 }
 
 /// Fetch, hash-verify and parse the root a manifest references.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(crate) async fn load_root(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,

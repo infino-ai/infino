@@ -12004,6 +12004,7 @@ fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEn
 
 /// Write `folded`, a fold made of `prior`, and keep both in `kept` for a
 /// retry should its publish lose to a commit.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_fold(
     storage: &Arc<dyn StorageProvider>,
     kept: &Mutex<Option<KeptFold>>,
@@ -12111,6 +12112,7 @@ const CONTRIBUTION_WALKS_FALLBACK: usize = 4;
 /// Each of `entries`' term-index contributions, in `entries` order, walked
 /// as many superfiles at a time as memory allows, up to
 /// [`CONTRIBUTION_WALKS_MAX`].
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
