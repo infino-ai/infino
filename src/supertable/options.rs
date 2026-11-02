@@ -53,7 +53,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
 
@@ -215,6 +215,33 @@ fn shared_writer_pool() -> Arc<ThreadPool> {
                 .expect("invariant: rayon pool build only fails on thread-spawn failure"),
         )
     }))
+}
+
+/// Pools for a `Fixed` thread count in [`Config`], one per (role, size),
+/// shared by every table configured with that size: a hundred tables under
+/// `writer_threads: 8` share one eight-thread pool rather than spawning
+/// eight hundred threads.
+static FIXED_POOLS: OnceLock<Mutex<HashMap<(&'static str, usize), Arc<ThreadPool>>>> =
+    OnceLock::new();
+
+fn fixed_pool(role: &'static str, threads: usize) -> Result<Arc<ThreadPool>, BuildError> {
+    let threads = threads.max(1);
+    let mut pools = FIXED_POOLS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(pool) = pools.get(&(role, threads)) {
+        return Ok(Arc::clone(pool));
+    }
+    let pool = Arc::new(
+        ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(move |i| format!("supertable-{role}-{i}"))
+            .build()
+            .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
+    );
+    pools.insert((role, threads), Arc::clone(&pool));
+    Ok(pool)
 }
 
 /// Default name of the supertable-injected primary-key column.
@@ -1358,34 +1385,7 @@ impl SupertableOptions {
     /// a user-schema field — same check as
     /// [`Self::with_id_column`].
     pub fn apply_config(mut self, cfg: &Config) -> Result<Self, BuildError> {
-        // `Auto` keeps the shared pool; `Fixed` builds a dedicated one
-        // (the config analogue of `with_reader_pool` / `with_writer_pool`).
-        self.reader_pool = match cfg.supertable.reader_threads {
-            ThreadCount::Auto => shared_reader_pool(),
-            ThreadCount::Fixed(n) => Arc::new(
-                ThreadPoolBuilder::new()
-                    .num_threads(n.max(1))
-                    .thread_name(|i| format!("supertable-reader-{i}"))
-                    .build()
-                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-            ),
-        };
-        self.writer_pool = match cfg.supertable.writer_threads {
-            ThreadCount::Auto => shared_writer_pool(),
-            ThreadCount::Fixed(n) => Arc::new(
-                ThreadPoolBuilder::new()
-                    .num_threads(n.max(1))
-                    .thread_name(|i| format!("supertable-writer-{i}"))
-                    .build()
-                    .map_err(|e| BuildError::ThreadPoolCreation(e.to_string()))?,
-            ),
-        };
-        self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
-        self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
-        self.crc_verification = cfg.supertable.crc_policy();
-        self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
-        self.target_recall = cfg.vector.target_recall;
-        self.drain_consolidate = cfg.vector.drain_consolidate;
+        self = self.apply_table_config(cfg)?;
         // The `config.yaml` source for the connection budget; the connect path
         // uses `ConnectOptions` instead. 0, the shipped default, is measure-only.
         // Note this replaces the budget outright: don't call `apply_config` on
@@ -1393,6 +1393,40 @@ impl SupertableOptions {
         // is silently dropped.
         self.connection_memory_budget =
             ConnectionMemoryBudget::from_budget_bytes(cfg.memory.connection_budget_bytes);
+        self.apply_storage_config(cfg)?;
+        Ok(self)
+    }
+
+    /// The table knobs of `cfg`, and nothing else: the `supertable` section
+    /// (thread pools, commit threshold, superfile split, CRC policy, id
+    /// column) and the `vector` drain settings. Leaves the connection budget
+    /// and the storage wiring as they are, so a caller that owns both — the
+    /// catalog, whose connection chose the backend and shares one budget
+    /// across its tables — can take the config's table settings without a
+    /// `memory://` table acquiring the config's storage, or a storage-backed
+    /// one a cache built over a different root. [`Self::apply_config`] is
+    /// this plus the budget and the storage.
+    ///
+    /// Rejects an id-column name from config that conflicts with a
+    /// user-schema field — same check as [`Self::with_id_column`].
+    pub fn apply_table_config(mut self, cfg: &Config) -> Result<Self, BuildError> {
+        // `Auto` keeps the shared pool; `Fixed` takes the pool shared by every
+        // table configured with that size (the config analogue of
+        // `with_reader_pool` / `with_writer_pool`).
+        self.reader_pool = match cfg.supertable.reader_threads {
+            ThreadCount::Auto => shared_reader_pool(),
+            ThreadCount::Fixed(n) => fixed_pool("reader", n)?,
+        };
+        self.writer_pool = match cfg.supertable.writer_threads {
+            ThreadCount::Auto => shared_writer_pool(),
+            ThreadCount::Fixed(n) => fixed_pool("writer", n)?,
+        };
+        self.commit_threshold_size_mb = cfg.supertable.commit_threshold_size_mb;
+        self.superfile_buffer_split_mb = cfg.supertable.superfile_buffer_split_mb;
+        self.crc_verification = cfg.supertable.crc_policy();
+        self.drain_batch_superfiles = cfg.vector.drain_batch_superfiles;
+        self.target_recall = cfg.vector.target_recall;
+        self.drain_consolidate = cfg.vector.drain_consolidate;
         if cfg.supertable.id_column != self.id_column {
             if self
                 .schema
@@ -1406,7 +1440,6 @@ impl SupertableOptions {
             }
             self.id_column = cfg.supertable.id_column.clone();
         }
-        self.apply_storage_config(cfg)?;
         Ok(self)
     }
 

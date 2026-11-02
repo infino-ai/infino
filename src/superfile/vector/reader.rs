@@ -3927,10 +3927,21 @@ impl VectorReader {
                     ));
                 }
                 // Cold (or RabitqOnly): probe-and-rerank now, width-divided.
+                // The per-cluster budget scales by the clusters this cell
+                // scores, as the warm arm does.
+                let cold_cell_rerank_mult = if budget_per_cluster {
+                    let scored = cluster_meta
+                        .iter()
+                        .filter(|&&(c, _, _)| cell_score.as_deref().is_none_or(|s| s.contains(&c)))
+                        .count();
+                    cold_rerank_mult.saturating_mul(scored.max(1))
+                } else {
+                    cold_rerank_mult
+                };
                 let ctx = ProbeCtx {
                     q_rot: q_rot_shared,
                     k,
-                    rerank_mult: cold_rerank_mult,
+                    rerank_mult: cold_cell_rerank_mult,
                     allow: cell_allow,
                     deny: cell_deny,
                     pool,
@@ -10483,6 +10494,88 @@ mod tests {
         assert_eq!(
             immediate.0, deferred,
             "deferred scan+select+rerank must equal the immediate probe's top-k"
+        );
+    }
+
+    /// With the per-cluster budget on, a cell keeps `k * rerank_mult` rows for
+    /// each selected cluster whether its bytes are resident (warm) or have to
+    /// be fetched (cold), so the rows that reach the exact rerank do not depend
+    /// on what the cache holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_scan_keeps_the_per_cluster_budget() {
+        const DIM: usize = 16;
+        /// Fine clusters in the single cell; all of them are selected.
+        const N_CENT: usize = 8;
+        /// Rows in the corpus, well above `K * RERANK_MULT * N_CENT`.
+        const N_DOCS: u32 = 4000;
+        const K: usize = 10;
+        /// Small enough that the budget, not the cluster sizes, caps the pool.
+        const RERANK_MULT: usize = 2;
+        const QUERY_ROW: usize = 7;
+
+        let (blob, json, all) =
+            build_large_corpus(DIM, N_CENT, N_DOCS, RerankCodec::Sq8Residual, Metric::L2Sq);
+        let clusters: Vec<u32> = (0..N_CENT as u32).collect();
+
+        let warm_reader = VectorReader::open(blob.clone(), &json).expect("open warm");
+        let warm = warm_reader
+            .search_clusters_scan_async(
+                "v",
+                &all[QUERY_ROW],
+                K,
+                &clusters,
+                None,
+                RERANK_MULT,
+                RERANK_MULT,
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("warm scan");
+        assert!(warm.hits.is_empty(), "a resident reader defers every cell");
+
+        let cold_source = StdArc::new(CountingLazyByteSource::new(blob));
+        let cold_reader = VectorReader::open_with_source(
+            Source::Lazy(StdArc::clone(&cold_source) as StdArc<dyn LazyByteSource>),
+            &json,
+            OpenOptions::default(),
+        )
+        .expect("open cold");
+        cold_source.disable_sync();
+        let cold = cold_reader
+            .search_clusters_scan_async(
+                "v",
+                &all[QUERY_ROW],
+                K,
+                &clusters,
+                None,
+                RERANK_MULT,
+                RERANK_MULT,
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("cold scan");
+        assert!(
+            cold.candidates.is_empty(),
+            "a non-resident cell probes cold"
+        );
+
+        assert_eq!(
+            warm.candidates.len(),
+            K * RERANK_MULT * N_CENT,
+            "the warm arm keeps k * rerank_mult rows per selected cluster"
+        );
+        assert_eq!(
+            cold.rows_reranked as usize,
+            warm.candidates.len(),
+            "the cold arm must rerank as many rows as the warm arm keeps"
         );
     }
 

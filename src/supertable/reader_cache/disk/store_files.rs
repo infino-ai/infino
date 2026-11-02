@@ -41,7 +41,7 @@ use crate::{
 /// "recovery is a refetch" argument cannot survive.
 ///
 /// `never` still means never, at every boundary.
-fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
+pub(super) fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
     match intent {
         ReadIntent::Load => config.crc_verification.verifies_on_landing(),
         ReadIntent::Warm | ReadIntent::Stream => config.crc_verification.verifies_on_open(),
@@ -110,10 +110,7 @@ impl DiskCacheStore {
             // local-disk table. A link that is refused (another filesystem)
             // falls through to the copy. The cache only ever adds and
             // removes whole files, so sharing the inode with storage is
-            // safe. The sealed file is not fsynced here: the storage copy it
-            // shares an inode with was never fsynced by the local-filesystem
-            // put either, so the cache's copy is no less durable than the
-            // table's own.
+            // safe.
             let linked = match temp_file_behind(&bytes) {
                 Some(sealed) => {
                     let _ = fs::remove_file(&tmp);
@@ -121,16 +118,23 @@ impl DiskCacheStore {
                 }
                 None => false,
             };
-            // Otherwise write the bytes to a tmp file, fsync, then atomically
-            // rename into place. The fsync is what makes the file on disk
-            // match the bytes written: nothing reads it back to check. An
-            // earlier version skipped it and leaned on a later run
-            // re-verifying every cache file at open to drop a torn one, but
-            // the default policy no longer does that scan, so a crash
-            // between the write and the flush would leave a torn file that
-            // the next run adopts. The other two fill paths already
-            // `sync_all` for the same reason.
-            if !linked {
+            // Either way the file is fsynced before the rename into place.
+            // The fsync is what makes the file on disk match the bytes
+            // written: nothing reads it back to check. An earlier version
+            // skipped it and leaned on a later run re-verifying every cache
+            // file at open to drop a torn one, but the default policy no
+            // longer does that scan, so a host crash between the write and
+            // the flush would leave a torn file that the next run adopts.
+            // The linked file needs it as much as a copy: the build wrote it
+            // without flushing, and when the table lives in an object store
+            // that upload is durable while this link is the only copy on
+            // the host. On a local-filesystem table the link shares the
+            // inode with the table's own copy, so the flush carries that to
+            // disk too. The other two fill paths already `sync_all` for the
+            // same reason.
+            if linked {
+                tokio::fs::File::open(&tmp).await?.sync_all().await?;
+            } else {
                 let mut file = tokio::fs::File::create(&tmp).await?;
                 file.write_all(&bytes).await?;
                 file.flush().await?;

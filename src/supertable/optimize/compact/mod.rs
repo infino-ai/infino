@@ -9,6 +9,7 @@
 //! re-compacted.
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
     io::{BufWriter, Write},
     mem,
@@ -62,7 +63,7 @@ use crate::{
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
-        reader_cache::disk::mmap_readonly_bytes,
+        reader_cache::disk::mmap_temp_file_bytes,
         schema::{FieldId, PhysicalSchema, TableSchema, map::FileSchemaMap},
         wal::{
             Etag, SealRecord, TombstonesSidecar, WalStore, WalStoreError,
@@ -127,12 +128,65 @@ impl Supertable {
     }
 }
 
-/// Threads in each merge's own pool: the maintenance width shared out among
-/// the merges that can run at once. A pass of fewer jobs than its width gives
-/// each the larger share, and rounding down keeps the pool's width a ceiling
-/// on all of them together.
-fn merge_pool_width(maintenance_threads: usize, concurrency: usize, jobs: usize) -> usize {
-    (maintenance_threads / concurrency.min(jobs).max(1)).max(1)
+/// Threads in each merge's own pool, by plan index: the maintenance width
+/// shared out among the merges that can run at once.
+///
+/// A pass whose jobs all run at once shares the width by documents: a
+/// merge's time goes with its documents, the pass takes as long as its
+/// largest merge, and an even share leaves the largest merge short while
+/// the smallest finishes early and idles its threads. The shares are
+/// rounded so they add up to the width exactly, largest remainders first,
+/// and every merge gets at least one thread — a tiny merge's thread comes
+/// out of the largest shares. A pass with more jobs than can run at once,
+/// or whose jobs report no documents, gives each the even share, rounded
+/// down, so the merges in flight never hold more threads together than
+/// the pool has; only more merges in flight than threads oversubscribes
+/// it, by that shortfall, since a merge cannot run on none.
+fn merge_pool_widths(
+    maintenance_threads: usize,
+    concurrency: usize,
+    jobs: &[CompactionJob],
+) -> Vec<usize> {
+    let threads = maintenance_threads.max(1);
+    let concurrency = concurrency.max(1);
+    let total_docs: u128 = jobs.iter().map(|j| u128::from(j.live_docs)).sum();
+    if jobs.len() > concurrency || jobs.len() <= 1 || total_docs == 0 {
+        let even = (threads / concurrency.min(jobs.len()).max(1)).max(1);
+        return vec![even; jobs.len()];
+    }
+    if threads <= jobs.len() {
+        return vec![1; jobs.len()];
+    }
+    // Each job's share in thread units, scaled so the largest remainders
+    // can be ranked without floating point: `scaled / total_docs` threads.
+    let scaled: Vec<u128> = jobs
+        .iter()
+        .map(|j| u128::from(j.live_docs) * threads as u128)
+        .collect();
+    let mut widths: Vec<usize> = scaled
+        .iter()
+        .map(|&s| ((s / total_docs) as usize).max(1))
+        .collect();
+    let mut by_remainder: Vec<usize> = (0..jobs.len()).collect();
+    by_remainder.sort_by_key(|&i| Reverse(scaled[i] % total_docs));
+    let mut sum: usize = widths.iter().sum();
+    for &i in &by_remainder {
+        if sum >= threads {
+            break;
+        }
+        widths[i] += 1;
+        sum += 1;
+    }
+    // Shares that rounded up to one thread can leave the sum over the
+    // width; the largest shares give those threads back.
+    while sum > threads {
+        let largest = (0..widths.len())
+            .max_by_key(|&i| (widths[i], Reverse(i)))
+            .expect("at least two jobs here");
+        widths[largest] -= 1;
+        sum -= 1;
+    }
+    widths
 }
 
 /// What running a job actually did.
@@ -810,7 +864,9 @@ impl Supertable {
             // Vec — the allocation that OOMs compaction on a memory-tight host.
             // Mapped pages are file-backed and reclaimable; downstream publish
             // takes `Bytes` unchanged (large superfiles already stream via
-            // put_multipart).
+            // put_multipart). The file stays behind the bytes, so a publish
+            // to a directory on this host links it into place instead of
+            // writing the output a second time.
             let mut output = NamedTempFile::new_in(scratch_root())
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
@@ -830,7 +886,7 @@ impl Supertable {
                     .map_err(|e| BuildError::Store(format!("merge temp flush: {e}")))?;
                 stats
             };
-            let bytes = mmap_readonly_bytes(output.path())
+            let bytes = mmap_temp_file_bytes(output)
                 .map_err(|e| BuildError::Store(format!("merge mmap: {e}")))?;
             record("output_bytes", bytes.len() as u64);
             usage.finish();
@@ -1480,11 +1536,13 @@ impl Supertable {
         host_memory: fn() -> Option<(u64, u64)>,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        let merge_threads =
-            merge_pool_width(maint_pool()?.current_num_threads(), concurrency, jobs.len());
         let settings = MergeSettings {
             stale_seal_timeout,
-            merge_threads,
+            merge_threads: merge_pool_widths(
+                maint_pool()?.current_num_threads(),
+                concurrency,
+                &jobs,
+            ),
         };
         // Whether merges here keep per-row bookkeeping, which is part of
         // what each one is charged for until its allocation shows up in
@@ -1716,10 +1774,8 @@ impl Supertable {
         let table = self.clone();
         let pass = Span::current();
         let job = job.clone();
-        let MergeSettings {
-            stale_seal_timeout,
-            merge_threads,
-        } = *settings;
+        let stale_seal_timeout = settings.stale_seal_timeout;
+        let merge_threads = settings.merge_threads[plan_index];
         let task = merging.spawn(async move {
             // Each merge is a trace of its own, linked back to the pass, so
             // a pass of many merges does not grow into one huge trace.
@@ -1854,10 +1910,11 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
 }
 
 /// The per-pass settings every merge of a pass runs under.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct MergeSettings {
     stale_seal_timeout: Duration,
-    merge_threads: usize,
+    /// Threads in each merge's own pool, by plan index.
+    merge_threads: Vec<usize>,
 }
 
 /// What one admitted merge is charged: its expected footprint while it
@@ -2798,11 +2855,13 @@ mod tests {
         plan::tests::{default_cfg, seg},
         *,
     };
+    #[cfg(unix)]
+    use crate::test_helpers::links::assert_cache_copies_are_links;
     use crate::{
         BoolMode, Stemmer, Stopwords, VectorSearchOptions,
         config::{
             CompactionSteps, DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions,
-            OptimizeSteps,
+            OptimizeSteps, scratch_root,
         },
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
@@ -2821,6 +2880,7 @@ mod tests {
                 },
                 term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
             },
+            reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy},
             schema::{
                 ColumnIndex,
                 change::{FieldPatch, SchemaPatch},
@@ -2838,6 +2898,13 @@ mod tests {
 
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// How long compaction's background warm of its output may take to land
+    /// in the disk cache before a test counts it as never warmed: the warm
+    /// is spawned after the commit and waits on a process-wide pair of
+    /// permits other tests' warms may hold. Polled every `WARM_POLL`.
+    const WARM_LANDS_WITHIN: Duration = Duration::from_secs(30);
+    const WARM_POLL: Duration = Duration::from_millis(10);
 
     /// Titles that cast cleanly to the integers the column is flipped to,
     /// so the rewritten file carries real values rather than nulls.
@@ -4352,6 +4419,43 @@ mod tests {
             .expect("create supertable")
     }
 
+    /// A table over a local directory with its own disk cache beside it,
+    /// so commits and compactions warm the cache.
+    fn table_with_disk_cache(
+        dir: &TempDir,
+    ) -> (Supertable, Arc<dyn StorageProvider>, Arc<DiskCacheStore>) {
+        let storage: Arc<dyn StorageProvider> = local_storage(dir);
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("disk-cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create supertable");
+        (st, storage, cache)
+    }
+
+    /// Wait for compaction's warm of `uri` to land in `cache`.
+    async fn wait_until_cached(cache: &DiskCacheStore, uri: &SuperfileUri) {
+        let deadline = Instant::now() + WARM_LANDS_WITHIN;
+        while !cache.is_cached(uri) {
+            assert!(
+                Instant::now() < deadline,
+                "compaction's warm of {uri:?} never landed in the disk cache"
+            );
+            time::sleep(WARM_POLL).await;
+        }
+    }
+
     /// Open the table already written at `dir`.
     fn open_st(dir: &TempDir) -> Supertable {
         Supertable::open(default_supertable_options().with_storage(local_storage(dir)))
@@ -4370,17 +4474,84 @@ mod tests {
         }
     }
 
+    /// Jobs of the given document counts, as the planner would hand them
+    /// to the runner.
+    fn jobs_of(docs: &[u64]) -> Vec<CompactionJob> {
+        docs.iter()
+            .map(|&live_docs| CompactionJob {
+                live_docs,
+                ..CompactionJob::default()
+            })
+            .collect()
+    }
+
     #[test]
     fn a_merge_pool_shares_the_maintenance_width_among_the_merges_that_run() {
         // One job takes the whole pool, whatever the configured width.
-        assert_eq!(merge_pool_width(10, 10, 1), 10);
-        assert_eq!(merge_pool_width(10, 10, 2), 5);
-        // Many jobs never take more threads together than the pool has.
-        assert_eq!(merge_pool_width(88, 60, 1_000), 1);
-        assert_eq!(merge_pool_width(88, 32, 1_000), 2);
-        // Never fewer than one.
-        assert_eq!(merge_pool_width(4, 16, 1_000), 1);
-        assert_eq!(merge_pool_width(4, 16, 0), 4);
+        assert_eq!(merge_pool_widths(10, 10, &jobs_of(&[5])), vec![10]);
+        assert_eq!(merge_pool_widths(10, 10, &jobs_of(&[5, 5])), vec![5, 5]);
+        // Jobs that run at once share the width by documents, adding up
+        // to the width exactly, largest remainders first.
+        assert_eq!(
+            merge_pool_widths(8, 8, &jobs_of(&[1_850, 1_650, 1_530])),
+            vec![3, 3, 2]
+        );
+        assert_eq!(merge_pool_widths(8, 8, &jobs_of(&[7, 1])), vec![7, 1]);
+        // A tiny job still gets a thread, out of the largest's share, and
+        // the widths still add up to the pool.
+        assert_eq!(merge_pool_widths(4, 4, &jobs_of(&[1_000, 1])), vec![3, 1]);
+        assert_eq!(
+            merge_pool_widths(5, 8, &jobs_of(&[1_000, 1, 1, 1])),
+            vec![2, 1, 1, 1]
+        );
+        assert_eq!(
+            merge_pool_widths(4, 8, &jobs_of(&[100, 1, 1])),
+            vec![2, 1, 1]
+        );
+        // Jobs that report no documents take the even share.
+        assert_eq!(merge_pool_widths(8, 8, &jobs_of(&[0, 0])), vec![4, 4]);
+        // Whatever the shares, the widths of a pass that runs at once add
+        // up to the pool when it has a thread for every merge.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for threads in 2..=64usize {
+            for n_jobs in 2..=threads.min(12) {
+                let docs: Vec<u64> = (0..n_jobs)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed % 10_000
+                    })
+                    .collect();
+                let widths = merge_pool_widths(threads, 64, &jobs_of(&docs));
+                assert!(widths.iter().all(|&w| w >= 1), "{threads} {docs:?}");
+                assert_eq!(
+                    widths.iter().sum::<usize>(),
+                    threads,
+                    "{threads} threads over {docs:?}: {widths:?}"
+                );
+            }
+        }
+        // More jobs than can run at once take the even share, rounded
+        // down, so the merges in flight never exceed the pool together.
+        assert_eq!(
+            merge_pool_widths(88, 60, &jobs_of(&[1; 1_000])),
+            vec![1; 1_000]
+        );
+        assert_eq!(
+            merge_pool_widths(88, 32, &jobs_of(&[1; 1_000])),
+            vec![2; 1_000]
+        );
+        // Never fewer than one, and more jobs than threads get one each.
+        assert_eq!(
+            merge_pool_widths(4, 16, &jobs_of(&[1; 1_000])),
+            vec![1; 1_000]
+        );
+        assert_eq!(
+            merge_pool_widths(4, 16, &jobs_of(&[9, 9, 9, 9, 9])),
+            vec![1; 5]
+        );
+        assert_eq!(merge_pool_widths(4, 16, &jobs_of(&[])), Vec::<usize>::new());
     }
 
     fn commit_titles(st: &Supertable, titles: &[&str]) {
@@ -4398,6 +4569,30 @@ mod tests {
 
     fn superfile_count(st: &Supertable) -> usize {
         st.inner().manifest.load().get_all_superfiles().len()
+    }
+
+    /// An optimize to a directory on this host with a disk cache attached
+    /// writes each output once: the storage copy and the cache copy are
+    /// links to the file the merge sealed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_links_its_outputs_into_storage_and_the_cache() {
+        // The sealed file lives under the configured scratch root; storage
+        // and cache go beside it so the links are on one filesystem.
+        let dir = TempDir::new_in(scratch_root()).expect("tempdir under the scratch root");
+        let (st, storage, cache) = table_with_disk_cache(&dir);
+        commit_ten_small_files(&st);
+        let before = superfile_count(&st);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(superfile_count(&st) < before, "the pass merged");
+        let manifest = st.inner().manifest.load();
+        let entries = manifest.get_all_superfiles();
+        for entry in entries {
+            wait_until_cached(&cache, &entry.uri).await;
+        }
+        assert_cache_copies_are_links(storage.as_ref(), &cache, entries.iter().map(Arc::as_ref));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6338,80 +6533,34 @@ mod tests {
         }
     }
 
-    /// How long compaction's background warm of its output may take to land
-    /// in the disk cache before the test counts it as never warmed.
-    const WARM_LANDS_WITHIN: Duration = Duration::from_secs(30);
-    /// How often the test looks for that warm to have landed.
-    const WARM_POLL: Duration = Duration::from_millis(10);
-
     /// Same as the in-memory case, but for a disk-cache-attached table:
     /// the merged superfile is resident in the disk cache once
     /// compaction's own warm lands, with no cold fetch needed.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_warms_merged_superfile_into_disk_cache() {
-        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
-
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let cache = DiskCacheStore::new_unpinned(
-            Arc::clone(&storage),
-            DiskCacheConfig {
-                cache_root: dir.path().join("disk-cache"),
-                mmap_cold_threshold_secs: 0,
-                eviction: Box::new(LruPolicy::new()),
-                ..Default::default()
-            },
-        )
-        .expect("disk cache");
-        let st = Supertable::create(
-            default_supertable_options()
-                .with_storage(Arc::clone(&storage))
-                .with_disk_cache(Arc::clone(&cache)),
-        )
-        .expect("create supertable");
-
-        commit_titles(&st, &["alpha first", "alpha second"]);
-        commit_titles(&st, &["bravo first", "bravo second"]);
-        commit_titles(&st, &["charlie first", "charlie second"]);
-        commit_titles(&st, &["delta first", "delta second"]);
-        commit_titles(&st, &["echo first", "echo second"]);
-        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
-        commit_titles(&st, &["golf first", "golf second"]);
-        commit_titles(&st, &["hotel first", "hotel second"]);
-        commit_titles(&st, &["india first", "india second"]);
-        commit_titles(&st, &["juliet first", "juliet second"]);
+        let (st, _storage, cache) = table_with_disk_cache(&dir);
+        commit_ten_small_files(&st);
 
         st.compact_async(&small_compact_cfg())
             .await
             .expect("compact");
 
-        // The warm is spawned after the commit and waits on a process-wide
-        // pair of permits (`finalize_compaction_commit`), so it can land
-        // after `compact_async` returns. Wait for it: queried at once, the
-        // test raced the warm, and with the lib tests in one process other
-        // tests' warms held the permits and the query won.
+        // Queried at once, the test raced the warm.
         let merged_uri = st.reader().expect("reader").manifest().superfiles[0].uri;
-        let deadline = Instant::now() + WARM_LANDS_WITHIN;
-        while !cache.is_cached(&merged_uri) {
-            assert!(
-                Instant::now() < deadline,
-                "compaction's warm of the merged superfile never landed in the disk cache"
-            );
-            time::sleep(WARM_POLL).await;
-        }
+        wait_until_cached(&cache, &merged_uri).await;
 
         let cold_fetches_after_compact = cache.stats().n_cold_fetches;
 
         // A query against the merged file must not trigger a cold
         // fetch -- it is resident from compaction's own warm-up.
         let n: usize = st
-            .token_match("title", "alpha", BoolMode::And, None)
+            .token_match("title", "first", BoolMode::And, None)
             .expect("token_match")
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        assert_eq!(n, 2);
+        assert_eq!(n, 10, "one 'first' title per small commit");
         assert_eq!(
             cache.stats().n_cold_fetches,
             cold_fetches_after_compact,

@@ -210,7 +210,7 @@ use crate::{
         },
         reader_cache::{
             DiskCacheStore, ReadIntent,
-            disk::{mmap_readonly_bytes, mmap_temp_file_bytes, temp_file_behind},
+            disk::{mmap_temp_file_bytes, temp_file_behind},
         },
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
@@ -8040,7 +8040,9 @@ fn build_one_shard_from_packed_cells(
             .flush()
             .map_err(|error| BuildError::Store(format!("compacted shard temp flush: {error}")))?;
     }
-    let bytes = mmap_readonly_bytes(output.path())
+    // The file stays behind the bytes, so a publish to local-filesystem
+    // storage links it into place instead of writing the shard again.
+    let bytes = mmap_temp_file_bytes(output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(ShardOutput {
@@ -8151,7 +8153,9 @@ fn build_prepared_from_spilled_cells(
         .as_file_mut()
         .flush()
         .map_err(|error| BuildError::Store(format!("packed shard temp flush: {error}")))?;
-    let bytes = mmap_readonly_bytes(output.path())
+    // The file stays behind the bytes, so a publish to local-filesystem
+    // storage links it into place instead of writing the shard again.
+    let bytes = mmap_temp_file_bytes(output)
         .map_err(|error| BuildError::Store(format!("packed shard mmap: {error}")))?;
 
     let (id_min, id_max) = if n_docs == 0 {
@@ -8617,7 +8621,9 @@ fn build_one_packed_shard_via_drain(
             .flush()
             .map_err(|error| BuildError::Store(format!("compacted shard temp flush: {error}")))?;
     }
-    let bytes = mmap_readonly_bytes(output.path())
+    // The file stays behind the bytes, so a publish to local-filesystem
+    // storage links it into place instead of writing the shard again.
+    let bytes = mmap_temp_file_bytes(output)
         .map_err(|error| BuildError::Store(format!("compacted shard mmap: {error}")))?;
 
     Ok(Some(ShardOutput {
@@ -13808,8 +13814,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
     use std::{
         fs,
         sync::{
@@ -13835,6 +13839,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::test_helpers::links::assert_cache_copies_are_links;
     use crate::{
         config::{CompactionSettings, Config, OptimizeOptions},
         superfile::{
@@ -17063,15 +17069,7 @@ mod tests {
             .disk_cache
             .as_ref()
             .expect("cache attached");
-        for entry in entries.iter() {
-            let stored = storage
-                .local_path(&entry.storage_path())
-                .expect("a directory on this host");
-            let stored = fs::metadata(&stored).expect("storage file");
-            let cached = fs::metadata(cache.cache_path(&entry.uri)).expect("cache file");
-            assert_eq!(stored.ino(), cached.ino(), "one file behind both");
-            assert!(stored.nlink() >= 2, "linked, not copied");
-        }
+        assert_cache_copies_are_links(storage.as_ref(), cache, entries.iter().map(Arc::as_ref));
     }
 
     /// The commit-time split cuts the buffer where [`piece_bounds`] puts

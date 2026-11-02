@@ -50,6 +50,7 @@ use tracing::Span;
 
 use crate::{
     runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+    superfile::fts::posting::BLOCK_LEN,
     utils::trace::detail_span,
 };
 
@@ -59,7 +60,13 @@ const SIGN_BIT: u32 = 0x8000_0000;
 /// Documents below this per-partition size are left in the order they
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
-const MIN_PARTITION: usize = 32;
+///
+/// One posting block of documents (two sub-blocks): a group that fits a
+/// block is already as close as the postings can place it, and splitting
+/// below it was measured to cost time and index bytes (the numbers are
+/// with the benches; the round loop below says why a leaf-sized round
+/// stops paying).
+const MIN_PARTITION: usize = BLOCK_LEN;
 
 /// Reorder convergence ratio.
 ///
@@ -116,8 +123,9 @@ const REORDER_MAX_ROUNDS: usize = 20;
 pub(crate) struct BisectParams {
     /// Stop once a round's realised gain per document falls below this
     /// fraction of the run's reference gain per document, which [`Bisect`]
-    /// takes from the root split's first round — not from the first round of
-    /// the split being tested. `0.0` disables the test.
+    /// takes from the root split's first round, or from the first completed
+    /// level below it when the root's lowered nothing — never from the first
+    /// round of the split being tested. `0.0` disables the test.
     pub(crate) convergence: f32,
     /// Ceiling on a split's move rounds whatever `convergence` says.
     pub(crate) max_rounds: usize,
@@ -126,8 +134,10 @@ pub(crate) struct BisectParams {
 /// A bisection in progress: the limits in force, plus the reference the
 /// convergence test measures rounds against.
 ///
-/// The reference is the gain per document of the first split's first round —
-/// the root's, since it is processed first — so the bar is taken from the
+/// The reference is the gain per document of the first first round that
+/// lowered the cost: the root's, since it is processed first, or, when the
+/// root moved documents without lowering anything, the summed first rounds of
+/// the first level below it that did. Either way the bar is taken from the
 /// corpus rather than chosen. Measuring a round against it, rather than
 /// against the first round of the split the round belongs to, is what stops
 /// large partitions being cut short: a big partition banks most of its
@@ -146,6 +156,11 @@ pub(crate) struct Bisect<'a> {
 }
 
 impl Bisect<'_> {
+    /// Whether an offer has set the bar yet.
+    fn has_reference(&self) -> bool {
+        self.reference.load(Relaxed) != 0
+    }
+
     /// Whether a round that realised `gain` over `len` documents means this
     /// split has stopped paying.
     fn converged(&self, gain: f64, len: usize) -> bool {
@@ -153,21 +168,26 @@ impl Bisect<'_> {
             return false;
         }
         let reference = f64::from_bits(self.reference.load(Relaxed));
-        // No reference yet means the first split made no move at all; there is
-        // nothing to measure against, so the ceiling is the only limit.
+        // No reference yet means no offering level has lowered the cost;
+        // there is nothing to measure against, so the ceiling is the only
+        // limit.
         reference > 0.0
             && gain / (len.max(1) as f64) < f64::from(self.params.convergence) * reference
     }
 
-    /// Offer the root's first round as the reference for the whole run.
+    /// Offer `gain`, what a first round over `len` documents lowered the
+    /// cost by, as the reference for the whole run; the first offer that
+    /// lowered the cost sets it.
     ///
-    /// Only the split at depth zero may offer. Any split can be first to
-    /// finish a first round, but below the root several run at once, so
-    /// letting them offer would hand the bar to whichever the thread pool
-    /// happened to finish first and make the output depend on scheduling. The
-    /// root runs alone, so taking the bar from it alone is what keeps a merge
-    /// reproducible. A root that moves nothing offers nothing, and the run
-    /// then has no bar and keeps every round.
+    /// Offers come only from where the order of events is fixed: the root,
+    /// which runs alone, and each level the top of the bisection completes
+    /// as a whole, whose splits' gains are summed in partition order. Below
+    /// that several splits run at once, and letting them offer would hand
+    /// the bar to whichever the thread pool happened to finish first and
+    /// make the output depend on scheduling. A root can move documents and
+    /// realise nothing — a corpus that repeats a document has the swap
+    /// exchange two copies — so the levels under it offer in turn; a run
+    /// no level of which lowers the cost has no bar and keeps every round.
     fn offer_reference(&self, gain: f64, len: usize) {
         let per_doc = gain / (len.max(1) as f64);
         if per_doc > 0.0 {
@@ -208,7 +228,7 @@ const REPORT: bool = cfg!(any(test, feature = "detailed-tracing"));
 #[derive(Debug, Default, Clone)]
 pub(crate) struct BisectReport {
     /// The gain per document the convergence test measures rounds against.
-    /// Zero when the root moved nothing.
+    /// Zero when no offering level lowered the cost.
     pub(crate) reference: f64,
     /// Threads in the pool the bisection ran on.
     pub(crate) pool_threads: usize,
@@ -551,39 +571,59 @@ pub(crate) fn bisect_order_reported(
 /// Split the top of the tree a level at a time, then hand each partition to
 /// [`split_parallel`].
 ///
-/// While a level holds fewer partitions than the pool has threads, its splits
-/// run side by side and each spreads its rounds across threads too. No subtree
-/// is queued until the whole level is done, so a round waiting on its own
-/// parallel pieces can only pick up another split of the same level, never a
-/// subtree many times its size. Every partition goes through exactly the steps
-/// [`split_parallel`] would take it through, so the order is the same.
+/// While a level holds fewer partitions than the pool has threads, or no
+/// level has yet set the run's bar, its splits run side by side and each
+/// spreads its rounds across threads too. No subtree is queued until the
+/// whole level is done, so a round waiting on its own parallel pieces can
+/// only pick up another split of the same level, never a subtree many times
+/// its size; and a completed level offers its realised gain as the bar in
+/// partition order, the same on every run. Every partition goes through
+/// exactly the steps [`split_parallel`] would take it through, so the order
+/// is the same.
 fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bisect<'_>) {
     let width = rayon::current_num_threads();
     let mut level: Vec<&mut [u32]> = vec![order];
     let mut handed_on: Vec<(&mut [u32], u32)> = Vec::new();
     let mut depth = 0u32;
-    while !level.is_empty() && level.len() < width {
+    // A level at a time while the level is narrower than the pool, and for
+    // as long as no level has set the bar: each completed level offers its
+    // realised gain in partition order, so a run whose root moved nothing
+    // still takes its bar from the first level that lowered the cost, and
+    // takes the same bar on every run.
+    while !level.is_empty() && (level.len() < width || !run.has_reference()) {
         // Only a partition `split_parallel` would refine and halve itself is
-        // split here; any other takes its own path there.
+        // split here; any other takes its own path there. A small partition
+        // is halved here too while no bar is set — the same serial refine
+        // `split_halves` would give it — so the levels keep offering until
+        // one lowers the cost.
+        let wide = run.has_reference();
         let (here, rest): (Vec<_>, Vec<_>) = level.into_iter().partition(|part| {
             part.len() > MIN_PARTITION
                 && depth < MAX_DEPTH
-                && part.len() >= PARALLEL_MIN_PARTITION
+                && (part.len() >= PARALLEL_MIN_PARTITION || !wide)
                 && !localizing_pays(fwd, part)
         });
         handed_on.extend(rest.into_iter().map(|part| (part, depth)));
-        level = here
+        let docs: usize = here.iter().map(|part| part.len()).sum();
+        let split: Vec<(f64, [&mut [u32]; 2])> = here
             .into_par_iter()
-            .flat_map_iter(|part| {
+            .map(|part| {
                 let mid = part.len() / 2;
-                pool.with_state(|state| {
-                    state.refine(fwd, part, mid, depth, true, run);
+                let parallel = part.len() >= PARALLEL_MIN_PARTITION;
+                let first_round = pool.with_state(|state| {
+                    let first_round = state.refine(fwd, part, mid, depth, parallel, run);
                     state.flush(run.report);
+                    first_round
                 });
                 let (left, right) = part.split_at_mut(mid);
-                [left, right]
+                (first_round, [left, right])
             })
             .collect();
+        // The level's splits ran side by side, but their first rounds' gains
+        // are summed here in partition order, so the bar they offer is the
+        // same on every run.
+        run.offer_reference(split.iter().map(|(gain, _)| gain).sum(), docs);
+        level = split.into_iter().flat_map(|(_, halves)| halves).collect();
         depth += 1;
     }
     handed_on.extend(level.into_iter().map(|part| (part, depth)));
@@ -657,6 +697,7 @@ fn split_parallel(
     // the subtrees are already running side by side, and a round waiting on its
     // own parallel pieces would steal a whole queued subtree and finish it
     // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
+    // The root's first round offers the bar from inside `refine`.
     pool.with_state(|state| {
         state.refine(fwd, order, mid, depth, depth == 0, run);
         state.flush(run.report);
@@ -884,6 +925,7 @@ impl BisectState {
     /// twice to reach the answer it already has.
     fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
+        // The root's first round offers the bar from inside `refine`.
         self.refine(fwd, order, mid, depth, false, run);
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1, run);
@@ -901,7 +943,7 @@ impl BisectState {
         depth: u32,
         parallel: bool,
         run: Bisect<'_>,
-    ) {
+    ) -> f64 {
         let started = REPORT.then(Instant::now);
         let span = match order.len() >= SPLIT_SPAN_MIN_DOCS {
             true => detail_span!(
@@ -945,9 +987,11 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        // The cost before the last round that moved documents, until the next
-        // gain pass measures what that round really bought.
-        let mut cost_before: Option<f64> = None;
+        let mut cost_before = self.partition_cost(n_left, n_right);
+        // What the split's first round lowered the cost by: its offer
+        // towards the run's bar, which measures every later round against
+        // what a first round over fresh halves is worth per document.
+        let mut first_round_gain = 0.0f64;
 
         // Taken out of `self` so the ranking can borrow the move-gain
         // tables while writing them, and put back before returning so the
@@ -955,19 +999,23 @@ impl BisectState {
         let mut left_gains = mem::take(&mut self.left_gains);
         let mut right_gains = mem::take(&mut self.right_gains);
         let mut last_swaps = 0usize;
-        // A round's realised gain is the sum of the pair gains it accepted,
-        // in the units of the cost this is minimising. The swap loop already
-        // computes them, so the convergence test is a running total and a
-        // comparison.
+        // A round is judged by its realised gain: the cost before it less
+        // the cost after, read off the degree tables the swaps just moved.
+        // The pair gains the swap loop adds up predict that only while the
+        // moves are few and far apart; where a partition is small the pairs
+        // moved in one round share terms, and their summed gains run to
+        // many times what the round actually buys, which kept the leaf
+        // splits rounding long after they had stopped paying. The reading
+        // costs a pass over the partition's terms, a small fraction of a
+        // round's pass over its postings in a large partition and about
+        // one round's worth in a leaf. A round that raised the cost is kept
+        // as it is — its swaps stay — and ends the split like any round
+        // under the bar.
         for round in 0..run.params.max_rounds {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
             // the other. Positive means the move is worth making.
-            let (moved, round_gain, round_cost) = {
-                let cost = REPORT.then(|| self.partition_cost(n_left, n_right));
-                if let (Some(before), Some(cost)) = (cost_before.take(), cost) {
-                    level.record_actual(before - cost);
-                }
+            let moved = {
                 let step = timed.then(Instant::now);
                 let cpu = timed.then(thread_cpu_ns).flatten();
                 self.compute_move_gains(n_left, n_right, parallel);
@@ -1066,7 +1114,10 @@ impl BisectState {
                     level.swap_ns += ns_since(step);
                     level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
                 }
-                (swaps, gain, cost)
+                if REPORT {
+                    level.predicted_gain += gain;
+                }
+                swaps
             };
             last_swaps = moved;
             level.rounds += 1;
@@ -1075,13 +1126,22 @@ impl BisectState {
                 break;
             }
             level.swaps += moved as u64;
-            level.predicted_gain += round_gain;
-            cost_before = round_cost;
+            let cost_after = self.partition_cost(n_left, n_right);
+            let round_gain = cost_before - cost_after;
+            cost_before = cost_after;
             if round == 0 {
+                first_round_gain = round_gain;
+                // The root offers at once, so its own later rounds are
+                // measured against it too; the levels offer again below
+                // for a root whose first round lowered nothing.
                 if depth == 0 {
                     run.offer_reference(round_gain, order.len());
                 }
-            } else if run.converged(round_gain, order.len()) {
+            }
+            if REPORT {
+                level.record_actual(round_gain);
+            }
+            if round > 0 && run.converged(round_gain, order.len()) {
                 // This round bought less per document than the corpus showed
                 // was available, so the rounds still to come are not worth
                 // their pass over the partition — and the work they would take
@@ -1090,16 +1150,13 @@ impl BisectState {
                 break;
             }
         }
-        if let Some(before) = cost_before {
-            level.record_actual(before - self.partition_cost(n_left, n_right));
-        }
 
         self.left_gains = left_gains;
         self.right_gains = right_gains;
         self.clear_degrees();
 
         let Some(started) = started else {
-            return;
+            return first_round_gain;
         };
         match end {
             SplitEnd::Settled => level.settled = 1,
@@ -1118,6 +1175,7 @@ impl BisectState {
         span.record("swap_ms", level.swap_ns / 1_000_000);
         span.record("serial_cpu_ms", level.serial_cpu_ns / 1_000_000);
         self.note(depth, &level);
+        first_round_gain
     }
 
     /// The cost of the current split, from its degree tables.
@@ -1408,6 +1466,7 @@ pub(crate) fn order_cost(fwd: &ForwardIndex, order: &[u32], window: usize) -> f6
 #[cfg(test)]
 mod tests {
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use rayon::ThreadPoolBuilder;
 
     use super::*;
 
@@ -1491,12 +1550,19 @@ mod tests {
         }
     }
 
+    /// The leaf is one posting block: a block of documents keeps its order,
+    /// one document more is split.
     #[test]
-    fn a_corpus_too_small_to_split_keeps_its_order() {
-        let (fwd, _) = clustered(MIN_PARTITION, 2, 3);
+    fn a_partition_is_split_only_above_a_posting_block() {
+        let (block, _) = clustered(BLOCK_LEN, 2, 3);
         assert_eq!(
-            bisect_order(&fwd, exhaustive()),
-            (0..MIN_PARTITION as u32).collect::<Vec<_>>()
+            bisect_order(&block, exhaustive()),
+            (0..BLOCK_LEN as u32).collect::<Vec<_>>()
+        );
+        let (over, _) = clustered(BLOCK_LEN + 1, 2, 3);
+        assert_ne!(
+            bisect_order(&over, exhaustive()),
+            (0..=BLOCK_LEN as u32).collect::<Vec<_>>()
         );
     }
 
@@ -1604,19 +1670,25 @@ mod tests {
         }
         let fwd = ForwardIndex::from_docs(&docs);
 
-        // A root that moves nothing offers no reference, so there is no bar to
-        // measure against and convergence is off for the whole run. The result
-        // must therefore be exactly what disabling the test outright gives.
-        // When a child could offer the reference instead, this held or not
-        // depending on which child the thread pool happened to finish first.
-        let disabled = BisectParams {
-            convergence: 0.0,
-            ..BisectParams::default()
-        };
+        // A root that moves nothing offers no bar, so the level under it
+        // does, from both halves' gains summed in partition order — not from
+        // whichever half the thread pool happened to finish first, which
+        // once made the result depend on scheduling. The same order on a
+        // pool of one thread and on the test's pool is what shows it.
+        let (parallel, report) = bisect_order_reported(&fwd, BisectParams::default());
+        assert!(
+            report.reference > 0.0,
+            "the level under the root set the bar"
+        );
+        assert_eq!(report.levels[0].swaps, 0, "the root moved nothing");
+        let serial = ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool")
+            .install(|| bisect_order(&fwd, BisectParams::default()));
         assert_eq!(
-            bisect_order(&fwd, BisectParams::default()),
-            bisect_order(&fwd, disabled),
-            "a split below the root set the convergence bar"
+            parallel, serial,
+            "the bar, and so the order, do not depend on the pool"
         );
     }
 
@@ -1947,5 +2019,59 @@ mod tests {
         assert!(total.swaps > 0);
         assert!(total.actual_gain > 0.0, "the cost fell: {total}");
         assert!(total.predicted_gain > 0.0);
+        // Under the default bar some splits end on their realised gain
+        // before the round ceiling.
+        assert!(
+            report.levels.iter().any(|level| level.converged > 0),
+            "some split ended on the bar"
+        );
+        assert!(
+            total.rounds < total.splits * REORDER_MAX_ROUNDS as u64,
+            "not every split ran to the ceiling: {total}"
+        );
+    }
+
+    /// A corpus that repeats its documents: the root swaps copies of one
+    /// document for copies of another, round after round, and lowers the
+    /// cost by nothing, so the bar comes from the first level under it that
+    /// does with its first rounds, and the splits below end on it instead
+    /// of at the ceiling.
+    #[test]
+    fn the_bar_comes_from_the_first_level_that_lowers_the_cost() {
+        /// Wide enough for the top of the bisection to run level by level.
+        const N_DOCS: u32 = 40_000;
+        /// Documents of four topics of forty terms each, six terms per
+        /// document on a stride that makes the documents repeat every
+        /// forty ids, every fifth document carrying two extra terms and all
+        /// of them one common term.
+        fn repeating_doc(id: u32) -> Vec<u32> {
+            let base = (id % 4) * 40;
+            let mut terms: Vec<u32> = (0..6).map(|step| base + (id + step * 7) % 40).collect();
+            if id.is_multiple_of(5) {
+                terms.extend([160, 161]);
+            }
+            terms.push(162);
+            terms
+        }
+        let docs: Vec<Vec<u32>> = (0..N_DOCS).map(repeating_doc).collect();
+        let fwd = ForwardIndex::from_docs(&docs);
+        let (_, report) = bisect_order_reported(&fwd, BisectParams::default());
+        assert!(report.reference > 0.0, "a level lowered the cost: {report}");
+        assert_eq!(
+            report.levels[0].capped, 1,
+            "the root realised nothing and ran to the ceiling: {report}"
+        );
+        let first = report
+            .levels
+            .iter()
+            .position(|level| level.actual_gain > 0.0)
+            .expect("a level lowered the cost");
+        let (capped, splits) = report.levels[first + 1..]
+            .iter()
+            .fold((0, 0), |(c, n), level| (c + level.capped, n + level.splits));
+        assert!(
+            capped * 4 < splits,
+            "with the bar set, the splits below end on it, not at the ceiling: {report}"
+        );
     }
 }

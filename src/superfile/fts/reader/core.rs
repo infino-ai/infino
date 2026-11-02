@@ -57,7 +57,7 @@ use crate::{
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
             posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
-            short::{SHORT_MAX_DF, decode_short},
+            short::{SHORT_MAX_DF, decode_short, short_df},
             tokenize::{Phrase, Tokenizer},
         },
         id_space::{DocMap, FtsDocId, RowId},
@@ -579,6 +579,13 @@ pub struct FtsReader {
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     verify_crc: bool,
+}
+
+/// The error for a short-form term body the decoder refuses.
+pub(super) fn short_body_malformed() -> FtsError {
+    FtsError::Read(ReadError::Malformed(
+        "short-form term body does not decode".into(),
+    ))
 }
 
 impl FtsReader {
@@ -1262,8 +1269,24 @@ impl FtsReader {
     /// read from its header, and the form's limit for a short one.
     pub(crate) fn term_postings_at_most(&self, value: DictEntry) -> Result<u32, FtsError> {
         match value {
-            DictEntry::Inline { .. } => Ok(1),
             DictEntry::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
+            exact => self.entry_df(exact),
+        }
+    }
+
+    /// How many documents the term at `value` holds, without decoding a
+    /// posting: an inline term has one, a short term's body leads with its
+    /// count, and a long term's header states it.
+    pub(crate) fn entry_df(&self, value: DictEntry) -> Result<u32, FtsError> {
+        match value {
+            DictEntry::Inline { .. } => Ok(1),
+            DictEntry::Pfor {
+                metadata_offset,
+                postings_length,
+                short: true,
+            } => self
+                .term_bytes_sync(metadata_offset, postings_length)
+                .and_then(|body| short_df(body.as_ref()).ok_or_else(short_body_malformed)),
             DictEntry::Pfor {
                 metadata_offset, ..
             } => {
@@ -1504,11 +1527,7 @@ impl FtsReader {
                         let mut d = [0u32; BLOCK_LEN];
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(cursor.bytes.as_ref(), true, &mut d, &mut t)
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                         inline_groups.push((
                             positional.len(),
                             cursor
@@ -1685,11 +1704,7 @@ impl FtsReader {
                         let mut d = [0u32; BLOCK_LEN];
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(term_bytes.as_ref(), positional, &mut d, &mut t)
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                         // A short body's positions are one group, inline
                         // after its postings.
                         let position_bytes = decoded.positions_at.map(|at| term_bytes.slice(at..));
@@ -1811,23 +1826,16 @@ impl FtsReader {
     pub(crate) fn for_each_term_doc<K>(
         &self,
         column_id: u32,
-        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        on_term: impl FnMut(&[u8]) -> Option<K>,
         mut on_doc: impl FnMut(&K, u32),
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dict_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&dict_bytes)?;
-        let prefix = make_key(&col_meta.name, "");
         let mut doc_ids = [0u32; BLOCK_LEN];
         let mut tfs = [0u32; BLOCK_LEN];
-        let mut failed = None;
-        dict.for_each_prefix(&prefix, |key, packed| {
-            let Some(carry) = on_term(&key[prefix.len()..]) else {
-                return true;
-            };
-            let docs = match packed {
+        self.for_each_column_entry(column_id, on_term, |carry, packed| {
+            match packed {
                 DictEntry::Inline { doc_id, .. } => {
-                    on_doc(&carry, doc_id);
+                    on_doc(carry, doc_id);
                     Ok(())
                 }
                 DictEntry::Pfor {
@@ -1844,13 +1852,9 @@ impl FtsReader {
                                 &mut doc_ids,
                                 &mut tfs,
                             )
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                             for &doc in &doc_ids[..decoded.n] {
-                                on_doc(&carry, doc);
+                                on_doc(carry, doc);
                             }
                             Ok(())
                         }
@@ -1867,7 +1871,7 @@ impl FtsReader {
                             )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
-                                    on_doc(&carry, doc);
+                                    on_doc(carry, doc);
                                 }
                                 cursor.pos = cursor.block_n;
                                 cursor.advance_block();
@@ -1875,8 +1879,30 @@ impl FtsReader {
                             Ok(())
                         }
                     }),
+            }
+        })
+    }
+
+    /// Walk `column_id`'s dictionary in term order and hand each wanted
+    /// term's entry to `on_entry`, with the carry `on_term` returned for
+    /// it; a term `on_term` answers `None` for is skipped. The first error
+    /// ends the walk.
+    fn for_each_column_entry<K>(
+        &self,
+        column_id: u32,
+        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        mut on_entry: impl FnMut(&K, DictEntry) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
+        let prefix = make_key(&col_meta.name, "");
+        let mut failed = None;
+        dict.for_each_prefix(&prefix, |key, packed| {
+            let Some(carry) = on_term(&key[prefix.len()..]) else {
+                return true;
             };
-            match docs {
+            match on_entry(&carry, packed) {
                 Ok(()) => true,
                 Err(e) => {
                     failed = Some(e);
@@ -1885,6 +1911,22 @@ impl FtsReader {
             }
         });
         failed.map_or(Ok(()), Err)
+    }
+
+    /// Walk `column_id`'s dictionary and hand each term's document count to
+    /// `on_df`, read as [`Self::entry_df`] reads it, without decoding a
+    /// posting. `on_term(term)` returns a carry for a wanted term or `None`
+    /// to skip it, as in [`Self::for_each_term_doc`].
+    pub(crate) fn for_each_term_df<K>(
+        &self,
+        column_id: u32,
+        on_term: impl FnMut(&[u8]) -> Option<K>,
+        mut on_df: impl FnMut(&K, u32),
+    ) -> Result<(), FtsError> {
+        self.for_each_column_entry(column_id, on_term, |carry, packed| {
+            on_df(carry, self.entry_df(packed)?);
+            Ok(())
+        })
     }
 
     /// One PFOR term's bytes, from its metadata header to its end.
@@ -3796,6 +3838,76 @@ mod tests {
             got.get(&t("c")).expect("term streamed").as_slice(),
             &[(1, 1, vec![2])]
         );
+    }
+
+    /// The header walk states, for every term, the number of documents the
+    /// full walk visits for it, over inline, short and long terms, and a
+    /// term it is told to skip is not counted.
+    #[test]
+    fn for_each_term_df_matches_the_full_walk_and_skips_terms() {
+        const N_DOCS: u32 = 700;
+        let mut b = FtsBuilder::new();
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = format!("every every u{i}");
+            if i.is_multiple_of(3) {
+                text.push_str(" some");
+            }
+            if i.is_multiple_of(50) {
+                text.push_str(" few");
+            }
+            b.add_doc(0, i, &text).expect("add pos");
+            b.add_doc(1, i, &text).expect("add flat");
+        }
+        let bytes = b.finish().expect("finish");
+        let json = r#"[{"name":"pos","tokenizer":"standard","k1":1.2,"b":0.75,"positions":true},{"name":"flat","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(bytes), json).expect("open");
+        for column_id in 0..2 {
+            let mut counted: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_posting(column_id, |term, _, _, _| {
+                match counted.last_mut() {
+                    Some((last, n)) if last.as_slice() == term => *n += 1,
+                    _ => counted.push((term.to_vec(), 1)),
+                }
+                Ok(())
+            })
+            .expect("full walk");
+            let mut stated: Vec<(Vec<u8>, u32)> = Vec::new();
+            r.for_each_term_df(
+                column_id,
+                |term| Some(term.to_vec()),
+                |term, df| stated.push((term.clone(), df)),
+            )
+            .expect("header walk");
+            assert_eq!(
+                stated, counted,
+                "column {column_id}: same counts, same order"
+            );
+            // The fixture reaches every entry kind: inline (one document),
+            // short (a few), and long over more than one block.
+            let df_of = |term: &[u8]| counted.iter().find(|(t, _)| t == term).map(|&(_, n)| n);
+            assert_eq!(df_of(b"u7"), Some(1), "an inline term");
+            assert!(
+                df_of(b"few").is_some_and(|n| n > 1 && n <= SHORT_MAX_DF as u32),
+                "a short term"
+            );
+            assert!(
+                df_of(b"every").is_some_and(|n| n > BLOCK_LEN as u32),
+                "a long term over several blocks"
+            );
+
+            let skipped = b"some".as_slice();
+            let mut kept: Vec<Vec<u8>> = Vec::new();
+            r.for_each_term_df(
+                column_id,
+                |term| (term != skipped).then(|| term.to_vec()),
+                |term, _| kept.push(term.clone()),
+            )
+            .expect("header walk with a skip");
+            assert!(!kept.iter().any(|t| t == skipped));
+            assert_eq!(kept.len(), counted.len() - 1);
+        }
     }
 
     /// The doc-only walk visits exactly the `(term, doc)` pairs the full
