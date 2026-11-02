@@ -905,10 +905,12 @@ impl SuperfileReader {
     /// decode: the open already loaded the page indexes, or an earlier call
     /// did. `None` means that call would do work.
     pub(crate) fn loaded_parquet_metadata_with_page_index(&self) -> Option<Arc<ParquetMetaData>> {
+        // Flag before footer: the load stores the indexed footer before it
+        // sets the flag, so a set flag means the footer read next is indexed.
+        let loaded = self.page_index_loaded.initialized();
         let footer = self.footer.load();
         let parquet = footer.parquet();
-        (self.page_index_loaded.initialized() || parquet.offset_index().is_some())
-            .then(|| Arc::clone(parquet))
+        (loaded || parquet.offset_index().is_some()).then(|| Arc::clone(parquet))
     }
 
     /// Parquet metadata with the page indexes (column + offset) loaded
