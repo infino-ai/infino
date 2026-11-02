@@ -2658,11 +2658,16 @@ impl SupertableWriter {
         // that run it like a commit-time build's pieces: the lanes frozen
         // side by side, then every piece built from its rows of them.
         let outputs: Vec<ShardOutput> = options.writer_pool.install(|| {
+            let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
             let frozen: Vec<FrozenLane> = lanes
                 .into_par_iter()
                 .map(|lane| timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?)))
                 .collect::<Result<_, BuildError>>()?;
+            drop(freeze_span);
+            let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
             let frozen = Arc::new(freeze_lanes(frozen, pieces)?);
+            drop(merge_span);
+            let _pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
             (0..n_pieces)
                 .into_par_iter()
                 .map(|i| {
@@ -3596,6 +3601,7 @@ impl LiveLanes {
     }
 
     /// Wait for the feed in flight, if any, and take the lanes back.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all, fields(rows_fed = self.rows_fed)))]
     fn join(&mut self) -> Result<Vec<LiveLane>, BuildError> {
         if let Some(rx) = self.pending.take() {
             let lanes = rx
