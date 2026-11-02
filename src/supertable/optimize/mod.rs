@@ -94,10 +94,23 @@ impl Supertable {
         }
         // Index the superfiles the term index does not list, a batch at a
         // time, and fold its layers in runs no larger than a compaction
-        // merge's input. Runs before gc so the sweep keeps the roots it
-        // publishes.
+        // merge's input or, where the table has a disk cache, half its
+        // budget: a fold downloads its run to local disk before merging, and
+        // that budget is the disk the table was given. Under the merge cap
+        // alone a root of fifty layers folded in four passes, each reading
+        // its layers back from storage and publishing a root. Runs before gc
+        // so the sweep keeps the roots it publishes.
         if opts.steps.refresh_term_index {
-            self.refresh_term_index_sync(max_merge_input_bytes(&opts.compaction))
+            let disk_bytes = self
+                .inner()
+                .manifest
+                .load()
+                .options
+                .disk_cache
+                .as_ref()
+                .map_or(0, |cache| cache.disk_budget_bytes() / 2);
+            let fold_max_bytes = max_merge_input_bytes(&opts.compaction).max(disk_bytes);
+            self.refresh_term_index_sync(fold_max_bytes)
                 .map_err(OptimizeError::from)?;
         }
 
