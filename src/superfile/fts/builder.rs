@@ -3301,6 +3301,9 @@ impl FtsBuilder {
                     column = col_name.as_str(),
                     inputs = sorted_inputs.len(),
                     terms = tracing::field::Empty,
+                    walk_wait_ms = tracing::field::Empty,
+                    encode_ms = tracing::field::Empty,
+                    write_ms = tracing::field::Empty,
                 )
                 .entered();
                 let profiling = finish_profile.enabled;

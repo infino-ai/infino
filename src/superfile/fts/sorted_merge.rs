@@ -24,7 +24,9 @@ use std::{
     ops::Range,
     str::from_utf8,
     sync::{Arc, Mutex, PoisonError, mpsc::sync_channel},
-    thread, vec,
+    thread,
+    time::{Duration, Instant},
+    vec,
 };
 
 use bytes::Bytes;
@@ -36,7 +38,7 @@ use crate::{
         fts::{positions::TermRuns, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::terms::DictEntry,
+    utils::{terms::DictEntry, trace::record},
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -130,6 +132,9 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     // written. Batches arrive in the order they were walked, so the terms are
     // written in the same order.
     let (sender, walked) = sync_channel::<Result<Batch, BuildError>>(BATCHES_AHEAD);
+    // Where this thread's time goes: waiting on the walk for the next
+    // batch, dispatching the batch's encodes, and writing the terms out.
+    let (mut waited, mut encoded, mut written) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     thread::scope(|scope| -> Result<(), BuildError> {
         let readers = &readers;
         scope.spawn(move || {
@@ -140,11 +145,21 @@ pub(crate) fn merge_column<S: Send, T: Send>(
                 let _ = sender.send(Err(e));
             }
         });
-        for batch in walked {
-            work.run(&batch?, &mut write)?;
+        loop {
+            let started = Instant::now();
+            let Ok(batch) = walked.recv() else {
+                break;
+            };
+            waited += started.elapsed();
+            let (encode, write_took) = work.run(&batch?, &mut write)?;
+            encoded += encode;
+            written += write_took;
         }
         Ok(())
     })?;
+    record("walk_wait_ms", waited.as_millis() as u64);
+    record("encode_ms", encoded.as_millis() as u64);
+    record("write_ms", written.as_millis() as u64);
 
     Ok(work
         .workers
@@ -273,19 +288,23 @@ struct BatchWork<'a, S, N, E> {
 
 impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     /// Merge a batch's terms in parallel, then write them in term order.
+    /// Returns how long the encodes took and how long the writes took.
     fn run<T: Send>(
         &self,
         batch: &Batch,
         write: &mut impl FnMut(&str, T) -> Result<(), BuildError>,
-    ) -> Result<(), BuildError>
+    ) -> Result<(Duration, Duration), BuildError>
     where
         E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
     {
+        let started = Instant::now();
         let merged = batch
             .terms
             .par_chunks(task_terms(batch.terms.len()))
             .map(|chunk| self.merge_chunk(batch, chunk))
             .collect::<Result<Vec<_>, _>>()?;
+        let encoded = started.elapsed();
+        let started = Instant::now();
         for (pending, output) in batch.terms.iter().zip(merged.into_iter().flatten()) {
             let term = from_utf8(&batch.term_bytes[pending.term.clone()])
                 .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
@@ -294,7 +313,7 @@ impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
                 write(term, output)?;
             }
         }
-        Ok(())
+        Ok((encoded, started.elapsed()))
     }
 
     /// Merge some consecutive terms of a batch on one worker.
