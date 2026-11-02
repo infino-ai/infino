@@ -11,7 +11,9 @@
 //! files' row groups; for each it takes every projected column from the cache,
 //! decodes the ones the cache lacks from the row group whole
 //! ([`read_file_row_group`], with the schema adaptation the search paths
-//! use), keeps them, and drops the row group's deleted rows.
+//! use), keeps them, and drops the row group's deleted rows. When the range
+//! index chose a file's rows (an `ORDER BY ... LIMIT` over a range), only
+//! those rows come out, and a row group holding none of them is not read.
 //!
 //! It answers what the Parquet scan would: the same columns, typed as the scan
 //! schema types them, each file's rows in file order, without the rows a
@@ -85,6 +87,10 @@ pub(crate) struct CachedFile {
     pub(crate) row_counts: Arc<[u32]>,
     /// The file's deleted rows, by position in the file.
     pub(crate) tombstones: Arc<RoaringBitmap>,
+    /// The only rows to read, by position in the file, when the range
+    /// index chose them (an `ORDER BY ... LIMIT` over a range reads the rows
+    /// up to its cutoff); `None` reads every row.
+    pub(crate) selected: Option<RoaringBitmap>,
 }
 
 /// The scan's `WHERE`, for skipping the row groups whose statistics show it
@@ -202,8 +208,14 @@ impl CachedScanExec {
                     pruned += 1;
                     continue;
                 }
-                // A row group every row of which is deleted reads nothing.
-                if n > 0 && file.tombstones.range_cardinality(rows.clone()) < u64::from(n) {
+                // A row group every row of which is deleted reads nothing, nor
+                // does one holding none of the rows the index chose.
+                let chosen = file
+                    .selected
+                    .as_ref()
+                    .is_none_or(|selected| selected.range_cardinality(rows.clone()) > 0);
+                if chosen && n > 0 && file.tombstones.range_cardinality(rows.clone()) < u64::from(n)
+                {
                     units.push(RowGroupUnit {
                         file: Arc::clone(&file),
                         row_group,
@@ -367,7 +379,8 @@ impl ScanContext {
         Ok(decoded)
     }
 
-    /// `unit`'s row group, every projected column, without its deleted rows.
+    /// `unit`'s row group, every projected column, without its deleted rows
+    /// and, when the index chose the file's rows, without the rows it didn't.
     async fn read(self: &Arc<Self>, unit: &RowGroupUnit) -> DfResult<RecordBatch> {
         let fields = self.schema.fields();
         let mut columns: Vec<Option<ArrayRef>> = fields
@@ -403,16 +416,31 @@ impl ScanContext {
             columns,
             &RecordBatchOptions::new().with_row_count(Some(n)),
         )?;
-        let deleted = unit.file.tombstones.range(unit.rows.clone());
-        let mut keep: Option<BooleanBufferBuilder> = None;
-        for row in deleted {
-            let mask = keep.get_or_insert_with(|| {
+        let start = unit.rows.start;
+        let keep = match &unit.file.selected {
+            Some(selected) => {
                 let mut mask = BooleanBufferBuilder::new(n);
-                mask.append_n(n, true);
-                mask
-            });
-            mask.set_bit((row - unit.rows.start) as usize, false);
-        }
+                mask.append_n(n, false);
+                for row in selected.range(unit.rows.clone()) {
+                    if !unit.file.tombstones.contains(row) {
+                        mask.set_bit((row - start) as usize, true);
+                    }
+                }
+                Some(mask)
+            }
+            None => {
+                let mut keep: Option<BooleanBufferBuilder> = None;
+                for row in unit.file.tombstones.range(unit.rows.clone()) {
+                    let mask = keep.get_or_insert_with(|| {
+                        let mut mask = BooleanBufferBuilder::new(n);
+                        mask.append_n(n, true);
+                        mask
+                    });
+                    mask.set_bit((row - start) as usize, false);
+                }
+                keep
+            }
+        };
         Ok(match keep {
             Some(mut mask) => filter_record_batch(&batch, &BooleanArray::new(mask.finish(), None))?,
             None => batch,

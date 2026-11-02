@@ -168,3 +168,176 @@ fn with_scan_source(plan: &LogicalPlan, source: &Arc<dyn TableSource>) -> DfResu
         .collect::<DfResult<Vec<_>>>()?;
     plan.with_new_exprs(plan.expressions(), inputs)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::prelude::{col, lit};
+    use tempfile::TempDir;
+
+    use crate::{
+        storage::{LocalFsStorageProvider, StorageProvider},
+        supertable::{
+            Supertable, SupertableOptions, SupertableReader, query::scalar_cache::ByteLru,
+        },
+    };
+
+    /// Superfiles the table is written as, one commit each.
+    const FILES: i64 = 3;
+    /// Rows in each.
+    const ROWS_PER_FILE: i64 = 4000;
+    /// Distinct `key` values: each is held by `FILES * ROWS_PER_FILE /
+    /// KEYS` rows, so every cutoff ties on many rows.
+    const KEYS: i64 = 100;
+    /// Rows per row group, so a file has several and the index's rows fall
+    /// in some of them only.
+    const ROW_GROUP_ROWS: usize = 500;
+    /// Characters of `pad`, a column wide beside `key` and `seq`.
+    const PAD_LEN: usize = 48;
+    /// Rows the delete removes: those with `seq` below this.
+    const DELETED_BELOW: i64 = 300;
+    /// Kept bytes: room for every column of every row group.
+    const KEPT_BYTES: usize = 64 << 20;
+    /// The tie-broken top-k statements, and the `(key above, descending,
+    /// limit)` each asks for.
+    const TOP_K: &[(&str, i64, bool, usize)] = &[
+        (
+            "SELECT seq, key FROM supertable WHERE key > 40 ORDER BY key, seq LIMIT 10",
+            40,
+            false,
+            10,
+        ),
+        (
+            "SELECT seq, key FROM supertable WHERE key > 40 ORDER BY key DESC, seq DESC LIMIT 25",
+            40,
+            true,
+            25,
+        ),
+        (
+            "SELECT seq, key, pad FROM supertable WHERE key > 90 ORDER BY key ASC NULLS LAST, seq ASC NULLS LAST LIMIT 130",
+            90,
+            false,
+            130,
+        ),
+    ];
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("seq", DataType::Int64, false),
+            Field::new("key", DataType::Int64, false),
+            Field::new("pad", DataType::LargeUtf8, false),
+        ]))
+    }
+
+    /// `key` of row `seq`: not in the order the rows arrive.
+    fn key(seq: i64) -> i64 {
+        (seq * 37) % KEYS
+    }
+
+    /// The range-indexed table, keeping decoded columns, its rows below
+    /// [`DELETED_BELOW`] deleted.
+    fn table(dir: &TempDir) -> Supertable {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let mut options = SupertableOptions::new(schema(), vec![], vec![])
+            .expect("options")
+            .with_storage(storage)
+            .with_range_indexes(&["key".to_string()]);
+        options.decoded_columns = Some(Arc::new(ByteLru::new(KEPT_BYTES)));
+        options.row_group_size = Some(ROW_GROUP_ROWS);
+        let st = Supertable::create(options).expect("create");
+        for file in 0..FILES {
+            let seqs: Vec<i64> = (file * ROWS_PER_FILE..(file + 1) * ROWS_PER_FILE).collect();
+            let keys: Vec<i64> = seqs.iter().map(|s| key(*s)).collect();
+            let pads: Vec<String> = seqs
+                .iter()
+                .map(|s| format!("{s:0>width$}", width = PAD_LEN))
+                .collect();
+            let batch = RecordBatch::try_new(
+                schema(),
+                vec![
+                    Arc::new(Int64Array::from(seqs)),
+                    Arc::new(Int64Array::from(keys)),
+                    Arc::new(LargeStringArray::from(pads)),
+                ],
+            )
+            .expect("batch");
+            let mut writer = st.writer().expect("writer");
+            writer.append(&batch).expect("append");
+            writer.commit().expect("commit");
+        }
+        st.delete(col("seq").lt(lit(DELETED_BELOW)))
+            .expect("delete");
+        st
+    }
+
+    /// The `seq`s a top-k over the live rows answers, in its order.
+    fn expected(above: i64, descending: bool, limit: usize) -> Vec<i64> {
+        let mut rows: Vec<(i64, i64)> = (DELETED_BELOW..FILES * ROWS_PER_FILE)
+            .map(|s| (key(s), s))
+            .filter(|(k, _)| *k > above)
+            .collect();
+        rows.sort();
+        if descending {
+            rows.reverse();
+        }
+        rows.into_iter().take(limit).map(|(_, s)| s).collect()
+    }
+
+    /// The `seq` column across `batches`, in order.
+    fn seqs(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let seqs = b
+                    .column_by_name("seq")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .expect("seq")
+                    .clone();
+                (0..seqs.len()).map(move |i| seqs.value(i))
+            })
+            .collect()
+    }
+
+    /// The `EXPLAIN` of `sql` on `reader`, every plan line joined.
+    fn explained(reader: &SupertableReader, sql: &str) -> String {
+        reader
+            .query_sql(&format!("EXPLAIN {sql}"))
+            .expect("explain")
+            .iter()
+            .flat_map(|b| {
+                let plans = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("plan column")
+                    .clone();
+                (0..plans.len()).map(move |i| plans.value(i).to_owned())
+            })
+            .collect()
+    }
+
+    /// A top-k whose ties a later key breaks reads the rows the range index
+    /// chose from kept columns, and answers exactly: on the pass that decodes
+    /// the columns and on the ones that read them kept, deleted rows left out.
+    #[test]
+    fn a_tie_broken_top_k_reads_the_chosen_rows_from_kept_columns() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        let reader = st.reader().expect("reader");
+        let plan = explained(&reader, TOP_K[0].0);
+        assert!(plan.contains("CachedScanExec"), "{plan}");
+        for pass in ["decoded", "kept", "kept again"] {
+            for (sql, above, descending, limit) in TOP_K {
+                assert_eq!(
+                    seqs(&reader.query_sql(sql).expect("sql")),
+                    expected(*above, *descending, *limit),
+                    "{pass}: {sql}"
+                );
+            }
+        }
+    }
+}

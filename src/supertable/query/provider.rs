@@ -2125,11 +2125,15 @@ impl TableProvider for SupertableProvider {
         // The files a scan of kept decoded columns would read (built below,
         // once the Parquet scan it stands in for is). Not for a scan the index
         // narrowed to a few rows (the Parquet scan decodes just their pages),
-        // nor for a scan of no column.
+        // nor for a scan of no column — except the rows a top-k reads from
+        // the range index: up to the cutoff, ties included, they are spread
+        // over the file, so the Parquet scan decodes a page of every wide
+        // column for each, where kept columns hand them over decoded.
         let output = projected_schema(&self.schema, projection)?;
+        let top_k_selected = top_k_rows.is_some();
         let cached_files = (self.manifest.options.decoded_columns.is_some()
             && has_columns(&output)
-            && superfiles.iter().all(|seg| seg.candidates.is_none()))
+            && (top_k_selected || superfiles.iter().all(|seg| seg.candidates.is_none())))
         .then(|| {
             superfiles
                 .iter()
@@ -2139,6 +2143,7 @@ impl TableProvider for SupertableProvider {
                     reader: Arc::clone(&seg.prepared.reader),
                     row_counts: Arc::clone(&seg.prepared.row_counts),
                     tombstones: Arc::clone(&seg.tombstones),
+                    selected: top_k_selected.then(|| seg.candidates.clone()).flatten(),
                 })
                 .collect::<Vec<_>>()
         });
