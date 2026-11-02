@@ -103,15 +103,34 @@ impl DiskCacheStore {
             let tmp = self.tmp_path(uri);
             let final_path = self.cache_path(uri);
 
-            // Write the bytes to a tmp file, fsync, then atomically rename into
-            // place. The fsync is what makes the file on disk match the bytes
-            // written: nothing reads it back to check. An earlier version
-            // skipped it and leaned on a later run re-verifying every cache
-            // file at open to drop a torn one, but the default policy no
-            // longer does that scan, so a crash between the write and the
-            // flush would leave a torn file that the next run adopts. The
-            // other two fill paths already `sync_all` for the same reason.
-            {
+            // Bytes still backed by the file a build sealed them to are
+            // linked into the cache rather than written again: the writer
+            // publishes such a file to a local directory by link too, and
+            // the copy here was the whole cost of a commit's publish on a
+            // local-disk table. A link that is refused (another filesystem)
+            // falls through to the copy. The cache only ever adds and
+            // removes whole files, so sharing the inode with storage is
+            // safe. The sealed file is not fsynced here: the storage copy it
+            // shares an inode with was never fsynced by the local-filesystem
+            // put either, so the cache's copy is no less durable than the
+            // table's own.
+            let linked = match temp_file_behind(&bytes) {
+                Some(sealed) => {
+                    let _ = fs::remove_file(&tmp);
+                    fs::hard_link(&sealed, &tmp).is_ok()
+                }
+                None => false,
+            };
+            // Otherwise write the bytes to a tmp file, fsync, then atomically
+            // rename into place. The fsync is what makes the file on disk
+            // match the bytes written: nothing reads it back to check. An
+            // earlier version skipped it and leaned on a later run
+            // re-verifying every cache file at open to drop a torn one, but
+            // the default policy no longer does that scan, so a crash
+            // between the write and the flush would leave a torn file that
+            // the next run adopts. The other two fill paths already
+            // `sync_all` for the same reason.
+            if !linked {
                 let mut file = tokio::fs::File::create(&tmp).await?;
                 file.write_all(&bytes).await?;
                 file.flush().await?;
@@ -847,11 +866,13 @@ mod landing_tests {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    use std::{fs, io::Write, sync::Arc};
 
     use bytes::Bytes;
     use roaring::RoaringBitmap;
-    use tempfile::TempDir;
+    use tempfile::{NamedTempFile, TempDir};
 
     use crate::{
         storage::{LocalFsStorageProvider, StorageProvider},
@@ -860,7 +881,7 @@ mod tests {
             reader_cache::{
                 block_source::{CACHE_BLOCK_BYTES, serialize_index},
                 config::DiskCacheConfig,
-                disk::{store_files::*, test_support::*},
+                disk::{mmap_temp_file_bytes, store_files::*, test_support::*},
             },
         },
     };
@@ -886,6 +907,40 @@ mod tests {
         assert!(store.cache_path(&uri).is_file());
 
         // reader() hits the cache (still no cold fetch).
+        let _r = store.reader(&uri).await.expect("reader");
+        assert_eq!(store.stats().n_cold_fetches, 0);
+    }
+
+    /// Bytes a build sealed to a file on the cache's disk are linked into
+    /// the cache, not copied: the cache file is the sealed file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn insert_warm_links_a_sealed_file_instead_of_copying_it() {
+        let (dir, store) = test_store();
+        let mut sealed = NamedTempFile::new_in(dir.path()).expect("temp file");
+        sealed
+            .write_all(&tiny_superfile_bytes())
+            .expect("write the superfile");
+        sealed.flush().expect("flush");
+        let sealed_path = sealed.path().to_path_buf();
+        let bytes = mmap_temp_file_bytes(sealed).expect("map the sealed file");
+        let uri = SuperfileUri::new_v4();
+        // A clone keeps the sealed file alive past the insert, as the
+        // writer's publish batch does.
+        store
+            .insert_warm(&uri, bytes.clone())
+            .await
+            .expect("insert_warm");
+
+        let cached = fs::metadata(store.cache_path(&uri)).expect("cache file");
+        let sealed = fs::metadata(&sealed_path).expect("sealed file");
+        assert_eq!(
+            cached.ino(),
+            sealed.ino(),
+            "the cache file is the sealed file"
+        );
+        assert_eq!(cached.nlink(), 2);
+        assert!(store.is_mmap_promoted(&uri));
         let _r = store.reader(&uri).await.expect("reader");
         assert_eq!(store.stats().n_cold_fetches, 0);
     }

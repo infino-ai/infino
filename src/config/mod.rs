@@ -244,8 +244,8 @@ pub(crate) fn scratch_root() -> PathBuf {
 pub struct SupertableSettings {
     /// Reader fan-out pool size. `auto` resolves to `num_cpus`.
     pub reader_threads: ThreadCount,
-    /// Writer commit-build pool size. `auto` resolves to
-    /// `max(1, num_cpus / 2)`.
+    /// Writer commit-build pool size. `auto` resolves to `num_cpus` on a
+    /// host of up to two cores and `num_cpus - 2` otherwise.
     pub writer_threads: ThreadCount,
     /// Name of the system-managed primary-key column the
     /// supertable injects on every `append()`. Type is fixed
