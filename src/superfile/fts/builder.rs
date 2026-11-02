@@ -949,6 +949,16 @@ fn failed_builder() -> BuildError {
     ))
 }
 
+/// The error a lane returns for the document that takes its postings
+/// past its threshold. A lane never spills — its reservation is what
+/// bounds it — so the feed drops the lanes and the commit builds from the
+/// buffer, where a column that outgrows the reservation spills.
+fn lane_outgrown() -> BuildError {
+    BuildError::Io(Error::other(
+        "an fts lane outgrew its reservation; the commit builds from the buffer",
+    ))
+}
+
 /// Intern `term` in a column's vocabulary and return its stable
 /// `term_id`.
 ///
@@ -1597,13 +1607,18 @@ fn docs_before_row(stretches: &[Stretch], row: u32) -> usize {
     }
 }
 
-/// The row document `doc` is, walking `stretches` from `*cursor`, which
-/// is left at the stretch holding it: a walk over ascending documents
-/// reads each stretch once.
+/// The row document `doc` is, from `*cursor`, which is left at the stretch
+/// holding it. The stretch at the cursor is tried first, so ascending
+/// documents within one stretch cost a compare each; a document further
+/// on is found by binary search over the stretches after it, so a term
+/// seen in few batches does not walk every stretch in between — every
+/// term's walk starts at the first stretch, and a lane has one stretch
+/// per batch fed.
 #[inline]
 fn row_of(stretches: &[Stretch], cursor: &mut usize, doc: u32) -> u32 {
-    while doc >= stretches[*cursor].doc + stretches[*cursor].len {
-        *cursor += 1;
+    let past = |s: &Stretch| doc >= s.doc + s.len;
+    if past(&stretches[*cursor]) {
+        *cursor += stretches[*cursor..].partition_point(past);
     }
     let s = &stretches[*cursor];
     s.row + (doc - s.doc)
@@ -1649,11 +1664,15 @@ pub(crate) struct FrozenLanes {
 /// cut into as many ranges as the pool has threads, at terms taken from
 /// the longest lane's dictionary, and the ranges merge side by side: a
 /// term is one value in every lane, so no term straddles a cut.
+/// The most lanes a commit may be fed through: a merged order names each
+/// entry's lane in a byte.
+pub(crate) const MAX_LANES: usize = u8::MAX as usize;
+
 pub(crate) fn freeze_lanes(
     mut lanes: Vec<FrozenLane>,
     pieces: Vec<Range<u32>>,
 ) -> Result<FrozenLanes, BuildError> {
-    if lanes.len() > usize::from(u8::MAX) {
+    if lanes.len() > MAX_LANES {
         return Err(BuildError::Io(Error::other("too many fts lanes")));
     }
     if let Some(first) = lanes.first()
@@ -2473,6 +2492,10 @@ impl FtsBuilder {
                     .saturating_add(new_bytes)
                     .saturating_add(run_bytes);
                 if ram.bytes > self.spill_threshold_bytes {
+                    if self.lane_mode {
+                        self.failed = true;
+                        return Err(lane_outgrown());
+                    }
                     // Crossed the threshold: move the postings to spill
                     // files, keyed by the ids already assigned, and run
                     // the rest of the build in spill mode.
@@ -2607,6 +2630,10 @@ impl FtsBuilder {
                 }
                 ram.bytes = ram.bytes.saturating_add(new_bytes);
                 if ram.bytes > self.spill_threshold_bytes {
+                    if self.lane_mode {
+                        self.failed = true;
+                        return Err(lane_outgrown());
+                    }
                     // The store is taken before the spill can fail, so a
                     // failed spill leaves the builder unusable, not empty.
                     let spilled = match Self::spill_ram_store(
@@ -2689,7 +2716,6 @@ impl FtsBuilder {
     /// it out of RAM.
     pub(crate) fn set_lane_mode(&mut self) {
         self.lane_mode = true;
-        self.spill_threshold_bytes = usize::MAX;
     }
 
     /// Freeze this lane for the finish: `stretches` are the commit rows
@@ -5177,6 +5203,123 @@ mod tests {
     /// column: over the whole corpus, and cut into two superfiles' worth
     /// of rows, with terms the lanes share, terms only one holds, a term
     /// of one document each, and a term that straddles the cut.
+    fn two_column_builder() -> FtsBuilder {
+        let mut b = FtsBuilder::new();
+        b.register_column("pos".into(), true).expect("register");
+        b.register_column("flat".into(), false).expect("register");
+        b
+    }
+
+    /// The blob one builder writes for rows `first..past` of `text_of`,
+    /// both columns.
+    fn single_blob(first: u32, past: u32, text_of: &dyn Fn(u32) -> String) -> Vec<u8> {
+        let mut b = two_column_builder();
+        for i in first..past {
+            b.add_doc(0, i - first, &text_of(i)).expect("add pos");
+            b.add_doc(1, i - first, &text_of(i)).expect("add flat");
+        }
+        b.finish().expect("finish single")
+    }
+
+    /// The blob piece `piece` of `pieces` gets from `lanes` lanes fed rows
+    /// `0..n_docs` of `text_of`: row `i` goes to lane `(i / slice) % lanes`,
+    /// so each lane holds runs of `slice` rows interleaved with the other
+    /// lanes', in row order, and consecutive rows of a lane fold into one
+    /// stretch.
+    fn lanes_blob(
+        n_docs: u32,
+        lanes: u32,
+        slice: u32,
+        text_of: &dyn Fn(u32) -> String,
+        pieces: Vec<Range<u32>>,
+        piece: usize,
+    ) -> Vec<u8> {
+        let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
+            let mut out: Vec<Stretch> = Vec::new();
+            for (doc, &row) in rows.iter().enumerate() {
+                match out.last_mut() {
+                    Some(s) if s.row + s.len == row => s.len += 1,
+                    _ => out.push(Stretch {
+                        doc: doc as u32,
+                        row,
+                        len: 1,
+                    }),
+                }
+            }
+            out
+        };
+        let mut fed: Vec<(FtsBuilder, Vec<u32>)> = (0..lanes)
+            .map(|_| {
+                let mut b = two_column_builder();
+                b.set_lane_mode();
+                (b, Vec::new())
+            })
+            .collect();
+        for i in 0..n_docs {
+            let (lane, rows) = &mut fed[((i / slice) % lanes) as usize];
+            let doc = rows.len() as u32;
+            lane.add_doc(0, doc, &text_of(i)).expect("add pos");
+            lane.add_doc(1, doc, &text_of(i)).expect("add flat");
+            rows.push(i);
+        }
+        let frozen: Vec<FrozenLane> = fed
+            .into_iter()
+            .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
+            .collect();
+        let frozen = Arc::new(freeze_lanes(frozen, pieces).expect("merge the lanes"));
+        let mut b = two_column_builder();
+        b.set_lane_view(LaneView {
+            lanes: frozen,
+            piece,
+        });
+        b.finish().expect("finish view")
+    }
+
+    /// A term held by several lanes but missing from some lanes' batches:
+    /// the merge takes each lane's stretch only up to the next row any
+    /// other lane holds, not up to that lane's own next document. Here
+    /// `t` is in rows 0 and 21 (lane 0), 7 (lane 1) and 35 (lane 2), so
+    /// lane 0's two postings must not come out together.
+    #[test]
+    fn a_term_some_lanes_miss_in_a_batch_merges_in_row_order() {
+        const N_DOCS: u32 = 42;
+        let text_of = |i: u32| match i {
+            0 | 7 | 21 | 35 => format!("u{i} t t"),
+            _ => format!("u{i}"),
+        };
+        assert_eq!(
+            lanes_blob(N_DOCS, 3, 7, &text_of, vec![0..N_DOCS; 1], 0),
+            single_blob(0, N_DOCS, &text_of)
+        );
+    }
+
+    /// A lane that outgrows its threshold fails the document that crosses
+    /// it rather than spilling, and can then neither take more nor be
+    /// frozen: the feed drops the lanes and the commit builds from the
+    /// buffer.
+    #[test]
+    fn a_lane_that_outgrows_its_threshold_fails_and_cannot_be_frozen() {
+        let mut lane = FtsBuilder::new();
+        lane.register_column("body".into(), false)
+            .expect("register");
+        lane.set_lane_mode();
+        lane.set_spill_threshold_bytes(1);
+        assert!(
+            lane.add_doc(0, 0, "alpha beta").is_err(),
+            "the lane is over"
+        );
+        assert!(lane.add_doc(0, 1, "gamma").is_err(), "no more documents");
+        assert!(
+            lane.freeze(vec![Stretch {
+                doc: 0,
+                row: 0,
+                len: 1,
+            }])
+            .is_err(),
+            "no frozen lane"
+        );
+    }
+
     #[test]
     fn lanes_cut_at_the_finish_write_the_blobs_single_builders_write() {
         const N_DOCS: u32 = 500;
@@ -5196,66 +5339,9 @@ mod tests {
             }
             text
         };
-        let fresh = || {
-            let mut b = FtsBuilder::new();
-            b.register_column("pos".into(), true).expect("register");
-            b.register_column("flat".into(), false).expect("register");
-            b
-        };
-        let single = |first: u32, past: u32| {
-            let mut b = fresh();
-            for i in first..past {
-                b.add_doc(0, i - first, &text_of(i)).expect("add pos");
-                b.add_doc(1, i - first, &text_of(i)).expect("add flat");
-            }
-            b.finish().expect("finish single")
-        };
-
-        // Row `i` goes to lane `(i / SLICE) % LANES`: each lane holds runs
-        // of rows, interleaved with the other lanes', in row order.
-        // Consecutive rows of a lane fold into one stretch.
-        let stretches_of = |rows: &[u32]| -> Vec<Stretch> {
-            let mut out: Vec<Stretch> = Vec::new();
-            for (doc, &row) in rows.iter().enumerate() {
-                match out.last_mut() {
-                    Some(s) if s.row + s.len == row => s.len += 1,
-                    _ => out.push(Stretch {
-                        doc: doc as u32,
-                        row,
-                        len: 1,
-                    }),
-                }
-            }
-            out
-        };
-        let build_lanes = || -> Vec<FrozenLane> {
-            let mut lanes: Vec<(FtsBuilder, Vec<u32>)> = (0..LANES)
-                .map(|_| {
-                    let mut b = fresh();
-                    b.set_lane_mode();
-                    (b, Vec::new())
-                })
-                .collect();
-            for i in 0..N_DOCS {
-                let (lane, rows) = &mut lanes[((i / SLICE) % LANES) as usize];
-                let doc = rows.len() as u32;
-                lane.add_doc(0, doc, &text_of(i)).expect("add pos");
-                lane.add_doc(1, doc, &text_of(i)).expect("add flat");
-                rows.push(i);
-            }
-            lanes
-                .into_iter()
-                .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
-                .collect()
-        };
-        let from_view = |pieces: Vec<std::ops::Range<u32>>, piece: usize| {
-            let frozen = Arc::new(freeze_lanes(build_lanes(), pieces).expect("merge the lanes"));
-            let mut b = fresh();
-            b.set_lane_view(LaneView {
-                lanes: frozen,
-                piece,
-            });
-            b.finish().expect("finish view")
+        let single = |first: u32, past: u32| single_blob(first, past, &text_of);
+        let from_view = |pieces: Vec<Range<u32>>, piece: usize| {
+            lanes_blob(N_DOCS, LANES, SLICE, &text_of, pieces, piece)
         };
         assert_eq!(from_view(vec![0..N_DOCS; 1], 0), single(0, N_DOCS), "whole");
         assert_eq!(
@@ -5270,7 +5356,7 @@ mod tests {
         );
 
         // A lane whose stretches do not cover its documents is refused.
-        let mut lane = fresh();
+        let mut lane = two_column_builder();
         lane.set_lane_mode();
         lane.add_doc(0, 0, "a").expect("add");
         lane.add_doc(1, 0, "a").expect("add");
@@ -5283,7 +5369,7 @@ mod tests {
             .is_err()
         );
         // A builder not in lane mode cannot be frozen.
-        assert!(fresh().freeze(Vec::new()).is_err());
+        assert!(two_column_builder().freeze(Vec::new()).is_err());
     }
 
     #[test]
