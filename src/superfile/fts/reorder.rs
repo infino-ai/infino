@@ -985,7 +985,7 @@ impl BisectState {
 
         let step = timed.then(Instant::now);
         let cpu = timed.then(thread_cpu_ns).flatten();
-        self.count_degrees(fwd, order, mid);
+        self.count_degrees(fwd, order, mid, parallel);
         if let Some(step) = step {
             level.count_ns += ns_since(step);
             level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -994,7 +994,7 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        let mut cost_before = self.partition_cost(n_left, n_right);
+        let mut cost_before = self.partition_cost(n_left, n_right, parallel);
         // What the split's first round lowered the cost by: its offer
         // towards the run's bar, which measures every later round against
         // what a first round over fresh halves is worth per document.
@@ -1137,7 +1137,7 @@ impl BisectState {
                 break;
             }
             level.swaps += moved as u64;
-            let cost_after = self.partition_cost(n_left, n_right);
+            let cost_after = self.partition_cost(n_left, n_right, parallel);
             let round_gain = cost_before - cost_after;
             cost_before = cost_after;
             if round == 0 {
@@ -1189,14 +1189,26 @@ impl BisectState {
         first_round_gain
     }
 
-    /// The cost of the current split, from its degree tables.
-    fn partition_cost(&self, n_left: f32, n_right: f32) -> f64 {
-        let mut cost = 0.0f64;
-        for &t in &self.touched {
-            let t = t as usize;
-            cost += self.term_split_cost(t, n_left, n_right);
+    /// The cost of the current split, from its degree tables. A large split
+    /// sums in parallel, a fixed chunk of terms at a time, each chunk in
+    /// order and then the chunks in order, so the total is the same on any
+    /// thread count.
+    fn partition_cost(&self, n_left: f32, n_right: f32, parallel: bool) -> f64 {
+        let cost_of = |terms: &[u32]| -> f64 {
+            terms
+                .iter()
+                .map(|&t| self.term_split_cost(t as usize, n_left, n_right))
+                .sum()
+        };
+        if !parallel {
+            return cost_of(&self.touched);
         }
-        cost
+        let chunks: Vec<f64> = self
+            .touched
+            .par_chunks(PAR_MIN_ITEMS)
+            .map(cost_of)
+            .collect();
+        chunks.into_iter().sum()
     }
 
     /// What term `t` costs across both halves of the current split.
@@ -1282,7 +1294,53 @@ impl BisectState {
         }
     }
 
-    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize) {
+    /// Count each term's documents on either side of `mid` into the degree
+    /// tables, and list the terms the partition touches.
+    ///
+    /// A large split counts in parallel. Degrees are counts, so adding them
+    /// up from any thread ends at the same tables; the touched terms are
+    /// then read off the tables in id order, so every later pass over them,
+    /// and the sums it makes, runs the same whichever threads counted. The
+    /// serial path lists a term as it first meets it, which costs nothing
+    /// beyond the count itself; a pass over the whole vocabulary would.
+    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
+        if parallel {
+            let Self {
+                deg_left,
+                deg_right,
+                touched,
+                ..
+            } = self;
+            let (left, right) = order.split_at(mid);
+            {
+                let (deg_left, deg_right) = (as_atomic(deg_left), as_atomic(deg_right));
+                join(
+                    || {
+                        left.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
+                            for &t in fwd.doc(d) {
+                                deg_left[t as usize].fetch_add(1, Relaxed);
+                            }
+                        })
+                    },
+                    || {
+                        right.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
+                            for &t in fwd.doc(d) {
+                                deg_right[t as usize].fetch_add(1, Relaxed);
+                            }
+                        })
+                    },
+                );
+            }
+            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
+            touched.clear();
+            touched.par_extend(
+                (0..deg_left.len() as u32)
+                    .into_par_iter()
+                    .with_min_len(PAR_MIN_ITEMS)
+                    .filter(|&t| deg_left[t as usize] > 0 || deg_right[t as usize] > 0),
+            );
+            return;
+        }
         for (i, &d) in order.iter().enumerate() {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
