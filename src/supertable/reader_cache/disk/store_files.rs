@@ -41,7 +41,7 @@ use crate::{
 /// "recovery is a refetch" argument cannot survive.
 ///
 /// `never` still means never, at every boundary.
-fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
+pub(super) fn adoption_verifies(config: &DiskCacheConfig, intent: ReadIntent) -> bool {
     match intent {
         ReadIntent::Load => config.crc_verification.verifies_on_landing(),
         ReadIntent::Warm | ReadIntent::Stream => config.crc_verification.verifies_on_open(),

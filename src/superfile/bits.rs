@@ -995,14 +995,6 @@ mod tests {
                 }
             }
         }
-        // The caps exactly at and one past an outlier count.
-        let mut lanes = vec![1u32; 128];
-        for i in 0..40 {
-            lanes[i * 3] = 1 << 15;
-        }
-        let base = |width: u8| 128 * width as usize / 8;
-        assert_eq!(planned(&lanes, 40, base, |_, _| 2).exceptions.len(), 40);
-        assert_eq!(planned(&lanes, 39, base, |_, _| 2).exceptions.len(), 0);
     }
 
     #[test]
@@ -1020,6 +1012,9 @@ mod tests {
         let roomy = planned(&lanes, 64, base, |_, _| 2);
         assert_eq!((roomy.width, roomy.exceptions.len()), (1, 40));
         assert!(roomy.bytes < capped.bytes);
+        // A cap of exactly the outlier count admits them; one fewer does not.
+        assert_eq!(planned(&lanes, 40, base, |_, _| 2).exceptions.len(), 40);
+        assert_eq!(planned(&lanes, 39, base, |_, _| 2).exceptions.len(), 0);
         let dear = planned(&lanes, 64, base, |_, _| 100);
         assert_eq!(dear.exceptions.len(), 0);
     }

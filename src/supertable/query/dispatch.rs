@@ -57,7 +57,7 @@ use arrow_array::Decimal128Array;
 use datafusion::common::runtime::SpawnedTask;
 use futures::stream::{FuturesUnordered, StreamExt};
 use roaring::RoaringBitmap;
-use tracing::{Instrument, Span, trace};
+use tracing::{Instrument, Span, debug, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -188,11 +188,10 @@ pub(crate) fn verify_superfile_vector_codecs(
 /// [`open_reader`] only exposes its bytes synchronously after a *background*
 /// mmap promotion, so a compaction that races that promotion sees a reader
 /// with no resident bytes (`record_batches` → `LazyReaderUnsupported`, and
-/// `try_get_range_sync` → `None`) and fails. An input the storage provider
-/// can name on this host's disk is mapped where it lies, verified under the
-/// cache's checksum policy as a `Load` it adopts would be (always, when no
-/// cache is attached). Any other input goes through the disk cache, which
-/// mmap-promotes it first via [`DiskCacheStore::reader_synchronous_with_storage`]:
+/// `try_get_range_sync` → `None`) and fails. An input on this host's disk is
+/// mapped where it lies, under the cache's `Load` checksum policy; any other
+/// goes through the disk cache, which mmap-promotes it first via
+/// [`DiskCacheStore::reader_synchronous_with_storage`]:
 /// the bytes are NVMe-backed and OS-paged — bounded by the cache budget and the
 /// `MADV_DONTNEED` sweep — so this does **not** pull whole superfiles into the
 /// heap (the whole point of the streamed/mmap design). Falls back to the query
@@ -204,19 +203,21 @@ pub(crate) async fn open_whole_superfile(
     entry: &SuperfileEntry,
 ) -> Result<Arc<SuperfileReader>, QueryError> {
     if let Some(storage) = storage {
-        // A file already on this host's disk is mapped where it lies. Going
-        // through the disk cache would copy it into the cache first: a
-        // second write of every input, on the path every merge waits on
-        // before it can start, for a file the merge is about to replace.
-        // Anything that stops the map takes the ordinary path below. The
-        // checksum policy is the cache's: an operator who turned
-        // verification off keeps it off here too.
-        if let Some(local) = storage.local_path(&entry.storage_path())
-            && let Ok(bytes) = mmap_readonly_bytes(&local)
-        {
-            let verify_crc = disk_cache.is_none_or(|cache| cache.verifies_on_load());
-            let reader = SuperfileReader::open_with(bytes, OpenOptions { verify_crc })?;
-            return Ok(Arc::new(reader));
+        // Going through the disk cache would copy a local file into the
+        // cache first: a second write of every input, on the path every
+        // merge waits on before it can start, for a file the merge is about
+        // to replace. A map that is refused takes the ordinary path below.
+        if let Some(local) = storage.local_path(&entry.storage_path()) {
+            match mmap_readonly_bytes(&local) {
+                Ok(bytes) => {
+                    let verify_crc = disk_cache.is_none_or(|cache| cache.verifies_on_load());
+                    let reader = SuperfileReader::open_with(bytes, OpenOptions { verify_crc })?;
+                    return Ok(Arc::new(reader));
+                }
+                Err(error) => {
+                    debug!(%error, "local input not mapped; reading it through the cache");
+                }
+            }
         }
         if let Some(cache) = disk_cache {
             let reader = cache

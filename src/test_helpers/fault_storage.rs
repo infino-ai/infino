@@ -21,6 +21,7 @@ use std::{
     fmt::{Debug, Formatter, Result as FmtResult},
     io::Error as IoError,
     ops::Range,
+    path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicUsize, Ordering},
@@ -104,6 +105,19 @@ pub struct FaultStorage {
     rules: Mutex<Vec<FaultRule>>,
     hooks: Mutex<Vec<Hook>>,
     fired: AtomicUsize,
+    local_paths: Mutex<Option<LocalPaths>>,
+}
+
+/// What the wrapper answers for [`StorageProvider::local_path`]. Unset,
+/// it answers `None` like an object store, whatever the inner provider
+/// would say; a test can name paths of its own to steer a reader that
+/// maps local files.
+struct LocalPaths(Box<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>);
+
+impl Debug for LocalPaths {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str("LocalPaths(..)")
+    }
 }
 
 impl FaultStorage {
@@ -113,7 +127,14 @@ impl FaultStorage {
             rules: Mutex::new(Vec::new()),
             hooks: Mutex::new(Vec::new()),
             fired: AtomicUsize::new(0),
+            local_paths: Mutex::new(None),
         })
+    }
+
+    /// Answer [`StorageProvider::local_path`] with `name(uri)` from now on,
+    /// in place of the `None` an object store gives.
+    pub fn name_local_paths(&self, name: impl Fn(&str) -> Option<PathBuf> + Send + Sync + 'static) {
+        *guard(&self.local_paths) = Some(LocalPaths(Box::new(name)));
     }
 
     /// Arm a rule: the next `times` calls of `op` whose URI **contains**
@@ -211,6 +232,12 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[async_trait]
 impl StorageProvider for FaultStorage {
+    fn local_path(&self, uri: &str) -> Option<PathBuf> {
+        guard(&self.local_paths)
+            .as_ref()
+            .and_then(|paths| (paths.0)(uri))
+    }
+
     async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
         if self.check(FaultOp::Head, uri)? {
             let _ = self.inner.head(uri).await;

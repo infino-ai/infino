@@ -7788,13 +7788,14 @@ mod tests {
             .collect()
     }
 
-    /// A merge that chooses its own doc order still goes term by term, and
-    /// writes what the accumulator writes.
-    #[test]
     /// The order's term counts come from the headers for an input that
     /// keeps every document and from a walk of the postings for one that
     /// drops some: both agree with a count over the surviving documents,
-    /// and for the dropping input the header counts would not.
+    /// and for the dropping input the header counts would not. The walk
+    /// here is the count's own slow path, so the equality on the dropping
+    /// input pins which path the count takes, and the live case pins that
+    /// the headers say what a walk counts.
+    #[test]
     fn term_counts_read_headers_only_for_inputs_that_keep_every_document() {
         /// The reorder fixture indexes one text column.
         const N_FTS_COLUMNS: u32 = 1;
@@ -7864,6 +7865,8 @@ mod tests {
         );
     }
 
+    /// A merge that chooses its own doc order still goes term by term, and
+    /// writes what the accumulator writes.
     #[test]
     fn sorted_merge_matches_accumulator_when_the_merge_reorders() {
         let a: Vec<u32> = (0..2_600).step_by(7).collect();

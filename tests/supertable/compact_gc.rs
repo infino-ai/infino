@@ -15,7 +15,6 @@
 #![deny(clippy::unwrap_used)]
 
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -526,6 +525,11 @@ fn merge_cache_config(cache_root: &Path) -> DiskCacheConfig {
     }
 }
 
+/// A disk cache over `storage` under `cfg`, pinning nothing.
+fn cache_store(storage: &Arc<dyn StorageProvider>, cfg: DiskCacheConfig) -> Arc<DiskCacheStore> {
+    DiskCacheStore::new_unpinned(Arc::clone(storage), cfg).expect("cache")
+}
+
 /// A table wired to its own disk cache, the shape both drop-through tests need:
 /// commits warm-fill this cache, so gc has copies to drop.
 fn table_with_disk_cache(
@@ -533,9 +537,7 @@ fn table_with_disk_cache(
     storage: Arc<dyn StorageProvider>,
     cache_root: &Path,
 ) -> (Supertable, Arc<DiskCacheStore>) {
-    let cfg = merge_cache_config(cache_root);
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
+    let cache = cache_store(&storage, merge_cache_config(cache_root));
     let table = Supertable::create(
         options
             .with_storage(storage)
@@ -921,12 +923,13 @@ fn reopen_over_cache(
     cache_dir: &Path,
     policy: CrcVerification,
 ) -> (Supertable, Arc<DiskCacheStore>) {
-    let cfg = DiskCacheConfig {
-        crc_verification: policy,
-        ..merge_cache_config(cache_dir)
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    let cache = DiskCacheStore::new(Arc::clone(storage), cfg, pinned).expect("cache");
+    let cache = cache_store(
+        storage,
+        DiskCacheConfig {
+            crc_verification: policy,
+            ..merge_cache_config(cache_dir)
+        },
+    );
     let st = Supertable::open(
         hidden_vector_options()
             .with_storage(Arc::clone(storage))
@@ -954,6 +957,10 @@ fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: boo
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
     let storage: Arc<dyn StorageProvider> = FaultStorage::wrap(local);
+    assert!(
+        storage.local_path("data/any").is_none(),
+        "the wrapper must hide the path, or the merge maps the file and never reads the cache"
+    );
     merge_inputs_on_disk(&storage, store_dir.path(), cache_dir.path());
 
     if corrupt_cached_inputs {
@@ -974,16 +981,28 @@ fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: boo
     cache.stats().n_cold_fetches - before
 }
 
+/// How a corrupt local input is read: under which cache policy, or with
+/// no cache at all.
+#[derive(Clone, Copy, Debug)]
+enum LocalInputCheck {
+    Cache(CrcVerification),
+    NoCache,
+}
+
 /// An input on this host's disk is mapped where it lies rather than read
 /// through the cache — the cache serves no fetch for it — and its checksums
-/// are verified as it opens under the cache's policy: under `Auto` a
-/// corrupt storage copy is refused and the merge does not run, so the table
-/// keeps its inputs and nothing is laundered into a fresh, validly
-/// checksummed output; under `Never` the operator turned the check off at
-/// every boundary, and the copy is merged as it is.
+/// are verified as it opens under the cache's policy: under `Auto`, and with
+/// no cache attached, a corrupt storage copy is refused and the merge does
+/// not run, so the table keeps its inputs and nothing is laundered into a
+/// fresh, validly checksummed output; under `Never` the operator turned the
+/// check off at every boundary, and the copy is merged as it is.
 #[test]
 fn optimize_refuses_a_corrupt_local_input_instead_of_merging_it() {
-    for policy in [CrcVerification::Auto, CrcVerification::Never] {
+    for check in [
+        LocalInputCheck::Cache(CrcVerification::Auto),
+        LocalInputCheck::Cache(CrcVerification::Never),
+        LocalInputCheck::NoCache,
+    ] {
         let store_dir = TempDir::new().expect("tempdir");
         let cache_dir = TempDir::new().expect("cache tempdir");
         let storage: Arc<dyn StorageProvider> =
@@ -995,31 +1014,74 @@ fn optimize_refuses_a_corrupt_local_input_instead_of_merging_it() {
         let corrupted = inputs.iter().filter(|p| corrupt_vector_blob_at(p)).count();
         assert!(corrupted > 0, "an input with a vector blob to corrupt");
 
-        let (st, cache) = reopen_over_cache(&storage, cache_dir.path(), policy);
-        let before = cache.stats().n_cold_fetches;
-        let merged = st.optimize(&small_optimize_opts());
-        assert_eq!(
-            cache.stats().n_cold_fetches - before,
-            0,
-            "{policy:?}: a local input is mapped, never fetched through the cache"
-        );
+        let merged = match check {
+            LocalInputCheck::Cache(policy) => {
+                let (st, cache) = reopen_over_cache(&storage, cache_dir.path(), policy);
+                let before = cache.stats().n_cold_fetches;
+                let merged = st.optimize(&small_optimize_opts());
+                assert_eq!(
+                    cache.stats().n_cold_fetches - before,
+                    0,
+                    "{check:?}: a local input is mapped, never fetched through the cache"
+                );
+                merged
+            }
+            LocalInputCheck::NoCache => {
+                let st =
+                    Supertable::open(hidden_vector_options().with_storage(Arc::clone(&storage)))
+                        .expect("reopen the table without a cache");
+                st.optimize(&small_optimize_opts())
+            }
+        };
         let mut after = superfile_paths_under(store_dir.path());
         after.sort();
         inputs.sort();
-        match policy {
-            CrcVerification::Never => {
+        match check {
+            LocalInputCheck::Cache(CrcVerification::Never) => {
                 merged.expect("never does not look, so the corrupt copy is merged in");
-                assert_ne!(after, inputs, "the inputs were merged");
+                assert_ne!(after, inputs, "{check:?}: the inputs were merged");
             }
             _ => {
                 merged.expect_err("a corrupt input is refused before the merge reads it");
                 assert_eq!(
                     after, inputs,
-                    "the inputs stay as they were; nothing was merged"
+                    "{check:?}: the inputs stay as they were; nothing was merged"
                 );
             }
         }
     }
+}
+
+/// A local path the provider names but that cannot be mapped — the file
+/// is not where the provider says — sends the merge down the cache path,
+/// where the input is fetched and served as any object-store input is.
+#[test]
+fn optimize_reads_through_the_cache_when_a_local_input_cannot_be_mapped() {
+    let store_dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let local: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
+    let faults = FaultStorage::wrap(local);
+    let storage: Arc<dyn StorageProvider> = Arc::<FaultStorage>::clone(&faults);
+    merge_inputs_on_disk(&storage, store_dir.path(), cache_dir.path());
+    // Every path named points beside the files, where nothing is.
+    let missing = store_dir.path().join("elsewhere");
+    faults.name_local_paths(move |uri| Some(missing.join(uri)));
+
+    let (st, cache) = reopen_over_cache(&storage, cache_dir.path(), CrcVerification::Auto);
+    let before = superfile_paths_under(store_dir.path());
+    st.optimize(&small_optimize_opts())
+        .expect("the merge reads the inputs through the cache instead");
+    assert_ne!(
+        superfile_paths_under(store_dir.path()),
+        before,
+        "the inputs were merged"
+    );
+    assert_eq!(
+        cache.stats().n_cold_fetches,
+        0,
+        "the cache held good copies from the commits, so nothing was fetched"
+    );
 }
 
 /// A corrupt cached input is refetched rather than merged, end to end through

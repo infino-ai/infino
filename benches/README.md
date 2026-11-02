@@ -677,6 +677,19 @@ Engine top-k graded against a streaming BM25 oracle over the whole corpus, tie-a
 | SQL | 75.02 s | 13.3 K/s | 256 | 11.42 GiB | 9.44 GiB | 11.02 GiB |
 <!-- END: bench/supertable/ingest -->
 
+### Supertable FTS — compaction reorder leaf (5M-doc corpora, 1 GiB superfiles)
+
+_Host: 8-vCPU x86_64 cloud VM · release build · two optimize runs per arm_
+
+The document reorder stops splitting a partition at one posting block (256 documents, `MIN_PARTITION` in `fts/reorder.rs`), up from 32. Measured on two 5M-document tables compacted at a 1 GiB target, each optimize run twice:
+
+| corpus | optimize wall, leaf 32 | leaf 256 | index bytes |
+| --- | ---: | ---: | ---: |
+| encyclopedia prose, 18 → 3 superfiles | 49.5 s | 48.2 s | −0.07% |
+| web crawl, 36 → 6 superfiles | 96 s | 88–95 s | −0.05% |
+
+The splits below a block took 2–4% of the compaction's time and left the index slightly larger; `fts/reorder.rs` says why a leaf-sized round stops paying.
+
 ### Superfile SQL
 
 <!-- BEGIN: bench/sql/build -->
@@ -915,14 +928,3 @@ Which terms get the second sub-block, each policy its own build and run, latency
 | previous format (none) | +5.3% | +8.3% | — |
 
 The order is the same on the held-out set and on every shape: the gain lives in the common terms, the ones a walk meets in every block it visits; keeping the rare and mid terms narrow costs nothing measurable (a run's noise is ±1–2%) and keeps their pruning at the finer grain. The default is one document in a thousand: the same speed as every term wide, the second-smallest data growth, and a density rather than a count so it carries across corpus sizes. The halved skip entries and block headers pay for most of the one-width-per-256-lanes cost of the doc-id and tf streams.
-
-### Compaction reorder — bisection leaf (5M-doc corpora, 1 GiB superfiles)
-
-The document reorder stops splitting a partition at one posting block (256 documents, `MIN_PARTITION` in `fts/reorder.rs`), up from 32. Measured on two 5M-document tables compacted at a 1 GiB target, each optimize run twice:
-
-| corpus | optimize wall, leaf 32 | leaf 256 | index bytes |
-| --- | ---: | ---: | ---: |
-| encyclopedia prose, 18 → 3 superfiles | 49.5 s | 48.2 s | −0.07% |
-| web crawl, 36 → 6 superfiles | 96 s | 88–95 s | −0.05% |
-
-The splits below a block took 2–4% of the compaction's time and left the index slightly larger: in a partition that small the pairs a round moves share terms, so the swaps undo each other's grouping more than they add to it.

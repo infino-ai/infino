@@ -582,7 +582,7 @@ pub struct FtsReader {
 }
 
 /// The error for a short-form term body the decoder refuses.
-fn short_body_malformed() -> FtsError {
+pub(super) fn short_body_malformed() -> FtsError {
     FtsError::Read(ReadError::Malformed(
         "short-form term body does not decode".into(),
     ))
@@ -1269,8 +1269,24 @@ impl FtsReader {
     /// read from its header, and the form's limit for a short one.
     pub(crate) fn term_postings_at_most(&self, value: DictEntry) -> Result<u32, FtsError> {
         match value {
-            DictEntry::Inline { .. } => Ok(1),
             DictEntry::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
+            exact => self.entry_df(exact),
+        }
+    }
+
+    /// How many documents the term at `value` holds, without decoding a
+    /// posting: an inline term has one, a short term's body leads with its
+    /// count, and a long term's header states it.
+    pub(crate) fn entry_df(&self, value: DictEntry) -> Result<u32, FtsError> {
+        match value {
+            DictEntry::Inline { .. } => Ok(1),
+            DictEntry::Pfor {
+                metadata_offset,
+                postings_length,
+                short: true,
+            } => self
+                .term_bytes_sync(metadata_offset, postings_length)
+                .and_then(|body| short_df(body.as_ref()).ok_or_else(short_body_malformed)),
             DictEntry::Pfor {
                 metadata_offset, ..
             } => {
@@ -1810,23 +1826,16 @@ impl FtsReader {
     pub(crate) fn for_each_term_doc<K>(
         &self,
         column_id: u32,
-        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        on_term: impl FnMut(&[u8]) -> Option<K>,
         mut on_doc: impl FnMut(&K, u32),
     ) -> Result<(), FtsError> {
         let col_meta = &self.columns[column_id as usize];
-        let dict_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&dict_bytes)?;
-        let prefix = make_key(&col_meta.name, "");
         let mut doc_ids = [0u32; BLOCK_LEN];
         let mut tfs = [0u32; BLOCK_LEN];
-        let mut failed = None;
-        dict.for_each_prefix(&prefix, |key, packed| {
-            let Some(carry) = on_term(&key[prefix.len()..]) else {
-                return true;
-            };
-            let docs = match packed {
+        self.for_each_column_entry(column_id, on_term, |carry, packed| {
+            match packed {
                 DictEntry::Inline { doc_id, .. } => {
-                    on_doc(&carry, doc_id);
+                    on_doc(carry, doc_id);
                     Ok(())
                 }
                 DictEntry::Pfor {
@@ -1845,7 +1854,7 @@ impl FtsReader {
                             )
                             .ok_or_else(short_body_malformed)?;
                             for &doc in &doc_ids[..decoded.n] {
-                                on_doc(&carry, doc);
+                                on_doc(carry, doc);
                             }
                             Ok(())
                         }
@@ -1862,7 +1871,7 @@ impl FtsReader {
                             )?;
                             while !cursor.is_exhausted() {
                                 for &doc in &cursor.block_doc_ids[cursor.pos..cursor.block_n] {
-                                    on_doc(&carry, doc);
+                                    on_doc(carry, doc);
                                 }
                                 cursor.pos = cursor.block_n;
                                 cursor.advance_block();
@@ -1870,8 +1879,30 @@ impl FtsReader {
                             Ok(())
                         }
                     }),
+            }
+        })
+    }
+
+    /// Walk `column_id`'s dictionary in term order and hand each wanted
+    /// term's entry to `on_entry`, with the carry `on_term` returned for
+    /// it; a term `on_term` answers `None` for is skipped. The first error
+    /// ends the walk.
+    fn for_each_column_entry<K>(
+        &self,
+        column_id: u32,
+        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        mut on_entry: impl FnMut(&K, DictEntry) -> Result<(), FtsError>,
+    ) -> Result<(), FtsError> {
+        let col_meta = &self.columns[column_id as usize];
+        let dict_bytes = self.dict_bytes()?;
+        let dict = Self::open_dict(&dict_bytes)?;
+        let prefix = make_key(&col_meta.name, "");
+        let mut failed = None;
+        dict.for_each_prefix(&prefix, |key, packed| {
+            let Some(carry) = on_term(&key[prefix.len()..]) else {
+                return true;
             };
-            match docs {
+            match on_entry(&carry, packed) {
                 Ok(()) => true,
                 Err(e) => {
                     failed = Some(e);
@@ -1883,51 +1914,19 @@ impl FtsReader {
     }
 
     /// Walk `column_id`'s dictionary and hand each term's document count to
-    /// `on_df`, without decoding a posting: a long term's header states it,
-    /// a short term's body leads with it and an inline term has one.
-    /// `on_term(term)` returns a carry for a wanted term or `None` to skip
-    /// it, as in [`Self::for_each_term_doc`], whose walk this replaces
-    /// when a merge drops no document, so every posting counts.
+    /// `on_df`, read as [`Self::entry_df`] reads it, without decoding a
+    /// posting. `on_term(term)` returns a carry for a wanted term or `None`
+    /// to skip it, as in [`Self::for_each_term_doc`].
     pub(crate) fn for_each_term_df<K>(
         &self,
         column_id: u32,
-        mut on_term: impl FnMut(&[u8]) -> Option<K>,
+        on_term: impl FnMut(&[u8]) -> Option<K>,
         mut on_df: impl FnMut(&K, u32),
     ) -> Result<(), FtsError> {
-        let col_meta = &self.columns[column_id as usize];
-        let dict_bytes = self.dict_bytes()?;
-        let dict = Self::open_dict(&dict_bytes)?;
-        let prefix = make_key(&col_meta.name, "");
-        let mut failed = None;
-        dict.for_each_prefix(&prefix, |key, packed| {
-            let Some(carry) = on_term(&key[prefix.len()..]) else {
-                return true;
-            };
-            let df = match packed {
-                DictEntry::Inline { .. } => Ok(1),
-                DictEntry::Pfor {
-                    metadata_offset,
-                    postings_length,
-                    short: true,
-                } => self
-                    .term_bytes_sync(metadata_offset, postings_length)
-                    .and_then(|term_bytes| {
-                        short_df(term_bytes.as_ref()).ok_or_else(short_body_malformed)
-                    }),
-                long => self.term_postings_at_most(long),
-            };
-            match df {
-                Ok(df) => {
-                    on_df(&carry, df);
-                    true
-                }
-                Err(e) => {
-                    failed = Some(e);
-                    false
-                }
-            }
-        });
-        failed.map_or(Ok(()), Err)
+        self.for_each_column_entry(column_id, on_term, |carry, packed| {
+            on_df(carry, self.entry_df(packed)?);
+            Ok(())
+        })
     }
 
     /// One PFOR term's bytes, from its metadata header to its end.
@@ -3053,7 +3052,7 @@ mod tests {
         }
     }
     use std::{
-        collections::{BTreeMap, HashMap, HashSet},
+        collections::{HashMap, HashSet},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Barrier, Mutex,
@@ -3844,60 +3843,6 @@ mod tests {
     /// The header walk states, for every term, the number of documents the
     /// full walk visits for it, over inline, short and long terms, and a
     /// term it is told to skip is not counted.
-    #[test]
-    /// A term's stated count covers every document of the superfile, the
-    /// ones a merge would drop included: a count over the surviving
-    /// documents alone has to walk the postings, which is why a merge
-    /// reads headers only for an input that keeps every document.
-    fn a_term_header_counts_the_documents_a_merge_would_drop_too() {
-        const N_DOCS: u32 = 400;
-        let mut b = FtsBuilder::new();
-        b.register_column("body".into(), false).expect("register");
-        for i in 0..N_DOCS {
-            let mut text = format!("every u{i}");
-            if i.is_multiple_of(3) {
-                text.push_str(" some");
-            }
-            b.add_doc(0, i, &text).expect("add");
-        }
-        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
-        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
-        let dropped = |doc: u32| doc.is_multiple_of(5);
-
-        let mut stated: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        r.for_each_term_df(
-            0,
-            |term| Some(term.to_vec()),
-            |term, df| {
-                stated.insert(term.clone(), df);
-            },
-        )
-        .expect("header walk");
-        let mut surviving: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        let mut gone: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-        r.for_each_term_doc(
-            0,
-            |term| Some(term.to_vec()),
-            |term, doc| {
-                let table = match dropped(doc) {
-                    true => &mut gone,
-                    false => &mut surviving,
-                };
-                *table.entry(term.clone()).or_default() += 1;
-            },
-        )
-        .expect("posting walk");
-        assert!(
-            gone.values().sum::<u32>() > 0,
-            "some dropped documents carry terms"
-        );
-        for (term, &df) in &stated {
-            let kept = surviving.get(term).copied().unwrap_or(0);
-            let lost = gone.get(term).copied().unwrap_or(0);
-            assert_eq!(df, kept + lost, "{}", String::from_utf8_lossy(term));
-        }
-    }
-
     #[test]
     fn for_each_term_df_matches_the_full_walk_and_skips_terms() {
         const N_DOCS: u32 = 700;

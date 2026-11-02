@@ -140,8 +140,8 @@ impl Supertable {
 /// out of the largest shares. A pass with more jobs than can run at once,
 /// or whose jobs report no documents, gives each the even share, rounded
 /// down, so the merges in flight never hold more threads together than
-/// the pool has; only more jobs than threads oversubscribes it, by the
-/// shortfall, since a merge cannot run on none.
+/// the pool has; only more merges in flight than threads oversubscribes
+/// it, by that shortfall, since a merge cannot run on none.
 fn merge_pool_widths(
     maintenance_threads: usize,
     concurrency: usize,
@@ -2824,8 +2824,6 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
     use std::{
         collections::HashSet,
         env, fs,
@@ -2857,6 +2855,8 @@ mod tests {
         plan::tests::{default_cfg, seg},
         *,
     };
+    #[cfg(unix)]
+    use crate::test_helpers::links::assert_cache_copies_are_links;
     use crate::{
         BoolMode, Stemmer, Stopwords, VectorSearchOptions,
         config::{
@@ -2880,7 +2880,7 @@ mod tests {
                 },
                 term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
             },
-            reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
+            reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy},
             schema::{
                 ColumnIndex,
                 change::{FieldPatch, SchemaPatch},
@@ -2899,10 +2899,12 @@ mod tests {
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
 
-    /// How long the output-link test waits for the post-commit cache warm:
-    /// `CACHE_WARM_POLLS` polls, `CACHE_WARM_POLL` apart.
-    const CACHE_WARM_POLLS: usize = 200;
-    const CACHE_WARM_POLL: Duration = Duration::from_millis(50);
+    /// How long compaction's background warm of its output may take to land
+    /// in the disk cache before a test counts it as never warmed: the warm
+    /// is spawned after the commit and waits on a process-wide pair of
+    /// permits other tests' warms may hold. Polled every `WARM_POLL`.
+    const WARM_LANDS_WITHIN: Duration = Duration::from_secs(30);
+    const WARM_POLL: Duration = Duration::from_millis(10);
 
     /// Titles that cast cleanly to the integers the column is flipped to,
     /// so the rewritten file carries real values rather than nulls.
@@ -4417,6 +4419,43 @@ mod tests {
             .expect("create supertable")
     }
 
+    /// A table over a local directory with its own disk cache beside it,
+    /// so commits and compactions warm the cache.
+    fn table_with_disk_cache(
+        dir: &TempDir,
+    ) -> (Supertable, Arc<dyn StorageProvider>, Arc<DiskCacheStore>) {
+        let storage: Arc<dyn StorageProvider> = local_storage(dir);
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("disk-cache"),
+                mmap_cold_threshold_secs: 0,
+                eviction: Box::new(LruPolicy::new()),
+                ..Default::default()
+            },
+        )
+        .expect("disk cache");
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create supertable");
+        (st, storage, cache)
+    }
+
+    /// Wait for compaction's warm of `uri` to land in `cache`.
+    async fn wait_until_cached(cache: &DiskCacheStore, uri: &SuperfileUri) {
+        let deadline = Instant::now() + WARM_LANDS_WITHIN;
+        while !cache.is_cached(uri) {
+            assert!(
+                Instant::now() < deadline,
+                "compaction's warm of {uri:?} never landed in the disk cache"
+            );
+            time::sleep(WARM_POLL).await;
+        }
+    }
+
     /// Open the table already written at `dir`.
     fn open_st(dir: &TempDir) -> Supertable {
         Supertable::open(default_supertable_options().with_storage(local_storage(dir)))
@@ -4541,22 +4580,7 @@ mod tests {
         // The sealed file lives under the configured scratch root; storage
         // and cache go beside it so the links are on one filesystem.
         let dir = TempDir::new_in(scratch_root()).expect("tempdir under the scratch root");
-        let storage: Arc<dyn StorageProvider> = local_storage(&dir);
-        let cache = DiskCacheStore::new_unpinned(
-            Arc::clone(&storage),
-            DiskCacheConfig {
-                cache_root: dir.path().join("cache"),
-                mmap_cold_threshold_secs: 0,
-                ..Default::default()
-            },
-        )
-        .expect("cache store");
-        let st = Supertable::create(
-            default_supertable_options()
-                .with_storage(Arc::clone(&storage))
-                .with_disk_cache(Arc::clone(&cache)),
-        )
-        .expect("create");
+        let (st, storage, cache) = table_with_disk_cache(&dir);
         commit_ten_small_files(&st);
         let before = superfile_count(&st);
         st.compact_async(&small_compact_cfg())
@@ -4565,26 +4589,10 @@ mod tests {
         assert!(superfile_count(&st) < before, "the pass merged");
         let manifest = st.inner().manifest.load();
         let entries = manifest.get_all_superfiles();
-        // The warm fill of the outputs runs after the commit, off the loop
-        // that admits merges; give it a moment to land.
-        for _ in 0..CACHE_WARM_POLLS {
-            if entries
-                .iter()
-                .all(|entry| cache.cache_path(&entry.uri).exists())
-            {
-                break;
-            }
-            tokio::time::sleep(CACHE_WARM_POLL).await;
-        }
         for entry in entries {
-            let stored = storage
-                .local_path(&entry.storage_path())
-                .expect("a directory on this host");
-            let stored = fs::metadata(&stored).expect("storage file");
-            let cached = fs::metadata(cache.cache_path(&entry.uri)).expect("cache file");
-            assert_eq!(stored.ino(), cached.ino(), "one file behind both copies");
-            assert!(stored.nlink() >= 2, "linked, not copied");
+            wait_until_cached(&cache, &entry.uri).await;
         }
+        assert_cache_copies_are_links(storage.as_ref(), &cache, entries.iter().map(Arc::as_ref));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6525,80 +6533,34 @@ mod tests {
         }
     }
 
-    /// How long compaction's background warm of its output may take to land
-    /// in the disk cache before the test counts it as never warmed.
-    const WARM_LANDS_WITHIN: Duration = Duration::from_secs(30);
-    /// How often the test looks for that warm to have landed.
-    const WARM_POLL: Duration = Duration::from_millis(10);
-
     /// Same as the in-memory case, but for a disk-cache-attached table:
     /// the merged superfile is resident in the disk cache once
     /// compaction's own warm lands, with no cold fetch needed.
     #[tokio::test(flavor = "multi_thread")]
     async fn compact_warms_merged_superfile_into_disk_cache() {
-        use crate::supertable::reader_cache::{DiskCacheConfig, DiskCacheStore, LruPolicy};
-
         let dir = TempDir::new().expect("tempdir");
-        let storage: Arc<dyn StorageProvider> =
-            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
-        let cache = DiskCacheStore::new_unpinned(
-            Arc::clone(&storage),
-            DiskCacheConfig {
-                cache_root: dir.path().join("disk-cache"),
-                mmap_cold_threshold_secs: 0,
-                eviction: Box::new(LruPolicy::new()),
-                ..Default::default()
-            },
-        )
-        .expect("disk cache");
-        let st = Supertable::create(
-            default_supertable_options()
-                .with_storage(Arc::clone(&storage))
-                .with_disk_cache(Arc::clone(&cache)),
-        )
-        .expect("create supertable");
-
-        commit_titles(&st, &["alpha first", "alpha second"]);
-        commit_titles(&st, &["bravo first", "bravo second"]);
-        commit_titles(&st, &["charlie first", "charlie second"]);
-        commit_titles(&st, &["delta first", "delta second"]);
-        commit_titles(&st, &["echo first", "echo second"]);
-        commit_titles(&st, &["foxtrot first", "foxtrot second"]);
-        commit_titles(&st, &["golf first", "golf second"]);
-        commit_titles(&st, &["hotel first", "hotel second"]);
-        commit_titles(&st, &["india first", "india second"]);
-        commit_titles(&st, &["juliet first", "juliet second"]);
+        let (st, _storage, cache) = table_with_disk_cache(&dir);
+        commit_ten_small_files(&st);
 
         st.compact_async(&small_compact_cfg())
             .await
             .expect("compact");
 
-        // The warm is spawned after the commit and waits on a process-wide
-        // pair of permits (`finalize_compaction_commit`), so it can land
-        // after `compact_async` returns. Wait for it: queried at once, the
-        // test raced the warm, and with the lib tests in one process other
-        // tests' warms held the permits and the query won.
+        // Queried at once, the test raced the warm.
         let merged_uri = st.reader().expect("reader").manifest().superfiles[0].uri;
-        let deadline = Instant::now() + WARM_LANDS_WITHIN;
-        while !cache.is_cached(&merged_uri) {
-            assert!(
-                Instant::now() < deadline,
-                "compaction's warm of the merged superfile never landed in the disk cache"
-            );
-            time::sleep(WARM_POLL).await;
-        }
+        wait_until_cached(&cache, &merged_uri).await;
 
         let cold_fetches_after_compact = cache.stats().n_cold_fetches;
 
         // A query against the merged file must not trigger a cold
         // fetch -- it is resident from compaction's own warm-up.
         let n: usize = st
-            .token_match("title", "alpha", BoolMode::And, None)
+            .token_match("title", "first", BoolMode::And, None)
             .expect("token_match")
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        assert_eq!(n, 2);
+        assert_eq!(n, 10, "one 'first' title per small commit");
         assert_eq!(
             cache.stats().n_cold_fetches,
             cold_fetches_after_compact,
