@@ -154,12 +154,27 @@ const RESERVED_SEPARATOR: char = '\x1F';
 /// with it. Mirrors superfile's `check_user_column_name`.
 const RESERVED_PREFIX: &str = "inf.";
 
-/// Default writer-pool size: half the host's logical cores
-/// (rounded up, minimum 1). Read-mostly workloads keep reader p99
-/// stable under writer load; ETL-shaped overrides via
-/// [`SupertableOptions::with_writer_pool`].
+/// Logical cores the default writer pool leaves free on a host with more
+/// than this many, so queries that arrive during an ingest still have CPU
+/// to run on.
+const WRITER_POOL_CORES_LEFT_FOR_QUERIES: usize = 2;
+
+/// Default writer-pool size: every logical core on a host of up to
+/// [`WRITER_POOL_CORES_LEFT_FOR_QUERIES`] cores, otherwise all but that
+/// many. Ingest is the long-running CPU job on a host, so it takes the
+/// machine and leaves a fixed slice, not a fraction, for concurrent
+/// queries; ETL-shaped overrides via [`SupertableOptions::with_writer_pool`].
 fn default_writer_thread_count() -> usize {
-    num_cpus::get().div_ceil(2).max(1)
+    writer_threads_for(num_cpus::get().max(1))
+}
+
+/// The default writer-pool size on a host of `cores` logical cores.
+fn writer_threads_for(cores: usize) -> usize {
+    if cores <= WRITER_POOL_CORES_LEFT_FOR_QUERIES {
+        cores
+    } else {
+        cores - WRITER_POOL_CORES_LEFT_FOR_QUERIES
+    }
 }
 
 /// Default reader-pool size: every logical core. Reader fan-out
@@ -174,7 +189,8 @@ fn default_reader_thread_count() -> usize {
 /// not M×N.
 static SHARED_READER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
 
-/// Process-wide writer pool; same sharing contract at half the cores.
+/// Process-wide writer pool; same sharing contract at
+/// [`default_writer_thread_count`] threads.
 static SHARED_WRITER_POOL: OnceLock<Arc<ThreadPool>> = OnceLock::new();
 
 fn shared_reader_pool() -> Arc<ThreadPool> {
@@ -372,8 +388,9 @@ pub struct SupertableOptions {
     /// Pool used by reader fan-out (skip + per-superfile fan-out +
     /// top-k merge). Default: every logical core.
     pub reader_pool: Arc<ThreadPool>,
-    /// Pool used by writer commit-time rayon-shard. Default:
-    /// half the logical cores.
+    /// Pool used by writer commit-time rayon-shard. Default: every
+    /// logical core on a host of up to two, otherwise all but two (see
+    /// `default_writer_thread_count`).
     pub writer_pool: Arc<ThreadPool>,
     /// Where superfile bytes live. Shared across reader threads
     /// and the writer. Default: `InMemoryReaderCache`.
@@ -1325,9 +1342,10 @@ impl SupertableOptions {
     /// supertable knobs, and attaches configured persistent
     /// storage + disk cache.
     ///
-    /// `auto` thread counts resolve to `num_cpus` (reader) and
-    /// `max(1, num_cpus / 2)` (writer). Explicit integers are used
-    /// as-is (clamped to ≥ 1).
+    /// `auto` thread counts resolve to `num_cpus` (reader) and, for the
+    /// writer, `num_cpus` on a host of up to two cores and `num_cpus - 2`
+    /// otherwise (see [`default_writer_thread_count`]). Explicit integers
+    /// are used as-is (clamped to ≥ 1).
     ///
     /// The schema, FTS / vector configuration, tokenizer, and
     /// in-memory superfile store are preserved. If
@@ -2010,11 +2028,25 @@ supertable:
             .expect("apply_config");
 
         let reader_default = num_cpus::get().max(1);
-        let writer_default = num_cpus::get().div_ceil(2).max(1);
+        let writer_default = default_writer_thread_count();
         assert_eq!(opts.reader_pool.current_num_threads(), reader_default);
         assert_eq!(opts.writer_pool.current_num_threads(), writer_default);
         assert_eq!(opts.commit_threshold_size_mb, 1024);
         assert_eq!(opts.id_column, "_id");
+    }
+
+    /// The default writer pool takes every core on a small host and leaves
+    /// a fixed two on a bigger one: pinned at fixed points, so a change to
+    /// the constant or the comparison fails here on any host.
+    #[test]
+    fn default_writer_threads_leave_two_cores_above_two() {
+        for (cores, threads) in [(1, 1), (2, 2), (3, 1), (4, 2), (8, 6), (96, 94)] {
+            assert_eq!(writer_threads_for(cores), threads, "{cores} cores");
+        }
+        assert_eq!(
+            default_writer_thread_count(),
+            writer_threads_for(num_cpus::get().max(1))
+        );
     }
 
     #[test]

@@ -23,7 +23,9 @@
 #
 # Thread-count values:
 #   - `auto` — resolves at runtime to num_cpus for reader_threads
-#     and max(1, num_cpus / 2) for writer_threads. Hardware-portable
+#     and, for writer_threads, num_cpus on a host of up to 2 cores and
+#     num_cpus - 2 otherwise: ingest takes the machine and leaves two
+#     cores for queries that arrive while it runs. Hardware-portable
 #     default; the same shipped config works on a 4-core dev laptop
 #     and a 96-core production node.
 #   - a positive integer — explicit override. Use when you've
