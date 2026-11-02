@@ -2543,17 +2543,13 @@ impl SupertableWriter {
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
-                // One lane per pool thread, but no more than the rows can
-                // use: every lane is a builder with its own dictionary, and
-                // the freeze merges all of them, so a 5M-row append fed
-                // through 180 lanes on a wide host pays for 180 small
-                // dictionaries and a 180-way term merge for tokenisation it
-                // could do on a few dozen threads. Concurrent appends fill
-                // the pool between them.
-                let buffered_rows: usize = self.buffer.iter().map(|b| b.scalar.num_rows()).sum();
                 // One lane per pool thread, so a commit that grows to many
-                // batches tokenizes and freezes as wide as the pool; each
-                // batch is dealt to only as many of them as its rows warrant.
+                // batches tokenizes and freezes as wide as the pool. Every
+                // lane is a builder with its own dictionary that the freeze
+                // merges, so a batch is dealt to only as many lanes as its
+                // rows warrant (`feed`): a small commit's text lands in a few
+                // lanes and the rest freeze empty, while a commit of many
+                // batches fills them all as its batches come round.
                 let n_lanes = options
                     .writer_pool
                     .current_num_threads()
