@@ -618,11 +618,13 @@ async fn move_reserved(
         }
     };
     write_tiers_and_slices(storage, moved.tiers.clone(), moved.slices.clone()).await?;
+    let mut layer = moved.layer;
+    layer.ordinals = Some(base..base + n);
     Ok(Some(ReservedLayer {
         base,
         superfiles: reserved.superfiles.clone(),
         id_mins: reserved.id_mins.clone(),
-        layer: moved.layer,
+        layer,
         bytes: Arc::new(LayerBytes {
             slices: moved.slices,
             tiers: moved.tiers,
@@ -950,9 +952,29 @@ async fn fold_layers(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<Layer, TermIndexError> {
+    // A layer whose every ordinal the fold drops holds nothing the merged
+    // layer keeps, so it is neither fetched nor read: after a compaction the
+    // root's commit layers name only replaced superfiles, and they were
+    // most of what the fold moved.
+    let kept: Vec<Layer> = layers
+        .iter()
+        .filter(|layer| layer_keeps_postings(layer, ordinals))
+        .cloned()
+        .collect();
+    let merged_ordinals = merged_ordinals(&kept, ordinals);
+    if kept.is_empty() {
+        return Ok(Layer {
+            slices: Vec::new(),
+            ordinals: merged_ordinals,
+        });
+    }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-    let sources = download_layers(storage, layers, scratch.path())
-        .instrument(detail_span!("fold.download", layers = layers.len()))
+    let sources = download_layers(storage, &kept, scratch.path())
+        .instrument(detail_span!(
+            "fold.download",
+            layers = kept.len(),
+            dropped = layers.len() - kept.len()
+        ))
         .await?;
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
@@ -967,7 +989,38 @@ async fn fold_layers(
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
     write_tiers_and_slices(storage, merged.tiers, merged.slices).await?;
-    Ok(merged.layer)
+    let mut layer = merged.layer;
+    layer.ordinals = merged_ordinals;
+    Ok(layer)
+}
+
+/// Whether a fold renumbering through `ordinals` keeps any posting of
+/// `layer`: any ordinal of its range maps to one, or its range is unknown.
+fn layer_keeps_postings(layer: &Layer, ordinals: &[Option<u32>]) -> bool {
+    match &layer.ordinals {
+        None => true,
+        Some(range) => range
+            .clone()
+            .any(|ordinal| ordinals.get(ordinal as usize).is_some_and(Option::is_some)),
+    }
+}
+
+/// The ordinals a fold of `layers` through `ordinals` may name: the
+/// inputs' ranges renumbered, or unknown when an input's is.
+fn merged_ordinals(layers: &[Layer], ordinals: &[Option<u32>]) -> Option<Range<u32>> {
+    let mut range: Option<Range<u32>> = None;
+    for layer in layers {
+        for ordinal in layer.ordinals.clone()? {
+            let Some(Some(renumbered)) = ordinals.get(ordinal as usize) else {
+                continue;
+            };
+            range = Some(match range {
+                None => *renumbered..*renumbered + 1,
+                Some(r) => r.start.min(*renumbered)..r.end.max(*renumbered + 1),
+            });
+        }
+    }
+    Some(range.unwrap_or(0..0))
 }
 
 /// The run of layers [`fold_tail`] merges next: [`FOLD_FAN_OUT`]
@@ -3331,6 +3384,7 @@ mod tests {
             superfiles: entries.iter().map(|e| e.superfile_id).collect(),
             id_mins: entries.iter().map(|e| e.id_min).collect(),
             layers: vec![Layer {
+                ordinals: None,
                 slices: vec![format::SliceRef {
                     first_key: key.clone(),
                     last_key: key.clone(),
@@ -4578,7 +4632,13 @@ mod tests {
         );
 
         maintenance_only_optimize(&st);
-        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let (_, mut root) = live_and_covered(&st, &storage, &rt);
+        // The planted root is from before ordinal ranges and the rewrite
+        // keeps its layers as they are, so the ranges are not compared.
+        let mut sized = sized;
+        for layer in root.layers.iter_mut().chain(&mut sized.layers) {
+            layer.ordinals = None;
+        }
         assert_eq!(root, sized, "every length is filled in from storage");
     }
 
@@ -7430,6 +7490,7 @@ mod tests {
     /// A one-slice layer, told apart by `tag`.
     fn tagged_layer(tag: u8) -> Layer {
         Layer {
+            ordinals: None,
             slices: vec![format::SliceRef {
                 first_key: vec![tag],
                 last_key: vec![tag],
@@ -7443,6 +7504,7 @@ mod tests {
     /// A layer of one slice of `bytes`, for the fold-run tests.
     fn sized_layer(bytes: u64) -> Layer {
         Layer {
+            ordinals: None,
             slices: vec![format::SliceRef {
                 first_key: vec![0],
                 last_key: vec![0],
@@ -7451,6 +7513,35 @@ mod tests {
                 len: bytes,
             }],
         }
+    }
+
+    /// A layer whose every ordinal the fold drops is left unread; one with
+    /// a live ordinal, or no recorded range, is merged; the merged layer's
+    /// range is the inputs' through the renumbering.
+    #[test]
+    fn a_fold_skips_a_layer_whose_ordinals_it_all_drops() {
+        let layer = |ordinals: Option<Range<u32>>| Layer {
+            slices: Vec::new(),
+            ordinals,
+        };
+        // Ordinals 0..4 die; 4..6 survive as 0..2.
+        let renumbering = [None, None, None, None, Some(0), Some(1)];
+        assert!(!layer_keeps_postings(&layer(Some(0..4)), &renumbering));
+        assert!(layer_keeps_postings(&layer(Some(3..5)), &renumbering));
+        assert!(layer_keeps_postings(&layer(None), &renumbering));
+        assert_eq!(
+            merged_ordinals(&[layer(Some(3..5)), layer(Some(5..6))], &renumbering),
+            Some(0..2)
+        );
+        assert_eq!(
+            merged_ordinals(&[layer(Some(0..2))], &renumbering),
+            Some(0..0)
+        );
+        assert_eq!(
+            merged_ordinals(&[layer(None), layer(Some(4..6))], &renumbering),
+            None,
+            "an input of unknown range leaves the fold's unknown"
+        );
     }
 
     #[test]

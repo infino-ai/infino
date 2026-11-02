@@ -27,6 +27,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
+    ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
     time::Instant,
@@ -1498,6 +1499,7 @@ impl LayerWriter {
         Ok((
             Layer {
                 slices: self.slices,
+                ordinals: None,
             },
             self.slice_bytes,
             self.tier_bytes,
@@ -1582,9 +1584,10 @@ pub(crate) fn build_layer(
         ordinal_base,
     );
     let ranges = build_ranges(contributions, policy)?;
-    let built = run_ranges(&ranges, policy, |start, end| {
+    let mut built = run_ranges(&ranges, policy, |start, end| {
         build_range(contributions, start, end, policy, &scoring, ordinal_base)
     })?;
+    built.layer.ordinals = Some(ordinal_base..ordinal_base + contributions.len() as u32);
     Ok(BuiltLayer {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
         id_mins: contributions.iter().map(|c| c.id_min).collect(),
@@ -2025,7 +2028,7 @@ pub(crate) fn merge_layers(
 ) -> Result<MergedLayer, TermIndexError> {
     let ranges = key_ranges(sources, policy)?;
     // Each range merges the slices that reach into it, on its own writer.
-    run_ranges(&ranges, policy, |start, end| {
+    let mut merged = run_ranges(&ranges, policy, |start, end| {
         let in_range: Vec<Vec<SliceFile>> = sources
             .iter()
             .map(|files| {
@@ -2037,6 +2040,21 @@ pub(crate) fn merge_layers(
             })
             .collect();
         merge_range(&in_range, start, end, ordinals, policy)
+    })?;
+    merged.layer.ordinals = Some(ordinals_span(ordinals));
+    Ok(merged)
+}
+
+/// The ordinals a merge through `ordinals` may name: from the smallest it
+/// maps to past the largest, or empty when it keeps none. A fold that
+/// knows its inputs' ranges narrows this to what they name.
+fn ordinals_span(ordinals: &[Option<u32>]) -> Range<u32> {
+    let mut kept = ordinals.iter().flatten();
+    let Some(&first) = kept.next() else {
+        return 0..0;
+    };
+    kept.fold(first..first + 1, |span, &o| {
+        span.start.min(o)..span.end.max(o + 1)
     })
 }
 

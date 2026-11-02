@@ -177,7 +177,10 @@ pub(crate) fn rebase_layer(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut rebased = RebasedLayer {
-        layer: Layer::default(),
+        layer: Layer {
+            slices: Vec::new(),
+            ordinals: Some(shift.to..shift.to + shift.n),
+        },
         slices: Vec::with_capacity(moved.len()),
         tiers: Vec::new(),
     };

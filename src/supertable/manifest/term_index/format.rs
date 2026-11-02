@@ -73,6 +73,8 @@
 //! block dictionary returns "absent" for an entry it cannot decode, and an
 //! artifact read as "terms absent" would silently route to nothing.
 
+use std::ops::Range;
+
 use uuid::Uuid;
 
 use super::{
@@ -103,7 +105,9 @@ pub(crate) const SLICE_MAGIC: &[u8; 8] = b"INFTSLC1";
 /// ceilings until a fold rewrites them in the current layout; anything
 /// older does not, and the index is built again from the superfiles, not
 /// translated.
-pub(crate) const ROOT_FORMAT_VERSION: u32 = 5;
+pub(crate) const ROOT_FORMAT_VERSION: u32 = 6;
+/// The root version with slice lengths but no ordinal range per layer.
+pub(crate) const UNRANGED_ROOT_FORMAT_VERSION: u32 = 5;
 /// The root version that named tiers but not slice lengths.
 pub(crate) const UNSIZED_ROOT_FORMAT_VERSION: u32 = 4;
 /// The root version before tiers: slices named with their byte length and
@@ -309,6 +313,13 @@ pub(crate) struct SliceRef {
 pub(crate) struct Layer {
     /// Slices in ascending key order, non-overlapping.
     pub(crate) slices: Vec<SliceRef>,
+    /// The ordinals the layer's postings may name: a delta's reserved base
+    /// to its end, a fold's the union of its inputs' through the fold's
+    /// renumbering. `None` for a layer written before ranges were
+    /// recorded, which may name anything. A fold that drops every ordinal
+    /// of a layer's range — a compaction's inputs, say — drops the layer
+    /// without reading it.
+    pub(crate) ordinals: Option<Range<u32>>,
 }
 
 /// The resident root.
@@ -426,6 +437,7 @@ impl Root {
         }
         out.extend_from_slice(&(self.layers.len() as u32).to_le_bytes());
         for seg in &self.layers {
+            push_ordinal_range(&mut out, seg.ordinals.as_ref());
             out.extend_from_slice(&(seg.slices.len() as u32).to_le_bytes());
             for s in &seg.slices {
                 push_bytes_u32_len(&mut out, &s.first_key);
@@ -449,6 +461,7 @@ impl Root {
             ROOT_MAGIC,
             &[
                 ROOT_FORMAT_VERSION,
+                UNRANGED_ROOT_FORMAT_VERSION,
                 UNSIZED_ROOT_FORMAT_VERSION,
                 LEGACY_ROOT_FORMAT_VERSION,
             ],
@@ -466,6 +479,22 @@ impl Root {
         let n_layers = c.u32("root layer count")? as usize;
         let mut layers = Vec::with_capacity(n_layers);
         for _ in 0..n_layers {
+            let ordinals = match version == ROOT_FORMAT_VERSION {
+                true => match c.take(1, "layer ordinal range flag")?[0] {
+                    0 => None,
+                    _ => {
+                        let start = c.u32("layer ordinal range start")?;
+                        let end = c.u32("layer ordinal range end")?;
+                        if end < start {
+                            return Err(malformed(
+                                "root: a layer's ordinal range ends before it starts",
+                            ));
+                        }
+                        Some(start..end)
+                    }
+                },
+                false => None,
+            };
             let n_slices = c.u32("layer slice count")? as usize;
             let mut slices = Vec::with_capacity(n_slices);
             for _ in 0..n_slices {
@@ -495,7 +524,7 @@ impl Root {
                     len,
                 });
             }
-            layers.push(Layer { slices });
+            layers.push(Layer { slices, ordinals });
         }
         if c.at != bytes.len() {
             return Err(malformed("root: trailing bytes"));
@@ -784,29 +813,27 @@ fn decode_legacy_run(bytes: &[u8]) -> Result<Run, TermIndexError> {
 /// with its byte length (`lens`, parallel to the slices in order) and no
 /// tier object. What a table indexed by that layout holds.
 /// A root at [`UNSIZED_ROOT_FORMAT_VERSION`]: tiers named, no lengths.
-#[cfg(test)]
-pub(crate) fn encode_unsized_root(root: &Root) -> Vec<u8> {
-    let sized = root.encode();
-    let mut at = ROOT_HEADER_LEN + root.superfiles.len() * (UUID_LEN + I128_LEN) + U32_LEN;
-    let mut out = sized[..at].to_vec();
-    out[MAGIC_LEN..MAGIC_LEN + U32_LEN].copy_from_slice(&UNSIZED_ROOT_FORMAT_VERSION.to_le_bytes());
-    for seg in &root.layers {
-        out.extend_from_slice(&sized[at..at + U32_LEN]);
-        at += U32_LEN;
-        for s in &seg.slices {
-            let n = U32_LEN + s.first_key.len() + U32_LEN + s.last_key.len() + HASH_LEN + HASH_LEN;
-            out.extend_from_slice(&sized[at..at + n]);
-            at += n + 8;
+/// A layer's ordinal range as the root writes it: a flag byte, then the
+/// range's bounds when there is one.
+fn push_ordinal_range(out: &mut Vec<u8>, range: Option<&Range<u32>>) {
+    match range {
+        Some(range) => {
+            out.push(1);
+            out.extend_from_slice(&range.start.to_le_bytes());
+            out.extend_from_slice(&range.end.to_le_bytes());
         }
+        None => out.push(0),
     }
-    out
 }
 
+/// Encode `root` as a root of `version` wrote it, for tests of the older
+/// layouts: `lens` gives the slice lengths a legacy root wrote in place of
+/// tier hashes.
 #[cfg(test)]
-pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
+fn encode_root_as(root: &Root, version: u32, lens: &[u64]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(ROOT_MAGIC);
-    out.extend_from_slice(&LEGACY_ROOT_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&(root.superfiles.len() as u32).to_le_bytes());
     for (id, id_min) in root.superfiles.iter().zip(&root.id_mins) {
         out.extend_from_slice(id.as_bytes());
@@ -820,10 +847,33 @@ pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
             push_bytes_u32_len(&mut out, &s.first_key);
             push_bytes_u32_len(&mut out, &s.last_key);
             out.extend_from_slice(&s.content_hash.0);
-            out.extend_from_slice(&lens.next().copied().unwrap_or(0).to_le_bytes());
+            if version == LEGACY_ROOT_FORMAT_VERSION {
+                out.extend_from_slice(&lens.next().copied().unwrap_or(0).to_le_bytes());
+                continue;
+            }
+            let tier = s.tier.unwrap_or(ContentHash([0u8; HASH_LEN]));
+            out.extend_from_slice(&tier.0);
+            if version == UNRANGED_ROOT_FORMAT_VERSION {
+                out.extend_from_slice(&s.len.to_le_bytes());
+            }
         }
     }
     out
+}
+
+#[cfg(test)]
+pub(crate) fn encode_unranged_root(root: &Root) -> Vec<u8> {
+    encode_root_as(root, UNRANGED_ROOT_FORMAT_VERSION, &[])
+}
+
+#[cfg(test)]
+pub(crate) fn encode_unsized_root(root: &Root) -> Vec<u8> {
+    encode_root_as(root, UNSIZED_ROOT_FORMAT_VERSION, &[])
+}
+
+#[cfg(test)]
+pub(crate) fn encode_legacy_root(root: &Root, lens: &[u64]) -> Vec<u8> {
+    encode_root_as(root, LEGACY_ROOT_FORMAT_VERSION, lens)
 }
 
 /// Encode a slice as the layout before tiers wrote it: per term, a run of
@@ -1347,15 +1397,42 @@ mod tests {
     }
 
     #[test]
+    fn a_root_records_each_layers_ordinal_range_and_an_unranged_root_reads_none() {
+        let root = Root {
+            superfiles: vec![Uuid::from_u128(1), Uuid::from_u128(2)],
+            id_mins: vec![7, 9],
+            layers: vec![
+                Layer {
+                    ordinals: Some(0..1),
+                    slices: vec![slice_ref("a", "b", 1)],
+                },
+                Layer {
+                    ordinals: None,
+                    slices: vec![slice_ref("c", "d", 3)],
+                },
+            ],
+        };
+        assert_eq!(Root::decode(&root.encode()).expect("decodes"), root);
+        let unranged = Root::decode(&encode_unranged_root(&root)).expect("decodes");
+        assert!(
+            unranged.layers.iter().all(|layer| layer.ordinals.is_none()),
+            "a root from before ranges reads with none"
+        );
+        assert_eq!(unranged.layers[0].slices, root.layers[0].slices);
+    }
+
+    #[test]
     fn a_root_records_each_slice_length_and_an_unsized_root_reads_as_zero() {
         let root = Root {
             superfiles: vec![Uuid::from_u128(1)],
             id_mins: vec![7],
             layers: vec![
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("a", "b", 1), slice_ref("c", "d", 2)],
                 },
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1386,9 +1463,11 @@ mod tests {
             id_mins: vec![10, -20],
             layers: vec![
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
                 },
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1454,6 +1533,7 @@ mod tests {
             superfiles: vec![],
             id_mins: vec![],
             layers: vec![Layer {
+                ordinals: None,
                 slices: vec![
                     slice_ref("a", "m", 1),
                     hi(&[0xFF, 0x01], &[0xFF, 0x05], 2),
@@ -1479,9 +1559,11 @@ mod tests {
             id_mins: vec![],
             layers: vec![
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("a", "m", 1), slice_ref("n", "z", 2)],
                 },
                 Layer {
+                    ordinals: None,
                     slices: vec![slice_ref("c", "d", 3)],
                 },
             ],
@@ -1512,6 +1594,7 @@ mod tests {
             superfiles: vec![],
             id_mins: vec![],
             layers: vec![Layer {
+                ordinals: None,
                 slices: vec![
                     slice_ref("aa", "ab", 1),
                     slice_ref("ac", "b", 2),
@@ -1630,9 +1713,11 @@ mod tests {
             id_mins: vec![10, -20],
             layers: vec![
                 Layer {
+                    ordinals: None,
                     slices: vec![untiered("a", "b", 1), untiered("c", "d", 2)],
                 },
                 Layer {
+                    ordinals: None,
                     slices: vec![untiered("c", "d", 3)],
                 },
             ],
