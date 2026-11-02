@@ -1971,7 +1971,9 @@ impl TableProvider for SupertableProvider {
             // `rows_end`); any other is handed whole.
             let path = seg.prepared.path.to_string();
             let mut file = match seg.prepared.rows_end {
-                Some(end) => PartitionedFile::new_with_range(path, seg.prepared.size, 0, end as i64),
+                Some(end) => {
+                    PartitionedFile::new_with_range(path, seg.prepared.size, 0, end as i64)
+                }
                 None => PartitionedFile::new(path, seg.prepared.size),
             };
             if let Some(plan) = access_plan {
