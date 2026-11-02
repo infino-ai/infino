@@ -453,6 +453,13 @@ impl DiskCacheStore {
         self.config.cache_root.join("scratch")
     }
 
+    /// Whether this cache's checksum policy verifies a superfile a merge
+    /// maps where it lies: the answer [`store_files::adoption_verifies`]
+    /// gives a `Load` the cache adopts.
+    pub(crate) fn verifies_on_load(&self) -> bool {
+        store_files::adoption_verifies(&self.config, ReadIntent::Load)
+    }
+
     /// Construct a new disk cache rooted at `config.cache_root`
     /// (created if absent) backed by `storage`. `pinned_fn`
     /// returns the currently-pinned URI set on each eviction

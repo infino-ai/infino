@@ -31,21 +31,30 @@ impl AsRef<[u8]> for ArcMmapOwner {
 
 fn open_readonly_mmap(path: &Path) -> io::Result<Mmap> {
     let file = fs::File::open(path)?;
-    // SAFETY: the cache file is created + filled + fsync'd
-    // before this mmap call. The file is owned by us; no
-    // other process modifies it. Once mmap'd we never write
-    // to it (eviction unlinks + drops the Arc<Mmap>, which
-    // unmaps cleanly under POSIX even if the file's already
-    // unlinked).
+    // SAFETY: a mapping is only unsound if the file's bytes change or the
+    // file shrinks under it, and every file mapped here is complete and
+    // immutable once mapped. A cache file or a merge's temp output is
+    // created, filled and fsync'd by this process before the map, and never
+    // written again. A superfile or hidden-index file in a table's local
+    // storage directory is written by the storage provider to a staged file
+    // and renamed into place, so a reader only ever sees a finished file; a
+    // later write to the same path is another rename, which leaves the
+    // mapped inode as it was, and removal is an unlink. Unlinking or
+    // renaming over a mapped file is safe under POSIX: the inode stays until
+    // the last mapping drops, so eviction, publish and garbage collection
+    // can all proceed while a reader holds the map. Nothing truncates or
+    // writes a file in place.
     unsafe { Mmap::map(&file) }
 }
 
-/// Open a completed local superfile as zero-copy mmap-backed [`Bytes`].
+/// Open a completed local file as zero-copy mmap-backed [`Bytes`].
 ///
-/// Drain assembles very large packed shards in temporary files and maps the
-/// finished file through this helper before handing it to the ordinary
-/// `prepare_superfile`/publish path. Keeping the unsafe mmap construction in
-/// this module preserves the repository's documented mmap safety boundary.
+/// For a finished file outside the cache: a superfile or hidden-index file in
+/// a table's local storage directory, which compaction and the vector index
+/// read where it lies rather than copying it into the cache first. Keeping
+/// the unsafe mmap construction in this module preserves the repository's
+/// documented mmap safety boundary; see [`open_readonly_mmap`] for why a file
+/// there may be mapped.
 pub(crate) fn mmap_readonly_bytes(path: &Path) -> io::Result<Bytes> {
     Ok(mmap_readonly_with_handle(path)?.1)
 }

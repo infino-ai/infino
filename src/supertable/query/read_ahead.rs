@@ -135,8 +135,9 @@ const READ_AHEAD_SCAN_MAX_BYTES: usize = 256 << 20;
 const MIN_CHUNK_READ_PERCENT: u64 = 75;
 
 /// Read-ahead uses at most this share of the connection's memory budget, and
-/// leaves the rest to joins, sorts and appends, which can't do without it.
-const BUDGET_SHARE_PERCENT: usize = 50;
+/// leaves the rest to joins, sorts and appends, which can't do without it. A
+/// take's prefetch is held to the same share.
+pub(crate) const BUDGET_SHARE_PERCENT: usize = 50;
 
 /// Widest run of skipped pages inside one column chunk that the scan reads
 /// through to fetch the cold kept pages on either side in one GET. The store
@@ -321,23 +322,15 @@ impl ScanReadAhead {
             let scan: Weak<ScanReadAhead> = Arc::downgrade(self);
             self.budget.register_reclaim(scan);
         });
-        let over_share = |extra: usize| {
-            self.budget.limit().is_some_and(|limit| {
-                self.budget.used().saturating_add(extra).saturating_mul(100)
-                    > limit.saturating_mul(BUDGET_SHARE_PERCENT)
-            })
-        };
-        if over_share(bytes) {
-            return None;
-        }
         let held = Hold {
             scan: Arc::clone(self),
             bytes,
-            _reservation: self.budget.try_reserve_without_reclaim(bytes).ok()?,
+            _reservation: self
+                .budget
+                .try_reserve_within_share(bytes, BUDGET_SHARE_PERCENT)?,
         };
         self.held.fetch_add(bytes, Ordering::Relaxed);
-        let over_scan_cap = self.held.load(Ordering::Relaxed) > READ_AHEAD_SCAN_MAX_BYTES;
-        (!over_scan_cap && !over_share(0)).then_some(held)
+        (self.held.load(Ordering::Relaxed) <= READ_AHEAD_SCAN_MAX_BYTES).then_some(held)
     }
 
     /// Track a reader's batch so [`Reclaim::reclaim`] can give it back, or give

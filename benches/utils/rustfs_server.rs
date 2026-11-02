@@ -1112,7 +1112,7 @@ fn download_rustfs_binary(dest: &Path) -> Result<(), String> {
     let mut extracted = false;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-        let name = file.name().to_string();
+        let name = file.name().map_err(|e| e.to_string())?.into_owned();
         if name.ends_with("rustfs") || name.ends_with("rustfs.exe") {
             let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             std::io::copy(&mut file, &mut out).map_err(|e| e.to_string())?;

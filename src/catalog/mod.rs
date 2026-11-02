@@ -116,7 +116,7 @@ static CANCELLABLE_OPENS: Semaphore = Semaphore::const_new(MAX_CANCELLABLE_OPENS
 use crate::utils::trace::OpOrigin;
 use crate::{
     InfinoError,
-    config::DEFAULT_CONNECTION_BUDGET_BYTES,
+    config::{self, Config, DEFAULT_CONNECTION_BUDGET_BYTES},
     error::{datafusion_error, datafusion_planning_error},
     memory::ConnectionMemoryBudget,
     runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, carry_span, shared_io_runtime},
@@ -488,6 +488,7 @@ impl Connection {
                     vec_cfg,
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
+                    config::global(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
                 let handle = SupertableHandle::create(opts)
@@ -584,6 +585,7 @@ impl Connection {
                     vec_cfg,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
+                    config::global(),
                 )
                 .map_err(|e| e.with_context("create_table", Some(name)))?;
                 if let Some((cache, manifest_cache)) = disk_cache {
@@ -766,6 +768,7 @@ impl Connection {
                     vec_cfg,
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
+                    config::global(),
                 )
                 .map_err(|e| e.with_context("open_table", Some(name)))?;
                 if let Some((cache, manifest_cache)) = disk_cache {
@@ -1732,14 +1735,24 @@ pub(crate) fn ensure_expr_within_connective_cap(predicate: &Expr) -> Result<(), 
 
 /// Build `SupertableOptions` from a schema + lowered configs, attaching
 /// `storage` when present (absent → in-memory table).
+///
+/// `cfg` is the layered configuration (embedded defaults, `/etc/infino`,
+/// the user config, `./infino.yaml`): its table settings (thread pools,
+/// commit threshold, superfile split, CRC policy, id column, vector drain)
+/// are applied here so a table reached through the catalog honours them
+/// like one built from `SupertableOptions` directly. The config's
+/// `storage` section is not: the connection chose this table's backend,
+/// and a `memory://` table must stay storage-less whatever the host's
+/// config says. The connection budget is set last so no step resets it.
 fn build_options(
     schema: SchemaRef,
     fts: Vec<FtsConfig>,
     vectors: Vec<VectorConfig>,
     storage: Option<Arc<dyn StorageProvider>>,
     connection_memory_budget: Arc<ConnectionMemoryBudget>,
+    cfg: &Config,
 ) -> Result<SupertableOptions, InfinoError> {
-    let mut opts = SupertableOptions::new(schema, fts, vectors)?;
+    let mut opts = SupertableOptions::new(schema, fts, vectors)?.apply_table_config(cfg)?;
     if let Some(s) = storage {
         opts = opts.with_storage(s);
     }
@@ -2105,6 +2118,10 @@ mod tests {
         error::DataFusionError,
         logical_expr::LogicalPlan,
         prelude::{SessionContext, col, lit},
+    };
+    use figment::{
+        Figment,
+        providers::{Format, Yaml},
     };
     use proptest::prelude::*;
     use serde_json::{Map, Value, json};
@@ -7252,5 +7269,61 @@ mod tests {
             "a cache that holds the table downloads every file the scan opened: \
              {downloaded} bytes read of a {table_bytes}-byte table"
         );
+    }
+
+    #[test]
+    fn catalog_tables_apply_the_supertable_config() {
+        // The `supertable` section of the layered config (`./infino.yaml` and
+        // friends) reaches a table built through the catalog: without this the
+        // documented keys were silently ignored on that path.
+        let yaml = r#"
+supertable:
+  superfile_buffer_split_mb: 1024
+  commit_threshold_size_mb: 7
+"#;
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let budget = ConnectionMemoryBudget::from_budget_bytes(0);
+        let opts = build_options(schema, vec![], vec![], None, budget, &cfg).expect("options");
+        assert_eq!(opts.superfile_buffer_split_mb, 1024);
+        assert_eq!(opts.commit_threshold_size_mb, 7);
+        // The embedded defaults leave them at the shipped values.
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let budget = ConnectionMemoryBudget::from_budget_bytes(0);
+        let default_cfg = Config::from_figment(Figment::new()).expect("defaults");
+        let opts =
+            build_options(schema, vec![], vec![], None, budget, &default_cfg).expect("options");
+        assert_eq!(opts.superfile_buffer_split_mb, 64);
+    }
+
+    #[test]
+    fn catalog_tables_do_not_take_storage_from_the_config() {
+        // A host config can name a storage backend; the connection, not the
+        // config, decides a catalog table's storage. A `memory://` table must
+        // come out storage-less and cache-less, with the table knobs applied.
+        let yaml = r#"
+supertable:
+  superfile_buffer_split_mb: 512
+storage:
+  backend: local_fs
+  local_root: /nonexistent/infino-config-root
+  disk_cache_root: /nonexistent/infino-config-cache
+"#;
+        let cfg =
+            Config::from_figment(Figment::new().merge(Yaml::string(yaml))).expect("parse config");
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let budget = ConnectionMemoryBudget::from_budget_bytes(0);
+        let opts = build_options(schema, vec![], vec![], None, budget, &cfg).expect("options");
+        assert!(
+            opts.storage.is_none(),
+            "memory table took the config's storage"
+        );
+        assert!(
+            opts.disk_cache.is_none(),
+            "memory table took the config's disk cache"
+        );
+        assert!(opts.manifest_disk_cache.is_none());
+        assert_eq!(opts.superfile_buffer_split_mb, 512);
     }
 }
