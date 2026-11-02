@@ -172,8 +172,9 @@ impl Bisect<'_> {
             && gain / (len.max(1) as f64) < f64::from(self.params.convergence) * reference
     }
 
-    /// Offer `gain` over `len` documents as the reference for the whole run;
-    /// the first offer that lowered the cost sets it.
+    /// Offer `gain`, what a first round over `len` documents lowered the
+    /// cost by, as the reference for the whole run; the first offer that
+    /// lowered the cost sets it.
     ///
     /// Offers come only from where the order of events is fixed: the root,
     /// which runs alone, and each level the top of the bisection completes
@@ -606,18 +607,18 @@ fn split_levels(fwd: &ForwardIndex, order: &mut [u32], pool: &StatePool, run: Bi
             .map(|part| {
                 let mid = part.len() / 2;
                 let parallel = part.len() >= PARALLEL_MIN_PARTITION;
-                let realised = pool.with_state(|state| {
-                    let realised = state.refine(fwd, part, mid, depth, parallel, run);
+                let first_round = pool.with_state(|state| {
+                    let first_round = state.refine(fwd, part, mid, depth, parallel, run);
                     state.flush(run.report);
-                    realised
+                    first_round
                 });
                 let (left, right) = part.split_at_mut(mid);
-                (realised, [left, right])
+                (first_round, [left, right])
             })
             .collect();
-        // The level's splits ran side by side, but their gains are summed
-        // here in partition order, so the bar they offer is the same on
-        // every run.
+        // The level's splits ran side by side, but their first rounds' gains
+        // are summed here in partition order, so the bar they offer is the
+        // same on every run.
         run.offer_reference(split.iter().map(|(gain, _)| gain).sum(), docs);
         level = split.into_iter().flat_map(|(_, halves)| halves).collect();
         depth += 1;
@@ -693,13 +694,13 @@ fn split_parallel(
     // the subtrees are already running side by side, and a round waiting on its
     // own parallel pieces would steal a whole queued subtree and finish it
     // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
-    let realised = pool.with_state(|state| {
-        let realised = state.refine(fwd, order, mid, depth, depth == 0, run);
+    let first_round = pool.with_state(|state| {
+        let first_round = state.refine(fwd, order, mid, depth, depth == 0, run);
         state.flush(run.report);
-        realised
+        first_round
     });
     if depth == 0 {
-        run.offer_reference(realised, order.len());
+        run.offer_reference(first_round, order.len());
     }
     let (left, right) = order.split_at_mut(mid);
     let (left_done, right_done) = join(
@@ -924,9 +925,9 @@ impl BisectState {
     /// twice to reach the answer it already has.
     fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
-        let realised = self.refine(fwd, order, mid, depth, false, run);
+        let first_round = self.refine(fwd, order, mid, depth, false, run);
         if depth == 0 {
-            run.offer_reference(realised, order.len());
+            run.offer_reference(first_round, order.len());
         }
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1, run);
@@ -989,9 +990,10 @@ impl BisectState {
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
         let mut cost_before = self.partition_cost(n_left, n_right);
-        // What the split's rounds lowered the cost by, all told: its offer
-        // towards the run's bar.
-        let mut realised = 0.0f64;
+        // What the split's first round lowered the cost by: its offer
+        // towards the run's bar, which measures every later round against
+        // what a first round over fresh halves is worth per document.
+        let mut first_round_gain = 0.0f64;
 
         // Taken out of `self` so the ranking can borrow the move-gain
         // tables while writing them, and put back before returning so the
@@ -1129,7 +1131,9 @@ impl BisectState {
             let cost_after = self.partition_cost(n_left, n_right);
             let round_gain = cost_before - cost_after;
             cost_before = cost_after;
-            realised += round_gain;
+            if round == 0 {
+                first_round_gain = round_gain;
+            }
             if REPORT {
                 level.record_actual(round_gain);
             }
@@ -1148,7 +1152,7 @@ impl BisectState {
         self.clear_degrees();
 
         let Some(started) = started else {
-            return realised;
+            return first_round_gain;
         };
         match end {
             SplitEnd::Settled => level.settled = 1,
@@ -1167,7 +1171,7 @@ impl BisectState {
         span.record("swap_ms", level.swap_ns / 1_000_000);
         span.record("serial_cpu_ms", level.serial_cpu_ns / 1_000_000);
         self.note(depth, &level);
-        realised
+        first_round_gain
     }
 
     /// The cost of the current split, from its degree tables.
@@ -2026,7 +2030,8 @@ mod tests {
     /// A corpus that repeats its documents: the root swaps copies of one
     /// document for copies of another, round after round, and lowers the
     /// cost by nothing, so the bar comes from the first level under it that
-    /// does, and the splits below end on it instead of at the ceiling.
+    /// does with its first rounds, and the splits below end on it instead
+    /// of at the ceiling.
     #[test]
     fn the_bar_comes_from_the_first_level_that_lowers_the_cost() {
         /// Wide enough for the top of the bisection to run level by level.
