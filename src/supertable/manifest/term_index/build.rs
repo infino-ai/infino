@@ -270,6 +270,9 @@ struct TierSource {
     /// Offset of the window in the tier object.
     base: u64,
     chunks: Vec<TierChunkRef>,
+    /// What the ordinals in the chunks are relative to: the source
+    /// layer's base.
+    ordinal_base: u32,
 }
 
 /// A term's tier, cut to the budget and encoded, before it is placed: in
@@ -313,6 +316,7 @@ fn encode_term(
             &source.chunks,
             &source.bytes,
             source.base,
+            source.ordinal_base,
             ordinals,
             &mut term.entries,
         )?;
@@ -465,11 +469,12 @@ fn splice_term(
         Fresh(Vec<TierEntry>),
     }
     let mut groups: BTreeMap<u32, Group<'_>> = BTreeMap::new();
-    for chunks in &opened {
+    for (chunks, source) in opened.iter().zip(&term.sources) {
+        let source_base = source.ordinal_base;
         for (r, chunk) in chunks.iter().enumerate() {
             for b in 0..chunk.n_blocks() {
                 let block = chunk.spliced_block(b);
-                let Some(ordinal) = renumber(ordinals, block.ordinal) else {
+                let Some(ordinal) = renumber(ordinals, source_base + block.ordinal) else {
                     continue;
                 };
                 match groups.entry(ordinal) {
@@ -1500,6 +1505,7 @@ impl LayerWriter {
             Layer {
                 slices: self.slices,
                 ordinals: None,
+                base: 0,
             },
             self.slice_bytes,
             self.tier_bytes,
@@ -1559,7 +1565,10 @@ pub(crate) fn build_onto(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
-    let built = build_layer(contributions, policy, base.superfiles.len() as u32)?;
+    let mut built = build_layer(contributions, policy)?;
+    built
+        .layer
+        .place_at(base.superfiles.len() as u32, contributions.len() as u32);
     base.superfiles.extend(built.superfiles);
     base.id_mins.extend(built.id_mins);
     base.layers.push(built.layer);
@@ -1571,23 +1580,22 @@ pub(crate) fn build_onto(
 }
 
 /// Merge contributions into one layer of slices. Superfile ordinals
-/// follow the order of `contributions`, offset by `ordinal_base` — the
-/// number of superfiles the root already names when this layer is a
-/// delta appended to it.
+/// follow the order of `contributions` from zero: the layer stores them
+/// relative to a base it is given when the root places it
+/// ([`Layer::place_at`]), so it is built before that base is known.
 pub(crate) fn build_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
-    ordinal_base: u32,
 ) -> Result<BuiltLayer, TermIndexError> {
     let scoring = scoring_lookup(
         Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
-        ordinal_base,
+        0,
     );
     let ranges = build_ranges(contributions, policy)?;
     let mut built = run_ranges(&ranges, policy, |start, end| {
-        build_range(contributions, start, end, policy, &scoring, ordinal_base)
+        build_range(contributions, start, end, policy, &scoring)
     })?;
-    built.layer.ordinals = Some(ordinal_base..ordinal_base + contributions.len() as u32);
+    built.layer.ordinals = Some(0..contributions.len() as u32);
     Ok(BuiltLayer {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
         id_mins: contributions.iter().map(|c| c.id_min).collect(),
@@ -1644,7 +1652,6 @@ fn build_range(
     end: Option<&[u8]>,
     policy: &BuildPolicy,
     scoring: &ScoringOf,
-    ordinal_base: u32,
 ) -> Result<MergedLayer, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1698,7 +1705,7 @@ fn build_range(
             let (mut p, h) = pending[ordinal as usize]
                 .take()
                 .expect("pending posting for heap head");
-            p.superfile = ordinal_base + ordinal;
+            p.superfile = ordinal;
             entries.extend(h.iter().map(|&(doc_id, tf, len)| TierEntry {
                 superfile: p.superfile,
                 doc_id,
@@ -1776,6 +1783,9 @@ pub(crate) struct SliceFile {
     pub(crate) first_key: Vec<u8>,
     /// Largest key the slice holds.
     pub(crate) last_key: Vec<u8>,
+    /// What the ordinals stored in the slice are relative to: its layer's
+    /// base.
+    pub(crate) base: u32,
 }
 
 /// `path`'s bytes, mapped read-only; empty for an empty file, which cannot
@@ -1794,6 +1804,8 @@ fn map_file(path: &Path) -> io::Result<Bytes> {
 /// Reads one layer's slices, already on local disk, term by term in key
 /// order.
 struct LayerCursor {
+    /// What the ordinals in the files are relative to: their layer's base.
+    base: u32,
     /// Slice files not opened yet, in key order.
     files: VecDeque<PathBuf>,
     /// The open slice's bytes, mapped rather than read, so the many cursors
@@ -1840,6 +1852,7 @@ impl LayerCursor {
         window_bytes: u64,
     ) -> Self {
         Self {
+            base: files.first().map_or(0, |f| f.base),
             files: files.iter().map(|f| f.path.clone()).collect(),
             bytes: Bytes::new(),
             tier: None,
@@ -1873,7 +1886,9 @@ impl LayerCursor {
                     self.bytes = Bytes::new();
                     return Ok(None);
                 }
-                return Ok(Some(term));
+                let (key, mut run) = term;
+                rebase_run(&mut run, self.base);
+                return Ok(Some((key, run)));
             }
             let started = Instant::now();
             if !self.bytes.is_empty() {
@@ -1963,6 +1978,22 @@ fn renumber(ordinals: &[Option<u32>], old: u32) -> Option<u32> {
     *ordinals.get(old as usize)?
 }
 
+/// Turn the ordinals a run stores — its postings' and its inline tier
+/// entries' — into the absolute ones they name, by its layer's `base`.
+pub(crate) fn rebase_run(run: &mut Run, base: u32) {
+    if base == 0 {
+        return;
+    }
+    for p in &mut run.postings {
+        p.superfile += base;
+    }
+    if let Some(tier) = &mut run.tier {
+        for e in &mut tier.inline {
+            e.superfile += base;
+        }
+    }
+}
+
 /// The per-ordinal scoring of a build's contributions, ordinals counted
 /// from `base`; a superfile with none scores at the defaults.
 fn scoring_lookup(table: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>, base: u32) -> ScoringOf {
@@ -1981,6 +2012,7 @@ fn tier_entries(
     chunks: &[TierChunkRef],
     object: &[u8],
     base: u64,
+    ordinal_base: u32,
     ordinals: &[Option<u32>],
     out: &mut Vec<TierEntry>,
 ) -> Result<(), TermIndexError> {
@@ -1999,7 +2031,7 @@ fn tier_entries(
         TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
         out.extend(block.iter().filter_map(|e| {
             Some(TierEntry {
-                superfile: renumber(ordinals, e.superfile)?,
+                superfile: renumber(ordinals, ordinal_base + e.superfile)?,
                 ..*e
             })
         }));
@@ -2327,12 +2359,14 @@ fn merge_range(
                         })
                     }));
                 } else {
-                    let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
+                    let cursor = &mut cursors[source as usize];
+                    let (bytes, base) = cursor.tier_span(&tier.chunks)?;
                     tier_bytes += tier.chunks.iter().map(|c| c.len).sum::<u64>();
                     sources.push(TierSource {
                         bytes,
                         base,
                         chunks: tier.chunks,
+                        ordinal_base: cursor.base,
                     });
                 }
             }

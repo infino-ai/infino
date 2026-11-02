@@ -1449,11 +1449,14 @@ impl WriterSlot {
     }
 }
 
-/// Orders the publishes of shared append writers. Each takes a ticket and a
-/// term-index base once its superfiles are uploaded, then publishes in ticket
-/// order, so its base is the root's length on its turn and its prebuilt
-/// layer is appended as is. A base the root no longer matches (another
-/// writer or an optimize moved it) costs a rebuild at the root's length.
+/// Groups the publishes of shared append writers. One publish runs at a
+/// time: a ticket whose publish is ready while none runs leads, taking
+/// every other ready publish parked on the queue into its own manifest
+/// write and root write; one that finds a publish running parks and waits
+/// for its result, or leads itself when the running one ends and it is the
+/// oldest parked. A term-index layer stores its ordinals relative to a base
+/// the root gives it when it is placed, so publishes need no order among
+/// themselves and nothing is rebuilt.
 #[derive(Default)]
 pub(super) struct AppendQueue {
     state: Mutex<AppendQueueState>,
@@ -1463,32 +1466,22 @@ pub(super) struct AppendQueue {
 #[derive(Default)]
 struct AppendQueueState {
     issued: u64,
-    serving: u64,
-    /// The root the queue last published, and its length.
-    published_root: Option<RoutingRef>,
-    published_end: u32,
-    /// Superfiles reserved by tickets not yet served.
-    pending: u32,
-    /// Publishes ready for their turn, by ticket, for the ticket holding
-    /// the turn to take with its own.
+    /// Whether a ticket is publishing now.
+    publishing: bool,
+    /// Publishes ready and waiting, by ticket, for the publishing ticket
+    /// to take with its own.
     parked: BTreeMap<u64, ParkedPublish>,
     /// What a leading ticket published for the tickets it took on, by
     /// ticket, until each collects it.
     results: BTreeMap<u64, Result<(), String>>,
-    /// Prebuilt layers the commit had to rebuild on their turn.
-    #[cfg(test)]
-    rebuilt: usize,
 }
 
-/// A publish ready for its turn, parked on the [`AppendQueue`].
+/// A publish ready to go, parked on the [`AppendQueue`].
 struct ParkedPublish {
     number: u64,
-    superfiles: u32,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
     segment: ReservedSegment,
-    /// Where the prebuilt layer ends, when one was built at a known base.
-    prebuilt_end: Option<u32>,
 }
 
 /// What a ticket does once its publish is ready.
@@ -1505,148 +1498,107 @@ impl AppendQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A ticket and the base for a layer of `superfiles`, or no base when
-    /// `root` is not the root the queue last published: its length is then
-    /// unknown, so the layer is built on the ticket's turn instead.
-    fn reserve(
-        &self,
-        root: Option<&RoutingRef>,
-        superfiles: u32,
-    ) -> (AppendTicket<'_>, Option<u32>) {
+    /// A ticket for a publish.
+    fn reserve(&self) -> AppendTicket<'_> {
         let mut state = self.lock();
-        let base = (state.published_root.as_ref() == root)
-            .then_some(state.published_end.saturating_add(state.pending));
-        state.pending += superfiles;
         let ticket = AppendTicket {
             queue: self,
             number: state.issued,
-            superfiles,
-            published: None,
-            led: 0,
+            leading: false,
             grouped: false,
         };
         state.issued += 1;
-        (ticket, base)
+        ticket
     }
 
-    /// Lead or follow with `parked`, `ticket`'s publish. The ticket whose
-    /// turn it is publishes every ready ticket queued consecutively behind
-    /// it with its own, in one manifest write and one root write: the turn
-    /// is object-store latency, paid once per commit however many were
-    /// waiting, and at thirty appends in flight it set the table's commit
-    /// rate. A ticket that is not next parks its publish and waits for
-    /// either its result or its turn; the run stops at the first ticket
-    /// whose list metadata cannot share a publish with the leader's.
-    fn lead_or_follow(&self, ticket: &AppendTicket<'_>, parked: ParkedPublish) -> Turn {
+    /// Lead or follow with `parked`, `ticket`'s publish. A ticket that
+    /// finds no publish running leads, taking every parked publish whose
+    /// list metadata can share its own; one that finds a publish running
+    /// parks and waits for its result or, once the running publish ends
+    /// and it is the oldest parked, leads itself. The publish is
+    /// object-store latency paid once however many were waiting, and at
+    /// thirty appends in flight it set the table's commit rate.
+    fn lead_or_follow(&self, ticket: &mut AppendTicket<'_>, parked: ParkedPublish) -> Turn {
         let mut state = self.lock();
-        if state.serving != ticket.number {
-            state.parked.insert(ticket.number, parked);
-            loop {
-                state = self
-                    .turn
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
-                if let Some(result) = state.results.remove(&ticket.number) {
-                    return Turn::Published(result.map_err(BuildError::Store));
-                }
-                if state.serving == ticket.number {
-                    break;
-                }
-            }
-            let mine = state
-                .parked
-                .remove(&ticket.number)
-                .expect("parked by this ticket; a leader that took it left a result");
-            return Turn::Lead(run_behind(&mut state, mine));
+        if !state.publishing {
+            state.publishing = true;
+            ticket.leading = true;
+            return Turn::Lead(take_run(&mut state, parked));
         }
-        Turn::Lead(run_behind(&mut state, parked))
+        state.parked.insert(ticket.number, parked);
+        loop {
+            state = self
+                .turn
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(result) = state.results.remove(&ticket.number) {
+                ticket.grouped = true;
+                return Turn::Published(result.map_err(BuildError::Store));
+            }
+            if !state.publishing && state.parked.keys().next() == Some(&ticket.number) {
+                state.publishing = true;
+                ticket.leading = true;
+                let mine = state
+                    .parked
+                    .remove(&ticket.number)
+                    .expect("parked by this ticket; a leader that took it left a result");
+                return Turn::Lead(take_run(&mut state, mine));
+            }
+        }
     }
 
-    /// Record what the leading `ticket` published for the `followers` it
-    /// took on — each's ticket number and reserved superfiles — and pass
-    /// their turns on with its own.
-    fn publish_followers(
-        &self,
-        ticket: &mut AppendTicket<'_>,
-        followers: Vec<(u64, u32)>,
-        result: Result<(), String>,
-    ) {
+    /// Record what the leading ticket published for the `followers` it
+    /// took on, by ticket number, and wake them.
+    fn publish_followers(&self, followers: Vec<u64>, result: Result<(), String>) {
         if followers.is_empty() {
             return;
         }
         let mut state = self.lock();
-        for (number, superfiles) in &followers {
-            state.pending -= superfiles;
-            state.results.insert(*number, result.clone());
+        for number in followers {
+            state.results.insert(number, result.clone());
         }
-        ticket.led += followers.len() as u64;
         drop(state);
         self.turn.notify_all();
     }
 }
 
-/// `mine` and the parked publishes queued consecutively behind it that
-/// its list metadata can share a publish with, taken off the queue.
-fn run_behind(state: &mut AppendQueueState, mine: ParkedPublish) -> Vec<ParkedPublish> {
+/// `mine` and every parked publish its list metadata can share a publish
+/// with, oldest first, taken off the queue.
+fn take_run(state: &mut AppendQueueState, mine: ParkedPublish) -> Vec<ParkedPublish> {
+    let taken: Vec<u64> = state
+        .parked
+        .iter()
+        .filter(|(_, parked)| parked.list_metadata.groups_with(&mine.list_metadata))
+        .map(|(number, _)| *number)
+        .collect();
     let mut run = vec![mine];
-    let mut next = run[0].number + 1;
-    while let Some(candidate) = state.parked.get(&next) {
-        if !candidate.list_metadata.groups_with(&run[0].list_metadata) {
-            break;
-        }
-        run.push(state.parked.remove(&next).expect("seen under the lock"));
-        next += 1;
-    }
+    run.extend(
+        taken
+            .into_iter()
+            .map(|number| state.parked.remove(&number).expect("seen under the lock")),
+    );
     run
 }
 
-/// A place in the [`AppendQueue`]. Dropping it waits for its turn and passes
-/// the turn on, so an append that fails before publishing never stalls the
-/// ones behind it.
+/// A place in the [`AppendQueue`]. Dropping a ticket that led a publish
+/// lets the next one run, so an append that fails while publishing never
+/// stalls the ones behind it; a ticket that never led holds nothing.
 struct AppendTicket<'a> {
     queue: &'a AppendQueue,
     number: u64,
-    superfiles: u32,
-    /// The root this append published and its length, recorded on drop in
-    /// the same critical section that passes the turn on.
-    published: Option<(Option<RoutingRef>, u32)>,
-    /// Tickets this one published for, whose turns pass with its own.
-    led: u64,
-    /// Published by the ticket leading it, which passed this one's turn on.
+    /// Whether this ticket holds the queue's one publish.
+    leading: bool,
+    /// Published by the ticket leading it.
     grouped: bool,
-}
-
-impl<'a> AppendTicket<'a> {
-    fn published(&mut self, root: Option<RoutingRef>, end: u32) {
-        self.published = Some((root, end));
-    }
-
-    fn wait_turn(&self) -> MutexGuard<'a, AppendQueueState> {
-        let mut state = self.queue.lock();
-        while state.serving != self.number {
-            state = self
-                .queue
-                .turn
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-        state
-    }
 }
 
 impl Drop for AppendTicket<'_> {
     fn drop(&mut self) {
-        if self.grouped {
+        if !self.leading {
             return;
         }
-        let published = self.published.take();
-        let mut state = self.wait_turn();
-        if let Some((root, end)) = published {
-            state.published_root = root;
-            state.published_end = end;
-        }
-        state.pending -= self.superfiles;
-        state.serving += 1 + self.led;
+        let mut state = self.queue.lock();
+        state.publishing = false;
         drop(state);
         self.queue.turn.notify_all();
     }
@@ -3419,99 +3371,64 @@ impl SupertableWriter {
         list_metadata
             .check_schema(&self.inner.manifest.load())
             .map_err(BuildError::from)?;
-        let current_root = || self.inner.manifest.load().term_index_ref().cloned();
         let mut layer = None;
-        let mut prebuilt_end = None;
-        let mut ticket = match &self.inner.options.storage {
-            None => self.inner.append_queue.reserve(None, 0).0,
-            Some(storage) => {
-                let list_span = detail_span!("publish.write_list").entered();
-                bridge_on_runtime(
-                    write_superfile_list(
-                        storage,
-                        &self.inner.options,
-                        &mut batch.pending_storage_writes,
-                        &mut Vec::new(),
-                    ),
-                    &runtime,
-                )?;
-                drop(list_span);
-                let contributions = &batch.term_contributions;
-                let (ticket, base) = self
-                    .inner
-                    .append_queue
-                    .reserve(current_root().as_ref(), contributions.len() as u32);
-                if !contributions.is_empty() {
-                    let base = match base {
-                        Some(base) => {
-                            prebuilt_end = Some(base + contributions.len() as u32);
-                            base
-                        }
-                        None => {
-                            drop(ticket.wait_turn());
-                            match current_root() {
-                                Some(root) => bridge_on_runtime(
-                                    term_index::load_root(storage.as_ref(), &root),
-                                    &runtime,
-                                )
-                                .map_or(0, |root| root.superfiles.len() as u32),
-                                None => 0,
-                            }
-                        }
-                    };
-                    let reserve_span =
-                        detail_span!("publish.reserve_layer", inputs = contributions.len())
-                            .entered();
-                    layer = Some(
-                        bridge_on_runtime(
-                            term_index::reserve_layer(
-                                storage,
-                                contributions,
-                                &self.inner.options.term_index_build_policy(),
-                                base,
-                            ),
-                            &runtime,
-                        )
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                    );
-                    drop(reserve_span);
-                }
-                ticket
+        let mut ticket = self.inner.append_queue.reserve();
+        if let Some(storage) = &self.inner.options.storage {
+            let list_span = detail_span!("publish.write_list").entered();
+            bridge_on_runtime(
+                write_superfile_list(
+                    storage,
+                    &self.inner.options,
+                    &mut batch.pending_storage_writes,
+                    &mut Vec::new(),
+                ),
+                &runtime,
+            )?;
+            drop(list_span);
+            let contributions = &batch.term_contributions;
+            if !contributions.is_empty() {
+                let reserve_span =
+                    detail_span!("publish.reserve_layer", inputs = contributions.len()).entered();
+                layer = Some(
+                    bridge_on_runtime(
+                        term_index::reserve_layer(
+                            storage,
+                            contributions,
+                            &self.inner.options.term_index_build_policy(),
+                        ),
+                        &runtime,
+                    )
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                drop(reserve_span);
             }
-        };
+        }
         let wait_span = detail_span!("publish.wait_turn").entered();
         let parked = ParkedPublish {
             number: ticket.number,
-            superfiles: ticket.superfiles,
             segment: ReservedSegment {
                 contributions: batch.term_contributions.len(),
                 layer,
             },
             batch,
             list_metadata,
-            prebuilt_end,
         };
-        let mut run = match self.inner.append_queue.lead_or_follow(&ticket, parked) {
+        let mut run = match self.inner.append_queue.lead_or_follow(&mut ticket, parked) {
             Turn::Lead(run) => run,
-            Turn::Published(result) => {
-                ticket.grouped = true;
-                return result;
-            }
+            Turn::Published(result) => return result,
         };
         drop(wait_span);
         let _turn_span = detail_span!("publish.turn", publishes = run.len()).entered();
-        // This ticket's own publish first, then the tickets it took on, in
-        // ticket order: their layers were reserved at bases that follow
-        // one another in that order.
+        // This ticket's own publish first, then the ones it took on, oldest
+        // first; each layer is placed where the root's list ends when its
+        // turn in the run comes.
         let mut lead = run.remove(0);
         let mut segments = vec![lead.segment];
-        let mut prebuilt_ends = vec![lead.prebuilt_end];
         let mut followers = Vec::with_capacity(run.len());
         for follower in run {
             lead.batch.absorb(follower.batch);
             segments.push(follower.segment);
-            prebuilt_ends.push(follower.prebuilt_end);
-            followers.push((follower.number, follower.superfiles));
+            followers.push(follower.number);
         }
         let published = bridge_on_runtime(
             persist_superfile_publish_batch_async(
@@ -3522,29 +3439,7 @@ impl SupertableWriter {
             ),
             &runtime,
         );
-        let end = segments
-            .iter()
-            .rev()
-            .find_map(|segment| segment.layer.as_ref().map(ReservedLayer::end));
-        if let (Ok(root), Some(end)) = (&published, end) {
-            ticket.published(root.clone(), end);
-        }
-        for (segment, prebuilt_end) in segments.iter().zip(&prebuilt_ends) {
-            if let (Some(layer), Some(expected)) = (segment.layer.as_ref(), prebuilt_end)
-                && layer.end() != *expected
-            {
-                debug!(
-                    end = layer.end(),
-                    "append's prebuilt term-index layer was rebuilt on its turn"
-                );
-                #[cfg(test)]
-                {
-                    self.inner.append_queue.lock().rebuilt += 1;
-                }
-            }
-        }
         self.inner.append_queue.publish_followers(
-            &mut ticket,
             followers,
             published.as_ref().map(drop).map_err(ToString::to_string),
         );
@@ -18046,11 +17941,6 @@ supertable:
             !listed.contains(&Uuid::nil()),
             "each prebuilt layer was appended at its reserved base, never rebuilt with padding"
         );
-        assert_eq!(
-            st.inner().append_queue.lock().rebuilt,
-            0,
-            "without another writer, every prebuilt layer is appended as built"
-        );
     }
 
     /// Runs `exclusive` while a shared append is open, and checks that it
@@ -18152,67 +18042,10 @@ supertable:
         );
     }
 
-    #[test]
-    fn a_ticket_dropped_before_its_turn_passes_the_turn_on() {
-        let queue = AppendQueue::default();
-        let (failed, failed_base) = queue.reserve(None, 2);
-        let (mut next, next_base) = queue.reserve(None, 3);
-        assert_eq!((failed_base, next_base), (Some(0), Some(2)));
-
-        drop(failed);
-        drop(next.wait_turn());
-        // Its base no longer matches the root, so the commit rebuilt it there.
-        next.published(None, 3);
-        drop(next);
-
-        assert_eq!(
-            queue.reserve(None, 1).1,
-            Some(3),
-            "the next base is where the root ends, not past the failed range"
-        );
-    }
-
-    #[test]
-    fn the_next_base_follows_where_the_last_segment_ended() {
-        let queue = AppendQueue::default();
-        let (mut ticket, _) = queue.reserve(None, 2);
-        ticket.published(None, 300);
-        drop(ticket);
-        let (mut ticket, base) = queue.reserve(None, 1);
-        assert_eq!(base, Some(300));
-        ticket.published(None, 31);
-        drop(ticket);
-        assert_eq!(
-            queue.reserve(None, 1).1,
-            Some(31),
-            "down as well as up, as when optimize shrinks the root"
-        );
-    }
-
-    #[test]
-    fn a_root_the_queue_did_not_publish_leaves_the_base_unknown() {
-        let root = |name: &str| RoutingRef {
-            uri: name.to_owned(),
-            content_hash: part_mod::ContentHash::of(name.as_bytes()),
-        };
-        let queue = AppendQueue::default();
-        let (mut ticket, _) = queue.reserve(None, 2);
-        ticket.published(Some(root("ours")), 5);
-        drop(ticket);
-
-        assert_eq!(
-            queue.reserve(Some(&root("theirs")), 1).1,
-            None,
-            "another writer moved the root, so its length is unknown"
-        );
-        assert_eq!(queue.reserve(Some(&root("ours")), 1).1, Some(5));
-    }
-
     /// A publish parked on the queue for a test, with nothing in it.
-    fn parked_for_test(number: u64, superfiles: u32) -> ParkedPublish {
+    fn parked_for_test(number: u64) -> ParkedPublish {
         ParkedPublish {
             number,
-            superfiles,
             batch: SuperfilePublishBatch {
                 new_entries: Vec::new(),
                 to_remove: Vec::new(),
@@ -18226,49 +18059,47 @@ supertable:
                 contributions: 0,
                 layer: None,
             },
-            prebuilt_end: None,
         }
     }
 
-    /// The ticket whose turn it is takes the ready tickets queued behind it
-    /// into its publish; they see its result, their turns pass with its, and
-    /// the next base follows where the group's root ended.
+    /// A ticket that finds no publish running leads; the ready tickets that
+    /// park behind it are taken by the next publish, see its result, and
+    /// leave the queue free when it is done.
     #[test]
-    fn a_leading_ticket_publishes_the_ready_tickets_behind_it() {
+    fn a_leading_ticket_publishes_the_ready_tickets_parked_behind_it() {
         let queue = AppendQueue::default();
         let queue = &queue;
-        let (mut lead, _) = queue.reserve(None, 2);
-        let (mut second, _) = queue.reserve(None, 3);
-        let (mut third, _) = queue.reserve(None, 4);
+        let mut lead = queue.reserve();
+        let mut second = queue.reserve();
+        let mut third = queue.reserve();
+        // The lead holds the queue while the others park.
+        let run = match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => run,
+            Turn::Published(_) => panic!("nothing was publishing"),
+        };
+        assert_eq!(run.len(), 1, "nothing was parked yet");
         thread::scope(|scope| {
             let followers = [&mut second, &mut third].map(|ticket| {
                 scope.spawn(move || {
-                    let parked = parked_for_test(ticket.number, ticket.superfiles);
+                    let parked = parked_for_test(ticket.number);
                     match queue.lead_or_follow(ticket, parked) {
-                        Turn::Published(result) => {
-                            ticket.grouped = true;
-                            result.is_ok()
-                        }
+                        Turn::Published(result) => result.is_ok(),
                         Turn::Lead(_) => false,
                     }
                 })
             });
-            // Both park before the lead takes its turn.
             while queue.lock().parked.len() < 2 {
                 thread::yield_now();
             }
-            let run =
-                match queue.lead_or_follow(&lead, parked_for_test(lead.number, lead.superfiles)) {
-                    Turn::Lead(run) => run,
-                    Turn::Published(_) => panic!("the first ticket leads"),
-                };
+            let parked: Vec<u64> = queue.lock().parked.keys().copied().collect();
+            assert_eq!(parked, vec![1, 2]);
+            let taken = take_run(&mut queue.lock(), parked_for_test(99));
             assert_eq!(
-                run.iter().map(|parked| parked.number).collect::<Vec<_>>(),
-                vec![0, 1, 2],
-                "its own publish first, then the ready tickets in order"
+                taken.iter().map(|parked| parked.number).collect::<Vec<_>>(),
+                vec![99, 1, 2],
+                "its own publish first, then the parked ones oldest first"
             );
-            lead.published(None, 9);
-            queue.publish_followers(&mut lead, vec![(1, 3), (2, 4)], Ok(()));
+            queue.publish_followers(vec![1, 2], Ok(()));
             drop(lead);
             for follower in followers {
                 assert!(
@@ -18279,36 +18110,35 @@ supertable:
         });
         drop(second);
         drop(third);
-        let (ticket, base) = queue.reserve(None, 1);
-        assert_eq!(
-            base,
-            Some(9),
-            "the next base is where the group's root ended"
-        );
-        assert_eq!(queue.lock().serving, 3, "the three turns passed together");
-        drop(ticket);
+        assert!(!queue.lock().publishing, "the queue is free after the lead");
+        assert!(queue.lock().parked.is_empty());
     }
 
-    /// A ticket parked behind a leader that did not take it leads itself
-    /// when its turn comes.
+    /// A ticket parked while another publishes leads itself once that
+    /// publish ends and left it behind.
     #[test]
-    fn a_parked_ticket_the_leader_left_leads_on_its_turn() {
+    fn a_parked_ticket_the_leader_left_leads_when_the_queue_frees() {
         let queue = AppendQueue::default();
         let queue = &queue;
-        let (lead, _) = queue.reserve(None, 1);
-        let (mut next, _) = queue.reserve(None, 1);
+        let mut lead = queue.reserve();
+        let mut next = queue.reserve();
+        match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => assert_eq!(run.len(), 1),
+            Turn::Published(_) => panic!("nothing was publishing"),
+        }
         thread::scope(|scope| {
-            let follower = scope.spawn(|| {
-                match queue.lead_or_follow(&next, parked_for_test(next.number, next.superfiles)) {
-                    Turn::Lead(run) => run.len(),
-                    Turn::Published(_) => 0,
-                }
-            });
+            let follower =
+                scope.spawn(
+                    || match queue.lead_or_follow(&mut next, parked_for_test(1)) {
+                        Turn::Lead(run) => run.len(),
+                        Turn::Published(_) => 0,
+                    },
+                );
             while queue.lock().parked.is_empty() {
                 thread::yield_now();
             }
-            // The leader publishes alone, having taken its turn before the
-            // follower parked, and passes the turn on.
+            // The leader publishes alone, having started before the
+            // follower parked, and frees the queue; the follower leads.
             drop(lead);
             assert_eq!(
                 follower.join().expect("follower thread"),
@@ -18316,9 +18146,9 @@ supertable:
                 "it leads a run of itself"
             );
         });
-        next.published(None, 2);
+        assert!(next.leading);
         drop(next);
-        assert_eq!(queue.reserve(None, 1).1, Some(2));
+        assert!(!queue.lock().publishing);
     }
 
     /// The term-index root `st`'s manifest references.
@@ -18349,11 +18179,6 @@ supertable:
         let root = term_root(&Supertable::open(options()).expect("reopen"), &storage);
         assert_eq!(root.superfiles.len(), APPENDS);
         assert!(!root.superfiles.contains(&Uuid::nil()));
-        assert!(
-            first.inner().append_queue.lock().rebuilt + second.inner().append_queue.lock().rebuilt
-                > 0,
-            "each handle's view goes stale behind the other's appends, so some rebuild"
-        );
     }
 
     /// A compaction leaves the root listing the superfiles it removed, so
