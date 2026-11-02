@@ -12,12 +12,11 @@
 use std::fmt;
 
 use super::{
-    core::{FtsReader, fetch_source_range},
+    core::{FtsReader, fetch_source_range, short_body_malformed},
     cursor::TermMeta,
 };
 use crate::{
     superfile::{
-        ReadError,
         bits::width_of,
         error::FtsError,
         format::{
@@ -241,17 +240,9 @@ impl FtsReader {
                             fetch_source_range(&self.source, start..start + len, "fts/size term")?;
                         let tb = bytes.as_ref();
                         if short {
-                            let df = u64::from(short_df(tb).ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?);
-                            let decoded =
-                                decode_short(tb, positional, &mut d, &mut t).ok_or_else(|| {
-                                    FtsError::Read(ReadError::Malformed(
-                                        "short-form term body does not decode".into(),
-                                    ))
-                                })?;
+                            let df = u64::from(short_df(tb).ok_or_else(short_body_malformed)?);
+                            let decoded = decode_short(tb, positional, &mut d, &mut t)
+                                .ok_or_else(short_body_malformed)?;
                             let b = &mut buckets[band_of(df)];
                             b.terms += 1;
                             b.postings += df;

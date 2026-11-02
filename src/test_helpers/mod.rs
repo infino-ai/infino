@@ -27,6 +27,8 @@
 pub mod brute_force_bm25;
 pub mod cas_conformance;
 pub mod fault_storage;
+#[cfg(unix)]
+pub mod links;
 pub mod slow_storage;
 
 /// Observability probe for the vector query path's EFFECTIVE served

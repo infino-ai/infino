@@ -20,7 +20,7 @@ use wide::i32x8;
 
 use super::{
     bounds::BoundDecoder,
-    core::{TermIdf, read_u32_le, read_u64_le},
+    core::{TermIdf, read_u32_le, read_u64_le, short_body_malformed},
     metadata::ColumnMeta,
 };
 #[cfg(target_arch = "x86_64")]
@@ -813,11 +813,7 @@ impl TermCursor {
             &mut block_doc_ids,
             &mut block_tfs,
         )
-        .ok_or_else(|| {
-            FtsError::Read(ReadError::Malformed(
-                "short-form term body does not decode".into(),
-            ))
-        })?;
+        .ok_or_else(short_body_malformed)?;
         let n = decoded.n;
         // An unscored cursor (`Match` or `Count`): no idf, no block maximum,
         // and no read of the length array to compute either.

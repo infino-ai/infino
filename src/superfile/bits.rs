@@ -9,8 +9,6 @@
 //! (plus the bytes past it for a value wider than [`ONE_LOAD_MAX_WIDTH`]
 //! bits that starts mid-byte).
 
-use std::mem::swap;
-
 /// Widest value the stream carries: a full `u64`.
 pub(crate) const MAX_WIDTH: u8 = 64;
 
@@ -114,9 +112,15 @@ pub struct PackScratch {
 /// where a width costs `base(width)` for its packed low bits plus
 /// `per_exception(lane, hi)` for each lane whose high bits do not fit —
 /// at most `max_exceptions` of them. The plain width's plan when nothing
-/// beats it. `candidates` is scratch for the width under trial; a
-/// winning width's list is swapped into `plan`, so neither grows past
-/// the block's lane count.
+/// beats it. `candidates` is scratch for the lanes under trial; it never
+/// grows past the block's lane count.
+///
+/// One pass over the lanes counts how many sit at each bit width, which
+/// says at once how many exceptions every width would list; the widths
+/// over the cap are dropped without a look at a lane, and the lanes the
+/// remaining widths could list — those wider than the narrowest width
+/// in reach, at most the cap of them — are gathered once, so each width
+/// is then costed over those alone rather than over the whole block.
 pub(crate) fn plan_exceptions(
     lanes: &[u32],
     max_exceptions: usize,
@@ -129,25 +133,55 @@ pub(crate) fn plan_exceptions(
     plan.width = plain;
     plan.exceptions.clear();
     plan.bytes = base(plain);
-    for width in 0..plain {
-        candidates.clear();
+    // Lanes at each bit width; a width's exceptions are the lanes wider
+    // than it, so the narrowest width in reach is found from the counts.
+    let mut at_width = [0usize; u32::BITS as usize + 1];
+    for &v in lanes {
+        at_width[width_of(v.into()) as usize] += 1;
+    }
+    let mut wider = 0usize;
+    let mut narrowest = plain;
+    for width in (0..plain).rev() {
+        wider += at_width[width as usize + 1];
+        if wider > max_exceptions {
+            break;
+        }
+        narrowest = width;
+    }
+    if narrowest == plain {
+        return;
+    }
+    candidates.clear();
+    candidates.extend(
+        lanes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &v)| v >> narrowest != 0)
+            .map(|(i, &v)| (i as u32, v)),
+    );
+    for width in narrowest..plain {
         let mut bytes = base(width);
         let mut beaten = bytes >= plan.bytes;
-        for (i, &v) in lanes.iter().enumerate() {
+        for &(i, v) in candidates.iter() {
             if beaten {
                 break;
             }
-            let hi = if width == 0 { v } else { v >> width };
+            let hi = v >> width;
             if hi != 0 {
-                candidates.push((i as u32, hi));
-                bytes += per_exception(i as u32, hi);
-                beaten = candidates.len() > max_exceptions || bytes >= plan.bytes;
+                bytes += per_exception(i, hi);
+                beaten = bytes >= plan.bytes;
             }
         }
         if !beaten {
             plan.width = width;
             plan.bytes = bytes;
-            swap(&mut plan.exceptions, candidates);
+            plan.exceptions.clear();
+            plan.exceptions.extend(
+                candidates
+                    .iter()
+                    .map(|&(i, v)| (i, v >> width))
+                    .filter(|&(_, hi)| hi != 0),
+            );
         }
     }
 }
@@ -857,6 +891,112 @@ mod tests {
         assert_eq!((plan.width, plan.bytes), (0, 0));
     }
 
+    /// The planner agrees with an exhaustive plan over every width: the
+    /// cheapest width wins, a tie goes to the narrower, a width that would
+    /// list more exceptions than the cap is out, and the exceptions are the
+    /// lanes wider than the width, in lane order, each with its high bits.
+    /// The grid reaches a middle width winning over both a narrower and a
+    /// wider one, ties, caps hit exactly, all-zero and uniform blocks, a
+    /// single wide lane, lanes of the full width and partial blocks.
+    #[test]
+    fn plan_exceptions_matches_the_exhaustive_plan() {
+        fn exhaustive(
+            lanes: &[u32],
+            cap: usize,
+            base: &dyn Fn(u8) -> usize,
+            per_exception: &dyn Fn(u32, u32) -> usize,
+        ) -> (u8, usize, Vec<(u32, u32)>) {
+            let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
+            let mut best = (plain, base(plain), Vec::new());
+            for width in 0..plain {
+                let exceptions: Vec<(u32, u32)> = lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &v)| v >> width != 0)
+                    .map(|(i, &v)| (i as u32, v >> width))
+                    .collect();
+                if exceptions.len() > cap {
+                    continue;
+                }
+                let bytes = base(width)
+                    + exceptions
+                        .iter()
+                        .map(|&(i, hi)| per_exception(i, hi))
+                        .sum::<usize>();
+                if bytes < best.1 {
+                    best = (width, bytes, exceptions);
+                }
+            }
+            best
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut cases: Vec<Vec<u32>> = vec![
+            Vec::new(),
+            vec![0; 16],
+            vec![5; 128],
+            vec![u32::MAX; 9],
+            // One lane wider than all the others.
+            (0..128u32)
+                .map(|i| if i == 77 { 1 << 30 } else { 3 })
+                .collect(),
+            // A middle width wins: 3-bit lanes, 8-bit ones, two 20-bit ones.
+            (0..142u32)
+                .map(|i| match i {
+                    0 | 1 => 1 << 19,
+                    i if i < 22 => 200,
+                    _ => 5,
+                })
+                .collect(),
+        ];
+        for &n in &[1usize, 7, 127, 128, 129, 256] {
+            for _ in 0..6 {
+                let common = next(12) as u8;
+                let outliers = next(40) as usize;
+                let lanes: Vec<u32> = (0..n)
+                    .map(|_| {
+                        let wide = outliers > 0 && next(n as u64) < outliers as u64;
+                        let width = if wide {
+                            common + 1 + next(20) as u8
+                        } else {
+                            common
+                        };
+                        if width == 0 {
+                            0
+                        } else {
+                            (1u32 << (width - 1)) | next(1u64 << (width - 1)) as u32
+                        }
+                    })
+                    .collect();
+                cases.push(lanes);
+            }
+        }
+        let bases: [&dyn Fn(u8) -> usize; 2] = [&|w| 128 * w as usize / 8, &|w| 2 * w as usize];
+        let costs: [&dyn Fn(u32, u32) -> usize; 3] = [&|_, _| 2, &|_, _| 100, &|_, hi| {
+            1 + (u32::BITS - hi.leading_zeros()) as usize / 8
+        }];
+        for lanes in &cases {
+            for cap in [0usize, 1, 3, 31, 64, usize::MAX] {
+                for base in bases {
+                    for per_exception in costs {
+                        let got = planned(lanes, cap, base, per_exception);
+                        let want = exhaustive(lanes, cap, base, per_exception);
+                        assert_eq!(
+                            (got.width, got.bytes, got.exceptions),
+                            want,
+                            "lanes {lanes:?} cap {cap}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn plan_exceptions_honours_the_cap_and_the_cost_model() {
         // 40 outliers among 128 lanes: with a cap of 31 the narrow width
@@ -872,6 +1012,9 @@ mod tests {
         let roomy = planned(&lanes, 64, base, |_, _| 2);
         assert_eq!((roomy.width, roomy.exceptions.len()), (1, 40));
         assert!(roomy.bytes < capped.bytes);
+        // A cap of exactly the outlier count admits them; one fewer does not.
+        assert_eq!(planned(&lanes, 40, base, |_, _| 2).exceptions.len(), 40);
+        assert_eq!(planned(&lanes, 39, base, |_, _| 2).exceptions.len(), 0);
         let dear = planned(&lanes, 64, base, |_, _| 100);
         assert_eq!(dear.exceptions.len(), 0);
     }

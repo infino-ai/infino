@@ -1609,11 +1609,7 @@ impl FtsReader {
                 let mut buf_t = [0u32; BLOCK_LEN];
                 let decoded =
                     decode_short(bytes.as_ref(), col_meta.positions, &mut buf_d, &mut buf_t)
-                        .ok_or_else(|| {
-                            FtsError::Read(ReadError::Malformed(
-                                "short-form term body does not decode".into(),
-                            ))
-                        })?;
+                        .ok_or_else(short_body_malformed)?;
                 let idf_weight = idf.resolve(col_meta, decoded.n as u64)?;
                 let dl_norm_k1 = col_meta.dl_norm_k1();
                 let mut heap: BinaryHeap<TopKEntry> =
@@ -1879,11 +1875,9 @@ impl FtsReader {
                     // form's metadata header, the short body's leading
                     // varint (CPU-only, no extra read).
                     let df = match short {
-                        true => u64::from(short_df(bytes.as_ref()).ok_or_else(|| {
-                            FtsError::Read(ReadError::Malformed(
-                                "short-form term body does not decode".into(),
-                            ))
-                        })?),
+                        true => {
+                            u64::from(short_df(bytes.as_ref()).ok_or_else(short_body_malformed)?)
+                        }
                         false => TermMeta::parse(bytes.as_ref(), 0, col_meta.positions)?.df,
                     };
                     Some(FetchedTermSlot::Pfor {
