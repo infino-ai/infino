@@ -111,6 +111,13 @@ const REORDER_CONVERGENCE: f32 = 0.05;
 /// what normally ends a split.
 const REORDER_MAX_ROUNDS: usize = 20;
 
+/// Fewest items one rayon task takes in the bisection's per-document and
+/// per-term loops. The work per item is a few reads and an atomic store, so
+/// a task that small is mostly the scheduler's: left to split down to one
+/// item, a round on a wide pool spends more time in work-stealing and epoch
+/// bookkeeping than in the loop itself.
+const PAR_MIN_ITEMS: usize = 4096;
+
 /// How hard the bisection works a split, and when it decides a split has
 /// stopped paying.
 ///
@@ -1095,16 +1102,20 @@ impl BisectState {
                     );
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
                     let (left_docs, right_docs) = (&*left, &*right);
-                    lefts.par_iter().zip(rights).for_each(|(&l, &r)| {
-                        for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
-                            deg_left[t as usize].fetch_sub(1, Relaxed);
-                            deg_right[t as usize].fetch_add(1, Relaxed);
-                        }
-                        for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
-                            deg_right[t as usize].fetch_sub(1, Relaxed);
-                            deg_left[t as usize].fetch_add(1, Relaxed);
-                        }
-                    });
+                    lefts
+                        .par_iter()
+                        .zip(rights)
+                        .with_min_len(PAR_MIN_ITEMS)
+                        .for_each(|(&l, &r)| {
+                            for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
+                                deg_left[t as usize].fetch_sub(1, Relaxed);
+                                deg_right[t as usize].fetch_add(1, Relaxed);
+                            }
+                            for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
+                                deg_right[t as usize].fetch_sub(1, Relaxed);
+                                deg_left[t as usize].fetch_add(1, Relaxed);
+                            }
+                        });
                     for (&l, &r) in lefts.iter().zip(rights) {
                         let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
                         let (ld, rd) = (left[li], right[ri]);
@@ -1226,26 +1237,29 @@ impl BisectState {
             let (gain_left, gain_right) = (as_atomic(move_gain_left), as_atomic(move_gain_right));
             let (deg_left, deg_right) = (&*deg_left, &*deg_right);
             let (cost_left, cost_right) = (cost_left.as_slice(), cost_right.as_slice());
-            touched.par_iter().for_each(|&t| {
-                let t = t as usize;
-                let (dl, dr) = (deg_left[t], deg_right[t]);
-                let left = Side {
-                    deg: dl,
-                    size: n_left,
-                    costs: cost_left,
-                };
-                let right = Side {
-                    deg: dr,
-                    size: n_right,
-                    costs: cost_right,
-                };
-                if dl > 0 {
-                    gain_left[t].store(move_gain(&left, &right).to_bits(), Relaxed);
-                }
-                if dr > 0 {
-                    gain_right[t].store(move_gain(&right, &left).to_bits(), Relaxed);
-                }
-            });
+            touched
+                .par_iter()
+                .with_min_len(PAR_MIN_ITEMS)
+                .for_each(|&t| {
+                    let t = t as usize;
+                    let (dl, dr) = (deg_left[t], deg_right[t]);
+                    let left = Side {
+                        deg: dl,
+                        size: n_left,
+                        costs: cost_left,
+                    };
+                    let right = Side {
+                        deg: dr,
+                        size: n_right,
+                        costs: cost_right,
+                    };
+                    if dl > 0 {
+                        gain_left[t].store(move_gain(&left, &right).to_bits(), Relaxed);
+                    }
+                    if dr > 0 {
+                        gain_right[t].store(move_gain(&right, &left).to_bits(), Relaxed);
+                    }
+                });
             return;
         }
         for &t in &self.touched {
@@ -1319,7 +1333,12 @@ fn rank_by_gain(
     match parallel {
         // `par_extend` over an indexed iterator fills `out` in index
         // order, so the ranking is the same whichever way it ran.
-        true => out.par_extend(half.par_iter().enumerate().map(gain_of)),
+        true => out.par_extend(
+            half.par_iter()
+                .enumerate()
+                .with_min_len(PAR_MIN_ITEMS)
+                .map(gain_of),
+        ),
         false => out.extend(half.iter().enumerate().map(gain_of)),
     }
 }
