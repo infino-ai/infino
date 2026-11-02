@@ -1133,6 +1133,12 @@ impl BisectState {
             cost_before = cost_after;
             if round == 0 {
                 first_round_gain = round_gain;
+                // The root offers at once, so its own later rounds are
+                // measured against it too; the levels offer again below
+                // for a root whose first round lowered nothing.
+                if depth == 0 {
+                    run.offer_reference(round_gain, order.len());
+                }
             }
             if REPORT {
                 level.record_actual(round_gain);
