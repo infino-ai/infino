@@ -1583,13 +1583,30 @@ impl Supertable {
         // Admission checks the host refused since the last merge started, so
         // the admit log shows how long memory held the next merge back.
         let mut held_back = 0u64;
+        // The host refused the next merge the room it needs while finished
+        // merges held their outputs; committing them is what frees it.
+        let mut needs_room = false;
 
         while !queued.is_empty()
             || !merging.is_empty()
             || !committing.is_terminated()
             || !ready.is_empty()
         {
-            if committing.is_terminated() && !ready.is_empty() {
+            // A finished merge commits when a commit is the only way forward:
+            // nothing is left merging, a queued merge waits on the slot or
+            // the memory its output holds, or the pass has stopped admitting.
+            // Otherwise it waits for the merges still running and rides with
+            // them: one CAS and one layer, which the fold after the pass
+            // moves into place instead of merging the several that a wave
+            // committing as each merge finished would leave. Its output was
+            // resident while it merged, so holding it costs nothing the wave
+            // did not already pay.
+            let commit_due = merging.is_empty()
+                || stop_admitting
+                || (!queued.is_empty()
+                    && (merging.len() + ready.len() >= concurrency || needs_room));
+            if committing.is_terminated() && !ready.is_empty() && commit_due {
+                needs_room = false;
                 // Plan order within the batch, which is as much of it as
                 // committing merges when they finish can preserve.
                 ready.sort_by_key(|(plan_index, _)| *plan_index);
@@ -1694,6 +1711,7 @@ impl Supertable {
                         self.admit_next_merge(&mut queued, &mut merging, &mut charges, &settings, &mut held_back);
                     } else {
                         held_back += 1;
+                        needs_room = true;
                     }
                     // Advanced whether or not the host had room: a deadline
                     // left in the past would re-fire immediately and spin on
@@ -7774,6 +7792,12 @@ mod tests {
         uploads: AtomicUsize,
         swaps_in_flight: AtomicUsize,
         max_swaps_in_flight: AtomicUsize,
+        /// Pointer swaps attempted once `hold` is set, held or let through.
+        swaps: AtomicUsize,
+        /// Set to hold the next superfile upload at `upload_gate`; cleared
+        /// by the upload it holds, so one merge stays in flight.
+        hold_upload: AtomicBool,
+        upload_gate: Semaphore,
     }
 
     impl HeldPointerStorage {
@@ -7785,11 +7809,18 @@ mod tests {
                 uploads: AtomicUsize::new(0),
                 swaps_in_flight: AtomicUsize::new(0),
                 max_swaps_in_flight: AtomicUsize::new(0),
+                swaps: AtomicUsize::new(0),
+                hold_upload: AtomicBool::new(false),
+                upload_gate: Semaphore::new(0),
             })
         }
 
         fn release(&self) {
             self.gate.add_permits(Semaphore::MAX_PERMITS);
+        }
+
+        fn release_upload(&self) {
+            self.upload_gate.add_permits(Semaphore::MAX_PERMITS);
         }
     }
 
@@ -7812,6 +7843,9 @@ mod tests {
             self.inner.put_atomic(uri, bytes).await
         }
         async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            if uri.contains(SUPERFILE_UPLOAD) && self.hold_upload.swap(false, Ordering::SeqCst) {
+                drop(self.upload_gate.acquire().await.expect("gate never closes"));
+            }
             self.inner.put_overwrite(uri, bytes).await?;
             if uri.contains(SUPERFILE_UPLOAD) && self.hold.load(Ordering::SeqCst) {
                 self.uploads.fetch_add(1, Ordering::SeqCst);
@@ -7824,6 +7858,9 @@ mod tests {
             bytes: Bytes,
             expected_etag: Option<&str>,
         ) -> Result<Option<String>, StorageError> {
+            if uri.contains(POINTER_PATH) && self.hold.load(Ordering::SeqCst) {
+                self.swaps.fetch_add(1, Ordering::SeqCst);
+            }
             if !uri.contains(POINTER_PATH) || !self.hold.load(Ordering::SeqCst) {
                 return self.inner.put_if_match(uri, bytes, expected_etag).await;
             }
@@ -7906,6 +7943,61 @@ mod tests {
         assert_eq!(
             listed_ids(&st).len(),
             HELD_COMMIT_JOBS,
+            "every pair merged into one superfile"
+        );
+    }
+
+    /// Jobs in the one-wave test, which is also the width it allows: every
+    /// merge starts at once and nothing is queued for a slot.
+    const ONE_WAVE_JOBS: usize = 3;
+
+    /// Merges that finish while others still run commit with them rather
+    /// than ahead of them when nothing is queued for their slots. With one
+    /// job's upload held, the other merges finish and nothing swaps the
+    /// pointer until it is let through; then every job lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_with_nothing_queued_commits_once_its_last_merge_finishes() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldPointerStorage::new(&dir);
+        let provider: Arc<dyn StorageProvider> = Arc::<HeldPointerStorage>::clone(&storage);
+        let st = Supertable::create(default_supertable_options().with_storage(provider))
+            .expect("create supertable");
+        let jobs = pair_jobs(&st, ONE_WAVE_JOBS);
+        // Uploads are counted and the pointer swaps pass; one upload holds.
+        storage.hold.store(true, Ordering::SeqCst);
+        storage.release();
+        storage.hold_upload.store(true, Ordering::SeqCst);
+
+        let check = async {
+            let others_uploaded = time::timeout(HELD_COMMIT_TIMEOUT, async {
+                while storage.uploads.load(Ordering::SeqCst) < ONE_WAVE_JOBS - 1 {
+                    time::sleep(HELD_COMMIT_POLL).await;
+                }
+            })
+            .await
+            .is_ok();
+            time::sleep(HELD_COMMIT_SETTLE).await;
+            let swaps_while_held = storage.swaps.load(Ordering::SeqCst);
+            storage.release_upload();
+            (others_uploaded, swaps_while_held)
+        };
+        let (pass, (others_uploaded, swaps_while_held)) = tokio::join!(
+            st.run_compaction_jobs_with(jobs, DEFAULT_STALE_SEAL_TIMEOUT, ONE_WAVE_JOBS, || None),
+            check
+        );
+        assert!(
+            others_uploaded,
+            "the merges beside the held one must finish"
+        );
+        assert_eq!(
+            swaps_while_held, 0,
+            "a finished merge waits for the wave when nothing is queued"
+        );
+        let dropped = pass.expect("the pass must commit every job");
+        assert_eq!(dropped, 0, "no job was dropped");
+        assert_eq!(
+            listed_ids(&st).len(),
+            ONE_WAVE_JOBS,
             "every pair merged into one superfile"
         );
     }

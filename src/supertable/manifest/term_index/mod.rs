@@ -908,6 +908,19 @@ async fn fold_layers(
             base: 0,
         });
     }
+    // One kept layer whose every posting survives under one shift is the
+    // merged layer already: it moves to its new place and its objects stay
+    // where they are, so the fold reads and writes nothing. The fold after
+    // an optimize finds this when the pass committed its merges in one
+    // batch: that batch's layer, behind the superfiles it replaced.
+    if let [layer] = kept.as_slice()
+        && let Some((base, range)) = shifted_whole(layer, ordinals)
+    {
+        let mut placed = layer.clone();
+        placed.base = base;
+        placed.ordinals = Some(range);
+        return Ok(placed);
+    }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
     let sources = download_layers(storage, &kept, scratch.path())
         .instrument(detail_span!(
@@ -943,6 +956,26 @@ fn layer_keeps_postings(layer: &Layer, ordinals: &[Option<u32>]) -> bool {
             .clone()
             .any(|ordinal| ordinals.get(ordinal as usize).is_some_and(Option::is_some)),
     }
+}
+
+/// Where `layer` lands when `ordinals` keeps every one of its postings and
+/// renumbers them by one shift: its new base and range. `None` when a
+/// posting is dropped, the renumbering is not one shift, the layer's range
+/// is unknown, or the shift would carry its base below zero (a layer whose
+/// stored ordinals count from a base behind its range).
+fn shifted_whole(layer: &Layer, ordinals: &[Option<u32>]) -> Option<(u32, Range<u32>)> {
+    let range = layer.ordinals.clone()?;
+    let first = (*ordinals.get(range.start as usize)?)?;
+    for (offset, ordinal) in range.clone().enumerate() {
+        match ordinals.get(ordinal as usize) {
+            Some(Some(renumbered)) if *renumbered == first.checked_add(offset as u32)? => {}
+            _ => return None,
+        }
+    }
+    // Stored ordinals are relative to the base, so the shift the
+    // renumbering applies to the range applies to the base as well.
+    let base = layer.base.checked_add(first)?.checked_sub(range.start)?;
+    Some((base, first..first + range.len() as u32))
 }
 
 /// The ordinals a fold of `layers` through `ordinals` may name: the
@@ -2186,6 +2219,7 @@ mod tests {
         collections::HashMap,
         fs,
         ops::Range,
+        slice::from_ref,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -7538,6 +7572,63 @@ mod tests {
             merged_ordinals(&[layer(None), layer(Some(4..6))], &renumbering),
             None,
             "an input of unknown range leaves the fold's unknown"
+        );
+    }
+
+    /// One kept layer whose postings all survive under one shift moves to
+    /// its new place without a read or a write: the fold hands it back with
+    /// its slices as they were, over a store that holds nothing. A layer
+    /// that loses a posting, or whose ordinals do not move as one, is
+    /// merged, which the empty store cannot serve.
+    #[tokio::test]
+    async fn a_fold_of_one_whole_layer_moves_it_without_a_rewrite() {
+        let dir = TempDir::new().expect("tempdir");
+        let empty: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let policy = BuildPolicy::default();
+        let layer = |tag: u8, base: u32, ordinals: Range<u32>| Layer {
+            base,
+            ordinals: Some(ordinals),
+            ..tagged_layer(tag)
+        };
+        // Ordinals 0..4 die; 4..7 survive as 0..3.
+        let renumbering = [None, None, None, None, Some(0), Some(1), Some(2)];
+        let whole = layer(7, 4, 4..7);
+        let moved = fold_layers(
+            &empty,
+            &[layer(1, 0, 0..4), whole.clone()],
+            &renumbering,
+            &policy,
+            None,
+        )
+        .await
+        .expect("a whole layer moves without the store");
+        assert_eq!(moved.slices, whole.slices, "the slices are the layer's own");
+        assert_eq!((moved.base, moved.ordinals), (0, Some(0..3)));
+
+        // A layer whose stored ordinals count from behind its range moves
+        // its base by the same shift.
+        let behind = layer(7, 2, 4..7);
+        assert_eq!(
+            shifted_whole(&behind, &renumbering),
+            None,
+            "its base would fall below zero"
+        );
+        let renumber_by_one = [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)];
+        assert_eq!(shifted_whole(&behind, &renumber_by_one), Some((1, 3..6)));
+
+        // A posting dropped, or an uneven shift: a merge, which fails here.
+        let dropped = [None, None, None, None, Some(0), None, Some(1)];
+        assert!(
+            fold_layers(&empty, from_ref(&whole), &dropped, &policy, None)
+                .await
+                .is_err()
+        );
+        let uneven = [None, None, None, None, Some(0), Some(2), Some(3)];
+        assert!(
+            fold_layers(&empty, &[whole], &uneven, &policy, None)
+                .await
+                .is_err()
         );
     }
 
