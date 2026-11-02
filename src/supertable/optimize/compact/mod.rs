@@ -1536,20 +1536,23 @@ impl Supertable {
         host_memory: fn() -> Option<(u64, u64)>,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        let settings = MergeSettings {
-            stale_seal_timeout,
-            merge_threads: merge_pool_widths(
-                maint_pool()?.current_num_threads(),
-                concurrency,
-                &jobs,
-            ),
-        };
         // Whether merges here keep per-row bookkeeping, which is part of
         // what each one is charged for until its allocation shows up in
         // the host reading.
         let indexed = {
             let manifest = self.inner().manifest.load();
             !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty()
+        };
+        // The pool is shared among the merges that will actually run side
+        // by side, which memory bounds before the configured concurrency
+        // does: on a host whose cores outnumber the merges its memory
+        // admits, widths cut from the configured concurrency would hand
+        // each merge one thread and leave the rest of the cores idle for
+        // the whole pass.
+        let in_flight = admittable_merges(concurrency, &jobs, indexed, host_memory());
+        let settings = MergeSettings {
+            stale_seal_timeout,
+            merge_threads: merge_pool_widths(maint_pool()?.current_num_threads(), in_flight, &jobs),
         };
         let mut charges = MergeCharges::new(indexed);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
@@ -1907,6 +1910,32 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
     job.input_bytes
         .saturating_add(job.estimated_output_bytes)
         .saturating_add(rows)
+}
+
+/// How many of `jobs` the host's memory lets run at once, as the width the
+/// pool is shared over: the merges the reserve leaves room for at the
+/// largest job's expected footprint, within `concurrency` and the job count.
+/// A host whose memory cannot be read is not throttled, so the configured
+/// concurrency stands; the admission itself still runs against the host's
+/// readings as merges land, this only sets how the threads are cut.
+fn admittable_merges(
+    concurrency: usize,
+    jobs: &[CompactionJob],
+    indexed: bool,
+    host_memory: Option<(u64, u64)>,
+) -> usize {
+    let bound = concurrency.max(1).min(jobs.len().max(1));
+    let Some((available, _)) = host_memory else {
+        return bound;
+    };
+    let largest = jobs
+        .iter()
+        .map(|job| expected_merge_footprint(job, indexed))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let usable = available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100;
+    ((usable / largest) as usize).clamp(1, bound)
 }
 
 /// The per-pass settings every merge of a pass runs under.
@@ -4483,6 +4512,42 @@ mod tests {
                 ..CompactionJob::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn admittable_merges_is_bounded_by_memory_then_by_concurrency_and_jobs() {
+        // Twenty 1 GiB-output jobs on a host with 100 GiB free: the reserve
+        // leaves 60 GiB, each indexed job is charged inputs + output + rows,
+        // so about 29 would fit; concurrency 180 and the job count bound it
+        // to 20, and the pool is cut over 20, not 180.
+        let jobs: Vec<CompactionJob> = (0..20)
+            .map(|_| CompactionJob {
+                partition_key: Vec::new(),
+                inputs: Vec::new(),
+                estimated_output_bytes: 1 << 30,
+                input_bytes: 1 << 30,
+                live_docs: 1_000_000,
+                merge_input_mb: None,
+            })
+            .collect();
+        let gib = 1u64 << 30;
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((100 * gib, 128 * gib))),
+            20
+        );
+        // Less memory than the jobs want: memory sets the width.
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((10 * gib, 128 * gib))),
+            2
+        );
+        // Unreadable memory never throttles the cut.
+        assert_eq!(admittable_merges(180, &jobs, true, None), 20);
+        assert_eq!(admittable_merges(8, &jobs, true, None), 8);
+        // Nothing fits at all still runs one merge at a time.
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((gib, 128 * gib))),
+            1
+        );
     }
 
     #[test]
