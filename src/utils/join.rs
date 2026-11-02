@@ -1,11 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Infino Authors
 
-//! Joining many fallible futures without running them all at once.
+//! Joining many fallible futures without running them all at once, and
+//! many fallible tasks on a thread pool from outside it.
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{Arc, mpsc::sync_channel},
+};
 
 use futures::stream::{FuturesUnordered, StreamExt};
+use rayon::ThreadPool;
 
 /// Run `futures` at most `limit` at a time and return their outputs in input
 /// order.
@@ -47,6 +52,52 @@ where
     // The loop ends only once every future made has finished, so every slot
     // is filled.
     Ok(slots.into_iter().flatten().collect())
+}
+
+/// Run `work` over `items`, one spawned task each on `pool`, and return
+/// the results in the items' order once every task has reported.
+///
+/// For a caller outside the pool, blocked here on a channel, so no pool
+/// thread waits for another's work. A thread that waits inside the pool —
+/// under `install`, or at a `join` — runs whatever job is queued meanwhile,
+/// and with many callers sharing the pool that is another caller's whole
+/// phase: a commit's lanes froze in a fraction of a second and then sat
+/// for tens of seconds while the thread that owned them worked elsewhere,
+/// and the pool ran at half its width. Every task reports before this
+/// returns, so a failed task's siblings finish rather than outlive it; a
+/// task that ends without reporting (a panic) is `lost`'s error.
+pub(crate) fn run_spawned<T, R, E, F>(
+    pool: &ThreadPool,
+    items: Vec<T>,
+    work: F,
+    lost: fn() -> E,
+) -> Result<Vec<R>, E>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    E: Send + 'static,
+    F: Fn(usize, T) -> Result<R, E> + Send + Sync + 'static,
+{
+    let n = items.len();
+    let (tx, rx) = sync_channel(n.max(1));
+    let work = Arc::new(work);
+    for (i, item) in items.into_iter().enumerate() {
+        let (tx, work) = (tx.clone(), Arc::clone(&work));
+        pool.spawn(move || {
+            // The receiver is gone only if the caller gave up; there is
+            // nobody left to tell.
+            let _ = tx.send((i, work(i, item)));
+        });
+    }
+    drop(tx);
+    let mut results: Vec<Option<Result<R, E>>> = (0..n).map(|_| None).collect();
+    for (i, result) in rx {
+        results[i] = Some(result);
+    }
+    results
+        .into_iter()
+        .map(|result| result.ok_or_else(lost)?)
+        .collect()
 }
 
 #[cfg(test)]
