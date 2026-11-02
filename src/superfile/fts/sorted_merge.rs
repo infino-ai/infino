@@ -47,6 +47,13 @@ pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 /// Batches the dictionary walk gathers ahead of the one being merged.
 const BATCHES_AHEAD: usize = 1;
 
+/// Encoded batches the writer may fall behind the encodes by. One keeps
+/// a batch's writes beside the next batch's encodes, which is the whole
+/// overlap there is: a merge of 68 inputs and 9M terms spent 6 s of its
+/// 11 s dispatching encodes and 4.5 s writing, one after the other per
+/// batch. More would hold more encoded postings for no further overlap.
+const ENCODED_BATCHES_AHEAD: usize = 1;
+
 /// Most terms in one parallel batch. Tiny under test, so the merge tests
 /// cross a batch boundary at every kind of term they build.
 const BATCH_TERMS: usize = if cfg!(test) { 3 } else { 1 << 16 };
@@ -88,15 +95,15 @@ pub(crate) struct SortedInput {
 /// position run, decoded (empty for a non-positional column).
 ///
 /// `encode` runs on many threads at once, each call with a worker state
-/// made by `new_state`; `write` runs on this thread, once per term, in term
-/// order. Returns the worker states, so the caller can fold what they
-/// gathered.
+/// made by `new_state`; `write` runs on a thread of its own, once per
+/// term, in term order, a batch behind the encodes. Returns the worker
+/// states, so the caller can fold what they gathered.
 pub(crate) fn merge_column<S: Send, T: Send>(
     inputs: &[SortedInput],
     column_id: u32,
     new_state: impl Fn() -> S + Sync,
     encode: impl Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
-    mut write: impl FnMut(&str, T) -> Result<(), BuildError>,
+    mut write: impl FnMut(&str, T) -> Result<(), BuildError> + Send,
 ) -> Result<Vec<S>, BuildError> {
     let readers = inputs
         .iter()
@@ -132,9 +139,13 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     // written. Batches arrive in the order they were walked, so the terms are
     // written in the same order.
     let (sender, walked) = sync_channel::<Result<Batch, BuildError>>(BATCHES_AHEAD);
-    // Where this thread's time goes: waiting on the walk for the next
-    // batch, dispatching the batch's encodes, and writing the terms out.
+    // Three stages on three threads: the walk gathers batches, this thread
+    // dispatches each batch's encodes to the pool, and the writer writes
+    // the encoded terms out in order, a batch behind. Where this thread's
+    // time goes: waiting on the walk, dispatching, and at the end waiting
+    // for the writer.
     let (mut waited, mut encoded, mut written) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (encoded_tx, encoded_rx) = sync_channel::<(Batch, Vec<Option<T>>)>(ENCODED_BATCHES_AHEAD);
     thread::scope(|scope| -> Result<(), BuildError> {
         let readers = &readers;
         scope.spawn(move || {
@@ -145,16 +156,37 @@ pub(crate) fn merge_column<S: Send, T: Send>(
                 let _ = sender.send(Err(e));
             }
         });
+        let writer = scope.spawn(move || -> Result<Duration, BuildError> {
+            let mut written = Duration::ZERO;
+            for (batch, merged) in encoded_rx {
+                let started = Instant::now();
+                write_batch(&batch, merged, &mut write)?;
+                written += started.elapsed();
+            }
+            Ok(written)
+        });
         loop {
             let started = Instant::now();
             let Ok(batch) = walked.recv() else {
                 break;
             };
             waited += started.elapsed();
-            let (encode, write_took) = work.run(&batch?, &mut write)?;
-            encoded += encode;
-            written += write_took;
+            let batch = batch?;
+            let started = Instant::now();
+            let merged = work.encode(&batch)?;
+            encoded += started.elapsed();
+            // The writer is gone only after an error of its own, which the
+            // join below reports.
+            if encoded_tx.send((batch, merged)).is_err() {
+                break;
+            }
         }
+        drop(encoded_tx);
+        written = writer.join().map_err(|_| {
+            BuildError::Io(Error::other(
+                "fts sorted merge: the writer thread ended without a result",
+            ))
+        })??;
         Ok(())
     })?;
     record("walk_wait_ms", waited.as_millis() as u64);
@@ -286,34 +318,38 @@ struct BatchWork<'a, S, N, E> {
     encode: &'a E,
 }
 
+/// Write a batch's encoded terms out, in term order. A term whose every
+/// posting was deleted leaves the output.
+fn write_batch<T>(
+    batch: &Batch,
+    merged: Vec<Option<T>>,
+    write: &mut impl FnMut(&str, T) -> Result<(), BuildError>,
+) -> Result<(), BuildError> {
+    for (pending, output) in batch.terms.iter().zip(merged) {
+        let term = from_utf8(&batch.term_bytes[pending.term.clone()])
+            .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
+        if let Some(output) = output {
+            write(term, output)?;
+        }
+    }
+    Ok(())
+}
+
 impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     /// Merge a batch's terms in parallel, then write them in term order.
-    /// Returns how long the encodes took and how long the writes took.
-    fn run<T: Send>(
-        &self,
-        batch: &Batch,
-        write: &mut impl FnMut(&str, T) -> Result<(), BuildError>,
-    ) -> Result<(Duration, Duration), BuildError>
+    /// Encode a batch's terms on the pool, in the batch's term order.
+    fn encode<T: Send>(&self, batch: &Batch) -> Result<Vec<Option<T>>, BuildError>
     where
         E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
     {
-        let started = Instant::now();
-        let merged = batch
+        Ok(batch
             .terms
             .par_chunks(task_terms(batch.terms.len()))
             .map(|chunk| self.merge_chunk(batch, chunk))
-            .collect::<Result<Vec<_>, _>>()?;
-        let encoded = started.elapsed();
-        let started = Instant::now();
-        for (pending, output) in batch.terms.iter().zip(merged.into_iter().flatten()) {
-            let term = from_utf8(&batch.term_bytes[pending.term.clone()])
-                .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
-            // A term whose every posting was deleted leaves the output.
-            if let Some(output) = output {
-                write(term, output)?;
-            }
-        }
-        Ok((encoded, started.elapsed()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Merge some consecutive terms of a batch on one worker.
