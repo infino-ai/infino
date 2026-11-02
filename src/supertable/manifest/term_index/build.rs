@@ -2135,6 +2135,11 @@ fn run_ranges(
             pool.in_place_scope(|scope| {
                 for ((start, end), slot) in ranges.iter().zip(&slots) {
                     scope.spawn(move |_| {
+                        let _span = detail_span!(
+                            "build.range",
+                            start = start.as_ref().map_or(0, |key| key.len())
+                        )
+                        .entered();
                         let part = one(start.as_deref(), end.as_deref());
                         *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
                     });
