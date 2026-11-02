@@ -5428,6 +5428,54 @@ fn make_drain_batches(
     batches
 }
 
+/// Rebuilds a checkpointed epoch's batches from its recorded `batch_layout`:
+/// batch `i` holds the sources whose `birth_version` the layout's group `i`
+/// names, in recorded order, each version's sources in `sources` order. The
+/// layout is part of the epoch (its id hashes it and the local checkpoint
+/// counts batches against it), so a resume follows it rather than re-batching
+/// under the current `drain_batch_superfiles`. A layout that does not
+/// partition the sources' versions exactly — an empty group, a version with no
+/// source or listed twice, a source version left out — is a corrupt checkpoint.
+fn drain_batches_from_layout(
+    sources: Vec<Arc<SuperfileEntry>>,
+    layout: &[Vec<u64>],
+) -> Result<Vec<(Vec<u64>, Vec<Arc<SuperfileEntry>>)>, BuildError> {
+    let mut by_version = std::collections::BTreeMap::<u64, Vec<Arc<SuperfileEntry>>>::new();
+    for source in sources {
+        by_version
+            .entry(source.birth_version)
+            .or_default()
+            .push(source);
+    }
+    let mut batches = Vec::with_capacity(layout.len());
+    for (batch_idx, versions) in layout.iter().enumerate() {
+        if versions.is_empty() {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint batch layout is corrupt: batch {batch_idx} is empty"
+            )));
+        }
+        let mut superfiles = Vec::new();
+        for &version in versions {
+            let mut version_superfiles = by_version.remove(&version).ok_or_else(|| {
+                BuildError::Store(format!(
+                    "drain checkpoint batch layout is corrupt: batch {batch_idx} names version \
+                     {version}, which has no checkpoint source or is listed more than once"
+                ))
+            })?;
+            superfiles.append(&mut version_superfiles);
+        }
+        batches.push((versions.clone(), superfiles));
+    }
+    if let Some(&version) = by_version.keys().next() {
+        return Err(BuildError::Store(format!(
+            "drain checkpoint batch layout is corrupt: it leaves out {} checkpoint source \
+             version(s), first {version}",
+            by_version.len()
+        )));
+    }
+    Ok(batches)
+}
+
 fn drain_batch_layout(batches: &[(Vec<u64>, Vec<Arc<SuperfileEntry>>)]) -> Vec<Vec<u64>> {
     batches
         .iter()
@@ -5619,11 +5667,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let shard_count = packed_cell_shard_count(&hidden_inner.options);
     let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
-    let budget = if batch_cfg < 0 {
-        usize::MAX
-    } else {
-        (batch_cfg as usize).max(1)
-    };
 
     // A remote checkpoint pins the exact source epoch. New user commits can
     // land while it is in progress; they are intentionally left for the next
@@ -5691,17 +5734,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             selected.push(Arc::clone(entry));
         }
-        let batches = make_drain_batches(selected, budget);
-        let batch_layout = drain_batch_layout(&batches);
-        if batch_layout != remote_state.checkpoint.batch_layout {
-            return Err(BuildError::Store(
-                "drain checkpoint batch layout differs from current configuration".into(),
-            ));
-        }
+        // The recorded layout, not the current `drain_batch_superfiles`,
+        // decides the batches: batch size is a tuning knob outside the options
+        // hash, and the epoch already committed to these batches.
+        let batches = drain_batches_from_layout(selected, &remote_state.checkpoint.batch_layout)?;
         let epoch_id = drain_epoch_id(
             &current_options_hash,
             &remote_state.checkpoint.sources,
-            &batch_layout,
+            &remote_state.checkpoint.batch_layout,
             shard_count,
             consolidate,
         );
@@ -5733,6 +5773,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .iter()
             .map(|entry| drain_checkpoint_source(entry))
             .collect();
+        let budget = if batch_cfg < 0 {
+            usize::MAX
+        } else {
+            (batch_cfg as usize).max(1)
+        };
         let batches = make_drain_batches(selected, budget);
         let batch_layout = drain_batch_layout(&batches);
         let epoch_id = drain_epoch_id(
@@ -15016,6 +15061,241 @@ mod tests {
                 .is_none(),
             "settled slow-CAS state contains no pending drain"
         );
+    }
+
+    #[test]
+    fn drain_batches_from_layout_follows_the_recorded_groups() {
+        let at = |id: u128, birth_version: u64| {
+            let mut entry = (*fp_entry(id)).clone();
+            entry.birth_version = birth_version;
+            Arc::new(entry)
+        };
+        let sources = vec![at(1, 3), at(2, 3), at(3, 5), at(4, 7)];
+        let ids = |batch: &[Arc<SuperfileEntry>]| -> Vec<u128> {
+            batch
+                .iter()
+                .map(|entry| entry.superfile_id.as_u128())
+                .collect()
+        };
+
+        // A layout recorded under a batch size of one superfile, read back
+        // where the current budget would group every version together.
+        let recorded = vec![vec![3], vec![5], vec![7]];
+        assert_ne!(
+            drain_batch_layout(&make_drain_batches(sources.clone(), 64)),
+            recorded,
+            "the current budget alone would re-batch this epoch"
+        );
+        let batches = drain_batches_from_layout(sources.clone(), &recorded).expect("rebuild");
+        assert_eq!(drain_batch_layout(&batches), recorded);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, batch)| ids(batch))
+                .collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3], vec![4]],
+            "a version's sources stay together, in source order"
+        );
+        // Rebuilding the layout a fresh drain records yields that drain's batches.
+        let fresh = make_drain_batches(sources.clone(), 2);
+        let rebuilt = drain_batches_from_layout(sources.clone(), &drain_batch_layout(&fresh))
+            .expect("rebuild");
+        assert_eq!(drain_batch_layout(&rebuilt), drain_batch_layout(&fresh));
+        for ((_, left), (_, right)) in rebuilt.iter().zip(&fresh) {
+            assert_eq!(ids(left), ids(right));
+        }
+
+        for (corrupt, why) in [
+            (vec![vec![3], vec![5]], "leaves out version 7"),
+            (
+                vec![vec![3], vec![5, 7], vec![9]],
+                "names a version with no source",
+            ),
+            (
+                vec![vec![3], vec![3, 5, 7]],
+                "lists a version in two batches",
+            ),
+            (
+                vec![vec![3, 3], vec![5, 7]],
+                "lists a version twice in one batch",
+            ),
+            (vec![vec![3], vec![], vec![5, 7]], "has an empty batch"),
+            (vec![], "has no batches"),
+        ] {
+            let error = drain_batches_from_layout(sources.clone(), &corrupt)
+                .expect_err(&format!("a layout that {why} must be refused"));
+            assert!(
+                error.to_string().contains("batch layout is corrupt"),
+                "a layout that {why}: {error}"
+            );
+        }
+    }
+
+    /// A drain interrupted after its checkpoint was recorded under one
+    /// `drain_batch_superfiles` resumes under another: the resume follows the
+    /// recorded batches (keeping the batches it already finished) and drains
+    /// every row, instead of refusing because the current setting would batch
+    /// the epoch differently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_resumes_with_recorded_batches_after_batch_size_change() {
+        use crate::superfile::reader::VectorSearchOptions;
+
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = |batch_superfiles: i64| {
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(batch_superfiles)
+        };
+        let table = Supertable::create(options(1)).expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop at the failpoint");
+        let pending = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        assert_eq!(pending.checkpoint.epoch_id, epoch_id);
+        assert_eq!(pending.checkpoint.batch_layout.len(), COMMITS);
+        drop(hidden);
+        drop(table);
+
+        // Reopen with a larger batch size: a fresh drain would now take every
+        // commit in one batch, so this epoch is no longer what the current
+        // setting produces.
+        let table = Supertable::open(options(64)).expect("reopen");
+        let (hidden, fresh_epoch_id) = current_drain_epoch(&table).await;
+        assert_ne!(
+            fresh_epoch_id, epoch_id,
+            "the new batch size must change what a fresh drain would record"
+        );
+
+        // A recorded layout that does not cover the checkpoint's sources is
+        // refused before any batch runs; the intact checkpoint still resumes.
+        let mut corrupt = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        corrupt.checkpoint.batch_layout.pop();
+        save_drain_remote_checkpoint(hidden.inner(), &mut corrupt)
+            .await
+            .expect("save corrupt layout");
+        let refused = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("a layout leaving out a source version must be refused");
+        assert!(
+            refused.to_string().contains("batch layout is corrupt"),
+            "{refused}"
+        );
+        let mut restored = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        restored.checkpoint.batch_layout = pending.checkpoint.batch_layout.clone();
+        save_drain_remote_checkpoint(hidden.inner(), &mut restored)
+            .await
+            .expect("restore recorded layout");
+        assert_eq!(
+            load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
+                .expect("load local checkpoint")
+                .expect("local checkpoint")
+                .batches_done,
+            1,
+            "the refused resume must not touch the finished batch"
+        );
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume under a different batch size");
+        assert!(
+            !drain_scratch_dir(&epoch_id).exists(),
+            "the recorded epoch is the one that completed"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled slow state")
+                .is_none(),
+            "settled slow-CAS state contains no pending drain"
+        );
+
+        let hidden_manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let drained = hidden_manifest.get_drained_ranges();
+        let user_manifest = Arc::clone(table.reader().expect("reader").manifest());
+        assert_eq!(user_manifest.superfiles.len(), COMMITS);
+        assert!(
+            user_manifest
+                .superfiles
+                .iter()
+                .all(|entry| drained.contains(entry.birth_version)),
+            "every commit's version is drained"
+        );
+        let hidden_rows: u64 = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.n_docs)
+            .sum();
+        assert_eq!(
+            hidden_rows,
+            (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64,
+            "every row lands in the hidden cells exactly once"
+        );
+
+        // Each axis has one row per commit; all of them come back as exact
+        // matches, served from the hidden cells.
+        let hidden_uris: HashSet<SuperfileUri> = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        for axis in 0..COMMIT_AS_DRAIN_TEST_ROWS {
+            let mut q = vec![0.0f32; COMMIT_AS_DRAIN_TEST_DIM];
+            q[axis] = 1.0;
+            let hits = table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    COMMITS * COMMIT_AS_DRAIN_TEST_ROWS,
+                    VectorSearchOptions::new().with_nprobe(32),
+                    None,
+                )
+                .expect("search");
+            let exact: Vec<_> = hits.iter().filter(|hit| hit.score < 1e-4).collect();
+            assert_eq!(
+                exact.len(),
+                COMMITS,
+                "axis {axis}: one exact match per commit, got {hits:?}"
+            );
+            assert!(
+                exact.iter().all(|hit| hidden_uris.contains(&hit.superfile)),
+                "axis {axis}: exact matches are served from the hidden cells"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
