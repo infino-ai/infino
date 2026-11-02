@@ -33,6 +33,7 @@ pub(crate) mod join_build_size;
 pub(crate) mod limit_stage;
 pub mod provider;
 pub mod prune;
+pub(crate) mod range_counts;
 pub(crate) mod range_top_k;
 pub(crate) mod read_ahead;
 pub(crate) mod read_ahead_rule;

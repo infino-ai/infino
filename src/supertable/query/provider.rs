@@ -84,7 +84,7 @@ use datafusion::{
     object_store::path::Path as ObjPath,
     physical_expr::create_physical_expr,
     physical_plan::{
-        ExecutionPlan,
+        ExecutionPlan, collect,
         empty::EmptyExec,
         filter::FilterExec,
         metrics::ExecutionPlanMetricsSet,
@@ -136,6 +136,7 @@ use crate::{
             },
             fts::{memos_from_plan_locations, plan_locations_for},
             prune::{PruneLeaf, select_superfiles},
+            range_counts::{RangeBucket, RangeCounts},
             read_ahead::ScanReadAhead,
             schema_adapter::TableExprAdapterFactory,
             skip::{ColumnTypeGuard, ScalarOp, ScalarPredicate},
@@ -792,6 +793,90 @@ impl SupertableProvider {
         filters: &[Expr],
         now: Instant,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let (total, unindexed) = self.range_index_count(survivors, range, now).await?;
+        // Rows with no columns, in batches of the session's size: `COUNT(*)`
+        // counts each batch's rows, and a constant it evaluates per row is
+        // never wider than a batch.
+        let schema = Arc::new(Schema::empty());
+        let batch_size = state.config().batch_size().max(1) as u64;
+        let batches = (0..total.div_ceil(batch_size))
+            .map(|b| {
+                let rows = (total - b * batch_size).min(batch_size) as usize;
+                RecordBatch::try_new_with_options(
+                    Arc::clone(&schema),
+                    vec![],
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let counted: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+        if unindexed.is_empty() {
+            return Ok(counted);
+        }
+        let rows = self
+            .unindexed_range_rows(state, unindexed, range, filters)
+            .await?;
+        UnionExec::try_new(vec![counted, rows])
+    }
+
+    /// `COUNT(*)` of the rows `filters` hold, `range` being those filters as
+    /// one interval on a range-indexed column ([`Self::counted_range`]),
+    /// counted as a counting scan counts them ([`Self::range_count_exec`]):
+    /// one bucket of a [`RangeCounts`] row.
+    pub(crate) async fn counted_rows(
+        &self,
+        state: &dyn Session,
+        range: &CountedRange,
+        filters: &[Expr],
+    ) -> DfResult<u64> {
+        let survivors = self.select_survivors(filters).await?;
+        if survivors.is_empty() {
+            return Ok(0);
+        }
+        let now = Instant::now();
+        self.prefetch_tombstones(&survivors, now).await;
+        let (total, unindexed) = self.range_index_count(&survivors, range, now).await?;
+        if unindexed.is_empty() {
+            return Ok(total);
+        }
+        let rows = self
+            .unindexed_range_rows(state, unindexed, range, filters)
+            .await?;
+        let scanned: usize = collect(rows, state.task_ctx())
+            .await?
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        Ok(total + scanned as u64)
+    }
+
+    /// A row of range counts, one per bucket, over this provider's snapshot
+    /// (see [`RangeCounts`]).
+    pub(crate) fn range_counts(&self, buckets: Vec<RangeBucket>) -> RangeCounts {
+        RangeCounts::new(self.sibling(), buckets)
+    }
+
+    /// Warm every one of `survivors`' tombstone bitmaps in one batched fetch,
+    /// mirroring the bm25 / vector fan-out (see `SidecarCache::prefetch`), so
+    /// each later `bitmap_for` resolves from cache.
+    async fn prefetch_tombstones(&self, survivors: &[Arc<SuperfileEntry>], now: Instant) {
+        if let Some(cache) = self.tombstone_cache.as_ref() {
+            let ids: Vec<_> = survivors.iter().map(|e| e.superfile_id).collect();
+            cache.prefetch(&ids, now).await;
+        }
+    }
+
+    /// The rows of `survivors` the counted `range` holds, from each
+    /// superfile's range index, and the superfiles with no range index over
+    /// the column, which the count leaves out (see
+    /// [`Self::range_count_exec`]).
+    async fn range_index_count(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        range: &CountedRange,
+        now: Instant,
+    ) -> DfResult<(u64, HashSet<Uuid>)> {
         let in_flight = self.manifest.options.superfiles_in_flight;
         let pool: &ThreadPool = &self.manifest.options.reader_pool;
         let counts = try_join_bounded(
@@ -831,26 +916,19 @@ impl SupertableProvider {
                 }
             }
         }
-        // Rows with no columns, in batches of the session's size: `COUNT(*)`
-        // counts each batch's rows, and a constant it evaluates per row is
-        // never wider than a batch.
-        let schema = Arc::new(Schema::empty());
-        let batch_size = state.config().batch_size().max(1) as u64;
-        let batches = (0..total.div_ceil(batch_size))
-            .map(|b| {
-                let rows = (total - b * batch_size).min(batch_size) as usize;
-                RecordBatch::try_new_with_options(
-                    Arc::clone(&schema),
-                    vec![],
-                    &RecordBatchOptions::new().with_row_count(Some(rows)),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let counted: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-        if unindexed.is_empty() {
-            return Ok(counted);
-        }
+        Ok((total, unindexed))
+    }
+
+    /// The rows of the `unindexed` superfiles `filters` hold, as rows with no
+    /// columns: those superfiles scanned for `range`'s column, with `filters`
+    /// applied above the scan.
+    async fn unindexed_range_rows(
+        &self,
+        state: &dyn Session,
+        unindexed: HashSet<Uuid>,
+        range: &CountedRange,
+        filters: &[Expr],
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let column = self.schema.index_of(&range.column)?;
         let scanned = self
             .restricted_to(unindexed)
@@ -866,11 +944,10 @@ impl SupertableProvider {
         let df_schema = DFSchema::try_from(scanned.schema())?;
         let predicate = create_physical_expr(&predicate, &df_schema, &ExecutionProps::new())?;
         let filtered = Arc::new(FilterExec::try_new(predicate, scanned)?);
-        let rows: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+        Ok(Arc::new(ProjectionExec::try_new(
             Vec::<ProjectionExpr>::new(),
             filtered,
-        )?);
-        UnionExec::try_new(vec![counted, rows])
+        )?))
     }
 
     /// For a scan carrying a top-k hint ([`Self::top_k`]) whose filters are
@@ -1683,14 +1760,9 @@ impl TableProvider for SupertableProvider {
         // reference.
         let now = Instant::now();
 
-        // Warm every surviving superfile's tombstone bitmap in one
-        // batched fetch before the per-superfile sweep below, mirroring
-        // the bm25 / vector fan-out (see `SidecarCache::prefetch`);
-        // each `bitmap_for` in the loop then resolves from cache.
-        if let Some(cache) = self.tombstone_cache.as_ref() {
-            let ids: Vec<_> = survivor_entries.iter().map(|e| e.superfile_id).collect();
-            cache.prefetch(&ids, now).await;
-        }
+        // Every surviving superfile's tombstones, before the per-superfile
+        // sweep below.
+        self.prefetch_tombstones(&survivor_entries, now).await;
 
         // A counting scan reads no row where a range index counts it (see
         // `range_count_exec`).

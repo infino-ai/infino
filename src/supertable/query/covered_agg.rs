@@ -11,7 +11,7 @@
 //! superfile's range index, by a scan that emits the count as rows with no
 //! columns (`SupertableProvider::counting`); so is each bucket of a
 //! bucketed range aggregation written as `COUNT(*) FILTER (WHERE range)`
-//! outputs, the buckets' counts joined into one row.
+//! outputs, every bucket's count in one row of one scan (`RangeCounts`).
 //! Other ungrouped aggregates whose `WHERE` clause is a single-column range
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
@@ -82,6 +82,7 @@ use crate::supertable::{
     manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
     query::{
         provider::{CountedRange, SupertableProvider},
+        range_counts::RangeBucket,
         skip::ColumnTypeGuard,
     },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
@@ -695,10 +696,13 @@ fn counting_scan(
 /// A bucketed range aggregation in one statement — `COUNT(*) FILTER
 /// (WHERE r)` for several ranges `r`, ungrouped — counted from the range
 /// index. A bucket's rows are those of the `WHERE` and its own filter
-/// together, so each is one range count over that conjunction; the counts,
-/// one row each, are joined into the aggregate's one row under its own
-/// names. Buckets may overlap, as a range aggregation's may: each is
-/// counted on its own.
+/// together, so each is one range count over that conjunction; one
+/// [`RangeCounts`](super::range_counts::RangeCounts) scan counts them all,
+/// as one row, under the aggregate's
+/// own names. Buckets may overlap, as a range aggregation's may: each is
+/// counted on its own. An unfiltered `COUNT(*)` beside them with no `WHERE`
+/// (the request's total) is the whole table's count, which the rule
+/// answers on its own; its row is joined to the buckets'.
 ///
 /// Declines (the scan answers) unless every output is a `COUNT(*)` and at
 /// least one carries a filter, and every bucket's rows are one interval on
@@ -724,31 +728,39 @@ fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan
         return Ok(None);
     }
 
-    let mut counts = Vec::with_capacity(buckets.len());
+    let mut ranges = Vec::with_capacity(buckets.len());
+    let mut totals = Vec::new();
     for (i, (count, filter)) in buckets.into_iter().enumerate() {
         let predicate = match (outer.clone(), filter) {
             (Some(outer), Some(filter)) => outer.and(filter),
             (Some(predicate), None) | (None, Some(predicate)) => predicate,
-            (None, None) => return Ok(None),
+            (None, None) => {
+                totals.push(
+                    LogicalPlanBuilder::from(agg.input.as_ref().clone())
+                        .aggregate(Vec::<Expr>::new(), vec![count.alias(bucket_name(i))])?
+                        .build()?,
+                );
+                continue;
+            }
         };
-        let Some(counted) = provider.counted_range(&predicate) else {
+        let Some(range) = provider.counted_range(&predicate) else {
             return Ok(None);
         };
-        let input = counting_scan(provider, scan, counted, &predicate)?;
-        counts.push(
-            LogicalPlanBuilder::from(input)
-                .aggregate(Vec::<Expr>::new(), vec![count.alias(bucket_name(i))])?
-                .build()?,
-        );
+        ranges.push(RangeBucket {
+            name: bucket_name(i),
+            range,
+            filters: split_conjunction(&predicate).into_iter().cloned().collect(),
+        });
     }
 
-    let mut counts = counts.into_iter();
-    let Some(first) = counts.next() else {
-        return Ok(None);
-    };
-    let mut joined = LogicalPlanBuilder::from(first);
-    for count in counts {
-        joined = joined.cross_join(count)?;
+    let counts = Arc::new(provider.range_counts(ranges));
+    let mut joined = LogicalPlanBuilder::scan(
+        scan.table_name.clone(),
+        provider_as_source(counts as Arc<dyn TableProvider>),
+        None,
+    )?;
+    for total in totals {
+        joined = joined.cross_join(total)?;
     }
     let names = agg
         .schema

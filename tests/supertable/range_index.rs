@@ -73,6 +73,7 @@ const QUERIES: &[&str] = &[
     "SELECT count(*) FILTER (WHERE qty < 0) AS low, count(*) FILTER (WHERE qty >= 0 AND qty < 200) AS high FROM {t} WHERE qty > -200",
     "SELECT count(*) AS n, count(*) FILTER (WHERE qty > 100) AS big FROM {t} WHERE qty > 0",
     BUCKETED_DAY,
+    BUCKETED_WITH_TOTAL,
     "SELECT count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 750.5) AS b, count(*) FILTER (WHERE price >= 750.5) AS c FROM {t}",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
@@ -101,6 +102,9 @@ const OUTPUT_ROWS: &str = "output_rows=";
 const BUCKETED_QTY: &str = "SELECT count(*) FILTER (WHERE qty < -100) AS a, count(*) FILTER (WHERE qty >= -100 AND qty < 0) AS b, count(*) FILTER (WHERE qty >= 0 AND qty < 100) AS c, count(*) FILTER (WHERE qty >= 50) AS d FROM {t}";
 /// Date buckets, quarter by quarter.
 const BUCKETED_DAY: &str = "SELECT count(*) FILTER (WHERE day < DATE '2022-04-01') AS q1, count(*) FILTER (WHERE day >= DATE '2022-04-01' AND day < DATE '2022-07-01') AS q2, count(*) FILTER (WHERE day >= DATE '2022-07-01') AS rest FROM {t}";
+/// Buckets beside the whole table's count, under a `WHERE` that holds every
+/// row: a search request's range aggregation and its hit total together.
+const BUCKETED_WITH_TOTAL: &str = "SELECT count(*) AS total, count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 500) AS b, count(*) FILTER (WHERE price >= 500) AS c FROM {t} WHERE 1=1";
 /// How a plan shows an aggregate that checks its own filter on each row; a
 /// bucketed count the range index answers has none.
 const BUCKET_FILTER: &str = "FILTER (WHERE";
@@ -236,7 +240,7 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
         );
     }
     // Nor does a bucketed one check any bucket's range on a row.
-    for bucketed in [BUCKETED_QTY, BUCKETED_DAY] {
+    for bucketed in [BUCKETED_QTY, BUCKETED_DAY, BUCKETED_WITH_TOTAL] {
         let query = format!("EXPLAIN {bucketed}");
         assert!(
             answer(&db, &query, "plain").contains(BUCKET_FILTER),
