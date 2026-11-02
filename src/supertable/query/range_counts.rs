@@ -27,11 +27,12 @@ use futures::future::try_join_all;
 use crate::supertable::query::provider::{CountedRange, SupertableProvider};
 
 /// One bucket: its output column, the `WHERE` and bucket filter together as
-/// conjuncts, and those conjuncts as one interval on a range-indexed column.
+/// conjuncts, and those conjuncts as one interval on a range-indexed column;
+/// with no conjuncts and no interval, every live row of the table.
 #[derive(Debug)]
 pub(crate) struct RangeBucket {
     pub(crate) name: String,
-    pub(crate) range: CountedRange,
+    pub(crate) range: Option<CountedRange>,
     pub(crate) filters: Vec<Expr>,
 }
 
@@ -77,7 +78,7 @@ impl TableProvider for RangeCounts {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let counts = try_join_all(self.buckets.iter().map(|bucket| {
             self.table
-                .counted_rows(state, &bucket.range, &bucket.filters)
+                .counted_rows(state, bucket.range.as_ref(), &bucket.filters)
         }))
         .await?;
         let columns = counts

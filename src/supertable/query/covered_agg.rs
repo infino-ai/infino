@@ -698,11 +698,10 @@ fn counting_scan(
 /// index. A bucket's rows are those of the `WHERE` and its own filter
 /// together, so each is one range count over that conjunction; one
 /// [`RangeCounts`](super::range_counts::RangeCounts) scan counts them all,
-/// as one row, under the aggregate's
-/// own names. Buckets may overlap, as a range aggregation's may: each is
-/// counted on its own. An unfiltered `COUNT(*)` beside them with no `WHERE`
-/// (the request's total) is the whole table's count, which the rule
-/// answers on its own; its row is joined to the buckets'.
+/// as one row, under the aggregate's own names. Buckets may overlap, as a
+/// range aggregation's may: each is counted on its own. An unfiltered
+/// `COUNT(*)` beside them with no `WHERE` (the request's total) is the
+/// table's live rows, counted in the same scan.
 ///
 /// Declines (the scan answers) unless every output is a `COUNT(*)` and at
 /// least one carries a filter, and every bucket's rows are one interval on
@@ -729,17 +728,16 @@ fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan
     }
 
     let mut ranges = Vec::with_capacity(buckets.len());
-    let mut totals = Vec::new();
-    for (i, (count, filter)) in buckets.into_iter().enumerate() {
+    for (i, (_, filter)) in buckets.into_iter().enumerate() {
         let predicate = match (outer.clone(), filter) {
             (Some(outer), Some(filter)) => outer.and(filter),
             (Some(predicate), None) | (None, Some(predicate)) => predicate,
             (None, None) => {
-                totals.push(
-                    LogicalPlanBuilder::from(agg.input.as_ref().clone())
-                        .aggregate(Vec::<Expr>::new(), vec![count.alias(bucket_name(i))])?
-                        .build()?,
-                );
+                ranges.push(RangeBucket {
+                    name: bucket_name(i),
+                    range: None,
+                    filters: Vec::new(),
+                });
                 continue;
             }
         };
@@ -748,20 +746,17 @@ fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan
         };
         ranges.push(RangeBucket {
             name: bucket_name(i),
-            range,
+            range: Some(range),
             filters: split_conjunction(&predicate).into_iter().cloned().collect(),
         });
     }
 
     let counts = Arc::new(provider.range_counts(ranges));
-    let mut joined = LogicalPlanBuilder::scan(
+    let joined = LogicalPlanBuilder::scan(
         scan.table_name.clone(),
         provider_as_source(counts as Arc<dyn TableProvider>),
         None,
     )?;
-    for total in totals {
-        joined = joined.cross_join(total)?;
-    }
     let names = agg
         .schema
         .fields()

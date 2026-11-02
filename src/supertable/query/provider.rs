@@ -823,11 +823,13 @@ impl SupertableProvider {
     /// `COUNT(*)` of the rows `filters` hold, `range` being those filters as
     /// one interval on a range-indexed column ([`Self::counted_range`]),
     /// counted as a counting scan counts them ([`Self::range_count_exec`]):
-    /// one bucket of a [`RangeCounts`] row.
+    /// one bucket of a [`RangeCounts`] row. With no `range` (and no
+    /// filters), every live row: each superfile's rows less its deleted
+    /// ones, read from the manifest and the tombstones alone.
     pub(crate) async fn counted_rows(
         &self,
         state: &dyn Session,
-        range: &CountedRange,
+        range: Option<&CountedRange>,
         filters: &[Expr],
     ) -> DfResult<u64> {
         let survivors = self.select_survivors(filters).await?;
@@ -836,6 +838,20 @@ impl SupertableProvider {
         }
         let now = Instant::now();
         self.prefetch_tombstones(&survivors, now).await;
+        let Some(range) = range else {
+            let mut live = 0u64;
+            for entry in &survivors {
+                let deleted = match self.tombstone_cache.as_ref() {
+                    Some(cache) => cache
+                        .bitmap_for(entry.superfile_id, now)
+                        .map_err(QueryError::tombstone_cache)?
+                        .len(),
+                    None => 0,
+                };
+                live += entry.n_docs - deleted;
+            }
+            return Ok(live);
+        };
         let (total, unindexed) = self.range_index_count(&survivors, range, now).await?;
         if unindexed.is_empty() {
             return Ok(total);
