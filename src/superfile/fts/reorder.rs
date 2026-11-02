@@ -123,8 +123,9 @@ const REORDER_MAX_ROUNDS: usize = 20;
 pub(crate) struct BisectParams {
     /// Stop once a round's realised gain per document falls below this
     /// fraction of the run's reference gain per document, which [`Bisect`]
-    /// takes from the root split's first round — not from the first round of
-    /// the split being tested. `0.0` disables the test.
+    /// takes from the root split's first round, or from the first completed
+    /// level below it when the root's lowered nothing — never from the first
+    /// round of the split being tested. `0.0` disables the test.
     pub(crate) convergence: f32,
     /// Ceiling on a split's move rounds whatever `convergence` says.
     pub(crate) max_rounds: usize,
@@ -133,8 +134,10 @@ pub(crate) struct BisectParams {
 /// A bisection in progress: the limits in force, plus the reference the
 /// convergence test measures rounds against.
 ///
-/// The reference is the gain per document of the first split's first round —
-/// the root's, since it is processed first — so the bar is taken from the
+/// The reference is the gain per document of the first first round that
+/// lowered the cost: the root's, since it is processed first, or, when the
+/// root moved documents without lowering anything, the summed first rounds of
+/// the first level below it that did. Either way the bar is taken from the
 /// corpus rather than chosen. Measuring a round against it, rather than
 /// against the first round of the split the round belongs to, is what stops
 /// large partitions being cut short: a big partition banks most of its
@@ -153,13 +156,13 @@ pub(crate) struct Bisect<'a> {
 }
 
 impl Bisect<'_> {
-    /// Whether a round that realised `gain` over `len` documents means this
-    /// split has stopped paying.
     /// Whether an offer has set the bar yet.
     fn has_reference(&self) -> bool {
         self.reference.load(Relaxed) != 0
     }
 
+    /// Whether a round that realised `gain` over `len` documents means this
+    /// split has stopped paying.
     fn converged(&self, gain: f64, len: usize) -> bool {
         if self.params.convergence <= 0.0 {
             return false;
@@ -694,14 +697,11 @@ fn split_parallel(
     // the subtrees are already running side by side, and a round waiting on its
     // own parallel pieces would steal a whole queued subtree and finish it
     // before resuming, which put one split's ranking at 46 s instead of 0.3 s.
-    let first_round = pool.with_state(|state| {
-        let first_round = state.refine(fwd, order, mid, depth, depth == 0, run);
+    // The root's first round offers the bar from inside `refine`.
+    pool.with_state(|state| {
+        state.refine(fwd, order, mid, depth, depth == 0, run);
         state.flush(run.report);
-        first_round
     });
-    if depth == 0 {
-        run.offer_reference(first_round, order.len());
-    }
     let (left, right) = order.split_at_mut(mid);
     let (left_done, right_done) = join(
         || {
@@ -925,10 +925,8 @@ impl BisectState {
     /// twice to reach the answer it already has.
     fn split_halves(&mut self, fwd: &ForwardIndex, order: &mut [u32], depth: u32, run: Bisect<'_>) {
         let mid = order.len() / 2;
-        let first_round = self.refine(fwd, order, mid, depth, false, run);
-        if depth == 0 {
-            run.offer_reference(first_round, order.len());
-        }
+        // The root's first round offers the bar from inside `refine`.
+        self.refine(fwd, order, mid, depth, false, run);
         let (left, right) = order.split_at_mut(mid);
         self.split(fwd, left, depth + 1, run);
         self.split(fwd, right, depth + 1, run);
