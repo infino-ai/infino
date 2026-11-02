@@ -1707,11 +1707,13 @@ fn build_range(
     let mut writer = LayerWriter::new(policy, scoring.clone())?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
+    let (mut n_terms, mut n_postings) = (0u64, 0u64);
 
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
         run.clear();
         entries.clear();
+        n_terms += 1;
         let mut take = |ordinal: u32,
                         run: &mut Vec<Posting>,
                         pending: &mut Vec<Option<(Posting, Vec<(u32, u32, u8)>)>>,
@@ -1768,6 +1770,7 @@ fn build_range(
         // megabytes per superfile, per query, where the postings it wants
         // are kilobytes — so the location is worth most exactly where it
         // was once dropped.
+        n_postings += run.len() as u64;
         writer.add_term(
             &key,
             mem::take(&mut run),
@@ -1776,6 +1779,8 @@ fn build_range(
         )?;
     }
     let (layer, slices, tiers, _) = writer.finish()?;
+    record("terms", n_terms);
+    record("postings", n_postings);
     Ok(MergedLayer {
         layer,
         slices,
@@ -2137,7 +2142,9 @@ fn run_ranges(
                     scope.spawn(move |_| {
                         let _span = detail_span!(
                             "build.range",
-                            start = start.as_ref().map_or(0, |key| key.len())
+                            start = start.as_ref().map_or(0, |key| key.len()),
+                            terms = tracing::field::Empty,
+                            postings = tracing::field::Empty,
                         )
                         .entered();
                         let part = one(start.as_deref(), end.as_deref());
