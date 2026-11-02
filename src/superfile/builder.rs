@@ -863,6 +863,13 @@ pub struct BuilderOptions {
     /// `None` outside compaction, where there is no run to honour and the
     /// configured value is the only one there is.
     pub(crate) merge_input_mb: Option<u64>,
+    /// Finish on the calling thread alone: no join or parallel encode
+    /// inside the pool. Set for a build that is itself one of many pool
+    /// tasks running side by side, such as a piece of an append, where a
+    /// wait inside the pool runs whatever else is queued and a piece was
+    /// seen to carry another's fifty-second build. A build with the pool
+    /// to itself, such as a compaction merge, leaves it off.
+    pub(crate) finish_serial: bool,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -1010,6 +1017,7 @@ impl BuilderOptions {
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
             merge_input_mb: None,
+            finish_serial: false,
         }
     }
 
@@ -1039,6 +1047,7 @@ impl BuilderOptions {
             row_group_size: self.row_group_size,
             dictionary_candidates,
             column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
+            encode_groups_together: !self.finish_serial,
         }
     }
 
@@ -1672,6 +1681,13 @@ impl SuperfileBuilder {
     /// streaming-dictionary finish path on a corpus too small to cross the
     /// default 256 MiB threshold; production callers should leave
     /// the default in place.
+    /// Finish on the calling thread alone (see
+    /// [`BuilderOptions::finish_serial`]): for a build that is itself one
+    /// of many pool tasks running side by side.
+    pub(crate) fn set_finish_serial(&mut self) {
+        self.opts.finish_serial = true;
+    }
+
     pub fn set_fts_spill_threshold_bytes(&mut self, threshold: usize) {
         if let Some(fb) = self.fts_builder.as_mut() {
             fb.set_spill_threshold_bytes(threshold);
@@ -3615,6 +3631,16 @@ impl SuperfileBuilder {
                 vec_builder,
                 cell_posting_builder,
                 prebuilt_multi_cell,
+                self.opts.finish_serial,
+            )?;
+            (encode_body()?, fts_file, vec_file)
+        } else if self.opts.finish_serial {
+            let (fts_file, vec_file) = stream_index_blobs_to_scratch(
+                fts_builder,
+                vec_builder,
+                cell_posting_builder,
+                prebuilt_multi_cell,
+                true,
             )?;
             (encode_body()?, fts_file, vec_file)
         } else {
@@ -3624,6 +3650,7 @@ impl SuperfileBuilder {
                     vec_builder,
                     cell_posting_builder,
                     prebuilt_multi_cell,
+                    false,
                 )
             });
             let (fts_file, vec_file) = blobs_res?;
@@ -3678,6 +3705,7 @@ impl SuperfileBuilder {
             vec_builder,
             cell_posting_builder,
             prebuilt_multi_cell,
+            self.opts.finish_serial,
         )?;
         splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
@@ -3808,7 +3836,8 @@ impl SuperfileBuilder {
             ));
         }
 
-        let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(fts_builder, None, None, None)?;
+        let (fts_file, _empty_vec) =
+            stream_index_blobs_to_scratch(fts_builder, None, None, None, self.opts.finish_serial)?;
         let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
         splice_carried_body_to(
             Cursor::new(&body),
@@ -4169,6 +4198,7 @@ fn stream_index_blobs_to_scratch(
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
+    serial: bool,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
     let scratch_root = scratch_root();
 
@@ -4187,6 +4217,7 @@ fn stream_index_blobs_to_scratch(
         prebuilt_multi_cell,
         &mut fw,
         &mut vw,
+        serial,
     )?;
 
     fw.flush().map_err(BuildError::Io)?;
@@ -4259,6 +4290,7 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
     fts_out: &mut Wf,
     vec_out: &mut Wv,
+    serial: bool,
 ) -> Result<(), BuildError> {
     if let Some(cells) = prebuilt_multi_cell {
         if vec_builder.is_some() || cell_posting_builder.is_some() {
@@ -4274,6 +4306,10 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
         return Ok(());
     }
     match (fts_builder, vec_builder, cell_posting_builder) {
+        (Some(fb), Some(vb), None) if serial => {
+            fb.finish_to(fts_out)?;
+            vb.finish_to(vec_out)?;
+        }
         (Some(fb), Some(vb), None) => {
             // Disjoint sinks, so the two finalizers can run concurrently.
             let (fts_res, vec_res) =

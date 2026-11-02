@@ -3806,6 +3806,9 @@ fn open_shard_builder(
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
+    // A piece is one of many pool tasks running side by side; its finish
+    // fans out to no other thread.
+    builder.set_finish_serial();
     let superfile_id = Uuid::new_v4();
     let head_sink = term_head_sink_for(manifest)?;
     if let Some((sink, depth)) = &head_sink {

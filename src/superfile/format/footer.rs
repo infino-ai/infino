@@ -228,6 +228,9 @@ pub(crate) struct ParquetBodyEncoder {
     held_rows: usize,
     /// Full row groups not yet encoded, oldest first.
     full: Vec<Vec<RecordBatch>>,
+    /// Whether held groups are encoded side by side on the pool, or one at
+    /// a time on this thread (see [`BodyPlan::encode_groups_together`]).
+    together: bool,
 }
 
 /// Full row groups the encoder holds before encoding them side by side,
@@ -249,6 +252,7 @@ impl ParquetBodyEncoder {
             row_group_size,
             column_page_size_limits,
             &[],
+            true,
         )
     }
 
@@ -259,6 +263,7 @@ impl ParquetBodyEncoder {
         row_group_size: usize,
         column_page_size_limits: &[(&str, usize)],
         plain_columns: &[String],
+        together: bool,
     ) -> Result<Self, FooterError> {
         let props = writer_properties(
             compression,
@@ -288,6 +293,7 @@ impl ParquetBodyEncoder {
             held: Vec::new(),
             held_rows: 0,
             full: Vec::new(),
+            together,
         })
     }
 
@@ -303,7 +309,11 @@ impl ParquetBodyEncoder {
             if self.held_rows >= self.row_group_size {
                 self.full.push(mem::take(&mut self.held));
                 self.held_rows = 0;
-                if self.full.len() >= ROW_GROUPS_ENCODED_TOGETHER {
+                let held = match self.together {
+                    true => ROW_GROUPS_ENCODED_TOGETHER,
+                    false => 1,
+                };
+                if self.full.len() >= held {
                     self.flush_row_groups()?;
                 }
             }
@@ -345,9 +355,14 @@ impl ParquetBodyEncoder {
             .flatten()
             .zip(leaves.iter().flatten())
             .collect();
-        tasks.par_iter_mut().try_for_each(|(writer, leaves)| {
-            leaves.iter().try_for_each(|leaf| writer.write(leaf))
-        })?;
+        match self.together {
+            true => tasks.par_iter_mut().try_for_each(|(writer, leaves)| {
+                leaves.iter().try_for_each(|leaf| writer.write(leaf))
+            })?,
+            false => tasks.iter_mut().try_for_each(|(writer, leaves)| {
+                leaves.iter().try_for_each(|leaf| writer.write(leaf))
+            })?,
+        }
         for group_writers in writers {
             let mut row_group = self.writer.next_row_group()?;
             for writer in group_writers {
@@ -436,6 +451,14 @@ pub(crate) struct BodyPlan {
     pub(crate) dictionary_candidates: Vec<String>,
     /// Per-column data-page size limits, as for [`encode_parquet_body`].
     pub(crate) column_page_size_limits: Vec<(String, usize)>,
+    /// Encode several full row groups side by side on the pool, one task
+    /// per leaf column per group, rather than one group at a time on the
+    /// calling thread. Right for a build that has the pool to itself, such
+    /// as a compaction merge; wrong for one of many builds already running
+    /// side by side as pool tasks, where a wait inside the pool runs
+    /// whatever else is queued — one such piece carried another's whole
+    /// fifty-second build.
+    pub(crate) encode_groups_together: bool,
 }
 
 impl BodyPlan {
@@ -580,6 +603,7 @@ impl PlannedBodyEncoder {
             self.plan.row_group_size,
             &self.plan.page_size_limits(),
             &plain_columns,
+            self.plan.encode_groups_together,
         )?;
         for batch in mem::take(&mut self.held) {
             encoder.write_batch(&batch)?;
@@ -1693,6 +1717,7 @@ mod tests {
             row_group_size: TEST_GROUP_ROWS,
             dictionary_candidates: schema.fields().iter().map(|f| f.name().clone()).collect(),
             column_page_size_limits: Vec::new(),
+            encode_groups_together: true,
         }
     }
 
