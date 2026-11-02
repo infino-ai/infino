@@ -16267,6 +16267,27 @@ mod tests {
         }
     }
 
+    /// The summary lists cells in the reader's directory order, with each
+    /// cell's row count equal to the reader's. Filtered vector search maps a
+    /// hidden file-local id to its cell by summing summary counts in this
+    /// order, while the probe numbers rows by the reader's cell sizes; the
+    /// two must agree cell for cell, order included.
+    #[test]
+    fn cell_doc_counts_from_summary_match_the_reader_in_order() {
+        let (_dir, _st, hidden) = drained_hidden_two_cells();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        assert!(!manifest.superfiles.is_empty());
+        for entry in manifest.superfiles.iter() {
+            let from_summary =
+                cell_doc_counts_from_summary(&inner, entry, None).expect("drained summary");
+            let from_reader = hidden
+                .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
+                .expect("reader counts");
+            assert_eq!(from_summary, from_reader);
+        }
+    }
+
     #[test]
     fn cell_doc_counts_fall_back_to_the_reader_without_a_summary() {
         let (_dir, _st, hidden) = drained_hidden_two_cells();
