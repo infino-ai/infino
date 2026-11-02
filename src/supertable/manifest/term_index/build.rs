@@ -28,7 +28,7 @@ use std::{
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -2055,15 +2055,40 @@ fn run_ranges(
     if let [(start, end)] = ranges {
         return one(start.as_deref(), end.as_deref());
     }
-    let run_all = || -> Result<Vec<MergedLayer>, TermIndexError> {
-        ranges
+    let parts = match policy.pool.as_deref() {
+        // Each range a task of its own, this thread — outside the pool —
+        // waiting here. Under `install` the pool thread that owned the
+        // build ran whatever else was queued while its ranges ran, and
+        // with thirty appends in flight that was other commits' piece
+        // builds: a commit's layer took 7.7 s of wall for 1.8 s of work,
+        // and every publish queued behind its ticket waited with it.
+        Some(pool) => {
+            let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
+                ranges.iter().map(|_| Mutex::new(None)).collect();
+            let one = &one;
+            pool.in_place_scope(|scope| {
+                for ((start, end), slot) in ranges.iter().zip(&slots) {
+                    scope.spawn(move |_| {
+                        let part = one(start.as_deref(), end.as_deref());
+                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
+                    });
+                }
+            });
+            slots
+                .into_iter()
+                .map(|slot| {
+                    slot.into_inner()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .ok_or_else(|| {
+                            TermIndexError::Build("a build range ended without a result".into())
+                        })?
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => ranges
             .par_iter()
             .map(|(start, end)| one(start.as_deref(), end.as_deref()))
-            .collect()
-    };
-    let parts = match policy.pool.as_deref() {
-        Some(pool) => pool.install(run_all)?,
-        None => run_all()?,
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let mut layer = Layer::default();
     let mut slices = Vec::new();
