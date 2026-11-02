@@ -1739,6 +1739,8 @@ pub(crate) struct PreparedGlobalAllow {
 /// read concurrently and each `_id` column is decoded at most once for the
 /// entire top-k. The previous per-hit lookup could decode the same full column
 /// twice per hit: once to identify its owner and again to locate its row.
+/// Every id must be a row; the tests that pin placement use it.
+#[cfg(test)]
 async fn lookup_user_placements_by_id(
     manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
@@ -1756,10 +1758,9 @@ async fn lookup_user_placements_by_id(
         .collect()
 }
 
-/// [`lookup_user_placements_by_id`] for ids that may no longer be rows —
-/// `None` for one no live superfile owns. A graph walk reaches nodes by
-/// an edge table that can lag the rows it names; a row gone since the edge
-/// was written is skipped, not an error.
+/// Resolve stable user ids to their Parquet `(superfile, local_doc_id)`, as
+/// `lookup_user_placements_by_id` does, for ids that may no longer be rows —
+/// `None` for one no live superfile owns (see [`MissingRow`]).
 pub(crate) async fn lookup_user_placements_by_id_opt(
     manifest: &ManifestSnapshot,
     user_row_ids: &[i128],
@@ -2472,9 +2473,13 @@ pub(crate) fn hits_id_score_batch(
 /// What placement does with a hit whose `_id` no live superfile owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MissingRow {
-    /// A search hit's id is always a row — identity resolution belongs
-    /// before this boundary — so a missing one is an upstream bug.
-    Error,
+    /// A search hit's id should always be a row of the query's snapshot, so
+    /// a missing one is a hidden index holding a row the user table retired
+    /// (a mutation it never recorded) or one from a newer snapshot. Either
+    /// way the row is not in the snapshot the query reads, so the hit is
+    /// left out, as a deleted row is, and logged: failing the whole search
+    /// for one stale hit would take every query that reaches it down.
+    Drift,
     /// A graph walk reaches rows through an edge table that can lag the
     /// rows it names; one gone since the edge was written is skipped, as a
     /// deleted row is.
@@ -2489,7 +2494,7 @@ pub(crate) async fn user_placement_for_scalar_resolve(
     user_reader: &SupertableReader,
     hits: &[SuperfileHit],
 ) -> Result<Vec<SuperfileHit>, QueryError> {
-    place_for_scalar_resolve(user_reader, hits, MissingRow::Error).await
+    place_for_scalar_resolve(user_reader, hits, MissingRow::Drift).await
 }
 
 /// [`user_placement_for_scalar_resolve`] with `missing` saying what a hit
@@ -2555,20 +2560,25 @@ pub(crate) async fn place_for_scalar_resolve(
         placement_requests.push((i, user_row_id));
     }
     let requested_ids: Vec<i128> = placement_requests.iter().map(|(_, id)| *id).collect();
-    let placements: Vec<Option<(Arc<SuperfileEntry>, u32)>> = match missing {
-        MissingRow::Error => {
-            lookup_user_placements_by_id(user_manifest, &requested_ids, &user_reader.op_stats)
-                .await?
-                .into_iter()
-                .map(Some)
-                .collect()
+    let placements =
+        lookup_user_placements_by_id_opt(user_manifest, &requested_ids, &user_reader.op_stats)
+            .await?;
+    if missing == MissingRow::Drift {
+        let unowned: Vec<i128> = requested_ids
+            .iter()
+            .zip(&placements)
+            .filter(|(_, placement)| placement.is_none())
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(first) = unowned.first() {
+            warn!(
+                n_hits = unowned.len(),
+                first_id = %first,
+                "vector search: hits whose _id no user superfile of the query's snapshot owns \
+                 were left out; the hidden vector index holds rows the user table retired"
+            );
         }
-        #[cfg(feature = "graph-index")]
-        MissingRow::Skip => {
-            lookup_user_placements_by_id_opt(user_manifest, &requested_ids, &user_reader.op_stats)
-                .await?
-        }
-    };
+    }
     for ((index, stable_id), placement) in placement_requests.into_iter().zip(placements) {
         let Some((entry, local_doc_id)) = placement else {
             continue;

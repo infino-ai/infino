@@ -2338,16 +2338,6 @@ impl SupertableWriter {
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
-        // The hidden vector-index cells are not rewritten on a user delete, so
-        // the deleted rows stay physically present in them. Record the resolved
-        // user `_id`s into the hidden index's resident deleted-set so vector
-        // search drops them in memory (zero per-cell tombstone GETs).
-        let hidden_inner = self
-            .inner
-            .vector_index_table
-            .as_ref()
-            .map(|vit| Arc::clone(vit.inner()));
-        let deleted_ids: Vec<i128> = entry.target_ids.clone();
         let owner = self.inner.handle_id;
         let drive = async move {
             let etag = wal_store
@@ -2374,15 +2364,6 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
-            if let Some(hi) = hidden_inner
-                && let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await
-            {
-                tracing::warn!(
-                    "supertable: hidden vector-index deleted-set record failed: {e} \
-                     (user-table delete is durable; vector search may transiently \
-                     return deleted rows until the next successful record)"
-                );
-            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -12360,7 +12341,10 @@ async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: Supe
     }
 }
 
-async fn record_hidden_deleted_ids(
+/// Add `new_deleted` to the hidden vector-index table's deleted-`_id` set
+/// (see [`hidden_deleted`]), committing a new hidden manifest; a no-op when
+/// every id is in the set already. `inner` is the hidden table's.
+pub(in crate::supertable) async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],
 ) -> Result<(), BuildError> {
