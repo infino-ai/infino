@@ -66,7 +66,7 @@ use rayon::ThreadPool;
 use rebase::{OrdinalShift, rebase_layer, remove_spilled};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet};
+use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet, try_join};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -136,8 +136,10 @@ const LAYER_FETCH_CONCURRENCY: usize = 64;
 
 /// Objects one build writes at once; the write-side twin of
 /// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
-/// object is read back only as its upload starts.
-const SLICE_WRITE_CONCURRENCY: usize = 16;
+/// object is read back only as its upload starts. At sixteen, a fold's
+/// four hundred slices and as many tier objects took half a minute of
+/// 400 ms PUTs, longer than the merge that made them.
+const SLICE_WRITE_CONCURRENCY: usize = LAYER_FETCH_CONCURRENCY;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -388,6 +390,19 @@ pub(crate) async fn write_tiers(
     write_objects(storage, "tier", tiers).await
 }
 
+/// Persist a build's tier objects and slices side by side. A slice names
+/// its tier object and the root names the slices, and the root is written
+/// only after both, so nothing reads either before it is durable; one
+/// kind after the other was two serial rounds of small PUTs.
+async fn write_tiers_and_slices(
+    storage: &Arc<dyn StorageProvider>,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
+    slices: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    try_join!(write_tiers(storage, tiers), write_slices(storage, slices))?;
+    Ok(())
+}
+
 async fn write_objects(
     storage: &Arc<dyn StorageProvider>,
     kind: &'static str,
@@ -471,8 +486,7 @@ pub(crate) async fn write_built(
     storage: &Arc<dyn StorageProvider>,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
-    write_tiers(storage, built.tiers).await?;
-    write_slices(storage, built.slices).await?;
+    write_tiers_and_slices(storage, built.tiers, built.slices).await?;
     write_root(storage.as_ref(), &built.root).await
 }
 
@@ -492,8 +506,7 @@ pub(crate) async fn append_delta(
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
     let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
-    write_tiers(storage, built.tiers).await?;
-    write_slices(storage, built.slices).await?;
+    write_tiers_and_slices(storage, built.tiers, built.slices).await?;
     publish_root(storage, built.root, policy, pool).await
 }
 
@@ -551,8 +564,7 @@ pub(crate) async fn reserve_layer(
         ordinal_base = base,
     )
     .in_scope(|| build_layer(contributions, policy, base))?;
-    write_tiers(storage, built.tiers.clone()).await?;
-    write_slices(storage, built.slices.clone()).await?;
+    write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
     Ok(ReservedLayer {
         base,
         superfiles: built.superfiles,
@@ -605,8 +617,7 @@ async fn move_reserved(
             return Ok(None);
         }
     };
-    write_tiers(storage, moved.tiers.clone()).await?;
-    write_slices(storage, moved.slices.clone()).await?;
+    write_tiers_and_slices(storage, moved.tiers.clone(), moved.slices.clone()).await?;
     Ok(Some(ReservedLayer {
         base,
         superfiles: reserved.superfiles.clone(),
@@ -907,8 +918,7 @@ async fn fold_layers(
     })
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    write_slices(storage, merged.slices).await?;
-    write_tiers(storage, merged.tiers).await?;
+    write_tiers_and_slices(storage, merged.tiers, merged.slices).await?;
     Ok(merged.layer)
 }
 
