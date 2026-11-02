@@ -62,7 +62,7 @@ use crate::{
     supertable::{manifest::part::ContentHash, schema::FieldId},
     utils::{
         terms::{DictEntry, TermBlockWriter},
-        trace::detail_span,
+        trace::{detail_span, record},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -1638,7 +1638,10 @@ fn build_ranges(
     for c in contributions {
         lens.push(fs::metadata(&c.path)?.len());
     }
-    let want = build_range_count(policy, lens.iter().sum())?;
+    let bytes: u64 = lens.iter().sum();
+    let want = build_range_count(policy, bytes)?;
+    record("bytes", bytes);
+    record("ranges", want as u64);
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }

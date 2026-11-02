@@ -555,8 +555,13 @@ pub(crate) async fn reserve_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<ReservedLayer, TermIndexError> {
-    let built = detail_span!("term_index.build_layer", inputs = contributions.len())
-        .in_scope(|| build_layer(contributions, policy))?;
+    let built = detail_span!(
+        "term_index.build_layer",
+        inputs = contributions.len(),
+        bytes = tracing::field::Empty,
+        ranges = tracing::field::Empty,
+    )
+    .in_scope(|| build_layer(contributions, policy))?;
     write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
     Ok(ReservedLayer {
         superfiles: built.superfiles,
