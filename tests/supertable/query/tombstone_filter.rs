@@ -68,13 +68,14 @@ const VECTOR_SEARCH_K: usize = 5;
 /// for them land in different millisecond ticks (a gapped id span).
 const ID_GAP_WAIT: Duration = Duration::from_millis(20);
 /// Rows in the `LIMIT` fixture. With [`LIMIT_FIXTURE_TITLE_LEN`]-character
-/// pseudo-random titles the superfile (Parquet pages plus the embedded
-/// term index over as many distinct terms) passes DataFusion's 10 MiB
-/// `repartition_file_min_size`, so the scan is split into byte ranges
-/// across partitions — the production shape — instead of getting a
-/// round-robin `RepartitionExec` that would stop a `LIMIT` short of the
-/// scan and hide the bug under test. The test asserts that shape.
-const LIMIT_FIXTURE_ROWS: usize = 60_000;
+/// pseudo-random titles the superfile's row groups — the bytes the scan
+/// reads; the embedded indexes after them are left out of its range —
+/// pass DataFusion's 10 MiB `repartition_file_min_size`, so the scan is
+/// split into byte ranges across partitions — the production shape —
+/// instead of getting a round-robin `RepartitionExec` that would stop a
+/// `LIMIT` short of the scan and hide the bug under test. The test
+/// asserts that shape.
+const LIMIT_FIXTURE_ROWS: usize = 140_000;
 /// Characters per pseudo-random title in the `LIMIT` fixture.
 const LIMIT_FIXTURE_TITLE_LEN: usize = 128;
 /// `LIMIT` small enough that one fully matching row group satisfies it.
