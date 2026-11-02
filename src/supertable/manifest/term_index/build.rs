@@ -2363,9 +2363,10 @@ pub(crate) struct MergedLayer {
 
 #[cfg(test)]
 mod contribution_mark_tests {
+    use rayon::ThreadPoolBuilder;
+
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
-    use rayon::ThreadPoolBuilder;
 
     /// A contribution gathered through a [`HeadSink`] from two columns, ids
     /// 3 and 12, with 3's terms handed over first: `"12\x1f…"` sorts before
