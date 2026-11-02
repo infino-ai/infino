@@ -299,14 +299,24 @@ async fn read_range(source: Arc<dyn LazyByteSource>, range: Range<u64>) -> OsRes
         })
 }
 
-/// How the store merges `ranges` into reads: sorted, and merged where the
-/// gap between two is at most object_store's default coalesce distance. The
-/// one merge rule for counting and charging, and for fetching, except that a
-/// scan's own reads may also join cold pages of one column chunk up to 2 MiB
-/// apart (see the read-ahead module). It matches
-/// object_store's own `coalesce_ranges` (pinned by a test), so merging is the
-/// same as the default `get_ranges`.
+/// How the store merges `ranges` into reads: [`merged_within`] object_store's
+/// default coalesce distance. The one merge rule for counting and charging,
+/// and for fetching, except that a scan's own reads may also join cold pages
+/// of one column chunk up to 2 MiB apart (see the read-ahead module). It
+/// matches object_store's own `coalesce_ranges` (pinned by a test), so
+/// merging is the same as the default `get_ranges`.
 pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+    merged_within(ranges, OBJECT_STORE_COALESCE_DEFAULT)
+}
+
+/// Gap at which exact reads (a take's pages, stable-id blocks) share one
+/// read. Smaller than [`merged_ranges`]' coalesce distance: those reads are
+/// scattered pages, and at the 1 MiB distance a 4M-row take read 4x the bytes
+/// for no fewer GETs.
+pub(crate) const EXACT_MERGE_GAP_BYTES: u64 = 128 * 1024;
+
+/// `ranges` sorted, and merged where at most `gap` bytes apart.
+pub(crate) fn merged_within(ranges: &[Range<u64>], gap: u64) -> Vec<Range<u64>> {
     let mut sorted = ranges.to_vec();
     sorted.sort_unstable_by_key(|range| range.start);
     let mut merged: Vec<Range<u64>> = Vec::with_capacity(sorted.len());
@@ -316,7 +326,7 @@ pub(crate) fn merged_ranges(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
                 if range
                     .start
                     .checked_sub(last.end)
-                    .is_none_or(|gap| gap <= OBJECT_STORE_COALESCE_DEFAULT) =>
+                    .is_none_or(|between| between <= gap) =>
             {
                 last.end = last.end.max(range.end);
             }

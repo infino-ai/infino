@@ -84,7 +84,10 @@ use crate::{
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
         },
     },
-    supertable::{query::provider::tombstone_access_plan, schema::FieldId},
+    supertable::{
+        query::{df_object_store::merged_within, provider::tombstone_access_plan},
+        schema::FieldId,
+    },
     utils::terms::DictEntry,
 };
 /// Speculative Parquet-footer tail length for a lazy open. 64 KiB
@@ -1599,10 +1602,13 @@ impl SuperfileReader {
     /// packed sidecar or its sidecar was found broken; a read that fails is
     /// an error the caller answers from Parquet instead, and a block that
     /// does not decode marks the sidecar broken, as a whole-sidecar read
-    /// would, so later reads skip it.
+    /// would, so later reads skip it. Blocks at most `gap` bytes apart share
+    /// one read
+    /// ([`EXACT_MERGE_GAP_BYTES`](crate::supertable::query::df_object_store::EXACT_MERGE_GAP_BYTES)).
     pub(crate) async fn ids_from_sidecar_blocks(
         &self,
         local_doc_ids: &[u32],
+        gap: u64,
     ) -> Result<Option<ArrayRef>, ReadError> {
         let Some(loc) = self.id_sidecar else {
             return Ok(None);
@@ -1651,13 +1657,41 @@ impl SuperfileReader {
                 })
             })
             .collect::<Result<_, _>>()?;
-        let bodies = try_join_all(
-            ranges
+        // The merge below takes each block to start past the one before it;
+        // a directory that says otherwise is corrupt.
+        if let Some(w) = ranges.windows(2).find(|w| w[1].start < w[0].end) {
+            return Err(malformed(format!(
+                "stable-id sidecar block at {}..{} starts before the one before it ends at {}",
+                w[1].start, w[1].end, w[0].end
+            )));
+        }
+        // Exact reads, since a block is a few KB and a cache widening each to
+        // its read window downloaded hundreds of KB per hit; blocks closer
+        // than `gap` share one read, so a superfile with many
+        // hits costs a few reads rather than one per block.
+        let blocks_at: Vec<Range<u64>> = ranges
+            .iter()
+            .map(|r| r.start as u64..r.end as u64)
+            .collect();
+        let spans: Vec<Range<usize>> = merged_within(&blocks_at, gap)
+            .into_iter()
+            .map(|r| r.start as usize..r.end as usize)
+            .collect();
+        let span_bodies = try_join_all(
+            spans
                 .iter()
-                .map(|r| source.range(loc.offset + r.start as u64, r.len() as u64)),
+                .map(|r| source.range_exact(loc.offset + r.start as u64, r.len() as u64)),
         )
         .await
         .map_err(fetch("stable-id sidecar block fetch"))?;
+        let bodies: Vec<Bytes> = ranges
+            .iter()
+            .map(|r| {
+                let at = spans.partition_point(|span| span.end <= r.start);
+                let span = &spans[at];
+                span_bodies[at].slice(r.start - span.start..r.end - span.start)
+            })
+            .collect();
         let mut by_doc: Vec<i128> = Vec::with_capacity(sorted.len());
         let mut at = 0usize;
         for (&b, body) in blocks.iter().zip(&bodies) {
@@ -3134,6 +3168,9 @@ mod tests {
             ids,
             vector::distance::normalize,
         },
+        supertable::query::{
+            df_object_store::EXACT_MERGE_GAP_BYTES, read_ahead::fixture::Superfile,
+        },
         test_helpers::{capture_logs, decimal128_ids, default_vector_config},
     };
 
@@ -3520,7 +3557,7 @@ mod tests {
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
         let lazy = lazy_shuffled_id_reader(bytes.clone()).await;
         let got = lazy
-            .ids_from_sidecar_blocks(&locals)
+            .ids_from_sidecar_blocks(&locals, EXACT_MERGE_GAP_BYTES)
             .await
             .expect("read")
             .expect("a packed sidecar serves");
@@ -3531,15 +3568,61 @@ mod tests {
         let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
         assert_eq!(got, expected, "ids from the blocks match the oracle");
 
+        // With no gap only blocks that touch share a read; with the
+        // production gap this small sidecar's blocks all share one. Either
+        // way each block's ids come out of its own slice.
+        let runs = |locals: &[u32]| {
+            let mut b: Vec<usize> = locals
+                .iter()
+                .map(|&l| l as usize / ids::BLOCK_DOCS)
+                .collect();
+            b.sort_unstable();
+            b.dedup();
+            1 + b.windows(2).filter(|w| w[1] > w[0] + 1).count()
+        };
+        for (gap, one_read) in [(0, false), (EXACT_MERGE_GAP_BYTES, true)] {
+            for locals in [vec![5u32, 1030], vec![5, 4100], vec![1030, 5, 4100, 2050]] {
+                let source = Superfile::new(bytes.clone(), false);
+                let src: Arc<dyn LazyByteSource> = Arc::clone(&source) as _;
+                let lazy = SuperfileReader::open_lazy(src).await.expect("open_lazy");
+                let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();
+                source.clear();
+                let got = lazy
+                    .ids_from_sidecar_blocks(&locals, gap)
+                    .await
+                    .expect("read")
+                    .expect("a packed sidecar serves");
+                let got = got
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("decimal ids");
+                let got: Vec<i128> = (0..got.len()).map(|i| got.value(i)).collect();
+                assert_eq!(got, expected, "rows {locals:?}, gap {gap}");
+                // One read for the directory, then the blocks'.
+                let block_reads = source.reads().len() - 1;
+                let want = if one_read { 1 } else { runs(&locals) };
+                assert_eq!(block_reads, want, "rows {locals:?}, gap {gap}");
+            }
+        }
+
+        // A directory that starts block 2 where block 0 starts is malformed,
+        // not a panic.
+        let reordered = Bytes::from(ids::with_out_of_order_id_block(&bytes, 2, 0));
+        let lazy = lazy_shuffled_id_reader(reordered).await;
+        assert!(
+            lazy.ids_from_sidecar_blocks(&[5, 2050], 0).await.is_err(),
+            "an out-of-order block is an error, for the Parquet fallback"
+        );
+
         let last_block = SHUFFLED_ID_ROWS.div_ceil(ids::BLOCK_DOCS) - 1;
         let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, last_block));
         let lazy = lazy_shuffled_id_reader(damaged).await;
         assert!(
-            lazy.ids_from_sidecar_blocks(&[4999]).await.is_err(),
+            lazy.ids_from_sidecar_blocks(&[4999], 0).await.is_err(),
             "a row in the damaged block is an error, for the Parquet fallback"
         );
         assert!(
-            lazy.ids_from_sidecar_blocks(&[0, 37])
+            lazy.ids_from_sidecar_blocks(&[0, 37], 0)
                 .await
                 .expect("read")
                 .is_none(),
