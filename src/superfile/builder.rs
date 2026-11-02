@@ -3442,46 +3442,21 @@ impl SuperfileBuilder {
             fb.set_sorted_inputs(sorted_inputs);
         }
 
-        // The index blobs, when they were streamed beside the body encode
-        // (below); otherwise they are streamed at the finish, after it.
-        let mut blobs: Option<IndexBlobs> = None;
         if let Some(batches) = ordered_batches {
             // The ordered rows are the whole output, numbered from zero.
             debug_assert_eq!(superfile_builder.next_local_doc_id, 0);
-            let rows: u32 = batches.iter().map(|b| b.num_rows() as u32).sum();
-            if reanalyze {
-                for batch in &batches {
-                    body_encoder.write_batch(batch)?;
-                    push_stable_ids(&mut id_sidecar, batch, &id_column)?;
-                    // The ordered rows are the output's; a re-analyzed merge
-                    // indexes them under the ids they are written at.
-                    let rows = batch.num_rows() as u32;
+            for batch in &batches {
+                body_encoder.write_batch(batch)?;
+
+                push_stable_ids(&mut id_sidecar, batch, &id_column)?;
+
+                let rows = batch.num_rows() as u32;
+                // The ordered rows are the output's; a re-analyzed merge
+                // indexes them under the ids they are written at.
+                if reanalyze {
                     superfile_builder.index_fts_batch(batch, rows)?;
-                    superfile_builder.next_local_doc_id += rows;
                 }
-            } else if rows > 0 {
-                // The body encode and the index blobs — the sorted merge of
-                // the inputs' postings into the chosen order — need nothing
-                // from each other until the splice, so the body is encoded
-                // on a thread of its own while this one streams the blobs.
-                // One after the other they were ten seconds each per GiB of
-                // output, on one thread while the merge's others waited.
-                superfile_builder.next_local_doc_id = rows;
-                let _span = detail_span!("merge_body_and_blobs", rows = rows).entered();
-                blobs = Some(thread::scope(|scope| -> Result<IndexBlobs, BuildError> {
-                    let body = scope.spawn(|| -> Result<(), BuildError> {
-                        for batch in &batches {
-                            body_encoder.write_batch(batch)?;
-                            push_stable_ids(&mut id_sidecar, batch, &id_column)?;
-                        }
-                        Ok(())
-                    });
-                    let blobs = superfile_builder.stream_index_blobs();
-                    body.join().map_err(|_| {
-                        BuildError::Io(Error::other("the merge's body encode thread panicked"))
-                    })??;
-                    blobs
-                })?);
+                superfile_builder.next_local_doc_id += rows;
             }
         }
 
@@ -3518,10 +3493,7 @@ impl SuperfileBuilder {
             None => pack_ids_in_memory(&[]).map_blocks(|blocks| Box::new(blocks) as Box<dyn Read>),
         };
 
-        match blobs {
-            Some(blobs) => superfile_builder.finish_with_blobs(body, ids, blobs, output)?,
-            None => superfile_builder.finish_to_with_packed_ids(body, ids, output)?,
-        };
+        superfile_builder.finish_to_with_packed_ids(body, ids, output)?;
 
         Ok(stats)
     }
@@ -3703,16 +3675,6 @@ impl SuperfileBuilder {
         ids: PackedIdOutput<R>,
         output: W,
     ) -> Result<ParquetLayout, BuildError> {
-        let blobs = self.stream_index_blobs()?;
-        self.finish_with_blobs(body, ids, blobs, output)
-    }
-
-    /// Stream the index blobs — the postings, the vector index and the cell
-    /// postings this builder holds, over its `next_local_doc_id` documents
-    /// — to scratch, with the key-values the footer carries for them. Takes
-    /// the index builders; the body may still be encoding meanwhile, and
-    /// the two meet in [`Self::finish_with_blobs`].
-    fn stream_index_blobs(&mut self) -> Result<IndexBlobs, BuildError> {
         let n_docs = self.next_local_doc_id as u64;
         let fts_builder = self.fts_builder.take();
         let vec_builder = self.vec_builder.take();
@@ -3728,30 +3690,7 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        Ok(IndexBlobs {
-            fts_file,
-            vec_file,
-            kvs,
-        })
-    }
-
-    /// Splice the encoded `body`, the packed `ids` and the streamed `blobs`
-    /// into the superfile at `output`.
-    fn finish_with_blobs<W: Write, R: Read>(
-        self,
-        body: EncodedBody,
-        ids: PackedIdOutput<R>,
-        blobs: IndexBlobs,
-        output: W,
-    ) -> Result<ParquetLayout, BuildError> {
-        splice_body_and_blobs_to(
-            body,
-            blobs.fts_file,
-            blobs.vec_file,
-            ids,
-            &blobs.kvs,
-            output,
-        )
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
     }
 
     /// Rebuild the FTS index from `source`'s stored text, touching nothing
@@ -4236,14 +4175,6 @@ pub(crate) fn index_fts_rows(
 /// disk instead of a `Vec` keeps a memory-tight build or merge under its RSS
 /// budget. `reopen()` gives an independent handle at offset 0, so the write
 /// handle here and the read handle at splice time don't share a cursor.
-/// A build's index blobs streamed to scratch, and the footer key-values
-/// that describe them, ready to splice behind an encoded body.
-struct IndexBlobs {
-    fts_file: NamedTempFile,
-    vec_file: NamedTempFile,
-    kvs: Vec<(String, String)>,
-}
-
 fn stream_index_blobs_to_scratch(
     fts_builder: Option<FtsBuilder>,
     vec_builder: Option<VectorBuilder>,
