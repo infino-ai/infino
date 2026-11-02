@@ -2661,7 +2661,11 @@ impl SupertableWriter {
             let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
             let frozen: Vec<FrozenLane> = lanes
                 .into_par_iter()
-                .map(|lane| timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?)))
+                .map(|lane| {
+                    let docs: u32 = lane.stretches.iter().map(|s| s.len).sum();
+                    let _span = detail_span!("lane.freeze", docs = docs).entered();
+                    timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?))
+                })
                 .collect::<Result<_, BuildError>>()?;
             drop(freeze_span);
             let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
@@ -3301,6 +3305,7 @@ impl SupertableWriter {
         let mut ticket = match &self.inner.options.storage {
             None => self.inner.append_queue.reserve(None, 0).0,
             Some(storage) => {
+                let list_span = detail_span!("publish.write_list").entered();
                 bridge_on_runtime(
                     write_superfile_list(
                         storage,
@@ -3310,6 +3315,7 @@ impl SupertableWriter {
                     ),
                     &runtime,
                 )?;
+                drop(list_span);
                 let contributions = &batch.term_contributions;
                 let (ticket, base) = self
                     .inner
@@ -3333,6 +3339,9 @@ impl SupertableWriter {
                             }
                         }
                     };
+                    let reserve_span =
+                        detail_span!("publish.reserve_layer", inputs = contributions.len())
+                            .entered();
                     layer = Some(
                         bridge_on_runtime(
                             term_index::reserve_layer(
@@ -3345,11 +3354,15 @@ impl SupertableWriter {
                         )
                         .map_err(|e| BuildError::Store(e.to_string()))?,
                     );
+                    drop(reserve_span);
                 }
                 ticket
             }
         };
+        let wait_span = detail_span!("publish.wait_turn").entered();
         drop(ticket.wait_turn());
+        drop(wait_span);
+        let _turn_span = detail_span!("publish.turn").entered();
         let published = bridge_on_runtime(
             persist_superfile_publish_batch_async(
                 &self.inner,
@@ -3635,7 +3648,9 @@ impl LiveLanes {
         let (tx, rx) = std_sync_channel(1);
         let stats = op_stats.clone();
         let col_idxs = self.col_idxs.clone();
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         pool.spawn(move || {
+            let _span = detail_span!("live.feed", lanes = n, rows = rows).entered();
             let fed = lanes
                 .par_iter_mut()
                 .enumerate()
