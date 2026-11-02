@@ -9,8 +9,6 @@
 //! (plus the bytes past it for a value wider than [`ONE_LOAD_MAX_WIDTH`]
 //! bits that starts mid-byte).
 
-use std::mem::swap;
-
 /// Widest value the stream carries: a full `u64`.
 pub(crate) const MAX_WIDTH: u8 = 64;
 

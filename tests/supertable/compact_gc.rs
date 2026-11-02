@@ -46,7 +46,10 @@ use infino::{
             },
         },
     },
-    test_helpers::{build_title_batch, default_supertable_options, default_vector_config},
+    test_helpers::{
+        build_title_batch, default_supertable_options, default_vector_config,
+        fault_storage::FaultStorage,
+    },
 };
 use tempfile::TempDir;
 
@@ -888,11 +891,18 @@ fn corrupt_vector_blob_at(path: &Path) -> bool {
 ///
 /// Only cache copies are touched; storage keeps a good copy throughout, which
 /// is what makes refetch-and-recover available to the merge.
+///
+/// The storage is a local directory behind a wrapper that hides its path, the
+/// way an object store has none: a merge maps an input it can see on this
+/// host's disk where it lies and never reads the cache's copy (see
+/// [`optimize_refuses_a_corrupt_local_input_instead_of_merging_it`]), and this
+/// test is about the copy the cache serves.
 fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: bool) -> u64 {
     let store_dir = TempDir::new().expect("tempdir");
     let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> =
+    let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
+    let storage: Arc<dyn StorageProvider> = FaultStorage::wrap(local);
 
     let (st, cache) = table_with_disk_cache(
         hidden_vector_options(),
@@ -950,6 +960,68 @@ fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: boo
     let before = cache.stats().n_cold_fetches;
     st.optimize(&small_optimize_opts()).expect("optimize");
     cache.stats().n_cold_fetches - before
+}
+
+/// An input on this host's disk is mapped where it lies rather than read
+/// through the cache, and its checksums are verified as it opens: a corrupt
+/// storage copy is refused and the merge does not run, so the table keeps its
+/// inputs and nothing is laundered into a fresh, validly checksummed output.
+#[test]
+fn optimize_refuses_a_corrupt_local_input_instead_of_merging_it() {
+    let store_dir = TempDir::new().expect("tempdir");
+    let cache_dir = TempDir::new().expect("cache tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
+    let (st, cache) = table_with_disk_cache(
+        hidden_vector_options(),
+        Arc::clone(&storage),
+        cache_dir.path(),
+    );
+    let schema = st.options().schema.clone();
+    for round in 0..2 {
+        let mut w = st.writer().expect("writer");
+        w.append(&hidden_batch(Arc::clone(&schema), round))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    let inputs = superfile_paths_under(store_dir.path());
+    assert!(inputs.len() >= 2, "the fixture must leave inputs to merge");
+    drop(st);
+    drop(cache);
+
+    // The storage copies are the ones the merge maps; the cache's copies,
+    // good or not, are not read for a local input.
+    let corrupted = inputs.iter().filter(|p| corrupt_vector_blob_at(p)).count();
+    assert!(corrupted > 0, "an input with a vector blob to corrupt");
+
+    let cfg = DiskCacheConfig {
+        cache_root: cache_dir.path().to_path_buf(),
+        disk_budget_bytes: CACHE_BUDGET_BYTES,
+        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
+        mmap_cold_threshold_secs: 0,
+        mmap_sweep_interval_secs: 0,
+        eviction: Box::new(LruPolicy::new()),
+        crc_verification: CrcVerification::Auto,
+        ..Default::default()
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
+    let st = Supertable::open(
+        hidden_vector_options()
+            .with_storage(Arc::clone(&storage))
+            .with_disk_cache(cache),
+    )
+    .expect("reopen the table");
+    st.optimize(&small_optimize_opts())
+        .expect_err("a corrupt input is refused before the merge reads it");
+    let mut after = superfile_paths_under(store_dir.path());
+    after.sort();
+    let mut before = inputs;
+    before.sort();
+    assert_eq!(
+        after, before,
+        "the inputs stay as they were; nothing was merged"
+    );
 }
 
 /// A corrupt cached input is refetched rather than merged, end to end through
