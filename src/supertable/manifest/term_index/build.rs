@@ -163,7 +163,18 @@ pub(crate) enum BuiltBytes {
         /// Held only to keep the scratch directory, and the file, alive.
         _dir: Arc<TempDir>,
         path: PathBuf,
+        len: usize,
     },
+}
+
+impl BuiltBytes {
+    /// The object's size, without reading a spilled one back.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Resident(bytes) => bytes.len(),
+            Self::Spilled { len, .. } => *len,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1324,6 +1335,7 @@ impl LayerWriter {
                 Ok(BuiltBytes::Spilled {
                     _dir: Arc::clone(dir),
                     path,
+                    len: bytes.len(),
                 })
             }
         }

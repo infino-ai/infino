@@ -37,6 +37,7 @@ pub(crate) mod format;
 pub(crate) mod tier;
 
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
     fs,
     future::Future,
@@ -403,8 +404,15 @@ async fn write_tiers_and_slices(
 async fn write_objects(
     storage: &Arc<dyn StorageProvider>,
     kind: &'static str,
-    objects: Vec<(ContentHash, BuiltBytes)>,
+    mut objects: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
+    // Largest first. A tier object for a common term is a thousand times
+    // the size of one for a rare term, and one PUT moves bytes over one
+    // connection, so the wave ends when its last large object does: a
+    // large object started in the final round stretched the wave by its
+    // whole upload while the other slots sat empty. Started first, the
+    // large ones run the whole wave and the small ones fill in around them.
+    objects.sort_by_key(|(_, built)| Reverse(built.len()));
     let jobs = objects.into_iter().map(|(hash, built)| {
         let storage = Arc::clone(storage);
         async move {

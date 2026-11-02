@@ -13730,12 +13730,14 @@ pub(in crate::supertable) async fn put_content_addressed(
 ) -> Result<RoutingRef, StorageError> {
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
+    let span = detail_span!("put_content_addressed", len = bytes.len());
     match put_bytes_multipart_or_atomic(
         storage,
         &uri,
         Bytes::from(bytes),
         CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES,
     )
+    .instrument(span)
     .await
     {
         Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
