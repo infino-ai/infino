@@ -54,11 +54,11 @@ pub infino::ColumnIndex::Fts::positions: bool
 pub infino::ColumnIndex::Fts::stemmer: infino::Stemmer
 pub infino::ColumnIndex::Fts::stopwords: infino::Stopwords
 pub infino::ColumnIndex::Fts::stored: bool
+pub infino::ColumnIndex::Range
 pub infino::ColumnIndex::Vector
 pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
 pub infino::ColumnIndex::Vector::rot_seed: u64
-pub infino::ColumnIndex::Range
 impl core::clone::Clone for infino::ColumnIndex
 pub fn infino::ColumnIndex::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::ColumnIndex
