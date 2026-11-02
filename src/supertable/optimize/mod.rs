@@ -14,11 +14,12 @@ pub(crate) mod compact;
 use std::time::Instant;
 
 use compact::max_merge_input_bytes;
+use fs4::available_space;
 
 #[cfg(feature = "detailed-tracing")]
 use crate::utils::trace::OpOrigin;
 use crate::{
-    config::OptimizeOptions,
+    config::{OptimizeOptions, scratch_root},
     supertable::{
         Supertable,
         error::{GcError, OptimizeError},
@@ -94,22 +95,15 @@ impl Supertable {
         }
         // Index the superfiles the term index does not list, a batch at a
         // time, and fold its layers in runs no larger than a compaction
-        // merge's input or, where the table has a disk cache, half its
-        // budget: a fold downloads its run to local disk before merging, and
-        // that budget is the disk the table was given. Under the merge cap
-        // alone a root of fifty layers folded in four passes, each reading
-        // its layers back from storage and publishing a root. Runs before gc
-        // so the sweep keeps the roots it publishes.
+        // merge's input or half the free space of the scratch filesystem,
+        // whichever is more: a fold downloads its run to scratch before
+        // merging, so the space there is what bounds it. Under the merge
+        // cap alone a root of fifty layers folded in four passes, each
+        // reading its layers back from storage and publishing a root. Runs
+        // before gc so the sweep keeps the roots it publishes.
         if opts.steps.refresh_term_index {
-            let disk_bytes = self
-                .inner()
-                .manifest
-                .load()
-                .options
-                .disk_cache
-                .as_ref()
-                .map_or(0, |cache| cache.disk_budget_bytes() / 2);
-            let fold_max_bytes = max_merge_input_bytes(&opts.compaction).max(disk_bytes);
+            let scratch_bytes = available_space(scratch_root()).map_or(0, |bytes| bytes / 2);
+            let fold_max_bytes = max_merge_input_bytes(&opts.compaction).max(scratch_bytes);
             self.refresh_term_index_sync(fold_max_bytes)
                 .map_err(OptimizeError::from)?;
         }
