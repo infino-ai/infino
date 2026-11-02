@@ -107,6 +107,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
     },
     time::sleep,
+    try_join,
 };
 use tracing::{Instrument, Span, debug, error, info, warn};
 use uuid::Uuid;
@@ -3425,51 +3426,75 @@ impl SupertableWriter {
         let mut ticket = match &self.inner.options.storage {
             None => self.inner.append_queue.reserve(None, 0).0,
             Some(storage) => {
-                let list_span = detail_span!("publish.write_list").entered();
-                bridge_on_runtime(
-                    write_superfile_list(
-                        storage,
-                        &self.inner.options,
-                        &mut batch.pending_storage_writes,
-                        &mut Vec::new(),
-                    ),
-                    &runtime,
-                )?;
-                drop(list_span);
-                let contributions = &batch.term_contributions;
+                let SuperfilePublishBatch {
+                    pending_storage_writes,
+                    term_contributions: contributions,
+                    ..
+                } = &mut batch;
+                let contributions = &*contributions;
                 let (ticket, base) = self
                     .inner
                     .append_queue
                     .reserve(current_root().as_ref(), contributions.len() as u32);
-                if !contributions.is_empty() {
-                    let base = match base {
+                let write_list = async {
+                    write_superfile_list(
+                        storage,
+                        &self.inner.options,
+                        pending_storage_writes,
+                        &mut Vec::new(),
+                    )
+                    .await
+                    .map_err(BuildError::from)
+                }
+                .instrument(detail_span!("publish.write_list"));
+                let policy = self.inner.options.term_index_build_policy();
+                // The layer is built from the sealed contributions and
+                // written beside the superfiles' uploads, not after them:
+                // a commit's layer is small, and its objects queued behind
+                // thirty appends' gigabytes when they went out last.
+                let base_known = match (contributions.is_empty(), base) {
+                    (true, _) => None,
+                    (false, Some(base)) => {
+                        prebuilt_end = Some(base + contributions.len() as u32);
+                        Some(base)
+                    }
+                    (false, None) => None,
+                };
+                let reserve = async {
+                    match base_known {
                         Some(base) => {
-                            prebuilt_end = Some(base + contributions.len() as u32);
-                            base
+                            term_index::reserve_layer(storage, contributions, &policy, base)
+                                .instrument(detail_span!(
+                                    "publish.reserve_layer",
+                                    inputs = contributions.len()
+                                ))
+                                .await
+                                .map(Some)
+                                .map_err(|e| BuildError::Store(e.to_string()))
                         }
-                        None => {
-                            drop(ticket.wait_turn());
-                            match current_root() {
-                                Some(root) => bridge_on_runtime(
-                                    term_index::load_root(storage.as_ref(), &root),
-                                    &runtime,
-                                )
-                                .map_or(0, |root| root.superfiles.len() as u32),
-                                None => 0,
-                            }
-                        }
+                        None => Ok(None),
+                    }
+                };
+                layer = bridge_on_runtime(async { try_join!(write_list, reserve) }, &runtime)?.1;
+                if !contributions.is_empty() && base_known.is_none() {
+                    // The root is not the one this queue last published, so
+                    // its length is learnt on the turn and the layer built
+                    // there.
+                    drop(ticket.wait_turn());
+                    let base = match current_root() {
+                        Some(root) => bridge_on_runtime(
+                            term_index::load_root(storage.as_ref(), &root),
+                            &runtime,
+                        )
+                        .map_or(0, |root| root.superfiles.len() as u32),
+                        None => 0,
                     };
                     let reserve_span =
                         detail_span!("publish.reserve_layer", inputs = contributions.len())
                             .entered();
                     layer = Some(
                         bridge_on_runtime(
-                            term_index::reserve_layer(
-                                storage,
-                                contributions,
-                                &self.inner.options.term_index_build_policy(),
-                                base,
-                            ),
+                            term_index::reserve_layer(storage, contributions, &policy, base),
                             &runtime,
                         )
                         .map_err(|e| BuildError::Store(e.to_string()))?,
