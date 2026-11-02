@@ -648,34 +648,79 @@ pub(crate) async fn append_reserved(
     reserved: &mut Option<ReservedLayer>,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
+    let mut run = [ReservedSegment {
+        contributions: contributions.len(),
+        layer: reserved.take(),
+    }];
+    let result = append_reserved_run(storage, prior, contributions, policy, &mut run, pool).await;
+    let [segment] = run;
+    *reserved = segment.layer;
+    result
+}
+
+/// One append's share of a publish: how many of the publish's
+/// contributions, in order, are its own, and the layer reserved for them,
+/// if one was. A publish that took on the appends queued behind it carries
+/// one per append.
+pub(crate) struct ReservedSegment {
+    pub(crate) contributions: usize,
+    pub(crate) layer: Option<ReservedLayer>,
+}
+
+/// [`append_reserved`] for a run of segments: each segment's layer is
+/// appended to `prior` after the one before it, numbered from where that
+/// one ends — reused as built when its reserved base is that length, moved
+/// or built again when not — and the root is written once for all of them.
+/// Appends that publish together pay the root write once this way, and
+/// their layers are the ones they would have appended one turn at a time.
+pub(crate) async fn append_reserved_run(
+    storage: &Arc<dyn StorageProvider>,
+    prior: Option<Root>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    run: &mut [ReservedSegment],
+    pool: Option<&ThreadPool>,
+) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
-    let base = root.superfiles.len() as u32;
-    let reusable = reserved
-        .as_ref()
-        .is_some_and(|r| r.base == base && r.built_from(contributions));
-    if !reusable {
-        let moved = match reserved
+    let mut rest = contributions;
+    for segment in run.iter_mut() {
+        let Some((own, after)) = segment
+            .contributions
+            .checked_sub(0)
+            .filter(|n| *n <= rest.len())
+            .map(|n| rest.split_at(n))
+        else {
+            return Err(TermIndexError::Build(
+                "a publish's segments cover more contributions than it carries".into(),
+            ));
+        };
+        rest = after;
+        let base = root.superfiles.len() as u32;
+        let reusable = segment
+            .layer
             .as_ref()
-            .filter(|kept| kept.built_from(contributions))
-        {
-            Some(kept) => move_reserved(storage, kept, base, pool).await?,
-            None => None,
-        };
-        let next = match moved {
-            Some(moved) => moved,
-            None => reserve_layer(storage, contributions, policy, base).await?,
-        };
-        // The replaced layer's objects are written; its spilled copies are
-        // read by nothing again.
-        if let Some(replaced) = reserved.replace(next) {
-            remove_spilled(&replaced.bytes.slices);
-            remove_spilled(&replaced.bytes.tiers);
+            .is_some_and(|r| r.base == base && r.built_from(own));
+        if !reusable {
+            let moved = match segment.layer.as_ref().filter(|kept| kept.built_from(own)) {
+                Some(kept) => move_reserved(storage, kept, base, pool).await?,
+                None => None,
+            };
+            let next = match moved {
+                Some(moved) => moved,
+                None => reserve_layer(storage, own, policy, base).await?,
+            };
+            // The replaced layer's objects are written; its spilled copies
+            // are read by nothing again.
+            if let Some(replaced) = segment.layer.replace(next) {
+                remove_spilled(&replaced.bytes.slices);
+                remove_spilled(&replaced.bytes.tiers);
+            }
         }
+        let layer = segment.layer.as_ref().expect("reserved above");
+        root.superfiles.extend_from_slice(&layer.superfiles);
+        root.id_mins.extend_from_slice(&layer.id_mins);
+        root.layers.push(layer.layer.clone());
     }
-    let layer = reserved.as_ref().expect("reserved above");
-    root.superfiles.extend_from_slice(&layer.superfiles);
-    root.id_mins.extend_from_slice(&layer.id_mins);
-    root.layers.push(layer.layer.clone());
     publish_root(storage, root, policy, pool).await
 }
 

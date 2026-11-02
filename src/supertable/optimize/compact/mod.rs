@@ -59,7 +59,7 @@ use crate::{
             RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
-            term_index::{Contribution as TermContribution, ReservedLayer},
+            term_index::{Contribution as TermContribution, ReservedLayer, ReservedSegment},
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
@@ -1328,6 +1328,11 @@ impl Supertable {
                 batch: &mut batch,
             };
             let attempted_id = current.get_next_manifest_id();
+            // The batch's layer rides this attempt as a run of one.
+            let mut reserved_run = [ReservedSegment {
+                contributions: term_contributions.len(),
+                layer: reserved_layer.take(),
+            }];
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1339,7 +1344,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
-                Some(&mut reserved_layer),
+                Some(&mut reserved_run),
                 Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )
@@ -1352,6 +1357,8 @@ impl Supertable {
                 lost = tracing::field::Empty,
             ))
             .await;
+            let [reserved_segment] = reserved_run;
+            reserved_layer = reserved_segment.layer;
             match attempt_outcome {
                 Ok(new_manifest) => {
                     record("attempts", attempt + 1);
