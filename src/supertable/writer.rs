@@ -2551,7 +2551,13 @@ impl SupertableWriter {
                 // could do on a few dozen threads. Concurrent appends fill
                 // the pool between them.
                 let buffered_rows: usize = self.buffer.iter().map(|b| b.scalar.num_rows()).sum();
-                let n_lanes = lane_count(options.writer_pool.current_num_threads(), buffered_rows);
+                // One lane per pool thread, so a commit that grows to many
+                // batches tokenizes and freezes as wide as the pool; each
+                // batch is dealt to only as many of them as its rows warrant.
+                let n_lanes = options
+                    .writer_pool
+                    .current_num_threads()
+                    .clamp(1, MAX_LANES);
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
                     Ok(live) => live,
@@ -3539,12 +3545,12 @@ fn reserve_build_scratch(
 /// does not open a lane per thread for a buffer that cannot fill them.
 const LANE_MIN_ROWS: usize = 1 << 16;
 
-/// How many live lanes a buffer of `rows` rows is fed through on a pool of
-/// `threads` threads: one per [`LANE_MIN_ROWS`] rows, at least one, at most
-/// the pool's width and [`MAX_LANES`].
-fn lane_count(threads: usize, rows: usize) -> usize {
+/// How many of `lanes` lanes a batch of `rows` rows is dealt to: one per
+/// [`LANE_MIN_ROWS`] rows, at least one, at most the lanes there are and
+/// [`MAX_LANES`]. A lane's share under that is more task than work.
+fn lane_count(lanes: usize, rows: usize) -> usize {
     let by_rows = rows.div_ceil(LANE_MIN_ROWS).max(1);
-    by_rows.min(threads.max(1)).min(MAX_LANES)
+    by_rows.min(lanes.max(1)).min(MAX_LANES)
 }
 
 struct LiveLanes {
@@ -3571,6 +3577,13 @@ struct LiveLanes {
     /// The least a lane's threshold is set to: the builder's own default,
     /// as a commit-time piece gets; lowered by tests to reach the bound.
     threshold_floor: usize,
+    /// The lane the next batch's first share goes to. Batches walk the
+    /// lanes round robin, so a commit of many batches fills every lane
+    /// evenly while each batch is cut only as many ways as its rows warrant.
+    next_lane: usize,
+    /// Lanes fed so far, which share the reserve: the first few batches of
+    /// a commit sit in the lanes they were dealt to, not spread over all.
+    lanes_fed: usize,
 }
 
 /// One lane: its accumulator, and the commit rows its documents are, as
@@ -3610,6 +3623,8 @@ impl LiveLanes {
             reservations: Vec::new(),
             fts_bytes: 0,
             threshold_floor: DEFAULT_SPILL_THRESHOLD_BYTES,
+            next_lane: 0,
+            lanes_fed: 0,
         })
     }
 
@@ -3627,10 +3642,14 @@ impl LiveLanes {
             .ok_or_else(|| BuildError::Store("live lanes are not available".into()))
     }
 
-    /// Tokenize `batches` into the lanes on `pool`, lane `i` taking rows
-    /// `[rows * i / n, rows * (i + 1) / n)` of each batch — an imbalance
-    /// of at most one row per batch — and return without waiting. The
-    /// caller has already reserved the build scratch for them.
+    /// Tokenize `batches` into the lanes on `pool` and return without
+    /// waiting. The batches are cut into as many shares as their rows
+    /// warrant ([`lane_count`]), share `j` taking rows
+    /// `[rows * j / k, rows * (j + 1) / k)` of each batch — an imbalance of
+    /// at most one row per batch — dealt to the `k` lanes from `next_lane`
+    /// on, so a small commit tokenizes in a few lanes and a large one fills
+    /// them all as its batches come round. The caller has already reserved
+    /// the build scratch for them.
     fn feed(
         &mut self,
         pool: &ThreadPool,
@@ -3641,26 +3660,36 @@ impl LiveLanes {
         let mut lanes = self.join()?;
         let n = lanes.len();
         let first_row = self.rows_fed;
-        self.rows_fed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        self.rows_fed += rows;
         self.fts_bytes = self.fts_bytes.saturating_add(fts_bytes);
-        // Each lane's share of the reserve for the text fed so far.
-        let threshold = in_ram_threshold(self.fts_bytes / n as u64, self.threshold_floor);
+        let k = lane_count(n, rows);
+        let first_lane = self.next_lane;
+        self.next_lane = (first_lane + k) % n;
+        self.lanes_fed = (self.lanes_fed + k).min(n);
+        // Each fed lane's share of the reserve for the text fed so far.
+        let threshold =
+            in_ram_threshold(self.fts_bytes / self.lanes_fed as u64, self.threshold_floor);
         let (tx, rx) = std_sync_channel(1);
         let stats = op_stats.clone();
         let col_idxs = self.col_idxs.clone();
-        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         pool.spawn(move || {
-            let _span = detail_span!("live.feed", lanes = n, rows = rows).entered();
+            let _span = detail_span!("live.feed", lanes = k, rows = rows).entered();
             let fed = lanes
                 .par_iter_mut()
                 .enumerate()
                 .try_for_each(|(i, lane)| {
+                    // This lane's share of the batches, or none this time.
+                    let j = (i + n - first_lane) % n;
+                    if j >= k {
+                        return Ok(());
+                    }
                     timed_kernel(&stats, || {
                         lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
                         for batch in &batches {
                             let rows = batch.num_rows();
-                            let (start, end) = (rows * i / n, rows * (i + 1) / n);
+                            let (start, end) = (rows * j / k, rows * (j + 1) / k);
                             if start < end {
                                 let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
                                 index_fts_rows(
