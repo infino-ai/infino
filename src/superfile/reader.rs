@@ -1268,6 +1268,11 @@ impl SuperfileReader {
         self.id_sidecar_broken.store(true, Ordering::Relaxed);
     }
 
+    /// Whether the superfile carries a range index region.
+    pub(crate) fn has_range_index(&self) -> bool {
+        self.range_region.is_some()
+    }
+
     /// The range index's directory and the column's id in it, when the
     /// superfile range-indexes the column with table id `field` with keys of
     /// `kind`. The column is found by its id, not its name, so a file written

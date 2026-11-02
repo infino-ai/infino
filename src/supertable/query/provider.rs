@@ -196,9 +196,9 @@ struct PreparedScanFile {
     reader: Arc<SuperfileReader>,
     path: ObjPath,
     size: u64,
-    /// Where the Parquet row groups end: the index regions follow them, and
-    /// the scan reads none of their bytes.
-    rows_end: u64,
+    /// Where the row groups end, when the scan is handed only them (see
+    /// [`rows_end`]); `None` hands it the whole file.
+    rows_end: Option<u64>,
     row_counts: Arc<[u32]>,
     /// Each column's data pages across the row groups, by name, from the
     /// page index; empty when the file carries none.
@@ -241,16 +241,7 @@ fn prepare_scan_file(
         .map(|row_group| row_group.num_rows() as u32)
         .collect::<Vec<_>>()
         .into();
-    let rows_end = parquet_meta
-        .row_groups()
-        .iter()
-        .flat_map(|row_group| row_group.columns())
-        .map(|chunk| {
-            let (start, len) = chunk.byte_range();
-            start + len
-        })
-        .max()
-        .unwrap_or(0);
+    let rows_end = rows_end(&reader, &parquet_meta);
     let mut pages: HashMap<String, u64> = HashMap::new();
     if let Some(offsets) = parquet_meta.offset_index() {
         let leaves = parquet_meta.file_metadata().schema_descr();
@@ -273,6 +264,30 @@ fn prepare_scan_file(
         pages,
         tier,
     })
+}
+
+/// Where a superfile's row groups end, when it is handed to DataFusion as
+/// that byte range rather than whole. DataFusion sizes a scan and splits it
+/// into byte ranges across partitions by its files' ranges, and a split
+/// that holds only index bytes opens the file and reads no row. A superfile
+/// carrying a range index region is handed as its row groups alone, so the
+/// region it adds is not counted. `None` for every other superfile, handed
+/// whole as before range indexes, so its plan keeps the shape it had.
+fn rows_end(reader: &SuperfileReader, parquet_meta: &ParquetMetaData) -> Option<u64> {
+    if !reader.has_range_index() {
+        return None;
+    }
+    let end = parquet_meta
+        .row_groups()
+        .iter()
+        .flat_map(|row_group| row_group.columns())
+        .map(|chunk| {
+            let (start, len) = chunk.byte_range();
+            start + len
+        })
+        .max()
+        .unwrap_or(0);
+    Some(end)
 }
 
 /// Concurrent first-open coalescing for one immutable superfile.
@@ -1952,15 +1967,13 @@ impl TableProvider for SupertableProvider {
             } else {
                 None
             };
-            // The file's range is its row groups, not the index regions after
-            // them: DataFusion sizes and splits a scan by its files' ranges,
-            // and a split over index bytes would open the file to read no row.
-            let mut file = PartitionedFile::new_with_range(
-                seg.prepared.path.to_string(),
-                seg.prepared.size,
-                0,
-                seg.prepared.rows_end as i64,
-            );
+            // A range-indexed superfile's range is its row groups (see
+            // `rows_end`); any other is handed whole.
+            let path = seg.prepared.path.to_string();
+            let mut file = match seg.prepared.rows_end {
+                Some(end) => PartitionedFile::new_with_range(path, seg.prepared.size, 0, end as i64),
+                None => PartitionedFile::new(path, seg.prepared.size),
+            };
             if let Some(plan) = access_plan {
                 // DataFusion 54 keys file extensions by concrete type and reads
                 // the access plan via `extensions.get::<ParquetAccessPlan>()`, so
