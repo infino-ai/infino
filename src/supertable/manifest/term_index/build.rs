@@ -1594,11 +1594,14 @@ pub(crate) fn build_layer(
     })
 }
 
-/// Contributions of at least this many bytes in all are built in key
-/// ranges. A commit's own contributions stay below it and build on one
-/// writer, byte for byte as before; a rebuild over thousands of
-/// superfiles goes over it.
-const BUILD_RANGE_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Bytes of contributions one key range of a layer build takes: a build of
+/// `n` times this runs in `n` ranges side by side, up to the pool's width
+/// and [`MERGE_RANGES_MAX`]. A commit's 5M-row append brings about 100 MiB
+/// of contributions and built them on one writer for three to five
+/// seconds while the pool idled; at this size it runs in a handful of
+/// ranges, a rebuild over thousands of superfiles in the full width, and a
+/// contribution set below one range's worth builds on one writer as before.
+const BUILD_RANGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The key ranges a build of `contributions` is cut into (see
 /// [`range_count`] and [`cut_ranges`]). A mark weighs the bytes up to its
@@ -1611,7 +1614,7 @@ fn build_ranges(
     for c in contributions {
         lens.push(fs::metadata(&c.path)?.len());
     }
-    let want = range_count(policy, BUILD_RANGE_MIN_BYTES, || Ok(lens.iter().sum()))?;
+    let want = build_range_count(policy, lens.iter().sum())?;
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }
@@ -2077,6 +2080,18 @@ fn run_ranges(
     })
 }
 
+/// How many key ranges a build of `bytes` of contributions is cut into: the
+/// policy's count when set, else one per [`BUILD_RANGE_BYTES`], at least
+/// one and at most the pool's width and [`MERGE_RANGES_MAX`].
+fn build_range_count(policy: &BuildPolicy, bytes: u64) -> Result<usize, TermIndexError> {
+    let width = range_count(policy, 0, || Ok(bytes))?;
+    if policy.merge_ranges.is_some() {
+        return Ok(width);
+    }
+    let by_bytes = bytes.div_ceil(BUILD_RANGE_BYTES).max(1);
+    Ok((by_bytes.min(width as u64)) as usize)
+}
+
 /// How many key ranges to cut work of `bytes` into: the policy's count when
 /// set, one when the work is under `min_bytes`, else the pool's width, at
 /// most [`MERGE_RANGES_MAX`].
@@ -2350,6 +2365,7 @@ pub(crate) struct MergedLayer {
 mod contribution_mark_tests {
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
+    use rayon::ThreadPoolBuilder;
 
     /// A contribution gathered through a [`HeadSink`] from two columns, ids
     /// 3 and 12, with 3's terms handed over first: `"12\x1f…"` sorts before
@@ -2449,5 +2465,43 @@ mod contribution_mark_tests {
             .collect();
             assert_eq!(got, all[150..450], "from the mark at {at}");
         }
+    }
+
+    #[test]
+    fn build_range_count_follows_the_contribution_bytes_up_to_the_pool() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .expect("pool"),
+        );
+        let policy = BuildPolicy {
+            pool: Some(pool),
+            ..BuildPolicy::default()
+        };
+        // Below one range's worth: one writer, as before.
+        assert_eq!(
+            build_range_count(&policy, BUILD_RANGE_BYTES / 2).expect("count"),
+            1
+        );
+        // A commit's ~100 MiB of contributions: one range per BUILD_RANGE_BYTES.
+        assert_eq!(
+            build_range_count(&policy, 7 * BUILD_RANGE_BYTES).expect("count"),
+            7
+        );
+        // Never more ranges than the pool has threads.
+        assert_eq!(
+            build_range_count(&policy, 1000 * BUILD_RANGE_BYTES).expect("count"),
+            8
+        );
+        // An explicit count from the policy wins.
+        let fixed = BuildPolicy {
+            merge_ranges: Some(3),
+            ..policy
+        };
+        assert_eq!(
+            build_range_count(&fixed, BUILD_RANGE_BYTES / 2).expect("count"),
+            3
+        );
     }
 }
