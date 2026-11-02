@@ -9,7 +9,9 @@
 //! unfiltered or filtered to the column's non-null values.
 //! `COUNT(*)` over a range on a range-indexed column is counted from each
 //! superfile's range index, by a scan that emits the count as rows with no
-//! columns (`SupertableProvider::counting`).
+//! columns (`SupertableProvider::counting`); so is each bucket of a
+//! bucketed range aggregation written as `COUNT(*) FILTER (WHERE range)`
+//! outputs, the buckets' counts joined into one row.
 //! Other ungrouped aggregates whose `WHERE` clause is a single-column range
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
@@ -78,7 +80,10 @@ use uuid::Uuid;
 use crate::supertable::{
     error::QueryError,
     manifest::{ManifestSnapshot, SuperfileEntry, add_sum_arrays, list::ScalarValueCounts},
-    query::{provider::SupertableProvider, skip::ColumnTypeGuard},
+    query::{
+        provider::{CountedRange, SupertableProvider},
+        skip::ColumnTypeGuard,
+    },
     schema::{DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId},
 };
 
@@ -157,6 +162,9 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     }
     if !agg.group_expr.is_empty() {
         return Ok(None);
+    }
+    if let Some(rewritten) = rewrite_bucketed_range_counts(agg)? {
+        return Ok(Some(rewritten));
     }
     let Some(kinds) = parse_aggregates(&agg.aggr_expr) else {
         return Ok(None);
@@ -258,15 +266,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     if matches!(kinds.as_slice(), [AggKind::CountStar])
         && let Some(counted) = provider.counted_range(&predicate)
     {
-        let counting = Arc::new(provider.counting(counted));
-        let filters = split_conjunction(&predicate).into_iter().cloned().collect();
-        let input = LogicalPlanBuilder::scan_with_filters(
-            scan.table_name.clone(),
-            provider_as_source(counting as Arc<dyn TableProvider>),
-            Some(Vec::new()),
-            filters,
-        )?
-        .build()?;
+        let input = counting_scan(provider, scan, counted, &predicate)?;
         return Ok(Some(LogicalPlan::Aggregate(
             Aggregate::try_new_with_schema(
                 Arc::new(input),
@@ -673,6 +673,135 @@ fn typed_zero(value: &ScalarValue) -> DfResult<ScalarValue> {
     }
 }
 
+/// The scan under a range count: `predicate`'s rows, counted from each
+/// superfile's range index and emitted as rows with no columns.
+fn counting_scan(
+    provider: &SupertableProvider,
+    scan: &TableScan,
+    counted: CountedRange,
+    predicate: &Expr,
+) -> DfResult<LogicalPlan> {
+    let counting = Arc::new(provider.counting(counted));
+    let filters = split_conjunction(predicate).into_iter().cloned().collect();
+    LogicalPlanBuilder::scan_with_filters(
+        scan.table_name.clone(),
+        provider_as_source(counting as Arc<dyn TableProvider>),
+        Some(Vec::new()),
+        filters,
+    )?
+    .build()
+}
+
+/// A bucketed range aggregation in one statement — `COUNT(*) FILTER
+/// (WHERE r)` for several ranges `r`, ungrouped — counted from the range
+/// index. A bucket's rows are those of the `WHERE` and its own filter
+/// together, so each is one range count over that conjunction; the counts,
+/// one row each, are joined into the aggregate's one row under its own
+/// names. Buckets may overlap, as a range aggregation's may: each is
+/// counted on its own.
+///
+/// Declines (the scan answers) unless every output is a `COUNT(*)` and at
+/// least one carries a filter, and every bucket's rows are one interval on
+/// one range-indexed column.
+fn rewrite_bucketed_range_counts(agg: &Aggregate) -> DfResult<Option<LogicalPlan>> {
+    let Some(buckets) = bucket_counts(&agg.aggr_expr) else {
+        return Ok(None);
+    };
+    if buckets.iter().all(|(_, filter)| filter.is_none()) {
+        return Ok(None);
+    }
+    let (outer, scan) = match peel_input(agg.input.as_ref()) {
+        Some((predicate, scan)) => (Some(predicate), scan),
+        None => match peel_unfiltered_scan(agg.input.as_ref()) {
+            Some(scan) => (None, scan),
+            None => return Ok(None),
+        },
+    };
+    let Some(provider) = provider_of(scan) else {
+        return Ok(None);
+    };
+    if provider.is_segment_restricted() {
+        return Ok(None);
+    }
+
+    let mut counts = Vec::with_capacity(buckets.len());
+    for (i, (count, filter)) in buckets.into_iter().enumerate() {
+        let predicate = match (outer.clone(), filter) {
+            (Some(outer), Some(filter)) => outer.and(filter),
+            (Some(predicate), None) | (None, Some(predicate)) => predicate,
+            (None, None) => return Ok(None),
+        };
+        let Some(counted) = provider.counted_range(&predicate) else {
+            return Ok(None);
+        };
+        let input = counting_scan(provider, scan, counted, &predicate)?;
+        counts.push(
+            LogicalPlanBuilder::from(input)
+                .aggregate(Vec::<Expr>::new(), vec![count.alias(bucket_name(i))])?
+                .build()?,
+        );
+    }
+
+    let mut counts = counts.into_iter();
+    let Some(first) = counts.next() else {
+        return Ok(None);
+    };
+    let mut joined = LogicalPlanBuilder::from(first);
+    for count in counts {
+        joined = joined.cross_join(count)?;
+    }
+    let names = agg
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, field)| ident(bucket_name(i)).alias(field.name().clone()));
+    Ok(Some(joined.project(names)?.build()?))
+}
+
+/// The name a bucket's count carries until the bucketed rewrite's final
+/// projection gives it the aggregate's own.
+fn bucket_name(bucket: usize) -> String {
+    format!("__range_bucket_{bucket}")
+}
+
+/// Each output as a `COUNT(*)` without its filter, beside the filter;
+/// `None` if any output is not a `COUNT(*)` or is DISTINCT or ordered.
+fn bucket_counts(exprs: &[Expr]) -> Option<Vec<(Expr, Option<Expr>)>> {
+    exprs
+        .iter()
+        .map(|expr| {
+            let inner = match expr {
+                Expr::Alias(alias) => alias.expr.as_ref(),
+                other => other,
+            };
+            let Expr::AggregateFunction(agg) = inner else {
+                return None;
+            };
+            let params = &agg.params;
+            if params.distinct
+                || !params.order_by.is_empty()
+                || !counts_rows(agg.func.name(), &params.args)
+            {
+                return None;
+            }
+            let mut unfiltered = agg.clone();
+            let filter = unfiltered.params.filter.take().map(|filter| *filter);
+            Some((Expr::AggregateFunction(unfiltered), filter))
+        })
+        .collect()
+}
+
+/// Whether an aggregate named `name` over `args` counts rows: `COUNT(*)`,
+/// or `COUNT` of a non-null literal.
+fn counts_rows(name: &str, args: &[Expr]) -> bool {
+    match (name, args) {
+        ("count", []) => true,
+        ("count", [Expr::Literal(value, _)]) => !value.is_null(),
+        _ => false,
+    }
+}
+
 /// Parse the aggregate outputs; `None` if any is unsupported.
 fn parse_aggregates(exprs: &[Expr]) -> Option<Vec<AggKind>> {
     let mut kinds = Vec::with_capacity(exprs.len());
@@ -690,8 +819,7 @@ fn parse_aggregates(exprs: &[Expr]) -> Option<Vec<AggKind>> {
             return None;
         }
         let kind = match (agg.func.name(), params.args.as_slice()) {
-            ("count", []) => AggKind::CountStar,
-            ("count", [Expr::Literal(value, _)]) if !value.is_null() => AggKind::CountStar,
+            (name, args) if counts_rows(name, args) => AggKind::CountStar,
             ("count", [Expr::Column(c)]) => AggKind::Count(c.name.clone()),
             ("sum", [Expr::Column(c)]) => AggKind::Sum(c.name.clone()),
             ("min", [Expr::Column(c)]) => AggKind::Min(c.name.clone()),

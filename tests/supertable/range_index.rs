@@ -8,6 +8,7 @@
 //!
 //! The unindexed table is the oracle: it answers by scanning. Every shape
 //! the range index serves is here — a count (answered from the index alone),
+//! a bucketed count (`COUNT(*) FILTER (WHERE range)` per bucket, likewise),
 //! a range's rows, `BETWEEN`, two conjuncts folded into one interval, an
 //! `ORDER BY ... LIMIT` the index serves in order, integer, float and date
 //! columns — beside shapes it must leave to the scan: two columns, an `OR`.
@@ -66,7 +67,23 @@ const QUERIES: &[&str] = &[
     "SELECT sum(seq) AS s FROM {t} WHERE qty > 0 AND price > 500",
     "SELECT count(*) AS n FROM {t} WHERE qty > 240 OR price < 1",
     "SELECT seq FROM {t} WHERE qty > 240 AND seq < 3000 ORDER BY seq",
+    BUCKETED_QTY,
+    "SELECT count(*) FILTER (WHERE qty < 0) AS low, count(*) FILTER (WHERE qty >= 0 AND qty < 200) AS high FROM {t} WHERE qty > -200",
+    "SELECT count(*) AS n, count(*) FILTER (WHERE qty > 100) AS big FROM {t} WHERE qty > 0",
+    BUCKETED_DAY,
+    "SELECT count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 750.5) AS b, count(*) FILTER (WHERE price >= 750.5) AS c FROM {t}",
+    "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
+    "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
 ];
+
+/// A bucketed range aggregation in one statement, its buckets overlapping
+/// as a range aggregation's may.
+const BUCKETED_QTY: &str = "SELECT count(*) FILTER (WHERE qty < -100) AS a, count(*) FILTER (WHERE qty >= -100 AND qty < 0) AS b, count(*) FILTER (WHERE qty >= 0 AND qty < 100) AS c, count(*) FILTER (WHERE qty >= 50) AS d FROM {t}";
+/// Date buckets, quarter by quarter.
+const BUCKETED_DAY: &str = "SELECT count(*) FILTER (WHERE day < DATE '2022-04-01') AS q1, count(*) FILTER (WHERE day >= DATE '2022-04-01' AND day < DATE '2022-07-01') AS q2, count(*) FILTER (WHERE day >= DATE '2022-07-01') AS rest FROM {t}";
+/// How a plan shows an aggregate that checks its own filter on each row; a
+/// bucketed count the range index answers has none.
+const BUCKET_FILTER: &str = "FILTER (WHERE";
 
 /// The shapes both tables answer once `qty` is renamed `amount` and a new
 /// `qty` is added: the range index follows `amount`, and the new `qty`
@@ -181,6 +198,19 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
         assert!(
             !answer(&db, query, "ranged").contains(FILTER_OPERATOR),
             "{query}"
+        );
+    }
+    // Nor does a bucketed one check any bucket's range on a row.
+    for bucketed in [BUCKETED_QTY, BUCKETED_DAY] {
+        let query = format!("EXPLAIN {bucketed}");
+        assert!(
+            answer(&db, &query, "plain").contains(BUCKET_FILTER),
+            "{query}"
+        );
+        let ranged = answer(&db, &query, "ranged");
+        assert!(
+            !ranged.contains(BUCKET_FILTER) && !ranged.contains(FILTER_OPERATOR),
+            "{query}: {ranged}"
         );
     }
 
