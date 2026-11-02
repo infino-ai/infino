@@ -3168,6 +3168,9 @@ mod tests {
             ids,
             vector::distance::normalize,
         },
+        supertable::query::{
+            df_object_store::EXACT_MERGE_GAP_BYTES, read_ahead::fixture::Superfile,
+        },
         test_helpers::{capture_logs, decimal128_ids, default_vector_config},
     };
 
@@ -3549,10 +3552,6 @@ mod tests {
     /// error, and marks the sidecar broken so later reads go to Parquet.
     #[tokio::test]
     async fn stable_id_sidecar_blocks_serve_a_few_rows_of_a_lazy_reader() {
-        use crate::supertable::query::{
-            df_object_store::EXACT_MERGE_GAP_BYTES, read_ahead::fixture::Superfile,
-        };
-
         let (bytes, ids) = build_shuffled_id_superfile();
         let locals: Vec<u32> = vec![0, 4999, 1, 4999, 37, 100, 2500];
         let expected: Vec<i128> = locals.iter().map(|&l| ids[l as usize]).collect();

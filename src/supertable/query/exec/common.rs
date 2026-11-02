@@ -2497,7 +2497,7 @@ mod tests {
         },
         supertable::{
             Supertable, SupertableOptions,
-            query::fts::TIE_NARROW_BATCH,
+            query::{fts::TIE_NARROW_BATCH, read_ahead::fixture::Superfile},
             reader_cache::{
                 ColdFetchMode, DiskCacheConfig, DiskCacheStore,
                 disk::test_support::RecordingStorage,
@@ -3561,8 +3561,6 @@ mod tests {
     /// way.
     #[tokio::test]
     async fn a_take_without_room_streams_the_same_rows() {
-        use crate::supertable::query::read_ahead::fixture::Superfile;
-
         let source = Superfile::new(titled_superfile_bytes(), false);
         let reader = SuperfileReader::open_lazy(Arc::clone(&source) as Arc<dyn LazyByteSource>)
             .await
