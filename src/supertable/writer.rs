@@ -144,8 +144,8 @@ use crate::{
         fts::{
             bm25::Bm25Params,
             builder::{
-                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, Stretch,
-                doc_lengths_entry_size, freeze_lanes,
+                DEFAULT_SPILL_THRESHOLD_BYTES, FrozenLane, FrozenLanes, FtsBuilder, MAX_LANES,
+                Stretch, doc_lengths_entry_size, freeze_lanes,
             },
         },
         reader::vector_layout_from_kv,
@@ -2416,22 +2416,16 @@ impl SupertableWriter {
         }
 
         // The live lanes, if this buffer has them: they hold the build
-        // scratch for the batches they were fed, so the commit reserves
-        // nothing on top. Taken here so a failed commit cannot seal lanes
-        // a later retry would also rebuild from the buffer.
+        // scratch for the batches they were fed. Taken here so a failed
+        // commit cannot seal lanes a later retry would also rebuild from
+        // the buffer. A commit that builds from the buffer instead reserves
+        // its scratch where it decides to (see
+        // `commit_appends_with_taken_buffer`).
         let live = self.live.take();
-        // Try reserving the transient heap from the ConnectionMemoryBudget before draining the buffer.
-        // For now, if memory reservation is refused, the buffer is left untouched, but this behaviour can be changed.
-        //
-        // Held until this function returns, i.e. past `publish_superfiles` below.
-        let _build_guard = match live {
-            Some(_) => None,
-            None => Some(reserve_build_scratch(
-                &self.inner.options.connection_memory_budget,
-                self.buffer_visible_scalar_bytes,
-                self.buffer_vector_bytes,
-                self.buffer_fts_bytes,
-            )?),
+        let scratch = BuildScratchInputs {
+            scalar_bytes: self.buffer_visible_scalar_bytes,
+            vector_bytes: self.buffer_vector_bytes,
+            fts_bytes: self.buffer_fts_bytes,
         };
 
         // Take the buffer so a concurrent append can't observe a half-drained
@@ -2447,7 +2441,7 @@ impl SupertableWriter {
         self.buffer_vector_bytes = 0;
         self.buffer_fts_bytes = 0;
 
-        match self.commit_appends_rebuilding(&buffer, stem, live) {
+        match self.commit_appends_rebuilding(&buffer, stem, live, scratch) {
             Ok(()) => {
                 self.live_disabled = false;
                 // Durable now, so the ingested work is real work. An
@@ -2524,7 +2518,7 @@ impl SupertableWriter {
                 .collect()
         };
         let target_bytes = split_target_bytes(options);
-        let (batches, reservation) = match &self.live {
+        let (batches, reservation, fts_fed) = match &self.live {
             Some(_) => {
                 // The guard for this batch alone; the earlier ones are held.
                 let reservation = reserve_build_scratch(
@@ -2540,7 +2534,7 @@ impl SupertableWriter {
                         return;
                     }
                 };
-                (batches, reservation)
+                (batches, reservation, fts_bytes)
             }
             None => {
                 // Open once the buffer holds a superfile's worth of rows, so a
@@ -2549,9 +2543,11 @@ impl SupertableWriter {
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
-                let n_threads = options.writer_pool.current_num_threads().max(1);
-                let opened =
-                    LiveLanes::open(Arc::clone(manifest), n_threads, options.vector_layout);
+                let n_lanes = options
+                    .writer_pool
+                    .current_num_threads()
+                    .clamp(1, MAX_LANES);
+                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
                     Ok(live) => live,
                     Err(error) => {
@@ -2574,7 +2570,7 @@ impl SupertableWriter {
                         return;
                     }
                 };
-                (batches, reservation)
+                (batches, reservation, self.buffer_fts_bytes as u64)
             }
         };
         let reservation = match reservation {
@@ -2591,7 +2587,7 @@ impl SupertableWriter {
             .as_mut()
             .expect("live lanes were opened or already present");
         live.reservations.push(reservation);
-        if let Err(error) = live.feed(&pool, &self.op_stats, batches) {
+        if let Err(error) = live.feed(&pool, &self.op_stats, batches, fts_fed) {
             debug!(%error, "live lane feed failed; the commit builds from the buffer");
             self.disable_live();
         }
@@ -2725,14 +2721,14 @@ impl SupertableWriter {
         &self,
         buffer: &[BufferedBatch],
         stem: Option<&str>,
-        live: Option<LiveLanes>,
+        mut live: Option<LiveLanes>,
+        scratch: BuildScratchInputs,
     ) -> Result<(), BuildError> {
         let attempts = self.inner.options.max_commit_retries.max(1);
         // The live lanes can only serve the first attempt: a retry runs
         // because the schema moved, which is what they cannot follow.
-        let mut live = live;
         for attempt in 0..attempts {
-            match self.commit_appends_with_taken_buffer(buffer, stem, live.take()) {
+            match self.commit_appends_with_taken_buffer(buffer, stem, live.take(), scratch) {
                 Err(BuildError::SchemaMoved { expected, current }) if attempt + 1 < attempts => {
                     warn!(
                         expected,
@@ -2833,6 +2829,7 @@ impl SupertableWriter {
         buffer: &[BufferedBatch],
         stem: Option<&str>,
         live: Option<LiveLanes>,
+        scratch: BuildScratchInputs,
     ) -> Result<(), BuildError> {
         // The schema this commit builds under: the table's, plus every
         // column the buffered batches add. Earlier batches are null-filled
@@ -2888,6 +2885,18 @@ impl SupertableWriter {
             }
             drop(live);
         }
+        // Building from the buffer: its transient heap is reserved from the
+        // connection's budget for as long as the build runs, past the
+        // publish — a refusal leaves the buffer to the caller untouched.
+        // Lanes dropped just above took their reservations with them, so
+        // the rebuild reserves afresh; the same goes for a retry after the
+        // schema moved, which arrives here without lanes.
+        let _build_guard = reserve_build_scratch(
+            &self.inner.options.connection_memory_budget,
+            scratch.scalar_bytes,
+            scratch.vector_bytes,
+            scratch.fts_bytes,
+        )?;
         // Phase A — train the global cell grid from the FIRST committed batch
         // into pending OCC metadata (not a bare ArcSwap.store). The pack path
         // below reads the same local `pending_gvi` / existing manifest grid;
@@ -3440,6 +3449,15 @@ impl ShardOutput {
 /// estimate = (2.5*scalar_raw_bytes + 6.5*vector_raw_bytes + 1.5*fts_text_raw_bytes)
 ///
 /// returns `OverBudget` when a bounded budget can't fit it.
+/// The buffered bytes a commit-time build reserves its scratch for, by
+/// input class, as [`reserve_build_scratch`] weights them.
+#[derive(Clone, Copy)]
+struct BuildScratchInputs {
+    scalar_bytes: usize,
+    vector_bytes: usize,
+    fts_bytes: usize,
+}
+
 fn reserve_build_scratch(
     budget: &Arc<ConnectionMemoryBudget>,
     scalar_bytes: usize,
@@ -3508,6 +3526,14 @@ struct LiveLanes {
     /// Build-scratch reserved for the batches fed so far; released with
     /// the lanes.
     reservations: Vec<Reservation>,
+    /// Text fed so far, which sizes each lane's threshold: a lane never
+    /// spills, so its share of the reserve is what bounds it, and a lane
+    /// that outgrows it fails the feed and the commit builds from the
+    /// buffer (where a column past the reserve spills).
+    fts_bytes: u64,
+    /// The least a lane's threshold is set to: the builder's own default,
+    /// as a commit-time piece gets; lowered by tests to reach the bound.
+    threshold_floor: usize,
 }
 
 /// One lane: its accumulator, and the commit rows its documents are, as
@@ -3545,6 +3571,8 @@ impl LiveLanes {
             pending: None,
             rows_fed: 0,
             reservations: Vec::new(),
+            fts_bytes: 0,
+            threshold_floor: DEFAULT_SPILL_THRESHOLD_BYTES,
         })
     }
 
@@ -3570,11 +3598,15 @@ impl LiveLanes {
         pool: &ThreadPool,
         op_stats: &Option<Arc<OpStatsCollector>>,
         batches: Vec<RecordBatch>,
+        fts_bytes: u64,
     ) -> Result<(), BuildError> {
         let mut lanes = self.join()?;
         let n = lanes.len();
         let first_row = self.rows_fed;
         self.rows_fed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
+        self.fts_bytes = self.fts_bytes.saturating_add(fts_bytes);
+        // Each lane's share of the reserve for the text fed so far.
+        let threshold = in_ram_threshold(self.fts_bytes / n as u64, self.threshold_floor);
         let (tx, rx) = std_sync_channel(1);
         let stats = op_stats.clone();
         let col_idxs = self.col_idxs.clone();
@@ -3584,6 +3616,7 @@ impl LiveLanes {
                 .enumerate()
                 .try_for_each(|(i, lane)| {
                     timed_kernel(&stats, || {
+                        lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
                         for batch in &batches {
                             let rows = batch.num_rows();
@@ -3668,11 +3701,19 @@ fn open_shard_builder(
     if let Some((sink, depth)) = &head_sink {
         builder.set_term_head_sink(Box::new(sink.clone()), *depth);
     }
-    builder.set_fts_spill_threshold_bytes(
-        (fts_text_bytes.saturating_mul(BUILD_FTS_NUM) / BUILD_SCRATCH_DENOM)
-            .max(DEFAULT_SPILL_THRESHOLD_BYTES),
-    );
+    builder.set_fts_spill_threshold_bytes(in_ram_threshold(
+        fts_text_bytes as u64,
+        DEFAULT_SPILL_THRESHOLD_BYTES,
+    ));
     Ok((builder, superfile_id, head_sink))
+}
+
+/// The postings a builder of `fts_text_bytes` of text may hold in RAM
+/// before spilling (or, for a lane, before giving up): the FTS share of
+/// the build-scratch reserve for that text, never below `floor`.
+fn in_ram_threshold(fts_text_bytes: u64, floor: usize) -> usize {
+    let share = fts_text_bytes.saturating_mul(BUILD_FTS_NUM as u64) / BUILD_SCRATCH_DENOM as u64;
+    usize::try_from(share).unwrap_or(usize::MAX).max(floor)
 }
 
 /// The id bounds and row count of `batches` (the id column is always at
@@ -13811,7 +13852,7 @@ mod tests {
                 commit::{MANIFEST_DIR, POINTER_PATH, manifest_uri},
             },
             query::vector::assemble_hnsw_incremental,
-            reader_cache::disk::test_support::test_store,
+            reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
             storage::LocalFsStorageProvider,
@@ -14503,8 +14544,10 @@ mod tests {
         );
         // Three equal shares of a ramp.
         assert_eq!(piece_bounds(&[1, 2, 3, 4, 5, 6], 3), vec![0, 3, 5, 6]);
-        // A heavy tail still leaves every earlier piece a row.
+        // A heavy tail still leaves every earlier piece a row, and a heavy
+        // head leaves every later piece one: no piece is ever empty.
         assert_eq!(piece_bounds(&[1, 1, 1, 100], 3), vec![0, 2, 3, 4]);
+        assert_eq!(piece_bounds(&[100, 1, 1, 1], 3), vec![0, 1, 2, 4]);
         // Nothing weighs: even by count.
         assert_eq!(piece_bounds(&[0; 10], 4), vec![0, 2, 5, 7, 10]);
         // Fewer rows than pieces: the trailing pieces are empty.
@@ -16855,6 +16898,73 @@ mod tests {
         }
     }
 
+    /// Text whose tokens are mostly new holds many times its bytes in
+    /// postings, past the reserve the lanes were sized by. A lane that
+    /// outgrows its share fails the feed, the lanes are dropped, and the
+    /// commit builds from the buffer as a commit without lanes does.
+    #[test]
+    fn a_lane_that_outgrows_its_reservation_hands_the_commit_to_the_buffer() {
+        const ROWS_PER_BATCH: usize = 2_000;
+        /// Batches that open the lanes under the default floor: about 200
+        /// KiB of text each against the 1 MiB split.
+        const OPENING_BATCHES: usize = 8;
+        /// Tokens per row, every one new to the table.
+        const UNIQUE_TOKENS: usize = 12;
+        let unique_batch = |batch: usize| {
+            RecordBatch::try_new(
+                schema_id_title(),
+                vec![Arc::new(LargeStringArray::from(
+                    (0..ROWS_PER_BATCH)
+                        .map(|i| {
+                            let row = batch * ROWS_PER_BATCH + i;
+                            (0..UNIQUE_TOKENS)
+                                .map(|k| format!("r{row}k{k}"))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect::<Vec<_>>(),
+                ))],
+            )
+            .expect("batch")
+        };
+        let build = |live: bool| {
+            let st = Supertable::create(live_options(2, 1, 4096, false)).expect("create");
+            let mut w = st.writer().expect("writer");
+            w.live_disabled = !live;
+            for b in 0..OPENING_BATCHES {
+                w.append(&unique_batch(b)).expect("append");
+            }
+            assert_eq!(w.live.is_some(), live, "the lanes opened");
+            if let Some(lanes) = w.live.as_mut() {
+                // Hold each lane to its real share of the reserve.
+                lanes.threshold_floor = 1;
+            }
+            // The next feed fails on the pool; the append after it sees the
+            // failure and drops the lanes.
+            w.append(&unique_batch(OPENING_BATCHES)).expect("append");
+            w.append(&unique_batch(OPENING_BATCHES + 1))
+                .expect("append");
+            if live {
+                assert!(w.live.is_none(), "the lanes are dropped");
+                assert!(w.live_disabled, "the commit builds from the buffer");
+            }
+            w.commit().expect("commit");
+            drop(w);
+            st
+        };
+        let live = build(true);
+        let plain = build(false);
+        assert_eq!(
+            live.reader().expect("reader").n_docs_total(),
+            ((OPENING_BATCHES + 2) * ROWS_PER_BATCH) as u64
+        );
+        assert_eq!(piece_sizes(&live), piece_sizes(&plain));
+        assert_eq!(
+            hit_titles(&live, "r4321k7", usize::MAX),
+            hit_titles(&plain, "r4321k7", usize::MAX)
+        );
+    }
+
     /// A commit that fails after it took the lanes restores the buffer and
     /// disarms the lanes; the rows appended after the failure join the
     /// restored buffer, and the retry rebuilds all of them from it.
@@ -16918,9 +17028,20 @@ mod tests {
     fn a_local_commit_links_the_sealed_file_into_storage_and_the_cache() {
         const ROWS_PER_BATCH: usize = 500;
         const BATCHES: usize = 2;
-        let (dir, cache) = test_store();
+        // The sealed file lives under the configured scratch root; storage
+        // and cache go beside it so the links are on one filesystem.
+        let dir = TempDir::new_in(scratch_root()).expect("tempdir under the scratch root");
         let storage: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache store");
         let st = Supertable::create(
             options_id_title()
                 .with_storage(Arc::clone(&storage))
