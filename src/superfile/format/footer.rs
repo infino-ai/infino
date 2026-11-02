@@ -210,10 +210,13 @@ pub fn encode_parquet_body(
 /// one `encode_parquet_body` over the same batches in the same order.
 ///
 /// It cuts and feeds row groups exactly as `ArrowWriter` would, but holds
-/// each row group's slices until it is full and then encodes its columns in
-/// parallel. Every column writer sees the same slices in the same order it
-/// would under `ArrowWriter`, and the chunks are appended in column order,
-/// so the bytes are the same; only the column encodes overlap.
+/// each row group's slices until it is full, and full row groups until
+/// [`ROW_GROUPS_ENCODED_TOGETHER`] of them are held, then encodes every
+/// column of every held group in parallel. Every column writer sees the
+/// same slices in the same order it would under `ArrowWriter`, and the
+/// chunks are appended group by group in column order, so the bytes are
+/// the same; only the encodes overlap. One group at a time, a body of few
+/// wide columns — a title and its id — encoded on about one thread.
 pub(crate) struct ParquetBodyEncoder {
     body_file: NamedTempFile,
     writer: SerializedFileWriter<File>,
@@ -223,7 +226,15 @@ pub(crate) struct ParquetBodyEncoder {
     /// The current row group's slices, in arrival order.
     held: Vec<RecordBatch>,
     held_rows: usize,
+    /// Full row groups not yet encoded, oldest first.
+    full: Vec<Vec<RecordBatch>>,
 }
+
+/// Full row groups the encoder holds before encoding them side by side,
+/// one task per leaf column per group. The held groups are slices of the
+/// caller's batches, so holding them costs no copy; the encoded chunks of
+/// this many groups are what the encode holds beyond one group's.
+const ROW_GROUPS_ENCODED_TOGETHER: usize = 4;
 
 impl ParquetBodyEncoder {
     pub(crate) fn new(
@@ -276,6 +287,7 @@ impl ParquetBodyEncoder {
             row_group_size: row_group_size.max(1),
             held: Vec::new(),
             held_rows: 0,
+            full: Vec::new(),
         })
     }
 
@@ -289,51 +301,71 @@ impl ParquetBodyEncoder {
             self.held_rows += take;
             rest = rest.slice(take, rest.num_rows() - take);
             if self.held_rows >= self.row_group_size {
-                self.flush_row_group()?;
+                self.full.push(mem::take(&mut self.held));
+                self.held_rows = 0;
+                if self.full.len() >= ROW_GROUPS_ENCODED_TOGETHER {
+                    self.flush_row_groups()?;
+                }
             }
         }
         Ok(())
     }
 
-    /// Encode the held row group, one task per leaf column.
-    fn flush_row_group(&mut self) -> Result<(), FooterError> {
-        if self.held.is_empty() {
+    /// Encode the held row groups, one task per leaf column per group, and
+    /// append them in order.
+    fn flush_row_groups(&mut self) -> Result<(), FooterError> {
+        let groups = mem::take(&mut self.full);
+        if groups.is_empty() {
             return Ok(());
         }
-        let mut writers = self
-            .columns
-            .create_column_writers(self.writer.flushed_row_groups().len())?;
-        // Each leaf column's slices, in the order its writer would get them.
-        let mut leaves: Vec<Vec<ArrowLeafColumn>> = writers.iter().map(|_| Vec::new()).collect();
-        for batch in &self.held {
-            let mut leaf_index = 0;
-            for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
-                for leaf in compute_leaves(field.as_ref(), column)? {
-                    leaves[leaf_index].push(leaf);
-                    leaf_index += 1;
+        let first_index = self.writer.flushed_row_groups().len();
+        // Each group's leaf-column writers and, per leaf column, its slices
+        // in the order the writer would get them.
+        let mut writers = Vec::with_capacity(groups.len());
+        let mut leaves: Vec<Vec<Vec<ArrowLeafColumn>>> = Vec::with_capacity(groups.len());
+        for (g, group) in groups.iter().enumerate() {
+            let group_writers = self.columns.create_column_writers(first_index + g)?;
+            let mut group_leaves: Vec<Vec<ArrowLeafColumn>> =
+                group_writers.iter().map(|_| Vec::new()).collect();
+            for batch in group {
+                let mut leaf_index = 0;
+                for (field, column) in self.schema.fields().iter().zip(batch.columns()) {
+                    for leaf in compute_leaves(field.as_ref(), column)? {
+                        group_leaves[leaf_index].push(leaf);
+                        leaf_index += 1;
+                    }
                 }
             }
+            writers.push(group_writers);
+            leaves.push(group_leaves);
         }
-        self.held.clear();
-        self.held_rows = 0;
-        writers
-            .par_iter_mut()
-            .zip(leaves.par_iter())
-            .try_for_each(|(writer, leaves)| {
-                leaves.iter().try_for_each(|leaf| writer.write(leaf))
-            })?;
-        let mut row_group = self.writer.next_row_group()?;
-        for writer in writers {
-            writer.close()?.append_to_row_group(&mut row_group)?;
+        drop(groups);
+        let mut tasks: Vec<_> = writers
+            .iter_mut()
+            .flatten()
+            .zip(leaves.iter().flatten())
+            .collect();
+        tasks.par_iter_mut().try_for_each(|(writer, leaves)| {
+            leaves.iter().try_for_each(|leaf| writer.write(leaf))
+        })?;
+        for group_writers in writers {
+            let mut row_group = self.writer.next_row_group()?;
+            for writer in group_writers {
+                writer.close()?.append_to_row_group(&mut row_group)?;
+            }
+            row_group.close()?;
         }
-        row_group.close()?;
         Ok(())
     }
 
     /// Close the writer and strip the Parquet footer, yielding the same
     /// [`EncodedBody`] as [`encode_parquet_body`].
     pub(crate) fn finish(mut self) -> Result<EncodedBody, FooterError> {
-        self.flush_row_group()?;
+        if !self.held.is_empty() {
+            self.full.push(mem::take(&mut self.held));
+            self.held_rows = 0;
+        }
+        self.flush_row_groups()?;
         let Self {
             body_file, writer, ..
         } = self;
