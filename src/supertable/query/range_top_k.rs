@@ -28,6 +28,9 @@
 //! rows the index puts first, and the cutoff would then drop rows that
 //! belong in the answer. A sort with nulls first and no filter is left
 //! alone too, as nulls are in no range index and would come first. The
+//! sort may order by more keys after the column (`ORDER BY price, id`, the
+//! tie-break a paged search adds): those order only the rows tied on the
+//! column, so the scan then reads every row tied with the cutoff too. The
 //! sort and the filters stay where they are, so the answer is the one they
 //! give over the rows the scan returns.
 
@@ -90,7 +93,9 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     else {
         return Ok(None);
     };
-    let [sort_expr] = expr.as_slice() else {
+    // Later sort keys (an id that breaks ties, say) order only rows the
+    // first key ties; the hint then keeps every row tied with its cutoff.
+    let Some((sort_expr, later)) = expr.split_first() else {
         return Ok(None);
     };
     let Expr::Column(column) = &sort_expr.expr else {
@@ -135,6 +140,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         column: column.name.clone(),
         descending: !sort_expr.asc,
         k: *k,
+        ties: !later.is_empty(),
     }));
     let source = provider_as_source(hinted as Arc<dyn TableProvider>);
     Ok(Some(with_scan_source(plan, &source)?))

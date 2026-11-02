@@ -46,7 +46,9 @@ const FILTER_OPERATOR: &str = "FilterExec";
 
 /// The shapes both tables answer, `{t}` standing for the table. Each is
 /// ordered so its rows compare as text, and a top-k selects only the sort
-/// column, as rows tied on it may come back in either order.
+/// column, as rows tied on it may come back in either order — unless a
+/// later key (`seq`, unique) breaks the ties, which then must pick the same
+/// rows from among them.
 const QUERIES: &[&str] = &[
     "SELECT count(*) AS n FROM {t} WHERE qty > 100",
     "SELECT count(*) AS n FROM {t} WHERE qty >= -10 AND qty < 10",
@@ -74,7 +76,25 @@ const QUERIES: &[&str] = &[
     "SELECT count(*) FILTER (WHERE price < 250) AS a, count(*) FILTER (WHERE price >= 250 AND price < 750.5) AS b, count(*) FILTER (WHERE price >= 750.5) AS c FROM {t}",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE price > 500) AS b FROM {t} WHERE seq < 6000",
     "SELECT count(*) FILTER (WHERE qty > 0) AS a, count(*) FILTER (WHERE qty > 100 OR qty < -100) AS b FROM {t}",
+    TIE_BROKEN_TOP_K,
+    "SELECT seq, qty FROM {t} WHERE qty < -200 ORDER BY qty DESC, seq DESC LIMIT 7",
+    "SELECT seq, price AS price FROM {t} WHERE price > 900 ORDER BY price ASC NULLS LAST, seq ASC NULLS LAST LIMIT 10",
+    "SELECT seq, qty FROM {t} WHERE qty BETWEEN 240 AND 249 ORDER BY qty DESC, seq LIMIT 30",
 ];
+
+/// A top-k whose sort column ties on many rows (`qty` repeats every 500
+/// rows), the ties broken by `seq`: a paged search's sort.
+const TIE_BROKEN_TOP_K: &str =
+    "SELECT seq, qty FROM {t} WHERE qty > 200 ORDER BY qty, seq LIMIT 10";
+/// Most rows a tie-broken top-k over the range index may read: the first
+/// `qty` above 200 holds the 10 answer rows and a few dozen ties.
+const TIE_BROKEN_TOP_K_MAX_ROWS: f64 = 100.0;
+/// Fewest rows a scan of `qty > 200` reads with no index: every row the
+/// range holds (49 values, about 22 live rows each).
+const TIE_BROKEN_TOP_K_SCAN_MIN_ROWS: f64 = 500.0;
+/// Where an analyzed plan names the scan, and how it counts what it read.
+const SCAN_OPERATOR: &str = "DataSourceExec";
+const OUTPUT_ROWS: &str = "output_rows=";
 
 /// A bucketed range aggregation in one statement, its buckets overlapping
 /// as a range aggregation's may.
@@ -166,6 +186,21 @@ fn answer(db: &Connection, query: &str, table: &str) -> String {
     pretty_format_batches(&batches).expect("format").to_string()
 }
 
+/// The rows the scan of an analyzed plan read (its `output_rows`, which
+/// DataFusion prints as `24` or `1.00 K`).
+fn scan_rows(plan: &str) -> f64 {
+    let scan = &plan[plan.find(SCAN_OPERATOR).expect("the plan has a scan")..];
+    let count =
+        &scan[scan.find(OUTPUT_ROWS).expect("the scan counts its rows") + OUTPUT_ROWS.len()..];
+    let count = &count[..count.find(',').expect("the count ends")];
+    let (number, scale) = match count.split_once(' ') {
+        Some((number, "K")) => (number, 1e3),
+        Some((number, "M")) => (number, 1e6),
+        _ => (count, 1.0),
+    };
+    number.parse::<f64>().expect("a row count") * scale
+}
+
 /// Every one of `queries`' answers from both tables, the same.
 fn assert_same_answers(db: &Connection, queries: &[&str], when: &str) {
     for query in queries {
@@ -213,6 +248,19 @@ fn a_range_indexed_table_answers_as_a_scan_does_through_deletes_compaction_and_r
             "{query}: {ranged}"
         );
     }
+    // A top-k broken by a later key reads the rows up to the cutoff from the
+    // range index, ties included, not every row of the range.
+    let query = format!("EXPLAIN ANALYZE {TIE_BROKEN_TOP_K}");
+    let plain_rows = scan_rows(&answer(&db, &query, "plain"));
+    let ranged_rows = scan_rows(&answer(&db, &query, "ranged"));
+    assert!(
+        plain_rows >= TIE_BROKEN_TOP_K_SCAN_MIN_ROWS,
+        "{query}: the plain scan read {plain_rows} rows"
+    );
+    assert!(
+        ranged_rows <= TIE_BROKEN_TOP_K_MAX_ROWS,
+        "{query}: the indexed scan read {ranged_rows} rows"
+    );
 
     for table in ["plain", "ranged"] {
         db.open_table(table)

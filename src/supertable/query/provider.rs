@@ -407,12 +407,15 @@ pub(crate) struct CountedRange {
 }
 
 /// What [`SupertableProvider::top_k`] carries: the sort column, its
-/// direction and the sort's row count.
+/// direction and the sort's row count, and whether the sort orders by more
+/// keys after the column (`ties`): then rows tied with the `k`-th key are
+/// told apart by those keys, so every one of them can be in the answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopKHint {
     pub(crate) column: String,
     pub(crate) descending: bool,
     pub(crate) k: usize,
+    pub(crate) ties: bool,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -930,10 +933,29 @@ impl SupertableProvider {
         if filters.is_empty() && keys.len() < hint.k {
             return Ok(None);
         }
-        let cutoff = (hint.k > 0 && keys.len() > hint.k).then(|| match hint.descending {
+        let kth = |keys: &mut Vec<u64>| match hint.descending {
             false => *keys.select_nth_unstable(hint.k - 1).1,
             true => *keys.select_nth_unstable_by(hint.k - 1, |a, b| b.cmp(a)).1,
-        });
+        };
+        // With later sort keys, the answer is the rows better than the
+        // `k`-th key and every row tied with it, which a superfile's first
+        // `k` need not all hold: its `k`-th row may be one of many with that
+        // key. The `k`-th key itself is exact (the keys collected hold each
+        // superfile's `k` best), so the rows are those of the interval up to
+        // it, read from the range index whole. Fewer than `k` keys in all
+        // means every superfile gave every row it holds in the range.
+        if hint.ties && hint.k > 0 && keys.len() >= hint.k {
+            let cut = kth(&mut keys);
+            let through = match hint.descending {
+                false => (lo, cut),
+                true => (cut, hi),
+            };
+            return self
+                .range_rows_live(survivors, field, kind, through, now)
+                .await
+                .map(Some);
+        }
+        let cutoff = (hint.k > 0 && keys.len() > hint.k).then(|| kth(&mut keys));
         let within = |key: u64| match (cutoff, hint.descending) {
             (None, _) => true,
             (Some(cut), false) => key <= cut,
@@ -951,6 +973,48 @@ impl SupertableProvider {
                 })
                 .collect(),
         ))
+    }
+
+    /// Each survivor's live rows whose key lies in `lo..=hi`, from its range
+    /// index. The caller has already found every survivor indexed over the
+    /// column (`range_ends` answered for each), so one that is not now is an
+    /// engine fault rather than a scan to fall back to.
+    async fn range_rows_live(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        field: FieldId,
+        kind: KeyKind,
+        (lo, hi): (u64, u64),
+        now: Instant,
+    ) -> DfResult<HashMap<Uuid, RoaringBitmap>> {
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let rows = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    let prepared = prepared.await?;
+                    let tombstones = match self.tombstone_cache.as_ref() {
+                        Some(cache) => cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(QueryError::tombstone_cache)?,
+                        None => Arc::new(RoaringBitmap::new()),
+                    };
+                    let rows = prepared
+                        .reader
+                        .range_rows(field, kind, lo, hi, Some(pool))
+                        .await
+                        .map_err(QueryError::from)?
+                        .ok_or_else(|| {
+                            QueryError::internal("range index: a superfile lost its range column")
+                        })?;
+                    Ok::<_, DataFusionError>((entry.superfile_id, rows - tombstones.as_ref()))
+                }
+            }),
+            in_flight,
+        )
+        .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Count the rows an exact check decoded to read their text but the
