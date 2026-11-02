@@ -303,6 +303,7 @@ async fn live_set(
         // public error variant.
         let state = slow_vector_state::load_full_state(
             storage.as_ref(),
+            inner.options.manifest_disk_cache.as_ref(),
             uri,
             &hash,
             &manifest.options.legacy_names(),
@@ -970,13 +971,14 @@ mod tests {
         };
         let checkpoint = slow_vector_state::write_state_with_pending_drain(
             storage.as_ref(),
+            None,
             &[],
             &pending,
             None,
         )
         .await
         .expect("checkpoint");
-        let settled = slow_vector_state::write_state(storage.as_ref(), &[], None)
+        let settled = slow_vector_state::write_state(storage.as_ref(), None, &[], None)
             .await
             .expect("settled");
         for (published, kept) in [(checkpoint, true), (settled, false)] {

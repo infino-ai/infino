@@ -1180,6 +1180,7 @@ impl ManifestSnapshot {
                     // centroid scores come from the section.
                     let entries = slow_vector_state::load_state(
                         storage.as_ref(),
+                        options.manifest_disk_cache.as_ref(),
                         uri,
                         &hash,
                         &options.legacy_names(),
@@ -8526,7 +8527,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);
@@ -8598,7 +8599,7 @@ mod tests {
     async fn state_blob_hydrates_stripped_for_all_consumers() {
         let (_dir, storage) = local_storage();
         let entries = vec![make_summary_entry(100), make_summary_entry(50)];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blobs");
         persist_two_entry_table(
@@ -9293,7 +9294,7 @@ mod tests {
             make_superfile_entry(100, hash_bucket_0_pk()),
             make_superfile_entry(50, hash_bucket_0_pk()),
         ];
-        let published = slow_vector_state::write_state(storage.as_ref(), &entries, None)
+        let published = slow_vector_state::write_state(storage.as_ref(), None, &entries, None)
             .await
             .expect("write blob");
         let (blob_uri, blob_hash) = (published.uri, published.content_hash);

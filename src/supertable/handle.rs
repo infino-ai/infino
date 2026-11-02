@@ -1847,6 +1847,10 @@ pub(crate) const GLOBAL_VECTOR_KMEANS_SEED: u64 = 0x51ED_2A11;
 /// the full working set stays resident.
 const CACHE_BUDGET_HEADROOM_DIVISOR: u64 = 10;
 
+/// Directory, beside the table's manifest cache, where the hidden vector
+/// index keeps its state blobs and centroid sections.
+const VECTOR_STATE_CACHE_SUBDIR: &str = "vector-state";
+
 /// Aggressive compaction profile for the hidden vector-index table: keep
 /// ~one compact packed shard object per partition key instead of many
 /// small delta files.
@@ -2020,6 +2024,12 @@ fn build_vector_index_options(
     // (drain, split, compaction) must stay writable regardless of how the
     // user handle was opened.
     hidden_opts.summary_centroids_from_superfiles = false;
+    if let Some(cache) = user_opts.manifest_disk_cache.as_ref() {
+        match cache.beside(VECTOR_STATE_CACHE_SUBDIR) {
+            Ok(cache) => hidden_opts.manifest_disk_cache = Some(cache),
+            Err(error) => warn!("vector-state disk cache unavailable: {error}"),
+        }
+    }
     // Per-table cell-count overrides ride along too: the hidden handle's
     // paths resolve counts through its own options.
     hidden_opts.user_cell_count = user_opts.user_cell_count;
@@ -2880,6 +2890,7 @@ mod tests {
             manifest::{
                 ScalarStats, SuperfileEntry, SuperfileUri,
                 commit::{POINTER_PATH, get_current_manifest_etag},
+                disk_cache::ManifestDiskCache,
                 list::PartitionStrategy,
             },
             opann::MODALITY_MIN_CELL_DOCS,
@@ -5819,6 +5830,7 @@ mod tests {
         let state = hidden
             .block_on_query(slow_vector_state::load_full_state(
                 hidden_storage.as_ref(),
+                None,
                 uri,
                 &hash,
                 &LegacyNames::none(),
@@ -6064,6 +6076,7 @@ mod tests {
         let state = hidden
             .block_on_query(slow_vector_state::load_full_state(
                 hidden_storage.as_ref(),
+                None,
                 uri,
                 &hash,
                 &LegacyNames::none(),
@@ -9044,6 +9057,94 @@ mod tests {
             .vector_hits("emb", &q, 2, VectorSearchOptions::new(), None)
             .expect("vector search on blob-hydrated manifest");
         assert!(!hits.is_empty(), "search serves from the hydrated view");
+    }
+
+    /// Budget of the manifest cache in the vector-state cache test.
+    const VECTOR_STATE_TEST_CACHE_BUDGET_BYTES: u64 = 1 << 30;
+
+    #[test]
+    fn a_reopened_table_reads_its_vector_state_from_disk() {
+        let dim = 16usize;
+        let item_field = Arc::new(Field::new("item", DataType::Float32, true));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new(
+                "emb",
+                DataType::FixedSizeList(item_field.clone(), dim as i32),
+                false,
+            ),
+        ]));
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool"),
+        );
+        let dir = TempDir::new().expect("tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let make_options = || {
+            let storage: Arc<dyn StorageProvider> =
+                Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+            let cache = ManifestDiskCache::new(
+                cache_dir.path().join("manifest-parts"),
+                VECTOR_STATE_TEST_CACHE_BUDGET_BYTES,
+            )
+            .expect("manifest cache");
+            SupertableOptions::new(
+                schema.clone(),
+                vec![FtsConfig::new("title")],
+                vec![VectorConfig {
+                    column: "emb".into(),
+                    dim,
+                    rot_seed: 7,
+                    metric: Metric::Cosine,
+                    rerank_codec: RerankCodec::Sq8Residual,
+                    provided_centroids: None,
+                }],
+            )
+            .expect("valid options")
+            .with_storage(storage)
+            .with_writer_pool(Arc::clone(&pool))
+            .with_manifest_disk_cache(cache)
+        };
+        let st = Supertable::create(make_options()).expect("create");
+        for title in ["alpha", "beta"] {
+            let titles = LargeStringArray::from(vec![title.to_owned()]);
+            let flat = Float32Array::from(vec![1.0f32; dim]);
+            let fsl = FixedSizeListArray::new(item_field.clone(), dim as i32, Arc::new(flat), None);
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(titles) as Arc<dyn Array>,
+                    Arc::new(fsl) as Arc<dyn Array>,
+                ],
+            )
+            .expect("batch");
+            let mut w = st.writer().expect("writer");
+            w.append(&batch).expect("append");
+            w.commit().expect("commit");
+        }
+        st.drain_vectors_to_cells_sync().expect("drain");
+        drop(st);
+
+        let st2 = Supertable::open(make_options()).expect("reopen");
+        let hidden = st2
+            .reader()
+            .expect("reader")
+            .vector_index_table()
+            .expect("hidden vector index on reopen")
+            .clone();
+        let stats = hidden
+            .reader()
+            .expect("reader")
+            .manifest()
+            .options
+            .manifest_disk_cache
+            .as_ref()
+            .expect("hidden vector-state cache")
+            .stats();
+        assert!(stats.n_hits > 0, "{stats:?}");
+        assert_eq!(stats.n_misses, 0, "{stats:?}");
     }
 
     /// Incremental drain: each drain consumes only user commits not already in

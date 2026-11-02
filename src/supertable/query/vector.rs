@@ -4585,7 +4585,14 @@ impl SupertableReader {
             return Some(Arc::clone(section));
         }
         let entries = manifest.get_all_superfiles();
-        match fetch_centroid_section(storage.as_ref(), &reference, entries).await {
+        match fetch_centroid_section(
+            storage.as_ref(),
+            manifest.options.manifest_disk_cache.as_ref(),
+            &reference,
+            entries,
+        )
+        .await
+        {
             Ok(section) => {
                 let section = Arc::new(section);
                 *guard = Some(Arc::clone(&section));

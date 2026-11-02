@@ -130,6 +130,12 @@ impl ManifestDiskCache {
         Ok(Arc::new(cache))
     }
 
+    /// A cache in the directory `subdir` beside this one, with the same budget.
+    pub(crate) fn beside(&self, subdir: &str) -> std::io::Result<Arc<Self>> {
+        let parent = self.cache_root.parent().unwrap_or(&self.cache_root);
+        Self::new(parent.join(subdir), self.budget_bytes())
+    }
+
     /// Walk the cache directory and register every well-formed cache
     /// file in the accounting index. A leftover `.tmp` file (an
     /// interrupted write) is removed. Unparseable names are ignored.
@@ -497,6 +503,22 @@ mod tests {
         cache.raise_budget(500);
         assert_eq!(cache.budget_bytes(), 500);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_cache_beside_another_keeps_its_own_entries() {
+        let parent = tmp_root("beside");
+        let _ = fs::remove_dir_all(&parent);
+        let cache = ManifestDiskCache::new(parent.join("parts"), 1 << 20).expect("cache");
+        let other = cache.beside("other").expect("cache beside");
+        assert_eq!(other.budget_bytes(), cache.budget_bytes());
+
+        let bytes = b"other-bytes".to_vec();
+        let h = hash_of(&bytes);
+        other.put(h, Bytes::copy_from_slice(&bytes)).await;
+        assert!(parent.join("other").join(cache_filename(&h)).exists());
+        assert_eq!(cache.get(&h).await, None);
+        let _ = fs::remove_dir_all(&parent);
     }
 
     #[tokio::test]

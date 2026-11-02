@@ -345,7 +345,7 @@ async fn put_content_addressed(
     Ok(crate::supertable::writer::put_content_addressed(
         storage,
         |hash| object_uri(kind, hash),
-        bytes,
+        bytes.into(),
     )
     .await?)
 }
