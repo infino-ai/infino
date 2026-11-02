@@ -2728,8 +2728,11 @@ impl SupertableWriter {
             pool,
             lanes,
             move |_, lane| {
-                let docs: u32 = lane.stretches.iter().map(|s| s.len).sum();
-                let _span = detail_span!("lane.freeze", docs = docs).entered();
+                let _span = detail_span!(
+                    "lane.freeze",
+                    docs = lane.stretches.iter().map(|s| s.len).sum::<u32>()
+                )
+                .entered();
                 timed_kernel(&freeze_stats, || Ok(lane.builder.freeze(lane.stretches)?))
             },
             seal_task_lost,
@@ -3706,9 +3709,13 @@ impl LiveLanes {
         let (tx, rx) = std_sync_channel(1);
         let stats = op_stats.clone();
         let col_idxs = self.col_idxs.clone();
-        let rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         pool.spawn(move || {
-            let _span = detail_span!("live.feed", lanes = n, rows = rows).entered();
+            let _span = detail_span!(
+                "live.feed",
+                lanes = n,
+                rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>()
+            )
+            .entered();
             let fed = lanes
                 .par_iter_mut()
                 .enumerate()
