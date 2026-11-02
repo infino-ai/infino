@@ -86,6 +86,13 @@ pub(crate) const BLOCK_VALUES: usize = 1024;
 /// `u64` key and a `u32` row, 48 MiB, whatever the superfile's size.
 const RUN_ENTRIES: usize = 4 << 20;
 
+/// Narrowest row id a block packs. A one-row superfile needs no bits for
+/// its row, and a block of one value needs none for its key, so without a
+/// floor such a block would take no bytes: it would start where the next
+/// one does (or at the region's end), which the directory refuses as a
+/// damaged layout. One bit per row keeps every block at least a byte.
+const MIN_ROW_WIDTH: u8 = 1;
+
 /// Bytes of one spilled pair: the key, then the row.
 const RUN_RECORD_BYTES: usize = 12;
 /// Bytes of a spilled pair's key.
@@ -258,7 +265,7 @@ where
         }
         n_rows += batch.num_rows() as u64;
     }
-    let row_width = width_of(n_rows.saturating_sub(1));
+    let row_width = width_of(n_rows.saturating_sub(1)).max(MIN_ROW_WIDTH);
 
     let mut blocks_file = BufWriter::new(tempfile::tempfile_in(scratch)?);
     let mut writer = BlockWriter::new(&mut blocks_file, row_width);
@@ -989,6 +996,42 @@ mod tests {
             "the estimate is off by at most the two cut blocks"
         );
         (rows, count)
+    }
+
+    /// A one-row superfile's region, with two indexed columns, parses and
+    /// answers: each column's one-value block still takes bytes of its own.
+    #[test]
+    fn a_one_row_region_parses_and_answers() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![7])),
+                Arc::new(Float64Array::from(vec![2.5])),
+            ],
+        );
+        let scratch = tempfile::tempdir().expect("scratch");
+        let region = whole(
+            build_region(
+                [batch],
+                &[spec("a", 1, KeyKind::Signed), spec("b", 2, KeyKind::Float)],
+                scratch.path(),
+            )
+            .expect("build"),
+        );
+        let one: RoaringBitmap = [0].into_iter().collect();
+        assert_eq!(
+            query(&region, 1, signed_key(0), signed_key(10)),
+            (one.clone(), 1)
+        );
+        assert_eq!(
+            query(&region, 1, signed_key(8), signed_key(10)),
+            (RoaringBitmap::new(), 0)
+        );
+        assert_eq!(query(&region, 2, float_key(2.5), float_key(2.5)), (one, 1));
     }
 
     #[test]

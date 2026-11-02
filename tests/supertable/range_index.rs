@@ -29,6 +29,8 @@ use tempfile::TempDir;
 const ROWS_PER_FILE: i64 = 3000;
 /// Superfiles each table is written as, one commit each.
 const FILES: i64 = 4;
+/// Superfiles of one row each in the one-row fixture.
+const ONE_ROW_FILES: usize = 3;
 /// Every this-many rows `qty` is null.
 const QTY_NULL_EVERY: i64 = 17;
 /// The first `day`: 2022-01-08 as days since the epoch.
@@ -251,6 +253,35 @@ fn a_range_index_follows_its_column_through_a_rename_and_not_into_a_reused_name(
             .expect("append");
     }
     assert_same_answers(&db, RENAMED_QUERIES, "after a rename and a reused name");
+}
+
+/// Superfiles of a single row each, as a writer committing one document at
+/// a time leaves them, answer as the scan does.
+#[test]
+fn one_row_superfiles_answer_as_a_scan_does() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = connect(dir.path().to_str().expect("utf-8 path")).expect("connect");
+    let plain = db
+        .create_table("plain", schema(), IndexSpec::new())
+        .expect("create plain");
+    let ranged = db
+        .create_table(
+            "ranged",
+            schema(),
+            IndexSpec::new()
+                .range("seq")
+                .range("qty")
+                .range("price")
+                .range("day"),
+        )
+        .expect("create ranged");
+    let batch = rows(0);
+    for row in 0..ONE_ROW_FILES {
+        let one = batch.slice(row, 1);
+        plain.append(&one).expect("append plain");
+        ranged.append(&one).expect("append ranged");
+    }
+    assert_same_answers(&db, QUERIES, "over one-row superfiles");
 }
 
 #[test]
