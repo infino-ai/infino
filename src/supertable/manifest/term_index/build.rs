@@ -62,6 +62,7 @@ use crate::{
     supertable::{manifest::part::ContentHash, schema::FieldId},
     utils::{
         terms::{DictEntry, TermBlockWriter},
+        trace::detail_span,
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -2058,7 +2059,7 @@ pub(crate) fn merge_layers(
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedLayer, TermIndexError> {
-    let ranges = key_ranges(sources, policy)?;
+    let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
     // Each range merges the slices that reach into it, on its own writer.
     let mut merged = run_ranges(&ranges, policy, |start, end| {
         let in_range: Vec<Vec<SliceFile>> = sources

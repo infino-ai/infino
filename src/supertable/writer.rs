@@ -11944,11 +11944,12 @@ pub(in crate::supertable) async fn stamp_term_index(
                     scoring_by_superfile: Arc::new(scoring_by_superfile(&old)),
                     ..old.options.term_index_build_policy()
                 };
+                let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
                 let (mut root, mut repaired, sized, before_tiers) = match referenced_root(&old)
                     .await?
                 {
                     Some(mut root) => {
-                        match term_index::check_objects(storage, &mut root, seen).await? {
+                        match term_index::check_objects(storage, &mut root, seen, &live).await? {
                             RootObjects::Present {
                                 sized,
                                 before_tiers,
@@ -11977,7 +11978,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                         published.store(true, Ordering::Relaxed);
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
-                    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
                     let renumber = !renumbered.load(Ordering::Relaxed);
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,

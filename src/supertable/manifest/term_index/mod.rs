@@ -1095,11 +1095,29 @@ pub(crate) async fn check_objects(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
     seen: &Mutex<HashSet<ContentHash>>,
+    live: &HashSet<Uuid>,
 ) -> Result<RootObjects, TermIndexError> {
+    // A layer whose every ordinal names a superfile that is gone is dropped
+    // unread by the fold that follows (`layer_keeps_postings`), so its
+    // objects are not checked either: after a compaction they are most of
+    // the root, and a check is a round trip each.
+    let names_live = |layer: &Layer| match &layer.ordinals {
+        None => true,
+        Some(range) => range.clone().any(|o| {
+            root.superfiles
+                .get(o as usize)
+                .is_some_and(|id| live.contains(id))
+        }),
+    };
     let wanted: HashSet<(ContentHash, ObjectCheck)> = {
         let seen = seen.lock().expect("term-index objects seen");
         let mut wanted = HashSet::new();
-        for slice in root.layers.iter().flat_map(|layer| &layer.slices) {
+        for slice in root
+            .layers
+            .iter()
+            .filter(|layer| names_live(layer))
+            .flat_map(|layer| &layer.slices)
+        {
             if !seen.contains(&slice.content_hash) {
                 wanted.insert((slice.content_hash, ObjectCheck::SliceLayout));
             }
@@ -7413,7 +7431,7 @@ mod tests {
             slice.len = 0;
         }
         assert_eq!(
-            check_objects(&local, &mut unsized_root, &seen)
+            check_all_objects(&local, &mut unsized_root, &seen)
                 .await
                 .expect("check"),
             RootObjects::Present {
@@ -7424,7 +7442,7 @@ mod tests {
         assert_eq!(unsized_root, root, "each length is the slice's on storage");
         let mut sized_root = root.clone();
         assert_eq!(
-            check_objects(&local, &mut sized_root, &seen)
+            check_all_objects(&local, &mut sized_root, &seen)
                 .await
                 .expect("check"),
             RootObjects::Present {
@@ -7437,7 +7455,7 @@ mod tests {
         fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash))).expect("remove");
         let mut root = root.clone();
         assert_eq!(
-            check_objects(&local, &mut root, &Mutex::new(HashSet::new()))
+            check_all_objects(&local, &mut root, &Mutex::new(HashSet::new()))
                 .await
                 .expect("check"),
             RootObjects::Missing
@@ -7472,6 +7490,17 @@ mod tests {
                 len: bytes,
             }],
         }
+    }
+
+    /// [`check_objects`] with every superfile of the root live, as a root
+    /// before any compaction has them.
+    async fn check_all_objects(
+        storage: &Arc<dyn StorageProvider>,
+        root: &mut Root,
+        seen: &Mutex<HashSet<ContentHash>>,
+    ) -> Result<RootObjects, TermIndexError> {
+        let live: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        check_objects(storage, root, seen, &live).await
     }
 
     /// A layer whose every ordinal the fold drops is left unread; one with
