@@ -68,6 +68,7 @@ use std::{
     num::NonZeroUsize,
     ops::Range,
     path::{Path, PathBuf},
+    pin::pin,
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -13674,50 +13675,51 @@ fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Bytes, String> {
     Ok(Bytes::from(out))
 }
 
-/// Multipart-upload variant of the writer's per-superfile put.
-/// Routes through [`crate::storage::StorageProvider::put_multipart`]
-/// for superfiles large enough that a single PUT is wasteful
-/// (slow on a backend stall, high RSS during the put).
-///
-/// Idempotency: superfile URIs are UUID v4, so the only "URI
-/// exists" hit on retry comes from our own prior attempt
-/// with bit-identical bytes. Head-first lets us short-circuit
-/// that case before re-running the multipart dance. The
-/// single-PUT path achieves the same effect by returning
-/// `PreconditionFailed`, which the call-site swallows;
-/// multipart's `complete()` doesn't carry a precondition, so
-/// we need to detect "already there" explicitly.
-///
-/// Part size: 8 MiB — comfortably above S3's 5-MiB minimum
-/// and a clean fit for the cold-fetch coordinator's default
-/// 16-MiB chunk reads on the way back out. Parts are pushed in declaration
-/// order and driven in bounded concurrent groups so mmap-backed shards remain
-/// memory-bounded during upload.
-/// Write `bytes` to `path`, routing through multipart (staged blocks) at or
-/// above `multipart_threshold` and a single `put_atomic` below it. A single
-/// `Put Blob`/`PutObject` is capped at ~5 GiB by Azure/S3, so any blob that can
-/// grow past that (e.g. the slow-vector-state centroid blob at 100M+ docs) must
-/// take the multipart path. Content-addressed callers treat `PreconditionFailed`
-/// as "identical bytes already durable" and swallow it.
-pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
-    storage: &dyn StorageProvider,
-    path: &str,
-    bytes: Bytes,
-    multipart_threshold: u64,
-) -> Result<(), StorageError> {
-    if (bytes.len() as u64) >= multipart_threshold {
-        put_superfile_multipart(storage, path, bytes).await
-    } else {
-        storage.put_atomic(path, bytes).await.map(|_| ())
-    }
-}
-
 /// Objects at or above this size go through the multipart upload path.
 /// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
 /// content hash — slow-vector state, term-index slices and roots — can
 /// grow past that at scale; the figure matches the superfile default.
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
+
+/// How long a content-addressed PUT below the multipart threshold runs
+/// alone before a second attempt starts beside it, plus the object's bytes
+/// at [`HEDGE_BYTES_PER_SEC`]. The stores answer an 8 MB PUT in under half
+/// a second and now and then hold one for the whole request timeout: one
+/// such PUT held a billion-row ingest's commit for a minute. The attempts
+/// write the same bytes under the same name, so the one that lands second
+/// is refused as already present, which the caller takes as success.
+const HEDGE_AFTER_BASE: time::Duration = time::Duration::from_secs(2);
+
+/// The rate the hedge's delay grants an object before its second attempt:
+/// well under what one connection moves, so a PUT that is merely large is
+/// not hedged for its size.
+const HEDGE_BYTES_PER_SEC: u64 = 4 << 20;
+
+/// PUT `bytes` at `uri` as a new object, starting a second attempt after
+/// [`HEDGE_AFTER_BASE`] and the object's share of [`HEDGE_BYTES_PER_SEC`]
+/// if the first has not answered; the first answer wins. Only for an
+/// object whose name is its content: a second attempt that lands second
+/// is refused as already present, which is the same outcome.
+async fn put_new_hedged(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    let delay = HEDGE_AFTER_BASE
+        + time::Duration::from_secs_f64(bytes.len() as f64 / HEDGE_BYTES_PER_SEC as f64);
+    let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
+    tokio::select! {
+        answer = &mut first => answer.map(|_| ()),
+        () = sleep(delay) => {
+            let mut second = pin!(storage.put_atomic(uri, bytes));
+            tokio::select! {
+                answer = &mut first => answer.map(|_| ()),
+                answer = &mut second => answer.map(|_| ()),
+            }
+        }
+    }
+}
 
 /// Persist `bytes` under the name `uri_for` derives from their content
 /// hash and return the reference a manifest records. Idempotent: an
@@ -13731,15 +13733,14 @@ pub(in crate::supertable) async fn put_content_addressed(
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
     let span = detail_span!("put_content_addressed", len = bytes.len());
-    match put_bytes_multipart_or_atomic(
-        storage,
-        &uri,
-        Bytes::from(bytes),
-        CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES,
-    )
-    .instrument(span)
-    .await
-    {
+    let bytes = Bytes::from(bytes);
+    let put = async {
+        match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
+            true => put_superfile_multipart(storage, &uri, bytes).await,
+            false => put_new_hedged(storage, &uri, bytes).await,
+        }
+    };
+    match put.instrument(span).await {
         Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
             Ok(RoutingRef { uri, content_hash })
         }
@@ -13960,6 +13961,7 @@ mod tests {
 
     use std::{
         fs,
+        future::pending,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -14005,7 +14007,7 @@ mod tests {
             reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
-            storage::LocalFsStorageProvider,
+            storage::{LocalFsStorageProvider, ObjectMeta},
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
         test_helpers::{
@@ -14659,6 +14661,86 @@ mod tests {
     /// The commit write fanout is a `NonZeroUsize` because a zero would
     /// panic the uploader's channel and stall `buffered`; a single-core host
     /// divides to zero before the floor applies.
+    /// Storage whose first PUT of an object named with `held` never
+    /// answers; later PUTs of such objects go through, and all are counted.
+    #[derive(Debug)]
+    struct HeldFirstPutStorage {
+        inner: LocalFsStorageProvider,
+        held: &'static str,
+        first: AtomicBool,
+        puts: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for HeldFirstPutStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            if uri.contains(self.held) {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                if self.first.swap(false, Ordering::SeqCst) {
+                    pending::<()>().await;
+                }
+            }
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// A content-addressed PUT the store never answers is answered by its
+    /// hedge: the second attempt lands the object and the caller sees
+    /// success. Time is paused, so the hedge's delay passes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_content_addressed_put_is_answered_by_its_hedge() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldFirstPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            held: "hedged",
+            first: AtomicBool::new(true),
+            puts: AtomicUsize::new(0),
+        };
+        let reference =
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
+                .await
+                .expect("the hedge answers");
+        assert_eq!(
+            storage.puts.load(Ordering::SeqCst),
+            2,
+            "one attempt held, one hedge"
+        );
+        assert!(
+            storage.inner.head(&reference.uri).await.is_ok(),
+            "the hedge landed the object"
+        );
+    }
+
     #[test]
     fn commit_write_concurrency_is_never_zero() {
         assert!(commit_write_concurrency().get() >= 1);
