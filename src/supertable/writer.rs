@@ -2654,44 +2654,49 @@ impl SupertableWriter {
             .map(|b| try_conform(&b.scalar, &scalar_schema))
             .collect::<Result<_, _>>()
             .map_err(|e| BuildError::Store(format!("live lanes: conform the buffer: {e}")))?;
-        // The seal is the append's own CPU, measured on the pool threads
-        // that run it like a commit-time build's pieces: the lanes frozen
-        // side by side, then every piece built from its rows of them.
-        let outputs: Vec<ShardOutput> = options.writer_pool.install(|| {
-            let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
-            let frozen: Vec<FrozenLane> = lanes
-                .into_par_iter()
-                .map(|lane| {
-                    let docs: u32 = lane.stretches.iter().map(|s| s.len).sum();
-                    let _span = detail_span!("lane.freeze", docs = docs).entered();
-                    timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?))
-                })
-                .collect::<Result<_, BuildError>>()?;
-            drop(freeze_span);
-            let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
-            let frozen = Arc::new(freeze_lanes(frozen, pieces)?);
-            drop(merge_span);
-            let _pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
-            (0..n_pieces)
-                .into_par_iter()
-                .map(|i| {
-                    timed_kernel(&stats, || {
-                        let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
-                        build_piece(
-                            PieceRows::Lanes {
-                                batches: &rows,
-                                lanes: Arc::clone(&frozen),
-                                piece: i,
-                            },
-                            &options,
-                            &manifest,
-                            options.vector_layout,
-                            None,
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, BuildError>>()
+        // The seal is the append's own CPU, run on the pool as spawned
+        // tasks this thread waits for (`run_spawned`): the lanes frozen
+        // side by side, their dictionaries merged into the pieces' order,
+        // then every piece built from its rows of them.
+        let pool = &options.writer_pool;
+        let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
+        let freeze_stats = stats.clone();
+        let frozen: Vec<FrozenLane> = run_spawned(pool, lanes, move |_, lane| {
+            let docs: u32 = lane.stretches.iter().map(|s| s.len).sum();
+            let _span = detail_span!("lane.freeze", docs = docs).entered();
+            timed_kernel(&freeze_stats, || Ok(lane.builder.freeze(lane.stretches)?))
         })?;
+        drop(freeze_span);
+        let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
+        let frozen = Arc::new(
+            run_spawned(pool, vec![frozen], move |_, frozen| {
+                Ok(freeze_lanes(frozen, pieces.clone())?)
+            })?
+            .pop()
+            .ok_or_else(|| BuildError::Store("live lanes: the merge returned no lanes".into()))?,
+        );
+        drop(merge_span);
+        let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
+        let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
+        let (piece_options, piece_manifest, piece_stats) =
+            (Arc::clone(&options), Arc::clone(&manifest), stats.clone());
+        let outputs: Vec<ShardOutput> = run_spawned(pool, (0..n_pieces).collect(), move |i, _| {
+            timed_kernel(&piece_stats, || {
+                let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
+                build_piece(
+                    PieceRows::Lanes {
+                        batches: &rows,
+                        lanes: Arc::clone(&frozen),
+                        piece: i,
+                    },
+                    &piece_options,
+                    &piece_manifest,
+                    piece_options.vector_layout,
+                    None,
+                )
+            })
+        })?;
+        drop(pieces_span);
         let sealed = sealing.elapsed();
         let superfiles = outputs.len();
         let cell_hints = vec![None; superfiles];
@@ -3698,6 +3703,47 @@ impl LiveLanes {
 
 /// The rows `start..end` of a commit, as `batches` hold them: the slices
 /// of the batches that fall in the range, in order.
+/// Run `work` over `items`, one spawned task each on `pool`, and return
+/// the results in the items' order once every task has reported.
+///
+/// The caller is a thread outside the pool, blocked on a channel, so no
+/// pool thread waits for another's work. A thread that waits inside the
+/// pool — under `install`, or at a `join` — runs whatever job is queued
+/// meanwhile, and with many appends sealing at once that was another
+/// append's whole seal: lanes frozen in a fraction of a second sat for
+/// tens of seconds while the thread that owned them worked elsewhere, and
+/// the pool ran at half its width. Every task reports before this
+/// returns, so a failed task's siblings finish rather than outlive it.
+fn run_spawned<T, R, F>(pool: &ThreadPool, items: Vec<T>, work: F) -> Result<Vec<R>, BuildError>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+    F: Fn(usize, T) -> Result<R, BuildError> + Send + Sync + 'static,
+{
+    let n = items.len();
+    let (tx, rx) = std_sync_channel(n.max(1));
+    let work = Arc::new(work);
+    for (i, item) in items.into_iter().enumerate() {
+        let (tx, work) = (tx.clone(), Arc::clone(&work));
+        pool.spawn(move || {
+            // The receiver is gone only if the caller gave up mid-seal;
+            // there is nobody left to tell.
+            let _ = tx.send((i, work(i, item)));
+        });
+    }
+    drop(tx);
+    let mut results: Vec<Option<Result<R, BuildError>>> = (0..n).map(|_| None).collect();
+    for (i, result) in rx {
+        results[i] = Some(result);
+    }
+    results
+        .into_iter()
+        .map(|result| {
+            result.ok_or_else(|| BuildError::Store("a seal task ended without a result".into()))?
+        })
+        .collect()
+}
+
 fn piece_batches(batches: &[RecordBatch], start: usize, end: usize) -> Vec<RecordBatch> {
     slice_rows(
         batches,
