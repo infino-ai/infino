@@ -1656,7 +1656,7 @@ async fn read_row_group_byte_source(
 ) -> DfResult<RecordBatch> {
     let input = ByteSourceAsyncReader {
         source: Source::Lazy(reader.byte_source()),
-        metadata: Arc::clone(reader.parquet_metadata()),
+        metadata: reader.parquet_metadata(),
     };
     let options = if views.is_empty() {
         ArrowReaderOptions::new()

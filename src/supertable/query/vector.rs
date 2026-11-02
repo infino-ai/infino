@@ -2194,7 +2194,7 @@ async fn ids_from_sidecar(
         }
     };
     let locals = Arc::clone(local_ids);
-    let metadata = Arc::clone(reader.parquet_metadata());
+    let metadata = reader.parquet_metadata();
     let id_column = reader.id_column().to_string();
     let id_range = (entry.id_min, entry.id_max);
     let (decoded, decode_ns) = run_on_pool(

@@ -1559,7 +1559,7 @@ async fn lazy_background_fill(
 
 /// Absolute `(offset, length)` of the vector blob from Parquet KV metadata.
 fn vector_blob_range(reader: &SuperfileReader) -> Option<(u64, u64)> {
-    vector_blob_range_in(&footer::extract_kv_map(reader.parquet_metadata()).ok()?)
+    vector_blob_range_in(&footer::extract_kv_map(&reader.parquet_metadata()).ok()?)
 }
 
 fn vector_blob_range_in(kv_map: &footer::KvMap) -> Option<(u64, u64)> {
