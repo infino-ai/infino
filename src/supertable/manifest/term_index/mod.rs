@@ -861,17 +861,51 @@ pub(crate) async fn fold_at_optimize(
     if fold.superfiles.is_empty() {
         return Ok(Root::default());
     }
-    let merged = fold_layers(
-        storage,
-        &root.layers[fold.run.clone()],
-        &fold.ordinals,
-        policy,
-        pool,
-    )
-    .await?;
+    let run = &root.layers[fold.run.clone()];
+    // A layer whose every posting survives, renumbered by one shift, is
+    // already what merging would make of it, and merging it in rewrites
+    // its every byte to save a lookup one slice. Where it holds at least
+    // half of what the fold keeps, that rewrite is most of the fold, so it
+    // moves instead: its base and range shift and its objects stay. The
+    // rest merge into one layer as before. After an optimize this is the
+    // pass's own layer, whole by construction, beside the postings of the
+    // few inputs the plan left out, which a small merge drops the dead
+    // from. A layer under one slice is merged whatever its share: the
+    // rewrite it would save is one slice, and a small index folds to one
+    // layer as it always did.
+    let kept_bytes: u64 = run
+        .iter()
+        .filter(|layer| layer_keeps_postings(layer, &fold.ordinals))
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size));
+    let moves = |layer: &Layer| -> Option<(u32, Range<u32>)> {
+        let bytes = layer_bytes(layer);
+        (bytes >= policy.slice_target_bytes as u64 && bytes.saturating_mul(2) >= kept_bytes)
+            .then(|| shifted_whole(layer, &fold.ordinals))
+            .flatten()
+    };
+    let mut folded: Vec<Layer> = Vec::new();
+    let mut merging: Vec<Layer> = Vec::new();
+    for layer in run {
+        match moves(layer) {
+            Some((base, range)) => {
+                let mut moved = layer.clone();
+                moved.base = base;
+                moved.ordinals = Some(range);
+                folded.push(moved);
+            }
+            None => merging.push(layer.clone()),
+        }
+    }
+    if folded.is_empty()
+        || merging
+            .iter()
+            .any(|layer| layer_keeps_postings(layer, &fold.ordinals))
+    {
+        folded.push(fold_layers(storage, &merging, &fold.ordinals, policy, pool).await?);
+    }
     let mut layers = root.layers.clone();
-    layers.drain(fold.run.clone());
-    layers.insert(fold.run.start, merged);
+    layers.splice(fold.run.clone(), folded);
     Ok(Root {
         superfiles: fold.superfiles,
         id_mins: fold.id_mins,
@@ -907,19 +941,6 @@ async fn fold_layers(
             ordinals: merged_ordinals,
             base: 0,
         });
-    }
-    // One kept layer whose every posting survives under one shift is the
-    // merged layer already: it moves to its new place and its objects stay
-    // where they are, so the fold reads and writes nothing. The fold after
-    // an optimize finds this when the pass committed its merges in one
-    // batch: that batch's layer, behind the superfiles it replaced.
-    if let [layer] = kept.as_slice()
-        && let Some((base, range)) = shifted_whole(layer, ordinals)
-    {
-        let mut placed = layer.clone();
-        placed.base = base;
-        placed.ordinals = Some(range);
-        return Ok(placed);
     }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
     let sources = download_layers(storage, &kept, scratch.path())
@@ -2219,7 +2240,6 @@ mod tests {
         collections::HashMap,
         fs,
         ops::Range,
-        slice::from_ref,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -7575,61 +7595,104 @@ mod tests {
         );
     }
 
-    /// One kept layer whose postings all survive under one shift moves to
-    /// its new place without a read or a write: the fold hands it back with
-    /// its slices as they were, over a store that holds nothing. A layer
-    /// that loses a posting, or whose ordinals do not move as one, is
-    /// merged, which the empty store cannot serve.
+    /// A whole layer of at least a slice holding at least half of what the
+    /// fold keeps moves to its new place without a read or a write:
+    /// optimize hands it back with its slices as they were, over a store
+    /// that holds nothing. A layer that loses a posting, is shifted
+    /// unevenly, or is small beside the rest is merged, which the empty
+    /// store cannot serve.
     #[tokio::test]
-    async fn a_fold_of_one_whole_layer_moves_it_without_a_rewrite() {
+    async fn an_optimize_fold_moves_a_whole_layer_that_is_most_of_what_it_keeps() {
         let dir = TempDir::new().expect("tempdir");
         let empty: Arc<dyn StorageProvider> =
             Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
         let policy = BuildPolicy::default();
-        let layer = |tag: u8, base: u32, ordinals: Range<u32>| Layer {
+        let layer = |bytes: u64, base: u32, ordinals: Range<u32>| Layer {
             base,
             ordinals: Some(ordinals),
-            ..tagged_layer(tag)
+            ..sized_layer(bytes)
         };
-        // Ordinals 0..4 die; 4..7 survive as 0..3.
-        let renumbering = [None, None, None, None, Some(0), Some(1), Some(2)];
-        let whole = layer(7, 4, 4..7);
-        let moved = fold_layers(
+        let ids: Vec<Uuid> = (1..=7).map(Uuid::from_u128).collect();
+        let root = |layers: Vec<Layer>| Root {
+            superfiles: ids.clone(),
+            id_mins: (1..=7).collect(),
+            layers,
+        };
+        // Superfiles 0..4 are replaced; 4..7 survive as 0..3.
+        let fold = || OptimizeFold {
+            run: 0..2,
+            ordinals: vec![None, None, None, None, Some(0), Some(1), Some(2)],
+            superfiles: ids[4..].to_vec(),
+            id_mins: (5..=7).collect(),
+            renumbers: true,
+        };
+        // Sizes in slices of the policy's target: a layer under one slice
+        // is merged whatever its share.
+        let slice = policy.slice_target_bytes as u64;
+        let dead = layer(slice, 0, 0..4);
+        let whole = layer(10 * slice, 4, 4..7);
+
+        let folded = fold_at_optimize(
             &empty,
-            &[layer(1, 0, 0..4), whole.clone()],
-            &renumbering,
+            &root(vec![dead.clone(), whole.clone()]),
+            fold(),
             &policy,
             None,
         )
         .await
         .expect("a whole layer moves without the store");
-        assert_eq!(moved.slices, whole.slices, "the slices are the layer's own");
-        assert_eq!((moved.base, moved.ordinals), (0, Some(0..3)));
-
-        // A layer whose stored ordinals count from behind its range moves
-        // its base by the same shift.
-        let behind = layer(7, 2, 4..7);
         assert_eq!(
-            shifted_whole(&behind, &renumbering),
-            None,
-            "its base would fall below zero"
+            folded.layers.len(),
+            1,
+            "the dead layer is dropped, the whole one moved"
         );
-        let renumber_by_one = [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)];
-        assert_eq!(shifted_whole(&behind, &renumber_by_one), Some((1, 3..6)));
+        assert_eq!(
+            folded.layers[0].slices, whole.slices,
+            "the slices are the layer's own"
+        );
+        assert_eq!(
+            (folded.layers[0].base, folded.layers[0].ordinals.clone()),
+            (0, Some(0..3))
+        );
+        assert_eq!(folded.superfiles, ids[4..]);
 
-        // A posting dropped, or an uneven shift: a merge, which fails here.
-        let dropped = [None, None, None, None, Some(0), None, Some(1)];
+        // A whole layer small beside a partial one is merged with it: here
+        // a merge, which the empty store fails.
+        let partial = layer(30 * slice, 3, 3..7);
+        let mut three = fold();
+        three.run = 0..3;
         assert!(
-            fold_layers(&empty, from_ref(&whole), &dropped, &policy, None)
+            fold_at_optimize(
+                &empty,
+                &root(vec![dead.clone(), whole.clone(), partial]),
+                three,
+                &policy,
+                None
+            )
+            .await
+            .is_err()
+        );
+        // A posting dropped from the large layer: a merge as well.
+        let mut dropped = fold();
+        dropped.ordinals = vec![None, None, None, None, Some(0), None, Some(1)];
+        dropped.superfiles = vec![ids[4], ids[6]];
+        dropped.id_mins = vec![5, 7];
+        assert!(
+            fold_at_optimize(&empty, &root(vec![dead, whole]), dropped, &policy, None)
                 .await
                 .is_err()
         );
+
+        // The shift alone: a layer whose stored ordinals count from behind
+        // its range moves its base by the same shift, and one that would
+        // fall below zero does not move.
+        let behind = layer(slice, 2, 4..7);
+        let renumbering = [None, None, None, None, Some(0), Some(1), Some(2)];
+        assert_eq!(shifted_whole(&behind, &renumbering), None);
+        let by_one = [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)];
+        assert_eq!(shifted_whole(&behind, &by_one), Some((1, 3..6)));
         let uneven = [None, None, None, None, Some(0), Some(2), Some(3)];
-        assert!(
-            fold_layers(&empty, &[whole], &uneven, &policy, None)
-                .await
-                .is_err()
-        );
+        assert_eq!(shifted_whole(&layer(slice, 4, 4..7), &uneven), None);
     }
 
     #[test]
