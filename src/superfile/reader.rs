@@ -65,6 +65,7 @@ use tracing::warn;
 use crate::superfile::fts::reader::TermIndexFact;
 use crate::{
     memory::ConnectionMemoryBudget,
+    runtime_bridge::run_on_pool_unless_blocking,
     superfile::{
         BytesLazyByteSource, LazyByteSource, LazyByteSourceError, LazySubSource, ReadError,
         error::FtsError,
@@ -79,6 +80,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId},
         ids::{self, PackedIds},
+        range::{KeyKind, RangeDirectory},
         vector::{
             layout::VectorLayout,
             reader::{self as vector_reader, ProbeTally, ScanCandidate, ScanOutcome, VectorReader},
@@ -262,6 +264,13 @@ pub struct SuperfileReader {
     /// reads take `_id` from Parquet, so the sidecar is not retried or warned
     /// about again.
     id_sidecar_broken: AtomicBool,
+    /// Where the range index region sits, when the superfile carries one
+    /// (`superfile::range`): absent on a table with no range-indexed column
+    /// and on superfiles written before the region existed.
+    range_region: Option<RangeRegionLocation>,
+    /// The region's directory, fetched and parsed on the first range read
+    /// and kept for the reader's life: a few kilobytes per million rows.
+    range_directory: OnceCell<Arc<RangeDirectory>>,
     /// The `(offset, len)` the resident bytes do not hold, when they are a
     /// local copy with a hole ([`install_resident_parquet`]); every other byte
     /// of them is the file's own.
@@ -296,6 +305,17 @@ impl IdSidecarLocation {
         let start = self.offset as usize;
         self.with_bytes(file.slice(start..start + self.len as usize), n_docs)
     }
+}
+
+/// Where a superfile's range index region lives, from the footer
+/// key-values: its range in the file and the length of the directory at its
+/// head. Checked against the file length when it was parsed
+/// ([`range_region_location`]).
+#[derive(Debug, Clone, Copy)]
+struct RangeRegionLocation {
+    offset: u64,
+    len: u64,
+    directory_len: u64,
 }
 
 /// A superfile's whole stable-id sidecar: one `_id` per local doc, in
@@ -666,6 +686,12 @@ impl SuperfileReader {
             warn!(%error, "ignoring the stable-id sidecar of a lazily opened superfile");
             None
         });
+        // Likewise the range index: a shortcut over the Parquet column it
+        // indexes, which a range scans when the region is unusable.
+        let range_region = range_region_location(&kv_map, source.size()).unwrap_or_else(|error| {
+            warn!(%error, "ignoring the range index of a lazily opened superfile");
+            None
+        });
 
         Ok(Self {
             bytes: None,
@@ -684,6 +710,8 @@ impl SuperfileReader {
             // one fetches the sidecar through `fetch_id_sidecar`.
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            range_region,
+            range_directory: OnceCell::new(),
             resident_hole: None,
         })
     }
@@ -806,6 +834,10 @@ impl SuperfileReader {
             loc.slice(&bytes, n_docs).check()?;
         }
 
+        // 7. Range index region (optional): located here, its directory
+        //    parsed on the first range read.
+        let range_region = range_region_location(&kv_map, bytes.len() as u64)?;
+
         Ok(Self {
             bytes: Some(bytes),
             parquet_meta: Arc::clone(arrow_meta.metadata()),
@@ -821,6 +853,8 @@ impl SuperfileReader {
             vec,
             id_sidecar,
             id_sidecar_broken: AtomicBool::new(false),
+            range_region,
+            range_directory: OnceCell::new(),
             resident_hole: None,
         })
     }
@@ -1232,6 +1266,216 @@ impl SuperfileReader {
     /// take `_id` from another source without fetching it again.
     pub(crate) fn mark_id_sidecar_broken(&self) {
         self.id_sidecar_broken.store(true, Ordering::Relaxed);
+    }
+
+    /// The range index's directory and the column's id in it, when the
+    /// superfile range-indexes the column with table id `field` with keys of
+    /// `kind`. The column is found by its id, not its name, so a file written
+    /// before a rename still serves it, and one written before the name was
+    /// dropped and reused does not. `None` otherwise — no region, the column
+    /// not in it, or keyed another way (a file written before the column's
+    /// type changed) — and the caller scans the column. The directory is
+    /// fetched once per reader.
+    async fn range_column(
+        &self,
+        field: FieldId,
+        kind: KeyKind,
+    ) -> Result<Option<(Arc<RangeDirectory>, u32)>, ReadError> {
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let directory = self
+            .range_directory
+            .get_or_try_init(|| async {
+                let bytes = self
+                    .range_region_bytes(loc, 0..loc.directory_len, "range index directory")
+                    .await?;
+                RangeDirectory::parse(&bytes, loc.len)
+                    .map(Arc::new)
+                    .map_err(ReadError::Malformed)
+            })
+            .await?;
+        let indexed = directory.column(field.0).is_some_and(|c| c.kind() == kind);
+        Ok(indexed.then(|| (Arc::clone(directory), field.0)))
+    }
+
+    /// Bytes `span` (relative to the region's start) of the range index
+    /// region at `loc`, in one read.
+    async fn range_region_bytes(
+        &self,
+        loc: RangeRegionLocation,
+        span: Range<u64>,
+        what: &'static str,
+    ) -> Result<Bytes, ReadError> {
+        let len = span.end - span.start;
+        let bytes = self
+            .byte_source()
+            .range(loc.offset + span.start, len)
+            .await
+            .map_err(|source| ReadError::RangeFetch { what, source })?;
+        if bytes.len() as u64 != len {
+            return Err(ReadError::RangeFetch {
+                what,
+                source: LazyByteSourceError::ShortRead {
+                    start: loc.offset + span.start,
+                    requested: len,
+                    got: bytes.len() as u64,
+                },
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// An estimate of the rows whose key lies in `lo..=hi`, from the range
+    /// index's directory alone (see `RangeColumn::estimate`); `None` when
+    /// the superfile does not range-index the column with keys of `kind`.
+    pub(crate) async fn range_estimate(
+        &self,
+        field: FieldId,
+        kind: KeyKind,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Option<u64>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+            return Ok(None);
+        };
+        Ok(directory.column(field_id).map(|c| c.estimate(lo, hi)))
+    }
+
+    /// The rows whose key lies in `lo..=hi`, read from the range
+    /// index: one read of the blocks the range reaches, decoded on `pool`.
+    /// `None` when the superfile does not range-index the column with keys of
+    /// `kind`; the caller scans the column.
+    pub(crate) async fn range_rows(
+        &self,
+        field: FieldId,
+        kind: KeyKind,
+        lo: u64,
+        hi: u64,
+        pool: Option<&ThreadPool>,
+    ) -> Result<Option<RoaringBitmap>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+            return Ok(None);
+        };
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let span = match directory.column(field_id) {
+            Some(c) => c.span_of(c.blocks_in(lo, hi)),
+            None => return Ok(None),
+        };
+        if span.is_empty() {
+            return Ok(Some(RoaringBitmap::new()));
+        }
+        let bytes = self
+            .range_region_bytes(loc, span, "range index blocks")
+            .await?;
+        let rows = run_on_pool_unless_blocking(pool, "range index rows", move || {
+            directory
+                .column(field_id)
+                .ok_or_else(|| "range index: the column left the directory".to_string())
+                .and_then(|c| c.rows(lo, hi, &bytes))
+        })
+        .await
+        .map_err(|_| ReadError::TaskDropped("range index rows"))?
+        .map_err(ReadError::Malformed)?;
+        Ok(Some(rows))
+    }
+
+    /// The `k` rows whose keys lie lowest (or, with `descending`,
+    /// highest) in `lo..=hi`, as `(key, row)` in that order, leaving out the
+    /// rows of `skip` (deleted ones): what an `ORDER BY column LIMIT k`
+    /// over a range keeps of this superfile. The interval's blocks are read
+    /// from its near end, one at a time, until `k` rows are found, so the
+    /// read is a block or two however wide the interval. Fewer than `k`
+    /// when the interval holds fewer. `None` when the superfile does not
+    /// range-index the column with keys of `kind`.
+    pub(crate) async fn range_ends(
+        &self,
+        field: FieldId,
+        kind: KeyKind,
+        (lo, hi): (u64, u64),
+        k: usize,
+        descending: bool,
+        skip: &RoaringBitmap,
+    ) -> Result<Option<Vec<(u64, u32)>>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+            return Ok(None);
+        };
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let Some(indexed) = directory.column(field_id) else {
+            return Ok(None);
+        };
+        let blocks: Vec<usize> = match descending {
+            false => indexed.blocks_in(lo, hi).collect(),
+            true => indexed.blocks_in(lo, hi).rev().collect(),
+        };
+        let mut out = Vec::with_capacity(k);
+        for b in blocks {
+            if out.len() >= k {
+                break;
+            }
+            let bytes = self
+                .range_region_bytes(loc, indexed.block_span(b), "range index block")
+                .await?;
+            let mut pairs = indexed
+                .pairs_in_block(b, &bytes, lo, hi)
+                .map_err(ReadError::Malformed)?;
+            if descending {
+                pairs.reverse();
+            }
+            out.extend(
+                pairs
+                    .into_iter()
+                    .filter(|(_, row)| !skip.contains(*row))
+                    .take(k - out.len()),
+            );
+        }
+        Ok(Some(out))
+    }
+
+    /// How many rows' keys lie in `lo..=hi`, from the range index:
+    /// the blocks wholly inside the range count from the directory, and only
+    /// the blocks it cuts — at most two — are read. `None` when the
+    /// superfile does not range-index the column with keys of `kind`.
+    pub(crate) async fn range_count(
+        &self,
+        field: FieldId,
+        kind: KeyKind,
+        lo: u64,
+        hi: u64,
+    ) -> Result<Option<u64>, ReadError> {
+        let Some((directory, field_id)) = self.range_column(field, kind).await? else {
+            return Ok(None);
+        };
+        let Some(loc) = self.range_region else {
+            return Ok(None);
+        };
+        let Some(indexed) = directory.column(field_id) else {
+            return Ok(None);
+        };
+        // At most two blocks of a thousand values each: decoded here, as the
+        // pool hop would cost more than the decode.
+        let boundary = try_join_all(indexed.boundary_blocks(lo, hi).into_iter().map(|b| {
+            let span = indexed.block_span(b);
+            async move {
+                let bytes = self
+                    .range_region_bytes(loc, span, "range index boundary block")
+                    .await?;
+                Ok::<_, ReadError>((b, bytes))
+            }
+        }))
+        .await?;
+        let boundary: Vec<(usize, &[u8])> = boundary
+            .iter()
+            .map(|(b, bytes)| (*b, bytes.as_ref()))
+            .collect();
+        indexed
+            .count(lo, hi, &boundary)
+            .map(Some)
+            .map_err(ReadError::Malformed)
     }
 
     /// A [`LazyByteSource`] over the **entire** superfile, regardless of
@@ -2792,6 +3036,36 @@ fn id_sidecar_location(
         offset,
         len,
         packed,
+    }))
+}
+
+/// The range index region's location from the footer key-values, `None` on
+/// a superfile that carries none. Partial keys, a region past `file_len`, or
+/// a directory longer than its region are malformed.
+fn range_region_location(
+    kv_map: &footer::KvMap,
+    file_len: u64,
+) -> Result<Option<RangeRegionLocation>, ReadError> {
+    if !all_present(kv_map, kv::RANGE_KEYS) {
+        if any_present(kv_map, kv::RANGE_KEYS) {
+            return Err(ReadError::MalformedKv(
+                "partial inf.range.* keys present".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let offset = parse_u64(kv_map, kv::RANGE_OFFSET)?;
+    let len = parse_u64(kv_map, kv::RANGE_LENGTH)?;
+    let directory_len = parse_u64(kv_map, kv::RANGE_DIRECTORY_LENGTH)?;
+    if offset.checked_add(len).is_none_or(|end| end > file_len) || directory_len > len {
+        return Err(ReadError::MalformedKv(
+            "range index region out of bounds".into(),
+        ));
+    }
+    Ok(Some(RangeRegionLocation {
+        offset,
+        len,
+        directory_len,
     }))
 }
 

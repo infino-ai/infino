@@ -7,6 +7,9 @@
 //! Exact low-cardinality frequencies answer `COUNT(*)` over a
 //! single-column equality/range and `GROUP BY column, COUNT(*)` directly,
 //! unfiltered or filtered to the column's non-null values.
+//! `COUNT(*)` over a range on a range-indexed column is counted from each
+//! superfile's range index, by a scan that emits the count as rows with no
+//! columns (`SupertableProvider::counting`).
 //! Other ungrouped aggregates whose `WHERE` clause is a single-column range
 //! use the manifest's segment bounds. Segments fall into three classes:
 //!
@@ -65,6 +68,7 @@ use datafusion::{
     functions_aggregate::expr_fn::{count, max, min, sum},
     logical_expr::{
         Aggregate, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, TableScan, lit,
+        utils::split_conjunction,
     },
     optimizer::{OptimizerConfig, OptimizerRule, optimizer::ApplyOrder},
     prelude::{cast, col, ident},
@@ -226,16 +230,17 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     };
 
     let manifest = provider.manifest();
-    // Hierarchical manifests may expose a partial flat view. Rewrite only
-    // when the resident entries are provably complete; eagerly hydrated
-    // persisted tables then receive the same no-scan aggregate path as
-    // in-process tables, while genuinely lazy views decline safely.
-    let Some(superfiles) = manifest.complete_flat_superfiles() else {
-        return Ok(None);
-    };
+    // Hierarchical manifests may expose a partial flat view. Answer from
+    // statistics only when the resident entries are provably complete;
+    // eagerly hydrated persisted tables then receive the same no-scan
+    // aggregate path as in-process tables, while genuinely lazy views
+    // decline safely. The range count below scans, so it needs no complete
+    // view.
+    let superfiles = manifest.complete_flat_superfiles();
     let id_column = manifest.options.id_column.as_str();
 
     if matches!(kinds.as_slice(), [AggKind::CountStar])
+        && superfiles.is_some()
         && value_counts_nulls(provider, &range.column).is_some()
         && let Some(value_counts) = provider.exact_value_counts(&range.column)
         && let Some(count) = count_range_from_value_counts(&value_counts, &range)
@@ -248,6 +253,33 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         ));
     }
 
+    // A range-indexed column counts the range from each superfile's index:
+    // the count reads a block or two per superfile, not the rows.
+    if matches!(kinds.as_slice(), [AggKind::CountStar])
+        && let Some(counted) = provider.counted_range(&predicate)
+    {
+        let counting = Arc::new(provider.counting(counted));
+        let filters = split_conjunction(&predicate).into_iter().cloned().collect();
+        let input = LogicalPlanBuilder::scan_with_filters(
+            scan.table_name.clone(),
+            provider_as_source(counting as Arc<dyn TableProvider>),
+            Some(Vec::new()),
+            filters,
+        )?
+        .build()?;
+        return Ok(Some(LogicalPlan::Aggregate(
+            Aggregate::try_new_with_schema(
+                Arc::new(input),
+                Vec::new(),
+                agg.aggr_expr.clone(),
+                Arc::clone(&agg.schema),
+            )?,
+        )));
+    }
+
+    let Some(superfiles) = superfiles else {
+        return Ok(None);
+    };
     // Classify every segment.
     let mut covered: Vec<&Arc<SuperfileEntry>> = Vec::new();
     let mut boundary: HashSet<Uuid> = HashSet::new();
@@ -756,13 +788,15 @@ fn peel_not_null_filter<'a>(input: &'a LogicalPlan, column: &str) -> Option<&'a 
 /// hands it to the scan alone — so the scan looks unfiltered while its rows
 /// are only the filter's. Every rewrite here answers from statistics that
 /// describe whole segments, so each would count rows the filter excludes;
-/// refusing the provider leaves the plan to the scan, which is exact.
+/// refusing the provider leaves the plan to the scan, which is exact. A
+/// counting provider (this rule's own range count) is refused for the same
+/// reason.
 fn provider_of(scan: &TableScan) -> Option<&SupertableProvider> {
     // DataFusion 54 dropped `as_any` for an `Any` supertrait; downcast through
     // its provided `downcast_ref` (auto-derefs the `Arc`).
     let source = scan.source.downcast_ref::<DefaultTableSource>()?;
     let provider = source.table_provider.downcast_ref::<SupertableProvider>()?;
-    (!provider.has_exact_filter(&scan.filters)).then_some(provider)
+    (!provider.has_exact_filter(&scan.filters) && !provider.is_counting()).then_some(provider)
 }
 
 /// Strictly extract a single-column range from the predicate: a

@@ -173,6 +173,11 @@ pub enum ColumnIndex {
         /// How candidates are re-scored after the coarse search.
         rerank_codec: RerankCodec,
     },
+    /// A range index over an integer, float, date or timestamp column: each
+    /// superfile keeps the column's rows in value order, so a range or
+    /// equality predicate on the column reads only the rows it matches,
+    /// however the values are spread across the table.
+    Range,
 }
 
 /// One live user column: its identity, label, physical type and index.
@@ -303,6 +308,19 @@ impl TableSchema {
         schema
     }
 
+    /// This schema with a range index on each of `columns`. The caller has
+    /// checked each is a column the index keys and that carries no other
+    /// index (`IndexSpec::check_ranges`); a name the schema lacks is passed
+    /// over.
+    pub(crate) fn with_range_indexes(mut self, columns: &[String]) -> Self {
+        for field in &mut self.fields {
+            if columns.contains(&field.name) {
+                field.index = Some(ColumnIndex::Range);
+            }
+        }
+        self
+    }
+
     /// The user schema: every live column in declared order, unstamped.
     pub(crate) fn user_schema(&self) -> Arc<Schema> {
         Arc::new(Schema::new(
@@ -351,7 +369,7 @@ impl TableSchema {
         self.stored_fields(id_column, |f| match &f.index {
             Some(ColumnIndex::Vector { .. }) => false,
             Some(ColumnIndex::Fts { stored, .. }) => *stored,
-            None => true,
+            Some(ColumnIndex::Range) | None => true,
         })
     }
 
@@ -412,6 +430,26 @@ impl TableSchema {
                 ),
                 _ => None,
             })
+            .collect()
+    }
+
+    /// The range-indexed columns, by name, in declared order.
+    pub(crate) fn range_columns(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.index, Some(ColumnIndex::Range)))
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
+    /// Each range-indexed column's id and type, by name: what a query lowers
+    /// a range predicate against. A superfile's range index holds the
+    /// column under the id.
+    pub(crate) fn range_column_types(&self) -> HashMap<String, (FieldId, DataType)> {
+        self.fields
+            .iter()
+            .filter(|f| matches!(f.index, Some(ColumnIndex::Range)))
+            .map(|f| (f.name.clone(), (f.id, f.data_type.clone())))
             .collect()
     }
 
@@ -665,6 +703,9 @@ pub(crate) fn index_to_json(index: &ColumnIndex) -> Value {
                 serde_json::to_value(rerank_codec).expect("codec name"),
             );
         }
+        ColumnIndex::Range => {
+            out.insert("kind".into(), Value::from("range"));
+        }
     }
     Value::Object(out)
 }
@@ -753,6 +794,7 @@ pub(crate) fn index_from_json(json: &Value) -> Result<ColumnIndex, String> {
                 .transpose()?
                 .unwrap_or_default(),
         }),
+        "range" => Ok(ColumnIndex::Range),
         other => Err(format!("unknown index kind '{other}'")),
     }
 }

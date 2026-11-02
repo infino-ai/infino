@@ -123,6 +123,14 @@ pub(crate) fn index_spec_to_json(spec: &IndexSpec) -> Value {
     if !vectors.is_empty() {
         indexes.insert("vector".to_string(), Value::Array(vectors));
     }
+    let ranges: Vec<Value> = spec
+        .range_columns()
+        .iter()
+        .map(|column| json!({ "column": column }))
+        .collect();
+    if !ranges.is_empty() {
+        indexes.insert("range".to_string(), Value::Array(ranges));
+    }
     Value::Object(indexes)
 }
 

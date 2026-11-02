@@ -58,7 +58,7 @@ use std::{
     time::Instant,
 };
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -68,6 +68,7 @@ use datafusion::{
     common::{ColumnStatistics, DFSchema, Statistics, runtime::SpawnedTask, stats::Precision},
     datasource::{
         listing::PartitionedFile,
+        memory::MemorySourceConfig,
         physical_plan::{
             FileScanConfigBuilder, ParquetFileReaderFactory, ParquetSource,
             parquet::ParquetAccessPlan,
@@ -75,11 +76,21 @@ use datafusion::{
         source::DataSourceExec,
     },
     error::{DataFusionError, Result as DfResult},
-    execution::object_store::ObjectStoreUrl,
-    logical_expr::{Expr, Operator, TableProviderFilterPushDown, TableType, utils::conjunction},
+    execution::{context::ExecutionProps, object_store::ObjectStoreUrl},
+    logical_expr::{
+        Expr, Operator, TableProviderFilterPushDown, TableType,
+        utils::{conjunction, split_conjunction},
+    },
     object_store::path::Path as ObjPath,
     physical_expr::create_physical_expr,
-    physical_plan::{ExecutionPlan, empty::EmptyExec, metrics::ExecutionPlanMetricsSet},
+    physical_plan::{
+        ExecutionPlan,
+        empty::EmptyExec,
+        filter::FilterExec,
+        metrics::ExecutionPlanMetricsSet,
+        projection::{ProjectionExec, ProjectionExpr},
+        union::UnionExec,
+    },
     scalar::ScalarValue,
 };
 use object_store::ObjectStore as OsObjectStore;
@@ -103,6 +114,7 @@ use crate::{
             reader::{BoolMode, ContainsRows, MatchWork},
             tokenize::{Tokenizer, unique_tokens},
         },
+        range::KeyKind,
     },
     supertable::{
         SuperfileEntry, SupertableReader,
@@ -111,13 +123,15 @@ use crate::{
             ColumnStats, ManifestSnapshot, add_sum_arrays, hll::HllSketch, list::ScalarValueCounts,
         },
         query::{
-            candidate::{CandidatePlan, ExactFilter, exact_filter, like_prune_leaves},
+            candidate::{
+                CandidatePlan, ExactFilter, exact_filter, like_prune_leaves, single_range,
+            },
             df_object_store::SuperfileObjectStore,
             exec::{
                 cached_scan_exec::{
                     CachedFile, CachedScanExec, RowGroupFilter, has_columns, projected_schema,
                 },
-                common::{BoundPredicate, PushedPredicate, take_rows},
+                common::{BoundPredicate, PushedPredicate, take_rows, unqualified},
                 metered_exec::MeteredExec,
             },
             fts::{memos_from_plan_locations, plan_locations_for},
@@ -182,11 +196,29 @@ struct PreparedScanFile {
     reader: Arc<SuperfileReader>,
     path: ObjPath,
     size: u64,
+    /// Where the Parquet row groups end: the index regions follow them, and
+    /// the scan reads none of their bytes.
+    rows_end: u64,
     row_counts: Arc<[u32]>,
+    /// Each column's data pages across the row groups, by name, from the
+    /// page index; empty when the file carries none.
+    pages: HashMap<String, u64>,
     /// Which cache tier the first open of this file was served from. A
     /// later scan of the same provider reuses the prepared file and reports
     /// the same tier: what it paid, not what it would pay now.
     tier: OpenTier,
+}
+
+impl PreparedScanFile {
+    /// The average data pages of `columns` in this file; `None` when the
+    /// page index names none of them.
+    fn pages_per_column(&self, columns: &[&str]) -> Option<u64> {
+        let pages: Vec<u64> = columns
+            .iter()
+            .filter_map(|column| self.pages.get(*column).copied())
+            .collect();
+        (!pages.is_empty()).then(|| pages.iter().sum::<u64>() / pages.len() as u64)
+    }
 }
 
 /// Register an opened superfile with the scan's store and footers, which
@@ -209,13 +241,36 @@ fn prepare_scan_file(
         .map(|row_group| row_group.num_rows() as u32)
         .collect::<Vec<_>>()
         .into();
+    let rows_end = parquet_meta
+        .row_groups()
+        .iter()
+        .flat_map(|row_group| row_group.columns())
+        .map(|chunk| {
+            let (start, len) = chunk.byte_range();
+            start + len
+        })
+        .max()
+        .unwrap_or(0);
+    let mut pages: HashMap<String, u64> = HashMap::new();
+    if let Some(offsets) = parquet_meta.offset_index() {
+        let leaves = parquet_meta.file_metadata().schema_descr();
+        for row_group in offsets {
+            for (leaf, chunk) in row_group.iter().enumerate() {
+                if let Some(name) = leaves.column(leaf).path().parts().first() {
+                    *pages.entry(name.clone()).or_default() += chunk.page_locations().len() as u64;
+                }
+            }
+        }
+    }
     scan_store.insert_source(path.clone(), source);
     scan_footers.insert(path.clone(), Arc::new(ScanFooter::new(parquet_meta)));
     Arc::new(PreparedScanFile {
         reader,
         path,
         size,
+        rows_end,
         row_counts,
+        pages,
         tier,
     })
 }
@@ -312,6 +367,37 @@ pub(crate) struct SupertableProvider {
     /// above brings to this snapshot. A provider built without the table's
     /// carries its own, and merges every superfile.
     value_count_carry: Arc<ValueCountCarry>,
+    /// Set by the range top-k rule (`range_top_k`) on a scan that feeds
+    /// `ORDER BY column LIMIT k` and is filtered only on `column`: the scan
+    /// then reads only the rows the range index puts first
+    /// ([`Self::top_k_rows`]).
+    top_k: Option<TopKHint>,
+    /// Set by the covered-aggregate rewrite (`covered_agg`) on the scan
+    /// under a `COUNT(*)` whose `WHERE` is one range on a range-indexed
+    /// column: the scan then emits a row with no columns for each row the
+    /// range holds, counted from the range index rather than read
+    /// ([`Self::range_count_exec`]).
+    count_range: Option<CountedRange>,
+}
+
+/// What [`SupertableProvider::count_range`] carries: the column, its id
+/// and key kind, and the interval of keys the `WHERE` holds, exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CountedRange {
+    pub(crate) column: String,
+    pub(crate) field: FieldId,
+    pub(crate) kind: KeyKind,
+    pub(crate) lo: u64,
+    pub(crate) hi: u64,
+}
+
+/// What [`SupertableProvider::top_k`] carries: the sort column, its
+/// direction and the sort's row count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TopKHint {
+    pub(crate) column: String,
+    pub(crate) descending: bool,
+    pub(crate) k: usize,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -375,6 +461,8 @@ impl SupertableProvider {
             scan_footers: Arc::new(DashMap::new()),
             scalar_value_counts: Arc::new(DashMap::new()),
             value_count_carry: Arc::default(),
+            top_k: None,
+            count_range: None,
         }
     }
 
@@ -393,6 +481,69 @@ impl SupertableProvider {
     /// can't collide with the parent's.
     pub(crate) fn restricted_to(&self, segments: HashSet<Uuid>) -> Self {
         Self {
+            segment_filter: Some(segments),
+            top_k: None,
+            count_range: None,
+            ..self.sibling()
+        }
+    }
+
+    /// Clone of this provider for a scan that feeds `ORDER BY hint.column
+    /// LIMIT hint.k` (see [`Self::top_k`]). Shares the parent's snapshot,
+    /// prepared files and scan store, as [`Self::restricted_to`] does.
+    pub(crate) fn with_top_k(&self, hint: TopKHint) -> Self {
+        Self {
+            top_k: Some(hint),
+            ..self.sibling()
+        }
+    }
+
+    /// Whether this provider carries a top-k hint: the top-k rule's
+    /// idempotency guard.
+    pub(crate) fn has_top_k(&self) -> bool {
+        self.top_k.is_some()
+    }
+
+    /// Clone of this provider for the scan under a `COUNT(*)` of `range`
+    /// (see [`Self::count_range`]). Shares the parent's snapshot, prepared
+    /// files and scan store, as [`Self::restricted_to`] does.
+    pub(crate) fn counting(&self, range: CountedRange) -> Self {
+        Self {
+            count_range: Some(range),
+            ..self.sibling()
+        }
+    }
+
+    /// Whether this provider counts a range instead of reading rows: a scan
+    /// that looks unfiltered while its rows are only the range's, which no
+    /// statistics rewrite may answer for.
+    pub(crate) fn is_counting(&self) -> bool {
+        self.count_range.is_some()
+    }
+
+    /// `predicate` as one interval on one range-indexed column, when it is
+    /// a conjunction of comparisons and `BETWEEN`s on that column against
+    /// literals (`a <= x AND x < b`): the shape a range index counts
+    /// without reading a row. `None` for anything else.
+    pub(crate) fn counted_range(&self, predicate: &Expr) -> Option<CountedRange> {
+        let conjuncts: Vec<Expr> = split_conjunction(predicate).into_iter().cloned().collect();
+        let column = predicate.column_refs().into_iter().next()?.name.clone();
+        let range_cols = self.manifest.table_schema().range_column_types();
+        let (field, kind, lo, hi) = single_range(&conjuncts, &column, &range_cols)?;
+        Some(CountedRange {
+            column,
+            field,
+            kind,
+            lo,
+            hi,
+        })
+    }
+
+    /// A clone sharing this provider's snapshot and caches, with its own
+    /// object-store registry key so the clone's scan registration cannot
+    /// collide with the parent's.
+    fn sibling(&self) -> Self {
+        Self {
             schema: Arc::clone(&self.schema),
             manifest: Arc::clone(&self.manifest),
             store: Arc::clone(&self.store),
@@ -400,12 +551,14 @@ impl SupertableProvider {
             open_intent: self.open_intent,
             tombstone_cache: self.tombstone_cache.clone(),
             store_url: unique_store_url(),
-            segment_filter: Some(segments),
+            segment_filter: self.segment_filter.clone(),
             prepared_scan_files: Arc::clone(&self.prepared_scan_files),
             scan_store: Arc::clone(&self.scan_store),
             scan_footers: Arc::clone(&self.scan_footers),
             scalar_value_counts: Arc::clone(&self.scalar_value_counts),
             value_count_carry: Arc::clone(&self.value_count_carry),
+            top_k: self.top_k.clone(),
+            count_range: self.count_range.clone(),
         }
     }
 
@@ -602,6 +755,187 @@ impl SupertableProvider {
             .await?;
         self.count_rows_checked(rows.doubtful.len(), verified.len());
         Ok((rows.proven | verified, work))
+    }
+
+    /// The rows of `survivors` the counted `range` holds (see
+    /// [`Self::count_range`]), as rows with no columns for `COUNT(*)` to
+    /// count. Each superfile's range index counts its interval — the blocks
+    /// wholly inside it from the directory, the at most two it cuts by
+    /// decoding them — and a superfile with deleted rows reads its
+    /// interval's rows to leave those out. A superfile with no range index
+    /// over the column (written before the column was indexed, or before
+    /// its type changed) is scanned instead, with `filters` applied above
+    /// the scan, and its rows are counted beside the others.
+    async fn range_count_exec(
+        &self,
+        state: &dyn Session,
+        survivors: &[Arc<SuperfileEntry>],
+        range: &CountedRange,
+        filters: &[Expr],
+        now: Instant,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let pool: &ThreadPool = &self.manifest.options.reader_pool;
+        let counts = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    let prepared = prepared.await?;
+                    let reader = &prepared.reader;
+                    let tombstones = match self.tombstone_cache.as_ref() {
+                        Some(cache) => cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(QueryError::tombstone_cache)?,
+                        None => Arc::new(RoaringBitmap::new()),
+                    };
+                    let (field, kind, lo, hi) = (range.field, range.kind, range.lo, range.hi);
+                    let count = match tombstones.is_empty() {
+                        true => reader.range_count(field, kind, lo, hi).await,
+                        false => reader
+                            .range_rows(field, kind, lo, hi, Some(pool))
+                            .await
+                            .map(|rows| rows.map(|rows| (rows - tombstones.as_ref()).len())),
+                    };
+                    let count = count.map_err(QueryError::from)?;
+                    Ok::<_, DataFusionError>((entry.superfile_id, count))
+                }
+            }),
+            in_flight,
+        )
+        .await?;
+        let mut total = 0u64;
+        let mut unindexed = HashSet::new();
+        for (superfile_id, count) in counts {
+            match count {
+                Some(count) => total += count,
+                None => {
+                    unindexed.insert(superfile_id);
+                }
+            }
+        }
+        // Rows with no columns, in batches of the session's size: `COUNT(*)`
+        // counts each batch's rows, and a constant it evaluates per row is
+        // never wider than a batch.
+        let schema = Arc::new(Schema::empty());
+        let batch_size = state.config().batch_size().max(1) as u64;
+        let batches = (0..total.div_ceil(batch_size))
+            .map(|b| {
+                let rows = (total - b * batch_size).min(batch_size) as usize;
+                RecordBatch::try_new_with_options(
+                    Arc::clone(&schema),
+                    vec![],
+                    &RecordBatchOptions::new().with_row_count(Some(rows)),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let counted: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
+        if unindexed.is_empty() {
+            return Ok(counted);
+        }
+        let column = self.schema.index_of(&range.column)?;
+        let scanned = self
+            .restricted_to(unindexed)
+            .scan(state, Some(&vec![column]), filters, None)
+            .await?;
+        let predicate = filters
+            .iter()
+            .cloned()
+            .reduce(Expr::and)
+            .map(unqualified)
+            .transpose()?
+            .unwrap_or_else(|| Expr::Literal(ScalarValue::Boolean(Some(true)), None));
+        let df_schema = DFSchema::try_from(scanned.schema())?;
+        let predicate = create_physical_expr(&predicate, &df_schema, &ExecutionProps::new())?;
+        let filtered = Arc::new(FilterExec::try_new(predicate, scanned)?);
+        let rows: Arc<dyn ExecutionPlan> = Arc::new(ProjectionExec::try_new(
+            Vec::<ProjectionExpr>::new(),
+            filtered,
+        )?);
+        UnionExec::try_new(vec![counted, rows])
+    }
+
+    /// For a scan carrying a top-k hint ([`Self::top_k`]) whose filters are
+    /// one range on the hint's column, the rows of each survivor that can be
+    /// in the sort's answer, by superfile. Each superfile's range index
+    /// gives its first `k` live keys inside the range, from the near end;
+    /// the `k`-th best of all of them is a cutoff no answer row passes, and
+    /// the rows kept are the collected ones within it — at least `k`, and
+    /// every row a superfile holds that the answer needs (one row past its
+    /// own `k`-th key is past the cutoff too). `None` when there is no hint,
+    /// the filters are not that one range, or a survivor has no range index
+    /// over the column: the scan then reads every row the filters admit.
+    async fn top_k_rows(
+        &self,
+        survivors: &[Arc<SuperfileEntry>],
+        filters: &[Expr],
+        now: Instant,
+    ) -> DfResult<Option<HashMap<Uuid, RoaringBitmap>>> {
+        let Some(hint) = self.top_k.as_ref() else {
+            return Ok(None);
+        };
+        let range_cols = self.manifest.table_schema().range_column_types();
+        let Some((field, kind, lo, hi)) = single_range(filters, &hint.column, &range_cols) else {
+            return Ok(None);
+        };
+        let in_flight = self.manifest.options.superfiles_in_flight;
+        let ends = try_join_bounded(
+            survivors.iter().cloned().map(|entry| {
+                let prepared = self.prepared_scan_file(Arc::clone(&entry));
+                async move {
+                    let prepared = prepared.await?;
+                    let tombstones = match self.tombstone_cache.as_ref() {
+                        Some(cache) => cache
+                            .bitmap_for(entry.superfile_id, now)
+                            .map_err(QueryError::tombstone_cache)?,
+                        None => Arc::new(RoaringBitmap::new()),
+                    };
+                    let ends = prepared
+                        .reader
+                        .range_ends(field, kind, (lo, hi), hint.k, hint.descending, &tombstones)
+                        .await
+                        .map_err(QueryError::from)?;
+                    Ok::<_, DataFusionError>(ends.map(|pairs| (entry.superfile_id, pairs)))
+                }
+            }),
+            in_flight,
+        )
+        .await?;
+        let Some(ends) = ends.into_iter().collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
+        let mut keys: Vec<u64> = ends
+            .iter()
+            .flat_map(|(_, pairs)| pairs.iter().map(|(key, _)| *key))
+            .collect();
+        // With no filter, a NULL is a row of the answer too — after every
+        // value, as the rule admits only `NULLS LAST` there — and no range
+        // index holds it. Fewer than `k` values in all leave room for nulls,
+        // so the scan reads every row.
+        if filters.is_empty() && keys.len() < hint.k {
+            return Ok(None);
+        }
+        let cutoff = (hint.k > 0 && keys.len() > hint.k).then(|| match hint.descending {
+            false => *keys.select_nth_unstable(hint.k - 1).1,
+            true => *keys.select_nth_unstable_by(hint.k - 1, |a, b| b.cmp(a)).1,
+        });
+        let within = |key: u64| match (cutoff, hint.descending) {
+            (None, _) => true,
+            (Some(cut), false) => key <= cut,
+            (Some(cut), true) => key >= cut,
+        };
+        Ok(Some(
+            ends.into_iter()
+                .map(|(id, pairs)| {
+                    let rows: RoaringBitmap = pairs
+                        .into_iter()
+                        .filter(|(key, _)| within(*key))
+                        .map(|(_, row)| row)
+                        .collect();
+                    (id, rows)
+                })
+                .collect(),
+        ))
     }
 
     /// Count the rows an exact check decoded to read their text but the
@@ -1191,6 +1525,10 @@ impl TableProvider for SupertableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
+        // A counting scan applies its range exactly (`range_count_exec`).
+        if self.count_range.is_some() {
+            return Ok(vec![TableProviderFilterPushDown::Exact; filters.len()]);
+        }
         let fts_cols = self.fts_cols_set();
         Ok(filters
             .iter()
@@ -1275,6 +1613,14 @@ impl TableProvider for SupertableProvider {
             cache.prefetch(&ids, now).await;
         }
 
+        // A counting scan reads no row where a range index counts it (see
+        // `range_count_exec`).
+        if let Some(range) = &self.count_range {
+            return self
+                .range_count_exec(state, &survivor_entries, range, filters, now)
+                .await;
+        }
+
         // Split the conjuncts into the ones the dictionary answers exactly
         // (reported `Exact`: DataFusion applies them nowhere else) and the
         // ones the index only bounds.
@@ -1301,9 +1647,11 @@ impl TableProvider for SupertableProvider {
         // it yields a candidate row-id superset (or `Unbounded` = scan
         // the superfile). See `crate::supertable::query::candidate`.
         let manifest = &self.manifest;
-        let candidate_plan = CandidatePlan::from_filters(&bounded_filters, &fts_cols, &|col| {
-            manifest.try_fts_tokenizer_for(col)
-        });
+        let range_cols = manifest.table_schema().range_column_types();
+        let candidate_plan =
+            CandidatePlan::from_filters(&bounded_filters, &fts_cols, &range_cols, &|col| {
+                manifest.try_fts_tokenizer_for(col)
+            });
         // A `LIKE` leaf is bound to each superfile's dictionary once, up
         // front, so the estimate and the evaluation below share one walk.
         let needs_expansion = candidate_plan.has_like();
@@ -1341,6 +1689,11 @@ impl TableProvider for SupertableProvider {
         }
         trace::end(open_span);
 
+        // A scan feeding `ORDER BY column LIMIT k` reads only the rows each
+        // superfile's range index puts first (see `top_k_rows`).
+        let top_k_rows = self.top_k_rows(&survivor_entries, filters, now).await?;
+        let top_k_rows = &top_k_rows;
+
         // Per-superfile scan inputs, resolved into PartitionedFiles once the
         // store is built (row-group counts are read from each superfile's
         // footer through the same byte source).
@@ -1373,6 +1726,20 @@ impl TableProvider for SupertableProvider {
         // task only polls, and nothing here is `'static`. Results come back
         // in survivor order, so the file list below stays deterministic in
         // manifest order, and the first error (in time) ends the scan.
+        // The columns the scan decodes, whose pages a selection may skip.
+        let read_columns: Vec<&str> = match projection {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|i| self.schema.fields().get(*i))
+                .map(|field| field.name().as_str())
+                .collect(),
+            None => self
+                .schema
+                .fields()
+                .iter()
+                .map(|field| field.name().as_str())
+                .collect(),
+        };
         let superfiles: Vec<SuperfileScan> = try_join_bounded(
             // Owned entries: a closure over borrowed ones, held across an
             // await in this `async_trait` method, trips rustc's "`FnOnce` is
@@ -1383,6 +1750,7 @@ impl TableProvider for SupertableProvider {
                 .zip(prepared_files)
                 .map(|(entry, prepared)| {
                     let candidate_plan = &candidate_plan;
+                    let read_columns = &read_columns;
                     async move {
                         // Resolve candidate rows from the index. `None` => no
                         // usable bound, scan the superfile.
@@ -1436,17 +1804,49 @@ impl TableProvider for SupertableProvider {
                         } else {
                             candidate_plan
                         };
-                        let (est, est_work) = plan
-                            .estimate(prepared.reader.as_ref(), Some(reader_pool))
-                            .await
-                            .map_err(QueryError::from)?;
-                        predicate_work.merge(est_work);
                         let gate = ((prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_FRACTION)
                             as u64)
                             .max(PUSHDOWN_MIN_ROWS);
                         let density_cap =
                             (prepared.reader.n_docs() as f64 * PUSHDOWN_MAX_DENSITY) as u64;
-                        let candidates = if est > gate || est >= density_cap {
+                        // The floor keeps text predicates on the index over
+                        // small superfiles, where each row a selection spares
+                        // is text not decoded and checked. A range selects
+                        // numbers, cheap to decode and check: its selection
+                        // pays only by the pages it skips, so only with fewer
+                        // rows than the columns read have pages. With more,
+                        // nearly every page holds a selected row and the
+                        // selection decodes them all, slower than the scan.
+                        // A file with no page index keeps the fraction.
+                        let index_gate = match plan.only_ranges() {
+                            true => {
+                                let fraction = (prepared.reader.n_docs() as f64
+                                    * PUSHDOWN_MAX_FRACTION)
+                                    as u64;
+                                prepared
+                                    .pages_per_column(read_columns)
+                                    .map_or(fraction, |pages| pages.min(fraction))
+                            }
+                            false => gate,
+                        };
+                        let top_k = top_k_rows.as_ref();
+                        let est = match top_k {
+                            Some(_) => 0,
+                            None => {
+                                let (est, est_work) = plan
+                                    .estimate(prepared.reader.as_ref(), Some(reader_pool))
+                                    .await
+                                    .map_err(QueryError::from)?;
+                                predicate_work.merge(est_work);
+                                est
+                            }
+                        };
+                        let candidates = if let Some(rows) = top_k {
+                            // A top-k scan reads only the rows the range
+                            // index put first; a superfile none of them is in
+                            // reads nothing.
+                            Some(rows.get(&entry.superfile_id).cloned().unwrap_or_default())
+                        } else if est > index_gate || est >= density_cap {
                             None
                         } else {
                             let memos = memos_from_plan_locations(
@@ -1552,7 +1952,15 @@ impl TableProvider for SupertableProvider {
             } else {
                 None
             };
-            let mut file = PartitionedFile::new(seg.prepared.path.to_string(), seg.prepared.size);
+            // The file's range is its row groups, not the index regions after
+            // them: DataFusion sizes and splits a scan by its files' ranges,
+            // and a split over index bytes would open the file to read no row.
+            let mut file = PartitionedFile::new_with_range(
+                seg.prepared.path.to_string(),
+                seg.prepared.size,
+                0,
+                seg.prepared.rows_end as i64,
+            );
             if let Some(plan) = access_plan {
                 // DataFusion 54 keys file extensions by concrete type and reads
                 // the access plan via `extensions.get::<ParquetAccessPlan>()`, so

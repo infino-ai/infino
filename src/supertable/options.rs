@@ -1484,6 +1484,15 @@ impl SupertableOptions {
         self.vector_layout = layout;
         self
     }
+
+    /// Range-index `columns` in the schema the table is created with, which
+    /// the table's first manifest records as its schema document.
+    pub(crate) fn with_range_indexes(mut self, columns: &[String]) -> Self {
+        if !columns.is_empty() {
+            self.table_schema = Arc::new((*self.table_schema).clone().with_range_indexes(columns));
+        }
+        self
+    }
 }
 
 /// Builder options for a superfile of a table whose schema is `schema`
@@ -1517,7 +1526,8 @@ pub(crate) fn builder_options_for(
     )
     .with_vector_layout(options.vector_layout)
     .with_schema_id(schema.schema_id())
-    .with_field_ids_outside_schema(outside_schema);
+    .with_field_ids_outside_schema(outside_schema)
+    .with_range_columns(schema.range_columns());
     #[cfg(test)]
     let builder = BuilderOptions {
         row_group_size: options.row_group_size.unwrap_or(builder.row_group_size),

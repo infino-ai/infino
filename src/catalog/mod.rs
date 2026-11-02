@@ -468,6 +468,9 @@ impl Connection {
         indexes
             .check_companions()
             .map_err(|e| e.with_context("create_table", Some(name)))?;
+        indexes
+            .check_ranges(&schema)
+            .map_err(|e| e.with_context("create_table", Some(name)))?;
         let (fts_cfg, vec_cfg) = indexes.to_configs();
         // A companion is a table on storage beside this one; a catalog with
         // no storage, or one forwarding to a hosted service, has nowhere to
@@ -488,7 +491,8 @@ impl Connection {
                     None,
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
-                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                .map_err(|e| e.with_context("create_table", Some(name)))?
+                .with_range_indexes(indexes.range_columns());
                 let handle = SupertableHandle::create(opts)
                     .map_err(|e| InfinoError::from(e).with_context("create_table", Some(name)))?;
                 let mut map = map.lock().expect("catalog mutex poisoned");
@@ -577,6 +581,8 @@ impl Connection {
                 let disk_cache =
                     build_disk_cache(&self.inner.options, &table_storage, name, &location)
                         .map_err(|e| e.with_context("create_table", Some(name)))?;
+                // The range indexes ride in the schema the table's first
+                // manifest records, which is what every later open reads.
                 let mut opts = build_options(
                     schema,
                     fts_cfg,
@@ -584,7 +590,8 @@ impl Connection {
                     Some(table_storage),
                     Arc::clone(&self.inner.connection_memory_budget),
                 )
-                .map_err(|e| e.with_context("create_table", Some(name)))?;
+                .map_err(|e| e.with_context("create_table", Some(name)))?
+                .with_range_indexes(indexes.range_columns());
                 if let Some((cache, manifest_cache)) = disk_cache {
                     opts = opts
                         .with_disk_cache(cache)
@@ -2004,6 +2011,9 @@ fn seed_from_patch(patch: &SchemaPatch) -> Result<(SchemaRef, IndexSpec), Infino
                     *rot_seed,
                     *rerank_codec,
                 );
+            }
+            Some(ColumnIndex::Range) => {
+                indexes = indexes.range(field.name.clone());
             }
             None => {}
         }

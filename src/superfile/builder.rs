@@ -68,7 +68,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
-    io::{BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
+    io::{self, BufReader, BufWriter, Cursor, Error, Read, Seek, SeekFrom, Write},
     ops::Range,
     str::from_utf8,
     sync::{Arc, mpsc::sync_channel},
@@ -81,7 +81,15 @@ use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader,
 };
 use arrow_schema::{DataType, Field, Schema};
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::{
+    arrow::{
+        ProjectionMask,
+        arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder},
+    },
+    basic::{Compression, ZstdLevel},
+    errors::ParquetError,
+    file::{metadata::ParquetMetaData, reader::ChunkReader},
+};
 use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
@@ -95,7 +103,7 @@ use crate::{
         format::{
             self,
             footer::{
-                BodyPlan, EncodedBody, ParquetLayout, PlannedBodyEncoder,
+                BodyPlan, EncodedBody, ParquetLayout, PlannedBodyEncoder, RangeStream,
                 encode_parquet_body_planned, extract_kv_map, splice_carried_body_to,
                 splice_index_streams_to,
             },
@@ -115,6 +123,7 @@ use crate::{
         },
         id_space::{FtsDocId, RowId, StableId},
         ids::{self, PackedIdEncoder, PackedIdOutput},
+        range::{self, KeyKind, RangeColumnSpec},
         stats::SuperfileStats,
         vector::{
             builder::{
@@ -791,6 +800,11 @@ pub struct BuilderOptions {
     /// `None` outside compaction, where there is no run to honour and the
     /// configured value is the only one there is.
     pub(crate) merge_input_mb: Option<u64>,
+    /// Range-indexed columns, by name: each must be a stored scalar column
+    /// of `schema` of a type [`KeyKind::of`] keys. The superfile carries a
+    /// range index region over them (`superfile::range`), built from the
+    /// rows as the Parquet body stores them. May be empty.
+    pub(crate) range_columns: Vec<String>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -938,7 +952,31 @@ impl BuilderOptions {
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
             merge_input_mb: None,
+            range_columns: Vec::new(),
         }
+    }
+
+    /// Range-index `columns` (see [`BuilderOptions::range_columns`]).
+    pub(crate) fn with_range_columns(mut self, columns: Vec<String>) -> Self {
+        self.range_columns = columns;
+        self
+    }
+
+    /// The range-indexed columns as the region builder takes them: each
+    /// with its field id and key kind. A column the body does not hold, or
+    /// whose type has no key, is left out: there is nothing to index.
+    fn range_column_specs(&self) -> Vec<RangeColumnSpec> {
+        self.range_columns
+            .iter()
+            .filter_map(|name| {
+                let field = self.schema.field_with_name(name).ok()?;
+                Some(RangeColumnSpec {
+                    name: name.clone(),
+                    field_id: self.field_id_of_column(name)?.0,
+                    kind: KeyKind::of(field.data_type())?,
+                })
+            })
+            .collect()
     }
 
     /// Give the merge the input cap its compaction run was configured with
@@ -3553,6 +3591,8 @@ impl SuperfileBuilder {
                 vec_length: 0,
                 ids_offset: 0,
                 ids_length: 0,
+                range_offset: 0,
+                range_length: 0,
             });
         }
         let n_docs = self.next_local_doc_id as u64;
@@ -3621,7 +3661,7 @@ impl SuperfileBuilder {
             &self.batches,
             &self.opts.id_column,
         ));
-        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &self.opts, &kvs, output)
     }
 
     /// Finish the build with a Parquet body the caller **already encoded** —
@@ -3667,7 +3707,7 @@ impl SuperfileBuilder {
             cell_posting_builder,
             prebuilt_multi_cell,
         )?;
-        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &kvs, output)
+        splice_body_and_blobs_to(body, fts_file, vec_file, ids, &self.opts, &kvs, output)
     }
 
     /// Rebuild the FTS index from `source`'s stored text, touching nothing
@@ -3798,6 +3838,14 @@ impl SuperfileBuilder {
 
         let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(fts_builder, None, None, None)?;
         let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
+        // The range region is the table's to decide, not the source's: built
+        // again from the carried rows, so a column range-indexed since the
+        // source was written gets its region here.
+        let range = range_region_of_body(
+            body.clone(),
+            Arc::clone(source.parquet_metadata()),
+            &self.opts,
+        )?;
         splice_carried_body_to(
             Cursor::new(&body),
             body.len() as u64,
@@ -3808,6 +3856,7 @@ impl SuperfileBuilder {
             vec_bytes.len() as u64,
             Cursor::new(&ids_bytes),
             ids_bytes.len() as u64,
+            range,
             &kvs,
             output,
         )
@@ -3900,6 +3949,9 @@ impl SuperfileBuilder {
             vector_length,
             Cursor::new(directory).chain(blocks),
             ids_length,
+            // A hidden vector-index file holds the ids alone: no column to
+            // range-index.
+            RangeStream::none(),
             &kvs,
             &mut output,
         )?;
@@ -4145,20 +4197,67 @@ fn kvs_naming_id_layout<R>(
     kvs
 }
 
-/// Splice an encoded body, the two on-disk blobs and the packed stable-id
-/// sidecar to `output`, streaming the blobs off disk so neither is ever
-/// resident. Cheap relative to the encode — byte appends + a footer
-/// rewrite.
+/// The range index region over the rows of a Parquet body, for the columns
+/// `opts` range-indexes ([`BuilderOptions::range_columns`]). Read back from
+/// the encoded body, projecting those columns alone, so every build path —
+/// a fresh build, a merge, a bulk load, a carried body — derives the region
+/// from the rows exactly as the file stores them, in the file's row order.
+/// `body` holds the row groups at the offsets `metadata` records; a body
+/// with no footer of its own is fine, since the footer is never read.
+/// [`RangeStream::none`] when `opts` names no range column.
+fn range_region_of_body<R: ChunkReader + 'static>(
+    body: R,
+    metadata: Arc<ParquetMetaData>,
+    opts: &BuilderOptions,
+) -> Result<RangeStream<Box<dyn Read>>, BuildError> {
+    let specs = opts.range_column_specs();
+    if specs.is_empty() {
+        return Ok(RangeStream {
+            region: Box::new(io::empty()),
+            length: 0,
+            directory_length: 0,
+        });
+    }
+    let parquet = |e: ParquetError| BuildError::Io(Error::other(e));
+    let arrow_meta =
+        ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map_err(parquet)?;
+    let roots: Vec<usize> = specs
+        .iter()
+        .filter_map(|spec| arrow_meta.schema().index_of(&spec.name).ok())
+        .collect();
+    let projection = ProjectionMask::roots(arrow_meta.parquet_schema(), roots);
+    let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(body, arrow_meta)
+        .with_projection(projection)
+        .build()
+        .map_err(parquet)?;
+    let region = range::build_region(batches, &specs, &scratch_root()).map_err(BuildError::Io)?;
+    let length = region.len();
+    let directory_length = region.directory.len() as u64;
+    Ok(RangeStream {
+        region: Box::new(Cursor::new(region.directory).chain(region.blocks)),
+        length,
+        directory_length,
+    })
+}
+
+/// Splice an encoded body, the two on-disk blobs, the packed stable-id
+/// sidecar and the range index region `opts` calls for to `output`,
+/// streaming the blobs off disk so neither is ever resident. Cheap
+/// relative to the encode — byte appends + a footer rewrite — but for the
+/// range region, which reads its columns back from the body.
 fn splice_body_and_blobs_to<W: Write, R: Read>(
     body: EncodedBody,
     fts_file: NamedTempFile,
     vec_file: NamedTempFile,
     ids: PackedIdOutput<R>,
+    opts: &BuilderOptions,
     kvs: &[(String, String)],
     output: W,
 ) -> Result<ParquetLayout, BuildError> {
     let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
     let vec_length = vec_file.as_file().metadata().map_err(BuildError::Io)?.len();
+    let (rows, metadata) = body.rows_source().map_err(BuildError::Io)?;
+    let range = range_region_of_body(rows, metadata, opts)?;
     let kvs = kvs_naming_id_layout(kvs, &ids);
     let ids_length = ids.len();
     let PackedIdOutput {
@@ -4173,6 +4272,7 @@ fn splice_body_and_blobs_to<W: Write, R: Read>(
         vec_length,
         Cursor::new(directory).chain(blocks),
         ids_length,
+        range,
         &kvs,
         output,
     )?;
@@ -8349,6 +8449,7 @@ mod tests {
             0,
             raw_ids.as_slice(),
             raw_ids.len() as u64,
+            RangeStream::none(),
             &kvs,
             &mut out,
         )

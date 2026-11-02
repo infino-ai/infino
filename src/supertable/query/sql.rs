@@ -91,6 +91,7 @@ use crate::{
                 vector_exec::register_vector_search,
             },
             provider::{SupertableProvider, TABLE_NAME, view_string_schema},
+            range_top_k::RangeTopK,
         },
         reader_cache::disk::ForegroundQueryGuard,
         tombstones::SidecarCache,
@@ -231,8 +232,10 @@ pub(crate) fn sql_session_context(
     budget: &Arc<ConnectionMemoryBudget>,
 ) -> Result<SessionContext, DataFusionError> {
     let ctx = budgeted_session_context(budget)?;
-    // Appended after the built-in rules, so it sees pushed-down, normalized plans.
+    // Appended after the built-in rules, so they see pushed-down, normalized
+    // plans: a `LIMIT` already folded into its sort as the fetch.
     ctx.add_optimizer_rule(Arc::new(CoveredAggregateRewrite));
+    ctx.add_optimizer_rule(Arc::new(RangeTopK));
     Ok(ctx)
 }
 

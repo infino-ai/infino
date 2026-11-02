@@ -58,6 +58,7 @@ pub infino::ColumnIndex::Vector
 pub infino::ColumnIndex::Vector::metric: infino::Metric
 pub infino::ColumnIndex::Vector::rerank_codec: infino::RerankCodec
 pub infino::ColumnIndex::Vector::rot_seed: u64
+pub infino::ColumnIndex::Range
 impl core::clone::Clone for infino::ColumnIndex
 pub fn infino::ColumnIndex::clone(&self) -> Self
 impl core::cmp::PartialEq for infino::ColumnIndex
@@ -769,6 +770,7 @@ impl infino::IndexSpec
 pub fn infino::IndexSpec::companion(self, impl core::convert::Into<alloc::string::String>, arrow_schema::schema::SchemaRef, infino::IndexSpec) -> Self
 pub fn infino::IndexSpec::fts(self, impl core::convert::Into<infino::FtsField>) -> Self
 pub fn infino::IndexSpec::new() -> Self
+pub fn infino::IndexSpec::range(self, impl core::convert::Into<alloc::string::String>) -> Self
 pub fn infino::IndexSpec::vector(self, impl core::convert::Into<alloc::string::String>, usize, infino::Metric) -> Self
 impl core::clone::Clone for infino::IndexSpec
 pub fn infino::IndexSpec::clone(&self) -> Self
