@@ -67,7 +67,7 @@ use crate::{
             exec::common::{
                 PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
                 exact_scope, fill_top_k, fill_top_k_within, live_reader, output_schema_with_score,
-                over_fetch_ceiling, resolve_hits, scope_to_call, top_k_statistics, traced_tvf,
+                resolve_hits, scope_to_call, top_k_statistics, traced_tvf, widening_ended_short,
             },
             vector::{
                 hits_id_score_batch, sql_id_score_projection, user_placement_for_scalar_resolve,
@@ -463,10 +463,7 @@ impl ExecutionPlan for VectorSearchExec {
             let Some(predicate) = predicate.as_ref() else {
                 return Ok(widened);
             };
-            let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-            if widened.num_rows() >= k || over_fetch_ceiling(k, total) >= total {
-                // Either `k` passed, or the ceiling let the search reach every
-                // row and the rows it returned are all there are.
+            if !widening_ended_short(&reader, k, widened.num_rows()) {
                 return Ok(widened);
             }
             // Short at the ceiling: rows the predicate keeps may sit farther

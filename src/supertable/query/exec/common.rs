@@ -204,6 +204,29 @@ pub(crate) fn over_fetch_ceiling(k: usize, total: usize) -> usize {
         .min(total)
 }
 
+/// Rows in `reader`'s table, the `total` every fill ceiling is capped at.
+fn table_rows(reader: &SupertableReader) -> usize {
+    usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX)
+}
+
+/// The fill's own ceiling for `k` on `reader`'s table:
+/// [`over_fetch_ceiling`] against the table's row count.
+pub(crate) fn fill_ceiling(reader: &SupertableReader, k: usize) -> usize {
+    over_fetch_ceiling(k, table_rows(reader))
+}
+
+/// Whether a widening that kept `kept` rows ended short at its ceiling: fewer
+/// than `k` passed, and the ceiling stopped the rounds below the table's
+/// size, so rows the predicate keeps may rank below every hit the rounds
+/// looked at. A ceiling at the table's size is not short: the last round
+/// asked for every row, and the kernels return every row they are asked for
+/// (BM25 every match, the vector search widening its probes until they hold
+/// the hits asked for), so the rows kept are all there are.
+pub(crate) fn widening_ended_short(reader: &SupertableReader, k: usize, kept: usize) -> bool {
+    let total = table_rows(reader);
+    kept < k && over_fetch_ceiling(k, total) < total
+}
+
 /// The reader a search table function captured, still alive when the query
 /// runs. The function holds it weakly; finding it gone means the table handle
 /// was dropped under a running plan, which is ours, not the query's.
@@ -669,7 +692,6 @@ where
     F: Fn(usize) -> Fut,
     Fut: Future<Output = Result<Vec<SuperfileHit>, QueryError>>,
 {
-    let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
     fill_top_k_within(
         reader,
         k,
@@ -677,7 +699,7 @@ where
         scalar_schema,
         output_schema,
         projection,
-        over_fetch_ceiling(k, total),
+        fill_ceiling(reader, k),
         search,
     )
     .await
