@@ -67,7 +67,7 @@ use rebase::{OrdinalShift, rebase_layer, remove_spilled};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
 use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet, try_join};
-use tracing::{error, warn};
+use tracing::{Instrument, error, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -951,7 +951,9 @@ async fn fold_layers(
     pool: Option<&ThreadPool>,
 ) -> Result<Layer, TermIndexError> {
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-    let sources = download_layers(storage, layers, scratch.path()).await?;
+    let sources = download_layers(storage, layers, scratch.path())
+        .instrument(detail_span!("fold.download", layers = layers.len()))
+        .await?;
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
     let merged = run_on_pool(pool, "term-index fold", move || {
@@ -961,6 +963,7 @@ async fn fold_layers(
         drop(scratch);
         merged
     })
+    .instrument(detail_span!("fold.merge"))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
     write_tiers_and_slices(storage, merged.tiers, merged.slices).await?;
