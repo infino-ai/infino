@@ -512,14 +512,10 @@ fn optimize_honors_overridden_gc_safety_gap() {
     );
 }
 
-/// A table wired to its own disk cache, the shape both drop-through tests need:
-/// commits warm-fill this cache, so gc has copies to drop.
-fn table_with_disk_cache(
-    options: SupertableOptions,
-    storage: Arc<dyn StorageProvider>,
-    cache_root: &Path,
-) -> (Supertable, Arc<DiskCacheStore>) {
-    let cfg = DiskCacheConfig {
+/// The disk cache every test here attaches: a budget wide enough for its
+/// files, hybrid cold fetches, and mmap promotion at once.
+fn merge_cache_config(cache_root: &Path) -> DiskCacheConfig {
+    DiskCacheConfig {
         cache_root: cache_root.to_path_buf(),
         disk_budget_bytes: CACHE_BUDGET_BYTES,
         cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
@@ -527,7 +523,17 @@ fn table_with_disk_cache(
         mmap_sweep_interval_secs: 0,
         eviction: Box::new(LruPolicy::new()),
         ..Default::default()
-    };
+    }
+}
+
+/// A table wired to its own disk cache, the shape both drop-through tests need:
+/// commits warm-fill this cache, so gc has copies to drop.
+fn table_with_disk_cache(
+    options: SupertableOptions,
+    storage: Arc<dyn StorageProvider>,
+    cache_root: &Path,
+) -> (Supertable, Arc<DiskCacheStore>) {
+    let cfg = merge_cache_config(cache_root);
     let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
     let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
     let table = Supertable::create(
@@ -885,6 +891,51 @@ fn corrupt_vector_blob_at(path: &Path) -> bool {
     true
 }
 
+/// Build a hidden-vector table through a disk cache at `cache_dir`, commit
+/// two rounds, and drop the handle and the cache the way a restart leaves
+/// them. Returns the inputs' paths in `store_dir`.
+fn merge_inputs_on_disk(
+    storage: &Arc<dyn StorageProvider>,
+    store_dir: &Path,
+    cache_dir: &Path,
+) -> Vec<PathBuf> {
+    let (st, cache) =
+        table_with_disk_cache(hidden_vector_options(), Arc::clone(storage), cache_dir);
+    let schema = st.options().schema.clone();
+    for round in 0..2 {
+        let mut w = st.writer().expect("writer");
+        w.append(&hidden_batch(Arc::clone(&schema), round))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    let inputs = superfile_paths_under(store_dir);
+    assert!(inputs.len() >= 2, "the fixture must leave inputs to merge");
+    drop(st);
+    drop(cache);
+    inputs
+}
+
+/// Reopen the table over the cache already at `cache_dir`, under `policy`.
+fn reopen_over_cache(
+    storage: &Arc<dyn StorageProvider>,
+    cache_dir: &Path,
+    policy: CrcVerification,
+) -> (Supertable, Arc<DiskCacheStore>) {
+    let cfg = DiskCacheConfig {
+        crc_verification: policy,
+        ..merge_cache_config(cache_dir)
+    };
+    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
+    let cache = DiskCacheStore::new(Arc::clone(storage), cfg, pinned).expect("cache");
+    let st = Supertable::open(
+        hidden_vector_options()
+            .with_storage(Arc::clone(storage))
+            .with_disk_cache(Arc::clone(&cache)),
+    )
+    .expect("reopen the table over the existing cache");
+    (st, cache)
+}
+
 /// Build a vector table through a disk cache, restart, optionally corrupt the
 /// **cached** copies, then merge under `policy`. Returns how many cold fetches
 /// the merge issued.
@@ -903,28 +954,7 @@ fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: boo
     let local: Arc<dyn StorageProvider> =
         Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
     let storage: Arc<dyn StorageProvider> = FaultStorage::wrap(local);
-
-    let (st, cache) = table_with_disk_cache(
-        hidden_vector_options(),
-        Arc::clone(&storage),
-        cache_dir.path(),
-    );
-    let schema = st.options().schema.clone();
-    for round in 0..2 {
-        let mut w = st.writer().expect("writer");
-        w.append(&hidden_batch(Arc::clone(&schema), round))
-            .expect("append");
-        w.commit().expect("commit");
-    }
-    assert!(
-        superfile_paths_under(store_dir.path()).len() >= 2,
-        "the fixture must leave inputs to merge"
-    );
-
-    // Restart: drop the handle and its cache, leaving the files on disk the
-    // way a new process finds them.
-    drop(st);
-    drop(cache);
+    merge_inputs_on_disk(&storage, store_dir.path(), cache_dir.path());
 
     if corrupt_cached_inputs {
         let corrupted = superfile_paths_under(cache_dir.path())
@@ -938,90 +968,58 @@ fn cold_fetches_during_merge(policy: CrcVerification, corrupt_cached_inputs: boo
         );
     }
 
-    let cfg = DiskCacheConfig {
-        cache_root: cache_dir.path().to_path_buf(),
-        disk_budget_bytes: CACHE_BUDGET_BYTES,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        crc_verification: policy,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
-    let st = Supertable::open(
-        hidden_vector_options()
-            .with_storage(Arc::clone(&storage))
-            .with_disk_cache(Arc::clone(&cache)),
-    )
-    .expect("reopen the table over the existing cache");
-
+    let (st, cache) = reopen_over_cache(&storage, cache_dir.path(), policy);
     let before = cache.stats().n_cold_fetches;
     st.optimize(&small_optimize_opts()).expect("optimize");
     cache.stats().n_cold_fetches - before
 }
 
 /// An input on this host's disk is mapped where it lies rather than read
-/// through the cache, and its checksums are verified as it opens: a corrupt
-/// storage copy is refused and the merge does not run, so the table keeps its
-/// inputs and nothing is laundered into a fresh, validly checksummed output.
+/// through the cache — the cache serves no fetch for it — and its checksums
+/// are verified as it opens under the cache's policy: under `Auto` a
+/// corrupt storage copy is refused and the merge does not run, so the table
+/// keeps its inputs and nothing is laundered into a fresh, validly
+/// checksummed output; under `Never` the operator turned the check off at
+/// every boundary, and the copy is merged as it is.
 #[test]
 fn optimize_refuses_a_corrupt_local_input_instead_of_merging_it() {
-    let store_dir = TempDir::new().expect("tempdir");
-    let cache_dir = TempDir::new().expect("cache tempdir");
-    let storage: Arc<dyn StorageProvider> =
-        Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
-    let (st, cache) = table_with_disk_cache(
-        hidden_vector_options(),
-        Arc::clone(&storage),
-        cache_dir.path(),
-    );
-    let schema = st.options().schema.clone();
-    for round in 0..2 {
-        let mut w = st.writer().expect("writer");
-        w.append(&hidden_batch(Arc::clone(&schema), round))
-            .expect("append");
-        w.commit().expect("commit");
+    for policy in [CrcVerification::Auto, CrcVerification::Never] {
+        let store_dir = TempDir::new().expect("tempdir");
+        let cache_dir = TempDir::new().expect("cache tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(store_dir.path()).expect("provider"));
+        let mut inputs = merge_inputs_on_disk(&storage, store_dir.path(), cache_dir.path());
+
+        // The storage copies are the ones the merge maps; the cache's copies,
+        // good or not, are not read for a local input.
+        let corrupted = inputs.iter().filter(|p| corrupt_vector_blob_at(p)).count();
+        assert!(corrupted > 0, "an input with a vector blob to corrupt");
+
+        let (st, cache) = reopen_over_cache(&storage, cache_dir.path(), policy);
+        let before = cache.stats().n_cold_fetches;
+        let merged = st.optimize(&small_optimize_opts());
+        assert_eq!(
+            cache.stats().n_cold_fetches - before,
+            0,
+            "{policy:?}: a local input is mapped, never fetched through the cache"
+        );
+        let mut after = superfile_paths_under(store_dir.path());
+        after.sort();
+        inputs.sort();
+        match policy {
+            CrcVerification::Never => {
+                merged.expect("never does not look, so the corrupt copy is merged in");
+                assert_ne!(after, inputs, "the inputs were merged");
+            }
+            _ => {
+                merged.expect_err("a corrupt input is refused before the merge reads it");
+                assert_eq!(
+                    after, inputs,
+                    "the inputs stay as they were; nothing was merged"
+                );
+            }
+        }
     }
-    let inputs = superfile_paths_under(store_dir.path());
-    assert!(inputs.len() >= 2, "the fixture must leave inputs to merge");
-    drop(st);
-    drop(cache);
-
-    // The storage copies are the ones the merge maps; the cache's copies,
-    // good or not, are not read for a local input.
-    let corrupted = inputs.iter().filter(|p| corrupt_vector_blob_at(p)).count();
-    assert!(corrupted > 0, "an input with a vector blob to corrupt");
-
-    let cfg = DiskCacheConfig {
-        cache_root: cache_dir.path().to_path_buf(),
-        disk_budget_bytes: CACHE_BUDGET_BYTES,
-        cold_fetch_mode: ColdFetchMode::HybridWithPrefetch,
-        mmap_cold_threshold_secs: 0,
-        mmap_sweep_interval_secs: 0,
-        eviction: Box::new(LruPolicy::new()),
-        crc_verification: CrcVerification::Auto,
-        ..Default::default()
-    };
-    let pinned: Arc<dyn Fn() -> HashSet<_> + Send + Sync> = Arc::new(HashSet::new);
-    let cache = DiskCacheStore::new(Arc::clone(&storage), cfg, pinned).expect("cache");
-    let st = Supertable::open(
-        hidden_vector_options()
-            .with_storage(Arc::clone(&storage))
-            .with_disk_cache(cache),
-    )
-    .expect("reopen the table");
-    st.optimize(&small_optimize_opts())
-        .expect_err("a corrupt input is refused before the merge reads it");
-    let mut after = superfile_paths_under(store_dir.path());
-    after.sort();
-    let mut before = inputs;
-    before.sort();
-    assert_eq!(
-        after, before,
-        "the inputs stay as they were; nothing was merged"
-    );
 }
 
 /// A corrupt cached input is refetched rather than merged, end to end through

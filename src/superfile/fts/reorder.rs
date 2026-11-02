@@ -50,6 +50,7 @@ use tracing::Span;
 
 use crate::{
     runtime_metrics::cpu::{thread_cpu_delta_ns, thread_cpu_ns},
+    superfile::fts::posting::BLOCK_LEN,
     utils::trace::detail_span,
 };
 
@@ -60,13 +61,13 @@ const SIGN_BIT: u32 = 0x8000_0000;
 /// already have. Splitting further costs more than the grouping is
 /// worth, and the gaps inside a group this small are already short.
 ///
-/// Two posting blocks of documents. The splits below that were measured
-/// on two 5M-document corpora, encyclopedia prose and web crawl, each
-/// compacted to 1 GiB superfiles: they took 2–4% of the compaction's
-/// time and left the index 0.05–0.07% *larger* than stopping here — in a
-/// partition that small the pairs a round moves share terms, so the
-/// swaps undo each other's grouping more than they add to it.
-const MIN_PARTITION: usize = 256;
+/// One posting block of documents (two sub-blocks): a group that fits a
+/// block is already as close as the postings can place it. Splitting
+/// below that was measured to cost time and to leave the index slightly
+/// larger — in a partition this small the pairs a round moves share
+/// terms, so the swaps undo each other's grouping more than they add to
+/// it. The numbers are recorded with the benches.
+const MIN_PARTITION: usize = BLOCK_LEN;
 
 /// Reorder convergence ratio.
 ///
@@ -173,8 +174,11 @@ impl Bisect<'_> {
     /// letting them offer would hand the bar to whichever the thread pool
     /// happened to finish first and make the output depend on scheduling. The
     /// root runs alone, so taking the bar from it alone is what keeps a merge
-    /// reproducible. A root that moves nothing offers nothing, and the run
-    /// then has no bar and keeps every round.
+    /// reproducible. The root offers the cost its first round really
+    /// removed, or, when that round moved documents without lowering the
+    /// cost, the gain it moved them by, so a bar always exists once the
+    /// root has moved anything. A root that moves nothing offers nothing,
+    /// and the run then has no bar and keeps every round.
     fn offer_reference(&self, gain: f64, len: usize) {
         let per_doc = gain / (len.max(1) as f64);
         if per_doc > 0.0 {
@@ -952,8 +956,6 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        // The cost as the round begins, so the round is judged by what it
-        // really lowered the cost by once its swaps are in.
         let mut cost_before = self.partition_cost(n_left, n_right);
 
         // Taken out of `self` so the ranking can borrow the move-gain
@@ -971,7 +973,9 @@ impl BisectState {
         // splits rounding long after they had stopped paying. The reading
         // costs a pass over the partition's terms, a small fraction of a
         // round's pass over its postings in a large partition and about
-        // one round's worth in a leaf.
+        // one round's worth in a leaf. A round that raised the cost is kept
+        // as it is — its swaps stay — and ends the split like any round
+        // under the bar.
         for round in 0..run.params.max_rounds {
             // A document's gain is what the cost drops by if it moves:
             // its terms get one rarer on this side and one commoner on
@@ -1075,9 +1079,12 @@ impl BisectState {
                     level.swap_ns += ns_since(step);
                     level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
                 }
-                level.predicted_gain += gain;
-                swaps
+                if REPORT {
+                    level.predicted_gain += gain;
+                }
+                (swaps, gain)
             };
+            let (moved, predicted) = moved;
             last_swaps = moved;
             level.rounds += 1;
             if moved == 0 {
@@ -1093,7 +1100,11 @@ impl BisectState {
             }
             if round == 0 {
                 if depth == 0 {
-                    run.offer_reference(round_gain, order.len());
+                    let offered = match round_gain > 0.0 {
+                        true => round_gain,
+                        false => predicted,
+                    };
+                    run.offer_reference(offered, order.len());
                 }
             } else if run.converged(round_gain, order.len()) {
                 // This round bought less per document than the corpus showed
@@ -1509,6 +1520,34 @@ mod tests {
             bisect_order(&fwd, exhaustive()),
             (0..MIN_PARTITION as u32).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_corpus_one_document_over_the_leaf_is_split() {
+        let (fwd, _) = clustered(MIN_PARTITION + 1, 2, 3);
+        assert_ne!(
+            bisect_order(&fwd, exhaustive()),
+            (0..=MIN_PARTITION as u32).collect::<Vec<_>>()
+        );
+    }
+
+    /// Under the default bar some splits end on their realised gain before
+    /// the round ceiling, and the cost those rounds removed is positive.
+    #[test]
+    fn splits_end_on_the_realised_gain_under_the_default_bar() {
+        let (fwd, _) = clustered(3 * PARALLEL_MIN_PARTITION, 20, 13);
+        let (_, report) = bisect_order_reported(&fwd, BisectParams::default());
+        assert!(report.reference > 0.0, "the root set the bar");
+        assert!(
+            report.levels.iter().any(|level| level.converged > 0),
+            "some split ended on the bar"
+        );
+        let total = report.total();
+        assert!(
+            total.rounds < total.splits * REORDER_MAX_ROUNDS as u64,
+            "not every split ran to the ceiling: {total}"
+        );
+        assert!(total.actual_gain > 0.0, "the cost fell: {total}");
     }
 
     #[test]

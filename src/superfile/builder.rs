@@ -478,6 +478,68 @@ fn term_bucket(term: &[u8]) -> u32 {
     ((h >> 32) as u32 ^ h as u32) & ((1 << REORDER_TERM_BUCKET_BITS) - 1)
 }
 
+/// How many surviving documents carry each term bucket, over `readers`'
+/// first `n_fts_columns` text columns, where `rows_by_blob[i][doc]` is
+/// `Some` for the documents of input `i` the merge keeps.
+///
+/// The inputs are counted side by side, each thread into its own table,
+/// and the tables summed: counts come out the same in any order. An input
+/// that keeps every document contributes each term's stored count, read
+/// from the term's header, so no posting is decoded for it; one that
+/// drops documents has its postings walked, since only the surviving ones
+/// count.
+fn term_document_counts<T: Sync>(
+    readers: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+    rows_by_blob: &[Vec<Option<T>>],
+    n_fts_columns: u32,
+    n_buckets: usize,
+) -> Result<Vec<u32>, BuildError> {
+    let count_failed = |e: FtsError| {
+        BuildError::Io(Error::other(format!(
+            "fts merge: counting terms for the document order failed: {e}"
+        )))
+    };
+    readers
+        .par_iter()
+        .zip(rows_by_blob.par_iter())
+        .try_fold(
+            || vec![0u32; n_buckets],
+            |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
+                let fts = reader.fts().ok_or(BuildError::BatchReadError)?;
+                let keeps_every_doc = rows.iter().all(Option::is_some);
+                for column_id in 0..n_fts_columns {
+                    match keeps_every_doc {
+                        true => fts.for_each_term_df(
+                            column_id,
+                            |term| Some(term_bucket(term)),
+                            |&t, term_df| df[t as usize] += term_df,
+                        ),
+                        false => fts.for_each_term_doc(
+                            column_id,
+                            |term| Some(term_bucket(term)),
+                            |&t, local_doc| {
+                                if rows[local_doc as usize].is_some() {
+                                    df[t as usize] += 1;
+                                }
+                            },
+                        ),
+                    }
+                    .map_err(count_failed)?;
+                }
+                Ok(df)
+            },
+        )
+        .try_reduce(
+            || vec![0u32; n_buckets],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    *x += y;
+                }
+                Ok(a)
+            },
+        )
+}
+
 /// How many documents carry a term set no other document carries, for the
 /// reorder span. Sets are compared by a hash of their sorted terms, so a rare
 /// collision counts two sets as one.
@@ -2808,56 +2870,7 @@ impl SuperfileBuilder {
             .zip(rows_of.iter())
             .map(|((reader, _), rows)| remap_by_blob_id(reader.fts().expect("checked above"), rows))
             .collect::<Result<_, _>>()?;
-        // The inputs are counted side by side, each thread into its own table,
-        // and the tables summed: counts come out the same in any order.
-        // An input that keeps every document contributes each term's stored
-        // count, read from the term's header, so no posting is decoded for
-        // it; one that drops documents has its postings walked, since only
-        // the surviving ones count.
-        let count_failed = |e: FtsError| {
-            BuildError::Io(Error::other(format!(
-                "fts merge: counting terms for the document order failed: {e}"
-            )))
-        };
-        let df: Vec<u32> = readers
-            .par_iter()
-            .zip(rows_by_blob.par_iter())
-            .try_fold(
-                || vec![0u32; n_buckets],
-                |mut df, ((reader, _), rows)| -> Result<Vec<u32>, BuildError> {
-                    let fts = reader.fts().expect("checked above");
-                    let keeps_every_doc = rows.iter().all(Option::is_some);
-                    for column_id in 0..n_fts_columns {
-                        match keeps_every_doc {
-                            true => fts.for_each_term_df(
-                                column_id,
-                                |term| Some(term_bucket(term)),
-                                |&t, term_df| df[t as usize] += term_df,
-                            ),
-                            false => fts.for_each_term_doc(
-                                column_id,
-                                |term| Some(term_bucket(term)),
-                                |&t, local_doc| {
-                                    if rows[local_doc as usize].is_some() {
-                                        df[t as usize] += 1;
-                                    }
-                                },
-                            ),
-                        }
-                        .map_err(count_failed)?;
-                    }
-                    Ok(df)
-                },
-            )
-            .try_reduce(
-                || vec![0u32; n_buckets],
-                |mut a, b| {
-                    for (x, y) in a.iter_mut().zip(&b) {
-                        *x += y;
-                    }
-                    Ok(a)
-                },
-            )?;
+        let df = term_document_counts(readers, &rows_by_blob, n_fts_columns, n_buckets)?;
         drop(count_span);
         let too_common = (n_out_docs / 2).max(2);
         let eligible = |t: u32| -> bool {
@@ -7777,6 +7790,80 @@ mod tests {
 
     /// A merge that chooses its own doc order still goes term by term, and
     /// writes what the accumulator writes.
+    #[test]
+    /// The order's term counts come from the headers for an input that
+    /// keeps every document and from a walk of the postings for one that
+    /// drops some: both agree with a count over the surviving documents,
+    /// and for the dropping input the header counts would not.
+    fn term_counts_read_headers_only_for_inputs_that_keep_every_document() {
+        /// The reorder fixture indexes one text column.
+        const N_FTS_COLUMNS: u32 = 1;
+        let deleted: Vec<u32> = (0..2_600).step_by(7).collect();
+        let n_buckets = 1usize << REORDER_TERM_BUCKET_BITS;
+        // Counted the slow way, over the documents `keep` admits.
+        let counted = |inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+                       keep: &dyn Fn(usize, u32) -> bool| {
+            let mut df = vec![0u32; n_buckets];
+            for (i, (reader, _)) in inputs.iter().enumerate() {
+                let fts = reader.fts().expect("fts");
+                for column_id in 0..N_FTS_COLUMNS {
+                    fts.for_each_term_doc(
+                        column_id,
+                        |term| Some(term_bucket(term)),
+                        |&t, doc| {
+                            if keep(i, doc) {
+                                df[t as usize] += 1;
+                            }
+                        },
+                    )
+                    .expect("walk");
+                }
+            }
+            df
+        };
+        let rows_of = |inputs: &[(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)],
+                       keep: &dyn Fn(usize, u32) -> bool| {
+            inputs
+                .iter()
+                .enumerate()
+                .map(|(i, (reader, _))| {
+                    (0..reader.fts().expect("fts").n_docs())
+                        .map(|doc| keep(i, doc).then_some(doc))
+                        .collect::<Vec<Option<u32>>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let every = |_: usize, _: u32| true;
+        let surviving = |input: usize, doc: u32| input != 0 || !deleted.contains(&doc);
+
+        let live = reorder_merge_inputs(false, &[]);
+        assert_eq!(
+            term_document_counts(&live, &rows_of(&live, &every), N_FTS_COLUMNS, n_buckets)
+                .expect("count"),
+            counted(&live, &every),
+            "inputs that keep every document: the headers say what a walk counts"
+        );
+
+        let dropping = reorder_merge_inputs(false, &[&deleted[..], &[][..]]);
+        let from_walk = counted(&dropping, &surviving);
+        assert_eq!(
+            term_document_counts(
+                &dropping,
+                &rows_of(&dropping, &surviving),
+                N_FTS_COLUMNS,
+                n_buckets
+            )
+            .expect("count"),
+            from_walk,
+            "an input that drops documents is counted over the survivors"
+        );
+        assert_ne!(
+            counted(&dropping, &every),
+            from_walk,
+            "the dropped documents carry terms, so the headers alone would overcount"
+        );
+    }
+
     #[test]
     fn sorted_merge_matches_accumulator_when_the_merge_reorders() {
         let a: Vec<u32> = (0..2_600).step_by(7).collect();

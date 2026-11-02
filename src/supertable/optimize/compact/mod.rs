@@ -136,9 +136,12 @@ impl Supertable {
 /// largest merge, and an even share leaves the largest merge short while
 /// the smallest finishes early and idles its threads. The shares are
 /// rounded so they add up to the width exactly, largest remainders first,
-/// and every merge gets at least one thread. A pass with more jobs than
-/// can run at once gives each the even share, rounded down, so the merges
-/// in flight never hold more threads together than the pool has.
+/// and every merge gets at least one thread — a tiny merge's thread comes
+/// out of the largest shares. A pass with more jobs than can run at once,
+/// or whose jobs report no documents, gives each the even share, rounded
+/// down, so the merges in flight never hold more threads together than
+/// the pool has; only more jobs than threads oversubscribes it, by the
+/// shortfall, since a merge cannot run on none.
 fn merge_pool_widths(
     maintenance_threads: usize,
     concurrency: usize,
@@ -146,12 +149,12 @@ fn merge_pool_widths(
 ) -> Vec<usize> {
     let threads = maintenance_threads.max(1);
     let concurrency = concurrency.max(1);
-    if jobs.len() > concurrency || jobs.len() <= 1 {
+    let total_docs: u128 = jobs.iter().map(|j| u128::from(j.live_docs)).sum();
+    if jobs.len() > concurrency || jobs.len() <= 1 || total_docs == 0 {
         let even = (threads / concurrency.min(jobs.len()).max(1)).max(1);
         return vec![even; jobs.len()];
     }
-    let total_docs: u128 = jobs.iter().map(|j| u128::from(j.live_docs)).sum();
-    if total_docs == 0 || threads <= jobs.len() {
+    if threads <= jobs.len() {
         return vec![1; jobs.len()];
     }
     // Each job's share in thread units, scaled so the largest remainders
@@ -164,15 +167,24 @@ fn merge_pool_widths(
         .iter()
         .map(|&s| ((s / total_docs) as usize).max(1))
         .collect();
-    let mut spare = threads.saturating_sub(widths.iter().sum::<usize>());
     let mut by_remainder: Vec<usize> = (0..jobs.len()).collect();
     by_remainder.sort_by_key(|&i| Reverse(scaled[i] % total_docs));
-    for i in by_remainder {
-        if spare == 0 {
+    let mut sum: usize = widths.iter().sum();
+    for &i in &by_remainder {
+        if sum >= threads {
             break;
         }
         widths[i] += 1;
-        spare -= 1;
+        sum += 1;
+    }
+    // Shares that rounded up to one thread can leave the sum over the
+    // width; the largest shares give those threads back.
+    while sum > threads {
+        let largest = (0..widths.len())
+            .max_by_key(|&i| (widths[i], Reverse(i)))
+            .expect("at least two jobs here");
+        widths[largest] -= 1;
+        sum -= 1;
     }
     widths
 }
@@ -2812,6 +2824,8 @@ async fn clear_completed_conversions(inner: &SupertableInner) -> Result<(), Comp
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
     use std::{
         collections::HashSet,
         env, fs,
@@ -2847,7 +2861,7 @@ mod tests {
         BoolMode, Stemmer, Stopwords, VectorSearchOptions,
         config::{
             CompactionSteps, DEFAULT_GC_SAFETY_GAP, DEFAULT_STALE_SEAL_TIMEOUT_MS, OptimizeOptions,
-            OptimizeSteps,
+            OptimizeSteps, scratch_root,
         },
         memory::ConnectionMemoryBudget,
         storage::{ObjectMeta, StorageError},
@@ -2866,6 +2880,7 @@ mod tests {
                 },
                 term_index::STORAGE_PREFIX as TERM_INDEX_PREFIX,
             },
+            reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
             schema::{
                 ColumnIndex,
                 change::{FieldPatch, SchemaPatch},
@@ -2883,6 +2898,11 @@ mod tests {
 
     const DEFAULT_STALE_SEAL_TIMEOUT: Duration =
         Duration::from_millis(DEFAULT_STALE_SEAL_TIMEOUT_MS);
+
+    /// How long the output-link test waits for the post-commit cache warm:
+    /// `CACHE_WARM_POLLS` polls, `CACHE_WARM_POLL` apart.
+    const CACHE_WARM_POLLS: usize = 200;
+    const CACHE_WARM_POLL: Duration = Duration::from_millis(50);
 
     /// Titles that cast cleanly to the integers the column is flipped to,
     /// so the rewritten file carries real values rather than nulls.
@@ -4420,12 +4440,8 @@ mod tests {
     fn jobs_of(docs: &[u64]) -> Vec<CompactionJob> {
         docs.iter()
             .map(|&live_docs| CompactionJob {
-                partition_key: Vec::new(),
-                inputs: Vec::new(),
-                estimated_output_bytes: 0,
-                input_bytes: 0,
                 live_docs,
-                merge_input_mb: None,
+                ..CompactionJob::default()
             })
             .collect()
     }
@@ -4442,8 +4458,41 @@ mod tests {
             vec![3, 3, 2]
         );
         assert_eq!(merge_pool_widths(8, 8, &jobs_of(&[7, 1])), vec![7, 1]);
-        // A tiny job still gets a thread, out of the largest's share.
+        // A tiny job still gets a thread, out of the largest's share, and
+        // the widths still add up to the pool.
         assert_eq!(merge_pool_widths(4, 4, &jobs_of(&[1_000, 1])), vec![3, 1]);
+        assert_eq!(
+            merge_pool_widths(5, 8, &jobs_of(&[1_000, 1, 1, 1])),
+            vec![2, 1, 1, 1]
+        );
+        assert_eq!(
+            merge_pool_widths(4, 8, &jobs_of(&[100, 1, 1])),
+            vec![2, 1, 1]
+        );
+        // Jobs that report no documents take the even share.
+        assert_eq!(merge_pool_widths(8, 8, &jobs_of(&[0, 0])), vec![4, 4]);
+        // Whatever the shares, the widths of a pass that runs at once add
+        // up to the pool when it has a thread for every merge.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for threads in 2..=64usize {
+            for n_jobs in 2..=threads.min(12) {
+                let docs: Vec<u64> = (0..n_jobs)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed % 10_000
+                    })
+                    .collect();
+                let widths = merge_pool_widths(threads, 64, &jobs_of(&docs));
+                assert!(widths.iter().all(|&w| w >= 1), "{threads} {docs:?}");
+                assert_eq!(
+                    widths.iter().sum::<usize>(),
+                    threads,
+                    "{threads} threads over {docs:?}: {widths:?}"
+                );
+            }
+        }
         // More jobs than can run at once take the even share, rounded
         // down, so the merges in flight never exceed the pool together.
         assert_eq!(
@@ -4481,6 +4530,61 @@ mod tests {
 
     fn superfile_count(st: &Supertable) -> usize {
         st.inner().manifest.load().get_all_superfiles().len()
+    }
+
+    /// An optimize to a directory on this host with a disk cache attached
+    /// writes each output once: the storage copy and the cache copy are
+    /// links to the file the merge sealed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compact_links_its_outputs_into_storage_and_the_cache() {
+        // The sealed file lives under the configured scratch root; storage
+        // and cache go beside it so the links are on one filesystem.
+        let dir = TempDir::new_in(scratch_root()).expect("tempdir under the scratch root");
+        let storage: Arc<dyn StorageProvider> = local_storage(&dir);
+        let cache = DiskCacheStore::new_unpinned(
+            Arc::clone(&storage),
+            DiskCacheConfig {
+                cache_root: dir.path().join("cache"),
+                mmap_cold_threshold_secs: 0,
+                ..Default::default()
+            },
+        )
+        .expect("cache store");
+        let st = Supertable::create(
+            default_supertable_options()
+                .with_storage(Arc::clone(&storage))
+                .with_disk_cache(Arc::clone(&cache)),
+        )
+        .expect("create");
+        commit_ten_small_files(&st);
+        let before = superfile_count(&st);
+        st.compact_async(&small_compact_cfg())
+            .await
+            .expect("compact");
+        assert!(superfile_count(&st) < before, "the pass merged");
+        let manifest = st.inner().manifest.load();
+        let entries = manifest.get_all_superfiles();
+        // The warm fill of the outputs runs after the commit, off the loop
+        // that admits merges; give it a moment to land.
+        for _ in 0..CACHE_WARM_POLLS {
+            if entries
+                .iter()
+                .all(|entry| cache.cache_path(&entry.uri).exists())
+            {
+                break;
+            }
+            tokio::time::sleep(CACHE_WARM_POLL).await;
+        }
+        for entry in entries {
+            let stored = storage
+                .local_path(&entry.storage_path())
+                .expect("a directory on this host");
+            let stored = fs::metadata(&stored).expect("storage file");
+            let cached = fs::metadata(cache.cache_path(&entry.uri)).expect("cache file");
+            assert_eq!(stored.ino(), cached.ino(), "one file behind both copies");
+            assert!(stored.nlink() >= 2, "linked, not copied");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

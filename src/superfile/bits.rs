@@ -156,7 +156,7 @@ pub(crate) fn plan_exceptions(
         lanes
             .iter()
             .enumerate()
-            .filter(|&(_, &v)| width_of(v.into()) > narrowest)
+            .filter(|&(_, &v)| v >> narrowest != 0)
             .map(|(i, &v)| (i as u32, v)),
     );
     for width in narrowest..plain {
@@ -889,6 +889,120 @@ mod tests {
         // All-zero lanes: width 0 and no exceptions.
         let plan = planned(&[0u32; 16], 31, |w| 2 * w as usize, |_, _| 2);
         assert_eq!((plan.width, plan.bytes), (0, 0));
+    }
+
+    /// The planner agrees with an exhaustive plan over every width: the
+    /// cheapest width wins, a tie goes to the narrower, a width that would
+    /// list more exceptions than the cap is out, and the exceptions are the
+    /// lanes wider than the width, in lane order, each with its high bits.
+    /// The grid reaches a middle width winning over both a narrower and a
+    /// wider one, ties, caps hit exactly, all-zero and uniform blocks, a
+    /// single wide lane, lanes of the full width and partial blocks.
+    #[test]
+    fn plan_exceptions_matches_the_exhaustive_plan() {
+        fn exhaustive(
+            lanes: &[u32],
+            cap: usize,
+            base: &dyn Fn(u8) -> usize,
+            per_exception: &dyn Fn(u32, u32) -> usize,
+        ) -> (u8, usize, Vec<(u32, u32)>) {
+            let plain = width_of(lanes.iter().copied().max().unwrap_or(0).into());
+            let mut best = (plain, base(plain), Vec::new());
+            for width in 0..plain {
+                let exceptions: Vec<(u32, u32)> = lanes
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &v)| v >> width != 0)
+                    .map(|(i, &v)| (i as u32, v >> width))
+                    .collect();
+                if exceptions.len() > cap {
+                    continue;
+                }
+                let bytes = base(width)
+                    + exceptions
+                        .iter()
+                        .map(|&(i, hi)| per_exception(i, hi))
+                        .sum::<usize>();
+                if bytes < best.1 {
+                    best = (width, bytes, exceptions);
+                }
+            }
+            best
+        }
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut cases: Vec<Vec<u32>> = vec![
+            Vec::new(),
+            vec![0; 16],
+            vec![5; 128],
+            vec![u32::MAX; 9],
+            // One lane wider than all the others.
+            (0..128u32)
+                .map(|i| if i == 77 { 1 << 30 } else { 3 })
+                .collect(),
+            // A middle width wins: 3-bit lanes, 8-bit ones, two 20-bit ones.
+            (0..142u32)
+                .map(|i| match i {
+                    0 | 1 => 1 << 19,
+                    i if i < 22 => 200,
+                    _ => 5,
+                })
+                .collect(),
+        ];
+        for &n in &[1usize, 7, 127, 128, 129, 256] {
+            for _ in 0..6 {
+                let common = next(12) as u8;
+                let outliers = next(40) as usize;
+                let lanes: Vec<u32> = (0..n)
+                    .map(|_| {
+                        let wide = outliers > 0 && next(n as u64) < outliers as u64;
+                        let width = if wide {
+                            common + 1 + next(20) as u8
+                        } else {
+                            common
+                        };
+                        if width == 0 {
+                            0
+                        } else {
+                            (1u32 << (width - 1)) | next(1u64 << (width - 1)) as u32
+                        }
+                    })
+                    .collect();
+                cases.push(lanes);
+            }
+        }
+        let bases: [&dyn Fn(u8) -> usize; 2] = [&|w| 128 * w as usize / 8, &|w| 2 * w as usize];
+        let costs: [&dyn Fn(u32, u32) -> usize; 3] = [&|_, _| 2, &|_, _| 100, &|_, hi| {
+            1 + (u32::BITS - hi.leading_zeros()) as usize / 8
+        }];
+        for lanes in &cases {
+            for cap in [0usize, 1, 3, 31, 64, usize::MAX] {
+                for base in bases {
+                    for per_exception in costs {
+                        let got = planned(lanes, cap, base, per_exception);
+                        let want = exhaustive(lanes, cap, base, per_exception);
+                        assert_eq!(
+                            (got.width, got.bytes, got.exceptions),
+                            want,
+                            "lanes {lanes:?} cap {cap}"
+                        );
+                    }
+                }
+            }
+        }
+        // The caps exactly at and one past an outlier count.
+        let mut lanes = vec![1u32; 128];
+        for i in 0..40 {
+            lanes[i * 3] = 1 << 15;
+        }
+        let base = |width: u8| 128 * width as usize / 8;
+        assert_eq!(planned(&lanes, 40, base, |_, _| 2).exceptions.len(), 40);
+        assert_eq!(planned(&lanes, 39, base, |_, _| 2).exceptions.len(), 0);
     }
 
     #[test]

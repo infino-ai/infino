@@ -449,6 +449,14 @@ pub(crate) use sources::{
 impl DiskCacheStore {
     /// Where a build may spill its scratch: beside the cache, on the disk
     /// sized for the table, rather than in the system temporary directory.
+    /// Whether this cache's checksum policy verifies a superfile a
+    /// compaction or reindex is about to read whole: the same answer the
+    /// cache gives a `Load` it adopts, for an input a merge maps where it
+    /// lies instead.
+    pub(crate) fn verifies_on_load(&self) -> bool {
+        self.config.crc_verification.verifies_on_landing()
+    }
+
     pub(crate) fn scratch_root(&self) -> PathBuf {
         self.config.cache_root.join("scratch")
     }

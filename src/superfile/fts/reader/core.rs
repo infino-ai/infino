@@ -57,7 +57,7 @@ use crate::{
             builder::doc_lengths_entry_size,
             positions::GroupIndex,
             posting::{BLOCK_LEN, ENCODING_BITSET, ENCODING_RUN, decode_block_doc_ids},
-            short::{SHORT_MAX_DF, decode_short},
+            short::{SHORT_MAX_DF, decode_short, short_df},
             tokenize::{Phrase, Tokenizer},
         },
         id_space::{DocMap, FtsDocId, RowId},
@@ -579,6 +579,13 @@ pub struct FtsReader {
     pub(super) doc_map_region: Option<Range<usize>>,
     /// Whether a read after open checks its CRC, as the open's reads did.
     verify_crc: bool,
+}
+
+/// The error for a short-form term body the decoder refuses.
+fn short_body_malformed() -> FtsError {
+    FtsError::Read(ReadError::Malformed(
+        "short-form term body does not decode".into(),
+    ))
 }
 
 impl FtsReader {
@@ -1504,11 +1511,7 @@ impl FtsReader {
                         let mut d = [0u32; BLOCK_LEN];
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(cursor.bytes.as_ref(), true, &mut d, &mut t)
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                         inline_groups.push((
                             positional.len(),
                             cursor
@@ -1685,11 +1688,7 @@ impl FtsReader {
                         let mut d = [0u32; BLOCK_LEN];
                         let mut t = [0u32; BLOCK_LEN];
                         let decoded = decode_short(term_bytes.as_ref(), positional, &mut d, &mut t)
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                         // A short body's positions are one group, inline
                         // after its postings.
                         let position_bytes = decoded.positions_at.map(|at| term_bytes.slice(at..));
@@ -1844,11 +1843,7 @@ impl FtsReader {
                                 &mut doc_ids,
                                 &mut tfs,
                             )
-                            .ok_or_else(|| {
-                                FtsError::Read(ReadError::Malformed(
-                                    "short-form term body does not decode".into(),
-                                ))
-                            })?;
+                            .ok_or_else(short_body_malformed)?;
                             for &doc in &doc_ids[..decoded.n] {
                                 on_doc(&carry, doc);
                             }
@@ -1903,8 +1898,6 @@ impl FtsReader {
         let dict_bytes = self.dict_bytes()?;
         let dict = Self::open_dict(&dict_bytes)?;
         let prefix = make_key(&col_meta.name, "");
-        let mut doc_ids = [0u32; BLOCK_LEN];
-        let mut tfs = [0u32; BLOCK_LEN];
         let mut failed = None;
         dict.for_each_prefix(&prefix, |key, packed| {
             let Some(carry) = on_term(&key[prefix.len()..]) else {
@@ -1919,18 +1912,7 @@ impl FtsReader {
                 } => self
                     .term_bytes_sync(metadata_offset, postings_length)
                     .and_then(|term_bytes| {
-                        decode_short(
-                            term_bytes.as_ref(),
-                            col_meta.positions,
-                            &mut doc_ids,
-                            &mut tfs,
-                        )
-                        .map(|decoded| decoded.n as u32)
-                        .ok_or_else(|| {
-                            FtsError::Read(ReadError::Malformed(
-                                "short-form term body does not decode".into(),
-                            ))
-                        })
+                        short_df(term_bytes.as_ref()).ok_or_else(short_body_malformed)
                     }),
                 long => self.term_postings_at_most(long),
             };
@@ -3071,7 +3053,7 @@ mod tests {
         }
     }
     use std::{
-        collections::{HashMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         panic::{AssertUnwindSafe, catch_unwind},
         sync::{
             Barrier, Mutex,
@@ -3863,6 +3845,60 @@ mod tests {
     /// full walk visits for it, over inline, short and long terms, and a
     /// term it is told to skip is not counted.
     #[test]
+    /// A term's stated count covers every document of the superfile, the
+    /// ones a merge would drop included: a count over the surviving
+    /// documents alone has to walk the postings, which is why a merge
+    /// reads headers only for an input that keeps every document.
+    fn a_term_header_counts_the_documents_a_merge_would_drop_too() {
+        const N_DOCS: u32 = 400;
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = format!("every u{i}");
+            if i.is_multiple_of(3) {
+                text.push_str(" some");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(Bytes::from(b.finish().expect("finish")), json).expect("open");
+        let dropped = |doc: u32| doc.is_multiple_of(5);
+
+        let mut stated: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        r.for_each_term_df(
+            0,
+            |term| Some(term.to_vec()),
+            |term, df| {
+                stated.insert(term.clone(), df);
+            },
+        )
+        .expect("header walk");
+        let mut surviving: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        let mut gone: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+        r.for_each_term_doc(
+            0,
+            |term| Some(term.to_vec()),
+            |term, doc| {
+                let table = match dropped(doc) {
+                    true => &mut gone,
+                    false => &mut surviving,
+                };
+                *table.entry(term.clone()).or_default() += 1;
+            },
+        )
+        .expect("posting walk");
+        assert!(
+            gone.values().sum::<u32>() > 0,
+            "some dropped documents carry terms"
+        );
+        for (term, &df) in &stated {
+            let kept = surviving.get(term).copied().unwrap_or(0);
+            let lost = gone.get(term).copied().unwrap_or(0);
+            assert_eq!(df, kept + lost, "{}", String::from_utf8_lossy(term));
+        }
+    }
+
+    #[test]
     fn for_each_term_df_matches_the_full_walk_and_skips_terms() {
         const N_DOCS: u32 = 700;
         let mut b = FtsBuilder::new();
@@ -3902,6 +3938,18 @@ mod tests {
             assert_eq!(
                 stated, counted,
                 "column {column_id}: same counts, same order"
+            );
+            // The fixture reaches every entry kind: inline (one document),
+            // short (a few), and long over more than one block.
+            let df_of = |term: &[u8]| counted.iter().find(|(t, _)| t == term).map(|&(_, n)| n);
+            assert_eq!(df_of(b"u7"), Some(1), "an inline term");
+            assert!(
+                df_of(b"few").is_some_and(|n| n > 1 && n <= SHORT_MAX_DF as u32),
+                "a short term"
+            );
+            assert!(
+                df_of(b"every").is_some_and(|n| n > BLOCK_LEN as u32),
+                "a long term over several blocks"
             );
 
             let skipped = b"some".as_slice();
