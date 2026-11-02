@@ -3622,7 +3622,9 @@ struct LiveLanes {
     /// `Some` between feeds; `None` while a feed holds the lanes.
     lanes: Option<Vec<LiveLane>>,
     /// The feed in flight, returning the lanes (or the first error).
-    pending: Option<StdReceiver<Result<Vec<LiveLane>, BuildError>>>,
+    /// The feed in flight: one message per lane, in whatever order the
+    /// lanes finish, and how many to wait for.
+    pending: Option<(StdReceiver<(usize, Result<LiveLane, BuildError>)>, usize)>,
     /// Rows fed so far, which is also the row number the next batch
     /// starts at.
     rows_fed: usize,
@@ -3682,11 +3684,24 @@ impl LiveLanes {
     /// Wait for the feed in flight, if any, and take the lanes back.
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all, fields(rows_fed = self.rows_fed)))]
     fn join(&mut self) -> Result<Vec<LiveLane>, BuildError> {
-        if let Some(rx) = self.pending.take() {
-            let lanes = rx
-                .recv()
-                .map_err(|_| BuildError::Store("live lane feed ended without a result".into()))??;
-            self.lanes = Some(lanes);
+        if let Some((rx, n)) = self.pending.take() {
+            let mut lanes: Vec<Option<LiveLane>> = (0..n).map(|_| None).collect();
+            for _ in 0..n {
+                let (i, lane) = rx.recv().map_err(|_| {
+                    BuildError::Store("live lane feed ended without a result".into())
+                })?;
+                lanes[i] = Some(lane?);
+            }
+            self.lanes = Some(
+                lanes
+                    .into_iter()
+                    .map(|lane| {
+                        lane.ok_or_else(|| {
+                            BuildError::Store("a live lane ended without a result".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         self.lanes
             .take()
@@ -3704,64 +3719,78 @@ impl LiveLanes {
         batches: Vec<RecordBatch>,
         fts_bytes: u64,
     ) -> Result<(), BuildError> {
-        let mut lanes = self.join()?;
+        let lanes = self.join()?;
         let n = lanes.len();
         let first_row = self.rows_fed;
         self.rows_fed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         self.fts_bytes = self.fts_bytes.saturating_add(fts_bytes);
         // Each lane's share of the reserve for the text fed so far.
         let threshold = in_ram_threshold(self.fts_bytes / n as u64, self.threshold_floor);
-        let (tx, rx) = std_sync_channel(1);
+        // One pool task per lane, waited for from the caller's thread when
+        // the lanes are joined. A task that ran the lanes under a parallel
+        // iterator waited for them by running whatever else the pool held
+        // — other appends' pieces and layer ranges — and the lanes of a
+        // feed, the pieces of a seal and the ranges of a layer build now
+        // all reach the pool the same way, served in the order they came.
+        let (tx, rx) = std_sync_channel(n.max(1));
         let stats = op_stats.clone();
-        let col_idxs = self.col_idxs.clone();
-        pool.spawn(move || {
-            let _span = detail_span!(
-                "live.feed",
-                lanes = n,
-                rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>()
-            )
-            .entered();
-            let fed = lanes
-                .par_iter_mut()
-                .enumerate()
-                .try_for_each(|(i, lane)| {
-                    timed_kernel(&stats, || {
-                        lane.builder.set_spill_threshold_bytes(threshold);
-                        let mut base = first_row;
-                        for batch in &batches {
-                            let rows = batch.num_rows();
-                            let (start, end) = (rows * i / n, rows * (i + 1) / n);
-                            if start < end {
-                                let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
-                                index_fts_rows(
-                                    &mut lane.builder,
-                                    &col_idxs,
-                                    &batch.slice(start, end - start),
-                                    first_doc,
-                                )?;
-                                let (row, len) = ((base + start) as u32, (end - start) as u32);
-                                match lane.stretches.last_mut() {
-                                    // Rows that carry straight on from the last
-                                    // stretch extend it.
-                                    Some(s) if s.row + s.len == row => s.len += len,
-                                    _ => lane.stretches.push(Stretch {
-                                        doc: first_doc,
-                                        row,
-                                        len,
-                                    }),
-                                }
+        let col_idxs = Arc::new(self.col_idxs.clone());
+        let batches = Arc::new(batches);
+        let parent = Span::current();
+        for (i, mut lane) in lanes.into_iter().enumerate() {
+            let (tx, stats, col_idxs, batches, parent) = (
+                tx.clone(),
+                stats.clone(),
+                Arc::clone(&col_idxs),
+                Arc::clone(&batches),
+                parent.clone(),
+            );
+            pool.spawn(move || {
+                let _span = detail_span!(
+                    "live.feed",
+                    parent: &parent,
+                    lanes = n,
+                    rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    lane = i
+                )
+                .entered();
+                let fed = timed_kernel(&stats, || {
+                    lane.builder.set_spill_threshold_bytes(threshold);
+                    let mut base = first_row;
+                    for batch in batches.iter() {
+                        let rows = batch.num_rows();
+                        let (start, end) = (rows * i / n, rows * (i + 1) / n);
+                        if start < end {
+                            let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
+                            index_fts_rows(
+                                &mut lane.builder,
+                                &col_idxs,
+                                &batch.slice(start, end - start),
+                                first_doc,
+                            )?;
+                            let (row, len) = ((base + start) as u32, (end - start) as u32);
+                            match lane.stretches.last_mut() {
+                                // Rows that carry straight on from the last
+                                // stretch extend it.
+                                Some(s) if s.row + s.len == row => s.len += len,
+                                _ => lane.stretches.push(Stretch {
+                                    doc: first_doc,
+                                    row,
+                                    len,
+                                }),
                             }
-                            base += rows;
                         }
-                        Ok::<(), BuildError>(())
-                    })
+                        base += rows;
+                    }
+                    Ok::<(), BuildError>(())
                 })
-                .map(|()| lanes);
-            // The receiver is gone only if the writer was dropped mid-feed;
-            // there is nobody left to tell.
-            let _ = tx.send(fed);
-        });
-        self.pending = Some(rx);
+                .map(|()| lane);
+                // The receiver is gone only if the writer was dropped
+                // mid-feed; there is nobody left to tell.
+                let _ = tx.send((i, fed));
+            });
+        }
+        self.pending = Some((rx, n));
         Ok(())
     }
 }
