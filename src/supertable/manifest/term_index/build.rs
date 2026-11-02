@@ -53,6 +53,7 @@ use super::{
 };
 use crate::{
     config::scratch_root,
+    runtime_metrics::rss::available_memory_bytes,
     superfile::{
         error::BuildError,
         format::checksum::crc32c,
@@ -2109,7 +2110,7 @@ fn run_ranges(
 /// policy's count when set, else one per [`BUILD_RANGE_BYTES`], at least
 /// one and at most the pool's width and [`MERGE_RANGES_MAX`].
 fn build_range_count(policy: &BuildPolicy, bytes: u64) -> Result<usize, TermIndexError> {
-    let width = range_count(policy, 0, || Ok(bytes))?;
+    let width = range_count(policy, 0, || Ok(bytes), MERGE_RANGES_MAX)?;
     if policy.merge_ranges.is_some() {
         return Ok(width);
     }
@@ -2124,6 +2125,7 @@ fn range_count(
     policy: &BuildPolicy,
     min_bytes: u64,
     bytes: impl FnOnce() -> Result<u64, TermIndexError>,
+    max_ranges: usize,
 ) -> Result<usize, TermIndexError> {
     Ok(match policy.merge_ranges {
         Some(n) => n.max(1),
@@ -2132,9 +2134,38 @@ fn range_count(
             .pool
             .as_deref()
             .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
-            .clamp(1, MERGE_RANGES_MAX),
+            .clamp(1, max_ranges.max(1)),
     })
 }
+
+/// Ranges a merge of `sources` may be cut into for the memory the host
+/// has: each range holds a cursor per layer with one of its slices
+/// resident and a tier window or two, so the width is what fits in
+/// [`MERGE_MEMORY_SHARE_PERCENT`] of the memory available, and
+/// [`MERGE_RANGES_MAX`] where the host reports none. A fixed cap of
+/// thirty-two left a 180-thread pool merging a 1B-row table's 52 layers
+/// on a sixth of its threads, 23 s for 20 GB.
+fn merge_ranges_cap(sources: &[Vec<SliceFile>]) -> Result<usize, TermIndexError> {
+    let Some(available) = available_memory_bytes() else {
+        return Ok(MERGE_RANGES_MAX);
+    };
+    let mut per_range = 0u64;
+    for layer in sources {
+        let mut largest = 0u64;
+        for file in layer {
+            largest = largest.max(fs::metadata(&file.path)?.len());
+        }
+        per_range = per_range
+            .saturating_add(largest)
+            .saturating_add(2 * TIER_READ_WINDOW_BYTES);
+    }
+    let budget = available / 100 * MERGE_MEMORY_SHARE_PERCENT;
+    Ok((budget / per_range.max(1)).clamp(1, usize::MAX as u64) as usize)
+}
+
+/// The share of the memory available a fold's merge may hold in range
+/// cursors; the rest is left to the queries and commits beside it.
+const MERGE_MEMORY_SHARE_PERCENT: u64 = 50;
 
 /// Cut `marks` — `(key, weight)` in ascending key — into up to `want`
 /// ranges of about equal weight, cutting where the running weight crosses
@@ -2175,9 +2206,9 @@ fn cut_ranges<K: AsRef<[u8]>>(marks: &[(K, u64)], want: usize) -> Vec<KeyRange> 
 
 /// Sources of at least this many bytes are merged in key ranges.
 const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
-/// Ranges a merge is cut into at most: each holds a cursor per layer
-/// with a slice's bytes and a few tier windows resident, so the width is
-/// bounded by memory as well as by threads.
+/// Ranges a build is cut into at most, and a merge where the host reports
+/// no memory to size by ([`merge_ranges_cap`]): each holds a cursor per
+/// layer with a slice's bytes and a few tier windows resident.
 const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
@@ -2200,13 +2231,18 @@ pub(crate) fn key_ranges(
     policy: &BuildPolicy,
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
-    let want = range_count(policy, MERGE_RANGE_MIN_BYTES, || {
-        let mut bytes = 0u64;
-        for file in &files {
-            bytes += fs::metadata(&file.path)?.len();
-        }
-        Ok(bytes)
-    })?;
+    let want = range_count(
+        policy,
+        MERGE_RANGE_MIN_BYTES,
+        || {
+            let mut bytes = 0u64;
+            for file in &files {
+                bytes += fs::metadata(&file.path)?.len();
+            }
+            Ok(bytes)
+        },
+        merge_ranges_cap(sources)?,
+    )?;
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }
