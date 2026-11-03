@@ -214,6 +214,28 @@ pub enum BuildError {
 }
 
 impl BuildError {
+    /// This error as another append should see it when one publish carried
+    /// both: the same kind, so the public mapping reads it the same way,
+    /// for the causes a publish can meet — refused credentials, a lost
+    /// race, a moved or invalid schema, a dropped table, an exhausted
+    /// budget. Anything else is a store failure carrying this one's
+    /// message.
+    pub(crate) fn for_follower(&self) -> BuildError {
+        match self {
+            BuildError::PermissionDenied(message) => BuildError::PermissionDenied(message.clone()),
+            BuildError::OverBudget(message) => BuildError::OverBudget(message.clone()),
+            BuildError::Schema(schema) => BuildError::Schema(schema.clone()),
+            BuildError::SchemaMoved { expected, current } => BuildError::SchemaMoved {
+                expected: *expected,
+                current: *current,
+            },
+            BuildError::TableGone => BuildError::TableGone,
+            BuildError::WriteContention => BuildError::WriteContention,
+            BuildError::SupertableInUse => BuildError::SupertableInUse,
+            other => BuildError::Store(other.to_string()),
+        }
+    }
+
     /// The over-budget message if this is a budget refusal, else `None`.
     pub(crate) fn over_budget(&self) -> Option<&str> {
         match self {

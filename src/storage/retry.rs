@@ -40,6 +40,27 @@ pub(crate) const MAX_RETRIES: usize = 20;
 /// worst-case total hang at 300s.
 pub(crate) const RETRY_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// How long an object-store request runs before it is taken for stuck and
+/// a second one is sent beside it, whatever the bytes. Far above a normal
+/// request (on GCS a GET is about 45 ms at p50 and under 140 ms at p90, an
+/// 8 MB PUT under half a second), far below a stalled one (one attempt can
+/// run to the request timeout of a minute): a hedge costs nothing
+/// normally, and bounds how long one stuck request holds what waits on it.
+const STUCK_AFTER: Duration = Duration::from_secs(2);
+
+/// A request moving bytes slower than this is taken for stuck: it is
+/// hedged once it has run [`STUCK_AFTER`] plus the time its bytes take at
+/// this rate, so a big request that is only slow is not sent twice. One
+/// request on GCS moves tens of MB/s even with many others in flight.
+const STUCK_BYTES_PER_SEC: u64 = 16 << 20;
+
+/// How long a request of `bytes` runs before a hedge is sent beside it:
+/// [`STUCK_AFTER`], plus the time those bytes take at
+/// [`STUCK_BYTES_PER_SEC`].
+pub(crate) fn stuck_after(bytes: u64) -> Duration {
+    STUCK_AFTER + Duration::from_millis(bytes.saturating_mul(1000) / STUCK_BYTES_PER_SEC)
+}
+
 /// Transient re-issue backoff: `BASE × 2^min(attempt, MAX_SHIFT)` ms, capped.
 const BACKOFF_BASE_MS: u64 = 50;
 const BACKOFF_MAX_SHIFT: u32 = 5;

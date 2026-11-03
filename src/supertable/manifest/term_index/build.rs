@@ -27,8 +27,9 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     mem,
+    ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::Instant,
 };
 
@@ -61,6 +62,7 @@ use crate::{
     supertable::{manifest::part::ContentHash, schema::FieldId},
     utils::{
         terms::{DictEntry, TermBlockWriter},
+        trace::{detail_span, record},
         varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
     },
 };
@@ -161,7 +163,18 @@ pub(crate) enum BuiltBytes {
         /// Held only to keep the scratch directory, and the file, alive.
         _dir: Arc<TempDir>,
         path: PathBuf,
+        len: usize,
     },
+}
+
+impl BuiltBytes {
+    /// The object's size, without reading a spilled one back.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Resident(bytes) => bytes.len(),
+            Self::Spilled { len, .. } => *len,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +282,9 @@ struct TierSource {
     /// Offset of the window in the tier object.
     base: u64,
     chunks: Vec<TierChunkRef>,
+    /// What the ordinals in the chunks are relative to: the source
+    /// layer's base.
+    ordinal_base: u32,
 }
 
 /// A term's tier, cut to the budget and encoded, before it is placed: in
@@ -312,6 +328,7 @@ fn encode_term(
             &source.chunks,
             &source.bytes,
             source.base,
+            source.ordinal_base,
             ordinals,
             &mut term.entries,
         )?;
@@ -464,11 +481,12 @@ fn splice_term(
         Fresh(Vec<TierEntry>),
     }
     let mut groups: BTreeMap<u32, Group<'_>> = BTreeMap::new();
-    for chunks in &opened {
+    for (chunks, source) in opened.iter().zip(&term.sources) {
+        let source_base = source.ordinal_base;
         for (r, chunk) in chunks.iter().enumerate() {
             for b in 0..chunk.n_blocks() {
                 let block = chunk.spliced_block(b);
-                let Some(ordinal) = renumber(ordinals, block.ordinal) else {
+                let Some(ordinal) = renumber(ordinals, source_base + block.ordinal) else {
                     continue;
                 };
                 match groups.entry(ordinal) {
@@ -1317,6 +1335,7 @@ impl LayerWriter {
                 Ok(BuiltBytes::Spilled {
                     _dir: Arc::clone(dir),
                     path,
+                    len: bytes.len(),
                 })
             }
         }
@@ -1498,6 +1517,8 @@ impl LayerWriter {
         Ok((
             Layer {
                 slices: self.slices,
+                ordinals: None,
+                base: 0,
             },
             self.slice_bytes,
             self.tier_bytes,
@@ -1557,7 +1578,10 @@ pub(crate) fn build_onto(
     contributions: &[Contribution],
     policy: &BuildPolicy,
 ) -> Result<Built, TermIndexError> {
-    let built = build_layer(contributions, policy, base.superfiles.len() as u32)?;
+    let mut built = build_layer(contributions, policy)?;
+    built
+        .layer
+        .place_at(base.superfiles.len() as u32, contributions.len() as u32);
     base.superfiles.extend(built.superfiles);
     base.id_mins.extend(built.id_mins);
     base.layers.push(built.layer);
@@ -1569,22 +1593,22 @@ pub(crate) fn build_onto(
 }
 
 /// Merge contributions into one layer of slices. Superfile ordinals
-/// follow the order of `contributions`, offset by `ordinal_base` — the
-/// number of superfiles the root already names when this layer is a
-/// delta appended to it.
+/// follow the order of `contributions` from zero: the layer stores them
+/// relative to a base it is given when the root places it
+/// ([`Layer::place_at`]), so it is built before that base is known.
 pub(crate) fn build_layer(
     contributions: &[Contribution],
     policy: &BuildPolicy,
-    ordinal_base: u32,
 ) -> Result<BuiltLayer, TermIndexError> {
     let scoring = scoring_lookup(
         Arc::new(contributions.iter().map(|c| c.scoring.clone()).collect()),
-        ordinal_base,
+        0,
     );
     let ranges = build_ranges(contributions, policy)?;
-    let built = run_ranges(&ranges, policy, |start, end| {
-        build_range(contributions, start, end, policy, &scoring, ordinal_base)
+    let mut built = run_ranges(&ranges, policy, |start, end| {
+        build_range(contributions, start, end, policy, &scoring)
     })?;
+    built.layer.ordinals = Some(0..contributions.len() as u32);
     Ok(BuiltLayer {
         superfiles: contributions.iter().map(|c| c.superfile_id).collect(),
         id_mins: contributions.iter().map(|c| c.id_min).collect(),
@@ -1594,11 +1618,23 @@ pub(crate) fn build_layer(
     })
 }
 
-/// Contributions of at least this many bytes in all are built in key
-/// ranges. A commit's own contributions stay below it and build on one
-/// writer, byte for byte as before; a rebuild over thousands of
-/// superfiles goes over it.
-const BUILD_RANGE_MIN_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Ranges a build from contributions is cut into at most. A range holds a
+/// reader per contribution and the writer's open slice and tier chunk, a
+/// few tens of megabytes, so a wide host's pool is the bound in practice
+/// and this only keeps a very wide one to a few gigabytes. An optimize's
+/// final build of 13 GB of contributions ran in 32 ranges of 7–9 s each on
+/// a 180-thread pool under the merge's cap; its work is per posting, not
+/// per byte, and spreads over whatever width it is given.
+const BUILD_RANGES_MAX: usize = 256;
+
+/// Bytes of contributions one key range of a layer build takes: a build of
+/// `n` times this runs in `n` ranges side by side, up to the pool's width
+/// and [`BUILD_RANGES_MAX`]. A commit's 5M-row append brings about 100 MiB
+/// of contributions and built them on one writer for three to five
+/// seconds while the pool idled; at this size it runs in a handful of
+/// ranges, a rebuild over thousands of superfiles in the full width, and a
+/// contribution set below one range's worth builds on one writer as before.
+const BUILD_RANGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The key ranges a build of `contributions` is cut into (see
 /// [`range_count`] and [`cut_ranges`]). A mark weighs the bytes up to its
@@ -1611,7 +1647,10 @@ fn build_ranges(
     for c in contributions {
         lens.push(fs::metadata(&c.path)?.len());
     }
-    let want = range_count(policy, BUILD_RANGE_MIN_BYTES, || Ok(lens.iter().sum()))?;
+    let bytes: u64 = lens.iter().sum();
+    let want = build_range_count(policy, bytes)?;
+    record("bytes", bytes);
+    record("ranges", want as u64);
     if want <= 1 {
         return Ok(vec![(None, None)]);
     }
@@ -1638,7 +1677,6 @@ fn build_range(
     end: Option<&[u8]>,
     policy: &BuildPolicy,
     scoring: &ScoringOf,
-    ordinal_base: u32,
 ) -> Result<MergedLayer, TermIndexError> {
     let mut readers = Vec::with_capacity(contributions.len());
     let mut heap: BinaryHeap<Reverse<MergeHead>> = BinaryHeap::new();
@@ -1678,11 +1716,13 @@ fn build_range(
     let mut writer = LayerWriter::new(policy, scoring.clone())?;
     let mut run: Vec<Posting> = Vec::new();
     let mut entries: Vec<TierEntry> = Vec::new();
+    let (mut n_terms, mut n_postings) = (0u64, 0u64);
 
     while let Some(Reverse(head)) = heap.pop() {
         let key = head.key;
         run.clear();
         entries.clear();
+        n_terms += 1;
         let mut take = |ordinal: u32,
                         run: &mut Vec<Posting>,
                         pending: &mut Vec<Option<(Posting, Vec<(u32, u32, u8)>)>>,
@@ -1692,7 +1732,7 @@ fn build_range(
             let (mut p, h) = pending[ordinal as usize]
                 .take()
                 .expect("pending posting for heap head");
-            p.superfile = ordinal_base + ordinal;
+            p.superfile = ordinal;
             entries.extend(h.iter().map(|&(doc_id, tf, len)| TierEntry {
                 superfile: p.superfile,
                 doc_id,
@@ -1739,6 +1779,7 @@ fn build_range(
         // megabytes per superfile, per query, where the postings it wants
         // are kilobytes — so the location is worth most exactly where it
         // was once dropped.
+        n_postings += run.len() as u64;
         writer.add_term(
             &key,
             mem::take(&mut run),
@@ -1747,6 +1788,8 @@ fn build_range(
         )?;
     }
     let (layer, slices, tiers, _) = writer.finish()?;
+    record("terms", n_terms);
+    record("postings", n_postings);
     Ok(MergedLayer {
         layer,
         slices,
@@ -1770,6 +1813,9 @@ pub(crate) struct SliceFile {
     pub(crate) first_key: Vec<u8>,
     /// Largest key the slice holds.
     pub(crate) last_key: Vec<u8>,
+    /// What the ordinals stored in the slice are relative to: its layer's
+    /// base.
+    pub(crate) base: u32,
 }
 
 /// `path`'s bytes, mapped read-only; empty for an empty file, which cannot
@@ -1788,6 +1834,8 @@ fn map_file(path: &Path) -> io::Result<Bytes> {
 /// Reads one layer's slices, already on local disk, term by term in key
 /// order.
 struct LayerCursor {
+    /// What the ordinals in the files are relative to: their layer's base.
+    base: u32,
     /// Slice files not opened yet, in key order.
     files: VecDeque<PathBuf>,
     /// The open slice's bytes, mapped rather than read, so the many cursors
@@ -1834,6 +1882,7 @@ impl LayerCursor {
         window_bytes: u64,
     ) -> Self {
         Self {
+            base: files.first().map_or(0, |f| f.base),
             files: files.iter().map(|f| f.path.clone()).collect(),
             bytes: Bytes::new(),
             tier: None,
@@ -1867,7 +1916,9 @@ impl LayerCursor {
                     self.bytes = Bytes::new();
                     return Ok(None);
                 }
-                return Ok(Some(term));
+                let (key, mut run) = term;
+                rebase_run(&mut run, self.base);
+                return Ok(Some((key, run)));
             }
             let started = Instant::now();
             if !self.bytes.is_empty() {
@@ -1957,6 +2008,22 @@ fn renumber(ordinals: &[Option<u32>], old: u32) -> Option<u32> {
     *ordinals.get(old as usize)?
 }
 
+/// Turn the ordinals a run stores — its postings' and its inline tier
+/// entries' — into the absolute ones they name, by its layer's `base`.
+pub(crate) fn rebase_run(run: &mut Run, base: u32) {
+    if base == 0 {
+        return;
+    }
+    for p in &mut run.postings {
+        p.superfile += base;
+    }
+    if let Some(tier) = &mut run.tier {
+        for e in &mut tier.inline {
+            e.superfile += base;
+        }
+    }
+}
+
 /// The per-ordinal scoring of a build's contributions, ordinals counted
 /// from `base`; a superfile with none scores at the defaults.
 fn scoring_lookup(table: Arc<Vec<BTreeMap<FieldId, ColumnScoring>>>, base: u32) -> ScoringOf {
@@ -1975,6 +2042,7 @@ fn tier_entries(
     chunks: &[TierChunkRef],
     object: &[u8],
     base: u64,
+    ordinal_base: u32,
     ordinals: &[Option<u32>],
     out: &mut Vec<TierEntry>,
 ) -> Result<(), TermIndexError> {
@@ -1993,7 +2061,7 @@ fn tier_entries(
         TierChunk::open(bytes, chunk.n_blocks)?.entries(&mut block)?;
         out.extend(block.iter().filter_map(|e| {
             Some(TierEntry {
-                superfile: renumber(ordinals, e.superfile)?,
+                superfile: renumber(ordinals, ordinal_base + e.superfile)?,
                 ..*e
             })
         }));
@@ -2020,9 +2088,9 @@ pub(crate) fn merge_layers(
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
 ) -> Result<MergedLayer, TermIndexError> {
-    let ranges = key_ranges(sources, policy)?;
+    let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
     // Each range merges the slices that reach into it, on its own writer.
-    run_ranges(&ranges, policy, |start, end| {
+    let mut merged = run_ranges(&ranges, policy, |start, end| {
         let in_range: Vec<Vec<SliceFile>> = sources
             .iter()
             .map(|files| {
@@ -2034,6 +2102,21 @@ pub(crate) fn merge_layers(
             })
             .collect();
         merge_range(&in_range, start, end, ordinals, policy)
+    })?;
+    merged.layer.ordinals = Some(ordinals_span(ordinals));
+    Ok(merged)
+}
+
+/// The ordinals a merge through `ordinals` may name: from the smallest it
+/// maps to past the largest, or empty when it keeps none. A fold that
+/// knows its inputs' ranges narrows this to what they name.
+fn ordinals_span(ordinals: &[Option<u32>]) -> Range<u32> {
+    let mut kept = ordinals.iter().flatten();
+    let Some(&first) = kept.next() else {
+        return 0..0;
+    };
+    kept.fold(first..first + 1, |span, &o| {
+        span.start.min(o)..span.end.max(o + 1)
     })
 }
 
@@ -2052,15 +2135,50 @@ fn run_ranges(
     if let [(start, end)] = ranges {
         return one(start.as_deref(), end.as_deref());
     }
-    let run_all = || -> Result<Vec<MergedLayer>, TermIndexError> {
-        ranges
+    let parts = match policy.pool.as_deref() {
+        // Each range a task of its own, this thread waiting here. A
+        // commit's layer is built from a thread outside the pool, which
+        // waits for its ranges and nothing else: under `install` the pool
+        // thread that owned the build ran whatever else was queued while
+        // its ranges ran, and with thirty appends in flight that was other
+        // commits' piece builds — a layer took 7.7 s of wall for 1.8 s of
+        // work, and every publish queued behind its ticket waited with it.
+        // The fold at optimize calls this from a reader-pool worker, which
+        // waits by running other queued jobs just as under `install`.
+        Some(pool) => {
+            let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
+                ranges.iter().map(|_| Mutex::new(None)).collect();
+            let one = &one;
+            pool.in_place_scope(|scope| {
+                for ((start, end), slot) in ranges.iter().zip(&slots) {
+                    scope.spawn(move |_| {
+                        let _span = detail_span!(
+                            "build.range",
+                            start = start.as_ref().map_or(0, |key| key.len()),
+                            terms = tracing::field::Empty,
+                            postings = tracing::field::Empty,
+                        )
+                        .entered();
+                        let part = one(start.as_deref(), end.as_deref());
+                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(part);
+                    });
+                }
+            });
+            slots
+                .into_iter()
+                .map(|slot| {
+                    slot.into_inner()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .ok_or_else(|| {
+                            TermIndexError::Build("a build range ended without a result".into())
+                        })?
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => ranges
             .par_iter()
             .map(|(start, end)| one(start.as_deref(), end.as_deref()))
-            .collect()
-    };
-    let parts = match policy.pool.as_deref() {
-        Some(pool) => pool.install(run_all)?,
-        None => run_all()?,
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let mut layer = Layer::default();
     let mut slices = Vec::new();
@@ -2077,12 +2195,25 @@ fn run_ranges(
     })
 }
 
+/// How many key ranges a build of `bytes` of contributions is cut into: the
+/// policy's count when set, else one per [`BUILD_RANGE_BYTES`], at least
+/// one and at most the pool's width and [`BUILD_RANGES_MAX`].
+fn build_range_count(policy: &BuildPolicy, bytes: u64) -> Result<usize, TermIndexError> {
+    let width = range_count(policy, 0, BUILD_RANGES_MAX, || Ok(bytes))?;
+    if policy.merge_ranges.is_some() {
+        return Ok(width);
+    }
+    let by_bytes = bytes.div_ceil(BUILD_RANGE_BYTES).max(1);
+    Ok((by_bytes.min(width as u64)) as usize)
+}
+
 /// How many key ranges to cut work of `bytes` into: the policy's count when
 /// set, one when the work is under `min_bytes`, else the pool's width, at
-/// most [`MERGE_RANGES_MAX`].
+/// most `cap`.
 fn range_count(
     policy: &BuildPolicy,
     min_bytes: u64,
+    cap: usize,
     bytes: impl FnOnce() -> Result<u64, TermIndexError>,
 ) -> Result<usize, TermIndexError> {
     Ok(match policy.merge_ranges {
@@ -2092,7 +2223,7 @@ fn range_count(
             .pool
             .as_deref()
             .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
-            .clamp(1, MERGE_RANGES_MAX),
+            .clamp(1, cap),
     })
 }
 
@@ -2160,7 +2291,7 @@ pub(crate) fn key_ranges(
     policy: &BuildPolicy,
 ) -> Result<Vec<KeyRange>, TermIndexError> {
     let files: Vec<&SliceFile> = sources.iter().flatten().collect();
-    let want = range_count(policy, MERGE_RANGE_MIN_BYTES, || {
+    let want = range_count(policy, MERGE_RANGE_MIN_BYTES, MERGE_RANGES_MAX, || {
         let mut bytes = 0u64;
         for file in &files {
             bytes += fs::metadata(&file.path)?.len();
@@ -2269,12 +2400,14 @@ fn merge_range(
                         })
                     }));
                 } else {
-                    let (bytes, base) = cursors[source as usize].tier_span(&tier.chunks)?;
+                    let cursor = &mut cursors[source as usize];
+                    let (bytes, base) = cursor.tier_span(&tier.chunks)?;
                     tier_bytes += tier.chunks.iter().map(|c| c.len).sum::<u64>();
                     sources.push(TierSource {
                         bytes,
                         base,
                         chunks: tier.chunks,
+                        ordinal_base: cursor.base,
                     });
                 }
             }
@@ -2348,6 +2481,8 @@ pub(crate) struct MergedLayer {
 
 #[cfg(test)]
 mod contribution_mark_tests {
+    use rayon::ThreadPoolBuilder;
+
     use super::*;
     use crate::superfile::fts::bm25::Bm25Params;
 
@@ -2449,5 +2584,43 @@ mod contribution_mark_tests {
             .collect();
             assert_eq!(got, all[150..450], "from the mark at {at}");
         }
+    }
+
+    #[test]
+    fn build_range_count_follows_the_contribution_bytes_up_to_the_pool() {
+        let pool = Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(8)
+                .build()
+                .expect("pool"),
+        );
+        let policy = BuildPolicy {
+            pool: Some(pool),
+            ..BuildPolicy::default()
+        };
+        // Below one range's worth: one writer, as before.
+        assert_eq!(
+            build_range_count(&policy, BUILD_RANGE_BYTES / 2).expect("count"),
+            1
+        );
+        // A commit's ~100 MiB of contributions: one range per BUILD_RANGE_BYTES.
+        assert_eq!(
+            build_range_count(&policy, 7 * BUILD_RANGE_BYTES).expect("count"),
+            7
+        );
+        // Never more ranges than the pool has threads.
+        assert_eq!(
+            build_range_count(&policy, 1000 * BUILD_RANGE_BYTES).expect("count"),
+            8
+        );
+        // An explicit count from the policy wins.
+        let fixed = BuildPolicy {
+            merge_ranges: Some(3),
+            ..policy
+        };
+        assert_eq!(
+            build_range_count(&fixed, BUILD_RANGE_BYTES / 2).expect("count"),
+            3
+        );
     }
 }

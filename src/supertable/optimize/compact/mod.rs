@@ -59,7 +59,7 @@ use crate::{
             RebuiltParts, SuperfileUri,
             list::PartitionStrategy,
             listed_once,
-            term_index::{Contribution as TermContribution, ReservedLayer},
+            term_index::{Contribution as TermContribution, ReservedLayer, ReservedSegment},
         },
         opann::rerank_pool_hint,
         query::{dispatch::open_whole_superfile, vector},
@@ -1328,6 +1328,11 @@ impl Supertable {
                 batch: &mut batch,
             };
             let attempted_id = current.get_next_manifest_id();
+            // The batch's layer rides this attempt as a run of one.
+            let mut reserved_run = [ReservedSegment {
+                contributions: term_contributions.len(),
+                layer: reserved_layer.take(),
+            }];
             let attempt_outcome = try_commit_attempt(
                 storage.clone(),
                 Arc::clone(&opts),
@@ -1339,7 +1344,7 @@ impl Supertable {
                 &mut pending_storage_writes,
                 &mut pending_storage_replaces,
                 &term_contributions,
-                Some(&mut reserved_layer),
+                Some(&mut reserved_run),
                 Some(&mut rebuilt_parts),
                 Some(&mut fence),
             )
@@ -1352,6 +1357,8 @@ impl Supertable {
                 lost = tracing::field::Empty,
             ))
             .await;
+            let [reserved_segment] = reserved_run;
+            reserved_layer = reserved_segment.layer;
             match attempt_outcome {
                 Ok(new_manifest) => {
                     record("attempts", attempt + 1);
@@ -1536,20 +1543,23 @@ impl Supertable {
         host_memory: fn() -> Option<(u64, u64)>,
     ) -> Result<usize, CompactionError> {
         let concurrency = concurrency.max(1);
-        let settings = MergeSettings {
-            stale_seal_timeout,
-            merge_threads: merge_pool_widths(
-                maint_pool()?.current_num_threads(),
-                concurrency,
-                &jobs,
-            ),
-        };
         // Whether merges here keep per-row bookkeeping, which is part of
         // what each one is charged for until its allocation shows up in
         // the host reading.
         let indexed = {
             let manifest = self.inner().manifest.load();
             !manifest.fts_configs().is_empty() || !manifest.vector_configs().is_empty()
+        };
+        // The pool is shared among the merges that will actually run side
+        // by side, which memory bounds before the configured concurrency
+        // does: on a host whose cores outnumber the merges its memory
+        // admits, widths cut from the configured concurrency would hand
+        // each merge one thread and leave the rest of the cores idle for
+        // the whole pass.
+        let in_flight = admittable_merges(concurrency, &jobs, indexed, host_memory());
+        let settings = MergeSettings {
+            stale_seal_timeout,
+            merge_threads: merge_pool_widths(maint_pool()?.current_num_threads(), in_flight, &jobs),
         };
         let mut charges = MergeCharges::new(indexed);
         let mut queued: VecDeque<(usize, CompactionJob)> = jobs.into_iter().enumerate().collect();
@@ -1573,13 +1583,30 @@ impl Supertable {
         // Admission checks the host refused since the last merge started, so
         // the admit log shows how long memory held the next merge back.
         let mut held_back = 0u64;
+        // The host refused the next merge the room it needs while finished
+        // merges held their outputs; committing them is what frees it.
+        let mut needs_room = false;
 
         while !queued.is_empty()
             || !merging.is_empty()
             || !committing.is_terminated()
             || !ready.is_empty()
         {
-            if committing.is_terminated() && !ready.is_empty() {
+            // A finished merge commits when a commit is the only way forward:
+            // nothing is left merging, a queued merge waits on the slot or
+            // the memory its output holds, or the pass has stopped admitting.
+            // Otherwise it waits for the merges still running and rides with
+            // them: one CAS and one layer, which the fold after the pass
+            // moves into place instead of merging the several that a wave
+            // committing as each merge finished would leave. Its output was
+            // resident while it merged, so holding it costs nothing the wave
+            // did not already pay.
+            let commit_due = merging.is_empty()
+                || stop_admitting
+                || (!queued.is_empty()
+                    && (merging.len() + ready.len() >= concurrency || needs_room));
+            if committing.is_terminated() && !ready.is_empty() && commit_due {
+                needs_room = false;
                 // Plan order within the batch, which is as much of it as
                 // committing merges when they finish can preserve.
                 ready.sort_by_key(|(plan_index, _)| *plan_index);
@@ -1684,6 +1711,7 @@ impl Supertable {
                         self.admit_next_merge(&mut queued, &mut merging, &mut charges, &settings, &mut held_back);
                     } else {
                         held_back += 1;
+                        needs_room = true;
                     }
                     // Advanced whether or not the host had room: a deadline
                     // left in the past would re-fire immediately and spin on
@@ -1907,6 +1935,32 @@ fn expected_merge_footprint(job: &CompactionJob, indexed: bool) -> u64 {
     job.input_bytes
         .saturating_add(job.estimated_output_bytes)
         .saturating_add(rows)
+}
+
+/// How many of `jobs` the host's memory lets run at once, as the width the
+/// pool is shared over: the merges the reserve leaves room for at the
+/// largest job's expected footprint, within `concurrency` and the job count.
+/// A host whose memory cannot be read is not throttled, so the configured
+/// concurrency stands; the admission itself still runs against the host's
+/// readings as merges land, this only sets how the threads are cut.
+fn admittable_merges(
+    concurrency: usize,
+    jobs: &[CompactionJob],
+    indexed: bool,
+    host_memory: Option<(u64, u64)>,
+) -> usize {
+    let bound = concurrency.max(1).min(jobs.len().max(1));
+    let Some((available, _)) = host_memory else {
+        return bound;
+    };
+    let largest = jobs
+        .iter()
+        .map(|job| expected_merge_footprint(job, indexed))
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let usable = available.saturating_mul(100 - MERGE_MEMORY_RESERVE_PERCENT) / 100;
+    ((usable / largest) as usize).clamp(1, bound)
 }
 
 /// The per-pass settings every merge of a pass runs under.
@@ -4483,6 +4537,42 @@ mod tests {
                 ..CompactionJob::default()
             })
             .collect()
+    }
+
+    #[test]
+    fn admittable_merges_is_bounded_by_memory_then_by_concurrency_and_jobs() {
+        // Twenty 1 GiB-output jobs on a host with 100 GiB free: the reserve
+        // leaves 60 GiB, each indexed job is charged inputs + output + rows,
+        // so about 29 would fit; concurrency 180 and the job count bound it
+        // to 20, and the pool is cut over 20, not 180.
+        let jobs: Vec<CompactionJob> = (0..20)
+            .map(|_| CompactionJob {
+                partition_key: Vec::new(),
+                inputs: Vec::new(),
+                estimated_output_bytes: 1 << 30,
+                input_bytes: 1 << 30,
+                live_docs: 1_000_000,
+                merge_input_mb: None,
+            })
+            .collect();
+        let gib = 1u64 << 30;
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((100 * gib, 128 * gib))),
+            20
+        );
+        // Less memory than the jobs want: memory sets the width.
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((10 * gib, 128 * gib))),
+            2
+        );
+        // Unreadable memory never throttles the cut.
+        assert_eq!(admittable_merges(180, &jobs, true, None), 20);
+        assert_eq!(admittable_merges(8, &jobs, true, None), 8);
+        // Nothing fits at all still runs one merge at a time.
+        assert_eq!(
+            admittable_merges(180, &jobs, true, Some((gib, 128 * gib))),
+            1
+        );
     }
 
     #[test]
@@ -7702,6 +7792,12 @@ mod tests {
         uploads: AtomicUsize,
         swaps_in_flight: AtomicUsize,
         max_swaps_in_flight: AtomicUsize,
+        /// Pointer swaps attempted once `hold` is set, held or let through.
+        swaps: AtomicUsize,
+        /// Set to hold the next superfile upload at `upload_gate`; cleared
+        /// by the upload it holds, so one merge stays in flight.
+        hold_upload: AtomicBool,
+        upload_gate: Semaphore,
     }
 
     impl HeldPointerStorage {
@@ -7713,11 +7809,18 @@ mod tests {
                 uploads: AtomicUsize::new(0),
                 swaps_in_flight: AtomicUsize::new(0),
                 max_swaps_in_flight: AtomicUsize::new(0),
+                swaps: AtomicUsize::new(0),
+                hold_upload: AtomicBool::new(false),
+                upload_gate: Semaphore::new(0),
             })
         }
 
         fn release(&self) {
             self.gate.add_permits(Semaphore::MAX_PERMITS);
+        }
+
+        fn release_upload(&self) {
+            self.upload_gate.add_permits(Semaphore::MAX_PERMITS);
         }
     }
 
@@ -7740,6 +7843,9 @@ mod tests {
             self.inner.put_atomic(uri, bytes).await
         }
         async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            if uri.contains(SUPERFILE_UPLOAD) && self.hold_upload.swap(false, Ordering::SeqCst) {
+                drop(self.upload_gate.acquire().await.expect("gate never closes"));
+            }
             self.inner.put_overwrite(uri, bytes).await?;
             if uri.contains(SUPERFILE_UPLOAD) && self.hold.load(Ordering::SeqCst) {
                 self.uploads.fetch_add(1, Ordering::SeqCst);
@@ -7752,6 +7858,9 @@ mod tests {
             bytes: Bytes,
             expected_etag: Option<&str>,
         ) -> Result<Option<String>, StorageError> {
+            if uri.contains(POINTER_PATH) && self.hold.load(Ordering::SeqCst) {
+                self.swaps.fetch_add(1, Ordering::SeqCst);
+            }
             if !uri.contains(POINTER_PATH) || !self.hold.load(Ordering::SeqCst) {
                 return self.inner.put_if_match(uri, bytes, expected_etag).await;
             }
@@ -7834,6 +7943,61 @@ mod tests {
         assert_eq!(
             listed_ids(&st).len(),
             HELD_COMMIT_JOBS,
+            "every pair merged into one superfile"
+        );
+    }
+
+    /// Jobs in the one-wave test, which is also the width it allows: every
+    /// merge starts at once and nothing is queued for a slot.
+    const ONE_WAVE_JOBS: usize = 3;
+
+    /// Merges that finish while others still run commit with them rather
+    /// than ahead of them when nothing is queued for their slots. With one
+    /// job's upload held, the other merges finish and nothing swaps the
+    /// pointer until it is let through; then every job lands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_with_nothing_queued_commits_once_its_last_merge_finishes() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldPointerStorage::new(&dir);
+        let provider: Arc<dyn StorageProvider> = Arc::<HeldPointerStorage>::clone(&storage);
+        let st = Supertable::create(default_supertable_options().with_storage(provider))
+            .expect("create supertable");
+        let jobs = pair_jobs(&st, ONE_WAVE_JOBS);
+        // Uploads are counted and the pointer swaps pass; one upload holds.
+        storage.hold.store(true, Ordering::SeqCst);
+        storage.release();
+        storage.hold_upload.store(true, Ordering::SeqCst);
+
+        let check = async {
+            let others_uploaded = time::timeout(HELD_COMMIT_TIMEOUT, async {
+                while storage.uploads.load(Ordering::SeqCst) < ONE_WAVE_JOBS - 1 {
+                    time::sleep(HELD_COMMIT_POLL).await;
+                }
+            })
+            .await
+            .is_ok();
+            time::sleep(HELD_COMMIT_SETTLE).await;
+            let swaps_while_held = storage.swaps.load(Ordering::SeqCst);
+            storage.release_upload();
+            (others_uploaded, swaps_while_held)
+        };
+        let (pass, (others_uploaded, swaps_while_held)) = tokio::join!(
+            st.run_compaction_jobs_with(jobs, DEFAULT_STALE_SEAL_TIMEOUT, ONE_WAVE_JOBS, || None),
+            check
+        );
+        assert!(
+            others_uploaded,
+            "the merges beside the held one must finish"
+        );
+        assert_eq!(
+            swaps_while_held, 0,
+            "a finished merge waits for the wave when nothing is queued"
+        );
+        let dropped = pass.expect("the pass must commit every job");
+        assert_eq!(dropped, 0, "no job was dropped");
+        assert_eq!(
+            listed_ids(&st).len(),
+            ONE_WAVE_JOBS,
             "every pair merged into one superfile"
         );
     }
