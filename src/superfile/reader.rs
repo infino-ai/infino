@@ -32,6 +32,7 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
 use arrow::compute::{concat_batches, interleave, take_record_batch};
 use arrow_array::{
     Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchOptions,
@@ -201,6 +202,47 @@ impl Deref for ScoredFts<'_> {
     }
 }
 
+/// A superfile's Parquet footer, as a reader holds it.
+///
+/// A footer is roughly half a KiB per column per row group, so a file with
+/// a few hundred row groups carries MiBs of it, and a scan that opens
+/// thousands of files holds GiBs, none of it charged to the memory budget.
+/// The page index, when a scan loads it, has to be attached to a copy of
+/// that metadata, since arrow-rs builds the indexed metadata by value.
+/// Keeping the footer-only parse beside the indexed one would hold every
+/// row group twice, so the reader holds one `Footer` and swaps it whole:
+/// once the indexed one is installed, the footer-only parse is freed as
+/// soon as the callers still holding it let go.
+enum Footer {
+    /// Opened over a byte source: the footer metadata alone.
+    Lazy(Arc<ParquetMetaData>),
+    /// The whole file is resident: the footer metadata with its Arrow schema
+    /// resolved, for the synchronous decodes (`take_by_local_doc_ids`,
+    /// `record_batches`, `read_row_group`), so they never re-parse it. Once
+    /// it carries the page index, a `RowSelection` there skips whole pages.
+    Resident(ArrowReaderMetadata),
+}
+
+impl Footer {
+    /// What the SQL scan, the row-group counts and DataFusion's Parquet
+    /// opener read: the footer-only parse until the page index loads, the
+    /// indexed one after.
+    fn parquet(&self) -> &Arc<ParquetMetaData> {
+        match self {
+            Footer::Lazy(parquet) => parquet,
+            Footer::Resident(arrow) => arrow.metadata(),
+        }
+    }
+
+    /// The same kind of footer over `parquet`, the indexed metadata.
+    fn over(&self, parquet: Arc<ParquetMetaData>) -> Result<Footer, ReadError> {
+        Ok(match self {
+            Footer::Lazy(_) => Footer::Lazy(parquet),
+            Footer::Resident(_) => Footer::Resident(resolve_arrow(parquet)?),
+        })
+    }
+}
+
 pub struct SuperfileReader {
     /// Full Parquet bytes, `Some` only for the eager [`open`]
     /// path. The lazy [`open_lazy`] path drops the
@@ -209,22 +251,16 @@ pub struct SuperfileReader {
     /// different path. Vector + FTS queries work on either,
     /// since each carries its own source under the inner readers.
     bytes: Option<Bytes>,
-    /// Parquet metadata parsed once at open (eager path only), reused
-    /// by every `take_by_local_doc_ids` so targeted reads never
-    /// re-parse the footer. `None` on the lazy path (no resident
-    /// bytes). Carries the page index when present so `RowSelection`
-    /// can skip whole pages.
-    arrow_meta: Option<ArrowReaderMetadata>,
-    /// The Parquet footer metadata parsed at open — set on BOTH paths
-    /// (eager: shared with `arrow_meta`; lazy: the footer
-    /// `open_lazy_with` already fetched). Lets the SQL scan path serve
-    /// row-group counts and DataFusion's parquet opener from one
-    /// per-open parse instead of re-reading footers on every query.
-    parquet_meta: Arc<ParquetMetaData>,
-    /// Lazy-reader metadata upgraded with Parquet offset indexes on the first
-    /// targeted scalar read. Offset-index bytes flow through the same
-    /// block-cached source and are decoded once per reader.
-    page_index_meta: OnceCell<Arc<ParquetMetaData>>,
+    /// The file's footer metadata, parsed once at open and swapped for the
+    /// page-indexed parse once something asks for the page index (see
+    /// [`Footer`]).
+    footer: ArcSwap<Footer>,
+    /// Set once the page index has been loaded into `footer`, or found
+    /// missing from the file: concurrent first callers of
+    /// [`Self::parquet_metadata_with_page_index`] wait on that one load
+    /// instead of each building their own copy, and a file with no page
+    /// index isn't asked again.
+    page_index_loaded: OnceCell<()>,
     /// The lazy byte source the reader was opened over, retained only
     /// on the [`open_lazy`] path. `None` on the eager [`open`] path
     /// (resident bytes already cover every range). Lets
@@ -484,6 +520,40 @@ struct LazyMetadataFetch {
     source: Arc<dyn LazyByteSource>,
 }
 
+/// A loader that attaches the column and offset indexes to a copy of
+/// `footer`, for a file that may have neither. arrow-rs builds the indexed
+/// metadata by value, so the copy is the price of the load; the caller
+/// installs the result and the original is freed (see [`Footer`]).
+fn page_index_loader(footer: &ParquetMetaData) -> ParquetMetaDataReader {
+    ParquetMetaDataReader::new_with_metadata(footer.clone())
+        .with_column_index_policy(PageIndexPolicy::Optional)
+        .with_offset_index_policy(PageIndexPolicy::Optional)
+}
+
+/// `footer` with its page index read out of the file's resident `bytes`.
+fn page_index_from_bytes(
+    footer: &ParquetMetaData,
+    bytes: &Bytes,
+) -> Result<Arc<ParquetMetaData>, ReadError> {
+    let mut loader = page_index_loader(footer);
+    loader
+        .read_page_indexes(bytes)
+        .map_err(footer::FooterError::from)?;
+    Ok(Arc::new(
+        loader.finish().map_err(footer::FooterError::from)?,
+    ))
+}
+
+/// `parquet` with its Arrow schema resolved as the eager open resolves it
+/// (default options), so a rebuilt [`Footer::Resident`] decodes the file
+/// exactly as the one it replaces did.
+fn resolve_arrow(parquet: Arc<ParquetMetaData>) -> Result<ArrowReaderMetadata, ReadError> {
+    Ok(
+        ArrowReaderMetadata::try_new(parquet, ArrowReaderOptions::new())
+            .map_err(footer::FooterError::from)?,
+    )
+}
+
 impl MetadataFetch for &mut LazyMetadataFetch {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
         let source = Arc::clone(&self.source);
@@ -607,7 +677,7 @@ impl SuperfileReader {
 
         // 3. Arrow schema from decoded Parquet metadata — no
         //    extra range GET. The parsed footer is retained on the
-        //    reader (`parquet_meta`) so later consumers (the SQL scan
+        //    reader (`footer`) so later consumers (the SQL scan
         //    path) never re-fetch or re-parse it.
         let file_meta = metadata.file_metadata();
         let schema = Arc::new(
@@ -698,9 +768,8 @@ impl SuperfileReader {
 
         Ok(Self {
             bytes: None,
-            arrow_meta: None,
-            parquet_meta,
-            page_index_meta: OnceCell::new(),
+            footer: ArcSwap::from_pointee(Footer::Lazy(parquet_meta)),
+            page_index_loaded: OnceCell::new(),
             source: Some(source),
             schema,
             id_column,
@@ -843,10 +912,9 @@ impl SuperfileReader {
 
         Ok(Self {
             bytes: Some(bytes),
-            parquet_meta: Arc::clone(arrow_meta.metadata()),
-            // Filled by `parquet_metadata_with_page_index` on first use.
-            page_index_meta: OnceCell::new(),
-            arrow_meta: Some(arrow_meta),
+            footer: ArcSwap::from_pointee(Footer::Resident(arrow_meta)),
+            // Set by `parquet_metadata_with_page_index` on first use.
+            page_index_loaded: OnceCell::new(),
             source: None,
             schema,
             id_column,
@@ -862,31 +930,34 @@ impl SuperfileReader {
         })
     }
 
-    /// The Parquet footer metadata parsed at open — page index included
-    /// on the eager path. One parse per reader lifetime; the SQL scan
-    /// path serves row-group counts and DataFusion's parquet opener
-    /// from this instead of re-reading the footer per query.
-    pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
-        &self.parquet_meta
+    /// The file's footer metadata: the parse made at open, or the
+    /// page-indexed one once something has loaded it. The SQL scan path
+    /// serves row-group counts and DataFusion's parquet opener from this
+    /// instead of re-reading the footer per query.
+    pub fn parquet_metadata(&self) -> Arc<ParquetMetaData> {
+        Arc::clone(self.footer.load().parquet())
     }
 
     /// [`Self::parquet_metadata_with_page_index`] when it needs no read or
     /// decode: the open already loaded the page indexes, or an earlier call
     /// did. `None` means that call would do work.
     pub(crate) fn loaded_parquet_metadata_with_page_index(&self) -> Option<Arc<ParquetMetaData>> {
-        if self.parquet_meta.offset_index().is_some() {
-            return Some(Arc::clone(&self.parquet_meta));
-        }
-        self.page_index_meta.get().cloned()
+        // Flag before footer: the load stores the indexed footer before it
+        // sets the flag, so a set flag means the footer read next is indexed.
+        let loaded = self.page_index_loaded.initialized();
+        let footer = self.footer.load();
+        let parquet = footer.parquet();
+        (loaded || parquet.offset_index().is_some()).then(|| Arc::clone(parquet))
     }
 
     /// Parquet metadata with the page indexes (column + offset) loaded
-    /// when available.
+    /// when the file has them.
     ///
-    /// Eager readers return their open-time metadata. Lazy readers fetch
-    /// only the page-index metadata range through their existing byte
-    /// source; a [`OnceCell`] coalesces concurrent first callers and keeps
-    /// all later targeted row reads local.
+    /// Loaded once per reader: a lazy reader fetches only the page-index
+    /// range through its byte source, a resident one parses it out of its
+    /// own bytes, and concurrent first callers wait on that one load. The
+    /// result replaces the footer-only parse the reader held (see
+    /// [`Footer`]), so the reader keeps one copy of its row-group metadata.
     ///
     /// Both indexes load together even though the take path needs only the
     /// offset index: the SQL scan serves this same parse to DataFusion's
@@ -901,45 +972,43 @@ impl SuperfileReader {
         if let Some(loaded) = self.loaded_parquet_metadata_with_page_index() {
             return Ok(loaded);
         }
-        let source = self.source.as_ref().map(Arc::clone);
-        let bytes = self.bytes.clone();
-        let metadata = self
-            .page_index_meta
-            .get_or_try_init(|| async move {
-                let Some(source) = source else {
-                    // Eager / mmap reader: the whole file is already
-                    // resident, so parse the index straight out of it
-                    // rather than going back to storage. Keeping this off
-                    // the metered DataFusion store is what makes page-byte
-                    // accounting independent of how the reader was opened.
-                    let Some(bytes) = bytes else {
-                        return Ok::<Arc<ParquetMetaData>, ReadError>(Arc::clone(
-                            &self.parquet_meta,
-                        ));
-                    };
-                    let indexed = ArrowReaderMetadata::load(
-                        &bytes,
-                        ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-                    )
-                    .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
-                    return Ok(Arc::clone(indexed.metadata()));
+        self.page_index_loaded
+            .get_or_try_init(|| async {
+                let current = self.footer.load_full();
+                let indexed = match (&self.source, &self.bytes) {
+                    (Some(source), _) => {
+                        let mut loader = page_index_loader(current.parquet());
+                        let mut fetch = LazyMetadataFetch {
+                            source: Arc::clone(source),
+                        };
+                        loader
+                            .load_page_index(&mut fetch)
+                            .await
+                            .map_err(footer::FooterError::from)?;
+                        Arc::new(loader.finish().map_err(footer::FooterError::from)?)
+                    }
+                    // Resident: parse the index out of the bytes already in
+                    // memory rather than going back to storage. Keeping this
+                    // off the metered DataFusion store is what makes
+                    // page-byte accounting independent of how the reader
+                    // was opened.
+                    (None, Some(bytes)) => page_index_from_bytes(current.parquet(), bytes)?,
+                    (None, None) => return Ok(()),
                 };
-                let mut fetch = LazyMetadataFetch { source };
-                let mut loader =
-                    ParquetMetaDataReader::new_with_metadata((*self.parquet_meta).clone())
-                        .with_column_index_policy(PageIndexPolicy::Optional)
-                        .with_offset_index_policy(PageIndexPolicy::Optional);
-                loader
-                    .load_page_index(&mut fetch)
-                    .await
-                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
-                let metadata = loader
-                    .finish()
-                    .map_err(|error| ReadError::Footer(footer::FooterError::Parquet(error)))?;
-                Ok(Arc::new(metadata))
+                self.footer.store(Arc::new(current.over(indexed)?));
+                Ok::<_, ReadError>(())
             })
             .await?;
-        Ok(Arc::clone(metadata))
+        Ok(self.parquet_metadata())
+    }
+
+    /// The Arrow metadata the synchronous decodes read through, or
+    /// [`ReadError::LazyReaderUnsupported`] when the file isn't resident.
+    fn resident_arrow_metadata(&self) -> Result<ArrowReaderMetadata, ReadError> {
+        match &**self.footer.load() {
+            Footer::Resident(arrow) => Ok(arrow.clone()),
+            Footer::Lazy(_) => Err(ReadError::LazyReaderUnsupported),
+        }
     }
 
     /// Arrow schema of the user-visible columns (Parquet rows).
@@ -1007,7 +1076,8 @@ impl SuperfileReader {
         let Some(bytes) = self.bytes.as_ref() else {
             return Ok(None);
         };
-        let kv_map = footer::extract_kv_map(&self.parquet_meta).map_err(ReadError::Footer)?;
+        let parquet_meta = self.parquet_metadata();
+        let kv_map = footer::extract_kv_map(&parquet_meta).map_err(ReadError::Footer)?;
         let kv_len = |key: &str| -> u64 {
             kv_map
                 .get(key)
@@ -1016,7 +1086,7 @@ impl SuperfileReader {
         };
         let mut columns: Vec<(String, u64)> = Vec::new();
         let mut row_group_bytes = 0u64;
-        for rg in self.parquet_meta.row_groups() {
+        for rg in parquet_meta.row_groups() {
             for c in rg.columns() {
                 let size = c.compressed_size().max(0) as u64;
                 row_group_bytes += size;
@@ -1034,7 +1104,7 @@ impl SuperfileReader {
         Ok(Some(SuperfileSizeBreakdown {
             total_bytes: bytes.len() as u64,
             n_docs: self.n_docs,
-            row_groups: self.parquet_meta.row_groups().len() as u64,
+            row_groups: parquet_meta.row_groups().len() as u64,
             row_group_bytes,
             columns,
             id_sidecar_bytes: self.id_sidecar.map_or(0, |loc| loc.len),
@@ -1080,11 +1150,11 @@ impl SuperfileReader {
         self.bytes.as_ref()
     }
 
-    /// Whether synchronous targeted row materialization is ready. A cache
-    /// reader can expose resident bytes before its Arrow metadata is installed;
-    /// those readers must stay on the async object-store row path.
+    /// Whether synchronous targeted row materialization is ready: the whole
+    /// file is resident, with its Arrow metadata resolved. A lazy reader
+    /// takes through the async object-store row path instead.
     pub(crate) fn can_take_by_local_doc_ids(&self) -> bool {
-        self.bytes.is_some() && self.arrow_meta.is_some()
+        matches!(**self.footer.load(), Footer::Resident(_))
     }
 
     /// Whether every byte of the superfile is resident and real — the eager
@@ -1133,16 +1203,19 @@ impl SuperfileReader {
         bytes: Bytes,
         hole: (u64, u64),
     ) -> Result<(), ReadError> {
+        // The sync decodes skip pages through the page index, so load it now
+        // from the resident bytes, unless a scan already has: reusing that
+        // one keeps the reader at one copy of its footer. Everything is
+        // built before the reader changes, so an error leaves it as it was.
+        let current = self.footer.load_full();
+        let indexed = match self.page_index_loaded.initialized() {
+            true => Arc::clone(current.parquet()),
+            false => page_index_from_bytes(current.parquet(), &bytes)?,
+        };
+        let footer = Footer::Resident(resolve_arrow(indexed)?);
+        self.footer = ArcSwap::from_pointee(footer);
+        self.page_index_loaded = OnceCell::new_with(Some(()));
         self.resident_hole = Some(hole);
-        let arrow_meta = ArrowReaderMetadata::load(
-            &bytes,
-            ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Optional),
-        )
-        .map_err(|e| ReadError::Footer(footer::FooterError::Parquet(e)))?;
-        // Seed the page-index cell too (best effort — a concurrent lazy
-        // upgrade may have won; either value serves the same reads).
-        let _ = self.page_index_meta.set(Arc::clone(arrow_meta.metadata()));
-        self.arrow_meta = Some(arrow_meta);
         self.bytes = Some(bytes);
         Ok(())
     }
@@ -1176,11 +1249,7 @@ impl SuperfileReader {
             .bytes
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?;
-        let arrow_meta = self
-            .arrow_meta
-            .as_ref()
-            .ok_or(ReadError::LazyReaderUnsupported)?
-            .clone();
+        let arrow_meta = self.resident_arrow_metadata()?;
         let plan = if let Some(deleted_docs_bitmap) = deleted_docs_bitmap {
             tombstone_access_plan(bytes, deleted_docs_bitmap.as_ref())
                 .map_err(|e| ReadError::Columnar(e.to_string()))?
@@ -1575,11 +1644,7 @@ impl SuperfileReader {
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?
             .clone();
-        let arrow_meta = self
-            .arrow_meta
-            .as_ref()
-            .ok_or(ReadError::LazyReaderUnsupported)?
-            .clone();
+        let arrow_meta = self.resident_arrow_metadata()?;
 
         // 1. Resolve projected names → output fields (in caller order),
         //    validating every name up front. Per-source column selection
@@ -1788,11 +1853,7 @@ impl SuperfileReader {
             .as_ref()
             .ok_or(ReadError::LazyReaderUnsupported)?
             .clone();
-        let mut arrow_meta = self
-            .arrow_meta
-            .as_ref()
-            .ok_or(ReadError::LazyReaderUnsupported)?
-            .clone();
+        let mut arrow_meta = self.resident_arrow_metadata()?;
         if !views.is_empty() {
             arrow_meta = ArrowReaderMetadata::try_new(
                 Arc::clone(arrow_meta.metadata()),
@@ -2028,7 +2089,7 @@ impl SuperfileReader {
     /// superfile once to find where those rows live so the phase
     /// can mark their bits. Rebuilds a `ParquetRecordBatchReader`
     /// each call (cold recovery path), rather than reusing the
-    /// cached `arrow_meta` like `take_by_local_doc_ids` does.
+    /// cached Arrow metadata like `take_by_local_doc_ids` does.
     pub(crate) fn id_lookup_many(
         &self,
         sorted_targets: &[i128],
@@ -3437,6 +3498,7 @@ mod tests {
     use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, RecordBatch};
     use arrow_schema::{DataType, Field};
     use async_trait::async_trait;
+    use tokio::{join, task::yield_now};
     use tracing::Level;
 
     use super::*;
@@ -4085,7 +4147,7 @@ mod tests {
         let r = SuperfileReader::open_with(bytes, OpenOptions { verify_crc: false })
             .expect("open eager");
         assert!(
-            r.parquet_meta.offset_index().is_none(),
+            r.parquet_metadata().offset_index().is_none(),
             "an eager open must not parse the page index"
         );
         let indexed = r
@@ -4094,7 +4156,7 @@ mod tests {
             .expect("page index on demand");
         assert_eq!(
             indexed.num_row_groups(),
-            r.parquet_meta.num_row_groups(),
+            r.parquet_metadata().num_row_groups(),
             "the on-demand parse must describe the same file"
         );
         // Cached: a second call returns the same allocation.
@@ -4436,6 +4498,146 @@ mod tests {
             .await
             .expect("reuse offset index");
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// `reader` serves `indexed` on every path that reads its footer, and
+    /// has let go of the footer-only parse: `plain`, taken before the page
+    /// index loaded, is held by nobody but the caller.
+    fn assert_serves_only(
+        reader: &SuperfileReader,
+        indexed: &Arc<ParquetMetaData>,
+        plain: &Arc<ParquetMetaData>,
+    ) {
+        assert!(
+            indexed.offset_index().is_some(),
+            "the fixture must carry a page index, or nothing here is tested"
+        );
+        assert!(
+            Arc::ptr_eq(&reader.parquet_metadata(), indexed),
+            "the reader must serve the indexed footer"
+        );
+        if let Ok(arrow) = reader.resident_arrow_metadata() {
+            assert!(
+                Arc::ptr_eq(arrow.metadata(), indexed),
+                "the sync decodes must read the indexed footer too"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(plain),
+            1,
+            "the reader must have let go of the footer-only parse"
+        );
+    }
+
+    async fn lazy_reader(bytes: Bytes) -> SuperfileReader {
+        let source: Arc<dyn LazyByteSource> = Arc::new(BytesLazyByteSource::new(bytes));
+        SuperfileReader::open_lazy(source).await.expect("lazy open")
+    }
+
+    #[tokio::test]
+    async fn a_lazy_page_index_load_keeps_one_copy_of_the_footer() {
+        let reader = lazy_reader(build_simple_fts_only_superfile()).await;
+        let plain = reader.parquet_metadata();
+        let indexed = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load page index");
+        assert_serves_only(&reader, &indexed, &plain);
+    }
+
+    /// A resident reader's sync decodes hold the footer too, through their
+    /// Arrow metadata; the load must move them onto the indexed footer, and
+    /// they must still decode the same rows.
+    #[tokio::test]
+    async fn a_resident_page_index_load_keeps_one_copy_of_the_footer() {
+        let reader = SuperfileReader::open(build_simple_fts_only_superfile()).expect("open eager");
+        let locals = [3, 0, 2];
+        let before = reader
+            .take_by_local_doc_ids(&locals, &["doc_id", "title"])
+            .expect("take before the load");
+        let plain = reader.parquet_metadata();
+        let indexed = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load page index");
+        assert_serves_only(&reader, &indexed, &plain);
+        let after = reader
+            .take_by_local_doc_ids(&locals, &["doc_id", "title"])
+            .expect("take after the load");
+        assert_eq!(
+            before, after,
+            "the indexed footer must decode the same rows"
+        );
+    }
+
+    /// Promotion installs resident bytes on a lazy reader. A page index a
+    /// scan already loaded is reused rather than parsed a second time.
+    #[tokio::test]
+    async fn promotion_reuses_a_page_index_already_loaded() {
+        let bytes = build_simple_fts_only_superfile();
+        let mut reader = lazy_reader(bytes.clone()).await;
+        let plain = reader.parquet_metadata();
+        let indexed = reader
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load page index");
+        reader
+            .install_resident_parquet(bytes, (0, 0))
+            .expect("promote");
+        assert_serves_only(&reader, &indexed, &plain);
+    }
+
+    /// Promotion with no page index loaded yet parses it from the resident
+    /// bytes and serves it on every path.
+    #[tokio::test]
+    async fn promotion_loads_the_page_index_once_for_every_path() {
+        let bytes = build_simple_fts_only_superfile();
+        let mut reader = lazy_reader(bytes.clone()).await;
+        let plain = reader.parquet_metadata();
+        reader
+            .install_resident_parquet(bytes, (0, 0))
+            .expect("promote");
+        let indexed = reader
+            .loaded_parquet_metadata_with_page_index()
+            .expect("promotion loads the page index");
+        assert_serves_only(&reader, &indexed, &plain);
+    }
+
+    /// A source whose every read waits one turn of the runtime, so a load
+    /// through it is still pending when the next caller arrives.
+    struct YieldingSource(BytesLazyByteSource);
+
+    #[async_trait]
+    impl LazyByteSource for YieldingSource {
+        fn size(&self) -> u64 {
+            self.0.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            yield_now().await;
+            self.0.range(start, len).await
+        }
+    }
+
+    /// Concurrent first callers wait on one load: both get the same indexed
+    /// footer, and no caller that lost the race leaves a copy of its own.
+    #[tokio::test]
+    async fn concurrent_first_page_index_loads_share_one_footer() {
+        let source: Arc<dyn LazyByteSource> = Arc::new(YieldingSource(BytesLazyByteSource::new(
+            build_simple_fts_only_superfile(),
+        )));
+        let reader = SuperfileReader::open_lazy(source).await.expect("lazy open");
+        let plain = reader.parquet_metadata();
+        let (first, second) = join!(
+            reader.parquet_metadata_with_page_index(),
+            reader.parquet_metadata_with_page_index()
+        );
+        let (first, second) = (first.expect("first load"), second.expect("second load"));
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "both callers must get the one load"
+        );
+        assert_serves_only(&reader, &first, &plain);
     }
 
     #[test]
@@ -4890,11 +5092,11 @@ mod tests {
                 packed: true,
                 n_docs: ids.len() as u64,
             }
-            .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+            .verified_ids(&reader.parquet_metadata(), "doc_id", id_range)
         };
         assert_eq!(
             loc.slice(&bytes, SHUFFLED_ID_ROWS as u64)
-                .verified_ids(reader.parquet_metadata(), "doc_id", id_range)
+                .verified_ids(&reader.parquet_metadata(), "doc_id", id_range)
                 .expect("the written sidecar passes"),
             ids
         );
@@ -4926,7 +5128,7 @@ mod tests {
             n_docs: outside.len() as u64,
         }
         .verified_ids(
-            reader.parquet_metadata(),
+            &reader.parquet_metadata(),
             "a column with no statistics",
             id_range,
         );

@@ -188,8 +188,9 @@ pub struct EncodedBody {
     body_file: NamedTempFile,
     /// Byte length of the footer-stripped body in `body_file`.
     body_len: u64,
-    /// Footer metadata decoded from the original write, carried through
-    /// to the rewrite so row groups + column/offset indexes survive.
+    /// Footer metadata decoded from the original write (footer only, no page
+    /// index), carried through to the rewrite so the row groups survive. The
+    /// page index itself stays in the body, where the column chunks point.
     metadata: ParquetMetaData,
 }
 
@@ -725,7 +726,7 @@ where
     splice_carried_body_to(
         BufReader::new(body_file.reopen()?),
         body_len,
-        metadata,
+        &metadata,
         fts_blob,
         fts_length,
         vec_blob,
@@ -744,10 +745,16 @@ where
 ///
 /// The body lands at offset 0 in both files, so the row-group and column
 /// offsets in `metadata` stay valid without adjustment.
+///
+/// The body already holds the page index (it ends where the old footer
+/// began), and the column chunks in `metadata` point at it. So the new
+/// footer is written from the row groups alone, whether or not `metadata`
+/// had the page index loaded: writing a loaded one again would append a
+/// second copy and repoint the footer at it.
 pub(crate) fn splice_carried_body_to<W, B, F, V, I, R>(
     mut body: B,
     body_len: u64,
-    metadata: ParquetMetaData,
+    metadata: &ParquetMetaData,
     mut fts_blob: F,
     fts_length: u64,
     mut vec_blob: V,
@@ -820,8 +827,7 @@ where
     // footer (Arrow schema KV among them); append `extra_kv` plus the
     // `inf.fts.*` / `inf.vec.*` offsets. `FileMetaData` is immutable, so
     // build a new one via the public ctor with the patched KV list and
-    // rebuild the `ParquetMetaData` around it, carrying row groups and
-    // column / offset indexes through unchanged.
+    // rebuild the `ParquetMetaData` around it with the carried row groups.
     let old_fm = metadata.file_metadata();
     let mut kvs = old_fm.key_value_metadata().cloned().unwrap_or_default();
     // `metadata` is the carried file's footer, so it already describes
@@ -887,8 +893,6 @@ where
     );
     let new_meta = ParquetMetaDataBuilder::new(new_fm)
         .set_row_groups(metadata.row_groups().to_vec())
-        .set_column_index(metadata.column_index().cloned())
-        .set_offset_index(metadata.offset_index().cloned())
         .build();
 
     // Re-encode footer. `ParquetMetaDataWriter::finish` appends the
@@ -1283,7 +1287,7 @@ mod tests {
         let layout = splice_carried_body_to(
             Cursor::new(body),
             body.len() as u64,
-            carried_meta,
+            &carried_meta,
             Cursor::new(NEW_FTS),
             NEW_FTS.len() as u64,
             Cursor::new(&[][..]),

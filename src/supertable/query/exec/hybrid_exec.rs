@@ -49,10 +49,14 @@
 //! satisfying the predicate*. Filters are reported `Inexact`, lowered
 //! once to a [`CandidateScope`] and handed to **both** retrievers, so the
 //! BM25 leg and the vector leg rank within the same superfiles and rows
-//! before fusion; what the index could not bound is made up by
-//! [`fill_top_k`] applying the exact predicate and fetching more. Without
-//! a `WHERE`, the vector leg is `vector_search`'s own search, the hidden
-//! vector index.
+//! before fusion. What the index could not bound is made up by widening:
+//! [`fill_top_k_within`] applies the exact predicate to the fused rows and
+//! asks both legs for more until `k` pass or a ceiling stops it. When the
+//! widening ends short at a ceiling below the table's size, the function
+//! checks the predicate over the scope's rows itself ([`exact_scope`]) and
+//! runs both legs once more within exactly the rows it keeps, as
+//! `vector_search` and `bm25_search` do. Without a `WHERE`, the vector leg
+//! is `vector_search`'s own search, the hidden vector index.
 
 use std::{cmp::Ordering, collections::HashMap, fmt, sync::Arc};
 
@@ -73,7 +77,10 @@ use datafusion::{
         stream::RecordBatchStreamAdapter,
     },
 };
-use futures::{future, stream};
+use futures::{
+    future::{self, BoxFuture},
+    stream,
+};
 use tracing::{Instrument, debug};
 
 #[cfg(feature = "detailed-tracing")]
@@ -95,8 +102,9 @@ use crate::{
             exec::{
                 common::{
                     PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                    fill_top_k, live_reader, output_schema_with_score, resolve_hits_named,
-                    scope_to_call, top_k_statistics, traced_tvf,
+                    exact_scope, fill_ceiling, fill_top_k_within, live_reader,
+                    output_schema_with_score, resolve_hits_named, scope_to_call, top_k_statistics,
+                    traced_tvf, widening_ended_short,
                 },
                 vector_exec::arg_to_query_vector,
             },
@@ -122,6 +130,37 @@ const HYBRID_SEARCH_ARG_COUNT: usize = 5;
 /// default across engines (Elasticsearch, Weaviate, …). Larger values
 /// flatten the rank weighting; it never depends on the raw scores.
 const RRF_K: f32 = 60.0;
+
+/// The rows a hybrid search ranks within. The BM25 leg ranks within these
+/// rows whatever the variant; the variant picks which search the vector leg
+/// runs, because each fits a different shape of scope.
+#[derive(Clone, Copy)]
+enum HybridScope<'a> {
+    /// Every row: no `WHERE`. The vector leg is `vector_search`'s own
+    /// search, the hidden vector index plus the rows not drained into it
+    /// yet, so its cost follows `k`, not the table's file count.
+    Table,
+    /// What a `WHERE` admits: the files the statistics keep and, when an
+    /// index bounds the rows, those rows. The vector leg searches those
+    /// user files directly, limited to the rows when they are bounded; it
+    /// costs a probe per file, which is why it is only the widening's scope.
+    Admitted(&'a CandidateScope),
+    /// Exactly the rows a `WHERE` keeps ([`exact_scope`]). The vector leg is
+    /// `vector_search`'s filtered search over them: drained rows through the
+    /// hidden index, the rest through their user files, each probing a
+    /// bounded number of clusters.
+    Exact(&'a CandidateScope),
+}
+
+impl<'a> HybridScope<'a> {
+    /// The scope the BM25 leg ranks within; `None` is the whole table.
+    fn candidates(self) -> Option<&'a CandidateScope> {
+        match self {
+            HybridScope::Table => None,
+            HybridScope::Admitted(scope) | HybridScope::Exact(scope) => Some(scope),
+        }
+    }
+}
 
 /// Register `hybrid_search(text_col, q_text, vec_col, q_vec, k)` on
 /// `ctx`, bound to the query's pinned `reader` + scalar `schema`.
@@ -161,25 +200,28 @@ impl SupertableReader {
         options: VectorSearchOptions,
         k: usize,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        self.hybrid_search_scoped_async(text_col, q_text, mode, vec_col, q_vec, options, k, None)
-            .await
+        self.hybrid_search_scoped_async(
+            text_col,
+            q_text,
+            mode,
+            vec_col,
+            q_vec,
+            options,
+            k,
+            HybridScope::Table,
+        )
+        .await
     }
 
-    /// [`Self::hybrid_search_async`] confined to a [`CandidateScope`] —
+    /// [`Self::hybrid_search_async`] confined to the rows `scope` names:
     /// what a SQL `WHERE` pushed into the `hybrid_search` table function
-    /// admits. `None` is the unscoped search.
-    ///
-    /// Unscoped, the vector leg is the search `vector_search` runs: the
-    /// hidden vector index plus the undrained user delta, with the index's
-    /// calibrated width and rerank budget, so its cost follows k rather than
-    /// the number of superfiles. A scope keeps the leg on the user table,
-    /// fanned out over the scope's superfiles with its rows as the
-    /// allow-set, so the fused top-k is the best `k` among rows that can
-    /// satisfy the predicate; the BM25 leg reads the same scope. Fusion
-    /// joins the legs on the stable `_id`, which every hit of both legs
-    /// carries, so where a hit was found does not change its identity.
+    /// admits, or exactly the rows it keeps. Both legs rank within the same
+    /// rows, so the fused top-k is the best `k` among them. Fusion joins the
+    /// legs on the stable `_id`, which every hit of both legs carries, so
+    /// where a hit was found does not change its identity. See
+    /// [`HybridScope`] for which search the vector leg runs.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn hybrid_search_scoped_async(
+    async fn hybrid_search_scoped_async(
         &self,
         text_col: &str,
         q_text: &str,
@@ -188,19 +230,20 @@ impl SupertableReader {
         q_vec: &[f32],
         options: VectorSearchOptions,
         k: usize,
-        scope: Option<&CandidateScope>,
+        scope: HybridScope<'_>,
     ) -> Result<Vec<SuperfileHit>, QueryError> {
-        // Hybrid's vector arm enters without the sync wrappers — apply the
-        // cosine query calibration (#512) at this seam so hybrid scores
-        // match the public vector path.
-        let q_vec = calibrated_query(self, vec_col, q_vec);
+        // The vector searches below take the query calibrated for the
+        // column's metric (normalized for cosine), as the public vector path
+        // does. `vector_hits_within_scope` calibrates for itself; the other
+        // two are calibrated here.
         let vector_leg = async {
             let mut hits = match scope {
-                None => {
+                HybridScope::Table => {
+                    let q_vec = calibrated_query(self, vec_col, q_vec);
                     self.vector_search_global_index_async(vec_col, &q_vec, k, options)
                         .await?
                 }
-                Some(scope) => {
+                HybridScope::Admitted(scope) => {
                     // Only superfiles that still hold a candidate row; the
                     // kernel treats a superfile absent from the allow map as
                     // having no admitted row, so none is handed to it.
@@ -208,6 +251,7 @@ impl SupertableReader {
                     if superfiles.is_empty() {
                         return Ok(Vec::new());
                     }
+                    let q_vec = calibrated_query(self, vec_col, q_vec);
                     self.vector_fanout_over_superfiles(
                         superfiles,
                         vec_col,
@@ -218,14 +262,18 @@ impl SupertableReader {
                     )
                     .await?
                 }
+                HybridScope::Exact(scope) => {
+                    self.vector_hits_within_scope(vec_col, q_vec, k, options, scope)
+                        .await?
+                }
             };
             // Fusion joins the legs on `_id`, so every vector hit needs one.
             // Hidden-index hits, and hits in cell-packed user files (from
             // their inline id region), carry it from the search. A hit in an
             // older plain-IVF user file whose ids are not one contiguous run
-            // can arrive without one (the scoped fan-out, or a table's search
-            // before its first drain); its local is its Parquet row, so the
-            // `_id` read there is its own. Only those hits are read.
+            // can arrive without one (a search over user files, or a table's
+            // search before its first drain); its local is its Parquet row,
+            // so the `_id` read there is its own. Only those hits are read.
             attach_stable_ids_to_hits(self, &mut hits).await?;
             Ok::<_, QueryError>(hits)
         };
@@ -239,7 +287,7 @@ impl SupertableReader {
                 q_text,
                 k,
                 Bm25SearchOptions::new().with_mode(mode),
-                scope,
+                scope.candidates(),
             )
             .instrument(trace::phase(phases, || detail_span!("hybrid.bm25")));
         let vector_leg =
@@ -490,7 +538,12 @@ impl TableProvider for HybridSearchTable {
     /// predicates to [`scan`](Self::scan), where they scope both
     /// retrievers to the rows that can satisfy them, **and** keeps a
     /// `FilterExec` above the scan that re-applies the exact predicate.
-    /// Correctness never depends on the pushdown.
+    /// Correctness never depends on the pushdown. What the scope could not
+    /// bound, the exec widens for and, when the widening ends short at its
+    /// ceiling, checks on the scope's rows itself (`exact_scope`) before
+    /// running both legs within exactly the rows the predicate keeps. A
+    /// predicate it cannot evaluate before ranking (one on `score`) keeps
+    /// what the widening found.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -658,6 +711,21 @@ impl ExecutionPlan for HybridSearchExec {
         );
 
         let fut = async move {
+            let predicate = PushedPredicate::compile(&filters, &output_schema);
+            let call = FusedCall {
+                reader: &reader,
+                text_col: &text_col,
+                q_text: &q_text,
+                mode,
+                vec_col: &vec_col,
+                q_vec: &q_vec,
+                options,
+                k,
+                predicate: predicate.as_ref(),
+                scalar_schema: &scalar_schema,
+                output_schema: &output_schema,
+                projection: projection.as_deref(),
+            };
             // `_id` and `score` come free with the fused hits (fusion
             // refuses a hit without its `_id`), so a projection of just
             // those needs no placement and no decode, as in
@@ -666,11 +734,7 @@ impl ExecutionPlan for HybridSearchExec {
             if filters.is_empty()
                 && let Some(indices) = id_score_projection
             {
-                let fused = reader
-                    .hybrid_search_scoped_async(
-                        &text_col, &q_text, mode, &vec_col, &q_vec, options, k, None,
-                    )
-                    .await?;
+                let fused = call.fused(k, HybridScope::Table).await?;
                 return hits_id_score_batch(&reader, &fused)?
                     .project(&indices)
                     .map_err(|e| QueryError::internal(e).into());
@@ -684,39 +748,38 @@ impl ExecutionPlan for HybridSearchExec {
                     Some(reader.candidate_scope(&filters, &plan).await?)
                 }
             };
-            let predicate = PushedPredicate::compile(&filters, &output_schema);
-            // Run both retrievers concurrently and fuse with RRF via the
-            // shared kernel; the fused set is resolved once per round.
-            let search = |want: usize| {
-                let reader = &reader;
-                let text_col = &text_col;
-                let q_text = &q_text;
-                let vec_col = &vec_col;
-                let q_vec = &q_vec;
-                let scope = scope.as_ref();
-                async move {
-                    let fused = reader
-                        .hybrid_search_scoped_async(
-                            text_col, q_text, mode, vec_col, q_vec, options, want, scope,
-                        )
-                        .await?;
-                    // Cell-packed user hits can be boundary stubs whose IVF
-                    // local does not address a Parquet row; remap those to
-                    // their owning placement by stable id before the scalar
-                    // decode — the same step the vector TVF takes.
-                    user_placement_for_scalar_resolve(reader, &fused).await
-                }
+            // Widen first, up to the fill's ceiling: the rounds stop as soon
+            // as `k` fused rows pass the predicate, which for a predicate
+            // most top-ranked rows satisfy is a round or two.
+            let admitted = scope
+                .as_ref()
+                .map_or(HybridScope::Table, HybridScope::Admitted);
+            let widened = call.rows(admitted, None).await?;
+            let (Some(scope), Some(predicate)) = (scope.as_ref(), predicate.as_ref()) else {
+                return Ok(widened);
             };
-            fill_top_k(
-                &reader,
-                k,
-                predicate.as_ref(),
-                &scalar_schema,
-                &output_schema,
-                projection.as_deref(),
-                search,
-            )
-            .await
+            if !widening_ended_short(&reader, k, widened.num_rows()) {
+                return Ok(widened);
+            }
+            // Short at the ceiling: rows the predicate keeps may rank below
+            // every hit either leg looked at. Check the predicate on the
+            // scope's rows, and run both legs once within exactly the ones
+            // it keeps. The vector leg needs every such row, not only the
+            // ones the query's terms match, so the check covers the whole
+            // scope. A predicate it cannot check before ranking (one on
+            // `score`) keeps what the widening found.
+            let Some(exact) = exact_scope(&reader, scope, predicate, &output_schema).await? else {
+                return Ok(widened);
+            };
+            let ranked = call.rows(HybridScope::Exact(&exact), Some(k)).await?;
+            // The vector leg within the kept rows probes a bounded number of
+            // clusters, so it can miss a kept row the widening found by
+            // asking for far more hits. Never return fewer rows than the
+            // widening already had.
+            Ok(match ranked.num_rows() >= widened.num_rows() {
+                true => ranked,
+                false => widened,
+            })
         };
 
         let span = detail_span!(
@@ -730,6 +793,78 @@ impl ExecutionPlan for HybridSearchExec {
             projected_schema,
             stream,
         )))
+    }
+}
+
+/// One `hybrid_search` call's fixed inputs, borrowed by each fused round
+/// [`HybridSearchExec::execute`] runs.
+struct FusedCall<'a> {
+    reader: &'a SupertableReader,
+    text_col: &'a str,
+    q_text: &'a str,
+    mode: BoolMode,
+    vec_col: &'a str,
+    q_vec: &'a [f32],
+    options: VectorSearchOptions,
+    k: usize,
+    predicate: Option<&'a PushedPredicate>,
+    scalar_schema: &'a SchemaRef,
+    output_schema: &'a SchemaRef,
+    projection: Option<&'a [usize]>,
+}
+
+impl FusedCall<'_> {
+    /// Both retrievers' `want` best hits within `scope`, run concurrently
+    /// and fused with RRF.
+    async fn fused(
+        &self,
+        want: usize,
+        scope: HybridScope<'_>,
+    ) -> Result<Vec<SuperfileHit>, QueryError> {
+        self.reader
+            .hybrid_search_scoped_async(
+                self.text_col,
+                self.q_text,
+                self.mode,
+                self.vec_col,
+                self.q_vec,
+                self.options,
+                want,
+                scope,
+            )
+            .await
+    }
+
+    /// The call's `k` rows within `scope` under the predicate, widening to
+    /// at most `ceiling` fused hits a round: `None` is the fill's own
+    /// ceiling ([`fill_ceiling`]), `Some(k)` exactly one round.
+    ///
+    /// Boxed, and built in a plain function rather than an `async` one: the
+    /// fill nests both retrievers' futures, and building it here keeps that
+    /// state off the stack frame of every caller that polls it.
+    fn rows<'b>(
+        &'b self,
+        scope: HybridScope<'b>,
+        ceiling: Option<usize>,
+    ) -> BoxFuture<'b, DfResult<RecordBatch>> {
+        let ceiling = ceiling.unwrap_or_else(|| fill_ceiling(self.reader, self.k));
+        Box::pin(fill_top_k_within(
+            self.reader,
+            self.k,
+            self.predicate,
+            self.scalar_schema,
+            self.output_schema,
+            self.projection,
+            ceiling,
+            move |want| async move {
+                let fused = self.fused(want, scope).await?;
+                // Cell-packed user hits can be boundary stubs whose IVF
+                // local does not address a Parquet row; remap those to
+                // their owning placement by stable id before the scalar
+                // decode, the same step the vector TVF takes.
+                user_placement_for_scalar_resolve(self.reader, &fused).await
+            },
+        ))
     }
 }
 
@@ -789,14 +924,17 @@ fn rrf_fuse(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::{collections::HashSet, iter::repeat_n};
 
     use arrow_array::{
         Array, ArrayRef, Decimal128Array, FixedSizeListArray, Float32Array, Int64Array,
         LargeStringArray, RecordBatch, StringArray,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::physical_plan::{displayable, joins::HashJoinExec};
+    use datafusion::{
+        physical_plan::{displayable, joins::HashJoinExec},
+        prelude::{col, lit},
+    };
     use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
@@ -809,8 +947,9 @@ mod tests {
             vector::{distance::Metric, rerank_codec::RerankCodec},
         },
         supertable::{
-            Supertable, SupertableOptions, manifest::SuperfileUri,
-            query::exec::common::test_support::sql_row_count,
+            Supertable, SupertableOptions,
+            manifest::SuperfileUri,
+            query::exec::common::{OVER_FETCH_MIN_CEILING, test_support::sql_row_count},
         },
     };
 
@@ -945,6 +1084,47 @@ mod tests {
             out.extend((0..c.len()).map(|i| c.value(i)));
         }
         out
+    }
+
+    /// Every value of the string column `name` across `batches`, in order.
+    fn strings_of(batches: &[RecordBatch], name: &str) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let c = col_str(b, name);
+                (0..c.len())
+                    .map(|i| c.value(i).to_owned())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// The one value a `SELECT COUNT(*)` returns.
+    fn count_of(batches: &[RecordBatch]) -> i64 {
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64")
+            .value(0)
+    }
+
+    /// An `emb` column of `dim`-wide vectors, row `i` set to `points[i]` in
+    /// its first two components and zero elsewhere. Requires `dim >= 2`.
+    fn graded_emb(points: &[[f32; 2]], dim: usize) -> ArrayRef {
+        let flat: Vec<f32> = points
+            .iter()
+            .flat_map(|&[x, y]| [x, y].into_iter().chain(repeat_n(0.0, dim - 2)))
+            .collect();
+        Arc::new(
+            FixedSizeListArray::try_new(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                dim as i32,
+                Arc::new(Float32Array::from(flat)) as ArrayRef,
+                None,
+            )
+            .expect("FSL"),
+        )
     }
 
     // ---- rrf_fuse unit (deterministic fusion math) ----
@@ -1932,26 +2112,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let titles = LargeStringArray::from(vec!["rust"; n]);
-        let mut flat = Vec::<f32>::with_capacity(n * dim);
-        for i in 0..n {
-            for d in 0..dim {
-                flat.push(match d {
-                    0 => 1.0,
-                    1 => i as f32,
-                    _ => 0.0,
-                });
-            }
-        }
-        let fsl = FixedSizeListArray::try_new(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            dim as i32,
-            Arc::new(Float32Array::from(flat)) as ArrayRef,
-            None,
-        )
-        .expect("FSL");
+        let points: Vec<[f32; 2]> = (0..n).map(|i| [1.0, i as f32]).collect();
         let batch = RecordBatch::try_new(
             st.options().schema.clone(),
-            vec![Arc::new(tags), Arc::new(titles), Arc::new(fsl)],
+            vec![Arc::new(tags), Arc::new(titles), graded_emb(&points, dim)],
         )
         .expect("batch");
         w.append(&batch).expect("append");
@@ -1968,17 +2132,6 @@ mod tests {
         let st = supertable_tag_ranked(dim);
         let k = 3;
         let qv = csv_one_hot(dim, 0);
-        let tags_of = |batches: &[RecordBatch]| -> Vec<String> {
-            batches
-                .iter()
-                .flat_map(|b| {
-                    let t = col_str(b, "tag");
-                    (0..t.len())
-                        .map(|i| t.value(i).to_owned())
-                        .collect::<Vec<_>>()
-                })
-                .collect()
-        };
         let unfiltered = st
             .reader()
             .expect("reader")
@@ -1987,7 +2140,7 @@ mod tests {
             ))
             .expect("unfiltered query_sql");
         assert_eq!(
-            tags_of(&unfiltered),
+            strings_of(&unfiltered, "tag"),
             vec!["a", "a", "a"],
             "guard: the unfiltered top-{k} is all `a`"
         );
@@ -1998,7 +2151,7 @@ mod tests {
                 "SELECT tag FROM hybrid_search('title', 'rust', 'emb', '{qv}', {k}) WHERE tag = 'b'"
             ))
             .expect("filtered query_sql");
-        assert_eq!(tags_of(&filtered), vec!["b", "b", "b"]);
+        assert_eq!(strings_of(&filtered, "tag"), vec!["b", "b", "b"]);
         // An aggregate over the filtered relation counts the matching rows,
         // not the survivors of a global fused top-k — the same acceptance
         // case `bm25_search` holds, on the fused function.
@@ -2010,13 +2163,288 @@ mod tests {
                  WHERE tag = 'b'"
             ))
             .expect("count query_sql");
-        let n = count[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("count is int64")
-            .value(0);
-        assert_eq!(n, k as i64);
+        assert_eq!(count_of(&count), k as i64);
+    }
+
+    // ---- a WHERE whose rows sit past the widening's ceiling ----
+
+    /// Rows titled `common`, nearer the query than every row the tests'
+    /// `WHERE` keeps, and ranked above them by BM25 too: more than the
+    /// widening's ceiling lets a small `k` look at, so a fill that only
+    /// widens stops with every kept row still beyond it in both legs.
+    const N_NEAR_PAST_THE_CEILING: usize = OVER_FETCH_MIN_CEILING + 100;
+
+    /// Rows `WHERE title <> 'common'` keeps, all past the
+    /// [`N_NEAR_PAST_THE_CEILING`] rejected ones in both legs.
+    const N_FAR_PAST_THE_CEILING: usize = 5;
+
+    /// Rows the drained-plus-tail test appends after the drain, also kept
+    /// by the `WHERE`.
+    const N_TAIL_PAST_THE_CEILING: usize = 5;
+
+    /// Spacing of the tail rows' first component: tail row `t` is
+    /// `[-(t + 1) · step, 1]`, nearer the query than every rare row (whose
+    /// first component is at most -1) and farther than every near one.
+    const TAIL_STEP: f32 = 0.1;
+
+    /// A `k` above every row the `WHERE` keeps in any of these tests, so a
+    /// query at it returns all of them.
+    const K_PAST_EVERY_MATCH: usize = N_FAR_PAST_THE_CEILING + N_TAIL_PAST_THE_CEILING + 1;
+
+    /// Vector width of the past-the-ceiling tests: the engine's smallest.
+    const PAST_THE_CEILING_DIM: usize = 16;
+
+    /// Rare row `j`'s title: `common` plus padding, so BM25 matches it but
+    /// ranks it below every one-word `common` row, and shorter titles above
+    /// longer ones: rare row `N_FAR_PAST_THE_CEILING - 1` first.
+    fn rare_title(j: usize) -> String {
+        format!(
+            "common rare{j}{}",
+            " pad".repeat(N_FAR_PAST_THE_CEILING - 1 - j)
+        )
+    }
+
+    /// Row `i` of the near rows: `[1, i]`, distance to `[1, 0]` rising with
+    /// `i`, every one nearer than any row with a negative first component.
+    fn near_point(i: usize) -> [f32; 2] {
+        [1.0, i as f32]
+    }
+
+    /// Rare row `j`: `[-(N - j), 1]`, farther than every near row and
+    /// nearest for the largest `j`, the reverse of the order rows are
+    /// written in. The cosines run from -0.71 to -0.98, well apart.
+    fn rare_point(j: usize) -> [f32; 2] {
+        [-((N_FAR_PAST_THE_CEILING - j) as f32), 1.0]
+    }
+
+    /// One superfile created with `options`, row `i` titled `rows[i].0` with
+    /// the vector [`graded_emb`] makes of `rows[i].1`.
+    fn supertable_of(options: SupertableOptions, rows: &[(String, [f32; 2])]) -> Supertable {
+        let st = Supertable::create(options).expect("create");
+        append_rows(&st, rows);
+        st
+    }
+
+    /// Append and commit `rows` as [`supertable_of`] lays them out.
+    fn append_rows(st: &Supertable, rows: &[(String, [f32; 2])]) {
+        let mut w = st.writer().expect("writer");
+        let titles =
+            LargeStringArray::from(rows.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>());
+        let points: Vec<[f32; 2]> = rows.iter().map(|(_, p)| *p).collect();
+        let batch = RecordBatch::try_new(
+            st.options().schema.clone(),
+            vec![Arc::new(titles), graded_emb(&points, PAST_THE_CEILING_DIM)],
+        )
+        .expect("batch");
+        w.append(&batch).expect("append");
+        w.commit().expect("commit");
+    }
+
+    /// [`N_NEAR_PAST_THE_CEILING`] near rows titled `common`, then the
+    /// [`N_FAR_PAST_THE_CEILING`] rare ones. Searching `common` near
+    /// `[1, 0, …]`, both legs rank every near row above every rare one, and
+    /// rank the rare rows the same way: `rare4` first, `rare0` last.
+    fn common_then_rare() -> Vec<(String, [f32; 2])> {
+        (0..N_NEAR_PAST_THE_CEILING)
+            .map(|i| ("common".to_owned(), near_point(i)))
+            .chain((0..N_FAR_PAST_THE_CEILING).map(|j| (rare_title(j), rare_point(j))))
+            .collect()
+    }
+
+    /// LocalFs-backed options for the past-the-ceiling tables: the drain and
+    /// deletes need storage.
+    fn options_on_disk(dir: &TempDir) -> SupertableOptions {
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        options_title_emb(PAST_THE_CEILING_DIM).with_storage(storage)
+    }
+
+    /// [`supertable_of`] [`common_then_rare`] on disk, every row drained
+    /// into the hidden vector index.
+    fn drained_common_then_rare(dir: &TempDir) -> Supertable {
+        let rows = common_then_rare();
+        let st = supertable_of(options_on_disk(dir), &rows);
+        st.drain_vectors_to_cells_sync().expect("drain");
+        let hidden = st.vector_index_table().expect("hidden index");
+        assert_eq!(
+            hidden.reader().expect("hidden reader").n_docs_total(),
+            rows.len() as u64,
+            "every row is in the vector index"
+        );
+        st
+    }
+
+    /// `SELECT {select}` from the `common` search near `[1, 0, …]` at `k`,
+    /// `WHERE title <> 'common'`: only the rare rows, and any tail, pass.
+    fn where_not_common(st: &Supertable, k: usize, select: &str) -> Vec<RecordBatch> {
+        let q = csv_one_hot(PAST_THE_CEILING_DIM, 0);
+        st.reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT {select} FROM hybrid_search('title', 'common', 'emb', '{q}', {k}) \
+                 WHERE title <> 'common'"
+            ))
+            .expect("filtered query_sql")
+    }
+
+    /// The `k` best rare rows of a [`common_then_rare`] table, best first,
+    /// each scored as both legs ranking it at its place among the rare rows:
+    /// the exact pass ranks each leg within exactly the rows the `WHERE`
+    /// keeps, then fuses. Every rare row comes back at a `k` past them all,
+    /// and an aggregate counts each one.
+    fn assert_hybrid_ranks_the_rare_rows(st: &Supertable) {
+        let k = 3;
+        let rows = where_not_common(st, k, "title, score");
+        let best: Vec<String> = (0..k)
+            .map(|r| rare_title(N_FAR_PAST_THE_CEILING - 1 - r))
+            .collect();
+        assert_eq!(strings_of(&rows, "title"), best, "the k best, best first");
+        for (rank, score) in scores(&rows).into_iter().enumerate() {
+            let both_legs = 2.0 / (RRF_K + 1.0 + rank as f32);
+            assert!(
+                (score - both_legs).abs() < f32::EPSILON,
+                "rank {rank}: both legs rank it {rank}th among the kept rows; got {score}"
+            );
+        }
+
+        let all = where_not_common(st, K_PAST_EVERY_MATCH, "title");
+        let every: Vec<String> = (0..N_FAR_PAST_THE_CEILING).rev().map(rare_title).collect();
+        assert_eq!(
+            strings_of(&all, "title"),
+            every,
+            "fewer than k match: every one of them, no more"
+        );
+        assert_eq!(
+            count_of(&where_not_common(st, K_PAST_EVERY_MATCH, "COUNT(*) AS n")),
+            N_FAR_PAST_THE_CEILING as i64
+        );
+    }
+
+    /// A predicate no index bounds, whose rows all rank past the widening's
+    /// ceiling in both legs: a short widening makes the function check the
+    /// predicate over the scope's rows and run both legs within exactly
+    /// those, so it still finds them, ranked as each leg ranks them there.
+    #[test]
+    fn hybrid_search_where_reaches_rows_past_the_fill_ceiling() {
+        let st = supertable_of(options_title_emb(PAST_THE_CEILING_DIM), &common_then_rare());
+        assert_hybrid_ranks_the_rare_rows(&st);
+    }
+
+    /// The same search on a table whose rows have been moved into the hidden
+    /// vector index: the vector leg's search over the exact pass's rows goes
+    /// through the index's cells, and ranks the rare rows the same way.
+    #[test]
+    fn hybrid_search_where_reaches_rows_past_the_fill_ceiling_in_the_vector_index() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = drained_common_then_rare(&dir);
+        assert_hybrid_ranks_the_rare_rows(&st);
+    }
+
+    /// A deleted row the `WHERE` would keep never comes back, and never
+    /// takes a place among the `k`: the exact pass leaves deleted rows out
+    /// of the rows both legs rank within.
+    #[test]
+    fn hybrid_search_where_past_the_fill_ceiling_skips_a_deleted_match() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = drained_common_then_rare(&dir);
+        let best = rare_title(N_FAR_PAST_THE_CEILING - 1);
+        st.delete(col("title").eq(lit(best.as_str())))
+            .expect("delete the best rare row");
+        let k = 3;
+        let next: Vec<String> = (1..=k)
+            .map(|r| rare_title(N_FAR_PAST_THE_CEILING - 1 - r))
+            .collect();
+        assert_eq!(
+            strings_of(&where_not_common(&st, k, "title"), "title"),
+            next,
+            "the k best of the rows still there"
+        );
+        assert_eq!(
+            count_of(&where_not_common(&st, K_PAST_EVERY_MATCH, "COUNT(*) AS n")),
+            N_FAR_PAST_THE_CEILING as i64 - 1
+        );
+    }
+
+    /// Rows the `WHERE` keeps on both sides of the drain: the rare rows in
+    /// the hidden vector index, and rows appended after it still only in
+    /// their user file. The exact pass reaches both.
+    #[test]
+    fn hybrid_search_where_past_the_fill_ceiling_reaches_drained_and_undrained_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = drained_common_then_rare(&dir);
+        let tail: Vec<(String, [f32; 2])> = (0..N_TAIL_PAST_THE_CEILING)
+            .map(|t| {
+                (
+                    format!("common tail{t}"),
+                    [-TAIL_STEP * (t + 1) as f32, 1.0],
+                )
+            })
+            .collect();
+        append_rows(&st, &tail);
+        let mut found = strings_of(&where_not_common(&st, K_PAST_EVERY_MATCH, "title"), "title");
+        found.sort();
+        let mut expected: Vec<String> = (0..N_FAR_PAST_THE_CEILING)
+            .map(rare_title)
+            .chain(tail.into_iter().map(|(title, _)| title))
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected, "every kept row, drained or not");
+    }
+
+    /// Rows in the within-the-ceiling test: few enough that a small `k`'s
+    /// ceiling covers the whole table.
+    const N_WITHIN_THE_CEILING: usize = OVER_FETCH_MIN_CEILING / 2;
+
+    /// On a table no larger than the widening's ceiling the exact pass never
+    /// runs: the last round asks both legs for every row, and that has to
+    /// reach rows the text doesn't match and the vector ranks last. Here the
+    /// kept rows are exactly those, so the widening alone must find them all.
+    #[test]
+    fn hybrid_search_where_within_the_fill_ceiling_reaches_the_farthest_rows() {
+        let rows: Vec<(String, [f32; 2])> = (0..N_WITHIN_THE_CEILING)
+            .map(|i| ("common".to_owned(), near_point(i)))
+            .chain((0..N_FAR_PAST_THE_CEILING).map(|j| (format!("rare{j}"), rare_point(j))))
+            .collect();
+        let st = supertable_of(options_title_emb(PAST_THE_CEILING_DIM), &rows);
+        let nearest_first: Vec<String> = (0..N_FAR_PAST_THE_CEILING)
+            .rev()
+            .map(|j| format!("rare{j}"))
+            .collect();
+        assert_eq!(
+            strings_of(&where_not_common(&st, K_PAST_EVERY_MATCH, "title"), "title"),
+            nearest_first,
+            "every kept row, nearest first"
+        );
+    }
+
+    /// A `WHERE` the widening fills `k` for keeps the widening's answer on a
+    /// table past the ceiling: the exact pass never runs. The predicate is
+    /// one no index bounds, and the text matches nothing, so each score is
+    /// the vector leg's rank alone, over the whole table: the rows ranked
+    /// 2nd to 4th behind the one row the predicate rejects. Ranked within
+    /// only the kept rows, as the exact pass would, they would score as 1st
+    /// to 3rd.
+    #[test]
+    fn hybrid_search_where_that_fills_k_keeps_the_widened_ranks() {
+        let rows: Vec<(String, [f32; 2])> = (0..N_NEAR_PAST_THE_CEILING)
+            .map(|i| {
+                let title = if i == 0 { "nearest" } else { "common" };
+                (title.to_owned(), near_point(i))
+            })
+            .collect();
+        let st = supertable_of(options_title_emb(PAST_THE_CEILING_DIM), &rows);
+        let q = csv_one_hot(PAST_THE_CEILING_DIM, 0);
+        let k = 3;
+        let got = st
+            .reader()
+            .expect("reader")
+            .query_sql(&format!(
+                "SELECT score FROM hybrid_search('title', 'absent', 'emb', '{q}', {k}) \
+                 WHERE title <> 'nearest'"
+            ))
+            .expect("filtered query_sql");
+        let widened: Vec<f32> = (1..=k).map(|r| 1.0 / (RRF_K + 1.0 + r as f32)).collect();
+        assert_eq!(scores(&got), widened, "ranked over the whole table");
     }
 
     #[test]
