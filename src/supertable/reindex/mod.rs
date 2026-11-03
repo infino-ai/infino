@@ -156,7 +156,7 @@ fn footer_state(reader: &SuperfileReader, offsets: Option<&SubsectionOffsets>) -
     let metadata = reader.parquet_metadata();
     // A reindex input is always opened whole; one that is not cannot be
     // checked against its bytes, so it is left alone like any other doubt.
-    let (Some(resolved), Some(bytes)) = (resolved_regions(metadata), reader.whole_file_bytes())
+    let (Some(resolved), Some(bytes)) = (resolved_regions(&metadata), reader.whole_file_bytes())
     else {
         return FooterState::Inconsistent;
     };
@@ -170,7 +170,7 @@ fn footer_state(reader: &SuperfileReader, offsets: Option<&SubsectionOffsets>) -
         offsets.is_none_or(|o| agrees(o.fts, resolved.fts) && agrees(o.vec, resolved.vec));
     match (
         in_file && matches_manifest,
-        has_duplicated_region_key(metadata),
+        has_duplicated_region_key(&metadata),
     ) {
         (false, _) => FooterState::Inconsistent,
         (true, true) => FooterState::DuplicatedKeys,
@@ -1192,7 +1192,7 @@ mod tests {
                 .expect("read superfile");
             let reader = SuperfileReader::open(bytes).expect("open superfile");
             assert!(
-                !has_duplicated_region_key(reader.parquet_metadata()),
+                !has_duplicated_region_key(&reader.parquet_metadata()),
                 "{}: footer still stores a region key twice",
                 entry.storage_path()
             );

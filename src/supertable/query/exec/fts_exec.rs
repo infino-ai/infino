@@ -38,7 +38,7 @@
 //! kernel admits into its heap. The function then ranks within the scope,
 //! applies the exact predicate to the rows it gets, and widens the search
 //! until `k` survive or the fill's ceiling is reached
-//! ([`over_fetch_ceiling`]). Stopped short at a ceiling below the table's
+//! ([`fill_ceiling`]). Stopped short at a ceiling below the table's
 //! size, the rows the predicate keeps may rank below everything it looked
 //! at: the function then checks the predicate on the rows the query's
 //! terms match ([`SupertableReader::match_scope`], [`exact_scope`]) and
@@ -78,8 +78,9 @@ use crate::{
             candidate::CandidateScope,
             exec::common::{
                 PushedPredicate, arg_to_string, arg_to_usize, candidate_plan_for_filters,
-                exact_scope, fill_top_k_within, live_reader, output_schema_with_score,
-                over_fetch_ceiling, scope_to_call, top_k_statistics, traced_tvf,
+                exact_scope, fill_ceiling, fill_top_k_within, live_reader,
+                output_schema_with_score, scope_to_call, top_k_statistics, traced_tvf,
+                widening_ended_short,
             },
         },
     },
@@ -465,10 +466,7 @@ impl ExecutionPlan for Bm25Exec {
             else {
                 return Ok(widened);
             };
-            let total = usize::try_from(reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-            if widened.num_rows() >= k || over_fetch_ceiling(k, total) >= total {
-                // Either `k` passed, or the ceiling let the search rank every
-                // row and the rows it returned are all there are.
+            if !widening_ended_short(&reader, k, widened.num_rows()) {
                 return Ok(widened);
             }
             // Short at the ceiling: rows the predicate keeps may rank below
@@ -550,17 +548,13 @@ impl RankedCall<'_> {
 
     /// The call's `k` rows within `scope` under the predicate, widening to
     /// at most `ceiling` hits a round — `None` is the fill's own ceiling
-    /// ([`over_fetch_ceiling`]), `Some(k)` exactly one round.
+    /// ([`fill_ceiling`]), `Some(k)` exactly one round.
     async fn rows(
         &self,
         scope: Option<&CandidateScope>,
         ceiling: Option<usize>,
     ) -> DfResult<RecordBatch> {
-        let ceiling = ceiling.unwrap_or_else(|| {
-            let total =
-                usize::try_from(self.reader.manifest().n_docs_total()).unwrap_or(usize::MAX);
-            over_fetch_ceiling(self.k, total)
-        });
+        let ceiling = ceiling.unwrap_or_else(|| fill_ceiling(self.reader, self.k));
         fill_top_k_within(
             self.reader,
             self.k,
