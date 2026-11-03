@@ -108,7 +108,7 @@ use std::{
 use bumpalo::Bump;
 use hashbrown::hash_map::{HashMap as HbHashMap, RawEntryMut};
 use memmap2::Mmap;
-use rayon::{current_num_threads, prelude::*};
+use rayon::ThreadPool;
 use rustc_hash::FxBuildHasher;
 use tempfile::{Builder, TempDir};
 use tracing::debug;
@@ -136,6 +136,7 @@ use crate::{
         id_space::FtsDocId,
     },
     utils::{
+        join::run_spawned,
         terms::{DictEntry, INLINE_TF_MAX, TermBlockWriter, TermDictBuilder, validate_column_name},
         trace::{detail_span, record},
         varint::push_varint,
@@ -1659,19 +1660,67 @@ pub(crate) struct FrozenLanes {
     pieces: Vec<Range<u32>>,
 }
 
+/// The most lanes a commit may be fed through: a merged order names each
+/// entry's lane in a byte.
+pub(crate) const MAX_LANES: usize = u8::MAX as usize;
+
 /// Merge `lanes`' dictionaries, column by column, into the order the
 /// pieces walk. The lanes must hold the same columns. The term space is
 /// cut into as many ranges as the pool has threads, at terms taken from
 /// the longest lane's dictionary, and the ranges merge side by side: a
 /// term is one value in every lane, so no term straddles a cut.
-/// The most lanes a commit may be fed through: a merged order names each
-/// entry's lane in a byte.
-pub(crate) const MAX_LANES: usize = u8::MAX as usize;
-
+///
+/// For a caller outside `pool`: the cuts and the range merges go to the
+/// pool as spawned tasks the caller waits for, so no pool thread waits for
+/// another's work. Run under `install`, the merge's own waits ran other
+/// commits' seals meanwhile, and a merge of two seconds' work took
+/// seventeen.
 pub(crate) fn freeze_lanes(
-    mut lanes: Vec<FrozenLane>,
+    pool: &ThreadPool,
+    lanes: Vec<FrozenLane>,
     pieces: Vec<Range<u32>>,
 ) -> Result<FrozenLanes, BuildError> {
+    fn lost() -> BuildError {
+        BuildError::Io(Error::other("a lane merge task ended without a result"))
+    }
+    check_lanes(&lanes)?;
+    let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
+    let shared_pieces = Arc::new(pieces.clone());
+    let lanes = run_spawned(
+        pool,
+        lanes,
+        move |_, mut lane| {
+            cut_lane(&mut lane, &shared_pieces);
+            Ok(lane)
+        },
+        lost,
+    )?;
+    let lanes = Arc::new(lanes);
+    let ranges = pool.current_num_threads().max(1);
+    let mut order = Vec::with_capacity(n_columns);
+    for column in 0..n_columns {
+        let spans = merge_spans(&lanes, column, ranges);
+        let shared = Arc::clone(&lanes);
+        let merged = run_spawned(
+            pool,
+            spans,
+            move |_, spans| Ok(merge_term_range(&shared, column, &spans)),
+            lost,
+        )?;
+        order.push(merged.concat());
+    }
+    let lanes = Arc::try_unwrap(lanes)
+        .map_err(|_| BuildError::Io(Error::other("a lane merge task still holds the lanes")))?;
+    Ok(FrozenLanes {
+        lanes,
+        order,
+        pieces,
+    })
+}
+
+/// The lanes a commit may seal: no more than a merged order can name,
+/// all holding the same columns.
+fn check_lanes(lanes: &[FrozenLane]) -> Result<(), BuildError> {
     if lanes.len() > MAX_LANES {
         return Err(BuildError::Io(Error::other("too many fts lanes")));
     }
@@ -1682,90 +1731,77 @@ pub(crate) fn freeze_lanes(
             "fts lanes must hold the same columns",
         )));
     }
-    let n_columns = lanes.first().map_or(0, |lane| lane.columns.len());
-    // Where each piece's postings start in every list that spans more
-    // than one piece: one pass over the list, in step with the pieces,
-    // in place of a search per piece at the seal.
-    lanes.par_iter_mut().for_each(|lane| {
-        let bounds: Vec<usize> = pieces
-            .iter()
-            .map(|piece| docs_before_row(&lane.stretches, piece.start))
-            .chain(
-                pieces
-                    .last()
-                    .map(|last| docs_before_row(&lane.stretches, last.end)),
-            )
-            .collect();
-        let piece_of = |doc: u32| bounds.partition_point(|&b| b <= doc as usize) - 1;
-        for col in &mut lane.columns {
-            col.cut_at = vec![u32::MAX; col.postings.len()];
-            col.cuts.clear();
-            for (id, list) in col.postings.iter().enumerate() {
-                let (Some(&(first, _)), Some(&(last, _))) = (list.first(), list.last()) else {
-                    continue;
-                };
-                if piece_of(first) == piece_of(last) {
-                    continue;
+    Ok(())
+}
+
+/// Where each piece's postings start in every list of `lane` that spans
+/// more than one piece: one pass over the list, in step with the pieces,
+/// in place of a search per piece at the seal.
+fn cut_lane(lane: &mut FrozenLane, pieces: &[Range<u32>]) {
+    let bounds: Vec<usize> = pieces
+        .iter()
+        .map(|piece| docs_before_row(&lane.stretches, piece.start))
+        .chain(
+            pieces
+                .last()
+                .map(|last| docs_before_row(&lane.stretches, last.end)),
+        )
+        .collect();
+    let piece_of = |doc: u32| bounds.partition_point(|&b| b <= doc as usize) - 1;
+    for col in &mut lane.columns {
+        col.cut_at = vec![u32::MAX; col.postings.len()];
+        col.cuts.clear();
+        for (id, list) in col.postings.iter().enumerate() {
+            let (Some(&(first, _)), Some(&(last, _))) = (list.first(), list.last()) else {
+                continue;
+            };
+            if piece_of(first) == piece_of(last) {
+                continue;
+            }
+            col.cut_at[id] = col.cuts.len() as u32;
+            let mut at = 0usize;
+            for &bound in &bounds {
+                while at < list.len() && (list[at].0 as usize) < bound {
+                    at += 1;
                 }
-                col.cut_at[id] = col.cuts.len() as u32;
-                let mut at = 0usize;
-                for &bound in &bounds {
-                    while at < list.len() && (list[at].0 as usize) < bound {
-                        at += 1;
-                    }
-                    col.cuts.push(at as u32);
-                }
+                col.cuts.push(at as u32);
             }
         }
-    });
-    let ranges = current_num_threads().max(1);
-    let order = (0..n_columns)
-        .map(|column| {
-            let longest = lanes
-                .iter()
-                .map(|lane| &lane.columns[column])
-                .max_by_key(|col| col.n_terms());
-            let Some(longest) = longest else {
-                return Vec::new();
-            };
-            // The terms the ranges start at, after the first.
-            let pivots: Vec<&str> = (1..ranges)
-                .map(|r| longest.n_terms() * r / ranges)
-                .filter(|&at| at < longest.n_terms())
-                .map(|at| longest.term(at as u32))
-                .collect();
-            // Each lane's dictionary index at every cut.
-            let cuts: Vec<Vec<usize>> = lanes
-                .iter()
-                .map(|lane| {
-                    let col = &lane.columns[column];
-                    let mut cuts = vec![0usize];
-                    cuts.extend(pivots.iter().map(|pivot| col.lower_bound(pivot)));
-                    cuts.push(col.n_terms());
-                    cuts
-                })
-                .collect();
-            let merged: Vec<Vec<OrderedTerm>> = (0..pivots.len() + 1)
-                .into_par_iter()
-                .map(|range| {
-                    merge_term_range(
-                        &lanes,
-                        column,
-                        &cuts
-                            .iter()
-                            .map(|c| c[range]..c[range + 1])
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .collect();
-            merged.concat()
+    }
+}
+
+/// The term space of `column` cut into up to `ranges` ranges at terms
+/// taken from the longest lane's dictionary — a term is one value in
+/// every lane, so no term straddles a cut — as each lane's dictionary
+/// span per range. Empty when no lane has the column.
+fn merge_spans(lanes: &[FrozenLane], column: usize, ranges: usize) -> Vec<Vec<Range<usize>>> {
+    let longest = lanes
+        .iter()
+        .map(|lane| &lane.columns[column])
+        .max_by_key(|col| col.n_terms());
+    let Some(longest) = longest else {
+        return Vec::new();
+    };
+    // The terms the ranges start at, after the first.
+    let pivots: Vec<&str> = (1..ranges)
+        .map(|r| longest.n_terms() * r / ranges)
+        .filter(|&at| at < longest.n_terms())
+        .map(|at| longest.term(at as u32))
+        .collect();
+    // Each lane's dictionary index at every cut.
+    let cuts: Vec<Vec<usize>> = lanes
+        .iter()
+        .map(|lane| {
+            let col = &lane.columns[column];
+            let mut cuts = vec![0usize];
+            cuts.extend(pivots.iter().map(|pivot| col.lower_bound(pivot)));
+            cuts.push(col.n_terms());
+            cuts
         })
         .collect();
-    Ok(FrozenLanes {
-        lanes,
-        order,
-        pieces,
-    })
+    (0..pivots.len() + 1)
+        .map(|range| cuts.iter().map(|c| c[range]..c[range + 1]).collect())
+        .collect()
 }
 
 /// Merge the dictionary entries `spans[lane]` of every lane's `column`
@@ -3265,6 +3301,9 @@ impl FtsBuilder {
                     column = col_name.as_str(),
                     inputs = sorted_inputs.len(),
                     terms = tracing::field::Empty,
+                    walk_wait_ms = tracing::field::Empty,
+                    encode_ms = tracing::field::Empty,
+                    write_ms = tracing::field::Empty,
                 )
                 .entered();
                 let profiling = finish_profile.enabled;
@@ -5100,6 +5139,7 @@ mod tests {
     use std::any::Any;
 
     use bytes::Bytes;
+    use rayon::ThreadPoolBuilder;
     use tempfile::tempdir;
 
     use super::*;
@@ -5266,7 +5306,11 @@ mod tests {
             .into_iter()
             .map(|(lane, rows)| lane.freeze(stretches_of(&rows)).expect("freeze"))
             .collect();
-        let frozen = Arc::new(freeze_lanes(frozen, pieces).expect("merge the lanes"));
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let frozen = Arc::new(freeze_lanes(&pool, frozen, pieces).expect("merge the lanes"));
         let mut b = two_column_builder();
         b.set_lane_view(LaneView {
             lanes: frozen,

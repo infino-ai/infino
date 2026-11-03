@@ -67,7 +67,9 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
+    pin::pin,
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
@@ -126,7 +128,7 @@ use crate::{
         op_stats::{self, OpStatsCollector, timed_kernel},
         rss::available_memory_bytes,
     },
-    storage::{StorageError, StorageProvider},
+    storage::{StorageError, StorageProvider, stuck_after},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
@@ -194,8 +196,8 @@ use crate::{
             part::{self as part_mod, PartId},
             superfile_stem,
             term_index::{
-                self, Contribution as TermContribution, ReservedLayer, Root, RootObjects,
-                TermIndexError,
+                self, Contribution as TermContribution, ReservedLayer, ReservedSegment, Root,
+                RootObjects, TermIndexError,
             },
         },
         mutations::{
@@ -231,7 +233,10 @@ use crate::{
             },
         },
     },
-    utils::trace::{self, detail_span, record},
+    utils::{
+        join::run_spawned,
+        trace::{self, detail_span, record},
+    },
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -1446,11 +1451,14 @@ impl WriterSlot {
     }
 }
 
-/// Orders the publishes of shared append writers. Each takes a ticket and a
-/// term-index base once its superfiles are uploaded, then publishes in ticket
-/// order, so its base is the root's length on its turn and its prebuilt
-/// layer is appended as is. A base the root no longer matches (another
-/// writer or an optimize moved it) costs a rebuild at the root's length.
+/// Groups the publishes of shared append writers. One publish runs at a
+/// time: a ticket whose publish is ready while none runs leads, taking
+/// every other ready publish parked on the queue into its own manifest
+/// write and root write; one that finds a publish running parks and waits
+/// for its result, or leads itself when the running one ends and it is the
+/// oldest parked. A term-index layer stores its ordinals relative to a base
+/// the root gives it when it is placed, so publishes need no order among
+/// themselves and nothing is rebuilt.
 #[derive(Default)]
 pub(super) struct AppendQueue {
     state: Mutex<AppendQueueState>,
@@ -1460,15 +1468,31 @@ pub(super) struct AppendQueue {
 #[derive(Default)]
 struct AppendQueueState {
     issued: u64,
-    serving: u64,
-    /// The root the queue last published, and its length.
-    published_root: Option<RoutingRef>,
-    published_end: u32,
-    /// Superfiles reserved by tickets not yet served.
-    pending: u32,
-    /// Prebuilt layers the commit had to rebuild on their turn.
-    #[cfg(test)]
-    rebuilt: usize,
+    /// Whether a ticket is publishing now.
+    publishing: bool,
+    /// Publishes ready and waiting, by ticket, for the publishing ticket
+    /// to take with its own.
+    parked: BTreeMap<u64, ParkedPublish>,
+    /// What a leading ticket published for the tickets it took on, by
+    /// ticket, until each collects it.
+    results: BTreeMap<u64, Result<(), BuildError>>,
+}
+
+/// A publish ready to go, parked on the [`AppendQueue`].
+struct ParkedPublish {
+    number: u64,
+    batch: SuperfilePublishBatch,
+    list_metadata: CommitListMetadata,
+    segment: ReservedSegment,
+}
+
+/// What a ticket does once its publish is ready.
+enum Turn {
+    /// Publish this run — its own first, then the ready tickets queued
+    /// consecutively behind it.
+    Lead(Vec<ParkedPublish>),
+    /// A leading ticket published it; this is the outcome.
+    Published(Result<(), BuildError>),
 }
 
 impl AppendQueue {
@@ -1476,69 +1500,144 @@ impl AppendQueue {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// A ticket and the base for a layer of `superfiles`, or no base when
-    /// `root` is not the root the queue last published: its length is then
-    /// unknown, so the layer is built on the ticket's turn instead.
-    fn reserve(
-        &self,
-        root: Option<&RoutingRef>,
-        superfiles: u32,
-    ) -> (AppendTicket<'_>, Option<u32>) {
+    /// A ticket for a publish.
+    fn reserve(&self) -> AppendTicket<'_> {
         let mut state = self.lock();
-        let base = (state.published_root.as_ref() == root)
-            .then_some(state.published_end.saturating_add(state.pending));
-        state.pending += superfiles;
         let ticket = AppendTicket {
             queue: self,
             number: state.issued,
-            superfiles,
-            published: None,
+            leading: false,
+            grouped: false,
+            followers: Vec::new(),
         };
         state.issued += 1;
-        (ticket, base)
-    }
-}
-
-/// A place in the [`AppendQueue`]. Dropping it waits for its turn and passes
-/// the turn on, so an append that fails before publishing never stalls the
-/// ones behind it.
-struct AppendTicket<'a> {
-    queue: &'a AppendQueue,
-    number: u64,
-    superfiles: u32,
-    /// The root this append published and its length, recorded on drop in
-    /// the same critical section that passes the turn on.
-    published: Option<(Option<RoutingRef>, u32)>,
-}
-
-impl<'a> AppendTicket<'a> {
-    fn published(&mut self, root: Option<RoutingRef>, end: u32) {
-        self.published = Some((root, end));
+        ticket
     }
 
-    fn wait_turn(&self) -> MutexGuard<'a, AppendQueueState> {
-        let mut state = self.queue.lock();
-        while state.serving != self.number {
+    /// Lead or follow with `parked`, `ticket`'s publish. A ticket that
+    /// finds no publish running leads, taking every parked publish whose
+    /// list metadata can share its own; one that finds a publish running
+    /// parks and waits for its result or, once the running publish ends
+    /// and it is the oldest parked, leads itself. The publish is
+    /// object-store latency paid once however many were waiting, and at
+    /// thirty appends in flight it set the table's commit rate.
+    fn lead_or_follow(&self, ticket: &mut AppendTicket<'_>, parked: ParkedPublish) -> Turn {
+        let mut state = self.lock();
+        if !state.publishing {
+            state.publishing = true;
+            return Turn::Lead(lead_run(ticket, &mut state, parked));
+        }
+        state.parked.insert(ticket.number, parked);
+        loop {
             state = self
-                .queue
                 .turn
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+            if let Some(result) = state.results.remove(&ticket.number) {
+                ticket.grouped = true;
+                return Turn::Published(result);
+            }
+            if !state.publishing && state.parked.keys().next() == Some(&ticket.number) {
+                state.publishing = true;
+                let mine = state
+                    .parked
+                    .remove(&ticket.number)
+                    .expect("parked by this ticket; a leader that took it left a result");
+                return Turn::Lead(lead_run(ticket, &mut state, mine));
+            }
         }
-        state
     }
+
+    /// Record what the leading `ticket` published for the tickets it took
+    /// on, and wake them. Each sees the leader's error of the same kind, so
+    /// refused credentials or a lost race read the same to every append
+    /// the publish carried.
+    fn publish_followers(&self, ticket: &mut AppendTicket<'_>, result: &Result<(), BuildError>) {
+        answer_followers(self, ticket, |_| match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.for_follower()),
+        });
+    }
+}
+
+/// Answer the tickets `ticket` took on with `outcome`, and wake them.
+fn answer_followers(
+    queue: &AppendQueue,
+    ticket: &mut AppendTicket<'_>,
+    outcome: impl Fn(u64) -> Result<(), BuildError>,
+) {
+    let followers = mem::take(&mut ticket.followers);
+    if followers.is_empty() {
+        return;
+    }
+    let mut state = queue.lock();
+    for number in followers {
+        state.results.insert(number, outcome(number));
+    }
+    drop(state);
+    queue.turn.notify_all();
+}
+
+/// Make `ticket` the leader of `mine` and the parked publishes it can take
+/// on, and record which tickets it owes an answer.
+fn lead_run(
+    ticket: &mut AppendTicket<'_>,
+    state: &mut AppendQueueState,
+    mine: ParkedPublish,
+) -> Vec<ParkedPublish> {
+    ticket.leading = true;
+    let run = take_run(state, mine);
+    ticket.followers = run[1..].iter().map(|parked| parked.number).collect();
+    run
+}
+
+/// `mine` and every parked publish its list metadata can share a publish
+/// with, oldest first, taken off the queue.
+fn take_run(state: &mut AppendQueueState, mine: ParkedPublish) -> Vec<ParkedPublish> {
+    let taken: Vec<u64> = state
+        .parked
+        .iter()
+        .filter(|(_, parked)| parked.list_metadata.groups_with(&mine.list_metadata))
+        .map(|(number, _)| *number)
+        .collect();
+    let mut run = vec![mine];
+    run.extend(
+        taken
+            .into_iter()
+            .map(|number| state.parked.remove(&number).expect("seen under the lock")),
+    );
+    run
+}
+
+/// A place in the [`AppendQueue`]. Dropping a ticket that led a publish
+/// lets the next one run, so an append that fails while publishing never
+/// stalls the ones behind it; a ticket that never led holds nothing.
+struct AppendTicket<'a> {
+    queue: &'a AppendQueue,
+    number: u64,
+    /// Whether this ticket holds the queue's one publish.
+    leading: bool,
+    /// Published by the ticket leading it.
+    grouped: bool,
+    /// The tickets this one leads a publish for and has not yet answered.
+    followers: Vec<u64>,
 }
 
 impl Drop for AppendTicket<'_> {
     fn drop(&mut self) {
-        let published = self.published.take();
-        let mut state = self.wait_turn();
-        if let Some((root, end)) = published {
-            state.published_root = root;
-            state.published_end = end;
+        if !self.leading {
+            return;
         }
-        state.pending -= self.superfiles;
-        state.serving += 1;
+        // A leader that unwinds before it answers the tickets it took on
+        // would leave them waiting for ever: they are off the parked list,
+        // so none of them can lead. They fail as the leader did.
+        answer_followers(self.queue, self, |_| {
+            Err(BuildError::Store(
+                "the append publishing this one ended before it finished".into(),
+            ))
+        });
+        let mut state = self.queue.lock();
+        state.publishing = false;
         drop(state);
         self.queue.turn.notify_all();
     }
@@ -2338,16 +2437,6 @@ impl SupertableWriter {
         let wal_store = WalStore::new(Arc::clone(&storage));
         let supertable = Supertable::from_inner(Arc::clone(&self.inner));
         let wal_id = entry.wal_id;
-        // The hidden vector-index cells are not rewritten on a user delete, so
-        // the deleted rows stay physically present in them. Record the resolved
-        // user `_id`s into the hidden index's resident deleted-set so vector
-        // search drops them in memory (zero per-cell tombstone GETs).
-        let hidden_inner = self
-            .inner
-            .vector_index_table
-            .as_ref()
-            .map(|vit| Arc::clone(vit.inner()));
-        let deleted_ids: Vec<i128> = entry.target_ids.clone();
         let owner = self.inner.handle_id;
         let drive = async move {
             let etag = wal_store
@@ -2374,15 +2463,6 @@ impl SupertableWriter {
                 } => (n_tombstoned, n_not_found),
             };
             let _ = wal_store.delete_state(wal_id).await;
-            if let Some(hi) = hidden_inner
-                && let Err(e) = record_hidden_deleted_ids(&hi, &deleted_ids).await
-            {
-                tracing::warn!(
-                    "supertable: hidden vector-index deleted-set record failed: {e} \
-                     (user-table delete is durable; vector search may transiently \
-                     return deleted rows until the next successful record)"
-                );
-            }
             Ok::<_, MutationError>((n_t, n_nf))
         };
         let (n_tombstoned, n_not_found) = bridge_on_runtime(drive, &self.inner.query_runtime())?;
@@ -2543,6 +2623,11 @@ impl SupertableWriter {
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
+                // The lanes are opened once, before the append's rows are
+                // all known, so their count follows the pool, not the rows
+                // buffered so far: those are one superfile's worth, and a
+                // large append fed through the few lanes they would ask for
+                // would tokenise on a few threads.
                 let n_lanes = options
                     .writer_pool
                     .current_num_threads()
@@ -2649,35 +2734,63 @@ impl SupertableWriter {
             .map(|b| try_conform(&b.scalar, &scalar_schema))
             .collect::<Result<_, _>>()
             .map_err(|e| BuildError::Store(format!("live lanes: conform the buffer: {e}")))?;
-        // The seal is the append's own CPU, measured on the pool threads
-        // that run it like a commit-time build's pieces: the lanes frozen
-        // side by side, then every piece built from its rows of them.
-        let outputs: Vec<ShardOutput> = options.writer_pool.install(|| {
-            let frozen: Vec<FrozenLane> = lanes
-                .into_par_iter()
-                .map(|lane| timed_kernel(&stats, || Ok(lane.builder.freeze(lane.stretches)?)))
-                .collect::<Result<_, BuildError>>()?;
-            let frozen = Arc::new(freeze_lanes(frozen, pieces)?);
-            (0..n_pieces)
-                .into_par_iter()
-                .map(|i| {
-                    timed_kernel(&stats, || {
-                        let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
-                        build_piece(
-                            PieceRows::Lanes {
-                                batches: &rows,
-                                lanes: Arc::clone(&frozen),
-                                piece: i,
-                            },
-                            &options,
-                            &manifest,
-                            options.vector_layout,
-                            None,
-                        )
-                    })
+        // The seal is the append's own CPU, run on the pool as spawned
+        // tasks this thread waits for (`run_spawned`): the lanes frozen
+        // side by side, their dictionaries merged into the pieces' order,
+        // then every piece built from its rows of them.
+        let pool = &options.writer_pool;
+        fn seal_task_lost() -> BuildError {
+            BuildError::Store("a seal task ended without a result".into())
+        }
+        let freeze_span = detail_span!("seal.freeze_lanes", lanes = lanes.len()).entered();
+        let freeze_stats = stats.clone();
+        let frozen: Vec<FrozenLane> = run_spawned(
+            pool,
+            lanes,
+            move |_, lane| {
+                let _span = detail_span!(
+                    "lane.freeze",
+                    docs = lane.stretches.iter().map(|s| s.len).sum::<u32>()
+                )
+                .entered();
+                timed_kernel(&freeze_stats, || Ok(lane.builder.freeze(lane.stretches)?))
+            },
+            seal_task_lost,
+        )?;
+        drop(freeze_span);
+        let merge_span = detail_span!("seal.merge_lanes", pieces = n_pieces).entered();
+        let frozen = Arc::new(freeze_lanes(pool, frozen, pieces)?);
+        drop(merge_span);
+        let pieces_span = detail_span!("seal.build_pieces", pieces = n_pieces).entered();
+        let (batches, bounds) = (Arc::new(batches), Arc::new(bounds));
+        let (piece_options, piece_manifest, piece_stats) =
+            (Arc::clone(&options), Arc::clone(&manifest), stats.clone());
+        // A spawned task starts no span of its own, so each piece's is
+        // parented here to read beside its append's.
+        let parent = Span::current();
+        let outputs: Vec<ShardOutput> = run_spawned(
+            pool,
+            (0..n_pieces).collect(),
+            move |i, _| {
+                let _span = detail_span!("piece.build", parent: &parent, piece = i).entered();
+                timed_kernel(&piece_stats, || {
+                    let rows = piece_batches(&batches, bounds[i], bounds[i + 1]);
+                    build_piece(
+                        PieceRows::Lanes {
+                            batches: &rows,
+                            lanes: Arc::clone(&frozen),
+                            piece: i,
+                        },
+                        &piece_options,
+                        &piece_manifest,
+                        piece_options.vector_layout,
+                        None,
+                    )
                 })
-                .collect::<Result<Vec<_>, BuildError>>()
-        })?;
+            },
+            seal_task_lost,
+        )?;
+        drop(pieces_span);
         let sealed = sealing.elapsed();
         let superfiles = outputs.len();
         let cell_hints = vec![None; superfiles];
@@ -3285,85 +3398,78 @@ impl SupertableWriter {
         list_metadata
             .check_schema(&self.inner.manifest.load())
             .map_err(BuildError::from)?;
-        let current_root = || self.inner.manifest.load().term_index_ref().cloned();
         let mut layer = None;
-        let mut prebuilt_end = None;
-        let mut ticket = match &self.inner.options.storage {
-            None => self.inner.append_queue.reserve(None, 0).0,
-            Some(storage) => {
-                bridge_on_runtime(
-                    write_superfile_list(
-                        storage,
-                        &self.inner.options,
-                        &mut batch.pending_storage_writes,
-                        &mut Vec::new(),
-                    ),
-                    &runtime,
-                )?;
-                let contributions = &batch.term_contributions;
-                let (ticket, base) = self
-                    .inner
-                    .append_queue
-                    .reserve(current_root().as_ref(), contributions.len() as u32);
-                if !contributions.is_empty() {
-                    let base = match base {
-                        Some(base) => {
-                            prebuilt_end = Some(base + contributions.len() as u32);
-                            base
-                        }
-                        None => {
-                            drop(ticket.wait_turn());
-                            match current_root() {
-                                Some(root) => bridge_on_runtime(
-                                    term_index::load_root(storage.as_ref(), &root),
-                                    &runtime,
-                                )
-                                .map_or(0, |root| root.superfiles.len() as u32),
-                                None => 0,
-                            }
-                        }
-                    };
-                    layer = Some(
-                        bridge_on_runtime(
-                            term_index::reserve_layer(
-                                storage,
-                                contributions,
-                                &self.inner.options.term_index_build_policy(),
-                                base,
-                            ),
-                            &runtime,
-                        )
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                    );
-                }
-                ticket
+        let mut ticket = self.inner.append_queue.reserve();
+        if let Some(storage) = &self.inner.options.storage {
+            let list_span = detail_span!("publish.write_list").entered();
+            bridge_on_runtime(
+                write_superfile_list(
+                    storage,
+                    &self.inner.options,
+                    &mut batch.pending_storage_writes,
+                    &mut Vec::new(),
+                ),
+                &runtime,
+            )?;
+            drop(list_span);
+            let contributions = &batch.term_contributions;
+            if !contributions.is_empty() {
+                let reserve_span =
+                    detail_span!("publish.reserve_layer", inputs = contributions.len()).entered();
+                layer = Some(
+                    bridge_on_runtime(
+                        term_index::reserve_layer(
+                            storage,
+                            contributions,
+                            &self.inner.options.term_index_build_policy(),
+                        ),
+                        &runtime,
+                    )
+                    .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                drop(reserve_span);
             }
+        }
+        let wait_span = detail_span!("publish.wait_turn").entered();
+        let parked = ParkedPublish {
+            number: ticket.number,
+            segment: ReservedSegment {
+                contributions: batch.term_contributions.len(),
+                layer,
+            },
+            batch,
+            list_metadata,
         };
-        drop(ticket.wait_turn());
+        let mut run = match self.inner.append_queue.lead_or_follow(&mut ticket, parked) {
+            Turn::Lead(run) => run,
+            Turn::Published(result) => return result,
+        };
+        drop(wait_span);
+        let _turn_span = detail_span!("publish.turn", publishes = run.len()).entered();
+        // This ticket's own publish first, then the ones it took on, oldest
+        // first; each layer is placed where the root's list ends when its
+        // turn in the run comes.
+        let mut lead = run.remove(0);
+        let mut segments = vec![lead.segment];
+        for follower in run {
+            lead.batch.absorb(follower.batch);
+            segments.push(follower.segment);
+        }
         let published = bridge_on_runtime(
             persist_superfile_publish_batch_async(
                 &self.inner,
-                batch,
-                list_metadata,
-                Some(&mut layer),
+                lead.batch,
+                lead.list_metadata,
+                Some(&mut segments),
             ),
             &runtime,
         );
-        if let (Ok(root), Some(layer)) = (&published, &layer) {
-            ticket.published(root.clone(), layer.end());
-            if prebuilt_end.is_some_and(|end| end != layer.end()) {
-                debug!(
-                    end = layer.end(),
-                    "append's prebuilt term-index layer was rebuilt on its turn"
-                );
-                #[cfg(test)]
-                {
-                    self.inner.append_queue.lock().rebuilt += 1;
-                }
-            }
-        }
+        let published = published.map(drop);
+        self.inner
+            .append_queue
+            .publish_followers(&mut ticket, &published);
         drop(ticket);
-        published.map(drop)
+        published
     }
 }
 
@@ -3519,7 +3625,9 @@ struct LiveLanes {
     /// `Some` between feeds; `None` while a feed holds the lanes.
     lanes: Option<Vec<LiveLane>>,
     /// The feed in flight, returning the lanes (or the first error).
-    pending: Option<StdReceiver<Result<Vec<LiveLane>, BuildError>>>,
+    /// The feed in flight: one message per lane, in whatever order the
+    /// lanes finish, and how many to wait for.
+    pending: Option<(StdReceiver<(usize, Result<LiveLane, BuildError>)>, usize)>,
     /// Rows fed so far, which is also the row number the next batch
     /// starts at.
     rows_fed: usize,
@@ -3577,12 +3685,38 @@ impl LiveLanes {
     }
 
     /// Wait for the feed in flight, if any, and take the lanes back.
+    #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all, fields(rows_fed = self.rows_fed)))]
     fn join(&mut self) -> Result<Vec<LiveLane>, BuildError> {
-        if let Some(rx) = self.pending.take() {
-            let lanes = rx
-                .recv()
-                .map_err(|_| BuildError::Store("live lane feed ended without a result".into()))??;
-            self.lanes = Some(lanes);
+        if let Some((rx, n)) = self.pending.take() {
+            // Every lane reports before the first error is returned, so a
+            // failed feed's sibling lanes do not run on, holding the fed
+            // batches and their builders, after the append has failed.
+            let mut lanes: Vec<Option<LiveLane>> = (0..n).map(|_| None).collect();
+            let mut first_error = None;
+            for _ in 0..n {
+                let (i, lane) = rx.recv().map_err(|_| {
+                    BuildError::Store("live lane feed ended without a result".into())
+                })?;
+                match lane {
+                    Ok(lane) => lanes[i] = Some(lane),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
+            }
+            self.lanes = Some(
+                lanes
+                    .into_iter()
+                    .map(|lane| {
+                        lane.ok_or_else(|| {
+                            BuildError::Store("a live lane ended without a result".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
         }
         self.lanes
             .take()
@@ -3600,25 +3734,49 @@ impl LiveLanes {
         batches: Vec<RecordBatch>,
         fts_bytes: u64,
     ) -> Result<(), BuildError> {
-        let mut lanes = self.join()?;
+        let lanes = self.join()?;
         let n = lanes.len();
         let first_row = self.rows_fed;
         self.rows_fed += batches.iter().map(RecordBatch::num_rows).sum::<usize>();
         self.fts_bytes = self.fts_bytes.saturating_add(fts_bytes);
         // Each lane's share of the reserve for the text fed so far.
         let threshold = in_ram_threshold(self.fts_bytes / n as u64, self.threshold_floor);
-        let (tx, rx) = std_sync_channel(1);
+        // One pool task per lane, waited for from the caller's thread when
+        // the lanes are joined. A task that ran the lanes under a parallel
+        // iterator waited for them by running whatever else the pool held
+        // — other appends' pieces and layer ranges — and the lanes of a
+        // feed, the pieces of a seal and the ranges of a layer build now
+        // all reach the pool the same way, served in the order they came.
+        let (tx, rx) = std_sync_channel(n.max(1));
         let stats = op_stats.clone();
-        let col_idxs = self.col_idxs.clone();
-        pool.spawn(move || {
-            let fed = lanes
-                .par_iter_mut()
-                .enumerate()
-                .try_for_each(|(i, lane)| {
+        let col_idxs = Arc::new(self.col_idxs.clone());
+        let batches = Arc::new(batches);
+        let parent = Span::current();
+        for (i, mut lane) in lanes.into_iter().enumerate() {
+            let (tx, stats, col_idxs, batches, parent) = (
+                tx.clone(),
+                stats.clone(),
+                Arc::clone(&col_idxs),
+                Arc::clone(&batches),
+                parent.clone(),
+            );
+            pool.spawn(move || {
+                let _span = detail_span!(
+                    "live.feed",
+                    parent: &parent,
+                    lanes = n,
+                    rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+                    lane = i
+                )
+                .entered();
+                // A panic is caught here and reported as the lane's error: a
+                // pool with no panic handler aborts the process on a spawned
+                // job's panic.
+                let fed = catch_unwind(AssertUnwindSafe(|| {
                     timed_kernel(&stats, || {
                         lane.builder.set_spill_threshold_bytes(threshold);
                         let mut base = first_row;
-                        for batch in &batches {
+                        for batch in batches.iter() {
                             let rows = batch.num_rows();
                             let (start, end) = (rows * i / n, rows * (i + 1) / n);
                             if start < end {
@@ -3645,13 +3803,15 @@ impl LiveLanes {
                         }
                         Ok::<(), BuildError>(())
                     })
-                })
-                .map(|()| lanes);
-            // The receiver is gone only if the writer was dropped mid-feed;
-            // there is nobody left to tell.
-            let _ = tx.send(fed);
-        });
-        self.pending = Some(rx);
+                    .map(|()| lane)
+                }))
+                .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
+                // The receiver is gone only if the writer was dropped
+                // mid-feed; there is nobody left to tell.
+                let _ = tx.send((i, fed));
+            });
+        }
+        self.pending = Some((rx, n));
         Ok(())
     }
 }
@@ -3696,6 +3856,9 @@ fn open_shard_builder(
             .with_vector_layout(vector_layout)
             .with_vector_centroids(provided_centroids),
     )?;
+    // A piece is one of many pool tasks running side by side; its finish
+    // fans out to no other thread.
+    builder.set_finish_serial();
     let superfile_id = Uuid::new_v4();
     let head_sink = term_head_sink_for(manifest)?;
     if let Some((sink, depth)) = &head_sink {
@@ -4756,6 +4919,20 @@ pub(super) struct SuperfilePublishBatch {
 }
 
 impl SuperfilePublishBatch {
+    /// Take on `other`'s superfiles behind this batch's own, for a publish
+    /// that lists both.
+    fn absorb(&mut self, other: SuperfilePublishBatch) {
+        self.new_entries.extend(other.new_entries);
+        self.to_remove.extend(other.to_remove);
+        self.pending_storage_writes
+            .extend(other.pending_storage_writes);
+        self.pending_cache_inserts
+            .extend(other.pending_cache_inserts);
+        self.pending_store_inserts
+            .extend(other.pending_store_inserts);
+        self.term_contributions.extend(other.term_contributions);
+    }
+
     /// Skip the in-memory reader-cache fill. Only for a storage-backed table,
     /// where the bytes are durable and reads fetch them from storage; a bulk
     /// load would otherwise keep every superfile it wrote in RAM.
@@ -5031,7 +5208,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
     inner: &SupertableInner,
     batch: SuperfilePublishBatch,
     list_metadata: CommitListMetadata,
-    reserved_layer: Option<&mut Option<ReservedLayer>>,
+    reserved_layers: Option<&mut [ReservedSegment]>,
 ) -> Result<Option<RoutingRef>, BuildError> {
     if batch.new_entries.is_empty() {
         return Ok(None);
@@ -5046,7 +5223,7 @@ pub(super) async fn persist_superfile_publish_batch_async(
             Vec::new(),
             list_metadata,
             batch.term_contributions,
-            reserved_layer,
+            reserved_layers,
         )
         .await
         .map_err(BuildError::from)?;
@@ -5428,6 +5605,54 @@ fn make_drain_batches(
     batches
 }
 
+/// Rebuilds a checkpointed epoch's batches from its recorded `batch_layout`:
+/// batch `i` holds the sources whose `birth_version` the layout's group `i`
+/// names, in recorded order, each version's sources in `sources` order. The
+/// layout is part of the epoch (its id hashes it and the local checkpoint
+/// counts batches against it), so a resume follows it rather than re-batching
+/// under the current `drain_batch_superfiles`. A layout that does not
+/// partition the sources' versions exactly — an empty group, a version with no
+/// source or listed twice, a source version left out — is a corrupt checkpoint.
+fn drain_batches_from_layout(
+    sources: Vec<Arc<SuperfileEntry>>,
+    layout: &[Vec<u64>],
+) -> Result<Vec<(Vec<u64>, Vec<Arc<SuperfileEntry>>)>, BuildError> {
+    let mut by_version = std::collections::BTreeMap::<u64, Vec<Arc<SuperfileEntry>>>::new();
+    for source in sources {
+        by_version
+            .entry(source.birth_version)
+            .or_default()
+            .push(source);
+    }
+    let mut batches = Vec::with_capacity(layout.len());
+    for (batch_idx, versions) in layout.iter().enumerate() {
+        if versions.is_empty() {
+            return Err(BuildError::Store(format!(
+                "drain checkpoint batch layout is corrupt: batch {batch_idx} is empty"
+            )));
+        }
+        let mut superfiles = Vec::new();
+        for &version in versions {
+            let mut version_superfiles = by_version.remove(&version).ok_or_else(|| {
+                BuildError::Store(format!(
+                    "drain checkpoint batch layout is corrupt: batch {batch_idx} names version \
+                     {version}, which has no checkpoint source or is listed more than once"
+                ))
+            })?;
+            superfiles.append(&mut version_superfiles);
+        }
+        batches.push((versions.clone(), superfiles));
+    }
+    if let Some(&version) = by_version.keys().next() {
+        return Err(BuildError::Store(format!(
+            "drain checkpoint batch layout is corrupt: it leaves out {} checkpoint source \
+             version(s), first {version}",
+            by_version.len()
+        )));
+    }
+    Ok(batches)
+}
+
 fn drain_batch_layout(batches: &[(Vec<u64>, Vec<Arc<SuperfileEntry>>)]) -> Vec<Vec<u64>> {
     batches
         .iter()
@@ -5619,11 +5844,6 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     let shard_count = packed_cell_shard_count(&hidden_inner.options);
     let drain_pool = maint_pool()?;
     let consolidate = user_inner.options.drain_consolidate;
-    let budget = if batch_cfg < 0 {
-        usize::MAX
-    } else {
-        (batch_cfg as usize).max(1)
-    };
 
     // A remote checkpoint pins the exact source epoch. New user commits can
     // land while it is in progress; they are intentionally left for the next
@@ -5691,17 +5911,14 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             selected.push(Arc::clone(entry));
         }
-        let batches = make_drain_batches(selected, budget);
-        let batch_layout = drain_batch_layout(&batches);
-        if batch_layout != remote_state.checkpoint.batch_layout {
-            return Err(BuildError::Store(
-                "drain checkpoint batch layout differs from current configuration".into(),
-            ));
-        }
+        // The recorded layout, not the current `drain_batch_superfiles`,
+        // decides the batches: batch size is a tuning knob outside the options
+        // hash, and the epoch already committed to these batches.
+        let batches = drain_batches_from_layout(selected, &remote_state.checkpoint.batch_layout)?;
         let epoch_id = drain_epoch_id(
             &current_options_hash,
             &remote_state.checkpoint.sources,
-            &batch_layout,
+            &remote_state.checkpoint.batch_layout,
             shard_count,
             consolidate,
         );
@@ -5733,6 +5950,11 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             .iter()
             .map(|entry| drain_checkpoint_source(entry))
             .collect();
+        let budget = if batch_cfg < 0 {
+            usize::MAX
+        } else {
+            (batch_cfg as usize).max(1)
+        };
         let batches = make_drain_batches(selected, budget);
         let batch_layout = drain_batch_layout(&batches);
         let epoch_id = drain_epoch_id(
@@ -11832,11 +12054,12 @@ pub(in crate::supertable) async fn stamp_term_index(
                     scoring_by_superfile: Arc::new(scoring_by_superfile(&old)),
                     ..old.options.term_index_build_policy()
                 };
+                let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
                 let (mut root, mut repaired, sized, before_tiers) = match referenced_root(&old)
                     .await?
                 {
                     Some(mut root) => {
-                        match term_index::check_objects(storage, &mut root, seen).await? {
+                        match term_index::check_objects(storage, &mut root, seen, &live).await? {
                             RootObjects::Present {
                                 sized,
                                 before_tiers,
@@ -11865,7 +12088,6 @@ pub(in crate::supertable) async fn stamp_term_index(
                         published.store(true, Ordering::Relaxed);
                         return Ok(Some(old.with_term_index(reference, true)));
                     }
-                    let live: HashSet<Uuid> = entries.iter().map(|e| e.superfile_id).collect();
                     let renumber = !renumbered.load(Ordering::Relaxed);
                     if let Some(fold) = term_index::plan_fold_at_optimize(
                         &root,
@@ -11985,6 +12207,7 @@ fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEn
 
 /// Write `folded`, a fold made of `prior`, and keep both in `kept` for a
 /// retry should its publish lose to a commit.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_fold(
     storage: &Arc<dyn StorageProvider>,
     kept: &Mutex<Option<KeptFold>>,
@@ -12092,6 +12315,7 @@ const CONTRIBUTION_WALKS_FALLBACK: usize = 4;
 /// Each of `entries`' term-index contributions, in `entries` order, walked
 /// as many superfiles at a time as memory allows, up to
 /// [`CONTRIBUTION_WALKS_MAX`].
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn collect_contributions(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
@@ -12360,7 +12584,10 @@ async fn release_mutation_lease(wal_store: &WalStore, wal_id: WalId, owner: Supe
     }
 }
 
-async fn record_hidden_deleted_ids(
+/// Add `new_deleted` to the hidden vector-index table's deleted-`_id` set
+/// (see [`hidden_deleted`]), committing a new hidden manifest; a no-op when
+/// every id is in the set already. `inner` is the hidden table's.
+pub(in crate::supertable) async fn record_hidden_deleted_ids(
     inner: &SupertableInner,
     new_deleted: &[i128],
 ) -> Result<(), BuildError> {
@@ -12506,6 +12733,12 @@ impl CommitListMetadata {
             && self.schema.is_none()
     }
 
+    /// Whether a publish under `self` can carry one under `other` too: both
+    /// stamp nothing and expect the same schema, as an append's does.
+    pub(crate) fn groups_with(&self, other: &Self) -> bool {
+        self.is_empty() && other.is_empty() && self.expected_schema_id == other.expected_schema_id
+    }
+
     /// Refuse `base` when the state this commit was decided against has
     /// moved under it: its schema, and — for a document that makes a
     /// column start requiring a value — its membership.
@@ -12608,7 +12841,7 @@ async fn persist_commit_with_layer_async(
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
     term_contributions: Vec<TermContribution>,
-    mut reserved_layer: Option<&mut Option<ReservedLayer>>,
+    mut reserved_layers: Option<&mut [ReservedSegment]>,
 ) -> Result<Arc<ManifestSnapshot>, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
@@ -12652,7 +12885,7 @@ async fn persist_commit_with_layer_async(
                 pending_writes,
                 pending_replaces,
                 contributions,
-                reserved_layer.as_deref_mut(),
+                reserved_layers.as_deref_mut(),
                 None,
                 None,
             )
@@ -13073,7 +13306,7 @@ pub(crate) async fn try_commit_attempt(
     term_contributions: &[TermContribution],
     // Set by a caller that retries: the delta is built once at a reserved
     // ordinal and kept here across attempts (see `term_index::append_reserved`).
-    reserved_layer: Option<&mut Option<ReservedLayer>>,
+    reserved_layers: Option<&mut [ReservedSegment]>,
     // Set by a caller that retries a commit with removals: parts rebuilt by
     // an earlier attempt are reused (see `RebuiltParts`).
     mut rebuilt_parts: Option<&mut RebuiltParts>,
@@ -13257,9 +13490,9 @@ pub(crate) async fn try_commit_attempt(
         // A fold the root calls for is CPU work, merged on the reader pool.
         let pool = Some(&*current_manifest.options.reader_pool);
         let reference = async move {
-            match reserved_layer {
+            match reserved_layers {
                 Some(reserved) => {
-                    term_index::append_reserved(
+                    term_index::append_reserved_run(
                         store,
                         prior,
                         term_contributions,
@@ -13547,50 +13780,47 @@ fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Bytes, String> {
     Ok(Bytes::from(out))
 }
 
-/// Multipart-upload variant of the writer's per-superfile put.
-/// Routes through [`crate::storage::StorageProvider::put_multipart`]
-/// for superfiles large enough that a single PUT is wasteful
-/// (slow on a backend stall, high RSS during the put).
-///
-/// Idempotency: superfile URIs are UUID v4, so the only "URI
-/// exists" hit on retry comes from our own prior attempt
-/// with bit-identical bytes. Head-first lets us short-circuit
-/// that case before re-running the multipart dance. The
-/// single-PUT path achieves the same effect by returning
-/// `PreconditionFailed`, which the call-site swallows;
-/// multipart's `complete()` doesn't carry a precondition, so
-/// we need to detect "already there" explicitly.
-///
-/// Part size: 8 MiB — comfortably above S3's 5-MiB minimum
-/// and a clean fit for the cold-fetch coordinator's default
-/// 16-MiB chunk reads on the way back out. Parts are pushed in declaration
-/// order and driven in bounded concurrent groups so mmap-backed shards remain
-/// memory-bounded during upload.
-/// Write `bytes` to `path`, routing through multipart (staged blocks) at or
-/// above `multipart_threshold` and a single `put_atomic` below it. A single
-/// `Put Blob`/`PutObject` is capped at ~5 GiB by Azure/S3, so any blob that can
-/// grow past that (e.g. the slow-vector-state centroid blob at 100M+ docs) must
-/// take the multipart path. Content-addressed callers treat `PreconditionFailed`
-/// as "identical bytes already durable" and swallow it.
-pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
-    storage: &dyn StorageProvider,
-    path: &str,
-    bytes: Bytes,
-    multipart_threshold: u64,
-) -> Result<(), StorageError> {
-    if (bytes.len() as u64) >= multipart_threshold {
-        put_superfile_multipart(storage, path, bytes).await
-    } else {
-        storage.put_atomic(path, bytes).await.map(|_| ())
-    }
-}
-
 /// Objects at or above this size go through the multipart upload path.
 /// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
 /// content hash — slow-vector state, term-index slices and roots — can
 /// grow past that at scale; the figure matches the superfile default.
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
+
+/// PUT `bytes` at `uri` as a new object, starting a second attempt once the
+/// first has run long enough to be taken for stuck (see [`stuck_after`]).
+/// The stores answer an 8 MB PUT in under half a second and now and then
+/// hold one for the whole request timeout: one such PUT held a billion-row
+/// ingest's commit for a minute. The first attempt to land wins; one that
+/// fails waits for the other, so a quick refusal of the hedge cannot cancel
+/// a slow first attempt that would have landed, and the PUT fails only if
+/// both do. Only for an object whose name is its content: a second attempt
+/// that lands second is refused as already present, which the caller takes
+/// as the same outcome.
+async fn put_new_hedged(
+    storage: &dyn StorageProvider,
+    uri: &str,
+    bytes: Bytes,
+) -> Result<(), StorageError> {
+    let delay = stuck_after(bytes.len() as u64);
+    let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
+    tokio::select! {
+        answer = &mut first => answer.map(|_| ()),
+        () = sleep(delay) => {
+            let mut second = pin!(storage.put_atomic(uri, bytes));
+            tokio::select! {
+                answer = &mut first => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => second.await.map(drop),
+                },
+                answer = &mut second => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => first.await.map(drop),
+                },
+            }
+        }
+    }
+}
 
 /// Persist `bytes` under the name `uri_for` derives from their content
 /// hash and return the reference a manifest records. Idempotent: an
@@ -13603,14 +13833,15 @@ pub(in crate::supertable) async fn put_content_addressed(
 ) -> Result<RoutingRef, StorageError> {
     let content_hash = part_mod::ContentHash::of(&bytes);
     let uri = uri_for(&content_hash);
-    match put_bytes_multipart_or_atomic(
-        storage,
-        &uri,
-        Bytes::from(bytes),
-        CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES,
-    )
-    .await
-    {
+    let span = detail_span!("put_content_addressed", len = bytes.len());
+    let bytes = Bytes::from(bytes);
+    let put = async {
+        match (bytes.len() as u64) >= CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES {
+            true => put_superfile_multipart(storage, &uri, bytes).await,
+            false => put_new_hedged(storage, &uri, bytes).await,
+        }
+    };
+    match put.instrument(span).await {
         Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
             Ok(RoutingRef { uri, content_hash })
         }
@@ -13816,6 +14047,7 @@ mod tests {
 
     use std::{
         fs,
+        future::pending,
         sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -13861,7 +14093,7 @@ mod tests {
             reader_cache::{config::DiskCacheConfig, disk::DiskCacheStore},
             schema::change::SchemaChange,
             slow_vector_state::STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX,
-            storage::LocalFsStorageProvider,
+            storage::{LocalFsStorageProvider, ObjectMeta},
             wal::{recovery::scan_and_recover, state_doc::SupertableHandleId},
         },
         test_helpers::{
@@ -14515,6 +14747,151 @@ mod tests {
     /// The commit write fanout is a `NonZeroUsize` because a zero would
     /// panic the uploader's channel and stall `buffered`; a single-core host
     /// divides to zero before the floor applies.
+    /// Storage whose first PUT of an object named with `held` never
+    /// answers; later PUTs of such objects go through, and all are counted.
+    #[derive(Debug)]
+    struct HeldFirstPutStorage {
+        inner: LocalFsStorageProvider,
+        held: &'static str,
+        first: AtomicBool,
+        puts: AtomicUsize,
+        /// How long the first PUT takes before it lands; `None` holds it
+        /// for ever. Later PUTs fail at once when it is set.
+        first_lands_after: Option<Duration>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageProvider for HeldFirstPutStorage {
+        async fn head(&self, uri: &str) -> Result<ObjectMeta, StorageError> {
+            self.inner.head(uri).await
+        }
+        async fn get(&self, uri: &str) -> Result<(Bytes, ObjectMeta), StorageError> {
+            self.inner.get(uri).await
+        }
+        async fn get_range(&self, uri: &str, range: Range<u64>) -> Result<Bytes, StorageError> {
+            self.inner.get_range(uri, range).await
+        }
+        async fn put_atomic(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+        ) -> Result<Option<String>, StorageError> {
+            if uri.contains(self.held) {
+                self.puts.fetch_add(1, Ordering::SeqCst);
+                let first = self.first.swap(false, Ordering::SeqCst);
+                match (first, self.first_lands_after) {
+                    (true, None) => pending::<()>().await,
+                    (true, Some(after)) => tokio::time::sleep(after).await,
+                    // Any refusal but "already present", which the caller
+                    // would take as success.
+                    (false, Some(_)) => return Err(StorageError::NotFound { uri: uri.into() }),
+                    (false, None) => {}
+                }
+            }
+            self.inner.put_atomic(uri, bytes).await
+        }
+        async fn put_overwrite(&self, uri: &str, bytes: Bytes) -> Result<(), StorageError> {
+            self.inner.put_overwrite(uri, bytes).await
+        }
+        async fn put_if_match(
+            &self,
+            uri: &str,
+            bytes: Bytes,
+            expected_etag: Option<&str>,
+        ) -> Result<Option<String>, StorageError> {
+            self.inner.put_if_match(uri, bytes, expected_etag).await
+        }
+        async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
+            self.inner.put_multipart(uri).await
+        }
+        async fn delete(&self, uri: &str) -> Result<(), StorageError> {
+            self.inner.delete(uri).await
+        }
+    }
+
+    /// A content-addressed PUT the store never answers is answered by its
+    /// hedge: the second attempt lands the object and the caller sees
+    /// success. Time is paused, so the hedge's delay passes at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_content_addressed_put_is_answered_by_its_hedge() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldFirstPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            held: "hedged",
+            first: AtomicBool::new(true),
+            puts: AtomicUsize::new(0),
+            first_lands_after: None,
+        };
+        let reference =
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
+                .await
+                .expect("the hedge answers");
+        assert_eq!(
+            storage.puts.load(Ordering::SeqCst),
+            2,
+            "one attempt held, one hedge"
+        );
+        assert!(
+            storage.inner.head(&reference.uri).await.is_ok(),
+            "the hedge landed the object"
+        );
+    }
+
+    /// A hedge that fails at once does not cancel a slow first attempt
+    /// that would land: the PUT waits for it and succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_hedge_waits_for_the_first_attempt() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldFirstPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            held: "hedged",
+            first: AtomicBool::new(true),
+            puts: AtomicUsize::new(0),
+            first_lands_after: Some(stuck_after(0) * 4),
+        };
+        let reference =
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
+                .await
+                .expect("the first attempt lands");
+        assert_eq!(
+            storage.puts.load(Ordering::SeqCst),
+            2,
+            "the first, and a hedge that failed"
+        );
+        assert!(storage.inner.head(&reference.uri).await.is_ok());
+    }
+
+    /// Bytes of the large object in the hedge-delay test: enough that its
+    /// share of the delay is a whole second at the store's assumed rate.
+    const HEDGE_TEST_LARGE_BYTES: usize = 16 << 20;
+
+    /// A PUT that lands inside the hedge's delay sends no second attempt,
+    /// and a large PUT is given longer: one that lands past the base delay
+    /// but within its own is not hedged either.
+    #[tokio::test(start_paused = true)]
+    async fn a_put_that_lands_within_its_delay_is_not_hedged() {
+        for (bytes, lands_after) in [
+            (b"small".to_vec(), stuck_after(0) / 2),
+            (
+                vec![7u8; HEDGE_TEST_LARGE_BYTES],
+                stuck_after(0) + (stuck_after(HEDGE_TEST_LARGE_BYTES as u64) - stuck_after(0)) / 2,
+            ),
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = HeldFirstPutStorage {
+                inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+                held: "hedged",
+                first: AtomicBool::new(true),
+                puts: AtomicUsize::new(0),
+                first_lands_after: Some(lands_after),
+            };
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes)
+                .await
+                .expect("the first attempt lands");
+            assert_eq!(storage.puts.load(Ordering::SeqCst), 1, "no hedge was sent");
+        }
+    }
+
     #[test]
     fn commit_write_concurrency_is_never_zero() {
         assert!(commit_write_concurrency().get() >= 1);
@@ -15016,6 +15393,241 @@ mod tests {
                 .is_none(),
             "settled slow-CAS state contains no pending drain"
         );
+    }
+
+    #[test]
+    fn drain_batches_from_layout_follows_the_recorded_groups() {
+        let at = |id: u128, birth_version: u64| {
+            let mut entry = (*fp_entry(id)).clone();
+            entry.birth_version = birth_version;
+            Arc::new(entry)
+        };
+        let sources = vec![at(1, 3), at(2, 3), at(3, 5), at(4, 7)];
+        let ids = |batch: &[Arc<SuperfileEntry>]| -> Vec<u128> {
+            batch
+                .iter()
+                .map(|entry| entry.superfile_id.as_u128())
+                .collect()
+        };
+
+        // A layout recorded under a batch size of one superfile, read back
+        // where the current budget would group every version together.
+        let recorded = vec![vec![3], vec![5], vec![7]];
+        assert_ne!(
+            drain_batch_layout(&make_drain_batches(sources.clone(), 64)),
+            recorded,
+            "the current budget alone would re-batch this epoch"
+        );
+        let batches = drain_batches_from_layout(sources.clone(), &recorded).expect("rebuild");
+        assert_eq!(drain_batch_layout(&batches), recorded);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|(_, batch)| ids(batch))
+                .collect::<Vec<_>>(),
+            vec![vec![1, 2], vec![3], vec![4]],
+            "a version's sources stay together, in source order"
+        );
+        // Rebuilding the layout a fresh drain records yields that drain's batches.
+        let fresh = make_drain_batches(sources.clone(), 2);
+        let rebuilt = drain_batches_from_layout(sources.clone(), &drain_batch_layout(&fresh))
+            .expect("rebuild");
+        assert_eq!(drain_batch_layout(&rebuilt), drain_batch_layout(&fresh));
+        for ((_, left), (_, right)) in rebuilt.iter().zip(&fresh) {
+            assert_eq!(ids(left), ids(right));
+        }
+
+        for (corrupt, why) in [
+            (vec![vec![3], vec![5]], "leaves out version 7"),
+            (
+                vec![vec![3], vec![5, 7], vec![9]],
+                "names a version with no source",
+            ),
+            (
+                vec![vec![3], vec![3, 5, 7]],
+                "lists a version in two batches",
+            ),
+            (
+                vec![vec![3, 3], vec![5, 7]],
+                "lists a version twice in one batch",
+            ),
+            (vec![vec![3], vec![], vec![5, 7]], "has an empty batch"),
+            (vec![], "has no batches"),
+        ] {
+            let error = drain_batches_from_layout(sources.clone(), &corrupt)
+                .expect_err(&format!("a layout that {why} must be refused"));
+            assert!(
+                error.to_string().contains("batch layout is corrupt"),
+                "a layout that {why}: {error}"
+            );
+        }
+    }
+
+    /// A drain interrupted after its checkpoint was recorded under one
+    /// `drain_batch_superfiles` resumes under another: the resume follows the
+    /// recorded batches (keeping the batches it already finished) and drains
+    /// every row, instead of refusing because the current setting would batch
+    /// the epoch differently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_resumes_with_recorded_batches_after_batch_size_change() {
+        use crate::superfile::reader::VectorSearchOptions;
+
+        const COMMITS: usize = 3;
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = |batch_superfiles: i64| {
+            options_title_emb_serial(COMMIT_AS_DRAIN_TEST_DIM)
+                .with_storage(Arc::clone(&storage))
+                .with_drain_batch_superfiles(batch_superfiles)
+        };
+        let table = Supertable::create(options(1)).expect("create");
+        for _ in 0..COMMITS {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_axis_vector_batch(
+                    COMMIT_AS_DRAIN_TEST_ROWS,
+                    COMMIT_AS_DRAIN_TEST_DIM,
+                ))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        let (hidden, epoch_id) = current_drain_epoch(&table).await;
+        inject_drain_test_failure(epoch_id.clone(), DrainTestFailurePhase::AfterBatch, 1);
+        let first = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await;
+        assert!(first.is_err(), "first drain must stop at the failpoint");
+        let pending = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        assert_eq!(pending.checkpoint.epoch_id, epoch_id);
+        assert_eq!(pending.checkpoint.batch_layout.len(), COMMITS);
+        drop(hidden);
+        drop(table);
+
+        // Reopen with a larger batch size: a fresh drain would now take every
+        // commit in one batch, so this epoch is no longer what the current
+        // setting produces.
+        let table = Supertable::open(options(64)).expect("reopen");
+        let (hidden, fresh_epoch_id) = current_drain_epoch(&table).await;
+        assert_ne!(
+            fresh_epoch_id, epoch_id,
+            "the new batch size must change what a fresh drain would record"
+        );
+
+        // A recorded layout that does not cover the checkpoint's sources is
+        // refused before any batch runs; the intact checkpoint still resumes.
+        let mut corrupt = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        corrupt.checkpoint.batch_layout.pop();
+        save_drain_remote_checkpoint(hidden.inner(), &mut corrupt)
+            .await
+            .expect("save corrupt layout");
+        let refused = drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect_err("a layout leaving out a source version must be refused");
+        assert!(
+            refused.to_string().contains("batch layout is corrupt"),
+            "{refused}"
+        );
+        let mut restored = load_drain_remote_checkpoint(hidden.inner())
+            .await
+            .expect("load pending slow state")
+            .expect("pending drain");
+        restored.checkpoint.batch_layout = pending.checkpoint.batch_layout.clone();
+        save_drain_remote_checkpoint(hidden.inner(), &mut restored)
+            .await
+            .expect("restore recorded layout");
+        assert_eq!(
+            load_drain_local_checkpoint(&drain_scratch_dir(&epoch_id), &epoch_id)
+                .expect("load local checkpoint")
+                .expect("local checkpoint")
+                .batches_done,
+            1,
+            "the refused resume must not touch the finished batch"
+        );
+
+        drain_user_superfiles_to_hidden_cells(
+            Arc::clone(table.inner()),
+            Arc::clone(hidden.inner()),
+        )
+        .await
+        .expect("resume under a different batch size");
+        assert!(
+            !drain_scratch_dir(&epoch_id).exists(),
+            "the recorded epoch is the one that completed"
+        );
+        assert!(
+            load_drain_remote_checkpoint(hidden.inner())
+                .await
+                .expect("load settled slow state")
+                .is_none(),
+            "settled slow-CAS state contains no pending drain"
+        );
+
+        let hidden_manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        let drained = hidden_manifest.get_drained_ranges();
+        let user_manifest = Arc::clone(table.reader().expect("reader").manifest());
+        assert_eq!(user_manifest.superfiles.len(), COMMITS);
+        assert!(
+            user_manifest
+                .superfiles
+                .iter()
+                .all(|entry| drained.contains(entry.birth_version)),
+            "every commit's version is drained"
+        );
+        let hidden_rows: u64 = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.n_docs)
+            .sum();
+        assert_eq!(
+            hidden_rows,
+            (COMMITS * COMMIT_AS_DRAIN_TEST_ROWS) as u64,
+            "every row lands in the hidden cells exactly once"
+        );
+
+        // Each axis has one row per commit; all of them come back as exact
+        // matches, served from the hidden cells.
+        let hidden_uris: HashSet<SuperfileUri> = hidden_manifest
+            .superfiles
+            .iter()
+            .map(|entry| entry.uri)
+            .collect();
+        for axis in 0..COMMIT_AS_DRAIN_TEST_ROWS {
+            let mut q = vec![0.0f32; COMMIT_AS_DRAIN_TEST_DIM];
+            q[axis] = 1.0;
+            let hits = table
+                .reader()
+                .expect("reader")
+                .vector_hits(
+                    "emb",
+                    &q,
+                    COMMITS * COMMIT_AS_DRAIN_TEST_ROWS,
+                    VectorSearchOptions::new().with_nprobe(32),
+                    None,
+                )
+                .expect("search");
+            let exact: Vec<_> = hits.iter().filter(|hit| hit.score < 1e-4).collect();
+            assert_eq!(
+                exact.len(),
+                COMMITS,
+                "axis {axis}: one exact match per commit, got {hits:?}"
+            );
+            assert!(
+                exact.iter().all(|hit| hidden_uris.contains(&hit.superfile)),
+                "axis {axis}: exact matches are served from the hidden cells"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16264,6 +16876,27 @@ mod tests {
             let counts = cell_doc_counts_from_summary(&inner, entry, Some(&dropped))
                 .expect("summary still present");
             assert!(counts.iter().all(|&(cell, _)| cell != populated[0]));
+        }
+    }
+
+    /// The summary lists cells in the reader's directory order, with each
+    /// cell's row count equal to the reader's. Filtered vector search maps a
+    /// hidden file-local id to its cell by summing summary counts in this
+    /// order, while the probe numbers rows by the reader's cell sizes; the
+    /// two must agree cell for cell, order included.
+    #[test]
+    fn cell_doc_counts_from_summary_match_the_reader_in_order() {
+        let (_dir, _st, hidden) = drained_hidden_two_cells();
+        let inner = Arc::clone(hidden.inner());
+        let manifest = Arc::clone(hidden.reader().expect("reader").manifest());
+        assert!(!manifest.superfiles.is_empty());
+        for entry in manifest.superfiles.iter() {
+            let from_summary =
+                cell_doc_counts_from_summary(&inner, entry, None).expect("drained summary");
+            let from_reader = hidden
+                .block_on_query(cell_doc_counts_via_reader(&inner, entry, None))
+                .expect("reader counts");
+            assert_eq!(from_summary, from_reader);
         }
     }
 
@@ -17802,11 +18435,6 @@ supertable:
             !listed.contains(&Uuid::nil()),
             "each prebuilt layer was appended at its reserved base, never rebuilt with padding"
         );
-        assert_eq!(
-            st.inner().append_queue.lock().rebuilt,
-            0,
-            "without another writer, every prebuilt layer is appended as built"
-        );
     }
 
     /// Runs `exclusive` while a shared append is open, and checks that it
@@ -17908,60 +18536,210 @@ supertable:
         );
     }
 
-    #[test]
-    fn a_ticket_dropped_before_its_turn_passes_the_turn_on() {
-        let queue = AppendQueue::default();
-        let (failed, failed_base) = queue.reserve(None, 2);
-        let (mut next, next_base) = queue.reserve(None, 3);
-        assert_eq!((failed_base, next_base), (Some(0), Some(2)));
-
-        drop(failed);
-        drop(next.wait_turn());
-        // Its base no longer matches the root, so the commit rebuilt it there.
-        next.published(None, 3);
-        drop(next);
-
-        assert_eq!(
-            queue.reserve(None, 1).1,
-            Some(3),
-            "the next base is where the root ends, not past the failed range"
-        );
+    /// A publish parked on the queue for a test, with nothing in it.
+    fn parked_for_test(number: u64) -> ParkedPublish {
+        ParkedPublish {
+            number,
+            batch: SuperfilePublishBatch {
+                new_entries: Vec::new(),
+                to_remove: Vec::new(),
+                pending_storage_writes: Vec::new(),
+                pending_cache_inserts: Vec::new(),
+                pending_store_inserts: Vec::new(),
+                term_contributions: Vec::new(),
+            },
+            list_metadata: CommitListMetadata::empty(),
+            segment: ReservedSegment {
+                contributions: 0,
+                layer: None,
+            },
+        }
     }
 
+    /// A ticket that finds no publish running leads; the ready tickets that
+    /// park behind it are taken by the next publish, see its result, and
+    /// leave the queue free when it is done.
     #[test]
-    fn the_next_base_follows_where_the_last_segment_ended() {
+    fn a_leading_ticket_publishes_the_ready_tickets_parked_behind_it() {
         let queue = AppendQueue::default();
-        let (mut ticket, _) = queue.reserve(None, 2);
-        ticket.published(None, 300);
-        drop(ticket);
-        let (mut ticket, base) = queue.reserve(None, 1);
-        assert_eq!(base, Some(300));
-        ticket.published(None, 31);
-        drop(ticket);
-        assert_eq!(
-            queue.reserve(None, 1).1,
-            Some(31),
-            "down as well as up, as when optimize shrinks the root"
-        );
-    }
-
-    #[test]
-    fn a_root_the_queue_did_not_publish_leaves_the_base_unknown() {
-        let root = |name: &str| RoutingRef {
-            uri: name.to_owned(),
-            content_hash: part_mod::ContentHash::of(name.as_bytes()),
+        let queue = &queue;
+        let mut lead = queue.reserve();
+        let mut second = queue.reserve();
+        let mut third = queue.reserve();
+        // The lead holds the queue while the others park.
+        let run = match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => run,
+            Turn::Published(_) => panic!("nothing was publishing"),
         };
-        let queue = AppendQueue::default();
-        let (mut ticket, _) = queue.reserve(None, 2);
-        ticket.published(Some(root("ours")), 5);
-        drop(ticket);
+        assert_eq!(run.len(), 1, "nothing was parked yet");
+        thread::scope(|scope| {
+            let followers = [&mut second, &mut third].map(|ticket| {
+                scope.spawn(move || {
+                    let parked = parked_for_test(ticket.number);
+                    match queue.lead_or_follow(ticket, parked) {
+                        Turn::Published(result) => result.is_ok(),
+                        Turn::Lead(_) => false,
+                    }
+                })
+            });
+            while queue.lock().parked.len() < 2 {
+                thread::yield_now();
+            }
+            let parked: Vec<u64> = queue.lock().parked.keys().copied().collect();
+            assert_eq!(parked, vec![1, 2]);
+            let taken = take_run(&mut queue.lock(), parked_for_test(99));
+            assert_eq!(
+                taken.iter().map(|parked| parked.number).collect::<Vec<_>>(),
+                vec![99, 1, 2],
+                "its own publish first, then the parked ones oldest first"
+            );
+            lead.followers = vec![1, 2];
+            queue.publish_followers(&mut lead, &Ok(()));
+            drop(lead);
+            for follower in followers {
+                assert!(
+                    follower.join().expect("follower thread"),
+                    "a follower sees the leader's result"
+                );
+            }
+        });
+        drop(second);
+        drop(third);
+        assert!(!queue.lock().publishing, "the queue is free after the lead");
+        assert!(queue.lock().parked.is_empty());
+    }
 
-        assert_eq!(
-            queue.reserve(Some(&root("theirs")), 1).1,
-            None,
-            "another writer moved the root, so its length is unknown"
+    /// A leader that unwinds after taking tickets on, before it answers
+    /// them, fails them as it failed rather than leaving them waiting: they
+    /// are off the parked list, so none of them could lead.
+    #[test]
+    fn a_leader_that_ends_unanswered_fails_its_followers_instead_of_stranding_them() {
+        let queue = AppendQueue::default();
+        let queue = &queue;
+        let mut lead = queue.reserve();
+        let mut second = queue.reserve();
+        match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => assert_eq!(run.len(), 1),
+            Turn::Published(_) => panic!("nothing was publishing"),
+        }
+        thread::scope(|scope| {
+            let follower = scope.spawn(|| {
+                let parked = parked_for_test(second.number);
+                match queue.lead_or_follow(&mut second, parked) {
+                    Turn::Published(result) => result.is_err(),
+                    Turn::Lead(_) => false,
+                }
+            });
+            while queue.lock().parked.is_empty() {
+                thread::yield_now();
+            }
+            // The leader takes the parked ticket on, then ends without
+            // answering it, as one that panicked mid-publish would.
+            let taken = take_run(&mut queue.lock(), parked_for_test(99));
+            assert_eq!(taken.len(), 2);
+            lead.followers = vec![1];
+            drop(lead);
+            assert!(
+                follower.join().expect("follower thread"),
+                "the follower fails rather than waits"
+            );
+        });
+        drop(second);
+        assert!(!queue.lock().publishing);
+        assert!(queue.lock().results.is_empty());
+    }
+
+    /// A follower sees the leader's error of the same kind, so the public
+    /// mapping reads it the same way whichever append led.
+    #[test]
+    fn a_follower_sees_the_leaders_error_of_the_same_kind() {
+        let queue = AppendQueue::default();
+        let mut lead = queue.reserve();
+        lead.followers = vec![7];
+        queue.publish_followers(
+            &mut lead,
+            &Err(BuildError::PermissionDenied("refused".into())),
         );
-        assert_eq!(queue.reserve(Some(&root("ours")), 1).1, Some(5));
+        assert!(matches!(
+            queue.lock().results.remove(&7),
+            Some(Err(BuildError::PermissionDenied(message))) if message == "refused"
+        ));
+        assert!(matches!(
+            BuildError::WriteContention.for_follower(),
+            BuildError::WriteContention
+        ));
+        assert!(matches!(
+            BuildError::NoDocsToBuild.for_follower(),
+            BuildError::Store(_)
+        ));
+    }
+
+    /// A leader takes on only the parked publishes it can share one manifest
+    /// write with: one that expects another schema stays parked, and leads
+    /// its own publish once the queue frees.
+    #[test]
+    fn a_leader_leaves_a_publish_under_another_schema_parked() {
+        let mut state = AppendQueueState {
+            issued: 3,
+            publishing: true,
+            parked: BTreeMap::new(),
+            results: BTreeMap::new(),
+        };
+        let under = |number: u64, schema: u32| {
+            let mut parked = parked_for_test(number);
+            parked.list_metadata.expected_schema_id = Some(schema);
+            parked
+        };
+        state.parked.insert(1, under(1, 7));
+        state.parked.insert(2, under(2, 8));
+        let run = take_run(&mut state, under(0, 7));
+        assert_eq!(
+            run.iter().map(|parked| parked.number).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the publish under the same schema rides along"
+        );
+        assert_eq!(
+            state.parked.keys().copied().collect::<Vec<_>>(),
+            vec![2],
+            "the publish under another schema stays parked"
+        );
+    }
+
+    /// A ticket parked while another publishes leads itself once that
+    /// publish ends and left it behind.
+    #[test]
+    fn a_parked_ticket_the_leader_left_leads_when_the_queue_frees() {
+        let queue = AppendQueue::default();
+        let queue = &queue;
+        let mut lead = queue.reserve();
+        let mut next = queue.reserve();
+        match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => assert_eq!(run.len(), 1),
+            Turn::Published(_) => panic!("nothing was publishing"),
+        }
+        thread::scope(|scope| {
+            let follower =
+                scope.spawn(
+                    || match queue.lead_or_follow(&mut next, parked_for_test(1)) {
+                        Turn::Lead(run) => run.len(),
+                        Turn::Published(_) => 0,
+                    },
+                );
+            while queue.lock().parked.is_empty() {
+                thread::yield_now();
+            }
+            // The leader publishes alone, having started before the
+            // follower parked, and frees the queue; the follower leads.
+            drop(lead);
+            assert_eq!(
+                follower.join().expect("follower thread"),
+                1,
+                "it leads a run of itself"
+            );
+        });
+        assert!(next.leading);
+        drop(next);
+        assert!(!queue.lock().publishing);
     }
 
     /// The term-index root `st`'s manifest references.
@@ -17992,11 +18770,6 @@ supertable:
         let root = term_root(&Supertable::open(options()).expect("reopen"), &storage);
         assert_eq!(root.superfiles.len(), APPENDS);
         assert!(!root.superfiles.contains(&Uuid::nil()));
-        assert!(
-            first.inner().append_queue.lock().rebuilt + second.inner().append_queue.lock().rebuilt
-                > 0,
-            "each handle's view goes stale behind the other's appends, so some rebuild"
-        );
     }
 
     /// A compaction leaves the root listing the superfiles it removed, so

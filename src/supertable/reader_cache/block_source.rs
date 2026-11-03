@@ -77,7 +77,7 @@
 //!   read that registered it and every read that needs its blocks meanwhile
 //!   await the same task, which is cancelled only when all of them are
 //!   dropped.
-//! - A read that has waited [`HEDGE_AFTER`] on another read's GET, longer for a
+//! - A read that has waited [`stuck_after`] on another read's GET, longer for a
 //!   big one, sends its own and keeps whichever lands first, so one stuck GET
 //!   can't hold every read sharing it. A GET that ends with no bytes for a
 //!   waiting read leaves it to fetch its blocks itself; one that fails fails
@@ -146,7 +146,7 @@ use super::disk::BlockWriteTicket;
 use super::disk::{ArcMmapOwner, DiskCacheStore, Reservation};
 use crate::{
     runtime_bridge::shared_io_runtime,
-    storage::StorageError,
+    storage::{StorageError, stuck_after},
     superfile::{CacheBlocks, CacheRoom, LazyByteSource, LazyByteSourceError},
     supertable::manifest::SuperfileUri,
 };
@@ -239,20 +239,6 @@ impl SourceLayout {
         aligned_region: Some((0, u64::MAX)),
     };
 }
-
-/// How long a read waits on another read's GET before it GETs the same blocks
-/// itself and keeps whichever lands first. Far above a normal GET (on GCS about
-/// 45 ms at p50 and under 140 ms at p90), far below a stalled one (one attempt
-/// can run to the store's 60 s request timeout): it costs nothing normally, and
-/// bounds how long one stuck GET holds the reads sharing it. A big GET gets
-/// longer: see [`STUCK_BYTES_PER_SEC`].
-const HEDGE_AFTER: Duration = Duration::from_secs(2);
-
-/// A GET slower than this is taken for stuck: a read waiting on another read's
-/// GET hedges once it has waited [`HEDGE_AFTER`] plus the time the GET's bytes
-/// take at this rate, so a big GET that is only slow is not fetched twice. One
-/// GET on GCS moves tens of MB/s even with twenty others in flight.
-const STUCK_BYTES_PER_SEC: u64 = 16 << 20;
 
 static PERSIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1521,7 +1507,7 @@ impl BlockCachedSource {
     /// Serves a read that is not fully on the block file: filled blocks from the
     /// file, fetched runs from memory, and every other run through its shared
     /// fetch, its own (see [`Self::claim_segments`]) or another read's (hedged
-    /// past [`HEDGE_AFTER`]). It awaits all of them at once, so it takes as long
+    /// past [`stuck_after`]). It awaits all of them at once, so it takes as long
     /// as the slowest, not their sum. `None` sends the read to the whole-file
     /// copy or to object storage: one of its own fetches ended without bytes
     /// ([`Fetched::Elsewhere`]), or a local read failed.
@@ -1614,10 +1600,10 @@ impl BlockCachedSource {
     }
 
     /// How long a read waits on another read's GET of `bytes` before it GETs the
-    /// blocks it needs itself: [`HEDGE_AFTER`], plus the time those bytes take at
-    /// [`STUCK_BYTES_PER_SEC`].
+    /// blocks it needs itself: the time after which the store's request is
+    /// taken for stuck (see [`stuck_after`]).
     fn hedge_after(bytes: u64) -> Duration {
-        HEDGE_AFTER + Duration::from_millis(bytes.saturating_mul(1000) / STUCK_BYTES_PER_SEC)
+        stuck_after(bytes)
     }
 
     /// Fetches blocks `[first, last]` and queues them for writing without
@@ -5760,7 +5746,7 @@ mod tests {
         }
     }
 
-    /// A read stuck behind another read's GET for longer than `HEDGE_AFTER` GETs
+    /// A read stuck behind another read's GET for longer than `stuck_after` GETs
     /// the blocks itself, so one stuck GET can't hold it.
     #[tokio::test(start_paused = true)]
     async fn a_waiting_read_hedges_a_stuck_get() {
@@ -5782,7 +5768,7 @@ mod tests {
         let started = Instant::now();
         let hedged = src.range(10, 64).await.expect("the waiting read");
         assert_eq!(hedged, inner.inner.blob.slice(10..74));
-        assert!(started.elapsed() >= HEDGE_AFTER, "it waited first");
+        assert!(started.elapsed() >= stuck_after(0), "it waited first");
         assert_eq!(inner.inner.calls(), 1, "then GET the block itself");
 
         inner.release();
@@ -5793,7 +5779,7 @@ mod tests {
         store.remove_block_entry_for_test(&uri);
     }
 
-    /// A read whose wait ends under `HEDGE_AFTER` sends no GET of its own.
+    /// A read whose wait ends under `stuck_after` sends no GET of its own.
     #[tokio::test(start_paused = true)]
     async fn a_waiting_read_does_not_hedge_a_get_that_lands_in_time() {
         let dir = tempdir().expect("tempdir");
@@ -5809,7 +5795,7 @@ mod tests {
         let mut two = pin!(src.range(10, 64));
         assert!(poll!(one.as_mut()).is_pending());
         assert!(poll!(two.as_mut()).is_pending());
-        advance(HEDGE_AFTER - Duration::from_millis(1)).await;
+        advance(stuck_after(0) - Duration::from_millis(1)).await;
         assert!(poll!(two.as_mut()).is_pending(), "still waiting");
         inner.release();
         // The GET runs on the I/O runtime, so this runtime looks idle meanwhile
@@ -6103,7 +6089,7 @@ mod tests {
 
         let mut stuck = pin!(src.range(0, 64));
         assert!(poll!(stuck.as_mut()).is_pending());
-        advance(3 * HEDGE_AFTER).await;
+        advance(3 * stuck_after(0)).await;
         assert!(poll!(stuck.as_mut()).is_pending(), "still waiting");
         assert_eq!(inner.inner.calls(), 0, "with no GET of its own");
 
@@ -6465,7 +6451,7 @@ mod tests {
         let hedged = src.range(10, 64).await.expect("the waiting read");
         assert_eq!(hedged, inner.inner.blob.slice(10..74));
         let after = BlockCachedSource::hedge_after(big);
-        assert!(after > HEDGE_AFTER, "a big GET gets longer");
+        assert!(after > stuck_after(0), "a big GET gets longer");
         assert!(
             started.elapsed() >= after,
             "the read waited that long first"

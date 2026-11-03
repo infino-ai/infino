@@ -370,6 +370,9 @@ struct Source {
     object: ContentHash,
     chunks: Vec<TierChunkRef>,
     data: Vec<Arc<TierChunkData>>,
+    /// What the ordinals in the chunks are relative to: the run's layer
+    /// base.
+    base: u32,
 }
 
 /// What the merge knows of one term in one kept superfile.
@@ -656,7 +659,12 @@ pub(crate) async fn prepare_merge<'a>(
     let mut inline: Vec<(usize, TierEntry)> = Vec::new();
     for (ti, runs) in runs_per_term.iter().enumerate() {
         let idf_table = idf[ti];
-        for SliceRun { tier_object, run } in runs.iter() {
+        for SliceRun {
+            tier_object,
+            run,
+            base,
+        } in runs.iter()
+        {
             // Runs without a tier and without postings were passed over
             // above; one with postings declined the merge there.
             let Some(tier) = &run.tier else {
@@ -671,6 +679,7 @@ pub(crate) async fn prepare_merge<'a>(
                     object,
                     chunks: tier.chunks.clone(),
                     data: Vec::new(),
+                    base: *base,
                 });
                 Some(sources[ti].len() - 1)
             } else {
@@ -931,7 +940,14 @@ impl PreparedMerge<'_> {
                                     state.done = true;
                                     continue;
                                 };
-                                let Some(block) = chunk.dir.block_of(slot.ordinal) else {
+                                // The chunk stores ordinals relative to its
+                                // layer's base.
+                                let Some(stored) = slot.ordinal.checked_sub(sources[ti][si].base)
+                                else {
+                                    state.done = true;
+                                    continue;
+                                };
+                                let Some(block) = chunk.dir.block_of(stored) else {
                                     state.done = true;
                                     continue;
                                 };

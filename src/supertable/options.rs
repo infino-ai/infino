@@ -667,7 +667,9 @@ pub struct SupertableOptions {
     /// fragmentation, but O(corpus) RAM — the pre-batching behavior). `0` =
     /// skip the drain entirely. Defaults to `vector.drain_batch_superfiles`
     /// from config (64 when unset); [`Self::with_drain_batch_superfiles`]
-    /// overrides per table.
+    /// overrides per table. A drain resumed from a checkpoint keeps the
+    /// batches that checkpoint recorded; this setting shapes the next fresh
+    /// drain.
     pub drain_batch_superfiles: i64,
     /// Recall the drain calibration targets when it stamps this table's
     /// probe laws — the recall/latency lever. Width crosses at this

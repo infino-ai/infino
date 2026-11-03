@@ -38,6 +38,7 @@ use infino::{
     },
     test_helpers::default_vector_config,
 };
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use tempfile::TempDir;
 
 /// `default_vector_config` is dim=16, cosine, n_cent=4.
@@ -923,5 +924,106 @@ fn filtered_knn_sizes_the_tail_probe_from_tail_counts_only() {
         stable_ids(&hits),
         tail_needles,
         "the tail's sparse matches win top-k; drained matches must not shrink the tail probe"
+    );
+}
+
+/// DRAINED table, a filter that keeps one cluster of rows far from the
+/// query: the search on the hidden vector index must return the exact
+/// top-k matching rows, even though no matching row sits in the cells
+/// near the query (issue #1168).
+#[test]
+fn filtered_knn_after_drain_finds_matches_in_a_far_cluster() {
+    /// Random rows that do not match the filter. Random data makes the
+    /// drain stamp a probe width of many cells, but fewer than all.
+    const BACKGROUND_ROWS: usize = 2048;
+    /// Matching rows, all close to `-query`: the far side of the space.
+    const NEEDLE_ROWS: usize = 64;
+    /// Per-row offset step, so the needle rows sit at distinct distances:
+    /// a larger offset is closer to the query under cosine.
+    const JITTER: f32 = 0.01;
+    /// Hidden index cells.
+    const CELLS: usize = 128;
+    /// Seed for the background rows.
+    const SEED: u64 = 1168;
+    /// Requested top-k, well below the matching row count.
+    const K: usize = 10;
+
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(
+        options_title_emb()
+            .with_storage(storage)
+            .with_vector_cell_counts(CELLS, CELLS),
+    )
+    .expect("create");
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let mut titles = Vec::new();
+    let mut flat = Vec::new();
+    for i in 0..BACKGROUND_ROWS {
+        titles.push(format!("doc {i}"));
+        flat.extend((0..DIM).map(|_| rng.random_range(-1.0f32..1.0)));
+    }
+    for i in 0..NEEDLE_ROWS {
+        // The last `K` needles are the true top-k.
+        if i >= NEEDLE_ROWS - K {
+            titles.push(format!("doc {i} needle best"));
+        } else {
+            titles.push(format!("doc {i} needle"));
+        }
+        let mut row = vec![0.0f32; DIM];
+        row[QUERY_DIM] = -1.0;
+        row[1 + i % (DIM - 1)] = JITTER * (i + 1) as f32;
+        flat.extend(row);
+    }
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(flat)) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    let title_arr = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+    let batch = RecordBatch::try_new(
+        st.options().schema.clone(),
+        vec![Arc::new(title_arr), Arc::new(fsl)],
+    )
+    .expect("batch");
+    let mut w = st.writer().expect("writer");
+    w.append(&batch).expect("append");
+    w.commit().expect("commit");
+    drop(w);
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    let reader = st.reader().expect("reader");
+    let allowed = stable_ids(
+        &reader
+            .token_match("title", "needle", BoolMode::Or)
+            .expect("token_match"),
+    );
+    assert_eq!(allowed.len(), NEEDLE_ROWS, "fixture: needle rows match");
+
+    let hits = reader
+        .vector_hits(
+            "emb",
+            &one_hot(QUERY_DIM),
+            K,
+            VectorSearchOptions::new(),
+            Some(VectorFilter {
+                column: "title",
+                query: "needle",
+                mode: BoolMode::Or,
+            }),
+        )
+        .expect("filtered vector search");
+    let best = stable_ids(
+        &reader
+            .token_match("title", "best", BoolMode::Or)
+            .expect("token_match best"),
+    );
+    assert_eq!(
+        stable_ids(&hits),
+        best,
+        "{NEEDLE_ROWS} rows match; the {K} nearest of them must return"
     );
 }

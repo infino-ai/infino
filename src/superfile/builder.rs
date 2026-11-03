@@ -91,7 +91,7 @@ use parquet::{
     errors::ParquetError,
     file::{metadata::ParquetMetaData, reader::ChunkReader},
 };
-use rayon::prelude::*;
+use rayon::{join, prelude::*};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
 use tracing::{info, warn};
@@ -878,6 +878,13 @@ pub struct BuilderOptions {
     /// range index region over them (`superfile::range`), built from the
     /// rows as the Parquet body stores them. May be empty.
     pub(crate) range_columns: Vec<String>,
+    /// Finish on the calling thread alone: no join or parallel encode
+    /// inside the pool. Set for a build that is itself one of many pool
+    /// tasks running side by side, such as a piece of an append, where a
+    /// wait inside the pool runs whatever else is queued and a piece was
+    /// seen to carry another's fifty-second build. A build with the pool
+    /// to itself, such as a compaction merge, leaves it off.
+    pub(crate) finish_serial: bool,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -1026,6 +1033,7 @@ impl BuilderOptions {
             field_ids_outside_schema: HashMap::new(),
             merge_input_mb: None,
             range_columns: Vec::new(),
+            finish_serial: false,
         }
     }
 
@@ -1080,6 +1088,7 @@ impl BuilderOptions {
             row_group_size: self.row_group_size,
             dictionary_candidates,
             column_page_size_limits: vec![(self.id_column.clone(), self.id_page_size_limit)],
+            encode_groups_together: !self.finish_serial,
         }
     }
 
@@ -1493,8 +1502,6 @@ impl fmt::Debug for SuperfileBuilder {
 #[derive(Default, Debug)]
 struct FtsMergeTimings {
     read_parquet: Duration,
-    stats_compute: Duration,
-    fts: Duration,
     write_parquet: Duration,
 }
 
@@ -1715,6 +1722,13 @@ impl SuperfileBuilder {
     /// streaming-dictionary finish path on a corpus too small to cross the
     /// default 256 MiB threshold; production callers should leave
     /// the default in place.
+    /// Finish on the calling thread alone (see
+    /// [`BuilderOptions::finish_serial`]): for a build that is itself one
+    /// of many pool tasks running side by side.
+    pub(crate) fn set_finish_serial(&mut self) {
+        self.opts.finish_serial = true;
+    }
+
     pub fn set_fts_spill_threshold_bytes(&mut self, threshold: usize) {
         if let Some(fb) = self.fts_builder.as_mut() {
             fb.set_spill_threshold_bytes(threshold);
@@ -3172,6 +3186,92 @@ impl SuperfileBuilder {
         )
     }
 
+    /// Stream every input's surviving rows into the body, in input order,
+    /// and the stable ids beside them. A thread of its own decodes the
+    /// next few batches and computes their stats while this one encodes
+    /// the last; they arrive in the order they were read, so the output is
+    /// the same. Nothing is decoded and retained whole. A re-analyzed
+    /// merge indexes the rows as they go by, under the doc ids they are
+    /// written at.
+    fn copy_input_bodies(
+        &mut self,
+        inputs: &[MergeInput],
+        body_encoder: &mut PlannedBodyEncoder,
+        id_sidecar: &mut Option<PackedIdEncoder<BufWriter<NamedTempFile>>>,
+        stats_collector: &mut Vec<SuperfileStats>,
+        reanalyze: bool,
+    ) -> Result<(), BuildError> {
+        let id_column = self.opts.id_column.clone();
+        let mut timings = FtsMergeTimings::default();
+        let copy_span =
+            detail_span!("merge_copy_rows", read_parquet = 0, write_parquet = 0).entered();
+        for input in inputs {
+            let opts = self.opts.clone();
+            let (sender, decoded) = sync_channel::<Result<(RecordBatch, SuperfileStats), BuildError>>(
+                DECODED_BATCHES_AHEAD,
+            );
+            thread::scope(|scope| -> Result<(), BuildError> {
+                // Owned here, so an encode that fails drops it on the
+                // way out and the decoder's next send fails, instead of
+                // the scope waiting on a decoder blocked on a full
+                // channel.
+                let decoded = decoded;
+                scope.spawn(move || {
+                    let batches = match input.batches(&opts) {
+                        Ok(batches) => batches,
+                        Err(e) => {
+                            let _ = sender.send(Err(e));
+                            return;
+                        }
+                    };
+                    for batch in batches {
+                        let decoded = batch.and_then(|batch| {
+                            let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
+                            Ok((batch, stats))
+                        });
+                        let failed = decoded.is_err();
+                        // The receiver is gone once the merge has failed.
+                        if sender.send(decoded).is_err() || failed {
+                            return;
+                        }
+                    }
+                });
+                loop {
+                    let start = std::time::Instant::now();
+                    let Ok(next) = decoded.recv() else {
+                        break;
+                    };
+                    let (record_batch, stats) = next?;
+                    #[cfg(test)]
+                    if tests::encode_fault() {
+                        return Err(BuildError::Io(Error::other(
+                            "test fault: the encode failed",
+                        )));
+                    }
+                    // Time spent waiting on the decoder, not decoding.
+                    timings.read_parquet += start.elapsed();
+                    stats_collector.push(stats);
+
+                    let start = std::time::Instant::now();
+                    body_encoder.write_batch(&record_batch)?;
+                    timings.write_parquet += start.elapsed();
+
+                    push_stable_ids(id_sidecar, &record_batch, &id_column)?;
+
+                    let rows = record_batch.num_rows() as u32;
+                    if reanalyze {
+                        self.index_fts_batch(&record_batch, rows)?;
+                    }
+                    self.next_local_doc_id += rows;
+                }
+                Ok(())
+            })?;
+        }
+        copy_span.record("read_parquet", timings.read_parquet.as_millis());
+        copy_span.record("write_parquet", timings.write_parquet.as_millis());
+        Ok(())
+    }
+
     fn merge_rows_to<W: Write>(
         mut superfile_builder: SuperfileBuilder,
         inputs: &[MergeInput],
@@ -3247,37 +3347,59 @@ impl SuperfileBuilder {
         // the blob in arrival order, exactly as before. A re-analyzed merge
         // keeps arrival order: its postings come from the rows as they are
         // written, under the ids they are written at.
-        let order = match superfile_builder.fts_builder.is_some() && !reanalyze {
-            true => {
-                let readers: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> = inputs
-                    .iter()
-                    .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
-                    .collect();
-                Self::merge_doc_order(
+        let reorder = superfile_builder.fts_builder.is_some() && !reanalyze;
+        let readers: Vec<(Arc<SuperfileReader>, Option<Arc<RoaringBitmap>>)> = inputs
+            .iter()
+            .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
+            .collect();
+        let merge_input_mb = superfile_builder.opts.merge_input_mb;
+        // The body is written in arrival order whatever order the blob
+        // stores its documents under, so the rows are copied while the
+        // order is chosen. The copy is one decode-and-encode stream over
+        // every input and the choice is a parallel pass over the postings;
+        // run one after the other, a merge spent the copy's length with
+        // most of its pool idle. `join` keeps both in the merge's own pool.
+        // The multi-cell path writes its preordered batches below instead.
+        let (order, copied) = join(
+            || match reorder {
+                true => Self::merge_doc_order(
                     &readers,
                     n_fts_columns,
                     n_out_docs,
                     &rows_of,
-                    superfile_builder.opts.merge_input_mb,
-                )?
-            }
-            false => None,
-        };
+                    merge_input_mb,
+                ),
+                false => Ok(None),
+            },
+            || match ordered_batches.is_none() {
+                true => superfile_builder.copy_input_bodies(
+                    inputs,
+                    &mut body_encoder,
+                    &mut id_sidecar,
+                    &mut stats_collector,
+                    reanalyze,
+                ),
+                false => Ok(()),
+            },
+        );
+        let order = order?;
+        copied?;
+        drop(readers);
         // The inverse, which is what the per-input remap needs: the doc
-        // id a row is stored under.
-
-        let new_of_row: Option<Vec<u32>> = if superfile_builder.fts_builder.is_none() || reanalyze {
-            None
-        } else if ordered_batches.is_some() && order.is_none() {
-            Some((0..n_out_docs).collect())
-        } else {
-            order.as_ref().map(|o| {
-                let mut inv = vec![0u32; o.len()];
-                for (new_id, &row) in o.iter().enumerate() {
-                    inv[row as usize] = new_id as u32;
+        // id a row is stored under. Without a chosen order a row is
+        // stored under its own number.
+        let new_of_row: Option<Vec<u32>> = match reorder {
+            false => None,
+            true => Some(match &order {
+                Some(order) => {
+                    let mut inv = vec![0u32; order.len()];
+                    for (new_id, &row) in order.iter().enumerate() {
+                        inv[row as usize] = new_id as u32;
+                    }
+                    inv
                 }
-                inv
-            })
+                None => (0..n_out_docs).collect(),
+            }),
         };
 
         // Doc lengths are scattered rather than appended when the order
@@ -3296,171 +3418,54 @@ impl SuperfileBuilder {
             superfile_builder.set_fts_spill_threshold_bytes(1);
         }
 
+        // Carry the inputs' prebuilt postings and doc lengths across,
+        // remapped onto the output. A re-analyzed merge carries nothing:
+        // its postings were produced from each batch as it was written.
+        // The term-by-term path carries only doc lengths here; the finish
+        // merges the postings.
         let mut sorted_inputs = Vec::new();
-
-        let mut timings = FtsMergeTimings::default();
-        let copy_span = detail_span!(
-            "merge_copy_rows",
-            read_parquet = 0,
-            stats_compute = 0,
-            fts = 0,
-            write_parquet = 0
-        )
-        .entered();
-        for (idx, input) in inputs.iter().enumerate() {
-            let (reader, deleted) = (&input.reader, &input.deleted);
-            let start = std::time::Instant::now();
-            // A re-analyzed merge copies nothing here: its postings are
-            // produced from each batch as it is written below.
-            if !reanalyze {
+        if !reanalyze {
+            let carry_span = detail_span!("merge_carry_postings").entered();
+            for (idx, input) in inputs.iter().enumerate() {
+                let reader = &input.reader;
                 superfile_builder.opts.check_fts_carry_compat(
                     reader
                         .fts()
                         .map(|f| f.fts_columns_config().collect::<Vec<_>>())
                         .as_deref(),
                 )?;
-                // Carry the input's prebuilt postings + doc-lengths across,
-                // remapped onto the output this batch is about to append (so
-                // it must run before `next_local_doc_id` advances).
-                // The term-by-term path carries only doc lengths here; the
-                // finish merges the postings.
-                match &new_of_row {
-                    // Arrival order: this input's rows land in the output in
-                    // input order, which is exactly what the term-by-term
-                    // merge needs, so it carries doc lengths here and leaves
-                    // the postings to the finish.
-                    None => match merge {
-                        PostingMerge::TermByTerm => {
-                            if let Some(remap) = superfile_builder.carry_fts_doc_lengths(
-                                reader,
-                                deleted.as_deref(),
-                                CarryScope::AllColumns,
-                            )? {
-                                sorted_inputs.push(SortedInput {
-                                    reader: Arc::clone(reader),
-                                    remap,
-                                });
-                            }
-                        }
-                        #[cfg(test)]
-                        PostingMerge::Accumulator => {
-                            superfile_builder.carry_fts_from_reader_scoped(
-                                reader,
-                                deleted.as_deref(),
-                                CarryScope::AllColumns,
-                            )?;
-                        }
-                    },
-                    // A chosen order sends this input's documents to output
-                    // positions that do not rise with its own ids.
-                    Some(inv) => {
-                        if let Some(fts) = reader.fts() {
-                            // The shared numbering gives the row; the order's
-                            // inverse gives the doc id that row is stored under;
-                            // and the input's own map turns that into the key
-                            // its postings and lengths actually arrive under.
-                            let remap_by_row: Vec<Option<FtsDocId>> = rows_of[idx]
-                                .iter()
-                                .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
-                                .collect();
-                            let remap = remap_by_blob_id(fts, &remap_by_row)?;
-                            scatter_doc_lengths(
-                                fts,
-                                &remap,
-                                0,
-                                &format!("fts merge input {idx}"),
-                                &mut out_lengths,
-                            )?;
-
-                            match merge {
-                                PostingMerge::TermByTerm => sorted_inputs.push(SortedInput {
-                                    reader: Arc::clone(reader),
-                                    remap,
-                                }),
-                                #[cfg(test)]
-                                PostingMerge::Accumulator => superfile_builder
-                                    .carry_fts_postings_with_remap(reader, &remap)?,
-                            }
-                        }
+                let (Some(inv), Some(fts)) = (&new_of_row, reader.fts()) else {
+                    continue;
+                };
+                // The shared numbering gives the row; the order's inverse
+                // gives the doc id that row is stored under; and the
+                // input's own map turns that into the key its postings and
+                // lengths actually arrive under.
+                let remap_by_row: Vec<Option<FtsDocId>> = rows_of[idx]
+                    .iter()
+                    .map(|row| row.map(|r| FtsDocId::new(inv[r.get() as usize])))
+                    .collect();
+                let remap = remap_by_blob_id(fts, &remap_by_row)?;
+                scatter_doc_lengths(
+                    fts,
+                    &remap,
+                    0,
+                    &format!("fts merge input {idx}"),
+                    &mut out_lengths,
+                )?;
+                match merge {
+                    PostingMerge::TermByTerm => sorted_inputs.push(SortedInput {
+                        reader: Arc::clone(reader),
+                        remap,
+                    }),
+                    #[cfg(test)]
+                    PostingMerge::Accumulator => {
+                        superfile_builder.carry_fts_postings_with_remap(reader, &remap)?
                     }
                 }
             }
-            timings.fts += start.elapsed();
-            if ordered_batches.is_none() {
-                // Stream surviving rows batch by batch. Do not decode and retain an
-                // entire input in memory. A thread of its own decodes the next
-                // few batches and computes their stats while this one encodes
-                // the last; they arrive in the order they were read, so the
-                // output is the same.
-                let opts = superfile_builder.opts.clone();
-                let (sender, decoded) = sync_channel::<
-                    Result<(RecordBatch, SuperfileStats), BuildError>,
-                >(DECODED_BATCHES_AHEAD);
-                thread::scope(|scope| -> Result<(), BuildError> {
-                    // Owned here, so an encode that fails drops it on the
-                    // way out and the decoder's next send fails, instead of
-                    // the scope waiting on a decoder blocked on a full
-                    // channel.
-                    let decoded = decoded;
-                    scope.spawn(move || {
-                        let batches = match input.batches(&opts) {
-                            Ok(batches) => batches,
-                            Err(e) => {
-                                let _ = sender.send(Err(e));
-                                return;
-                            }
-                        };
-                        for batch in batches {
-                            let decoded = batch.and_then(|batch| {
-                                let stats = SuperfileStats::try_compute_from_record_batch(&batch)?;
-                                Ok((batch, stats))
-                            });
-                            let failed = decoded.is_err();
-                            // The receiver is gone once the merge has failed.
-                            if sender.send(decoded).is_err() || failed {
-                                return;
-                            }
-                        }
-                    });
-                    loop {
-                        let start = std::time::Instant::now();
-                        let Ok(next) = decoded.recv() else {
-                            break;
-                        };
-                        let (record_batch, stats) = next?;
-                        #[cfg(test)]
-                        if tests::encode_fault() {
-                            return Err(BuildError::Io(Error::other(
-                                "test fault: the encode failed",
-                            )));
-                        }
-                        // Time spent waiting on the decoder, not decoding.
-                        timings.read_parquet += start.elapsed();
-                        stats_collector.push(stats);
-
-                        let start = std::time::Instant::now();
-                        body_encoder.write_batch(&record_batch)?;
-                        timings.write_parquet += start.elapsed();
-
-                        push_stable_ids(&mut id_sidecar, &record_batch, &id_column)?;
-
-                        let rows = record_batch.num_rows() as u32;
-                        // A re-analyzed merge indexes the rows as they go by,
-                        // under the doc ids they are written at.
-                        if reanalyze {
-                            superfile_builder.index_fts_batch(&record_batch, rows)?;
-                        }
-                        superfile_builder.next_local_doc_id += rows;
-                    }
-                    Ok(())
-                })?;
-            }
+            drop(carry_span);
         }
-        copy_span.record("read_parquet", timings.read_parquet.as_millis());
-        copy_span.record("fts", timings.fts.as_millis());
-        copy_span.record("write_parquet", timings.write_parquet.as_millis());
-        copy_span.record("stats_compute", timings.stats_compute.as_millis());
-        drop(copy_span);
 
         if new_of_row.is_some()
             && let Some(fts_builder) = superfile_builder.fts_builder.as_mut()
@@ -3669,6 +3674,16 @@ impl SuperfileBuilder {
                 vec_builder,
                 cell_posting_builder,
                 prebuilt_multi_cell,
+                self.opts.finish_serial,
+            )?;
+            (encode_body()?, fts_file, vec_file)
+        } else if self.opts.finish_serial {
+            let (fts_file, vec_file) = stream_index_blobs_to_scratch(
+                fts_builder,
+                vec_builder,
+                cell_posting_builder,
+                prebuilt_multi_cell,
+                true,
             )?;
             (encode_body()?, fts_file, vec_file)
         } else {
@@ -3678,6 +3693,7 @@ impl SuperfileBuilder {
                     vec_builder,
                     cell_posting_builder,
                     prebuilt_multi_cell,
+                    false,
                 )
             });
             let (fts_file, vec_file) = blobs_res?;
@@ -3733,6 +3749,7 @@ impl SuperfileBuilder {
             vec_builder,
             cell_posting_builder,
             prebuilt_multi_cell,
+            self.opts.finish_serial,
         )?;
         // The caller streamed the rows into `body` and kept none of them, so
         // the range region reads its columns back from the body.
@@ -3870,7 +3887,8 @@ impl SuperfileBuilder {
             ));
         }
 
-        let (fts_file, _empty_vec) = stream_index_blobs_to_scratch(fts_builder, None, None, None)?;
+        let (fts_file, _empty_vec) =
+            stream_index_blobs_to_scratch(fts_builder, None, None, None, self.opts.finish_serial)?;
         let fts_length = fts_file.as_file().metadata().map_err(BuildError::Io)?.len();
         // The range region is the table's to decide, not the source's: built
         // again from the carried rows, so a column range-indexed since the
@@ -4239,6 +4257,7 @@ fn stream_index_blobs_to_scratch(
     vec_builder: Option<VectorBuilder>,
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
+    serial: bool,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
     let scratch_root = scratch_root();
 
@@ -4257,6 +4276,7 @@ fn stream_index_blobs_to_scratch(
         prebuilt_multi_cell,
         &mut fw,
         &mut vw,
+        serial,
     )?;
 
     fw.flush().map_err(BuildError::Io)?;
@@ -4429,6 +4449,7 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
     fts_out: &mut Wf,
     vec_out: &mut Wv,
+    serial: bool,
 ) -> Result<(), BuildError> {
     if let Some(cells) = prebuilt_multi_cell {
         if vec_builder.is_some() || cell_posting_builder.is_some() {
@@ -4444,6 +4465,10 @@ fn finish_index_blobs_streamed<Wf: Write + Send, Wv: Write + Send>(
         return Ok(());
     }
     match (fts_builder, vec_builder, cell_posting_builder) {
+        (Some(fb), Some(vb), None) if serial => {
+            fb.finish_to(fts_out)?;
+            vb.finish_to(vec_out)?;
+        }
         (Some(fb), Some(vb), None) => {
             // Disjoint sinks, so the two finalizers can run concurrently.
             let (fts_res, vec_res) =
@@ -7317,8 +7342,17 @@ mod tests {
         ];
         let (done, finished) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            ENCODE_FAULT.with(|f| f.set(true));
-            let _ = done.send(SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err());
+            // The copy runs wherever `join` places it, so the fault is
+            // armed on the one thread a single-worker pool has.
+            let pool = ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .expect("pool");
+            let failed = pool.install(|| {
+                ENCODE_FAULT.with(|f| f.set(true));
+                SuperfileBuilder::build_from_readers_fts_merge(&inputs).is_err()
+            });
+            let _ = done.send(failed);
         });
         let failed = finished
             .recv_timeout(std::time::Duration::from_secs(60))

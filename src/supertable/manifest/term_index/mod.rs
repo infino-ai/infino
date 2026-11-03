@@ -34,13 +34,12 @@ pub(crate) mod build;
 #[cfg(test)]
 mod fold_tool;
 pub(crate) mod format;
-mod rebase;
 pub(crate) mod tier;
 
-#[cfg(test)]
-use std::fs;
 use std::{
+    cmp::Reverse,
     collections::{HashMap, HashSet},
+    fs,
     future::Future,
     io,
     iter::repeat_n,
@@ -49,25 +48,24 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use build::build_layer;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
     HeadSink, SliceFile, build_onto, merge_layers, scratch_dir, tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
+use build::{build_layer, rebase_run};
 use bytes::Bytes;
-use format::Layer;
 #[cfg(test)]
 pub(crate) use format::TierRef;
+use format::{Layer, SliceRef};
 pub(crate) use format::{Location, Posting, Root, Run, Slice, legacy_bound_as_key};
 use futures::{StreamExt, TryStreamExt, stream};
 use rayon::ThreadPool;
-use rebase::{OrdinalShift, rebase_layer, remove_spilled};
 use thiserror::Error;
 pub(crate) use tier::{BLOCK_ENTRIES, ColumnScoring, TierChunkRef, TierDirectory, TierEntry};
-use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet};
-use tracing::{error, warn};
+use tokio::{fs as async_fs, io::AsyncWriteExt, task, task::JoinSet, try_join};
+use tracing::{Instrument, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -126,16 +124,22 @@ const SLICE_FETCH_CONCURRENCY: usize = 8;
 
 /// Objects a merge downloads at once. A rebuild at a billion documents
 /// reads over a hundred gigabytes of slices and tier objects, and at eight
-/// in flight the transfer ran at a fraction of the host's bandwidth; the
+/// in flight the transfer ran at a fraction of the host's bandwidth; at
+/// sixteen a fold of fifty layers still spent four seconds awaiting reads
+/// for every second it merged, with 3,600 ranged reads of 80 ms each. The
 /// client keeps far more warm connections than this. Each task holds one
 /// object at a time, so this many of the largest tier object bounds the
 /// transfer's memory.
-const LAYER_FETCH_CONCURRENCY: usize = 16;
+const LAYER_FETCH_CONCURRENCY: usize = 64;
 
-/// Objects one build writes at once; the write-side twin of
-/// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
-/// object is read back only as its upload starts.
-const SLICE_WRITE_CONCURRENCY: usize = 16;
+/// Objects of one kind a build writes at once; the write-side twin of
+/// [`LAYER_FETCH_CONCURRENCY`]. A build writes its tier objects and its
+/// slices side by side, so twice this many are in flight in all, and twice
+/// this many of the largest bound the upload's memory: a spilled object is
+/// read back only as its upload starts. At sixteen, a fold's four hundred
+/// slices and as many tier objects took half a minute of 400 ms PUTs,
+/// longer than the merge that made them.
+const SLICE_WRITE_CONCURRENCY: usize = LAYER_FETCH_CONCURRENCY;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
 /// [`fold_tail`]). A lookup opens one slice per layer, so a root that only
@@ -386,11 +390,31 @@ pub(crate) async fn write_tiers(
     write_objects(storage, "tier", tiers).await
 }
 
+/// Persist a build's tier objects and slices side by side. A slice names
+/// its tier object and the root names the slices, and the root is written
+/// only after both, so nothing reads either before it is durable; one
+/// kind after the other was two serial rounds of small PUTs.
+async fn write_tiers_and_slices(
+    storage: &Arc<dyn StorageProvider>,
+    tiers: Vec<(ContentHash, BuiltBytes)>,
+    slices: Vec<(ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    try_join!(write_tiers(storage, tiers), write_slices(storage, slices))?;
+    Ok(())
+}
+
 async fn write_objects(
     storage: &Arc<dyn StorageProvider>,
     kind: &'static str,
-    objects: Vec<(ContentHash, BuiltBytes)>,
+    mut objects: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<(), TermIndexError> {
+    // Largest first. A tier object for a common term is a thousand times
+    // the size of one for a rare term, and one PUT moves bytes over one
+    // connection, so the wave ends when its last large object does: a
+    // large object started in the final round stretched the wave by its
+    // whole upload while the other slots sat empty. Started first, the
+    // large ones run the whole wave and the small ones fill in around them.
+    objects.sort_by_key(|(_, built)| Reverse(built.len()));
     let jobs = objects.into_iter().map(|(hash, built)| {
         let storage = Arc::clone(storage);
         async move {
@@ -469,8 +493,7 @@ pub(crate) async fn write_built(
     storage: &Arc<dyn StorageProvider>,
     built: Built,
 ) -> Result<RoutingRef, TermIndexError> {
-    write_tiers(storage, built.tiers).await?;
-    write_slices(storage, built.slices).await?;
+    write_tiers_and_slices(storage, built.tiers, built.slices).await?;
     write_root(storage.as_ref(), &built.root).await
 }
 
@@ -489,26 +512,25 @@ pub(crate) async fn append_delta(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
-    let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
-    write_tiers(storage, built.tiers).await?;
-    write_slices(storage, built.slices).await?;
-    publish_root(storage, built.root, policy, pool).await
+    let prior = prior.unwrap_or_default();
+    let named = prior.layers.len();
+    let built = build_onto(prior, contributions, policy)?;
+    write_tiers_and_slices(storage, built.tiers, built.slices).await?;
+    publish_root(storage, built.root, named, policy, pool).await
 }
 
 /// A delta layer built and written once, numbered from the length of the
 /// root it was built against. A commit that loses its race to a commit
 /// that left the root's list as it was appends the same layer to the
-/// winner's root; when the winner's list is longer, the layer is moved to
-/// its length from the bytes it keeps (see `rebase_layer`) rather than
-/// built again. Either way the root is never padded on its account.
+/// winner's root; the layer stores its ordinals relative to a base the
+/// root gives it when it is placed, so a longer list only places it
+/// further along. The root is never padded on its account.
 pub(crate) struct ReservedLayer {
-    /// The ordinal its first superfile takes. Its postings name
-    /// `base + i` for the `i`-th of `superfiles`.
-    base: u32,
     superfiles: Vec<Uuid>,
     id_mins: Vec<i128>,
     layer: Layer,
-    /// The layer's slice and tier bytes, kept to move it.
+    /// The layer's slice and tier bytes, whose spilled copies go once the
+    /// layer is replaced.
     bytes: Arc<LayerBytes>,
 }
 
@@ -519,11 +541,6 @@ struct LayerBytes {
 }
 
 impl ReservedLayer {
-    /// The ordinal just past the layer's last superfile.
-    pub(crate) fn end(&self) -> u32 {
-        self.base + self.superfiles.len() as u32
-    }
-
     /// Whether it was built from `contributions`, in their order.
     fn built_from(&self, contributions: &[Contribution]) -> bool {
         self.superfiles.len() == contributions.len()
@@ -535,24 +552,22 @@ impl ReservedLayer {
     }
 }
 
-/// Build `contributions` into a layer numbered from `base` and write its
-/// slices, for a later [`append_reserved`].
+/// Build `contributions` into a layer and write its slices, for a later
+/// [`append_reserved`] to place.
 pub(crate) async fn reserve_layer(
     storage: &Arc<dyn StorageProvider>,
     contributions: &[Contribution],
     policy: &BuildPolicy,
-    base: u32,
 ) -> Result<ReservedLayer, TermIndexError> {
     let built = detail_span!(
         "term_index.build_layer",
         inputs = contributions.len(),
-        ordinal_base = base,
+        bytes = tracing::field::Empty,
+        ranges = tracing::field::Empty,
     )
-    .in_scope(|| build_layer(contributions, policy, base))?;
-    write_tiers(storage, built.tiers.clone()).await?;
-    write_slices(storage, built.slices.clone()).await?;
+    .in_scope(|| build_layer(contributions, policy))?;
+    write_tiers_and_slices(storage, built.tiers.clone(), built.slices.clone()).await?;
     Ok(ReservedLayer {
-        base,
         superfiles: built.superfiles,
         id_mins: built.id_mins,
         layer: built.layer,
@@ -561,60 +576,6 @@ pub(crate) async fn reserve_layer(
             tiers: built.tiers,
         }),
     })
-}
-
-/// `reserved` moved to start at `base` and its moved objects written, or
-/// `None` when it cannot be moved in place (see [`OrdinalShift::new`]) or
-/// the move failed, for the caller to build it again. The CPU work runs on
-/// `pool`, one slice per task.
-async fn move_reserved(
-    storage: &Arc<dyn StorageProvider>,
-    reserved: &ReservedLayer,
-    base: u32,
-    pool: Option<&ThreadPool>,
-) -> Result<Option<ReservedLayer>, TermIndexError> {
-    let n = reserved.superfiles.len() as u32;
-    let Some(shift) = OrdinalShift::new(reserved.base, base, n) else {
-        return Ok(None);
-    };
-    let span = detail_span!(
-        "term_index.rebase_layer",
-        from = reserved.base,
-        to = base,
-        superfiles = n,
-        slices = reserved.layer.slices.len(),
-    );
-    let (layer, bytes) = (reserved.layer.clone(), Arc::clone(&reserved.bytes));
-    let moved = run_on_pool(pool, "term-index layer rebase", move || {
-        span.in_scope(|| rebase_layer(&layer, &bytes.slices, &bytes.tiers, &shift))
-    })
-    .await
-    .map_err(|e| TermIndexError::Build(e.to_string()))?;
-    let moved = match moved {
-        Ok(moved) => moved,
-        // Bytes this build wrote that the move cannot parse: the writer and
-        // the move disagree on the format, which is a bug.
-        Err(error @ TermIndexError::Malformed(_)) => {
-            error!(%error, "term index: a reserved layer did not parse for a move; building it again");
-            return Ok(None);
-        }
-        Err(error) => {
-            warn!(%error, "term index: moving a reserved layer failed; building it again");
-            return Ok(None);
-        }
-    };
-    write_tiers(storage, moved.tiers.clone()).await?;
-    write_slices(storage, moved.slices.clone()).await?;
-    Ok(Some(ReservedLayer {
-        base,
-        superfiles: reserved.superfiles.clone(),
-        id_mins: reserved.id_mins.clone(),
-        layer: moved.layer,
-        bytes: Arc::new(LayerBytes {
-            slices: moved.slices,
-            tiers: moved.tiers,
-        }),
-    }))
 }
 
 /// [`append_delta`] for a commit that may retry: the layer is built once,
@@ -635,35 +596,92 @@ pub(crate) async fn append_reserved(
     reserved: &mut Option<ReservedLayer>,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
+    let mut run = [ReservedSegment {
+        contributions: contributions.len(),
+        layer: reserved.take(),
+    }];
+    let result = append_reserved_run(storage, prior, contributions, policy, &mut run, pool).await;
+    let [segment] = run;
+    *reserved = segment.layer;
+    result
+}
+
+/// One append's share of a publish: how many of the publish's
+/// contributions, in order, are its own, and the layer reserved for them,
+/// if one was. A publish that took on the appends queued behind it carries
+/// one per append.
+pub(crate) struct ReservedSegment {
+    pub(crate) contributions: usize,
+    pub(crate) layer: Option<ReservedLayer>,
+}
+
+/// [`append_reserved`] for a run of segments: each segment's layer is
+/// appended to `prior` after the one before it, numbered from where that
+/// one ends — reused as built when its reserved base is that length, moved
+/// or built again when not — and the root is written once for all of them.
+/// Appends that publish together pay the root write once this way, and
+/// their layers are the ones they would have appended one turn at a time.
+pub(crate) async fn append_reserved_run(
+    storage: &Arc<dyn StorageProvider>,
+    prior: Option<Root>,
+    contributions: &[Contribution],
+    policy: &BuildPolicy,
+    run: &mut [ReservedSegment],
+    pool: Option<&ThreadPool>,
+) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
-    let base = root.superfiles.len() as u32;
-    let reusable = reserved
-        .as_ref()
-        .is_some_and(|r| r.base == base && r.built_from(contributions));
-    if !reusable {
-        let moved = match reserved
-            .as_ref()
-            .filter(|kept| kept.built_from(contributions))
-        {
-            Some(kept) => move_reserved(storage, kept, base, pool).await?,
-            None => None,
-        };
-        let next = match moved {
-            Some(moved) => moved,
-            None => reserve_layer(storage, contributions, policy, base).await?,
-        };
-        // The replaced layer's objects are written; its spilled copies are
-        // read by nothing again.
-        if let Some(replaced) = reserved.replace(next) {
-            remove_spilled(&replaced.bytes.slices);
-            remove_spilled(&replaced.bytes.tiers);
+    let named = root.layers.len();
+    let mut rest = contributions;
+    for segment in run.iter_mut() {
+        if segment.contributions > rest.len() {
+            return Err(TermIndexError::Build(
+                "a publish's segments cover more contributions than it carries".into(),
+            ));
+        }
+        let (own, after) = rest.split_at(segment.contributions);
+        rest = after;
+        // An append that indexed nothing adds nothing to the root: on its
+        // own it would not have touched the root, and an empty layer would
+        // only bring the next fold forward.
+        if own.is_empty() {
+            continue;
+        }
+        let base = root.superfiles.len() as u32;
+        let reusable = segment.layer.as_ref().is_some_and(|r| r.built_from(own));
+        if !reusable {
+            let next = reserve_layer(storage, own, policy).await?;
+            // The replaced layer's objects are written; its spilled copies
+            // are read by nothing again.
+            if let Some(replaced) = segment.layer.replace(next) {
+                remove_spilled(&replaced.bytes.slices);
+                remove_spilled(&replaced.bytes.tiers);
+            }
+        }
+        let reserved = segment.layer.as_ref().expect("reserved above");
+        let mut layer = reserved.layer.clone();
+        layer.place_at(base, reserved.superfiles.len() as u32);
+        root.superfiles.extend_from_slice(&reserved.superfiles);
+        root.id_mins.extend_from_slice(&reserved.id_mins);
+        root.layers.push(layer);
+    }
+    // A contribution no segment claims would be listed by the manifest and
+    // routed to by nothing.
+    if !rest.is_empty() {
+        return Err(TermIndexError::Build(
+            "a publish carries contributions no segment claims".into(),
+        ));
+    }
+    publish_root(storage, root, named, policy, pool).await
+}
+
+/// Delete the spilled copies among `objects`; a resident object has none.
+fn remove_spilled(objects: &[(ContentHash, BuiltBytes)]) {
+    for (_, built) in objects {
+        if let BuiltBytes::Spilled { path, .. } = built {
+            // Best effort: a copy left behind is scratch, swept with it.
+            let _ = fs::remove_file(path);
         }
     }
-    let layer = reserved.as_ref().expect("reserved above");
-    root.superfiles.extend_from_slice(&layer.superfiles);
-    root.id_mins.extend_from_slice(&layer.id_mins);
-    root.layers.push(layer.layer.clone());
-    publish_root(storage, root, policy, pool).await
 }
 
 /// Fold `root`'s layers where they have piled up, then write it and
@@ -671,9 +689,12 @@ pub(crate) async fn append_reserved(
 /// an optimisation, so one that fails is logged and the root published as
 /// far as the folds before it took it, every layer still in it: the
 /// commit it is part of never fails on its account.
+/// The first `named` of `root`'s layers are the ones the root it replaces
+/// named; the rest were written by this publish (see [`fold_tail`]).
 async fn publish_root(
     storage: &Arc<dyn StorageProvider>,
     mut root: Root,
+    named: usize,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
@@ -699,7 +720,7 @@ async fn publish_root(
         },
         false => policy.clone(),
     };
-    if let Err(error) = fold_tail(storage, &mut root, &fold_policy, pool).await {
+    if let Err(error) = fold_tail(storage, &mut root, named, &fold_policy, pool).await {
         warn!(%error, "term index: folding layers at commit failed; publishing the root unfolded");
     }
     write_root(storage.as_ref(), &root).await
@@ -720,19 +741,31 @@ async fn publish_root(
 ///
 /// `root` changes only once a fold's merged slices are written, so a fold
 /// that fails leaves it as the last one that succeeded made it.
+///
+/// Only the first `named` layers, the ones the root this publish replaces
+/// named, are folded, and a layer a fold made here is not folded again.
+/// The others' slices were written by this publish and no root names them
+/// yet: a fold that retired them would leave objects no root ever named,
+/// which the commit's sweep, reading what retired roots named, could not
+/// find. A publish that carries several appends adds a layer for each.
 pub(crate) async fn fold_tail(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
+    named: usize,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
     // Every ordinal keeps its place: the fold renumbers nothing.
     let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
-    while let Some(run) = next_fold(root, policy) {
+    // Whether each layer is one the replaced root named.
+    let mut foldable: Vec<bool> = (0..root.layers.len()).map(|i| i < named).collect();
+    while let Some(run) = next_fold(root, &foldable, policy) {
         let merged =
             fold_layers(storage, &root.layers[run.clone()], &ordinals, policy, pool).await?;
         root.layers.drain(run.clone());
         root.layers.insert(run.start, merged);
+        foldable.drain(run.clone());
+        foldable.insert(run.start, false);
     }
     Ok(())
 }
@@ -830,7 +863,7 @@ pub(crate) fn plan_fold_at_optimize(
     }
     let run = match before_tiers && bytes <= max_bytes {
         true => 0..root.layers.len(),
-        false => fold_run(&root.layers, max_bytes)?,
+        false => fold_run_at_optimize(&root.layers, max_bytes)?,
     };
     Some(OptimizeFold {
         run,
@@ -862,17 +895,51 @@ pub(crate) async fn fold_at_optimize(
     if fold.superfiles.is_empty() {
         return Ok(Root::default());
     }
-    let merged = fold_layers(
-        storage,
-        &root.layers[fold.run.clone()],
-        &fold.ordinals,
-        policy,
-        pool,
-    )
-    .await?;
+    let run = &root.layers[fold.run.clone()];
+    // A layer whose every posting survives, renumbered by one shift, is
+    // already what merging would make of it, and merging it in rewrites
+    // its every byte to save a lookup one slice. Where it holds at least
+    // half of what the fold keeps, that rewrite is most of the fold, so it
+    // moves instead: its base and range shift and its objects stay. The
+    // rest merge into one layer as before. After an optimize this is the
+    // pass's own layer, whole by construction, beside the postings of the
+    // few inputs the plan left out, which a small merge drops the dead
+    // from. A layer under one slice is merged whatever its share: the
+    // rewrite it would save is one slice, and a small index folds to one
+    // layer as it always did.
+    let kept_bytes: u64 = run
+        .iter()
+        .filter(|layer| layer_keeps_postings(layer, &fold.ordinals))
+        .map(layer_bytes)
+        .fold(0u64, |sum, size| sum.saturating_add(size));
+    let moves = |layer: &Layer| -> Option<(u32, Range<u32>)> {
+        let bytes = layer_bytes(layer);
+        (bytes >= policy.slice_target_bytes as u64 && bytes.saturating_mul(2) >= kept_bytes)
+            .then(|| shifted_whole(layer, &fold.ordinals))
+            .flatten()
+    };
+    let mut folded: Vec<Layer> = Vec::new();
+    let mut merging: Vec<Layer> = Vec::new();
+    for layer in run {
+        match moves(layer) {
+            Some((base, range)) => {
+                let mut moved = layer.clone();
+                moved.base = base;
+                moved.ordinals = Some(range);
+                folded.push(moved);
+            }
+            None => merging.push(layer.clone()),
+        }
+    }
+    if folded.is_empty()
+        || merging
+            .iter()
+            .any(|layer| layer_keeps_postings(layer, &fold.ordinals))
+    {
+        folded.push(fold_layers(storage, &merging, &fold.ordinals, policy, pool).await?);
+    }
     let mut layers = root.layers.clone();
-    layers.drain(fold.run.clone());
-    layers.insert(fold.run.start, merged);
+    layers.splice(fold.run.clone(), folded);
     Ok(Root {
         superfiles: fold.superfiles,
         id_mins: fold.id_mins,
@@ -892,8 +959,31 @@ async fn fold_layers(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<Layer, TermIndexError> {
+    // A layer whose every ordinal the fold drops holds nothing the merged
+    // layer keeps, so it is neither fetched nor read: after a compaction the
+    // root's commit layers name only replaced superfiles, and they were
+    // most of what the fold moved.
+    let kept: Vec<Layer> = layers
+        .iter()
+        .filter(|layer| layer_keeps_postings(layer, ordinals))
+        .cloned()
+        .collect();
+    let merged_ordinals = merged_ordinals(&kept, ordinals);
+    if kept.is_empty() {
+        return Ok(Layer {
+            slices: Vec::new(),
+            ordinals: merged_ordinals,
+            base: 0,
+        });
+    }
     let scratch = scratch_dir(policy.scratch_root.as_deref())?;
-    let sources = download_layers(storage, layers, scratch.path()).await?;
+    let sources = download_layers(storage, &kept, scratch.path())
+        .instrument(detail_span!(
+            "fold.download",
+            layers = kept.len(),
+            dropped = layers.len() - kept.len()
+        ))
+        .await?;
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
     let merged = run_on_pool(pool, "term-index fold", move || {
@@ -903,11 +993,62 @@ async fn fold_layers(
         drop(scratch);
         merged
     })
+    .instrument(detail_span!("fold.merge"))
     .await
     .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    write_slices(storage, merged.slices).await?;
-    write_tiers(storage, merged.tiers).await?;
-    Ok(merged.layer)
+    write_tiers_and_slices(storage, merged.tiers, merged.slices).await?;
+    let mut layer = merged.layer;
+    layer.ordinals = merged_ordinals;
+    Ok(layer)
+}
+
+/// Whether a fold renumbering through `ordinals` keeps any posting of
+/// `layer`: any ordinal of its range maps to one, or its range is unknown.
+fn layer_keeps_postings(layer: &Layer, ordinals: &[Option<u32>]) -> bool {
+    match &layer.ordinals {
+        None => true,
+        Some(range) => range
+            .clone()
+            .any(|ordinal| ordinals.get(ordinal as usize).is_some_and(Option::is_some)),
+    }
+}
+
+/// Where `layer` lands when `ordinals` keeps every one of its postings and
+/// renumbers them by one shift: its new base and range. `None` when a
+/// posting is dropped, the renumbering is not one shift, the layer's range
+/// is unknown, or the shift would carry its base below zero (a layer whose
+/// stored ordinals count from a base behind its range).
+fn shifted_whole(layer: &Layer, ordinals: &[Option<u32>]) -> Option<(u32, Range<u32>)> {
+    let range = layer.ordinals.clone()?;
+    let first = (*ordinals.get(range.start as usize)?)?;
+    for (offset, ordinal) in range.clone().enumerate() {
+        match ordinals.get(ordinal as usize) {
+            Some(Some(renumbered)) if *renumbered == first.checked_add(offset as u32)? => {}
+            _ => return None,
+        }
+    }
+    // Stored ordinals are relative to the base, so the shift the
+    // renumbering applies to the range applies to the base as well.
+    let base = layer.base.checked_add(first)?.checked_sub(range.start)?;
+    Some((base, first..first + range.len() as u32))
+}
+
+/// The ordinals a fold of `layers` through `ordinals` may name: the
+/// inputs' ranges renumbered, or unknown when an input's is.
+fn merged_ordinals(layers: &[Layer], ordinals: &[Option<u32>]) -> Option<Range<u32>> {
+    let mut range: Option<Range<u32>> = None;
+    for layer in layers {
+        for ordinal in layer.ordinals.clone()? {
+            let Some(Some(renumbered)) = ordinals.get(ordinal as usize) else {
+                continue;
+            };
+            range = Some(match range {
+                None => *renumbered..*renumbered + 1,
+                Some(r) => r.start.min(*renumbered)..r.end.max(*renumbered + 1),
+            });
+        }
+    }
+    Some(range.unwrap_or(0..0))
 }
 
 /// The run of layers [`fold_tail`] merges next: [`FOLD_FAN_OUT`]
@@ -928,15 +1069,26 @@ async fn fold_layers(
 /// larger fold would be commit latency and a wider window for a concurrent
 /// writer to win, so a run past it is left to optimize ([`fold_at_optimize`]).
 ///
-/// The newest layer is never in a run. Its slices were written by the
-/// publish that is still under way and no root names them yet; a fold that
-/// retired them would leave objects no root ever named, which the sweep
-/// could not find. Every layer beneath it was named by the root this
-/// publish replaces, so the slices a fold retires are exactly the ones the
-/// sweep reclaims from that root.
-fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
-    let beneath = root.layers.len().checked_sub(1)?;
-    fold_run(&root.layers[..beneath], policy.slice_target_bytes as u64)
+/// A run lies within one stretch of consecutive `foldable` layers, the
+/// ones the root this publish replaces named, so the slices a fold retires
+/// are exactly the ones the sweep reclaims from that root (see
+/// [`fold_tail`]).
+fn next_fold(root: &Root, foldable: &[bool], policy: &BuildPolicy) -> Option<Range<usize>> {
+    let mut start = 0;
+    while start < root.layers.len() {
+        if !foldable[start] {
+            start += 1;
+            continue;
+        }
+        let end = (start..root.layers.len())
+            .find(|&i| !foldable[i])
+            .unwrap_or(root.layers.len());
+        if let Some(run) = fold_run(&root.layers[start..end], policy.slice_target_bytes as u64) {
+            return Some(start + run.start..start + run.end);
+        }
+        start = end;
+    }
+    None
 }
 
 /// The first run of [`FOLD_FAN_OUT`] consecutive `layers` of one size level
@@ -963,6 +1115,46 @@ fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
                 .fold(0u64, |sum, &size| sum.saturating_add(size));
             if bytes <= bound {
                 return Some(run);
+            }
+            first += FOLD_FAN_OUT;
+        }
+        start = end;
+    }
+    None
+}
+
+/// The longest run of consecutive `layers` of one size level that fit in
+/// `bound` together, at least [`FOLD_FAN_OUT`] of them; `None` when no such
+/// run exists. A commit's fold takes exactly [`FOLD_FAN_OUT`] layers to stay
+/// quick ([`fold_run`]); optimize is maintenance and can take a whole level
+/// at once, so a root of fifty layers folds in one or two passes instead of
+/// one pass per eight, each pass reading its layers from storage and
+/// publishing a root. Grouped by level like [`fold_run`], so a fold still
+/// merges layers of about one size.
+fn fold_run_at_optimize(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
+    let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
+    let levels: Vec<f64> = layers.iter().map(layer_level).collect();
+    let mut start = 0;
+    while start < layers.len() {
+        let top = levels[start..]
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let end = 1
+            + (start..layers.len())
+                .rev()
+                .find(|&i| levels[i] >= top - FOLD_LEVEL_SPAN)?;
+        let mut first = start;
+        while first + FOLD_FAN_OUT <= end {
+            // Grow the run from `first` while the bytes allow.
+            let mut last = first;
+            let mut bytes = 0u64;
+            while last < end && bytes.saturating_add(sizes[last]) <= bound {
+                bytes = bytes.saturating_add(sizes[last]);
+                last += 1;
+            }
+            if last - first >= FOLD_FAN_OUT {
+                return Some(first..last);
             }
             first += FOLD_FAN_OUT;
         }
@@ -1005,15 +1197,34 @@ enum ObjectCheck {
 /// the objects new since the last one. (Whether a slice names a tier
 /// object does not tell its layout: a slice whose terms' tiers are small
 /// keeps them inline and names none.)
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(crate) async fn check_objects(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
     seen: &Mutex<HashSet<ContentHash>>,
+    live: &HashSet<Uuid>,
 ) -> Result<RootObjects, TermIndexError> {
+    // A layer whose every ordinal names a superfile that is gone is dropped
+    // unread by the fold that follows (`layer_keeps_postings`), so its
+    // objects are not checked either: after a compaction they are most of
+    // the root, and a check is a round trip each.
+    let names_live = |layer: &Layer| match &layer.ordinals {
+        None => true,
+        Some(range) => range.clone().any(|o| {
+            root.superfiles
+                .get(o as usize)
+                .is_some_and(|id| live.contains(id))
+        }),
+    };
     let wanted: HashSet<(ContentHash, ObjectCheck)> = {
         let seen = seen.lock().expect("term-index objects seen");
         let mut wanted = HashSet::new();
-        for slice in root.layers.iter().flat_map(|layer| &layer.slices) {
+        for slice in root
+            .layers
+            .iter()
+            .filter(|layer| names_live(layer))
+            .flat_map(|layer| &layer.slices)
+        {
             if !seen.contains(&slice.content_hash) {
                 wanted.insert((slice.content_hash, ObjectCheck::SliceLayout));
             }
@@ -1206,6 +1417,7 @@ pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
                     path: slice_file_path(dir, &slice.content_hash),
                     first_key: slice.first_key.clone(),
                     last_key: slice.last_key.clone(),
+                    base: layer.base,
                 })
                 .collect()
         })
@@ -1218,10 +1430,11 @@ pub(crate) fn slice_files(dir: &Path, layers: &[Layer]) -> Vec<Vec<SliceFile>> {
 #[cfg(test)]
 pub(crate) fn spill_slices(
     dir: &Path,
-    refs: &[format::SliceRef],
+    layer: &Layer,
     slices: Vec<(ContentHash, BuiltBytes)>,
 ) -> Result<Vec<SliceFile>, TermIndexError> {
-    let keys_of: HashMap<ContentHash, (&[u8], &[u8])> = refs
+    let keys_of: HashMap<ContentHash, (&[u8], &[u8])> = layer
+        .slices
         .iter()
         .map(|r| {
             (
@@ -1239,6 +1452,7 @@ pub(crate) fn spill_slices(
             let path = dir.join(format!("{}.slice", hash.to_hex()));
             place_built(&path, built)?;
             Ok(SliceFile {
+                base: layer.base,
                 path,
                 first_key: first_key.to_vec(),
                 last_key: last_key.to_vec(),
@@ -1362,6 +1576,7 @@ async fn fetch_verified(
 }
 
 /// Fetch, hash-verify and parse the root a manifest references.
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 pub(crate) async fn load_root(
     storage: &dyn StorageProvider,
     reference: &RoutingRef,
@@ -1375,7 +1590,11 @@ pub(crate) async fn load_root(
 #[derive(Debug, Clone)]
 pub(crate) struct SliceRun {
     pub(crate) tier_object: Option<ContentHash>,
+    /// The run, its postings' and inline tier entries' ordinals made
+    /// absolute by its layer's base; the tier chunks the run names store
+    /// ordinals relative to `base` still.
     pub(crate) run: Run,
+    pub(crate) base: u32,
 }
 
 /// A term's postings across its runs, in layer order.
@@ -1811,20 +2030,24 @@ impl TermIndex {
         // Per missing term, the slices that can hold it in layer order,
         // each with its tier object; per distinct slice, the missing terms
         // it can hold.
-        let mut wanted: Vec<(usize, Vec<ContentHash>)> = Vec::new();
-        let mut by_slice: HashMap<ContentHash, (Option<ContentHash>, Vec<usize>)> = HashMap::new();
+        let mut wanted: Vec<(usize, Vec<(ContentHash, u32)>)> = Vec::new();
+        // Keyed by the slice and its layer's base: two layers whose content
+        // is the same relative to their bases share one object, and each
+        // layer's run of it names different superfiles.
+        let mut by_slice: HashMap<(ContentHash, u32), (Option<ContentHash>, Vec<usize>)> =
+            HashMap::new();
         for (i, key) in keys.iter().enumerate() {
             if out[i].is_some() {
                 continue;
             }
             let mut hashes = Vec::new();
-            for r in self.root.slices_for_key(key) {
+            for (base, r) in self.root.based_slices_for_key(key) {
                 by_slice
-                    .entry(r.content_hash)
+                    .entry((r.content_hash, base))
                     .or_insert_with(|| (r.tier, Vec::new()))
                     .1
                     .push(i);
-                hashes.push(r.content_hash);
+                hashes.push((r.content_hash, base));
             }
             wanted.push((i, hashes));
         }
@@ -1836,20 +2059,28 @@ impl TermIndex {
                 .collect());
         }
         let keys = &keys;
-        let mut decoded: HashMap<(usize, ContentHash), SliceRun> = stream::iter(by_slice)
-            .map(|(hash, (tier_object, terms_here))| async move {
+        let mut decoded: HashMap<(usize, ContentHash, u32), SliceRun> = stream::iter(by_slice)
+            .map(|((hash, base), (tier_object, terms_here))| async move {
                 let bytes = self.slice_bytes(&hash).await?;
                 let slice = Slice::open(&bytes)?;
                 let mut found = Vec::new();
                 for i in terms_here {
-                    if let Some(run) = slice.run(&keys[i])? {
+                    if let Some(mut run) = slice.run(&keys[i])? {
+                        rebase_run(&mut run, base);
                         let chunked = run.tier.as_ref().is_some_and(|t| !t.chunks.is_empty());
                         if chunked && tier_object.is_none() {
                             return Err(TermIndexError::Malformed(
                                 "a run has tier chunks but its slice names no tier object".into(),
                             ));
                         }
-                        found.push(((i, hash), SliceRun { tier_object, run }));
+                        found.push((
+                            (i, hash, base),
+                            SliceRun {
+                                tier_object,
+                                run,
+                                base,
+                            },
+                        ));
                     }
                 }
                 Ok::<_, TermIndexError>(found)
@@ -1864,7 +2095,7 @@ impl TermIndex {
         for (i, hashes) in wanted {
             let runs: Vec<SliceRun> = hashes
                 .into_iter()
-                .filter_map(|hash| decoded.remove(&(i, hash)))
+                .filter_map(|(hash, base)| decoded.remove(&(i, hash, base)))
                 .collect();
             let runs = Arc::new(runs);
             resident.insert(keys[i].clone(), Arc::clone(&runs));
@@ -2024,15 +2255,22 @@ impl TermIndex {
         mut visit: impl FnMut(&[u8], Vec<Posting>) -> bool,
     ) -> Result<(), TermIndexError> {
         let key_prefix = column.term_key(prefix);
-        let refs: Vec<_> = self.root.slices_for_prefix(&key_prefix).cloned().collect();
+        let refs: Vec<(u32, SliceRef)> = self
+            .root
+            .based_slices_for_prefix(&key_prefix)
+            .map(|(base, r)| (base, r.clone()))
+            .collect();
         let mut keep_going = true;
-        for r in refs {
+        for (base, r) in refs {
             if !keep_going {
                 break;
             }
             let bytes = self.slice_bytes(&r.content_hash).await?;
             let slice = Slice::open(&bytes)?;
-            slice.for_each_prefix(&key_prefix, |k, run| {
+            slice.for_each_prefix(&key_prefix, |k, mut run| {
+                for p in &mut run {
+                    p.superfile += base;
+                }
                 keep_going = visit(k, run);
                 keep_going
             })?;
@@ -2417,7 +2655,7 @@ mod tests {
                 merge_ranges: Some(ranges),
                 ..range_policy()
             };
-            let built = build_layer(&contributions, &policy, 0).expect("build");
+            let built = build_layer(&contributions, &policy).expect("build");
             build::MergedLayer {
                 layer: built.layer,
                 slices: built.slices,
@@ -2463,7 +2701,7 @@ mod tests {
         let scratch = TempDir::new().expect("scratch");
         spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
         let sources =
-            vec![spill_slices(scratch.path(), &layer.slices, built.slices).expect("place slices")];
+            vec![spill_slices(scratch.path(), &layer, built.slices).expect("place slices")];
         assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
@@ -2492,8 +2730,8 @@ mod tests {
         spill_tiers(scratch.path(), base_refs, base.tiers).expect("place base tiers");
         spill_tiers(scratch.path(), delta_refs, delta.tiers).expect("place delta tiers");
         let sources = vec![
-            spill_slices(scratch.path(), base_refs, base.slices).expect("place base"),
-            spill_slices(scratch.path(), delta_refs, delta.slices).expect("place delta"),
+            spill_slices(scratch.path(), &base.root.layers[0], base.slices).expect("place base"),
+            spill_slices(scratch.path(), &delta.root.layers[1], delta.slices).expect("place delta"),
         ];
         assert_ranges_match_one_writer(&sources, &[Some(0), Some(1), Some(2)], &policy);
     }
@@ -2576,7 +2814,7 @@ mod tests {
         let scratch = TempDir::new().expect("scratch");
         spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
         let sources =
-            vec![spill_slices(scratch.path(), &layer.slices, built.slices).expect("place slices")];
+            vec![spill_slices(scratch.path(), layer, built.slices).expect("place slices")];
         let merged = merge_layers(&sources, &[None, Some(0)], &policy).expect("merge");
         let merged_bytes = bytes_of(&merged.slices[0].1);
         let merged_slice = Slice::open(&merged_bytes).expect("open");
@@ -2675,12 +2913,8 @@ mod tests {
         )
         .expect("place tiers");
         let sources = vec![
-            spill_slices(
-                scratch.path(),
-                &spilled.root.layers[0].slices,
-                spilled.slices,
-            )
-            .expect("place slices"),
+            spill_slices(scratch.path(), &spilled.root.layers[0], spilled.slices)
+                .expect("place slices"),
         ];
         let merged = merge_layers(&sources, &[Some(0), Some(1)], &resident).expect("merge");
         assert_eq!(
@@ -2726,9 +2960,8 @@ mod tests {
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
-            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
-                .expect("spill delta"),
+            spill_slices(dir.path(), &base.root.layers[0], base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1], delta.slices).expect("spill delta"),
         ];
         // Drop the middle superfile; the merge renumbers the survivors.
         let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
@@ -2775,9 +3008,8 @@ mod tests {
         )
         .expect("spill delta tiers");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
-            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
-                .expect("spill delta"),
+            spill_slices(dir.path(), &base.root.layers[0], base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1], delta.slices).expect("spill delta"),
         ];
         let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let slice_bytes = bytes_of(&merged.slices[0].1);
@@ -3000,9 +3232,8 @@ mod tests {
         let base = build(&[first, gone], &policy).expect("base");
         let delta = build_onto(base.root.clone(), &[last], &policy).expect("delta");
         let sources = vec![
-            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
-            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
-                .expect("spill delta"),
+            spill_slices(dir.path(), &base.root.layers[0], base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1], delta.slices).expect("spill delta"),
         ];
         let merged = merge_layers(&sources, &[Some(0), None, Some(1)], &policy).expect("merge");
         let (layer, slices) = (merged.layer, merged.slices);
@@ -3229,6 +3460,8 @@ mod tests {
             superfiles: entries.iter().map(|e| e.superfile_id).collect(),
             id_mins: entries.iter().map(|e| e.id_min).collect(),
             layers: vec![Layer {
+                base: 0,
+                ordinals: None,
                 slices: vec![format::SliceRef {
                     first_key: key.clone(),
                     last_key: key.clone(),
@@ -3281,6 +3514,7 @@ mod tests {
         let path = scratch.path().join("legacy.slice");
         fs::write(&path, &slice).expect("place slice");
         let sources = vec![vec![build::SliceFile {
+            base: 0,
             path,
             first_key: key.clone(),
             last_key: key.clone(),
@@ -4476,7 +4710,14 @@ mod tests {
         );
 
         maintenance_only_optimize(&st);
-        let (_, root) = live_and_covered(&st, &storage, &rt);
+        let (_, mut root) = live_and_covered(&st, &storage, &rt);
+        // The planted root is from before ordinal ranges and bases and the
+        // rewrite keeps its layers as they are, so neither is compared.
+        let mut sized = sized;
+        for layer in root.layers.iter_mut().chain(&mut sized.layers) {
+            layer.ordinals = None;
+            layer.base = 0;
+        }
         assert_eq!(root, sized, "every length is filled in from storage");
     }
 
@@ -5233,7 +5474,10 @@ mod tests {
             .remove(0);
         assert_eq!(runs.len(), 2, "one run per delta");
         let mut held = 0;
-        for SliceRun { tier_object, run } in runs.iter() {
+        for SliceRun {
+            tier_object, run, ..
+        } in runs.iter()
+        {
             let tier = run.tier.as_ref().expect("a term in every title has a tier");
             let object = tier_object.unwrap_or_else(|| ContentHash::of(b""));
             held += rt
@@ -7294,7 +7538,7 @@ mod tests {
             slice.len = 0;
         }
         assert_eq!(
-            check_objects(&local, &mut unsized_root, &seen)
+            check_all_objects(&local, &mut unsized_root, &seen)
                 .await
                 .expect("check"),
             RootObjects::Present {
@@ -7305,7 +7549,7 @@ mod tests {
         assert_eq!(unsized_root, root, "each length is the slice's on storage");
         let mut sized_root = root.clone();
         assert_eq!(
-            check_objects(&local, &mut sized_root, &seen)
+            check_all_objects(&local, &mut sized_root, &seen)
                 .await
                 .expect("check"),
             RootObjects::Present {
@@ -7318,7 +7562,7 @@ mod tests {
         fs::remove_file(store_dir.path().join(slice_uri(&slice.content_hash))).expect("remove");
         let mut root = root.clone();
         assert_eq!(
-            check_objects(&local, &mut root, &Mutex::new(HashSet::new()))
+            check_all_objects(&local, &mut root, &Mutex::new(HashSet::new()))
                 .await
                 .expect("check"),
             RootObjects::Missing
@@ -7328,6 +7572,8 @@ mod tests {
     /// A one-slice layer, told apart by `tag`.
     fn tagged_layer(tag: u8) -> Layer {
         Layer {
+            base: 0,
+            ordinals: None,
             slices: vec![format::SliceRef {
                 first_key: vec![tag],
                 last_key: vec![tag],
@@ -7336,6 +7582,182 @@ mod tests {
                 len: 0,
             }],
         }
+    }
+
+    /// A layer of one slice of `bytes`, for the fold-run tests.
+    fn sized_layer(bytes: u64) -> Layer {
+        Layer {
+            base: 0,
+            ordinals: None,
+            slices: vec![format::SliceRef {
+                first_key: vec![0],
+                last_key: vec![0],
+                content_hash: ContentHash::of(&bytes.to_le_bytes()),
+                tier: None,
+                len: bytes,
+            }],
+        }
+    }
+
+    /// [`check_objects`] with every superfile of the root live, as a root
+    /// before any compaction has them.
+    async fn check_all_objects(
+        storage: &Arc<dyn StorageProvider>,
+        root: &mut Root,
+        seen: &Mutex<HashSet<ContentHash>>,
+    ) -> Result<RootObjects, TermIndexError> {
+        let live: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+        check_objects(storage, root, seen, &live).await
+    }
+
+    /// A layer whose every ordinal the fold drops is left unread; one with
+    /// a live ordinal, or no recorded range, is merged; the merged layer's
+    /// range is the inputs' through the renumbering.
+    #[test]
+    fn a_fold_skips_a_layer_whose_ordinals_it_all_drops() {
+        let layer = |ordinals: Option<Range<u32>>| Layer {
+            base: 0,
+            slices: Vec::new(),
+            ordinals,
+        };
+        // Ordinals 0..4 die; 4..6 survive as 0..2.
+        let renumbering = [None, None, None, None, Some(0), Some(1)];
+        assert!(!layer_keeps_postings(&layer(Some(0..4)), &renumbering));
+        assert!(layer_keeps_postings(&layer(Some(3..5)), &renumbering));
+        assert!(layer_keeps_postings(&layer(None), &renumbering));
+        assert_eq!(
+            merged_ordinals(&[layer(Some(3..5)), layer(Some(5..6))], &renumbering),
+            Some(0..2)
+        );
+        assert_eq!(
+            merged_ordinals(&[layer(Some(0..2))], &renumbering),
+            Some(0..0)
+        );
+        assert_eq!(
+            merged_ordinals(&[layer(None), layer(Some(4..6))], &renumbering),
+            None,
+            "an input of unknown range leaves the fold's unknown"
+        );
+    }
+
+    /// A whole layer of at least a slice holding at least half of what the
+    /// fold keeps moves to its new place without a read or a write:
+    /// optimize hands it back with its slices as they were, over a store
+    /// that holds nothing. A layer that loses a posting, is shifted
+    /// unevenly, or is small beside the rest is merged, which the empty
+    /// store cannot serve.
+    #[tokio::test]
+    async fn an_optimize_fold_moves_a_whole_layer_that_is_most_of_what_it_keeps() {
+        let dir = TempDir::new().expect("tempdir");
+        let empty: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("local fs"));
+        let policy = BuildPolicy::default();
+        let layer = |bytes: u64, base: u32, ordinals: Range<u32>| Layer {
+            base,
+            ordinals: Some(ordinals),
+            ..sized_layer(bytes)
+        };
+        let ids: Vec<Uuid> = (1..=7).map(Uuid::from_u128).collect();
+        let root = |layers: Vec<Layer>| Root {
+            superfiles: ids.clone(),
+            id_mins: (1..=7).collect(),
+            layers,
+        };
+        // Superfiles 0..4 are replaced; 4..7 survive as 0..3.
+        let fold = || OptimizeFold {
+            run: 0..2,
+            ordinals: vec![None, None, None, None, Some(0), Some(1), Some(2)],
+            superfiles: ids[4..].to_vec(),
+            id_mins: (5..=7).collect(),
+            renumbers: true,
+        };
+        // Sizes in slices of the policy's target: a layer under one slice
+        // is merged whatever its share.
+        let slice = policy.slice_target_bytes as u64;
+        let dead = layer(slice, 0, 0..4);
+        let whole = layer(10 * slice, 4, 4..7);
+
+        let folded = fold_at_optimize(
+            &empty,
+            &root(vec![dead.clone(), whole.clone()]),
+            fold(),
+            &policy,
+            None,
+        )
+        .await
+        .expect("a whole layer moves without the store");
+        assert_eq!(
+            folded.layers.len(),
+            1,
+            "the dead layer is dropped, the whole one moved"
+        );
+        assert_eq!(
+            folded.layers[0].slices, whole.slices,
+            "the slices are the layer's own"
+        );
+        assert_eq!(
+            (folded.layers[0].base, folded.layers[0].ordinals.clone()),
+            (0, Some(0..3))
+        );
+        assert_eq!(folded.superfiles, ids[4..]);
+
+        // A whole layer small beside a partial one is merged with it: here
+        // a merge, which the empty store fails.
+        let partial = layer(30 * slice, 3, 3..7);
+        let mut three = fold();
+        three.run = 0..3;
+        assert!(
+            fold_at_optimize(
+                &empty,
+                &root(vec![dead.clone(), whole.clone(), partial]),
+                three,
+                &policy,
+                None
+            )
+            .await
+            .is_err()
+        );
+        // A posting dropped from the large layer: a merge as well.
+        let mut dropped = fold();
+        dropped.ordinals = vec![None, None, None, None, Some(0), None, Some(1)];
+        dropped.superfiles = vec![ids[4], ids[6]];
+        dropped.id_mins = vec![5, 7];
+        assert!(
+            fold_at_optimize(&empty, &root(vec![dead, whole]), dropped, &policy, None)
+                .await
+                .is_err()
+        );
+
+        // The shift alone: a layer whose stored ordinals count from behind
+        // its range moves its base by the same shift, and one that would
+        // fall below zero does not move.
+        let behind = layer(slice, 2, 4..7);
+        let renumbering = [None, None, None, None, Some(0), Some(1), Some(2)];
+        assert_eq!(shifted_whole(&behind, &renumbering), None);
+        let by_one = [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)];
+        assert_eq!(shifted_whole(&behind, &by_one), Some((1, 3..6)));
+        let uneven = [None, None, None, None, Some(0), Some(2), Some(3)];
+        assert_eq!(shifted_whole(&layer(slice, 4, 4..7), &uneven), None);
+    }
+
+    #[test]
+    fn an_optimize_fold_takes_a_whole_level_where_a_commit_fold_takes_eight() {
+        // Fifty-two layers of one size level, as a commit-heavy table leaves
+        // behind: a commit's fold takes the first eight; optimize takes them
+        // all while the bytes allow, and only eight at a time once they
+        // don't.
+        let layers: Vec<Layer> = (0..52).map(|_| sized_layer(1 << 20)).collect();
+        assert_eq!(fold_run(&layers, 1 << 40), Some(0..FOLD_FAN_OUT));
+        assert_eq!(fold_run_at_optimize(&layers, 1 << 40), Some(0..52));
+        // A bound of twenty layers' bytes: the run stops there.
+        assert_eq!(fold_run_at_optimize(&layers, 20 << 20), Some(0..20));
+        // Fewer than a fan-out's worth within the bound: nothing to fold here.
+        assert_eq!(fold_run_at_optimize(&layers, 3 << 20), None);
+        // Two size levels: the run stays within the larger level's span and
+        // does not cross into the small layers behind it.
+        let mut mixed: Vec<Layer> = (0..10).map(|_| sized_layer(1 << 30)).collect();
+        mixed.extend((0..10).map(|_| sized_layer(1 << 10)));
+        assert_eq!(fold_run_at_optimize(&mixed, 1 << 40), Some(0..10));
     }
 
     /// A root listing `ids` (each its own `id_min`; `0` is padding) over
@@ -7496,15 +7918,15 @@ mod tests {
         let root = load_root(local.as_ref(), &reference).await.expect("root");
         let layer = &reserved.as_ref().expect("reserved").layer;
         assert_eq!(root.layers.len(), 2, "the run beneath the retry folded");
+        let placed = root.layers.last().expect("the reserved layer");
         assert_eq!(
-            root.layers.last(),
-            Some(layer),
-            "the reserved layer is appended as it was moved"
+            placed.slices, layer.slices,
+            "the reserved layer is appended as it was built"
         );
         assert_eq!(
-            reserved.as_ref().expect("reserved").base as usize,
+            placed.base as usize,
             winner.superfiles.len(),
-            "moved to the winner's length"
+            "placed at the winner's length"
         );
         assert!(!root.superfiles.contains(&Uuid::nil()), "no padding");
         let mut expected: Vec<Uuid> = (1..=winner_id).map(Uuid::from_u128).collect();
@@ -7575,11 +7997,12 @@ mod tests {
         );
     }
 
-    /// A root whose list grew since the layer was built gets the layer
-    /// moved to its length, other contributions get one built again; either
-    /// way its postings name the right superfile.
+    /// A root whose list grew since the layer was built places the layer
+    /// at its length as it is — the layer's ordinals are relative to the
+    /// base it is given, so nothing is written again; other contributions
+    /// get one built again. Either way its postings name the right superfile.
     #[tokio::test]
-    async fn append_reserved_moves_or_rebuilds_when_it_cannot_reuse() {
+    async fn append_reserved_places_its_layer_where_the_list_ends() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -7612,10 +8035,10 @@ mod tests {
         )
         .await
         .expect("outgrown");
-        assert_ne!(
+        assert_eq!(
             slice_objects(&store_dir),
             slices_before,
-            "moved slices written"
+            "the layer is placed, not rewritten"
         );
         let root = load_root(local.as_ref(), &reference).await.expect("root");
         assert_eq!(root.superfiles.len(), outgrown.superfiles.len() + 1);
@@ -7637,11 +8060,121 @@ mod tests {
         assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
     }
 
+    /// In a run, an append that indexed nothing adds no layer, and a
+    /// contribution no segment claims fails the publish rather than being
+    /// listed and routed to by nothing.
+    #[tokio::test]
+    async fn a_run_adds_no_layer_for_an_unindexed_append_and_refuses_an_unclaimed_contribution() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let indexed = [contribution(&dir, 9, &[("body", "indexed", 1)])];
+        let mut run = [
+            ReservedSegment {
+                contributions: 1,
+                layer: None,
+            },
+            ReservedSegment {
+                contributions: 0,
+                layer: None,
+            },
+        ];
+        let reference = append_reserved_run(
+            &local,
+            Some(prior.clone()),
+            &indexed,
+            &policy,
+            &mut run,
+            None,
+        )
+        .await
+        .expect("run");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            root.layers.len(),
+            prior.layers.len() + 1,
+            "one layer, for the indexed append"
+        );
+        assert_eq!(
+            posted_superfiles(&root, &local, "indexed").await,
+            [Uuid::from_u128(9)]
+        );
+
+        let mut short = [ReservedSegment {
+            contributions: 0,
+            layer: None,
+        }];
+        assert!(
+            append_reserved_run(&local, Some(prior), &indexed, &policy, &mut short, None)
+                .await
+                .is_err(),
+            "a contribution no segment claims"
+        );
+    }
+
+    /// Appends in the grouped-publish fold test: past the fan-out, so a
+    /// fold over the run's own layers would be due.
+    const GROUPED_APPENDS: u128 = FOLD_FAN_OUT as u128 + 1;
+
+    /// A publish that carries many appends adds a layer for each and folds
+    /// none of them: no root names their slices yet, and a fold that
+    /// retired them would leave objects only a listing sweep could find.
+    /// Every slice on disk is named by the prior root or the new one.
+    #[tokio::test]
+    async fn a_grouped_publish_folds_none_of_its_own_layers() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let contributions: Vec<Contribution> = (2..2 + GROUPED_APPENDS)
+            .map(|id| contribution(&dir, id, &[("body", &format!("own{id}"), 1)]))
+            .collect();
+        let mut run: Vec<ReservedSegment> = (0..GROUPED_APPENDS)
+            .map(|_| ReservedSegment {
+                contributions: 1,
+                layer: None,
+            })
+            .collect();
+        let reference = append_reserved_run(
+            &local,
+            Some(prior.clone()),
+            &contributions,
+            &policy,
+            &mut run,
+            None,
+        )
+        .await
+        .expect("run");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            root.layers.len(),
+            prior.layers.len() + GROUPED_APPENDS as usize,
+            "one layer per append, none folded"
+        );
+        let named: HashSet<String> = [&prior, &root]
+            .iter()
+            .flat_map(|r| r.layers.iter().flat_map(|l| l.slices.iter()))
+            .map(|slice| {
+                slice_uri(&slice.content_hash)
+                    .trim_start_matches(STORAGE_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        let on_disk = slice_objects(&store_dir);
+        assert!(
+            on_disk.is_subset(&named),
+            "slices no root names: {:?}",
+            on_disk.difference(&named).collect::<Vec<_>>()
+        );
+        for id in 2..2 + GROUPED_APPENDS {
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                [Uuid::from_u128(id)]
+            );
+        }
+    }
+
     /// Superfiles other commits list before a retry in the move tests.
     const LANDED_FIRST: usize = 3;
-
-    /// A slice target small enough that a few terms make several slices.
-    const SMALL_SLICE_TARGET_BYTES: usize = 64;
     /// Documents a superfile holds of the term every tier shape shares: past
     /// one block, and past the head the fixtures keep.
     const COMMON_DOCS: u32 = 130;
@@ -7688,72 +8221,11 @@ mod tests {
         ]
     }
 
-    /// `objects` in content-hash order, for comparing sets of objects.
-    fn by_hash(mut objects: Vec<(ContentHash, BuiltBytes)>) -> Vec<(ContentHash, BuiltBytes)> {
-        objects.sort_by_key(|(hash, _)| hash.0);
-        objects
-    }
-
-    /// A layer moved to other ordinals is, byte for byte, what a build at
-    /// those ordinals writes, up and down, resident and spilled: every
-    /// posting, inline tier entry and chunk directory renumbered, nothing
-    /// else changed.
-    #[test]
-    fn a_moved_layer_equals_a_build_at_its_new_ordinals() {
-        let dir = TempDir::new().expect("tempdir");
-        let contributions = mixed_contributions(&dir);
-        let n = contributions.len() as u32;
-        let resident = BuildPolicy {
-            slice_target_bytes: SMALL_SLICE_TARGET_BYTES,
-            ..BuildPolicy::default()
-        };
-        let spilling = BuildPolicy {
-            spill_to_disk: true,
-            ..resident.clone()
-        };
-        for policy in [&resident, &spilling] {
-            for (from, to) in [(300, 5_000), (5_000, 300), (70_000, 900_000)] {
-                let at_from = build_layer(&contributions, policy, from).expect("build at from");
-                assert!(at_from.layer.slices.len() > 1, "several slices");
-                assert!(!at_from.tiers.is_empty(), "a chunked tier");
-                let shift = OrdinalShift::new(from, to, n).expect("same widths");
-                let moved = rebase_layer(&at_from.layer, &at_from.slices, &at_from.tiers, &shift)
-                    .expect("move");
-                let at_to = build_layer(&contributions, policy, to).expect("build at to");
-                assert_eq!(moved.layer, at_to.layer, "{from} → {to}: slice list");
-                assert_eq!(moved.slices, at_to.slices, "{from} → {to}: slices");
-                assert_eq!(
-                    by_hash(moved.tiers),
-                    by_hash(at_to.tiers),
-                    "{from} → {to}: tier objects"
-                );
-            }
-        }
-    }
-
-    /// A move refuses a layer that names an ordinal it does not move, and
-    /// leaves the kept bytes as they were.
-    #[test]
-    fn a_move_refuses_an_ordinal_outside_the_layer() {
-        let dir = TempDir::new().expect("tempdir");
-        let contributions = mixed_contributions(&dir);
-        let policy = BuildPolicy {
-            slice_target_bytes: SMALL_SLICE_TARGET_BYTES,
-            ..BuildPolicy::default()
-        };
-        let built = build_layer(&contributions, &policy, 300).expect("build");
-        let before = built.slices.clone();
-        // One ordinal short: the layer's last superfile is not moved.
-        let shift = OrdinalShift::new(300, 5_000, contributions.len() as u32 - 1).expect("shift");
-        assert!(rebase_layer(&built.layer, &built.slices, &built.tiers, &shift).is_err());
-        assert_eq!(built.slices, before, "kept bytes untouched");
-    }
-
-    /// A retry whose root's list grew moves the layer it built rather than
+    /// A retry whose root's list grew places the layer it built rather than
     /// building it again: it succeeds with the contributions' spill gone,
-    /// and publishes the layer a build at the new ordinals would.
+    /// and publishes the layer a build placed at the new length would.
     #[tokio::test]
-    async fn append_reserved_moves_its_layer_without_its_contributions() {
+    async fn append_reserved_places_its_layer_without_its_contributions() {
         let dir = TempDir::new().expect("tempdir");
         let policy = BuildPolicy::default();
         let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
@@ -7775,8 +8247,10 @@ mod tests {
             .superfiles
             .extend(repeat_n(Uuid::nil(), LANDED_FIRST));
         outgrown.id_mins.extend(repeat_n(0, LANDED_FIRST));
-        let base = outgrown.superfiles.len() as u32;
-        let expected = build_layer(&merged, &policy, base).expect("build at the new base");
+        let mut expected = build_layer(&merged, &policy).expect("build at the new base");
+        expected
+            .layer
+            .place_at(outgrown.superfiles.len() as u32, merged.len() as u32);
         for c in &merged {
             fs::remove_file(&c.path).expect("drop the contribution spill");
         }
@@ -7790,86 +8264,13 @@ mod tests {
             None,
         )
         .await
-        .expect("moved without the contributions");
+        .expect("placed without the contributions");
         let root = load_root(local.as_ref(), &reference).await.expect("root");
         assert_eq!(root.layers.last(), Some(&expected.layer));
         assert_eq!(
             posted_superfiles(&root, &local, "rare").await,
             [1, 2].map(Uuid::from_u128)
         );
-    }
-
-    /// A move that would change how many bytes an ordinal takes is not made
-    /// in place: the layer is built again from its contributions.
-    #[tokio::test]
-    async fn append_reserved_builds_again_across_a_varint_width() {
-        let dir = TempDir::new().expect("tempdir");
-        let policy = BuildPolicy::default();
-        let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
-        let merged = mixed_contributions(&dir);
-        let mut reserved = None;
-        append_reserved(
-            &local,
-            Some(prior.clone()),
-            &merged,
-            &policy,
-            &mut reserved,
-            None,
-        )
-        .await
-        .expect("first attempt");
-
-        // Grown far enough that the new base's ordinals take a byte more.
-        let mut outgrown = prior;
-        let extra = 8_200;
-        outgrown.superfiles.extend(repeat_n(Uuid::nil(), extra));
-        outgrown.id_mins.extend(repeat_n(0, extra));
-        let reference = append_reserved(
-            &local,
-            Some(outgrown.clone()),
-            &merged,
-            &policy,
-            &mut reserved,
-            None,
-        )
-        .await
-        .expect("built again");
-        let root = load_root(local.as_ref(), &reference).await.expect("root");
-        let base = outgrown.superfiles.len() as u32;
-        let expected = build_layer(&merged, &policy, base).expect("build at the new base");
-        assert_eq!(root.layers.last(), Some(&expected.layer));
-
-        // The same crossing without the contributions: the build, and so
-        // the retry, fails.
-        let mut fresh = None;
-        append_reserved(
-            &local,
-            Some(prior_of(&outgrown, extra)),
-            &merged,
-            &policy,
-            &mut fresh,
-            None,
-        )
-        .await
-        .expect("first attempt");
-        for c in &merged {
-            fs::remove_file(&c.path).expect("drop the contribution spill");
-        }
-        assert!(
-            append_reserved(&local, Some(outgrown), &merged, &policy, &mut fresh, None)
-                .await
-                .is_err(),
-            "no move across the width, so a build was tried"
-        );
-    }
-
-    /// `root` without its last `n` superfiles: the root a commit started
-    /// from before `n` more landed.
-    fn prior_of(root: &Root, n: usize) -> Root {
-        let mut prior = root.clone();
-        prior.superfiles.truncate(root.superfiles.len() - n);
-        prior.id_mins.truncate(root.id_mins.len() - n);
-        prior
     }
 
     /// A compaction that loses its commit to an ingest commit moves the
@@ -8163,9 +8564,8 @@ mod tests {
         spill_tiers(dir.path(), &delta.root.layers[1].slices, delta.tiers)
             .expect("spill delta tiers");
         vec![
-            spill_slices(dir.path(), &base.root.layers[0].slices, base.slices).expect("spill base"),
-            spill_slices(dir.path(), &delta.root.layers[1].slices, delta.slices)
-                .expect("spill delta"),
+            spill_slices(dir.path(), &base.root.layers[0], base.slices).expect("spill base"),
+            spill_slices(dir.path(), &delta.root.layers[1], delta.slices).expect("spill delta"),
         ]
     }
 
@@ -8404,8 +8804,7 @@ mod tests {
         let built = build(&[hot(1), hot(2), hot(3)], &policy).expect("build");
         spill_tiers(dir.path(), &built.root.layers[0].slices, built.tiers).expect("spill tiers");
         let sources = vec![
-            spill_slices(dir.path(), &built.root.layers[0].slices, built.slices)
-                .expect("spill slices"),
+            spill_slices(dir.path(), &built.root.layers[0], built.slices).expect("spill slices"),
         ];
         let ranges = key_ranges(&sources, &policy).expect("ranges");
         assert_eq!(ranges.len(), 4, "four ranges: {ranges:?}");

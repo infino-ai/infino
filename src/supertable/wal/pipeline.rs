@@ -78,7 +78,7 @@ use crate::{
     superfile::{ReadError, SuperfileReader, builder::SuperfileBuilder},
     supertable::{
         ManifestSnapshot,
-        error::CommitError as ManifestCommitError,
+        error::{BuildError, CommitError as ManifestCommitError},
         handle::{Supertable, SupertableInner},
         manifest::{ScalarStatsAgg, SuperfileEntry, SuperfileUri},
         query::superfile_reader::superfile_reader,
@@ -101,7 +101,7 @@ use crate::{
             CommitListMetadata, build_fts_summary, build_packed_update_superfile,
             build_subsection_offsets, build_term_contribution, build_vector_summary,
             builder_options_of, owned_vector_arrays, persist_commit, read_vector_layout_from_bytes,
-            stamp_tombstone_seqs, with_id_column,
+            record_hidden_deleted_ids, stamp_tombstone_seqs, with_id_column,
         },
     },
 };
@@ -814,6 +814,13 @@ pub enum TombstonePhaseError {
     #[error("tombstone-seq manifest stamp failed: {0}")]
     ManifestStamp(#[source] Box<ManifestCommitError>),
 
+    /// Recording the retired rows in the hidden vector index's deleted set
+    /// failed. The user table's tombstones are durable and the WAL stays
+    /// incomplete, so the recovery sweep re-runs the phase and records
+    /// them again; until then a vector search may still return them.
+    #[error("hidden vector-index deleted-set record failed: {0}")]
+    HiddenDeletedRecord(#[source] Box<BuildError>),
+
     /// Tombstone codec error from the sidecar layer.
     #[error("tombstone sidecar codec error: {0}")]
     SidecarCodec(#[from] crate::supertable::wal::tombstones_codec::SidecarCodecError),
@@ -1358,6 +1365,20 @@ async fn do_tombstone_apply(
         stamp_tombstone_seqs(inner, &touched)
             .await
             .map_err(|e| TombstonePhaseError::ManifestStamp(Box::new(e)))?;
+    }
+
+    // The hidden vector-index cells are not rewritten on a user mutation, so
+    // every row this phase retires (a delete's, or the rows an update
+    // replaces) stays in them; vector search leaves a retired row out by the
+    // hidden index's deleted set. Recorded before the `Complete` CAS like the
+    // stamp above: a record that fails leaves the WAL incomplete, and recovery
+    // records it again. Every target is recorded, found or not: an id the
+    // user table no longer holds is no row of the hidden index either.
+    if let Some(hidden) = inner.vector_index_table.as_ref() {
+        let retired: Vec<i128> = wal_cur.target_ids.iter().map(|id| id.0).collect();
+        record_hidden_deleted_ids(hidden.inner(), &retired)
+            .await
+            .map_err(|e| TombstonePhaseError::HiddenDeletedRecord(Box::new(e)))?;
     }
 
     // Final transition: every entry is non-Pending; flip the

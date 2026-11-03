@@ -21,9 +21,9 @@ use arrow_array::{ArrayRef, FixedSizeListArray, Float32Array, LargeStringArray, 
 use arrow_schema::{DataType, Field, Schema};
 use datafusion::prelude::{col, lit};
 use infino::{
-    VectorSearchOptions,
+    BoolMode, CompactionSettings, OptimizeOptions, VectorSearchOptions,
     storage::{LocalFsStorageProvider, StorageProvider},
-    superfile::builder::FtsConfig,
+    superfile::{builder::FtsConfig, vector::rerank_codec::RerankCodec},
     supertable::{Supertable, SupertableOptions},
     test_helpers::default_vector_config,
 };
@@ -60,6 +60,20 @@ fn vector_options() -> SupertableOptions {
         vec![default_vector_config("emb", VECTOR_ROT_SEED)],
     )
     .expect("valid options")
+}
+
+/// [`vector_options`] with the engine-default rerank codec, which catalog
+/// tables get and which `optimize` builds cells from; `default_vector_config`
+/// hands out the legacy Fp32 codec, which the cell build refuses.
+fn production_vector_options() -> SupertableOptions {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("title", DataType::LargeUtf8, false),
+        Field::new("emb", fixed_list_f32(DIM), false),
+    ]));
+    let mut vector_config = default_vector_config("emb", VECTOR_ROT_SEED);
+    vector_config.rerank_codec = RerankCodec::default();
+    SupertableOptions::new(schema, vec![FtsConfig::new("title")], vec![vector_config])
+        .expect("valid options")
 }
 
 fn one_hot_batch(schema: Arc<Schema>) -> RecordBatch {
@@ -172,6 +186,213 @@ async fn drain_excludes_tombstoned_vectors_from_hidden_cells() {
         )
         .expect("search survivor embedding");
     assert_eq!(hit_titles(&survivor)[0], TITLES[0]);
+}
+
+/// The doc an update replaces after the drain.
+const UPDATED: usize = 2;
+/// The replacement row's title.
+const UPDATED_TITLE: &str = "charlie v2";
+
+/// One row titled `title` with a one-hot embedding at `dim_index`.
+fn one_hot_row(schema: Arc<Schema>, title: &str, dim_index: usize) -> RecordBatch {
+    let fsl = FixedSizeListArray::try_new(
+        Arc::new(Field::new("item", DataType::Float32, true)),
+        DIM as i32,
+        Arc::new(Float32Array::from(one_hot(dim_index))) as ArrayRef,
+        None,
+    )
+    .expect("FSL");
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(LargeStringArray::from(vec![title])), Arc::new(fsl)],
+    )
+    .expect("batch")
+}
+
+/// Settings under which `optimize` merges the drained base with an update's
+/// replacement superfile, so the replaced row is dropped from the user table.
+fn merge_optimize_opts() -> OptimizeOptions {
+    OptimizeOptions::compact(CompactionSettings {
+        target_superfile_size_mb: 1,
+        min_fill_percent: 1,
+        min_superfiles_for_merge: 2,
+        ..CompactionSettings::default()
+    })
+}
+
+/// An update after the drain retires its old row in the hidden index too.
+///
+/// The hidden cells are not rewritten on a user mutation: a vector search
+/// leaves a retired row out by the hidden index's deleted set. A delete
+/// records its ids there; an update, which tombstones the rows it replaces,
+/// must as well. Otherwise the old row's vector stays searchable: before a
+/// compaction its hit is the replaced row, and once a compaction has dropped
+/// that row from the user table, its `_id` is in no user superfile and the
+/// search fails. The replacement carries a new `_id`, so a later drain that
+/// moves it into the cells keeps it searchable.
+#[test]
+fn an_update_after_the_drain_leaves_no_ghost_of_the_row_it_replaced() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(production_vector_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let schema = st.options().schema.clone();
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&one_hot_batch(Arc::clone(&schema)))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    let stats = st
+        .update(
+            col("title").eq(lit(TITLES[UPDATED])),
+            &one_hot_row(Arc::clone(&schema), UPDATED_TITLE, UPDATED),
+        )
+        .expect("update");
+    assert_eq!(stats.n_tombstoned(), 1);
+
+    let search = |what: &str| {
+        let hits = st
+            .vector_search(
+                "emb",
+                &one_hot(UPDATED),
+                TOP_K,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id", "title", "score"]),
+            )
+            .unwrap_or_else(|e| panic!("vector search {what}: {e}"));
+        hit_titles(&hits)
+    };
+
+    let before = search("before the compaction");
+    assert!(
+        !before.iter().any(|t| t == TITLES[UPDATED]),
+        "the replaced row must not come back before a compaction: {before:?}"
+    );
+    assert_eq!(before[0], UPDATED_TITLE);
+
+    // A drain after the update moves the replacement into the hidden cells
+    // under its own new `_id`, beside the retired row the cells still hold.
+    st.drain_vectors_to_cells_sync()
+        .expect("drain after the update");
+    let hidden = st.vector_index_table().expect("hidden index table");
+    assert_eq!(
+        hidden.reader().expect("hidden reader").n_docs_total(),
+        (TITLES.len() + 1) as u64,
+        "the replacement must be drained into the hidden cells"
+    );
+    let drained = search("after a drain of the update");
+    assert!(
+        !drained.iter().any(|t| t == TITLES[UPDATED]),
+        "the replaced row must not come back after a later drain: {drained:?}"
+    );
+    assert_eq!(drained[0], UPDATED_TITLE);
+
+    st.optimize(&merge_optimize_opts()).expect("optimize");
+    let after = search("after the compaction");
+    assert!(
+        !after.iter().any(|t| t == TITLES[UPDATED]),
+        "the replaced row must not come back after a compaction: {after:?}"
+    );
+    assert_eq!(after[0], UPDATED_TITLE);
+
+    // A hybrid search's vector half reads the same hidden index.
+    let hybrid = st
+        .hybrid_search(
+            "title",
+            TITLES[UPDATED],
+            BoolMode::Or,
+            "emb",
+            &one_hot(UPDATED),
+            VectorSearchOptions::new(),
+            TOP_K,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("hybrid search after the compaction");
+    let titles = hit_titles(&hybrid);
+    assert!(
+        !titles.iter().any(|t| t == TITLES[UPDATED]),
+        "the replaced row must not come back in a hybrid search: {titles:?}"
+    );
+    assert!(titles.iter().any(|t| t == UPDATED_TITLE));
+}
+
+/// A row committed after an older reader was taken.
+const LATER_TITLE: &str = "echo";
+/// Its embedding's hot dimension, which no earlier row has.
+const LATER_DIM: usize = 4;
+
+/// A vector hit the query's snapshot has no row for is left out, not an
+/// error.
+///
+/// The hidden index a search reads is the table's current one, which can
+/// hold rows the query's own user-table snapshot does not: here, rows
+/// committed and drained after an older reader was taken. Such a hit's
+/// `_id` is in no user superfile of that snapshot. It is not a row the
+/// snapshot shows, so the search leaves it out, as it leaves out a deleted
+/// row, and answers with the rows it does show.
+#[test]
+fn a_search_through_an_older_reader_leaves_out_rows_its_snapshot_lacks() {
+    let dir = TempDir::new().expect("tempdir");
+    let storage: Arc<dyn StorageProvider> =
+        Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+    let st = Supertable::create(production_vector_options().with_storage(Arc::clone(&storage)))
+        .expect("create");
+    let schema = st.options().schema.clone();
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&one_hot_batch(Arc::clone(&schema)))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    st.drain_vectors_to_cells_sync().expect("drain");
+    let older = st.reader().expect("older reader");
+
+    {
+        let mut w = st.writer().expect("writer");
+        w.append(&one_hot_row(Arc::clone(&schema), LATER_TITLE, LATER_DIM))
+            .expect("append");
+        w.commit().expect("commit");
+    }
+    st.drain_vectors_to_cells_sync().expect("drain");
+
+    let hits = older
+        .vector_search(
+            "emb",
+            &one_hot(LATER_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            None,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("a search through the older reader");
+    let titles = hit_titles(&hits);
+    assert!(
+        !titles.iter().any(|t| t == LATER_TITLE),
+        "a row the older snapshot lacks must not come back: {titles:?}"
+    );
+    assert_eq!(
+        titles.len(),
+        TITLES.len(),
+        "the snapshot's own rows still answer: {titles:?}"
+    );
+
+    // A reader taken now has the row.
+    let current = st
+        .vector_search(
+            "emb",
+            &one_hot(LATER_DIM),
+            TOP_K,
+            VectorSearchOptions::new(),
+            None,
+            Some(&["_id", "title", "score"]),
+        )
+        .expect("a search now");
+    assert_eq!(hit_titles(&current)[0], LATER_TITLE);
 }
 
 /// Rows per superfile in the multi-superfile pairing fixture.

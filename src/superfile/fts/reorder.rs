@@ -100,6 +100,12 @@ const MIN_PARTITION: usize = BLOCK_LEN;
 /// before indexing it. What does adapt to the corpus is the bar this ratio is
 /// taken against, which is measured from the data on every run.
 ///
+/// A looser ratio buys optimize time with query time. At 0.20 the bisection
+/// did 10–16% less work, and a 5M-document table's queries ran 1.6% slower
+/// across every query shape measured, with its index 0.35% larger; at this
+/// value they ran as before. Query time is what the reordering is for, so
+/// the ratio stays here.
+///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
 const REORDER_CONVERGENCE: f32 = 0.05;
@@ -110,6 +116,13 @@ const REORDER_CONVERGENCE: f32 = 0.05;
 /// whose rounds keep paying, not the working limit — the convergence test is
 /// what normally ends a split.
 const REORDER_MAX_ROUNDS: usize = 20;
+
+/// Fewest items one rayon task takes in the bisection's per-document and
+/// per-term loops. The work per item is a few reads and an atomic store, so
+/// a task that small is mostly the scheduler's: left to split down to one
+/// item, a round on a wide pool spends more time in work-stealing and epoch
+/// bookkeeping than in the loop itself.
+const PAR_MIN_ITEMS: usize = 4096;
 
 /// How hard the bisection works a split, and when it decides a split has
 /// stopped paying.
@@ -978,7 +991,7 @@ impl BisectState {
 
         let step = timed.then(Instant::now);
         let cpu = timed.then(thread_cpu_ns).flatten();
-        self.count_degrees(fwd, order, mid);
+        self.count_degrees(fwd, order, mid, parallel);
         if let Some(step) = step {
             level.count_ns += ns_since(step);
             level.serial_cpu_ns += thread_cpu_delta_ns(cpu);
@@ -987,7 +1000,7 @@ impl BisectState {
         let n_right = (order.len() - mid) as f32;
         fill_cost_table(&mut self.cost_left, n_left);
         fill_cost_table(&mut self.cost_right, n_right);
-        let mut cost_before = self.partition_cost(n_left, n_right);
+        let mut cost_before = self.partition_cost(n_left, n_right, parallel);
         // What the split's first round lowered the cost by: its offer
         // towards the run's bar, which measures every later round against
         // what a first round over fresh halves is worth per document.
@@ -1093,16 +1106,20 @@ impl BisectState {
                     );
                     let (lefts, rights) = (&left_gains[..swaps], &right_gains[..swaps]);
                     let (left_docs, right_docs) = (&*left, &*right);
-                    lefts.par_iter().zip(rights).for_each(|(&l, &r)| {
-                        for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
-                            deg_left[t as usize].fetch_sub(1, Relaxed);
-                            deg_right[t as usize].fetch_add(1, Relaxed);
-                        }
-                        for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
-                            deg_right[t as usize].fetch_sub(1, Relaxed);
-                            deg_left[t as usize].fetch_add(1, Relaxed);
-                        }
-                    });
+                    lefts
+                        .par_iter()
+                        .zip(rights)
+                        .with_min_len(PAR_MIN_ITEMS)
+                        .for_each(|(&l, &r)| {
+                            for &t in fwd.doc(left_docs[key_pos(l) as usize]) {
+                                deg_left[t as usize].fetch_sub(1, Relaxed);
+                                deg_right[t as usize].fetch_add(1, Relaxed);
+                            }
+                            for &t in fwd.doc(right_docs[key_pos(r) as usize]) {
+                                deg_right[t as usize].fetch_sub(1, Relaxed);
+                                deg_left[t as usize].fetch_add(1, Relaxed);
+                            }
+                        });
                     for (&l, &r) in lefts.iter().zip(rights) {
                         let (li, ri) = (key_pos(l) as usize, key_pos(r) as usize);
                         let (ld, rd) = (left[li], right[ri]);
@@ -1126,7 +1143,7 @@ impl BisectState {
                 break;
             }
             level.swaps += moved as u64;
-            let cost_after = self.partition_cost(n_left, n_right);
+            let cost_after = self.partition_cost(n_left, n_right, parallel);
             let round_gain = cost_before - cost_after;
             cost_before = cost_after;
             if round == 0 {
@@ -1178,14 +1195,26 @@ impl BisectState {
         first_round_gain
     }
 
-    /// The cost of the current split, from its degree tables.
-    fn partition_cost(&self, n_left: f32, n_right: f32) -> f64 {
-        let mut cost = 0.0f64;
-        for &t in &self.touched {
-            let t = t as usize;
-            cost += self.term_split_cost(t, n_left, n_right);
+    /// The cost of the current split, from its degree tables. A large split
+    /// sums in parallel, a fixed chunk of terms at a time, each chunk in
+    /// order and then the chunks in order, so the total is the same on any
+    /// thread count.
+    fn partition_cost(&self, n_left: f32, n_right: f32, parallel: bool) -> f64 {
+        let cost_of = |terms: &[u32]| -> f64 {
+            terms
+                .iter()
+                .map(|&t| self.term_split_cost(t as usize, n_left, n_right))
+                .sum()
+        };
+        if !parallel {
+            return cost_of(&self.touched);
         }
-        cost
+        let chunks: Vec<f64> = self
+            .touched
+            .par_chunks(PAR_MIN_ITEMS)
+            .map(cost_of)
+            .collect();
+        chunks.into_iter().sum()
     }
 
     /// What term `t` costs across both halves of the current split.
@@ -1224,26 +1253,29 @@ impl BisectState {
             let (gain_left, gain_right) = (as_atomic(move_gain_left), as_atomic(move_gain_right));
             let (deg_left, deg_right) = (&*deg_left, &*deg_right);
             let (cost_left, cost_right) = (cost_left.as_slice(), cost_right.as_slice());
-            touched.par_iter().for_each(|&t| {
-                let t = t as usize;
-                let (dl, dr) = (deg_left[t], deg_right[t]);
-                let left = Side {
-                    deg: dl,
-                    size: n_left,
-                    costs: cost_left,
-                };
-                let right = Side {
-                    deg: dr,
-                    size: n_right,
-                    costs: cost_right,
-                };
-                if dl > 0 {
-                    gain_left[t].store(move_gain(&left, &right).to_bits(), Relaxed);
-                }
-                if dr > 0 {
-                    gain_right[t].store(move_gain(&right, &left).to_bits(), Relaxed);
-                }
-            });
+            touched
+                .par_iter()
+                .with_min_len(PAR_MIN_ITEMS)
+                .for_each(|&t| {
+                    let t = t as usize;
+                    let (dl, dr) = (deg_left[t], deg_right[t]);
+                    let left = Side {
+                        deg: dl,
+                        size: n_left,
+                        costs: cost_left,
+                    };
+                    let right = Side {
+                        deg: dr,
+                        size: n_right,
+                        costs: cost_right,
+                    };
+                    if dl > 0 {
+                        gain_left[t].store(move_gain(&left, &right).to_bits(), Relaxed);
+                    }
+                    if dr > 0 {
+                        gain_right[t].store(move_gain(&right, &left).to_bits(), Relaxed);
+                    }
+                });
             return;
         }
         for &t in &self.touched {
@@ -1268,7 +1300,53 @@ impl BisectState {
         }
     }
 
-    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize) {
+    /// Count each term's documents on either side of `mid` into the degree
+    /// tables, and list the terms the partition touches.
+    ///
+    /// A large split counts in parallel. Degrees are counts, so adding them
+    /// up from any thread ends at the same tables; the touched terms are
+    /// then read off the tables in id order, so every later pass over them,
+    /// and the sums it makes, runs the same whichever threads counted. The
+    /// serial path lists a term as it first meets it, which costs nothing
+    /// beyond the count itself; a pass over the whole vocabulary would.
+    fn count_degrees(&mut self, fwd: &ForwardIndex, order: &[u32], mid: usize, parallel: bool) {
+        if parallel {
+            let Self {
+                deg_left,
+                deg_right,
+                touched,
+                ..
+            } = self;
+            let (left, right) = order.split_at(mid);
+            {
+                let (deg_left, deg_right) = (as_atomic(deg_left), as_atomic(deg_right));
+                join(
+                    || {
+                        left.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
+                            for &t in fwd.doc(d) {
+                                deg_left[t as usize].fetch_add(1, Relaxed);
+                            }
+                        })
+                    },
+                    || {
+                        right.par_iter().with_min_len(PAR_MIN_ITEMS).for_each(|&d| {
+                            for &t in fwd.doc(d) {
+                                deg_right[t as usize].fetch_add(1, Relaxed);
+                            }
+                        })
+                    },
+                );
+            }
+            let (deg_left, deg_right) = (&*deg_left, &*deg_right);
+            touched.clear();
+            touched.par_extend(
+                (0..deg_left.len() as u32)
+                    .into_par_iter()
+                    .with_min_len(PAR_MIN_ITEMS)
+                    .filter(|&t| deg_left[t as usize] > 0 || deg_right[t as usize] > 0),
+            );
+            return;
+        }
         for (i, &d) in order.iter().enumerate() {
             let side_left = i < mid;
             for &t in fwd.doc(d) {
@@ -1317,7 +1395,12 @@ fn rank_by_gain(
     match parallel {
         // `par_extend` over an indexed iterator fills `out` in index
         // order, so the ranking is the same whichever way it ran.
-        true => out.par_extend(half.par_iter().enumerate().map(gain_of)),
+        true => out.par_extend(
+            half.par_iter()
+                .enumerate()
+                .with_min_len(PAR_MIN_ITEMS)
+                .map(gain_of),
+        ),
         false => out.extend(half.iter().enumerate().map(gain_of)),
     }
 }

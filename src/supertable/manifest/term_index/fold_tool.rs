@@ -95,10 +95,7 @@ fn present_sources(dir: &Path, layers: &[Layer]) -> Option<Vec<Vec<SliceFile>>> 
 }
 
 fn bytes_of(built: &BuiltBytes) -> u64 {
-    match built {
-        BuiltBytes::Resident(bytes) => bytes.len() as u64,
-        BuiltBytes::Spilled { path, .. } => fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-    }
+    built.len() as u64
 }
 
 fn file_len(path: &Path) -> u64 {

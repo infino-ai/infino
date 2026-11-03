@@ -52,7 +52,7 @@
 
 use std::ops::Range;
 
-use super::{TermIndexError, rebase::OrdinalShift};
+use super::TermIndexError;
 use crate::{
     superfile::{
         bits::{for_each_lane, payload_bytes, put_bits, width_of},
@@ -591,35 +591,6 @@ pub(crate) fn read_chunk_refs(
         });
     }
     Ok(out)
-}
-
-/// Renumber the ordinals of `chunk`'s block directory in `object`, a tier
-/// object, through `shift`, and write the directory's new CRC. Block bodies
-/// carry no ordinal and stay as they are. The directory's CRC is checked
-/// first, so a chunk reference that does not point at a directory is
-/// refused before anything is written.
-pub(crate) fn rebase_chunk(
-    object: &mut [u8],
-    chunk: &TierChunkRef,
-    shift: &OrdinalShift,
-) -> Result<(), TermIndexError> {
-    let start = usize::try_from(chunk.offset).map_err(|_| malformed("rebase: chunk offset"))?;
-    let dir_len = TierDirectory::len_for(chunk.n_blocks);
-    let dir = start
-        .checked_add(dir_len)
-        .and_then(|end| object.get_mut(start..end))
-        .filter(|_| dir_len as u64 <= chunk.len)
-        .ok_or_else(|| malformed("rebase: chunk directory past its object"))?;
-    if u32_le_at(dir, 0) != Some(crc32c(&dir[CHUNK_HEADER_LEN..])) {
-        return Err(malformed("rebase: chunk directory checksum"));
-    }
-    for entry in dir[CHUNK_HEADER_LEN..].chunks_exact_mut(DIRECTORY_ENTRY_LEN) {
-        let old = u32_le_at(entry, 0).expect("a directory entry holds an ordinal");
-        entry[..4].copy_from_slice(&shift.apply(old)?.to_le_bytes());
-    }
-    let crc = crc32c(&dir[CHUNK_HEADER_LEN..]);
-    dir[..CHUNK_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
-    Ok(())
 }
 
 #[cfg(test)]
