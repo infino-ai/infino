@@ -574,18 +574,23 @@ fn an_unreadable_tier_leaves_the_query_to_its_ceilings() {
 /// ways: every try answers the same. The way without the merge is always
 /// among the tries; the merge is, unless the measured costs rule it out
 /// before it runs — which a loaded machine can do for some shapes.
+///
+/// Each shape asks through a handle opened for it. The policy is learned
+/// per handle and per class of query, and shapes here share classes ("the
+/// data", "search index" and "quokka tensor" as conjunctions are all two
+/// terms of the commonest rarity bucket): through one handle a later shape
+/// meets a decision the earlier ones made, which tries the other way only
+/// one query in 64 once it is clear, and its asks can all go one way.
 #[test]
 fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
     let with_dir = TempDir::new().expect("tempdir");
     let without_dir = TempDir::new().expect("tempdir");
-    let with = table_with(
-        &with_dir,
-        Build {
-            tiers: true,
-            gate: true,
-            ..Build::default()
-        },
-    );
+    let gated = Build {
+        tiers: true,
+        gate: true,
+        ..Build::default()
+    };
+    drop(table_with(&with_dir, gated));
     let without = table(&without_dir, false);
     let mut merged_any = false;
     for (query, mode) in [
@@ -596,6 +601,7 @@ fn the_learned_gate_answers_the_same_whichever_way_it_goes() {
         ("quokka tensor", BoolMode::And),
     ] {
         for k in [10usize, 100] {
+            let with = Supertable::open(options_for(&with_dir, gated)).expect("open");
             let (expected, _, _) = run(&without, query, mode, k);
             let mut plain = false;
             // Every ask observed: the policy alternates between asks.
