@@ -355,6 +355,14 @@ pub(crate) struct SupertableProvider {
     /// keeps the analytical SELECT path's projection/limit/row-group
     /// pushdown intact while still honoring deletes.
     tombstone_cache: Option<Arc<SidecarCache>>,
+    /// Each superfile's deleted rows as first read, set by
+    /// [`Self::reading_tombstones_once`] for a call that counts several
+    /// predicates. The cache answers with the newest deletes the process
+    /// has seen, so two counts reading it apart can see different deletes
+    /// under a concurrent commit; reading each superfile's once and reusing
+    /// them keeps the counts of one call consistent, an unfiltered total
+    /// never below a bucket. `None`: every read asks the cache.
+    tombstones_read: Option<Arc<DashMap<Uuid, Arc<RoaringBitmap>>>>,
     /// Per-provider object-store registry key (see
     /// [`SUPERFILE_STORE_URL_PREFIX`]). Unique across providers so a
     /// multi-table query's registrations don't collide.
@@ -473,6 +481,7 @@ impl SupertableProvider {
             disk_cache: options.disk_cache.clone(),
             open_intent: reader.open_intent(),
             tombstone_cache: reader.tombstone_cache.clone(),
+            tombstones_read: None,
             store_url: unique_store_url(),
             segment_filter: None,
             prepared_scan_files: Arc::new(DashMap::new()),
@@ -533,6 +542,43 @@ impl SupertableProvider {
         }
     }
 
+    /// Clone of this provider whose reads of a superfile's deleted rows, and
+    /// those of every provider derived from it, take the rows the first read
+    /// found (see [`Self::tombstones_read`]). For one call's counts, built
+    /// per call: a clone kept across calls would never see a later delete.
+    pub(crate) fn reading_tombstones_once(&self) -> Self {
+        Self {
+            tombstones_read: Some(Arc::default()),
+            ..self.sibling()
+        }
+    }
+
+    /// The rows of superfile `superfile_id` deleted as of `now`, empty with
+    /// no tombstone overlay; under [`Self::reading_tombstones_once`], the
+    /// rows its first read found.
+    fn deleted_rows(
+        &self,
+        superfile_id: Uuid,
+        now: Instant,
+    ) -> Result<Arc<RoaringBitmap>, QueryError> {
+        let Some(cache) = self.tombstone_cache.as_ref() else {
+            return Ok(Arc::new(RoaringBitmap::new()));
+        };
+        let Some(read) = self.tombstones_read.as_ref() else {
+            return cache
+                .bitmap_for(superfile_id, now)
+                .map_err(QueryError::tombstone_cache);
+        };
+        if let Some(rows) = read.get(&superfile_id) {
+            return Ok(Arc::clone(rows.value()));
+        }
+        let rows = cache
+            .bitmap_for(superfile_id, now)
+            .map_err(QueryError::tombstone_cache)?;
+        // Two reads racing keep the first one stored, so both use one set.
+        Ok(Arc::clone(read.entry(superfile_id).or_insert(rows).value()))
+    }
+
     /// Whether this provider counts a range instead of reading rows: a scan
     /// that looks unfiltered while its rows are only the range's, which no
     /// statistics rewrite may answer for.
@@ -569,6 +615,7 @@ impl SupertableProvider {
             disk_cache: self.disk_cache.clone(),
             open_intent: self.open_intent,
             tombstone_cache: self.tombstone_cache.clone(),
+            tombstones_read: self.tombstones_read.clone(),
             store_url: unique_store_url(),
             segment_filter: self.segment_filter.clone(),
             prepared_scan_files: Arc::clone(&self.prepared_scan_files),
@@ -878,14 +925,7 @@ impl SupertableProvider {
         }
         let mut live = 0u64;
         for entry in &survivors {
-            let deleted = match self.tombstone_cache.as_ref() {
-                Some(cache) => cache
-                    .bitmap_for(entry.superfile_id, now)
-                    .map_err(QueryError::tombstone_cache)?
-                    .len(),
-                None => 0,
-            };
-            live += entry.n_docs - deleted;
+            live += entry.n_docs - self.deleted_rows(entry.superfile_id, now)?.len();
         }
         Ok((live, HashSet::new()))
     }
@@ -924,12 +964,7 @@ impl SupertableProvider {
                 async move {
                     let prepared = prepared.await?;
                     let reader = &prepared.reader;
-                    let tombstones = match self.tombstone_cache.as_ref() {
-                        Some(cache) => cache
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(QueryError::tombstone_cache)?,
-                        None => Arc::new(RoaringBitmap::new()),
-                    };
+                    let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let (field, kind, lo, hi) = (range.field, range.kind, range.lo, range.hi);
                     let count = match tombstones.is_empty() {
                         true => reader.range_count(field, kind, lo, hi).await,
@@ -1018,12 +1053,7 @@ impl SupertableProvider {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
-                    let tombstones = match self.tombstone_cache.as_ref() {
-                        Some(cache) => cache
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(QueryError::tombstone_cache)?,
-                        None => Arc::new(RoaringBitmap::new()),
-                    };
+                    let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let ends = prepared
                         .reader
                         .range_ends(field, kind, (lo, hi), hint.k, hint.descending, &tombstones)
@@ -1110,12 +1140,7 @@ impl SupertableProvider {
                 let prepared = self.prepared_scan_file(Arc::clone(&entry));
                 async move {
                     let prepared = prepared.await?;
-                    let tombstones = match self.tombstone_cache.as_ref() {
-                        Some(cache) => cache
-                            .bitmap_for(entry.superfile_id, now)
-                            .map_err(QueryError::tombstone_cache)?,
-                        None => Arc::new(RoaringBitmap::new()),
-                    };
+                    let tombstones = self.deleted_rows(entry.superfile_id, now)?;
                     let rows = prepared
                         .reader
                         .range_rows(field, kind, lo, hi, Some(pool))
@@ -2056,12 +2081,7 @@ impl TableProvider for SupertableProvider {
                         // This superfile's tombstoned rows (empty when no
                         // overlay); the batch prefetch above already resolved
                         // them, so this is a cache read.
-                        let tombstones = match self.tombstone_cache.as_ref() {
-                            Some(cache) => cache
-                                .bitmap_for(entry.superfile_id, now)
-                                .map_err(QueryError::tombstone_cache)?,
-                            None => Arc::new(RoaringBitmap::new()),
-                        };
+                        let tombstones = self.deleted_rows(entry.superfile_id, now)?;
 
                         // The exact conjuncts' rows, within whatever the
                         // bounded ones kept. No selectivity gate sends them to
@@ -3789,6 +3809,44 @@ mod tests {
         assert_eq!(provider.surviving_superfile_count(&inside).await, 1);
         assert_eq!(provider.surviving_superfile_count(&before).await, 0);
         assert_eq!(provider.surviving_superfile_count(&after).await, 0);
+    }
+
+    /// Under [`SupertableProvider::reading_tombstones_once`] a superfile's
+    /// deleted rows are those its first read found, for every provider
+    /// derived from it: a delete committed later in the call is not seen, so
+    /// the counts one call makes agree with each other. A plain provider
+    /// asks the cache each time and sees it.
+    #[test]
+    fn a_call_reading_tombstones_once_sees_one_set_of_deletes() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st =
+            Supertable::create(default_supertable_options().with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_title_batch(&["alpha", "bravo", "charlie"]))
+            .expect("append");
+        w.commit().expect("commit");
+
+        let provider = provider_of(&st);
+        let once = provider.reading_tombstones_once();
+        let derived = once.restricted_to(HashSet::new());
+        let id = provider.manifest().superfiles[0].superfile_id;
+        let first = once.deleted_rows(id, Instant::now()).expect("first read");
+        assert!(first.is_empty());
+
+        w.delete(col("title").eq(lit("bravo"))).expect("delete");
+        w.commit().expect("commit the delete");
+        let now = Instant::now();
+        assert_eq!(provider.deleted_rows(id, now).expect("plain read").len(), 1);
+        assert!(
+            once.deleted_rows(id, now).expect("second read").is_empty(),
+            "a later read in the call takes the first read's rows"
+        );
+        assert!(
+            derived.deleted_rows(id, now).expect("derived read").is_empty(),
+            "a provider derived from the call's shares its reads"
+        );
     }
 
     /// Rows per superfile the hydrate prune test packs: one two-row batch each.

@@ -76,9 +76,12 @@ impl TableProvider for RangeCounts {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        // Every bucket reads a superfile's deleted rows as the first read
+        // found them, so a concurrent delete cannot leave the unfiltered
+        // total below a bucket of the same row.
+        let table = self.table.reading_tombstones_once();
         let counts = try_join_all(self.buckets.iter().map(|bucket| {
-            self.table
-                .counted_rows(state, bucket.range.as_ref(), &bucket.filters)
+            table.counted_rows(state, bucket.range.as_ref(), &bucket.filters)
         }))
         .await?;
         let columns = counts

@@ -250,8 +250,11 @@ where
     let mut n_rows: u64 = 0;
     for batch in batches {
         let batch = batch.map_err(io::Error::other)?;
-        let first_row = u32::try_from(n_rows)
-            .map_err(|_| io::Error::other("a superfile holds at most u32::MAX rows"))?;
+        // Every row of the batch takes a `u32` id, its last row included.
+        let end_row = n_rows + batch.num_rows() as u64;
+        let (Ok(first_row), Ok(_)) = (u32::try_from(n_rows), u32::try_from(end_row)) else {
+            return Err(io::Error::other("a superfile holds at most u32::MAX rows"));
+        };
         for (spec, sorter) in columns.iter().zip(&mut sorters) {
             let array = batch.column_by_name(&spec.name).ok_or_else(|| {
                 io::Error::other(format!(
@@ -598,6 +601,13 @@ impl RangeDirectory {
             ));
         }
         let n_columns = u32_le_at(bytes, N_COLUMNS_AT).ok_or_else(truncated)? as usize;
+        // The CRC that refuses a damaged count is checked only after the
+        // column entries are read, so the count is bounded by the bytes
+        // before anything is sized by it: one flipped bit in it would
+        // otherwise size an allocation of gigabytes and abort the process.
+        if directory_len(n_columns, 0) > bytes.len() {
+            return Err(truncated());
+        }
         let mut columns = Vec::with_capacity(n_columns);
         let mut n_blocks_total = 0usize;
         for c in 0..n_columns {
@@ -1219,6 +1229,11 @@ mod tests {
         bad_dir[HEADER_BYTES] ^= 1;
         assert!(RangeDirectory::parse(&bad_dir, bad_dir.len() as u64).is_err());
         assert!(RangeDirectory::parse(&region[..HEADER_BYTES], region.len() as u64).is_err());
+        // A damaged column count, magic and version intact, is refused
+        // before it sizes anything.
+        let mut bad_count = region.clone();
+        bad_count[N_COLUMNS_AT..N_COLUMNS_AT + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(RangeDirectory::parse(&bad_count, bad_count.len() as u64).is_err());
 
         let directory = RangeDirectory::parse(&region, region.len() as u64).expect("parse");
         let column = directory.column(1).expect("indexed");

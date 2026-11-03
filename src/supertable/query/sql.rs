@@ -537,7 +537,9 @@ impl SupertableReader {
     /// range-indexed column nor the literal `true`, or a superfile it keeps
     /// has no range index over the column.
     fn count_where_from_index(&self, predicates: &[Expr]) -> Result<Option<Vec<u64>>, QueryError> {
-        let provider = op_stats::suppressed(|| self.sql_provider());
+        // One read of each superfile's deleted rows for every predicate, so
+        // the counts agree with each other as one aggregate's would.
+        let provider = op_stats::suppressed(|| self.sql_provider()).reading_tombstones_once();
         let mut counted = Vec::with_capacity(predicates.len());
         for predicate in predicates {
             if matches!(
@@ -802,7 +804,7 @@ fn count_where_name(i: usize) -> String {
 
 /// Whether `expr` reads another relation: an `IN`, `EXISTS` or scalar
 /// subquery anywhere in it.
-fn holds_subquery(expr: &Expr) -> bool {
+pub(crate) fn holds_subquery(expr: &Expr) -> bool {
     expr.exists(|e| {
         Ok(matches!(
             e,
