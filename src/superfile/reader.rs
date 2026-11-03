@@ -318,6 +318,15 @@ pub struct SuperfileReader {
     resident_hole: Option<(u64, u64)>,
 }
 
+/// What [`SuperfileReader::range_ends`] keeps of a superfile: its first rows
+/// by the key, as `(key, row)`, and whether its rows ascend by `_id`, so
+/// that the rows kept of a tied key are its lowest `_id`s too.
+#[derive(Debug, Clone)]
+pub(crate) struct RangeEnds {
+    pub(crate) pairs: Vec<(u64, u32)>,
+    pub(crate) rows_in_id_order: bool,
+}
+
 /// Where a superfile's stable-id sidecar lives and how it is laid out, from
 /// the footer key-values. Its range was checked against the file length when
 /// it was parsed ([`id_sidecar_location`]).
@@ -1460,13 +1469,16 @@ impl SuperfileReader {
     }
 
     /// The `k` rows whose keys lie lowest (or, with `descending`,
-    /// highest) in `lo..=hi`, as `(key, row)` in that order, leaving out the
-    /// rows of `skip` (deleted ones): what an `ORDER BY column LIMIT k`
-    /// over a range keeps of this superfile. The interval's blocks are read
-    /// from its near end, one at a time, until `k` rows are found, so the
-    /// read is a block or two however wide the interval. Fewer than `k`
-    /// when the interval holds fewer. `None` when the superfile does not
-    /// range-index the column with keys of `kind`.
+    /// highest) in `lo..=hi`, as `(key, row)`, leaving out the rows of
+    /// `skip` (deleted ones): what an `ORDER BY column LIMIT k` over a range
+    /// keeps of this superfile. Of the rows holding the `k`-th key, the
+    /// lowest are kept, whichever the direction, so in a superfile whose
+    /// rows ascend by `_id` ([`RangeEnds::rows_in_id_order`]) the `k` are
+    /// the first by the key and then `_id` ascending. The interval's blocks
+    /// are read from its near end, one at a time, until `k` rows are found,
+    /// so the read is a block or two however wide the interval. Fewer than
+    /// `k` when the interval holds fewer. `None` when the superfile does
+    /// not range-index the column with keys of `kind`.
     pub(crate) async fn range_ends(
         &self,
         field: FieldId,
@@ -1475,7 +1487,7 @@ impl SuperfileReader {
         k: usize,
         descending: bool,
         skip: &RoaringBitmap,
-    ) -> Result<Option<Vec<(u64, u32)>>, ReadError> {
+    ) -> Result<Option<RangeEnds>, ReadError> {
         let Some((directory, field_id)) = self.range_column(field, kind).await? else {
             return Ok(None);
         };
@@ -1510,7 +1522,34 @@ impl SuperfileReader {
                     .take(k - out.len()),
             );
         }
-        Ok(Some(out))
+        // A descending walk meets a key's rows highest first, so the rows it
+        // kept of the `k`-th key are that key's highest. Keep its lowest
+        // instead: read forward from the key's first block, where they are.
+        if descending && k > 0 && out.len() == k {
+            let cut = out[k - 1].0;
+            out.retain(|(key, _)| *key != cut);
+            for b in indexed.blocks_in(cut, cut) {
+                if out.len() == k {
+                    break;
+                }
+                let bytes = self
+                    .range_region_bytes(loc, indexed.block_span(b), "range index block")
+                    .await?;
+                let pairs = indexed
+                    .pairs_in_block(b, &bytes, cut, cut)
+                    .map_err(ReadError::Malformed)?;
+                out.extend(
+                    pairs
+                        .into_iter()
+                        .filter(|(_, row)| !skip.contains(*row))
+                        .take(k - out.len()),
+                );
+            }
+        }
+        Ok(Some(RangeEnds {
+            pairs: out,
+            rows_in_id_order: indexed.rows_in_id_order(),
+        }))
     }
 
     /// How many rows' keys lie in `lo..=hi`, from the range index:

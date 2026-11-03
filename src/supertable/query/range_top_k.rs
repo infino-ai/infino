@@ -31,8 +31,12 @@
 //! sort may order by more keys after the column (`ORDER BY price, id`, the
 //! tie-break a paged search adds): those order only the rows tied on the
 //! column, so the scan then reads every row tied with the cutoff too. The
-//! sort and the filters stay where they are, so the answer is the one they
-//! give over the rows the scan returns.
+//! one exception is a sort whose only later key is the table's `_id`,
+//! ascending: a superfile whose rows ascend by `_id` keeps the rows of a
+//! tied key in `_id` order in its range index, so its first rows by the
+//! column are its first by the column and `_id`, and the scan reads those
+//! alone. The sort and the filters stay where they are, so the answer is
+//! the one they give over the rows the scan returns.
 
 use std::sync::Arc;
 
@@ -130,6 +134,11 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
     }
     predicates.extend(scan.filters.iter().flat_map(split_conjunction).cloned());
     let range_cols = provider.manifest().table_schema().range_column_types();
+    let id_column = provider.manifest().options.id_column.as_str();
+    let ties_by_id = matches!(
+        later,
+        [only] if only.asc && matches!(&only.expr, Expr::Column(c) if c.name == id_column)
+    );
     if single_range(&predicates, &column.name, &range_cols).is_none() {
         return Ok(None);
     }
@@ -141,6 +150,7 @@ fn try_rewrite(plan: &LogicalPlan) -> DfResult<Option<LogicalPlan>> {
         descending: !sort_expr.asc,
         k: *k,
         ties: !later.is_empty(),
+        ties_by_id,
     }));
     let source = provider_as_source(hinted as Arc<dyn TableProvider>);
     Ok(Some(with_scan_source(plan, &source)?))
@@ -176,10 +186,14 @@ mod tests {
     use arrow_array::{Array, Int64Array, LargeStringArray, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::prelude::{col, lit};
+    use roaring::RoaringBitmap;
     use tempfile::TempDir;
+    use tokio::runtime::Builder;
 
     use crate::{
+        config::OptimizeOptions,
         storage::{LocalFsStorageProvider, StorageProvider},
+        superfile::range::KeyKind,
         supertable::{
             Supertable, SupertableOptions, SupertableReader, query::scalar_cache::ByteLru,
         },
@@ -201,6 +215,19 @@ mod tests {
     const DELETED_BELOW: i64 = 300;
     /// Kept bytes: room for every column of every row group.
     const KEPT_BYTES: usize = 64 << 20;
+    /// Below every `key`: a cutoff that keeps all of them.
+    const BELOW_EVERY_KEY: i64 = -1;
+    /// Top-k statements whose ties the table's `_id` breaks, ascending, as
+    /// `(key above, descending, limit)`; no key bound means no `WHERE`, as a
+    /// search with no query sends.
+    const BY_ID: &[(Option<i64>, bool, usize)] = &[
+        (Some(40), false, 10),
+        (Some(40), true, 25),
+        (Some(90), false, 130),
+        (None, true, 7),
+        (None, false, 45),
+        (None, true, 250),
+    ];
     /// The tie-broken top-k statements, and the `(key above, descending,
     /// limit)` each asks for.
     const TOP_K: &[(&str, i64, bool, usize)] = &[
@@ -287,6 +314,50 @@ mod tests {
         rows.into_iter().take(limit).map(|(_, s)| s).collect()
     }
 
+    /// The `seq`s a top-k over the live rows answers when it orders by
+    /// `key` and then `seq` ascending, whichever way `key` goes.
+    fn expected_then_seq(above: i64, descending: bool, limit: usize) -> Vec<i64> {
+        let mut rows: Vec<(i64, i64)> = (DELETED_BELOW..FILES * ROWS_PER_FILE)
+            .map(|s| (key(s), s))
+            .filter(|(k, _)| *k > above)
+            .collect();
+        rows.sort_by(|a, b| {
+            let by_key = match descending {
+                false => a.0.cmp(&b.0),
+                true => b.0.cmp(&a.0),
+            };
+            by_key.then(a.1.cmp(&b.1))
+        });
+        rows.into_iter().take(limit).map(|(_, s)| s).collect()
+    }
+
+    /// Assert every superfile of `reader`'s snapshot keeps the rows tied on
+    /// `key` in `_id` order, which is what lets a top-k tie-broken by `_id`
+    /// read only each superfile's first rows.
+    fn assert_tied_rows_in_id_order(st: &Supertable, reader: &SupertableReader, what: &str) {
+        let manifest = reader.manifest();
+        let field = manifest.field_id("key").expect("key");
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        for entry in &manifest.superfiles {
+            let file = st.options().store.reader(&entry.uri).expect("superfile");
+            let ends = runtime
+                .block_on(file.range_ends(
+                    field,
+                    KeyKind::Signed,
+                    (0, u64::MAX),
+                    1,
+                    false,
+                    &RoaringBitmap::new(),
+                ))
+                .expect("ends")
+                .expect("key is indexed");
+            assert!(ends.rows_in_id_order, "{what}: {:?}", entry.uri);
+        }
+    }
+
     /// The `seq` column across `batches`, in order.
     fn seqs(batches: &[RecordBatch]) -> Vec<i64> {
         batches
@@ -335,6 +406,37 @@ mod tests {
                 assert_eq!(
                     seqs(&reader.query_sql(sql).expect("sql")),
                     expected(*above, *descending, *limit),
+                    "{pass}: {sql}"
+                );
+            }
+        }
+    }
+
+    /// A top-k whose ties the table's `_id` breaks answers as a sort by the
+    /// key and then `seq` does (the rows were appended in `seq` order, so
+    /// their ids ascend with it), deleted rows left out, whichever way the
+    /// key goes, before and after an optimize merges the superfiles; and
+    /// every superfile says its tied rows are in `_id` order, so the scan
+    /// reads each one's first rows alone.
+    #[test]
+    fn a_top_k_tie_broken_by_the_id_answers_from_each_superfiles_first_rows() {
+        let dir = TempDir::new().expect("tempdir");
+        let st = table(&dir);
+        for pass in ["appended", "optimized"] {
+            if pass == "optimized" {
+                st.optimize(&OptimizeOptions::default()).expect("optimize");
+            }
+            let reader = st.reader().expect("reader");
+            assert_tied_rows_in_id_order(&st, &reader, pass);
+            for (above, descending, limit) in BY_ID {
+                let filter = above.map_or(String::new(), |a| format!("WHERE key > {a} "));
+                let order = if *descending { "DESC" } else { "ASC" };
+                let sql = format!(
+                    "SELECT seq, key FROM supertable {filter}ORDER BY key {order} NULLS LAST, _id ASC LIMIT {limit}"
+                );
+                assert_eq!(
+                    seqs(&reader.query_sql(&sql).expect("sql")),
+                    expected_then_seq(above.unwrap_or(BELOW_EVERY_KEY), *descending, *limit),
                     "{pass}: {sql}"
                 );
             }

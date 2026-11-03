@@ -419,12 +419,15 @@ pub(crate) struct CountedRange {
 /// direction and the sort's row count, and whether the sort orders by more
 /// keys after the column (`ties`): then rows tied with the `k`-th key are
 /// told apart by those keys, so every one of them can be in the answer.
+/// When the one later key is the id, ascending (`ties_by_id`), a superfile
+/// that keeps its tied rows in id order answers with its first rows alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopKHint {
     pub(crate) column: String,
     pub(crate) descending: bool,
     pub(crate) k: usize,
     pub(crate) ties: bool,
+    pub(crate) ties_by_id: bool,
 }
 
 /// Manual `Debug` (required by `TableProvider`): the cache /
@@ -1031,7 +1034,10 @@ impl SupertableProvider {
     /// the `k`-th best of all of them is a cutoff no answer row passes, and
     /// the rows kept are the collected ones within it — at least `k`, and
     /// every row a superfile holds that the answer needs (one row past its
-    /// own `k`-th key is past the cutoff too). `None` when there is no hint,
+    /// own `k`-th key is past the cutoff too). Ties broken by the id ascending
+    /// are settled the same way when every survivor's rows ascend by the id:
+    /// each one's first rows by the key are then its first by the key and
+    /// the id. `None` when there is no hint,
     /// the filters are not that one range, or a survivor has no range index
     /// over the column: the scan then reads every row the filters admit.
     async fn top_k_rows(
@@ -1059,7 +1065,7 @@ impl SupertableProvider {
                         .range_ends(field, kind, (lo, hi), hint.k, hint.descending, &tombstones)
                         .await
                         .map_err(QueryError::from)?;
-                    Ok::<_, DataFusionError>(ends.map(|pairs| (entry.superfile_id, pairs)))
+                    Ok::<_, DataFusionError>(ends.map(|ends| (entry.superfile_id, ends)))
                 }
             }),
             in_flight,
@@ -1068,9 +1074,13 @@ impl SupertableProvider {
         let Some(ends) = ends.into_iter().collect::<Option<Vec<_>>>() else {
             return Ok(None);
         };
+        // Ties the id breaks need no rows past each superfile's first when
+        // every superfile keeps its tied rows in id order.
+        let ties =
+            hint.ties && !(hint.ties_by_id && ends.iter().all(|(_, ends)| ends.rows_in_id_order));
         let mut keys: Vec<u64> = ends
             .iter()
-            .flat_map(|(_, pairs)| pairs.iter().map(|(key, _)| *key))
+            .flat_map(|(_, ends)| ends.pairs.iter().map(|(key, _)| *key))
             .collect();
         // With no filter, a NULL is a row of the answer too — after every
         // value, as the rule admits only `NULLS LAST` there — and no range
@@ -1090,7 +1100,7 @@ impl SupertableProvider {
         // superfile's `k` best), so the rows are those of the interval up to
         // it, read from the range index whole. Fewer than `k` keys in all
         // means every superfile gave every row it holds in the range.
-        if hint.ties && hint.k > 0 && keys.len() >= hint.k {
+        if ties && hint.k > 0 && keys.len() >= hint.k {
             let cut = kth(&mut keys);
             let through = match hint.descending {
                 false => (lo, cut),
@@ -1109,8 +1119,9 @@ impl SupertableProvider {
         };
         Ok(Some(
             ends.into_iter()
-                .map(|(id, pairs)| {
-                    let rows: RoaringBitmap = pairs
+                .map(|(id, ends)| {
+                    let rows: RoaringBitmap = ends
+                        .pairs
                         .into_iter()
                         .filter(|(key, _)| within(*key))
                         .map(|(_, row)| row)

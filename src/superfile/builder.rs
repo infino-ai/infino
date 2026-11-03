@@ -4331,8 +4331,14 @@ fn range_specs_in(specs: Vec<RangeColumnSpec>, schema: &Schema) -> Vec<RangeColu
 
 /// The range index region over `batches`, the superfile's rows in file
 /// order, for `specs` (already resolved against the batches' schema by
-/// [`range_specs_in`]). No region when `specs` is empty.
-fn range_region_of<I>(batches: I, specs: &[RangeColumnSpec]) -> Result<RangeRegion, BuildError>
+/// [`range_specs_in`]). `id_column` names the id column the batches carry,
+/// so the region records whether the rows ascend by it. No region when
+/// `specs` is empty.
+fn range_region_of<I>(
+    batches: I,
+    specs: &[RangeColumnSpec],
+    id_column: Option<&str>,
+) -> Result<RangeRegion, BuildError>
 where
     I: IntoIterator<Item = Result<RecordBatch, ArrowError>>,
 {
@@ -4343,7 +4349,8 @@ where
             directory_length: 0,
         });
     }
-    let region = range::build_region(batches, specs, &scratch_root()).map_err(BuildError::Io)?;
+    let region =
+        range::build_region(batches, specs, id_column, &scratch_root()).map_err(BuildError::Io)?;
     let length = region.len();
     let directory_length = region.directory.len() as u64;
     Ok(RangeStream {
@@ -4362,14 +4369,19 @@ fn range_region_of_batches(
     opts: &BuilderOptions,
 ) -> Result<RangeRegion, BuildError> {
     let specs = range_specs_in(opts.range_column_specs(), schema);
-    range_region_of(batches.iter().cloned().map(Ok), &specs)
+    let id_column = schema
+        .index_of(&opts.id_column)
+        .is_ok()
+        .then_some(opts.id_column.as_str());
+    range_region_of(batches.iter().cloned().map(Ok), &specs, id_column)
 }
 
 /// The range index region over the rows of a Parquet body, for the columns
 /// `opts` range-indexes ([`BuilderOptions::range_columns`]): for a body
 /// whose rows the build no longer holds (a merge streams them through the
 /// encoder and drops them) or never decoded (a carried body). Read back
-/// from the body, projecting those columns alone, in the file's row order.
+/// from the body, projecting those columns and the id column alone, in the
+/// file's row order.
 /// `body` holds the row groups at the offsets `metadata` records; a body
 /// with no footer of its own is fine, since the footer is never read.
 /// No region when `opts` names no range column the body holds.
@@ -4379,25 +4391,27 @@ fn range_region_of_body<R: ChunkReader + 'static>(
     opts: &BuilderOptions,
 ) -> Result<RangeRegion, BuildError> {
     if opts.range_columns.is_empty() {
-        return range_region_of(iter::empty(), &[]);
+        return range_region_of(iter::empty(), &[], None);
     }
     let parquet = |e: ParquetError| BuildError::Io(Error::other(e));
     let arrow_meta =
         ArrowReaderMetadata::try_new(metadata, ArrowReaderOptions::new()).map_err(parquet)?;
     let specs = range_specs_in(opts.range_column_specs(), arrow_meta.schema());
     if specs.is_empty() {
-        return range_region_of(iter::empty(), &[]);
+        return range_region_of(iter::empty(), &[], None);
     }
+    let id_root = arrow_meta.schema().index_of(&opts.id_column).ok();
     let roots: Vec<usize> = specs
         .iter()
         .filter_map(|spec| arrow_meta.schema().index_of(&spec.name).ok())
+        .chain(id_root)
         .collect();
     let projection = ProjectionMask::roots(arrow_meta.parquet_schema(), roots);
     let batches = ParquetRecordBatchReaderBuilder::new_with_metadata(body, arrow_meta)
         .with_projection(projection)
         .build()
         .map_err(parquet)?;
-    range_region_of(batches, &specs)
+    range_region_of(batches, &specs, id_root.map(|_| opts.id_column.as_str()))
 }
 
 /// Splice an encoded body, the two on-disk blobs, the packed stable-id
