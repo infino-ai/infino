@@ -1278,6 +1278,17 @@ struct LayerWriter {
     splice: bool,
 }
 
+/// Whether a layer writer on this thread spreads a batch of terms over its
+/// pool. Only one called from outside every pool does. A writer already
+/// running on a pool thread is one range of a build whose ranges are the
+/// parallelism, and encodes on its own thread: a fan-out from there waits
+/// by running whatever the pool holds — the build's other ranges — and a
+/// range of a commit's layer took ten seconds of wall for a fraction of
+/// one of work.
+fn spreads_batches() -> bool {
+    current_thread_index().is_none()
+}
+
 /// What a layer writer spent its time on, for the merge's per-range
 /// trace event.
 #[derive(Debug, Default, Clone, Copy)]
@@ -1437,21 +1448,15 @@ impl LayerWriter {
                 splice,
             )
         };
-        // A writer already running on a pool thread is one range of a build
-        // whose ranges are the parallelism: it encodes on its own thread. A
-        // fan-out from there waits by running whatever the pool holds — the
-        // build's other ranges — and a range of a commit's layer took ten
-        // seconds of wall for a fraction of one of work. Only a writer
-        // called from outside a pool spreads its batch over one.
-        let encoded = match (&self.pool, current_thread_index()) {
-            (Some(pool), None) => pool.install(|| {
+        let encoded = match self.pool.as_deref().filter(|_| spreads_batches()) {
+            Some(pool) => pool.install(|| {
                 batch
                     .into_par_iter()
                     .with_min_len(ENCODE_JOB_MIN_TERMS)
                     .map(one)
                     .collect::<Result<Vec<EncodedTerm>, TermIndexError>>()
             }),
-            _ => batch
+            None => batch
                 .into_iter()
                 .map(one)
                 .collect::<Result<Vec<EncodedTerm>, TermIndexError>>(),
@@ -2593,6 +2598,22 @@ mod contribution_mark_tests {
             .collect();
             assert_eq!(got, all[150..450], "from the mark at {at}");
         }
+    }
+
+    /// A writer spreads its batches over its pool only from outside every
+    /// pool: on a pool thread it is one range of a build whose ranges are
+    /// the parallelism, and encodes on that thread.
+    #[test]
+    fn a_writer_spreads_its_batches_only_from_outside_a_pool() {
+        assert!(spreads_batches(), "the test thread is on no pool");
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("pool");
+        assert!(
+            !pool.install(spreads_batches),
+            "a pool thread encodes on itself"
+        );
     }
 
     #[test]
