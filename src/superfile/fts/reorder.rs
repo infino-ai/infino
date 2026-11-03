@@ -1071,9 +1071,13 @@ impl BisectState {
                 let mut gain = 0.0f64;
                 while swaps < pairs {
                     if swaps == ready {
+                        // The first `swaps` entries are already the largest,
+                        // in order, and every other entry sits behind them:
+                        // ordering the next ones from the rest alone ends at
+                        // the order a pass over the whole list would.
                         ready = (ready * 2).min(pairs);
-                        order_leading_gains(&mut left_gains, ready, parallel);
-                        order_leading_gains(&mut right_gains, ready, parallel);
+                        order_leading_gains(&mut left_gains[swaps..], ready - swaps, parallel);
+                        order_leading_gains(&mut right_gains[swaps..], ready - swaps, parallel);
                     }
                     let (l, r) = (left_gains[swaps], right_gains[swaps]);
                     let pair_gain = key_gain(l) + key_gain(r);
