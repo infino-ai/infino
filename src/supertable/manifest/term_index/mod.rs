@@ -48,13 +48,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(test)]
+use build::merge_layers;
 pub(crate) use build::{
     BuildPolicy, BuiltBytes, Contribution, ContributionWriter, HEAD_DEPTH, HEAD_DEPTH_MAX,
-    HeadSink, SliceFile, build_onto, merge_layers, scratch_dir, tier_path,
+    HeadSink, SliceFile, build_onto, scratch_dir, tier_path,
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{MERGE_RANGES_MAX, build_layer, rebase_run};
+use build::{MERGE_RANGES_MAX, build_layer, merge_layers_into, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -416,19 +418,54 @@ async fn write_objects(
     // whole upload while the other slots sat empty. Started first, the
     // large ones run the whole wave and the small ones fill in around them.
     objects.sort_by_key(|(_, built)| Reverse(built.len()));
-    let jobs = objects.into_iter().map(|(hash, built)| {
-        let storage = Arc::clone(storage);
-        async move {
-            let bytes = match built {
-                BuiltBytes::Resident(bytes) => bytes,
-                BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
-            };
-            let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
-            debug_assert_eq!(reference.content_hash, hash);
-            Ok(())
-        }
-    });
+    let jobs = objects
+        .into_iter()
+        .map(|(hash, built)| put_built(Arc::clone(storage), kind, hash, built));
     run_bounded(SLICE_WRITE_CONCURRENCY, "object write", jobs).await
+}
+
+/// Store one built object of `kind`, reading it back from disk when it
+/// was spilled.
+async fn put_built(
+    storage: Arc<dyn StorageProvider>,
+    kind: &'static str,
+    hash: ContentHash,
+    built: BuiltBytes,
+) -> Result<(), TermIndexError> {
+    let bytes = match built {
+        BuiltBytes::Resident(bytes) => bytes,
+        BuiltBytes::Spilled { path, .. } => async_fs::read(&path).await?,
+    };
+    let reference = put_content_addressed(storage.as_ref(), kind, bytes).await?;
+    debug_assert_eq!(reference.content_hash, hash);
+    Ok(())
+}
+
+/// Store the objects a merge hands over as its ranges finish, at most the
+/// tier and slice waves of [`write_tiers_and_slices`] at once. The first
+/// error stops the uploads still running and closes the stream.
+async fn upload_objects(
+    storage: Arc<dyn StorageProvider>,
+    mut objects: tokio::sync::mpsc::UnboundedReceiver<(&'static str, ContentHash, BuiltBytes)>,
+) -> Result<(), TermIndexError> {
+    let mut running: JoinSet<Result<(), TermIndexError>> = JoinSet::new();
+    let outcome = async {
+        while let Some((kind, hash, built)) = objects.recv().await {
+            while running.len() >= 2 * SLICE_WRITE_CONCURRENCY {
+                join_one(&mut running, "object write").await?;
+            }
+            running.spawn(put_built(Arc::clone(&storage), kind, hash, built));
+        }
+        while !running.is_empty() {
+            join_one(&mut running, "object write").await?;
+        }
+        Ok(())
+    }
+    .await;
+    if outcome.is_err() {
+        running.shutdown().await;
+    }
+    outcome
 }
 
 /// Run `jobs` as spawned tasks, at most `limit` at once, so they spread
@@ -818,9 +855,9 @@ const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
 /// tier it is writing, and a batch of entries being encoded.
 const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Memory a fold holds whatever its shape: the key marks it cuts ranges at
-/// and the objects being downloaded.
-const FOLD_FIXED_BYTES: u64 = 512 * 1024 * 1024;
+/// Memory a fold holds whatever its shape: the key marks it cuts ranges at,
+/// the objects being downloaded, and those uploading beside its merge.
+const FOLD_FIXED_BYTES: u64 = 1536 * 1024 * 1024;
 
 /// Memory an optimize fold is planned in when the host reports none.
 const FOLD_FALLBACK_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
@@ -1196,17 +1233,23 @@ async fn fold_layers(
         .await?;
     let ordinals = ordinals.to_vec();
     let policy = policy.clone();
+    // Each range's objects upload as the range finishes, beside the ranges
+    // still merging; the root that names them is written after all land.
+    let (sink, objects) = tokio::sync::mpsc::unbounded_channel();
+    let uploads = task::spawn(upload_objects(Arc::clone(storage), objects));
     let merged = run_on_pool(pool, "term-index fold", move || {
-        let merged = merge_layers(&sources, &ordinals, &policy);
+        let merged = merge_layers_into(&sources, &ordinals, &policy, Some(&sink));
         // The slice files are read; the scratch directory can go with the
         // task rather than outlive the fold.
         drop(scratch);
         merged
     })
     .instrument(detail_span!("fold.merge"))
-    .await
-    .map_err(|e| TermIndexError::Build(e.to_string()))??;
-    write_tiers_and_slices(storage, merged.tiers, merged.slices).await?;
+    .await;
+    let uploaded = uploads.instrument(detail_span!("fold.upload_tail")).await;
+    let merged = merged.map_err(|e| TermIndexError::Build(e.to_string()))??;
+    uploaded.map_err(|e| TermIndexError::Build(format!("term-index upload: {e}")))??;
+    debug_assert!(merged.tiers.is_empty() && merged.slices.is_empty());
     let mut layer = merged.layer;
     layer.ordinals = merged_ordinals;
     Ok(layer)
@@ -9338,5 +9381,19 @@ mod tests {
         assert_eq!(faults.fired(), 2);
         let good = rt.block_on(download_layers(&local, &root.layers, scratch.path()));
         assert!(good.is_ok(), "the same download succeeds without the fault");
+
+        // A fold uploads each range's objects as the range finishes; one
+        // failed put still fails the fold, so no root names what did not land.
+        faults.fail(FaultOp::PutAtomic, "term-index/slice-", 1);
+        let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
+        let ranged = BuildPolicy {
+            merge_ranges: Some(4),
+            ..policy.clone()
+        };
+        let folded = rt.block_on(fold_layers(&faulty, &root.layers, &ordinals, &ranged, None));
+        assert!(folded.is_err(), "a failed put fails the fold");
+        assert_eq!(faults.fired(), 3);
+        let folded = rt.block_on(fold_layers(&local, &root.layers, &ordinals, &ranged, None));
+        assert!(folded.is_ok(), "the same fold succeeds without the fault");
     }
 }

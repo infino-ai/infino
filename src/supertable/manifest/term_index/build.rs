@@ -2113,10 +2113,28 @@ fn tier_entries(
 /// its contributions writes the same bytes as that build; a range-cut one
 /// writes the same terms, each with the same postings and tier entries,
 /// in slices cut at the range bounds too.
+#[cfg(test)]
 pub(crate) fn merge_layers(
     sources: &[Vec<SliceFile>],
     ordinals: &[Option<u32>],
     policy: &BuildPolicy,
+) -> Result<MergedLayer, TermIndexError> {
+    merge_layers_into(sources, ordinals, policy, None)
+}
+
+/// Where a merge hands each finished range's tier objects and slices, by
+/// kind, so they upload while the other ranges still merge.
+pub(crate) type ObjectSink =
+    tokio::sync::mpsc::UnboundedSender<(&'static str, ContentHash, BuiltBytes)>;
+
+/// [`merge_layers`], handing each range's objects to `sink` as the range
+/// finishes; the merged layer then holds none. A closed sink drops them,
+/// and the uploader that closed it reports why.
+pub(crate) fn merge_layers_into(
+    sources: &[Vec<SliceFile>],
+    ordinals: &[Option<u32>],
+    policy: &BuildPolicy,
+    sink: Option<&ObjectSink>,
 ) -> Result<MergedLayer, TermIndexError> {
     let ranges = detail_span!("fold.key_ranges").in_scope(|| key_ranges(sources, policy))?;
     // Each range merges the slices that reach into it, on its own writer.
@@ -2131,7 +2149,16 @@ pub(crate) fn merge_layers(
                     .collect()
             })
             .collect();
-        merge_range(&in_range, start, end, ordinals, policy)
+        let mut part = merge_range(&in_range, start, end, ordinals, policy)?;
+        if let Some(sink) = sink {
+            for (hash, built) in part.tiers.drain(..) {
+                let _ = sink.send(("tier", hash, built));
+            }
+            for (hash, built) in part.slices.drain(..) {
+                let _ = sink.send(("slice", hash, built));
+            }
+        }
+        Ok(part)
     })?;
     merged.layer.ordinals = Some(ordinals_span(ordinals));
     Ok(merged)
