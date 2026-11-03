@@ -105,11 +105,11 @@ impl RowGroupFilter {
     /// read.
     fn plan(&self, file: &CachedFile) -> Option<ParquetAccessPlan> {
         let meta = file.reader.parquet_metadata();
-        let pruning = file_pruning(&self.predicate, &self.adapter, &self.table, meta)?;
+        let pruning = file_pruning(&self.predicate, &self.adapter, &self.table, &meta)?;
         let all = ParquetAccessPlan::new_all(file.row_counts.len());
         Some(statistics_pruned(
             all,
-            meta,
+            &meta,
             &pruning,
             &file.uri.0.to_string(),
         ))

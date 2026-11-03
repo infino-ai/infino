@@ -3746,9 +3746,12 @@ impl SuperfileBuilder {
         let bytes = source
             .whole_file_bytes()
             .ok_or_else(|| BuildError::Io(Error::other("carried body needs a resident source")))?;
-        // The reader decoded this footer when it opened; decoding the bytes
-        // again would buy nothing.
-        let src_kv = extract_kv_map(source.parquet_metadata()).map_err(BuildError::Footer)?;
+        // The footer the reader holds, decoded when it opened (with the page
+        // index too if a scan has loaded it); decoding the bytes again would
+        // buy nothing. Read once, so the keys and the row groups below come
+        // from the same parse.
+        let source_footer = source.parquet_metadata();
+        let src_kv = extract_kv_map(&source_footer).map_err(BuildError::Footer)?;
         // `None` only when the footer declares no such blob. A declared one
         // that is partial, unparsable or out of bounds is refused: carrying
         // it as absent would silently drop the blob from the output, and
@@ -3824,7 +3827,7 @@ impl SuperfileBuilder {
         splice_carried_body_to(
             Cursor::new(&body),
             body.len() as u64,
-            source.parquet_metadata().as_ref().clone(),
+            &source_footer,
             BufReader::new(fts_file.reopen().map_err(BuildError::Io)?),
             fts_length,
             Cursor::new(&vec_bytes),
@@ -8480,7 +8483,7 @@ mod tests {
     /// a writer that predates the packed layout left.
     fn with_raw_id_sidecar(bytes: &Bytes, batch: &RecordBatch) -> Bytes {
         let source = SuperfileReader::open(bytes.clone()).expect("open packed superfile");
-        let src_kv = extract_kv_map(source.parquet_metadata()).expect("footer kvs");
+        let src_kv = extract_kv_map(&source.parquet_metadata()).expect("footer kvs");
         let at = |key: &str| -> usize { src_kv[key].parse().expect("numeric region key") };
         let fts = at(kv::FTS_OFFSET)..at(kv::FTS_OFFSET) + at(kv::FTS_LENGTH);
         let raw_ids = stable_id_sidecar_bytes(slice::from_ref(batch), "doc_id");
@@ -8497,7 +8500,7 @@ mod tests {
         splice_carried_body_to(
             &bytes[..fts.start],
             fts.start as u64,
-            source.parquet_metadata().as_ref().clone(),
+            &source.parquet_metadata(),
             &bytes[fts.clone()],
             fts.len() as u64,
             empty(),
@@ -8545,6 +8548,30 @@ mod tests {
                 .take_by_local_doc_ids(&locals, &["doc_id"])
                 .expect("ids via the repacked sidecar"),
             expected
+        );
+    }
+
+    /// A scan may have loaded the source's page index before a reindex
+    /// carries its body. The body already holds that index, so the rewrite
+    /// must come out byte for byte as it does from a footer-only reader,
+    /// not with a second copy of the index appended.
+    #[tokio::test]
+    async fn a_carry_writes_the_same_file_whether_or_not_the_page_index_is_loaded() {
+        let (opts, _, bytes) = sidecar_fixture();
+        let footer_only = SuperfileReader::open(bytes.clone()).expect("open source");
+        let indexed = SuperfileReader::open(bytes).expect("open source");
+        let loaded = indexed
+            .parquet_metadata_with_page_index()
+            .await
+            .expect("load the page index");
+        assert!(
+            loaded.offset_index().is_some(),
+            "the fixture must carry a page index, or nothing here is tested"
+        );
+
+        assert_eq!(
+            carry_rewrite(opts.clone(), &indexed).expect("carry from the indexed reader"),
+            carry_rewrite(opts, &footer_only).expect("carry from the footer-only reader"),
         );
     }
 
