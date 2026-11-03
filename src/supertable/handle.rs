@@ -247,6 +247,11 @@ pub(super) struct SupertableInner {
     /// and purged elsewhere. Latched: the handle can only be discarded, and
     /// `Connection::open_table` checks this before serving it from cache.
     pub(super) pointer_vanished: OnceLock<()>,
+    /// Set the first time a vector search through this handle leaves out
+    /// hits whose `_id` no user superfile owns. A table that holds such
+    /// rows reaches them on many searches, so the warning is said once per
+    /// handle rather than once per search.
+    pub(super) unowned_hits_warned: OnceLock<()>,
     /// Cached SQL schemas, keyed by the `schema_id` they were built from:
     /// a pure function of the table's schema, rebuilt when it changes and
     /// otherwise shared (unlike `sql_session_cache`, which follows the
@@ -2249,6 +2254,7 @@ async fn build_handle(
         last_pointer_etag: Mutex::new(None),
         superseded: Mutex::default(),
         pointer_vanished: OnceLock::new(),
+        unowned_hits_warned: OnceLock::new(),
         hidden_deleted_cache: Mutex::new(None),
         sql_schemas: ArcSwapOption::empty(),
         term_index_objects_seen: Mutex::default(),
@@ -2628,6 +2634,13 @@ impl SupertableReader {
     #[cfg_attr(not(feature = "detailed-tracing"), allow(dead_code))]
     pub(crate) fn role(&self) -> TableRole {
         self.inner.role
+    }
+
+    /// `true` the first time a search through this table's handle leaves
+    /// out hits no user superfile owns, `false` after (see
+    /// `SupertableInner::unowned_hits_warned`).
+    pub(crate) fn first_unowned_hits(&self) -> bool {
+        self.inner.unowned_hits_warned.set(()).is_ok()
     }
 
     /// Sync→async bridge for this reader's public query surface.
