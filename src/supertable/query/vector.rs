@@ -2475,9 +2475,10 @@ pub(crate) fn hits_id_score_batch(
 pub(crate) enum MissingRow {
     /// A search hit's id should always be a row of the query's snapshot, so
     /// a missing one is a hidden index holding a row the user table retired
-    /// (a mutation it never recorded) or one from a newer snapshot. Either
-    /// way the row is not in the snapshot the query reads, so the hit is
-    /// left out, as a deleted row is, and logged: failing the whole search
+    /// (a mutation it never recorded), one from a newer snapshot, or an id
+    /// stored wrong that no row ever had. In every case the row is not in
+    /// the snapshot the query reads, so the hit is left out, as a deleted
+    /// row is, and logged once per table handle: failing the whole search
     /// for one stale hit would take every query that reaches it down.
     Drift,
     /// A graph walk reaches rows through an edge table that can lag the
@@ -2570,12 +2571,16 @@ pub(crate) async fn place_for_scalar_resolve(
             .filter(|(_, placement)| placement.is_none())
             .map(|(id, _)| *id)
             .collect();
-        if let Some(first) = unowned.first() {
+        if let Some(first) = unowned.first()
+            && user_reader.first_unowned_hits()
+        {
             warn!(
                 n_hits = unowned.len(),
                 first_id = %first,
                 "vector search: hits whose _id no user superfile of the query's snapshot owns \
-                 were left out; the hidden vector index holds rows the user table retired"
+                 were left out (said once per table handle). The hidden vector index holds \
+                 rows the user table retired or committed after this snapshot, or an id \
+                 stored wrong that no row ever had"
             );
         }
     }

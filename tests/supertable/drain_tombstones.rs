@@ -228,7 +228,8 @@ fn merge_optimize_opts() -> OptimizeOptions {
 /// must as well. Otherwise the old row's vector stays searchable: before a
 /// compaction its hit is the replaced row, and once a compaction has dropped
 /// that row from the user table, its `_id` is in no user superfile and the
-/// search fails.
+/// search fails. The replacement carries a new `_id`, so a later drain that
+/// moves it into the cells keeps it searchable.
 #[test]
 fn an_update_after_the_drain_leaves_no_ghost_of_the_row_it_replaced() {
     let dir = TempDir::new().expect("tempdir");
@@ -273,6 +274,23 @@ fn an_update_after_the_drain_leaves_no_ghost_of_the_row_it_replaced() {
         "the replaced row must not come back before a compaction: {before:?}"
     );
     assert_eq!(before[0], UPDATED_TITLE);
+
+    // A drain after the update moves the replacement into the hidden cells
+    // under its own new `_id`, beside the retired row the cells still hold.
+    st.drain_vectors_to_cells_sync()
+        .expect("drain after the update");
+    let hidden = st.vector_index_table().expect("hidden index table");
+    assert_eq!(
+        hidden.reader().expect("hidden reader").n_docs_total(),
+        (TITLES.len() + 1) as u64,
+        "the replacement must be drained into the hidden cells"
+    );
+    let drained = search("after a drain of the update");
+    assert!(
+        !drained.iter().any(|t| t == TITLES[UPDATED]),
+        "the replaced row must not come back after a later drain: {drained:?}"
+    );
+    assert_eq!(drained[0], UPDATED_TITLE);
 
     st.optimize(&merge_optimize_opts()).expect("optimize");
     let after = search("after the compaction");
