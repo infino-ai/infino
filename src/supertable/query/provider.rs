@@ -3844,7 +3844,10 @@ mod tests {
             "a later read in the call takes the first read's rows"
         );
         assert!(
-            derived.deleted_rows(id, now).expect("derived read").is_empty(),
+            derived
+                .deleted_rows(id, now)
+                .expect("derived read")
+                .is_empty(),
             "a provider derived from the call's shares its reads"
         );
     }

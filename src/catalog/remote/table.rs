@@ -546,7 +546,10 @@ mod tests {
         assert_eq!(statements[0].1, plain.len());
         assert!(statements[0].0.contains("FILTER"), "{statements:?}");
 
-        let with_subquery = [col("n").gt(lit(1i64)), in_subquery(col("n"), Arc::new(tags))];
+        let with_subquery = [
+            col("n").gt(lit(1i64)),
+            in_subquery(col("n"), Arc::new(tags)),
+        ];
         let statements =
             count_where_statements("docs", &schema, &with_subquery).expect("statements");
         let counts: Vec<usize> = statements.iter().map(|(_, n)| *n).collect();
@@ -557,7 +560,10 @@ mod tests {
             !sql[..from].contains("IN (SELECT"),
             "no subquery in the counts: {sql}"
         );
-        assert!(sql[from..].contains("IN (SELECT"), "the subquery is the WHERE: {sql}");
+        assert!(
+            sql[from..].contains("IN (SELECT"),
+            "the subquery is the WHERE: {sql}"
+        );
     }
 
     /// Hydrate over the remote transport is refused as unsupported, before any

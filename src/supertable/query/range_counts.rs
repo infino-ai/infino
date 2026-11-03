@@ -80,9 +80,11 @@ impl TableProvider for RangeCounts {
         // found them, so a concurrent delete cannot leave the unfiltered
         // total below a bucket of the same row.
         let table = self.table.reading_tombstones_once();
-        let counts = try_join_all(self.buckets.iter().map(|bucket| {
-            table.counted_rows(state, bucket.range.as_ref(), &bucket.filters)
-        }))
+        let counts = try_join_all(
+            self.buckets
+                .iter()
+                .map(|bucket| table.counted_rows(state, bucket.range.as_ref(), &bucket.filters)),
+        )
         .await?;
         let columns = counts
             .into_iter()
