@@ -139,7 +139,7 @@ use crate::{
         join::run_spawned,
         terms::{DictEntry, INLINE_TF_MAX, TermBlockWriter, TermDictBuilder, validate_column_name},
         trace::{detail_span, record},
-        varint::push_varint,
+        varint::{push_head, push_varint},
     },
 };
 
@@ -1888,8 +1888,8 @@ pub(crate) struct TermHeadFacts<'a> {
     pub(crate) entry: DictEntry,
     /// The best documents by impact as `(row, term frequency, length
     /// bucket)`, in descending impact then ascending blob document id, at
-    /// most the sink's depth.
-    pub(crate) head: &'a [(u32, u32, u8)],
+    /// most the sink's depth, encoded by [`push_head`].
+    pub(crate) head: &'a [u8],
     /// The length-normalized term frequency — `tf / (tf + norm)` at this
     /// blob's average length and parameters, the factor a score multiplies
     /// the idf by — of the best document `head` left out; `0.0` when it
@@ -1903,18 +1903,18 @@ pub(crate) struct TermHeadFacts<'a> {
 }
 
 /// A term's head as the encoder gathers it.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct HeadOut {
     df: u64,
-    docs: Vec<(u32, u32, u8)>,
+    /// The head's documents as `(row, term frequency, length bucket)`,
+    /// encoded by [`push_head`] where the term is encoded, so the thread
+    /// that writes terms in order only copies them.
+    facts: Vec<u8>,
     bound: f32,
     tail: f32,
     /// The average length and parameters `tail` is keyed at.
     avgdl: f32,
     params: bm25::Bm25Params,
-    /// The documents kept, drained from the heap: `(doc, tf)` with the
-    /// score, in descending score.
-    kept: Vec<((u32, u32), f32)>,
 }
 
 /// Keep a term's best `depth` documents by `scores` (one per posting, as
@@ -1927,6 +1927,7 @@ fn term_head(
     scores: &[f32],
     enc: &TermEncoding<'_>,
     heap: &mut BinaryHeap<TopKEntry<(u32, u32)>>,
+    kept: &mut Vec<((u32, u32), f32)>,
     out: &mut HeadOut,
 ) {
     let depth = enc.head_depth;
@@ -1949,12 +1950,15 @@ fn term_head(
                 .dl_norm_k1(bm25::stored_len(enc.doc_lengths[doc as usize]), enc.avgdl),
         )
     };
-    (out.bound, out.tail) = finish_head(heap, depth, &mut out.kept, key);
-    out.docs.clear();
-    out.docs.extend(out.kept.iter().map(|&((doc, tf), _)| {
-        let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
-        (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
-    }));
+    (out.bound, out.tail) = finish_head(heap, depth, kept, key);
+    out.facts.clear();
+    push_head(
+        &mut out.facts,
+        kept.iter().map(|&((doc, tf), _)| {
+            let row = enc.rows.map_or(doc, |rows| rows[doc as usize]);
+            (row, tf, bm25::quantize_len(enc.doc_lengths[doc as usize]))
+        }),
+    );
     out.avgdl = enc.avgdl;
     out.params = enc.params;
 }
@@ -3084,6 +3088,7 @@ impl FtsBuilder {
                 ),
             };
             let mut sink = TermSink {
+                col_name: &col_name,
                 col_name_bytes,
                 col_positions,
                 key_buf: &mut key_buf,
@@ -3272,6 +3277,7 @@ impl FtsBuilder {
             };
 
             let mut sink = TermSink {
+                col_name: &col_name,
                 col_name_bytes,
                 col_positions,
                 key_buf: &mut key_buf,
@@ -3344,7 +3350,7 @@ impl FtsBuilder {
                             encoded,
                             body,
                             positions,
-                            head: mem::take(&mut scratch.head),
+                            head: scratch.head.clone(),
                         })
                     },
                     |term, mut merged| {
@@ -4092,6 +4098,9 @@ struct TermScratch {
     /// posting's score, computed once for the head and the block maxima.
     head: HeadOut,
     head_heap: BinaryHeap<TopKEntry<(u32, u32)>>,
+    /// The documents the head keeps, drained from the heap: `(doc, tf)`
+    /// with the score, in descending score.
+    head_kept: Vec<((u32, u32), f32)>,
     scores: Vec<f32>,
     /// Per-block doc_id column passed to `encode_block`. Re-used by
     /// taking it into a Block, encoding, and taking it back. Capacity
@@ -4562,6 +4571,7 @@ fn emit_ram_column<W: Write>(
 /// scratch the writes share. Built per column, in place of a dozen
 /// arguments on every emit; the finish's profile travels beside it.
 struct TermSink<'a, W> {
+    col_name: &'a str,
     col_name_bytes: &'a [u8],
     /// Whether the column keeps positions: only then does a term carry
     /// runs into the positions region.
@@ -4712,6 +4722,7 @@ fn encode_term(
             &scratch.scores,
             enc,
             &mut scratch.head_heap,
+            &mut scratch.head_kept,
             &mut scratch.head,
         );
     }
@@ -5035,16 +5046,14 @@ fn write_term<W: Write>(
     };
 
     if let Some(head_sink) = sink.head_sink.as_mut() {
-        let column = std::str::from_utf8(sink.col_name_bytes)
-            .map_err(|_| BuildError::Io(Error::other("fts: non-utf8 column name")))?;
         head_sink.term(
-            column,
+            sink.col_name,
             term,
             &TermHeadFacts {
                 df: head.df,
                 bound: head.bound,
                 entry: dict_entry,
-                head: &head.docs,
+                head: &head.facts,
                 tail: head.tail,
                 avgdl: head.avgdl,
                 params: head.params,

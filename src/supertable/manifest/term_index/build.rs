@@ -44,8 +44,7 @@ use super::{
     TermIndexError,
     format::{
         BlockMark, Layer, Location, Posting, Root, Run, Slice, SliceRef, TierRef, encode_run,
-        encode_slice, legacy_bound_as_key, push_doc_facts, push_posting, read_doc_facts,
-        read_posting,
+        encode_slice, legacy_bound_as_key, push_posting, read_doc_facts, read_posting,
     },
     tier::{
         BLOCK_ENTRIES, ColumnScoring, EncodedChunk, HeadGroup, SplicedBlock, TierChunk,
@@ -63,7 +62,7 @@ use crate::{
     utils::{
         terms::{DictEntry, TermBlockWriter},
         trace::{detail_span, record},
-        varint::{CONTINUATION_BIT, push_varint, read_u64_varint, read_varint},
+        varint::{CONTINUATION_BIT, push_head, push_varint, read_u64_varint, read_varint},
     },
 };
 
@@ -637,6 +636,8 @@ pub(crate) struct ContributionWriter {
     record: Vec<u8>,
     /// The record's length prefix.
     frame: Vec<u8>,
+    /// A head handed over as documents, encoded for the record.
+    head: Vec<u8>,
     /// Bytes written so far: where the next record starts.
     offset: u64,
     /// Some records' keys with the offsets they start at (see
@@ -691,6 +692,7 @@ impl ContributionWriter {
             n_terms: 0,
             record: Vec::new(),
             frame: Vec::new(),
+            head: Vec::new(),
             offset: 0,
             marks: Vec::new(),
         })
@@ -722,6 +724,25 @@ impl ContributionWriter {
         tail: f32,
         head: &[(u32, u32, u8)],
     ) -> Result<(), TermIndexError> {
+        let mut encoded = mem::take(&mut self.head);
+        encoded.clear();
+        push_head(&mut encoded, head.iter().copied());
+        let pushed = self.push_encoded(key, df, bound, location, tail, &encoded);
+        self.head = encoded;
+        pushed
+    }
+
+    /// [`Self::push`] with the head already encoded by [`push_head`], as a
+    /// superfile build's encoders hand it over: the record copies it.
+    pub(crate) fn push_encoded(
+        &mut self,
+        key: &[u8],
+        df: u64,
+        bound: f32,
+        location: Location,
+        tail: f32,
+        head: &[u8],
+    ) -> Result<(), TermIndexError> {
         if self.n_terms > 0 && key <= self.prev_key.as_slice() {
             return Err(TermIndexError::Build(format!(
                 "contribution for {} is not in ascending key order",
@@ -741,10 +762,7 @@ impl ContributionWriter {
                 location,
             },
         );
-        push_varint(&mut self.record, head.len() as u32);
-        for &(row, tf, len) in head {
-            push_doc_facts(&mut self.record, row, tf, len);
-        }
+        self.record.extend_from_slice(head);
         self.frame.clear();
         push_varint(&mut self.frame, self.record.len() as u32);
         if self
@@ -933,7 +951,7 @@ impl TermHeadSink for HeadSink {
         state.key.extend_from_slice(prefix);
         state.key.extend_from_slice(term.as_bytes());
         writer
-            .push(
+            .push_encoded(
                 &state.key,
                 facts.df,
                 facts.bound,
@@ -2512,6 +2530,8 @@ mod contribution_mark_tests {
         ]);
         let mut sink = HeadSink::new(columns, None).expect("sink");
         let head: Vec<(u32, u32, u8)> = (0..8).map(|row| (row, 1 + row % 3, 4)).collect();
+        let mut facts = Vec::new();
+        push_head(&mut facts, head.iter().copied());
         for column in ["three", "twelve"] {
             for i in 0..300 {
                 sink.term(
@@ -2525,7 +2545,7 @@ mod contribution_mark_tests {
                             postings_length: 64,
                             short: true,
                         },
-                        head: &head,
+                        head: &facts,
                         tail: 0.1,
                         avgdl: 4.0,
                         params: Bm25Params::default(),

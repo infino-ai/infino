@@ -33,6 +33,31 @@ pub(crate) fn push_varint(out: &mut Vec<u8>, v: u32) {
     push_u64_varint(out, u64::from(v));
 }
 
+/// Append a document's facts — row, term frequency, length bucket — as a
+/// term's head carries them.
+pub(crate) fn push_doc_facts(out: &mut Vec<u8>, row: u32, tf: u32, len: u8) {
+    push_varint(out, row);
+    push_varint(out, tf);
+    out.push(len);
+}
+
+/// Read what [`push_doc_facts`] wrote at `at`, advancing it; `None` short.
+pub(crate) fn read_doc_facts(bytes: &[u8], at: &mut usize) -> Option<(u32, u32, u8)> {
+    let row = read_varint(bytes, at)?;
+    let tf = read_varint(bytes, at)?;
+    let len = *bytes.get(*at)?;
+    *at += 1;
+    Some((row, tf, len))
+}
+
+/// Append a term's head: its count, then each document's facts in order.
+pub(crate) fn push_head(out: &mut Vec<u8>, head: impl ExactSizeIterator<Item = (u32, u32, u8)>) {
+    push_varint(out, head.len() as u32);
+    for (row, tf, len) in head {
+        push_doc_facts(out, row, tf, len);
+    }
+}
+
 /// Decode one LEB128 `u64` from `bytes` starting at `*at`, advancing
 /// `*at` past it. `None` on truncated input or a value that overflows
 /// `u64` — both only reachable on corrupt bytes, which the caller
