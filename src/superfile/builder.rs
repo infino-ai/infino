@@ -3875,11 +3875,7 @@ impl SuperfileBuilder {
         // The range region is the table's to decide, not the source's: built
         // again from the carried rows, so a column range-indexed since the
         // source was written gets its region here.
-        let range = range_region_of_body(
-            body.clone(),
-            Arc::clone(source.parquet_metadata()),
-            &self.opts,
-        )?;
+        let range = range_region_of_body(body.clone(), source.parquet_metadata(), &self.opts)?;
         splice_carried_body_to(
             Cursor::new(&body),
             body.len() as u64,
