@@ -12074,7 +12074,8 @@ struct KeptFold {
 ///   a writer that keeps none.
 /// - With none left to index, layers fold one run per publish, as
 ///   [`term_index::plan_fold_at_optimize`] picks them, of at most
-///   `fold_max_bytes` together. A fold that loses its publish to commits
+///   `fold_max_bytes` together and as many layers as the host's free
+///   memory and open-file limit hold. A fold that loses its publish to commits
 ///   has their layers stacked on it ([`term_index::rebase`]), so a retry
 ///   writes one root.
 /// - A root that will never load (gone, corrupt, or in a layout this engine
@@ -12109,6 +12110,8 @@ pub(in crate::supertable) async fn stamp_term_index(
     // the next optimize's drops it.
     let renumbered = AtomicBool::new(false);
     let mut passes = 0;
+    let fold_budget =
+        term_index::FoldBudget::for_host(inner.options.writer_pool.current_num_threads());
     loop {
         let published = AtomicBool::new(false);
         let kept_batch: Mutex<Option<KeptBatch>> = Mutex::new(None);
@@ -12165,6 +12168,7 @@ pub(in crate::supertable) async fn stamp_term_index(
                         &root,
                         &live,
                         fold_max_bytes,
+                        fold_budget,
                         renumber,
                         before_tiers,
                     ) {
@@ -12173,6 +12177,15 @@ pub(in crate::supertable) async fn stamp_term_index(
                             ..policy.clone()
                         };
                         let renumbers = fold.renumbers();
+                        info!(
+                            layers = root.layers.len(),
+                            first = fold.run().start,
+                            members = fold.run().len(),
+                            ranges = fold.ranges(),
+                            renumbers,
+                            budget_mib = fold_budget.memory_bytes >> 20,
+                            "term index fold plan"
+                        );
                         let span = detail_span!("term_index.fold", layers = root.layers.len());
                         match term_index::fold_at_optimize(storage, &root, fold, &policy, pool)
                             .instrument(span)

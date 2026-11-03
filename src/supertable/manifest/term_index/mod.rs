@@ -54,7 +54,7 @@ pub(crate) use build::{
 };
 #[cfg(test)]
 pub(crate) use build::{Built, build, first_contribution_difference};
-use build::{build_layer, rebase_run};
+use build::{MERGE_RANGES_MAX, build_layer, rebase_run};
 use bytes::Bytes;
 #[cfg(test)]
 pub(crate) use format::TierRef;
@@ -70,6 +70,7 @@ use uuid::Uuid;
 
 use crate::{
     runtime_bridge::run_on_pool,
+    runtime_metrics::rss::available_memory_bytes,
     storage::{StorageError, StorageProvider, permission_denied_in_chain},
     superfile::{FtsError, fts::reader::BoolMode},
     supertable::{
@@ -782,6 +783,8 @@ pub(crate) struct OptimizeFold {
     id_mins: Vec<i128>,
     /// Whether it numbers the live superfiles afresh.
     renumbers: bool,
+    /// Key ranges the merge is cut into, as the budget sized the fold.
+    ranges: usize,
 }
 
 impl OptimizeFold {
@@ -795,37 +798,160 @@ impl OptimizeFold {
     pub(crate) fn renumbers(&self) -> bool {
         self.renumbers
     }
+
+    /// The layers it folds, by index in the root.
+    pub(crate) fn run(&self) -> Range<usize> {
+        self.run.clone()
+    }
+
+    /// Key ranges its merge is cut into.
+    pub(crate) fn ranges(&self) -> usize {
+        self.ranges
+    }
+}
+
+/// Memory a fold holds per input layer and key range: a tier read window
+/// and a decoded batch of terms, with room for long runs in merged layers.
+const FOLD_CURSOR_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Memory each key range of a fold holds besides its cursors: the slice and
+/// tier it is writing, and a batch of entries being encoded.
+const FOLD_RANGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Memory a fold holds whatever its shape: the key marks it cuts ranges at
+/// and the objects being downloaded.
+const FOLD_FIXED_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Memory an optimize fold is planned in when the host reports none.
+const FOLD_FALLBACK_MEMORY_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Cursors an optimize fold opens at most when the host reports no limit
+/// on open files or mappings: each holds a tier file and a mapped slice.
+const FOLD_FALLBACK_CURSORS: usize = 16 * 1024;
+
+/// Share of the process's open-file and mapping limits one fold's cursors
+/// may take, so queries and writes running beside it keep theirs.
+const FOLD_CURSOR_LIMIT_SHARE: usize = 4;
+
+/// Layers one optimize fold of a run reads at most: the merge keeps its
+/// speed per byte up to about this many and slows past it.
+const FOLD_LAYERS_MAX: usize = 512;
+
+/// Layers a fold aims to read before it narrows its key ranges, so a tight
+/// budget still folds in a few passes.
+const FOLD_LAYERS_TARGET: usize = 64;
+
+/// What a fold's fixed costs (its root publish and object round trips)
+/// weigh against the bytes it reads, when optimize picks between runs.
+const FOLD_OVERHEAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What one optimize fold may use: bytes of memory, the key ranges the
+/// writer pool can merge at once, and cursors (one per layer it reads and
+/// key range, each an open file and a mapping).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FoldBudget {
+    pub(crate) memory_bytes: u64,
+    pub(crate) ranges: usize,
+    pub(crate) cursors: usize,
+}
+
+impl FoldBudget {
+    /// Three quarters of the memory the process may still take (the
+    /// cgroup's room where it has a limit), at the pool's width, with a
+    /// share of the open-file and mapping limits.
+    pub(crate) fn for_host(pool_threads: usize) -> Self {
+        let available = available_memory_bytes().unwrap_or(FOLD_FALLBACK_MEMORY_BYTES);
+        let cursors = cursor_limit().map_or(FOLD_FALLBACK_CURSORS, |limit| {
+            limit / FOLD_CURSOR_LIMIT_SHARE
+        });
+        Self {
+            memory_bytes: available / 4 * 3,
+            ranges: pool_threads,
+            cursors,
+        }
+    }
+
+    /// Memory a fold reading `layers` layers in `ranges` key ranges is
+    /// planned to hold.
+    pub(crate) fn fold_bytes(layers: usize, ranges: usize) -> u64 {
+        (layers as u64)
+            .saturating_mul(ranges as u64)
+            .saturating_mul(FOLD_CURSOR_BYTES)
+            .saturating_add((ranges as u64).saturating_mul(FOLD_RANGE_BYTES))
+            .saturating_add(FOLD_FIXED_BYTES)
+    }
+
+    /// The most layers one fold reads, and its key ranges: the pool's
+    /// width, narrowed until [`FOLD_LAYERS_TARGET`] layers fit in memory and
+    /// cursors, or failing that [`FOLD_FAN_OUT`]. A fold of the fan-out in
+    /// one range runs whatever the budget, as small as a commit's fold.
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        let layers_at = |ranges: usize| {
+            let fixed = FoldBudget::fold_bytes(0, ranges);
+            let room = self.memory_bytes.saturating_sub(fixed);
+            let by_memory = (room / (ranges as u64 * FOLD_CURSOR_BYTES)) as usize;
+            by_memory.min(self.cursors / ranges)
+        };
+        let widest = self.ranges.clamp(1, MERGE_RANGES_MAX);
+        let widest_holding = |layers: usize| (1..=widest).rev().find(|&r| layers_at(r) >= layers);
+        let ranges = widest_holding(FOLD_LAYERS_TARGET)
+            .or_else(|| widest_holding(FOLD_FAN_OUT))
+            .unwrap_or(1);
+        (layers_at(ranges).max(FOLD_FAN_OUT), ranges)
+    }
+}
+
+/// The lower of the process's open-file soft limit and the host's mapping
+/// limit, `None` where neither is readable.
+fn cursor_limit() -> Option<usize> {
+    let files = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|limits| {
+            limits
+                .lines()
+                .find(|line| line.starts_with("Max open files"))?
+                .split_whitespace()
+                .nth(3)?
+                .parse::<usize>()
+                .ok()
+        });
+    let maps = std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .ok()
+        .and_then(|count| count.trim().parse::<usize>().ok());
+    files.into_iter().chain(maps).min()
 }
 
 /// The fold optimize makes of `root` next, or `None` when it makes none.
 ///
-/// When `renumber` allows it, at least half of the root's list is dead —
-/// padding, superfiles `live` does not hold, a superfile's later listings —
-/// and its layers fit in `max_bytes` together, every layer folds into one
-/// and the live superfiles are numbered afresh, in the root's order. That
-/// is the only fold that shortens the list: an ordinal names postings in
-/// every layer, so it can change only when every layer is rewritten.
-/// Waiting until half the list is dead keeps that rewrite to once per
-/// doubling of the list.
+/// A fold reads at most the layers `budget` holds in memory and cursors
+/// ([`FoldBudget::shape`]), at most `max_bytes` of them together (the
+/// scratch space the fold downloads into). A layer whose every superfile
+/// is dead counts toward neither: the fold drops it unread. Among the runs
+/// that fit, it takes the one [`fold_window`] picks, so layers of like size
+/// fold together and a fold's output is not read again until the layers
+/// beside it have grown to its size.
 ///
-/// Otherwise, when some layer holds a slice of the layout before tiers
-/// (`before_tiers`) and the layers fit in `max_bytes`
-/// together, every layer folds into one: the old layout's postings are
-/// written in the current one, bounds as keys, in runs beside the other
-/// superfiles' heads, so a term's tier serves. Left as they are, they serve
-/// ceilings and no tier. Failing that, the run [`fold_run`] picks among
-/// all the layers, of at most `max_bytes` together, the bound a compaction
-/// merge keeps to. A commit's fold stops at one slice to keep the commit
-/// quick; this takes the larger runs it leaves. The run's dead postings
-/// are dropped, but their ordinals stay in the list, so no layer outside
-/// the run is rewritten.
+/// A fold of every layer numbers the live superfiles afresh when `renumber`
+/// allows it and some are dead: it rewrites every layer it keeps anyway,
+/// and an ordinal names postings in every layer, so only then can the list
+/// shrink. When `renumber` allows it and at least half of the list is dead
+/// (padding, superfiles `live` does not hold, a superfile's later
+/// listings), every layer folds into one even if their sizes differ, once
+/// the budget holds them all. When some layer holds a slice of the layout
+/// before tiers (`before_tiers`) and the budget holds every layer, every
+/// layer folds into one, so the old layout's postings are written in the
+/// current one. A fold that does not renumber drops its run's dead
+/// postings but keeps their ordinals, so no layer outside the run is
+/// rewritten.
 pub(crate) fn plan_fold_at_optimize(
     root: &Root,
     live: &HashSet<Uuid>,
     max_bytes: u64,
+    budget: FoldBudget,
     renumber: bool,
     before_tiers: bool,
 ) -> Option<OptimizeFold> {
+    let (max_layers, ranges) = budget.shape();
     let mut claimed: HashSet<Uuid> = HashSet::new();
     let kept: Vec<bool> = root
         .superfiles
@@ -833,23 +959,42 @@ pub(crate) fn plan_fold_at_optimize(
         .map(|id| live.contains(id) && claimed.insert(*id))
         .collect();
     let dead = kept.iter().filter(|keep| !**keep).count();
-    let bytes = root
+    let ordinals: Vec<Option<u32>> = kept
+        .iter()
+        .enumerate()
+        .map(|(i, &keep)| keep.then_some(i as u32))
+        .collect();
+    let costs: Vec<FoldCost> = root
         .layers
         .iter()
-        .map(layer_bytes)
-        .fold(0u64, |sum, size| sum.saturating_add(size));
-    if renumber
-        && !root.layers.is_empty()
-        && dead > 0
-        && 2 * dead >= kept.len()
-        && bytes <= max_bytes
-    {
+        .map(|layer| match layer_keeps_postings(layer, &ordinals) {
+            true => FoldCost {
+                bytes: layer_bytes(layer),
+                read: true,
+            },
+            false => FoldCost {
+                bytes: 0,
+                read: false,
+            },
+        })
+        .collect();
+    let n = root.layers.len();
+    let whole = FoldCost::sum(&costs);
+    let whole_fits = n > 0 && whole.0 <= max_layers && whole.1 <= max_bytes;
+    let mostly_dead = dead > 0 && 2 * dead >= kept.len();
+    let run = match (whole_fits && ((renumber && mostly_dead) || before_tiers), n) {
+        (true, _) => 0..n,
+        (false, 0..=1) => return None,
+        (false, _) => fold_window(&costs, max_layers.min(FOLD_LAYERS_MAX), max_bytes)?,
+    };
+    if renumber && dead > 0 && run == (0..n) {
         let mut fold = OptimizeFold {
-            run: 0..root.layers.len(),
+            run,
             ordinals: Vec::with_capacity(kept.len()),
             superfiles: Vec::new(),
             id_mins: Vec::new(),
             renumbers: true,
+            ranges,
         };
         for ((&keep, id), id_min) in kept.iter().zip(&root.superfiles).zip(&root.id_mins) {
             fold.ordinals
@@ -861,21 +1006,82 @@ pub(crate) fn plan_fold_at_optimize(
         }
         return Some(fold);
     }
-    let run = match before_tiers && bytes <= max_bytes {
-        true => 0..root.layers.len(),
-        false => fold_run_at_optimize(&root.layers, max_bytes)?,
-    };
+    // A lone layer folds only to renumber or to leave the old layout.
+    if run.len() < 2 && !before_tiers {
+        return None;
+    }
     Some(OptimizeFold {
         run,
-        ordinals: kept
-            .iter()
-            .enumerate()
-            .map(|(i, &keep)| keep.then_some(i as u32))
-            .collect(),
+        ordinals,
         superfiles: root.superfiles.clone(),
         id_mins: root.id_mins.clone(),
         renumbers: false,
+        ranges,
     })
+}
+
+/// What one layer adds to a fold: its slice bytes, and whether the fold
+/// reads it (a layer of dead superfiles only is dropped unread).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FoldCost {
+    bytes: u64,
+    read: bool,
+}
+
+impl FoldCost {
+    /// The layers read and the bytes of `costs` together.
+    fn sum(costs: &[FoldCost]) -> (usize, u64) {
+        costs.iter().fold((0, 0u64), |(read, bytes), cost| {
+            (
+                read + usize::from(cost.read),
+                bytes.saturating_add(cost.bytes),
+            )
+        })
+    }
+}
+
+/// The run of layers optimize folds next: among runs of consecutive layers
+/// reading at most `max_layers` and `max_bytes` together, whose largest
+/// layer holds no more than the others together, the one that removes the
+/// most layers per byte it reads, a fold's fixed cost counted as
+/// [`FOLD_OVERHEAD_BYTES`]; the longest among equals. A run holds at least
+/// [`FOLD_FAN_OUT`] layers, or `max_layers` when that is fewer, so the few
+/// layers commits append call for no write. `None` when no run qualifies.
+///
+/// This is size-tiered merging: long runs of small layers fold first, a
+/// large layer is read again only once the layers beside it match it, and
+/// layers of dead superfiles, read for nothing, ride along with any fold.
+fn fold_window(costs: &[FoldCost], max_layers: usize, max_bytes: u64) -> Option<Range<usize>> {
+    let shortest = FOLD_FAN_OUT.min(max_layers).max(2);
+    // (layers removed, bytes weighed) of the best run so far.
+    let mut best: Option<((u128, u128), Range<usize>)> = None;
+    for start in 0..costs.len() {
+        let (mut read, mut total, mut largest) = (0usize, 0u64, 0u64);
+        for (end, cost) in costs.iter().enumerate().skip(start) {
+            read += usize::from(cost.read);
+            total = total.saturating_add(cost.bytes);
+            if read > max_layers || total > max_bytes {
+                break;
+            }
+            largest = largest.max(cost.bytes);
+            let len = end + 1 - start;
+            if len < shortest || largest > total - largest {
+                continue;
+            }
+            let score = (
+                (len - 1) as u128,
+                (total as u128) + FOLD_OVERHEAD_BYTES as u128,
+            );
+            let better = best.as_ref().is_none_or(|((removed, weight), run)| {
+                let (lhs, rhs) = (score.0 * weight, removed * score.1);
+                lhs > rhs || (lhs == rhs && len > run.len())
+            });
+            if better {
+                best = Some((score, start..end + 1));
+            }
+        }
+    }
+    best.map(|(_, run)| run)
 }
 
 /// `root` with `fold` made: its run merged into one layer on `pool`,
@@ -895,6 +1101,10 @@ pub(crate) async fn fold_at_optimize(
     if fold.superfiles.is_empty() {
         return Ok(Root::default());
     }
+    let policy = &BuildPolicy {
+        merge_ranges: Some(fold.ranges),
+        ..policy.clone()
+    };
     let run = &root.layers[fold.run.clone()];
     // A layer whose every posting survives, renumbered by one shift, is
     // already what merging would make of it, and merging it in rewrites
@@ -1115,46 +1325,6 @@ fn fold_run(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
                 .fold(0u64, |sum, &size| sum.saturating_add(size));
             if bytes <= bound {
                 return Some(run);
-            }
-            first += FOLD_FAN_OUT;
-        }
-        start = end;
-    }
-    None
-}
-
-/// The longest run of consecutive `layers` of one size level that fit in
-/// `bound` together, at least [`FOLD_FAN_OUT`] of them; `None` when no such
-/// run exists. A commit's fold takes exactly [`FOLD_FAN_OUT`] layers to stay
-/// quick ([`fold_run`]); optimize is maintenance and can take a whole level
-/// at once, so a root of fifty layers folds in one or two passes instead of
-/// one pass per eight, each pass reading its layers from storage and
-/// publishing a root. Grouped by level like [`fold_run`], so a fold still
-/// merges layers of about one size.
-fn fold_run_at_optimize(layers: &[Layer], bound: u64) -> Option<Range<usize>> {
-    let sizes: Vec<u64> = layers.iter().map(layer_bytes).collect();
-    let levels: Vec<f64> = layers.iter().map(layer_level).collect();
-    let mut start = 0;
-    while start < layers.len() {
-        let top = levels[start..]
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        let end = 1
-            + (start..layers.len())
-                .rev()
-                .find(|&i| levels[i] >= top - FOLD_LEVEL_SPAN)?;
-        let mut first = start;
-        while first + FOLD_FAN_OUT <= end {
-            // Grow the run from `first` while the bytes allow.
-            let mut last = first;
-            let mut bytes = 0u64;
-            while last < end && bytes.saturating_add(sizes[last]) <= bound {
-                bytes = bytes.saturating_add(sizes[last]);
-                last += 1;
-            }
-            if last - first >= FOLD_FAN_OUT {
-                return Some(first..last);
             }
             first += FOLD_FAN_OUT;
         }
@@ -7487,11 +7657,19 @@ mod tests {
             .filter(|id| *id != removed)
             .collect();
         assert!(
-            plan_fold_at_optimize(&root, &live, run_bytes - 1, true, false).is_none(),
-            "a run past the bound waits"
+            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), false, false)
+                .is_none(),
+            "a run past the byte bound waits"
         );
-        let fold =
-            plan_fold_at_optimize(&root, &live, run_bytes, true, false).expect("a fold is due");
+        let fold = plan_fold_at_optimize(
+            &root,
+            &live,
+            run_bytes,
+            budget_for(FOLD_FAN_OUT),
+            false,
+            false,
+        )
+        .expect("a fold is due");
         let listed = root.superfiles.clone();
 
         let root = fold_at_optimize(&local, &root, fold, &policy, None)
@@ -7499,7 +7677,17 @@ mod tests {
             .expect("fold");
 
         assert_eq!(root.layers.len(), 1, "the run folds into one layer");
-        assert!(plan_fold_at_optimize(&root, &live, run_bytes, true, false).is_none());
+        assert!(
+            plan_fold_at_optimize(
+                &root,
+                &live,
+                run_bytes,
+                budget_for(FOLD_FAN_OUT),
+                false,
+                false
+            )
+            .is_none()
+        );
         assert_eq!(root.superfiles, listed, "ordinals are untouched");
         let expected: Vec<Uuid> = (1..=commits)
             .map(Uuid::from_u128)
@@ -7532,7 +7720,7 @@ mod tests {
     /// Once at least half of the root's list is dead, optimize folds every
     /// layer into one and numbers the live superfiles afresh, so the list
     /// shrinks to them and every live term routes as before. An index past
-    /// the bound is not renumbered, and its run waits.
+    /// the byte bound is neither renumbered nor folded.
     #[tokio::test]
     async fn optimize_renumbers_a_mostly_dead_root_into_one_layer() {
         let dir = TempDir::new().expect("tempdir");
@@ -7550,17 +7738,31 @@ mod tests {
         let kept: Vec<Uuid> = (1..=LIVE_AFTER_REMOVALS).map(Uuid::from_u128).collect();
         let live: HashSet<Uuid> = kept.iter().copied().collect();
         assert!(
-            plan_fold_at_optimize(&root, &live, index_bytes - 1, true, false).is_none(),
-            "an index past the bound is neither renumbered nor folded"
+            plan_fold_at_optimize(&root, &live, 1, budget_for(FOLD_FAN_OUT), true, false).is_none(),
+            "an index past the byte bound is neither renumbered nor folded"
         );
-        let run =
-            plan_fold_at_optimize(&root, &live, index_bytes, false, false).expect("a run is due");
+        let run = plan_fold_at_optimize(
+            &root,
+            &live,
+            index_bytes,
+            budget_for(FOLD_FAN_OUT),
+            false,
+            false,
+        )
+        .expect("a run is due");
         assert!(
             !run.renumbers(),
             "without leave to renumber, the run folds alone"
         );
-        let fold =
-            plan_fold_at_optimize(&root, &live, index_bytes, true, false).expect("a fold is due");
+        let fold = plan_fold_at_optimize(
+            &root,
+            &live,
+            index_bytes,
+            budget_for(FOLD_FAN_OUT),
+            true,
+            false,
+        )
+        .expect("a fold is due");
         assert!(fold.renumbers());
         assert_eq!(
             fold.superfiles(),
@@ -7577,7 +7779,17 @@ mod tests {
             root.superfiles, kept,
             "the list holds the live superfiles alone"
         );
-        assert!(plan_fold_at_optimize(&root, &live, index_bytes, true, false).is_none());
+        assert!(
+            plan_fold_at_optimize(
+                &root,
+                &live,
+                index_bytes,
+                budget_for(FOLD_FAN_OUT),
+                true,
+                false
+            )
+            .is_none()
+        );
         assert_eq!(posted_superfiles(&root, &local, "shared").await, kept);
         for id in 2..=commits {
             let expected: Vec<Uuid> = match id <= LIVE_AFTER_REMOVALS {
@@ -7744,6 +7956,7 @@ mod tests {
             superfiles: ids[4..].to_vec(),
             id_mins: (5..=7).collect(),
             renumbers: true,
+            ranges: 1,
         };
         // Sizes in slices of the policy's target: a layer under one slice
         // is merged whatever its share.
@@ -7814,24 +8027,195 @@ mod tests {
         assert_eq!(shifted_whole(&layer(slice, 4, 4..7), &uneven), None);
     }
 
+    /// Each of `layers` as a fold reads it.
+    fn read_costs(layers: &[Layer]) -> Vec<FoldCost> {
+        layers
+            .iter()
+            .map(|layer| FoldCost {
+                bytes: layer_bytes(layer),
+                read: true,
+            })
+            .collect()
+    }
+
     #[test]
     fn an_optimize_fold_takes_a_whole_level_where_a_commit_fold_takes_eight() {
         // Fifty-two layers of one size level, as a commit-heavy table leaves
         // behind: a commit's fold takes the first eight; optimize takes them
-        // all while the bytes allow, and only eight at a time once they
-        // don't.
+        // all while the bytes and layers allow, and fewer once they don't.
         let layers: Vec<Layer> = (0..52).map(|_| sized_layer(1 << 20)).collect();
+        let costs = read_costs(&layers);
         assert_eq!(fold_run(&layers, 1 << 40), Some(0..FOLD_FAN_OUT));
-        assert_eq!(fold_run_at_optimize(&layers, 1 << 40), Some(0..52));
-        // A bound of twenty layers' bytes: the run stops there.
-        assert_eq!(fold_run_at_optimize(&layers, 20 << 20), Some(0..20));
+        assert_eq!(fold_window(&costs, usize::MAX, 1 << 40), Some(0..52));
+        // A bound of twenty layers' bytes, or of twenty layers: the run stops there.
+        assert_eq!(fold_window(&costs, usize::MAX, 20 << 20), Some(0..20));
+        assert_eq!(fold_window(&costs, 20, 1 << 40), Some(0..20));
         // Fewer than a fan-out's worth within the bound: nothing to fold here.
-        assert_eq!(fold_run_at_optimize(&layers, 3 << 20), None);
-        // Two size levels: the run stays within the larger level's span and
-        // does not cross into the small layers behind it.
+        assert_eq!(fold_window(&costs, usize::MAX, 3 << 20), None);
+        // Two size levels: the small layers fold among themselves first.
         let mut mixed: Vec<Layer> = (0..10).map(|_| sized_layer(1 << 30)).collect();
         mixed.extend((0..10).map(|_| sized_layer(1 << 10)));
-        assert_eq!(fold_run_at_optimize(&mixed, 1 << 40), Some(0..10));
+        assert_eq!(
+            fold_window(&read_costs(&mixed), usize::MAX, 1 << 40),
+            Some(10..20)
+        );
+    }
+
+    /// A budget that holds a fold of `layers` layers in one key range.
+    fn budget_for(layers: usize) -> FoldBudget {
+        FoldBudget {
+            memory_bytes: FoldBudget::fold_bytes(layers, 1),
+            ranges: 1,
+            cursors: usize::MAX,
+        }
+    }
+
+    /// Folds `sizes` the way optimize's passes would, one window at a time,
+    /// and returns the layers left and the bytes read.
+    fn fold_sizes(mut sizes: Vec<u64>, max_layers: usize) -> (Vec<u64>, u64) {
+        let mut read = 0u64;
+        loop {
+            let costs: Vec<FoldCost> = sizes
+                .iter()
+                .map(|&bytes| FoldCost { bytes, read: true })
+                .collect();
+            let Some(run) = fold_window(&costs, max_layers, u64::MAX) else {
+                return (sizes, read);
+            };
+            let merged: u64 = sizes[run.clone()].iter().sum();
+            read += merged;
+            sizes.splice(run, [merged]);
+        }
+    }
+
+    /// Layers of a 100B-row load fold in a few rounds to fewer than the
+    /// fan-out, each byte read at most three times, whether they start as
+    /// the load left them or as one large layer then seven small ones.
+    #[test]
+    fn optimize_folds_a_large_index_to_a_few_layers_in_a_few_rounds() {
+        const SMALL: u64 = 107_000_000;
+        let loaded = vec![SMALL; 11_209];
+        let total: u64 = loaded.iter().sum();
+        let (left, read) = fold_sizes(loaded, 254);
+        assert!(left.len() < FOLD_FAN_OUT, "{} layers left", left.len());
+        assert!(read <= 3 * total, "read {read} of {total}");
+
+        let mut locked = Vec::new();
+        for _ in 0..135 {
+            locked.push(2_500_000_000);
+            locked.extend([SMALL; 7]);
+        }
+        let total: u64 = locked.iter().sum();
+        let (left, read) = fold_sizes(locked, 254);
+        assert!(left.len() < FOLD_FAN_OUT, "{} layers left", left.len());
+        assert!(read <= 3 * total, "read {read} of {total}");
+    }
+
+    /// A layer larger than the others together stays out of their fold,
+    /// and layers the fold drops unread count toward no bound.
+    #[test]
+    fn optimize_leaves_a_large_layer_out_and_counts_only_layers_it_reads() {
+        let costs = |sizes: &[u64]| -> Vec<FoldCost> {
+            sizes
+                .iter()
+                .map(|&bytes| FoldCost { bytes, read: true })
+                .collect()
+        };
+        let mut sizes = vec![1000];
+        sizes.extend([10; 9]);
+        assert_eq!(fold_window(&costs(&sizes), 64, u64::MAX), Some(1..10));
+        assert_eq!(
+            fold_window(&costs(&[1000, 10, 10, 10, 10, 10, 10, 10]), 64, u64::MAX),
+            None,
+            "a few small layers beside a large one wait"
+        );
+        assert_eq!(
+            fold_window(&costs(&[10; 4]), 3, u64::MAX),
+            Some(0..3),
+            "at most the budget's layers"
+        );
+        let mut dead_then_live = vec![
+            FoldCost {
+                bytes: 0,
+                read: false
+            };
+            20
+        ];
+        dead_then_live.extend(costs(&[10; 3]));
+        assert_eq!(
+            fold_window(&dead_then_live, 3, u64::MAX),
+            Some(0..23),
+            "dead layers ride free"
+        );
+    }
+
+    /// A tight budget narrows the key ranges before it folds fewer than
+    /// the target's layers; a wide one is capped at the merge's widest; few
+    /// open files bound the layers as memory does; the fan-out always folds.
+    #[test]
+    fn fold_budget_narrows_ranges_before_layers() {
+        let tight = FoldBudget {
+            memory_bytes: FoldBudget::fold_bytes(FOLD_LAYERS_TARGET, 4),
+            ranges: 32,
+            cursors: usize::MAX,
+        };
+        assert_eq!(tight.shape(), (FOLD_LAYERS_TARGET, 4));
+        let wide = FoldBudget {
+            memory_bytes: FoldBudget::fold_bytes(1000, MERGE_RANGES_MAX),
+            ranges: 88,
+            cursors: usize::MAX,
+        };
+        assert_eq!(wide.shape(), (1000, MERGE_RANGES_MAX));
+        let few_files = FoldBudget {
+            cursors: 64 * MERGE_RANGES_MAX,
+            ..wide
+        };
+        assert_eq!(few_files.shape(), (64, MERGE_RANGES_MAX));
+        assert_eq!(
+            budget_for(1).shape(),
+            (FOLD_FAN_OUT, 1),
+            "a fold of the fan-out runs whatever the budget"
+        );
+    }
+
+    /// A root of `layers` layers with no slices over superfiles 1..=`superfiles`.
+    fn bare_root(layers: usize, superfiles: u128) -> Root {
+        Root {
+            superfiles: (1..=superfiles).map(Uuid::from_u128).collect(),
+            id_mins: vec![0; superfiles as usize],
+            layers: vec![Layer::default(); layers],
+        }
+    }
+
+    /// A fold of every layer renumbers once any superfile is dead, and a
+    /// lone layer of the layout before tiers is still rewritten.
+    #[test]
+    fn optimize_renumbers_a_whole_fold_and_rewrites_a_lone_old_layer() {
+        let root = bare_root(FOLD_FAN_OUT, 8);
+        let live: HashSet<Uuid> = (2..=8).map(Uuid::from_u128).collect();
+        let fold = plan_fold_at_optimize(
+            &root,
+            &live,
+            u64::MAX,
+            budget_for(FOLD_FAN_OUT),
+            true,
+            false,
+        )
+        .expect("a fold is due");
+        assert_eq!(fold.run(), 0..FOLD_FAN_OUT);
+        assert!(
+            fold.renumbers(),
+            "one dead superfile, every layer rewritten"
+        );
+
+        let lone = bare_root(1, 2);
+        let all: HashSet<Uuid> = lone.superfiles.iter().copied().collect();
+        assert!(
+            plan_fold_at_optimize(&lone, &all, u64::MAX, budget_for(2), false, false).is_none()
+        );
+        let fold = plan_fold_at_optimize(&lone, &all, u64::MAX, budget_for(2), false, true)
+            .expect("the old layout is rewritten");
+        assert_eq!(fold.run(), 0..1);
     }
 
     /// A root listing `ids` (each its own `id_min`; `0` is padding) over

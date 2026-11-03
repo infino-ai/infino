@@ -2299,7 +2299,7 @@ const MERGE_RANGE_MIN_BYTES: u64 = 64 * 1024 * 1024;
 /// Ranges a merge is cut into at most: each holds a cursor per layer
 /// with a slice's bytes and a few tier windows resident, so the width is
 /// bounded by memory as well as by threads.
-const MERGE_RANGES_MAX: usize = 32;
+pub(crate) const MERGE_RANGES_MAX: usize = 32;
 
 /// Whether `slice` holds a key in `start..end`.
 fn slice_reaches(slice: &SliceFile, start: Option<&[u8]>, end: Option<&[u8]>) -> bool {
