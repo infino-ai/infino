@@ -23,7 +23,10 @@ use std::{
     mem,
     ops::Range,
     str::from_utf8,
-    sync::{Arc, Mutex, PoisonError, mpsc::sync_channel},
+    sync::{
+        Arc, Mutex, PoisonError,
+        mpsc::{channel, sync_channel},
+    },
     thread,
     time::{Duration, Instant},
     vec,
@@ -44,8 +47,19 @@ use crate::{
 /// Terms each input cursor reads from its dictionary at a time.
 pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 
-/// Batches the dictionary walk gathers ahead of the one being merged.
-const BATCHES_AHEAD: usize = 1;
+/// Key ranges a large column's dictionaries are walked in, side by side.
+/// The walk is a heap over every input's cursor, one term at a time, and on
+/// a merge of 68 inputs and 9M terms it ran 11 s on its one thread while the
+/// encodes it fed took 7: the finish waited on it. Each range's walk runs
+/// on a thread of its own, and its batches are taken in range order, so the
+/// terms are written in the same order. A later range's batches wait whole
+/// until the ranges before them are taken: they hold the terms and their
+/// inputs' dictionary values, not postings, about a hundred bytes a term.
+const WALK_RANGES: usize = 4;
+
+/// Terms a column's sampled input must hold before its walk is split into
+/// [`WALK_RANGES`]: a small merge walks in one range as before.
+const WALK_SPLIT_MIN_TERMS: usize = if cfg!(test) { 8 } else { 1 << 16 };
 
 /// Encoded batches the writer may fall behind the encodes by. One keeps
 /// a batch's writes beside the next batch's encodes, which is the whole
@@ -109,22 +123,14 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .iter()
         .map(|input| input.reader.fts().ok_or(BuildError::BatchReadError))
         .collect::<Result<Vec<_>, _>>()?;
-    let mut cursors: Vec<TermChunks> = readers
+    // Each input's dictionary, fetched once and shared by every range's
+    // cursor: on a lazy source each fetch is a full-dictionary read.
+    let dicts = readers
         .iter()
-        .map(|fts| TermChunks::new(fts, column_id))
-        .collect::<Result<_, _>>()
+        .map(|fts| fts.dict_bytes())
+        .collect::<Result<Vec<_>, _>>()
         .map_err(read_error)?;
-
-    // Min-heap of each input's current term; ties pop in input order.
-    let mut heap = BinaryHeap::new();
-    let mut values = Vec::with_capacity(inputs.len());
-    for (i, cursor) in cursors.iter_mut().enumerate() {
-        let next = cursor.next().map_err(read_error)?;
-        values.push(next.as_ref().map(|(_, value)| *value));
-        if let Some((term, _)) = next {
-            heap.push(Reverse((term, i)));
-        }
-    }
+    let ranges = walk_ranges(&readers, &dicts, column_id)?;
 
     let work = BatchWork {
         readers: &readers,
@@ -134,11 +140,16 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         new_state: &new_state,
         encode: &encode,
     };
-    // The walk over the dictionaries runs a batch ahead on a thread of its
-    // own, so the next batch is gathered while this one is merged and
-    // written. Batches arrive in the order they were walked, so the terms are
-    // written in the same order.
-    let (sender, walked) = sync_channel::<Result<Batch, BuildError>>(BATCHES_AHEAD);
+    // The walk over the dictionaries runs ahead on threads of its own, one
+    // per key range, so the next batch is gathered while this one is merged
+    // and written. A range's walk runs on without bound, since nothing takes
+    // a later range's batches until the ranges before it are done; a batch
+    // holds terms and dictionary values, not postings. Batches are taken
+    // range by range in the order they were walked, so the terms are
+    // written in order.
+    let (senders, receivers): (Vec<_>, Vec<_>) = (0..ranges.len())
+        .map(|_| channel::<Result<Batch, BuildError>>())
+        .unzip();
     // Three stages on three threads: the walk gathers batches, this thread
     // dispatches each batch's encodes to the pool, and the writer writes
     // the encoded terms out in order, a batch behind. Where this thread's
@@ -147,15 +158,18 @@ pub(crate) fn merge_column<S: Send, T: Send>(
     let (mut waited, mut encoded, mut written) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let (encoded_tx, encoded_rx) = sync_channel::<(Batch, Vec<Option<T>>)>(ENCODED_BATCHES_AHEAD);
     thread::scope(|scope| -> Result<(), BuildError> {
-        let readers = &readers;
-        scope.spawn(move || {
-            let walk = walk_batches(readers, &mut cursors, &mut heap, &mut values, |batch| {
-                sender.send(Ok(batch)).is_ok()
+        let (readers, dicts) = (&readers, &dicts);
+        for ((start, end), sender) in ranges.into_iter().zip(senders) {
+            scope.spawn(move || {
+                let walk = walk_range(readers, dicts, column_id, start, end, |batch| {
+                    sender.send(Ok(batch)).is_ok()
+                });
+                if let Err(e) = walk {
+                    let _ = sender.send(Err(e));
+                }
             });
-            if let Err(e) = walk {
-                let _ = sender.send(Err(e));
-            }
-        });
+        }
+        let mut walked = receivers.into_iter().flatten();
         let writer = scope.spawn(move || -> Result<Duration, BuildError> {
             let mut written = Duration::ZERO;
             for (batch, merged) in encoded_rx {
@@ -167,7 +181,7 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         });
         loop {
             let started = Instant::now();
-            let Ok(batch) = walked.recv() else {
+            let Some(batch) = walked.next() else {
                 break;
             };
             waited += started.elapsed();
@@ -202,6 +216,76 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         .collect())
 }
 
+/// A key range of a column's walk: from `start` (none: the first term)
+/// up to but not including `end` (none: past the last).
+type WalkRange = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// The key ranges a column's walk runs in: [`WALK_RANGES`] cut at even
+/// quantiles of the largest input's terms, or one when that input is small.
+fn walk_ranges(
+    readers: &[&FtsReader],
+    dicts: &[Bytes],
+    column_id: u32,
+) -> Result<Vec<WalkRange>, BuildError> {
+    let Some(largest) = (0..readers.len()).max_by_key(|&i| dicts[i].len()) else {
+        return Ok(vec![(None, None)]);
+    };
+    let mut cursor = TermChunks::new(
+        readers[largest],
+        dicts[largest].clone(),
+        column_id,
+        None,
+        None,
+    );
+    let mut terms: Vec<Vec<u8>> = Vec::new();
+    while let Some((term, _)) = cursor.next().map_err(read_error)? {
+        terms.push(term);
+    }
+    if terms.len() < WALK_SPLIT_MIN_TERMS {
+        return Ok(vec![(None, None)]);
+    }
+    let cuts: Vec<Vec<u8>> = (1..WALK_RANGES)
+        .map(|r| terms[terms.len() * r / WALK_RANGES].clone())
+        .collect();
+    let mut ranges = Vec::with_capacity(WALK_RANGES);
+    let mut start = None;
+    for cut in cuts {
+        ranges.push((start.take(), Some(cut.clone())));
+        start = Some(cut);
+    }
+    ranges.push((start, None));
+    Ok(ranges)
+}
+
+/// Walk the terms of `start..end` across every input, in term order,
+/// gathering them into batches for `emit`.
+fn walk_range(
+    readers: &[&FtsReader],
+    dicts: &[Bytes],
+    column_id: u32,
+    start: Option<Vec<u8>>,
+    end: Option<Vec<u8>>,
+    emit: impl FnMut(Batch) -> bool,
+) -> Result<(), BuildError> {
+    let mut cursors: Vec<TermChunks> = readers
+        .iter()
+        .zip(dicts)
+        .map(|(fts, dict)| {
+            TermChunks::new(fts, dict.clone(), column_id, start.clone(), end.clone())
+        })
+        .collect();
+    // Min-heap of each input's current term; ties pop in input order.
+    let mut heap = BinaryHeap::new();
+    let mut values = Vec::with_capacity(readers.len());
+    for (i, cursor) in cursors.iter_mut().enumerate() {
+        let next = cursor.next().map_err(read_error)?;
+        values.push(next.as_ref().map(|(_, value)| *value));
+        if let Some((term, _)) = next {
+            heap.push(Reverse((term, i)));
+        }
+    }
+    walk_batches(readers, &mut cursors, &mut heap, &mut values, emit)
+}
 /// Walk the inputs' dictionaries in term order, gathering terms into
 /// batches and handing each to `emit` in order; the last, possibly empty,
 /// batch too. Stops early once `emit` returns false.
@@ -509,28 +593,45 @@ struct TermChunks<'a> {
     dict_bytes: Bytes,
     column_id: u32,
     chunk: vec::IntoIter<(Vec<u8>, DictEntry)>,
-    /// Last term of the latest chunk; the next chunk starts after it.
+    /// Last term of the latest chunk; the next chunk starts after it. Before
+    /// the first chunk, the range's first key.
     resume: Vec<u8>,
+    /// The first term past the range, if it ends before the dictionary.
+    end: Option<Vec<u8>>,
     started: bool,
     done: bool,
 }
 
 impl<'a> TermChunks<'a> {
-    fn new(fts: &'a FtsReader, column_id: u32) -> Result<Self, FtsError> {
-        Ok(Self {
+    /// A cursor over the column's terms from `start` (none: the first) up
+    /// to but not including `end` (none: the last).
+    fn new(
+        fts: &'a FtsReader,
+        dict_bytes: Bytes,
+        column_id: u32,
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
             fts,
-            dict_bytes: fts.dict_bytes()?,
+            dict_bytes,
             column_id,
             chunk: Vec::new().into_iter(),
-            resume: Vec::new(),
+            resume: start.unwrap_or_default(),
+            end,
             started: false,
             done: false,
-        })
+        }
     }
 
     fn next(&mut self) -> Result<Option<(Vec<u8>, DictEntry)>, FtsError> {
         loop {
             if let Some(entry) = self.chunk.next() {
+                if self.end.as_ref().is_some_and(|end| entry.0 >= *end) {
+                    self.done = true;
+                    self.chunk = Vec::new().into_iter();
+                    return Ok(None);
+                }
                 return Ok(Some(entry));
             }
             if self.done {
