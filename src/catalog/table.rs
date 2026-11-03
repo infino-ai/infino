@@ -421,7 +421,8 @@ impl Supertable {
     /// literal `true`, which counts every live row; every superfile it keeps
     /// must carry that column's index. A predicate is simplified first, so a
     /// `1 = 1 AND price > 500` counts as `price > 500`. Otherwise the counts
-    /// run as one aggregate, and the answer is the same either way.
+    /// run as one aggregate (a predicate holding a subquery as a statement
+    /// of its own), and the answer is the same either way.
     ///
     /// ```
     /// # use std::sync::Arc;

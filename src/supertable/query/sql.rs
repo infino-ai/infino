@@ -62,7 +62,7 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, DFSchema, ScalarValue},
+    common::{Column, DFSchema, ScalarValue, tree_node::TreeNode},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
@@ -469,7 +469,8 @@ impl SupertableReader {
     /// one interval on one range-indexed column, or the literal `true` (every
     /// live row), and every superfile it keeps carries that column's range
     /// index ([`Self::count_where_from_index`]). Otherwise the counts run as
-    /// one aggregate, built as a plan.
+    /// one aggregate, built as a plan; a predicate holding a subquery, which
+    /// a FILTER clause cannot, is counted under its own WHERE.
     pub(crate) fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, QueryError> {
         let _foreground = ForegroundQueryGuard::enter();
         if predicates.is_empty() {
@@ -490,19 +491,45 @@ impl SupertableReader {
         if let Some(counts) = self.count_where_from_index(&predicates)? {
             return Ok(counts);
         }
+        // A FILTER clause cannot hold a subquery: a predicate that reads
+        // another relation is counted under its own WHERE.
+        if predicates.iter().any(holds_subquery) {
+            return predicates
+                .into_iter()
+                .map(|predicate| {
+                    let counted = count_where_exprs([lit(true)]).map_err(QueryError::DataFusion)?;
+                    let batches = self.count_where_aggregate(Some(predicate), counted)?;
+                    Ok(count_where_row(&batches, 1)?[0])
+                })
+                .collect();
+        }
+        let n = predicates.len();
         let aggregates = count_where_exprs(predicates).map_err(QueryError::DataFusion)?;
-        let n = aggregates.len();
+        count_where_row(&self.count_where_aggregate(None, aggregates)?, n)
+    }
+
+    /// `aggregates` over the table's live rows, over those `filter` holds
+    /// when there is one: [`Self::count_where`]'s statement, built as a plan.
+    fn count_where_aggregate(
+        &self,
+        filter: Option<Expr>,
+        aggregates: Vec<Expr>,
+    ) -> Result<Vec<RecordBatch>, QueryError> {
         let ctx = self.sql_session_context()?;
         let op_stats = op_stats::current();
         let drive = async move {
             let df = ctx
                 .table(TABLE_NAME)
                 .await
+                .and_then(|table| match filter {
+                    Some(filter) => table.filter(filter),
+                    None => Ok(table),
+                })
                 .and_then(|table| table.aggregate(Vec::new(), aggregates))
                 .map_err(QueryError::DataFusion)?;
             Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
         };
-        count_where_row(&self.block_on(drive)?, n)
+        self.block_on(drive)
     }
 
     /// [`Self::count_where`] from the range index, the manifest and the
@@ -771,6 +798,18 @@ impl Supertable {
 /// its `i`-th predicate; a hosted table's statement names them the same way.
 fn count_where_name(i: usize) -> String {
     format!("count_{i}")
+}
+
+/// Whether `expr` reads another relation: an `IN`, `EXISTS` or scalar
+/// subquery anywhere in it.
+fn holds_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::InSubquery(_) | Expr::Exists(_) | Expr::ScalarSubquery(_)
+        ))
+    })
+    .unwrap_or(true)
 }
 
 /// One `COUNT(*) FILTER (WHERE p)` per predicate, named by

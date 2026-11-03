@@ -20,12 +20,20 @@ use std::sync::Arc;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_array::{Array, Date32Array, Float64Array, Int32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use datafusion::prelude::{col, lit};
+use datafusion::{
+    logical_expr::LogicalPlanBuilder,
+    prelude::{col, in_subquery, lit},
+};
 use infino::{
     ColumnIndex, Connection, FieldPatch, IndexSpec, OptimizeOptions, SchemaPatch, connect,
 };
 use tempfile::TempDir;
 
+/// The `seq` values a subquery predicate lists: some deleted, one past the
+/// last row.
+const SUBQUERY_SEQS: [i64; 4] = [3, 777, 4321, 999_999];
+/// The name DataFusion gives a `VALUES` list's one column.
+const VALUES_COLUMN: &str = "column1";
 /// Rows in each committed superfile.
 const ROWS_PER_FILE: i64 = 3000;
 /// Superfiles each table is written as, one commit each.
@@ -271,6 +279,50 @@ fn assert_same_counts(db: &Connection, when: &str) {
             .count_where(&exprs)
             .unwrap_or_else(|e| panic!("{when}: count_where on {table}: {e}"));
         assert_eq!(counts, expected, "{when}: count_where on {table}");
+    }
+
+    // A predicate that reads another relation, which no FILTER clause can
+    // hold, beside one the index counts.
+    // A subquery's plan ends in the projection of its one column, as SQL
+    // plans `seq IN (SELECT ...)`.
+    let listed =
+        LogicalPlanBuilder::values(SUBQUERY_SEQS.iter().map(|seq| vec![lit(*seq)]).collect())
+            .and_then(|values| values.project(vec![col(VALUES_COLUMN)]))
+            .and_then(|values| values.build())
+            .expect("values");
+    let with_subquery = [
+        in_subquery(col("seq"), Arc::new(listed)),
+        col("qty").gt(lit(100)),
+    ];
+    let listed_sql = SUBQUERY_SEQS
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT count(*) FILTER (WHERE seq IN ({listed_sql})), count(*) FILTER (WHERE qty > 100) FROM plain"
+    );
+    let batches = db.query_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let expected: Vec<u64> = (0..with_subquery.len())
+        .map(|i| {
+            let counts = batches[0]
+                .column(i)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count");
+            u64::try_from(counts.value(0)).expect("a count")
+        })
+        .collect();
+    for table in ["ranged", "plain"] {
+        let counts = db
+            .open_table(table)
+            .expect("open")
+            .count_where(&with_subquery)
+            .unwrap_or_else(|e| panic!("{when}: count_where with a subquery on {table}: {e}"));
+        assert_eq!(
+            counts, expected,
+            "{when}: count_where with a subquery on {table}"
+        );
     }
 }
 
