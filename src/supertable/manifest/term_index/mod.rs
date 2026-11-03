@@ -2293,6 +2293,7 @@ mod tests {
         time::Duration,
     };
 
+    use rayon::ThreadPoolBuilder;
     use tempfile::TempDir;
 
     use super::{
@@ -2682,6 +2683,79 @@ mod tests {
         assert!(!a.is_empty());
         assert_eq!(a.len(), b.len(), "the same terms");
         assert_eq!(a, b, "the same postings and entries per term");
+    }
+
+    /// Threads in the pool the pooled build and merge tests run on: more
+    /// than one, so a build's ranges run side by side and a lone writer has
+    /// threads to spread its batches over.
+    const RANGE_POOL_THREADS: usize = 4;
+
+    /// A pool for the pooled build and merge tests.
+    fn range_pool() -> Arc<ThreadPool> {
+        Arc::new(
+            ThreadPoolBuilder::new()
+                .num_threads(RANGE_POOL_THREADS)
+                .build()
+                .expect("pool"),
+        )
+    }
+
+    /// A build on a pool writes the terms a build without one writes,
+    /// whether as one writer, which spreads its batches of terms over the
+    /// pool, or in key ranges, each of which runs on a pool thread and
+    /// encodes its batches there. A range that fanned its batches out on the
+    /// pool it runs on would wait by running the build's other ranges; one
+    /// that encodes on its own thread must still write the same terms.
+    #[test]
+    fn a_build_on_a_pool_writes_the_terms_a_build_without_one_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let contributions: Vec<Contribution> =
+            (1..=3).map(|id| range_contribution(&dir, id)).collect();
+        let build_with = |pool: Option<Arc<ThreadPool>>, ranges: usize| {
+            let policy = BuildPolicy {
+                merge_ranges: Some(ranges),
+                pool,
+                ..range_policy()
+            };
+            let built = build_layer(&contributions, &policy).expect("build");
+            merged_terms(&build::MergedLayer {
+                layer: built.layer,
+                slices: built.slices,
+                tiers: built.tiers,
+            })
+        };
+        let plain = build_with(None, 1);
+        assert!(!plain.is_empty());
+        let pool = range_pool();
+        for ranges in [1, RANGE_POOL_THREADS] {
+            assert_eq!(
+                build_with(Some(Arc::clone(&pool)), ranges),
+                plain,
+                "a pooled build in {ranges} range(s) writes the same terms"
+            );
+        }
+    }
+
+    /// The same for a merge of layers on a pool, the fold's path: in key
+    /// ranges on the pool's threads it writes the terms one writer writes.
+    #[test]
+    fn a_merge_on_a_pool_writes_the_terms_one_writer_writes() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy {
+            pool: Some(range_pool()),
+            ..range_policy()
+        };
+        let built = build(
+            &[range_contribution(&dir, 1), range_contribution(&dir, 2)],
+            &policy,
+        )
+        .expect("build");
+        let layer = built.root.layers[0].clone();
+        let scratch = TempDir::new().expect("scratch");
+        spill_tiers(scratch.path(), &layer.slices, built.tiers).expect("place tiers");
+        let sources =
+            vec![spill_slices(scratch.path(), &layer, built.slices).expect("place slices")];
+        assert_ranges_match_one_writer(&sources, &[Some(0), Some(1)], &policy);
     }
 
     /// A merge cut into key ranges writes the terms one writer over

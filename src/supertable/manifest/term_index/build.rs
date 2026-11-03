@@ -35,7 +35,7 @@ use std::{
 
 use bytes::Bytes;
 use memmap2::Mmap;
-use rayon::{ThreadPool, current_num_threads, current_thread_index, prelude::*};
+use rayon::{ThreadPool, current_num_threads, prelude::*};
 use tempfile::TempDir;
 use tracing::debug;
 use uuid::Uuid;
@@ -1278,6 +1278,19 @@ struct LayerWriter {
     splice: bool,
 }
 
+/// Whether a layer writer on this thread spreads a batch of terms over
+/// `pool`, the pool it would install on. Only one off that pool's threads
+/// does. A writer on one of them is one range of a build whose ranges are
+/// the parallelism, and encodes on its own thread: a fan-out from there
+/// waits by running whatever the pool holds — the build's other ranges —
+/// and a range of a commit's layer took ten seconds of wall for a fraction
+/// of one of work. A lone writer on another pool's thread, such as a small
+/// fold's single range run on a reader-pool worker, has no ranges beside it
+/// and still spreads.
+fn spreads_batches(pool: &ThreadPool) -> bool {
+    pool.current_thread_index().is_none()
+}
+
 /// What a layer writer spent its time on, for the merge's per-range
 /// trace event.
 #[derive(Debug, Default, Clone, Copy)]
@@ -1437,21 +1450,15 @@ impl LayerWriter {
                 splice,
             )
         };
-        // A writer already running on a pool thread is one range of a build
-        // whose ranges are the parallelism: it encodes on its own thread. A
-        // fan-out from there waits by running whatever the pool holds — the
-        // build's other ranges — and a range of a commit's layer took ten
-        // seconds of wall for a fraction of one of work. Only a writer
-        // called from outside a pool spreads its batch over one.
-        let encoded = match (&self.pool, current_thread_index()) {
-            (Some(pool), None) => pool.install(|| {
+        let encoded = match self.pool.as_deref().filter(|pool| spreads_batches(pool)) {
+            Some(pool) => pool.install(|| {
                 batch
                     .into_par_iter()
                     .with_min_len(ENCODE_JOB_MIN_TERMS)
                     .map(one)
                     .collect::<Result<Vec<EncodedTerm>, TermIndexError>>()
             }),
-            _ => batch
+            None => batch
                 .into_iter()
                 .map(one)
                 .collect::<Result<Vec<EncodedTerm>, TermIndexError>>(),
@@ -2593,6 +2600,34 @@ mod contribution_mark_tests {
             .collect();
             assert_eq!(got, all[150..450], "from the mark at {at}");
         }
+    }
+
+    /// A writer spreads its batches over its pool from any thread but that
+    /// pool's own: on one of them it is one range of a build whose ranges
+    /// are the parallelism, and encodes on that thread. A thread of another
+    /// pool, where a small fold's single range runs, still spreads.
+    #[test]
+    fn a_writer_spreads_its_batches_unless_on_its_own_pool() {
+        let writer_pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("writer pool");
+        let other_pool = ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("other pool");
+        assert!(
+            spreads_batches(&writer_pool),
+            "the test thread is on no pool"
+        );
+        assert!(
+            !writer_pool.install(|| spreads_batches(&writer_pool)),
+            "a thread of the writer's own pool encodes on itself"
+        );
+        assert!(
+            other_pool.install(|| spreads_batches(&writer_pool)),
+            "a thread of another pool spreads over the writer's"
+        );
     }
 
     #[test]
