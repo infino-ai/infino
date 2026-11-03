@@ -124,6 +124,11 @@ const REORDER_MAX_ROUNDS: usize = 20;
 /// bookkeeping than in the loop itself.
 const PAR_MIN_ITEMS: usize = 4096;
 
+/// Documents whose gains [`rank_by_gain`] sums side by side, one
+/// accumulator each: enough independent chains of adds to keep the adder
+/// busy while each waits on its own previous add.
+const GAIN_LANES: usize = 8;
+
 /// How hard the bisection works a split, and when it decides a split has
 /// stopped paying.
 ///
@@ -1384,25 +1389,65 @@ fn rank_by_gain(
     parallel: bool,
     out: &mut Vec<u64>,
 ) {
-    let gain_of = |(i, &d): (usize, &u32)| {
-        let mut gain = 0.0f32;
-        for &t in fwd.doc(d) {
-            gain += move_gain[t as usize];
+    // Keys for the documents of one stretch of `half` starting at `first`.
+    let keys_of = |first: usize, docs: &[u32], keys: &mut Vec<u64>| {
+        for (j, group) in docs.chunks(GAIN_LANES).enumerate() {
+            let gains = lane_gains(fwd, group, move_gain);
+            let at = first + j * GAIN_LANES;
+            keys.extend(
+                gains[..group.len()]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &gain)| rank_key(gain, (at + k) as u32)),
+            );
         }
-        rank_key(gain, i as u32)
     };
     out.clear();
     match parallel {
-        // `par_extend` over an indexed iterator fills `out` in index
-        // order, so the ranking is the same whichever way it ran.
-        true => out.par_extend(
-            half.par_iter()
+        // Stretches of whole lane groups, collected in order, so the
+        // ranking is the same whichever way it ran.
+        true => {
+            let stretch = PAR_MIN_ITEMS.next_multiple_of(GAIN_LANES);
+            let parts: Vec<Vec<u64>> = half
+                .par_chunks(stretch)
                 .enumerate()
-                .with_min_len(PAR_MIN_ITEMS)
-                .map(gain_of),
-        ),
-        false => out.extend(half.iter().enumerate().map(gain_of)),
+                .map(|(c, docs)| {
+                    let mut keys = Vec::with_capacity(docs.len());
+                    keys_of(c * stretch, docs, &mut keys);
+                    keys
+                })
+                .collect();
+            out.reserve(half.len());
+            for part in parts {
+                out.extend(part);
+            }
+        }
+        false => keys_of(0, half, out),
     }
+}
+
+/// The gain of each document in `group` (at most [`GAIN_LANES`] of them):
+/// the sum of its terms' `move_gain`, added from zero in the order the
+/// document lists its terms, as a document-at-a-time loop adds them. The
+/// documents are summed side by side, one accumulator each, so the adds of
+/// different documents do not wait on one another: summed one document at a
+/// time, every add waited on the one before it, and the gather spent its
+/// time in that chain rather than in its loads.
+fn lane_gains(fwd: &ForwardIndex, group: &[u32], move_gain: &[f32]) -> [f32; GAIN_LANES] {
+    let mut terms: [&[u32]; GAIN_LANES] = [&[]; GAIN_LANES];
+    for (slot, &d) in terms.iter_mut().zip(group) {
+        *slot = fwd.doc(d);
+    }
+    let longest = terms.iter().map(|t| t.len()).max().unwrap_or(0);
+    let mut gains = [0.0f32; GAIN_LANES];
+    for k in 0..longest {
+        for (gain, doc) in gains.iter_mut().zip(&terms) {
+            if let Some(&t) = doc.get(k) {
+                *gain += move_gain[t as usize];
+            }
+        }
+    }
+    gains
 }
 
 /// Put the `want` highest-gain entries at the front of `gains`, in the
@@ -1552,6 +1597,60 @@ mod tests {
     use rayon::ThreadPoolBuilder;
 
     use super::*;
+
+    /// Documents in the lane-gain test: several whole lane groups and a
+    /// ragged last one.
+    const LANE_TEST_DOCS: usize = 8 * GAIN_LANES + 3;
+    /// Terms the lane-gain test's documents draw from.
+    const LANE_TEST_TERMS: u32 = 1000;
+
+    /// Summed side by side, each document's gain is the one a
+    /// document-at-a-time loop adds up, bit for bit, whatever the lengths
+    /// of the documents grouped with it — none, one term, or longer than
+    /// any other in its group.
+    #[test]
+    fn lane_gains_add_each_document_as_one_at_a_time_does() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let docs: Vec<Vec<u32>> = (0..LANE_TEST_DOCS)
+            .map(|d| {
+                let len = (d * 5) % 23;
+                (0..len)
+                    .map(|_| rng.random_range(0..LANE_TEST_TERMS))
+                    .collect()
+            })
+            .collect();
+        let fwd = ForwardIndex::from_docs(&docs);
+        let move_gain: Vec<f32> = (0..LANE_TEST_TERMS)
+            .map(|_| rng.random_range(-1.0e3f32..1.0e3))
+            .collect();
+        let order: Vec<u32> = (0..LANE_TEST_DOCS as u32).rev().collect();
+        for group in order.chunks(GAIN_LANES) {
+            let gains = lane_gains(&fwd, group, &move_gain);
+            for (gain, &d) in gains.iter().zip(group) {
+                let mut one = 0.0f32;
+                for &t in fwd.doc(d) {
+                    one += move_gain[t as usize];
+                }
+                assert_eq!(gain.to_bits(), one.to_bits(), "document {d}");
+            }
+        }
+        for parallel in [false, true] {
+            let mut keys = Vec::new();
+            rank_by_gain(&fwd, &order, &move_gain, parallel, &mut keys);
+            let expected: Vec<u64> = order
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| {
+                    let mut one = 0.0f32;
+                    for &t in fwd.doc(d) {
+                        one += move_gain[t as usize];
+                    }
+                    rank_key(one, i as u32)
+                })
+                .collect();
+            assert_eq!(keys, expected, "parallel={parallel}");
+        }
+    }
 
     /// Every round, every split: the shape the oracle implements. The
     /// convergence test is a deliberate change of behaviour and is covered on
