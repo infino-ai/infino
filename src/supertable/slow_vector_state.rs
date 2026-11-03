@@ -78,9 +78,27 @@ const STRIPED_FETCH_CHUNK_BYTES: u64 = 64 << 20;
 /// per-stream gain flattens.
 const STRIPED_FETCH_MAX_IN_FLIGHT: usize = 16;
 
+/// File-name prefix of a slow vector-state blob; the content hash follows.
+const BLOB_NAME_PREFIX: &str = "state-";
+
+/// File-name suffix of a slow vector-state blob.
+const BLOB_NAME_SUFFIX: &str = ".bin";
+
 /// Object-storage path for a content-addressed slow vector-state blob.
 pub(crate) fn storage_path(hash: &ContentHash) -> String {
-    format!("{STORAGE_PREFIX}state-{}.bin", hash.to_hex())
+    format!(
+        "{STORAGE_PREFIX}{BLOB_NAME_PREFIX}{}{BLOB_NAME_SUFFIX}",
+        hash.to_hex()
+    )
+}
+
+/// The content hash a [`storage_path`] names, or `None` for any other key.
+pub(crate) fn content_hash_of_path(path: &str) -> Option<ContentHash> {
+    let hex = path
+        .strip_prefix(STORAGE_PREFIX)?
+        .strip_prefix(BLOB_NAME_PREFIX)?
+        .strip_suffix(BLOB_NAME_SUFFIX)?;
+    ContentHash::from_hex(hex)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -968,8 +986,9 @@ pub(crate) async fn load_full_state(
     // blake3 over the whole blob plus the Avro parse is a CPU wave
     // (multi-GiB at 100M docs); run it on the blocking pool so the
     // runtime keeps driving I/O instead of stalling behind the decode.
+    // The cache verified a hit, so only a fetched blob is hashed here.
     let state = match spawn_blocking(carry_span(move || {
-        if ContentHash::of(bytes.as_ref()) != expected {
+        if fetched && ContentHash::of(bytes.as_ref()) != expected {
             return Err(SlowVectorStateError::HashMismatch);
         }
         decode_state(bytes.as_ref(), &legacy)
@@ -1589,5 +1608,13 @@ mod tests {
 
         assert!(cache.get(&published.content_hash).await.is_some());
         assert!(cache.get(&published.centroids.content_hash).await.is_some());
+    }
+
+    #[test]
+    fn a_storage_path_names_its_content_hash() {
+        let hash = ContentHash::of(b"state");
+        assert_eq!(content_hash_of_path(&storage_path(&hash)), Some(hash));
+        assert_eq!(content_hash_of_path("slow-vector-state/absent.bin"), None);
+        assert_eq!(content_hash_of_path("data/state-00.bin"), None);
     }
 }

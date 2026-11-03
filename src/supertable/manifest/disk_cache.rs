@@ -59,6 +59,16 @@ const CACHE_FILE_SUFFIX: &str = ".avro.zst";
 /// onto the final name once the bytes are durable.
 const CACHE_TMP_SUFFIX: &str = ".tmp";
 
+/// What a `get` found on disk for an indexed hash.
+enum CachedRead {
+    /// The file is gone.
+    Missing,
+    /// The bytes do not hash to the key; the file has been removed.
+    Corrupt,
+    /// The bytes, verified against the key.
+    Verified(Vec<u8>),
+}
+
 /// Per-entry bookkeeping for the in-memory accounting index. The bytes
 /// themselves live on disk; this only tracks what eviction needs.
 struct CacheEntry {
@@ -83,10 +93,8 @@ pub struct ManifestCacheStats {
 /// Content-addressed disk cache for manifest-part bytes.
 ///
 /// Construction is sync (a directory scan); `get` / `put` are async
-/// because their file I/O runs off the tokio workers (a `get` through
-/// `tokio::fs`, a `put` as one blocking task) so they aren't blocked on
-/// the syscall. Verification (blake3 over the cached bytes)
-/// runs inline, matching the loader's existing hash check.
+/// because their file I/O runs off the tokio workers, each as one
+/// blocking task. A `get` verifies the bytes (blake3) in that same task.
 pub struct ManifestDiskCache {
     cache_root: PathBuf,
     budget_bytes: AtomicU64,
@@ -197,9 +205,22 @@ impl ManifestDiskCache {
             return None;
         }
         let path = self.cache_path(hash);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(_) => {
+        let expected = *hash;
+        // The read and the hash run as one blocking task: a cached object can
+        // be hundreds of MB, too much to hash on a runtime worker.
+        let read = spawn_blocking(move || match fs::read(&path) {
+            Err(_) => CachedRead::Missing,
+            Ok(bytes) if ContentHash::of(&bytes) != expected => {
+                let _ = fs::remove_file(&path);
+                CachedRead::Corrupt
+            }
+            Ok(bytes) => CachedRead::Verified(bytes),
+        })
+        .await
+        .unwrap_or(CachedRead::Missing);
+        let bytes = match read {
+            CachedRead::Verified(bytes) => bytes,
+            CachedRead::Missing => {
                 // File vanished out from under the index (manual
                 // delete, external eviction). Drop the stale entry.
                 record("outcome", "file_missing");
@@ -207,16 +228,15 @@ impl ManifestDiskCache {
                 self.n_misses.fetch_add(1, Ordering::AcqRel);
                 return None;
             }
+            CachedRead::Corrupt => {
+                // Content-addressing guarantee: the bytes must hash to the
+                // key. A mismatch means on-disk corruption, already removed.
+                record("outcome", "corrupt");
+                self.drop_entry(hash);
+                self.n_misses.fetch_add(1, Ordering::AcqRel);
+                return None;
+            }
         };
-        // Content-addressing guarantee: the bytes must hash to the key.
-        // A mismatch means on-disk corruption — discard and miss.
-        if ContentHash::of(&bytes) != *hash {
-            record("outcome", "corrupt");
-            let _ = tokio::fs::remove_file(&path).await;
-            self.drop_entry(hash);
-            self.n_misses.fetch_add(1, Ordering::AcqRel);
-            return None;
-        }
         if let Some(entry) = self.entries.get(hash) {
             entry.last_access_us.store(self.now_us(), Ordering::Release);
         }
@@ -362,6 +382,21 @@ impl ManifestDiskCache {
         }
         record("freed", freed);
         freed >= bytes_needed
+    }
+
+    /// Remove the entry for `hash` and its file. Blocking: it unlinks the file.
+    pub(crate) fn remove(&self, hash: &ContentHash) {
+        if let Some((_, entry)) = self.entries.remove(hash) {
+            let _ = fs::remove_file(self.cache_path(hash));
+            self.current_bytes
+                .fetch_sub(entry.size_bytes, Ordering::Release);
+        }
+    }
+
+    /// Whether `hash` is in the cache.
+    #[cfg(test)]
+    pub(crate) fn contains(&self, hash: &ContentHash) -> bool {
+        self.entries.contains_key(hash)
     }
 
     /// Remove an entry from the accounting index and release its
@@ -568,6 +603,26 @@ mod tests {
         assert!(cache.get(&hc).await.is_some(), "c kept (just inserted)");
         assert!(cache.get(&hb).await.is_none(), "b evicted (LRU)");
         assert!(cache.stats().n_evictions >= 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_removed_entry_leaves_the_disk_and_the_budget() {
+        let root = tmp_root("remove");
+        let _ = fs::remove_dir_all(&root);
+        let cache = ManifestDiskCache::new(root.clone(), 1 << 20).expect("cache");
+        let bytes = b"superseded-bytes".to_vec();
+        let h = hash_of(&bytes);
+        cache.put(h, Bytes::copy_from_slice(&bytes)).await;
+        let path = cache.cache_path(&h);
+        assert!(path.exists());
+
+        cache.remove(&h);
+
+        assert!(!path.exists(), "the file is unlinked");
+        assert!(!cache.contains(&h));
+        assert_eq!(cache.stats().current_bytes, 0);
+        assert!(cache.get(&h).await.is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

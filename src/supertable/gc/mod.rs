@@ -25,6 +25,7 @@ use crate::{
             SUPERFILE_DATA_DIR, SUPERFILE_KEY_SUFFIX, SuperfileUri,
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
+            part::ContentHash,
             summaries::MANIFEST_SUMMARIES_DIR,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
         },
@@ -175,7 +176,7 @@ async fn term_index_slices(
     Ok(uris)
 }
 
-/// Delete `keys`, each superfile's disk-cache copy first, at most [`RECLAIM_CONCURRENCY`] in
+/// Delete `keys`, each one's cached local copy first, at most [`RECLAIM_CONCURRENCY`] in
 /// flight. `on_result` sees every key's outcome as it arrives. Both sweeps delete through here.
 async fn delete_objects(
     inner: &SupertableInner,
@@ -200,30 +201,48 @@ async fn delete_objects(
         .await;
 }
 
-/// Drop the disk-cache copy of each superfile about to be deleted. Unlinking thousands of files is
-/// blocking filesystem work, so it runs on the blocking pool, off the runtime queries share.
+/// Drop the cached copy of each superfile and vector-state blob about to be deleted. Unlinking
+/// thousands of files is blocking filesystem work, so it runs on the blocking pool, off the runtime
+/// queries share.
 async fn erase_cached_copies(inner: &SupertableInner, keys: &[String]) {
-    let Some(cache) = inner.options.disk_cache.clone() else {
-        return;
-    };
-
-    let uris: Vec<SuperfileUri> = keys
+    let superfiles: Vec<SuperfileUri> = keys
         .iter()
         .filter_map(|key| SuperfileUri::from_storage_path(key))
         .collect();
+    let vector_states: Vec<ContentHash> = keys
+        .iter()
+        .filter_map(|key| slow_vector_state::content_hash_of_path(key))
+        .collect();
+    let superfile_cache = inner
+        .options
+        .disk_cache
+        .clone()
+        .filter(|_| !superfiles.is_empty());
+    let vector_state_cache = inner
+        .options
+        .manifest_disk_cache
+        .clone()
+        .filter(|_| !vector_states.is_empty());
 
-    if uris.is_empty() {
+    if superfile_cache.is_none() && vector_state_cache.is_none() {
         return;
     }
 
     if let Err(error) = spawn_blocking(move || {
-        for uri in &uris {
-            cache.erase_superfile_local_copy(uri);
+        if let Some(cache) = superfile_cache {
+            for uri in &superfiles {
+                cache.erase_superfile_local_copy(uri);
+            }
+        }
+        if let Some(cache) = vector_state_cache {
+            for hash in &vector_states {
+                cache.remove(hash);
+            }
         }
     })
     .await
     {
-        warn!(%error, "gc: disk-cache erase for deleted superfiles did not finish");
+        warn!(%error, "gc: disk-cache erase for deleted objects did not finish");
     }
 }
 
