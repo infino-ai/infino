@@ -35,7 +35,7 @@ use std::{
 
 use bytes::Bytes;
 use memmap2::Mmap;
-use rayon::{ThreadPool, prelude::*};
+use rayon::{ThreadPool, current_num_threads, current_thread_index, prelude::*};
 use tempfile::TempDir;
 use tracing::debug;
 use uuid::Uuid;
@@ -1426,26 +1426,35 @@ impl LayerWriter {
         let splice = self.splice;
         let ordinals = Arc::clone(&self.ordinals);
         let scoring = Arc::clone(&self.scoring);
-        let encode = || -> Result<Vec<EncodedTerm>, TermIndexError> {
-            batch
-                .into_par_iter()
-                .with_min_len(ENCODE_JOB_MIN_TERMS)
-                .map(|term| {
-                    let column = FieldId::of_term_key(&term.key).unwrap_or(FieldId(u32::MAX));
-                    encode_term(
-                        term,
-                        budget,
-                        depth,
-                        &ordinals,
-                        &|ordinal| scoring(ordinal, column),
-                        splice,
-                    )
-                })
-                .collect()
+        let one = |term: TermInput| {
+            let column = FieldId::of_term_key(&term.key).unwrap_or(FieldId(u32::MAX));
+            encode_term(
+                term,
+                budget,
+                depth,
+                &ordinals,
+                &|ordinal| scoring(ordinal, column),
+                splice,
+            )
         };
-        let encoded = match &self.pool {
-            Some(pool) => pool.install(encode),
-            None => encode(),
+        // A writer already running on a pool thread is one range of a build
+        // whose ranges are the parallelism: it encodes on its own thread. A
+        // fan-out from there waits by running whatever the pool holds — the
+        // build's other ranges — and a range of a commit's layer took ten
+        // seconds of wall for a fraction of one of work. Only a writer
+        // called from outside a pool spreads its batch over one.
+        let encoded = match (&self.pool, current_thread_index()) {
+            (Some(pool), None) => pool.install(|| {
+                batch
+                    .into_par_iter()
+                    .with_min_len(ENCODE_JOB_MIN_TERMS)
+                    .map(one)
+                    .collect::<Result<Vec<EncodedTerm>, TermIndexError>>()
+            }),
+            _ => batch
+                .into_iter()
+                .map(one)
+                .collect::<Result<Vec<EncodedTerm>, TermIndexError>>(),
         }?;
         self.stats.encode_secs += started.elapsed().as_secs_f64();
         for term in encoded {
@@ -2222,7 +2231,7 @@ fn range_count(
         None => policy
             .pool
             .as_deref()
-            .map_or_else(rayon::current_num_threads, ThreadPool::current_num_threads)
+            .map_or_else(current_num_threads, ThreadPool::current_num_threads)
             .clamp(1, cap),
     })
 }
