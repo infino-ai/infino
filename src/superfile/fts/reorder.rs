@@ -92,21 +92,23 @@ const MIN_PARTITION: usize = BLOCK_LEN;
 /// everywhere, and nothing here should be read as claiming one.
 ///
 /// What does hold on both is that the whole range is narrow — 1.8% and 0.7%
-/// end to end. The value is set for the time the reordering takes at
-/// scale rather than for the last fraction of a percent of index size: at
-/// 0.20 the bisection does 10–16% less work than at 0.05 — a 5M-document
-/// optimize 47.0 → 42.4 s with the index 0.66% larger, a 1B-row one's merge
-/// phase 123 → 112 s with the index 1.1% larger — and the index stays
-/// within 1.1% of either corpus's own best. It is a fixed value rather than
-/// something calibrated per corpus, and not a knob: the error from not
-/// knowing the text is far smaller than what measuring it would cost, and a
-/// service cannot sweep a customer's data before indexing it. What does
-/// adapt to the corpus is the bar this ratio is taken against, which is
-/// measured from the data on every run.
+/// end to end — and this value lands within 0.07% of each corpus's own best
+/// while running faster than doing every round on both. That is the reason it
+/// is a fixed value rather than something calibrated per corpus, and not a
+/// knob: the error from not knowing the text is far smaller than what
+/// measuring it would cost, and a service cannot sweep a customer's data
+/// before indexing it. What does adapt to the corpus is the bar this ratio is
+/// taken against, which is measured from the data on every run.
+///
+/// A looser ratio buys optimize time with query time. At 0.20 the bisection
+/// did 10–16% less work, and a 5M-document table's queries ran 1.6% slower
+/// across every query shape measured, with its index 0.35% larger; at this
+/// value they ran as before. Query time is what the reordering is for, so
+/// the ratio stays here.
 ///
 /// Index size stands in for layout quality throughout. The reordering exists
 /// for query performance, which is not resolved at this scale.
-const REORDER_CONVERGENCE: f32 = 0.20;
+const REORDER_CONVERGENCE: f32 = 0.05;
 
 /// Ceiling on a split's move rounds. Equal to the fixed count the bisection
 /// used before the convergence test existed, so setting [`REORDER_CONVERGENCE`]
