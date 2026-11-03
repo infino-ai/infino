@@ -3707,12 +3707,24 @@ impl LiveLanes {
     #[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all, fields(rows_fed = self.rows_fed)))]
     fn join(&mut self) -> Result<Vec<LiveLane>, BuildError> {
         if let Some((rx, n)) = self.pending.take() {
+            // Every lane reports before the first error is returned, so a
+            // failed feed's sibling lanes do not run on, holding the fed
+            // batches and their builders, after the append has failed.
             let mut lanes: Vec<Option<LiveLane>> = (0..n).map(|_| None).collect();
+            let mut first_error = None;
             for _ in 0..n {
                 let (i, lane) = rx.recv().map_err(|_| {
                     BuildError::Store("live lane feed ended without a result".into())
                 })?;
-                lanes[i] = Some(lane?);
+                match lane {
+                    Ok(lane) => lanes[i] = Some(lane),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            if let Some(error) = first_error {
+                return Err(error);
             }
             self.lanes = Some(
                 lanes
@@ -14820,6 +14832,37 @@ mod tests {
         assert!(storage.inner.head(&reference.uri).await.is_ok());
     }
 
+    /// Bytes of the large object in the hedge-delay test: enough that its
+    /// share of the delay is a whole second at the store's assumed rate.
+    const HEDGE_TEST_LARGE_BYTES: usize = 16 << 20;
+
+    /// A PUT that lands inside the hedge's delay sends no second attempt,
+    /// and a large PUT is given longer: one that lands past the base delay
+    /// but within its own is not hedged either.
+    #[tokio::test(start_paused = true)]
+    async fn a_put_that_lands_within_its_delay_is_not_hedged() {
+        for (bytes, lands_after) in [
+            (b"small".to_vec(), stuck_after(0) / 2),
+            (
+                vec![7u8; HEDGE_TEST_LARGE_BYTES],
+                stuck_after(0) + (stuck_after(HEDGE_TEST_LARGE_BYTES as u64) - stuck_after(0)) / 2,
+            ),
+        ] {
+            let dir = TempDir::new().expect("tempdir");
+            let storage = HeldFirstPutStorage {
+                inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+                held: "hedged",
+                first: AtomicBool::new(true),
+                puts: AtomicUsize::new(0),
+                first_lands_after: Some(lands_after),
+            };
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), bytes)
+                .await
+                .expect("the first attempt lands");
+            assert_eq!(storage.puts.load(Ordering::SeqCst), 1, "no hedge was sent");
+        }
+    }
+
     #[test]
     fn commit_write_concurrency_is_never_zero() {
         assert!(commit_write_concurrency().get() >= 1);
@@ -18344,6 +18387,37 @@ supertable:
             BuildError::NoDocsToBuild.for_follower(),
             BuildError::Store(_)
         ));
+    }
+
+    /// A leader takes on only the parked publishes it can share one manifest
+    /// write with: one that expects another schema stays parked, and leads
+    /// its own publish once the queue frees.
+    #[test]
+    fn a_leader_leaves_a_publish_under_another_schema_parked() {
+        let mut state = AppendQueueState {
+            issued: 3,
+            publishing: true,
+            parked: BTreeMap::new(),
+            results: BTreeMap::new(),
+        };
+        let under = |number: u64, schema: u32| {
+            let mut parked = parked_for_test(number);
+            parked.list_metadata.expected_schema_id = Some(schema);
+            parked
+        };
+        state.parked.insert(1, under(1, 7));
+        state.parked.insert(2, under(2, 8));
+        let run = take_run(&mut state, under(0, 7));
+        assert_eq!(
+            run.iter().map(|parked| parked.number).collect::<Vec<_>>(),
+            vec![0, 1],
+            "the publish under the same schema rides along"
+        );
+        assert_eq!(
+            state.parked.keys().copied().collect::<Vec<_>>(),
+            vec![2],
+            "the publish under another schema stays parked"
+        );
     }
 
     /// A ticket parked while another publishes leads itself once that

@@ -9,11 +9,22 @@
 //! ```text
 //! magic "INFTIDX1" | version u32 | n_superfiles u32
 //! | per superfile: uuid | smallest doc id i128 LE
-//! | n_layers u32 | per layer: n_slices u32
+//! | n_layers u32 | per layer: ordinal range (u8 flag; when 1, start u32 | end u32)
+//!     | base u32 | n_slices u32
 //!     | per slice: first_key (u32 len + bytes) | last_key (u32 len + bytes)
 //!                | content hash (32 B)
 //!                | tier object content hash (32 B, all zero when no run of the slice has one)
+//!                | slice length u64
 //! ```
+//!
+//! A layer's *ordinal range* is the superfile ordinals its postings may
+//! name, so a fold that drops every one of them can drop the layer unread;
+//! no range (a root of an earlier version) is never dropped. Its *base* is
+//! added to every ordinal its slices and tier objects store, so a layer
+//! built before its superfiles' place in the list was known is placed by
+//! recording where they landed, not rewritten. Earlier versions read with
+//! no range and base 0; the version before them carried no slice length,
+//! and the one before that a length in place of the tier object hash.
 //!
 //! A slice's *tier object* holds its terms' tier chunks (`tier.rs`) back
 //! to back; a run names its chunks by offset into it. Both the slice and

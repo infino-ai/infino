@@ -2136,12 +2136,15 @@ fn run_ranges(
         return one(start.as_deref(), end.as_deref());
     }
     let parts = match policy.pool.as_deref() {
-        // Each range a task of its own, this thread — outside the pool —
-        // waiting here. Under `install` the pool thread that owned the
-        // build ran whatever else was queued while its ranges ran, and
-        // with thirty appends in flight that was other commits' piece
-        // builds: a commit's layer took 7.7 s of wall for 1.8 s of work,
-        // and every publish queued behind its ticket waited with it.
+        // Each range a task of its own, this thread waiting here. A
+        // commit's layer is built from a thread outside the pool, which
+        // waits for its ranges and nothing else: under `install` the pool
+        // thread that owned the build ran whatever else was queued while
+        // its ranges ran, and with thirty appends in flight that was other
+        // commits' piece builds — a layer took 7.7 s of wall for 1.8 s of
+        // work, and every publish queued behind its ticket waited with it.
+        // The fold at optimize calls this from a reader-pool worker, which
+        // waits by running other queued jobs just as under `install`.
         Some(pool) => {
             let slots: Vec<Mutex<Option<Result<MergedLayer, TermIndexError>>>> =
                 ranges.iter().map(|_| Mutex::new(None)).collect();

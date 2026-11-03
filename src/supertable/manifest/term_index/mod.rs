@@ -132,11 +132,13 @@ const SLICE_FETCH_CONCURRENCY: usize = 8;
 /// transfer's memory.
 const LAYER_FETCH_CONCURRENCY: usize = 64;
 
-/// Objects one build writes at once; the write-side twin of
-/// [`LAYER_FETCH_CONCURRENCY`], with the same memory bound: a spilled
-/// object is read back only as its upload starts. At sixteen, a fold's
-/// four hundred slices and as many tier objects took half a minute of
-/// 400 ms PUTs, longer than the merge that made them.
+/// Objects of one kind a build writes at once; the write-side twin of
+/// [`LAYER_FETCH_CONCURRENCY`]. A build writes its tier objects and its
+/// slices side by side, so twice this many are in flight in all, and twice
+/// this many of the largest bound the upload's memory: a spilled object is
+/// read back only as its upload starts. At sixteen, a fold's four hundred
+/// slices and as many tier objects took half a minute of 400 ms PUTs,
+/// longer than the merge that made them.
 const SLICE_WRITE_CONCURRENCY: usize = LAYER_FETCH_CONCURRENCY;
 
 /// Fan-out of the tiered fold a commit applies to its root's layers (see
@@ -510,9 +512,11 @@ pub(crate) async fn append_delta(
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
-    let built = build_onto(prior.unwrap_or_default(), contributions, policy)?;
+    let prior = prior.unwrap_or_default();
+    let named = prior.layers.len();
+    let built = build_onto(prior, contributions, policy)?;
     write_tiers_and_slices(storage, built.tiers, built.slices).await?;
-    publish_root(storage, built.root, policy, pool).await
+    publish_root(storage, built.root, named, policy, pool).await
 }
 
 /// A delta layer built and written once, numbered from the length of the
@@ -626,6 +630,7 @@ pub(crate) async fn append_reserved_run(
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
     let mut root = prior.unwrap_or_default();
+    let named = root.layers.len();
     let mut rest = contributions;
     for segment in run.iter_mut() {
         if segment.contributions > rest.len() {
@@ -666,7 +671,7 @@ pub(crate) async fn append_reserved_run(
             "a publish carries contributions no segment claims".into(),
         ));
     }
-    publish_root(storage, root, policy, pool).await
+    publish_root(storage, root, named, policy, pool).await
 }
 
 /// Delete the spilled copies among `objects`; a resident object has none.
@@ -684,9 +689,12 @@ fn remove_spilled(objects: &[(ContentHash, BuiltBytes)]) {
 /// an optimisation, so one that fails is logged and the root published as
 /// far as the folds before it took it, every layer still in it: the
 /// commit it is part of never fails on its account.
+/// The first `named` of `root`'s layers are the ones the root it replaces
+/// named; the rest were written by this publish (see [`fold_tail`]).
 async fn publish_root(
     storage: &Arc<dyn StorageProvider>,
     mut root: Root,
+    named: usize,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<RoutingRef, TermIndexError> {
@@ -712,7 +720,7 @@ async fn publish_root(
         },
         false => policy.clone(),
     };
-    if let Err(error) = fold_tail(storage, &mut root, &fold_policy, pool).await {
+    if let Err(error) = fold_tail(storage, &mut root, named, &fold_policy, pool).await {
         warn!(%error, "term index: folding layers at commit failed; publishing the root unfolded");
     }
     write_root(storage.as_ref(), &root).await
@@ -733,19 +741,31 @@ async fn publish_root(
 ///
 /// `root` changes only once a fold's merged slices are written, so a fold
 /// that fails leaves it as the last one that succeeded made it.
+///
+/// Only the first `named` layers, the ones the root this publish replaces
+/// named, are folded, and a layer a fold made here is not folded again.
+/// The others' slices were written by this publish and no root names them
+/// yet: a fold that retired them would leave objects no root ever named,
+/// which the commit's sweep, reading what retired roots named, could not
+/// find. A publish that carries several appends adds a layer for each.
 pub(crate) async fn fold_tail(
     storage: &Arc<dyn StorageProvider>,
     root: &mut Root,
+    named: usize,
     policy: &BuildPolicy,
     pool: Option<&ThreadPool>,
 ) -> Result<(), TermIndexError> {
     // Every ordinal keeps its place: the fold renumbers nothing.
     let ordinals: Vec<Option<u32>> = (0..root.superfiles.len() as u32).map(Some).collect();
-    while let Some(run) = next_fold(root, policy) {
+    // Whether each layer is one the replaced root named.
+    let mut foldable: Vec<bool> = (0..root.layers.len()).map(|i| i < named).collect();
+    while let Some(run) = next_fold(root, &foldable, policy) {
         let merged =
             fold_layers(storage, &root.layers[run.clone()], &ordinals, policy, pool).await?;
         root.layers.drain(run.clone());
         root.layers.insert(run.start, merged);
+        foldable.drain(run.clone());
+        foldable.insert(run.start, false);
     }
     Ok(())
 }
@@ -1049,15 +1069,26 @@ fn merged_ordinals(layers: &[Layer], ordinals: &[Option<u32>]) -> Option<Range<u
 /// larger fold would be commit latency and a wider window for a concurrent
 /// writer to win, so a run past it is left to optimize ([`fold_at_optimize`]).
 ///
-/// The newest layer is never in a run. Its slices were written by the
-/// publish that is still under way and no root names them yet; a fold that
-/// retired them would leave objects no root ever named, which the sweep
-/// could not find. Every layer beneath it was named by the root this
-/// publish replaces, so the slices a fold retires are exactly the ones the
-/// sweep reclaims from that root.
-fn next_fold(root: &Root, policy: &BuildPolicy) -> Option<Range<usize>> {
-    let beneath = root.layers.len().checked_sub(1)?;
-    fold_run(&root.layers[..beneath], policy.slice_target_bytes as u64)
+/// A run lies within one stretch of consecutive `foldable` layers, the
+/// ones the root this publish replaces named, so the slices a fold retires
+/// are exactly the ones the sweep reclaims from that root (see
+/// [`fold_tail`]).
+fn next_fold(root: &Root, foldable: &[bool], policy: &BuildPolicy) -> Option<Range<usize>> {
+    let mut start = 0;
+    while start < root.layers.len() {
+        if !foldable[start] {
+            start += 1;
+            continue;
+        }
+        let end = (start..root.layers.len())
+            .find(|&i| !foldable[i])
+            .unwrap_or(root.layers.len());
+        if let Some(run) = fold_run(&root.layers[start..end], policy.slice_target_bytes as u64) {
+            return Some(start + run.start..start + run.end);
+        }
+        start = end;
+    }
+    None
 }
 
 /// The first run of [`FOLD_FAN_OUT`] consecutive `layers` of one size level
@@ -8079,6 +8110,67 @@ mod tests {
                 .is_err(),
             "a contribution no segment claims"
         );
+    }
+
+    /// Appends in the grouped-publish fold test: past the fan-out, so a
+    /// fold over the run's own layers would be due.
+    const GROUPED_APPENDS: u128 = FOLD_FAN_OUT as u128 + 1;
+
+    /// A publish that carries many appends adds a layer for each and folds
+    /// none of them: no root names their slices yet, and a fold that
+    /// retired them would leave objects only a listing sweep could find.
+    /// Every slice on disk is named by the prior root or the new one.
+    #[tokio::test]
+    async fn a_grouped_publish_folds_none_of_its_own_layers() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let contributions: Vec<Contribution> = (2..2 + GROUPED_APPENDS)
+            .map(|id| contribution(&dir, id, &[("body", &format!("own{id}"), 1)]))
+            .collect();
+        let mut run: Vec<ReservedSegment> = (0..GROUPED_APPENDS)
+            .map(|_| ReservedSegment {
+                contributions: 1,
+                layer: None,
+            })
+            .collect();
+        let reference = append_reserved_run(
+            &local,
+            Some(prior.clone()),
+            &contributions,
+            &policy,
+            &mut run,
+            None,
+        )
+        .await
+        .expect("run");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            root.layers.len(),
+            prior.layers.len() + GROUPED_APPENDS as usize,
+            "one layer per append, none folded"
+        );
+        let named: HashSet<String> = [&prior, &root]
+            .iter()
+            .flat_map(|r| r.layers.iter().flat_map(|l| l.slices.iter()))
+            .map(|slice| {
+                slice_uri(&slice.content_hash)
+                    .trim_start_matches(STORAGE_PREFIX)
+                    .to_string()
+            })
+            .collect();
+        let on_disk = slice_objects(&store_dir);
+        assert!(
+            on_disk.is_subset(&named),
+            "slices no root names: {:?}",
+            on_disk.difference(&named).collect::<Vec<_>>()
+        );
+        for id in 2..2 + GROUPED_APPENDS {
+            assert_eq!(
+                posted_superfiles(&root, &local, &format!("own{id}")).await,
+                [Uuid::from_u128(id)]
+            );
+        }
     }
 
     /// Superfiles other commits list before a retry in the move tests.
