@@ -239,8 +239,10 @@ const ENCODE_JOB_MIN_TERMS: usize = 64;
 /// of a window share one read rather than each seeking for its own chunks.
 /// A cursor keeps its current window, and a term whose chunks are still
 /// being encoded keeps the window they were read from, so a merge holds a
-/// few windows per cursor on top of the slice's bytes.
-const TIER_READ_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+/// few windows per cursor on top of the slice's bytes. A merge holds one
+/// cursor per input layer and key range, so the window is most of what a
+/// wide merge holds; a term whose chunks span more is still read whole.
+const TIER_READ_WINDOW_BYTES: u64 = 256 * 1024;
 
 /// One term as the merge hands it over: its postings and the tier entries
 /// gathered for it, in any order.
