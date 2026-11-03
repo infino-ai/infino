@@ -73,7 +73,7 @@ use std::{
     str::from_utf8,
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{Receiver as StdReceiver, sync_channel as std_sync_channel},
     },
     thread::available_parallelism,
@@ -2619,20 +2619,22 @@ impl SupertableWriter {
             None => {
                 // Open once the buffer holds a superfile's worth of rows, so a
                 // small commit keeps today's one superfile; then feed everything
-                // buffered so far. One lane per pool thread.
+                // buffered so far.
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
                 // The lanes are opened once, before the append's rows are
-                // all known, so their count follows the pool, not the rows
+                // all known, so their count follows the threads, not the rows
                 // buffered so far: those are one superfile's worth, and a
                 // large append fed through the few lanes they would ask for
                 // would tokenise on a few threads.
-                let n_lanes = options
-                    .writer_pool
-                    .current_num_threads()
-                    .clamp(1, MAX_LANES);
-                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
+                let open = OpenAppend::enter();
+                let n_lanes = lanes_for(options.writer_pool.current_num_threads(), open.count);
+                let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout)
+                    .map(|mut live| {
+                        live.open_append = Some(open);
+                        live
+                    });
                 let live = match opened {
                     Ok(live) => live,
                     Err(error) => {
@@ -3642,6 +3644,45 @@ struct LiveLanes {
     /// The least a lane's threshold is set to: the builder's own default,
     /// as a commit-time piece gets; lowered by tests to reach the bound.
     threshold_floor: usize,
+    /// This append's place among those with lanes open, released with the
+    /// lanes.
+    open_append: Option<OpenAppend>,
+}
+
+/// Appends in this process with live lanes open.
+static OPEN_APPENDS: AtomicUsize = AtomicUsize::new(0);
+
+/// One append counted in [`OPEN_APPENDS`] until it is dropped.
+struct OpenAppend {
+    /// Appends with lanes open when this one opened, itself included.
+    count: usize,
+}
+
+impl OpenAppend {
+    fn enter() -> Self {
+        Self {
+            count: OPEN_APPENDS.fetch_add(1, Ordering::Relaxed) + 1,
+        }
+    }
+}
+
+impl Drop for OpenAppend {
+    fn drop(&mut self) {
+        OPEN_APPENDS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Lanes an append opens on a pool of `threads` while `open` appends,
+/// itself included, have lanes open: an even share of the threads, at
+/// least one. A lone append takes the whole pool. Every lane interns its
+/// own copy of the vocabulary and grows its own posting vectors, so lanes
+/// past the threads that can feed them buy nothing; at one per thread for
+/// each of 32 appends on a 178-thread pool, 5,700 lanes' allocations held
+/// the process's memory-map lock and left the host idle for seconds at a
+/// time: a 1B-row ingest took 60.6 s where an even share took 46.4 s. The
+/// lanes do not change what is written, only how the tokenising is split.
+fn lanes_for(threads: usize, open: usize) -> usize {
+    (threads / open.max(1)).clamp(1, MAX_LANES)
 }
 
 /// One lane: its accumulator, and the commit rows its documents are, as
@@ -3681,6 +3722,7 @@ impl LiveLanes {
             reservations: Vec::new(),
             fts_bytes: 0,
             threshold_floor: DEFAULT_SPILL_THRESHOLD_BYTES,
+            open_append: None,
         })
     }
 
@@ -17377,6 +17419,20 @@ mod tests {
     /// rows no other's overlaps. Positions are on and the rows are skewed,
     /// so a document length at the wrong row or a cut at the wrong row
     /// shows.
+    /// An append's lanes are an even share of the pool among the appends
+    /// with lanes open: the whole pool alone, never none, and never past the
+    /// most a merged order can name.
+    #[test]
+    fn an_append_takes_an_even_share_of_the_pool_in_lanes() {
+        const POOL: usize = 178;
+        assert_eq!(lanes_for(POOL, 1), POOL, "alone, the whole pool");
+        assert_eq!(lanes_for(POOL, 2), POOL / 2);
+        assert_eq!(lanes_for(POOL, 32), POOL / 32);
+        assert_eq!(lanes_for(POOL, POOL * 4), 1, "never none");
+        assert_eq!(lanes_for(POOL, 0), POOL, "an empty count reads as one");
+        assert_eq!(lanes_for(MAX_LANES * 2, 1), MAX_LANES);
+    }
+
     #[test]
     fn live_pieces_seal_the_same_table_a_commit_time_build_makes() {
         const ROWS_PER_BATCH: usize = 2_000;

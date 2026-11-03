@@ -5376,7 +5376,10 @@ mod tests {
     #[test]
     fn lanes_cut_at_the_finish_write_the_blobs_single_builders_write() {
         const N_DOCS: u32 = 500;
-        const LANES: u32 = 3;
+        /// Lane counts the rows are fed through: one, a few, and more lanes
+        /// than slices of rows, since how many lanes an append opens depends
+        /// on how many appends are open at once.
+        const LANE_COUNTS: [u32; 4] = [1, 2, 3, 80];
         const SLICE: u32 = 7;
         const CUT: u32 = 213;
         let text_of = |i: u32| {
@@ -5393,20 +5396,26 @@ mod tests {
             text
         };
         let single = |first: u32, past: u32| single_blob(first, past, &text_of);
-        let from_view = |pieces: Vec<Range<u32>>, piece: usize| {
-            lanes_blob(N_DOCS, LANES, SLICE, &text_of, pieces, piece)
-        };
-        assert_eq!(from_view(vec![0..N_DOCS; 1], 0), single(0, N_DOCS), "whole");
-        assert_eq!(
-            from_view(vec![0..CUT, CUT..N_DOCS], 0),
-            single(0, CUT),
-            "first piece"
-        );
-        assert_eq!(
-            from_view(vec![0..CUT, CUT..N_DOCS], 1),
-            single(CUT, N_DOCS),
-            "second piece"
-        );
+        for lanes in LANE_COUNTS {
+            let from_view = |pieces: Vec<Range<u32>>, piece: usize| {
+                lanes_blob(N_DOCS, lanes, SLICE, &text_of, pieces, piece)
+            };
+            assert_eq!(
+                from_view(vec![0..N_DOCS; 1], 0),
+                single(0, N_DOCS),
+                "whole, {lanes} lanes"
+            );
+            assert_eq!(
+                from_view(vec![0..CUT, CUT..N_DOCS], 0),
+                single(0, CUT),
+                "first piece, {lanes} lanes"
+            );
+            assert_eq!(
+                from_view(vec![0..CUT, CUT..N_DOCS], 1),
+                single(CUT, N_DOCS),
+                "second piece, {lanes} lanes"
+            );
+        }
 
         // A lane whose stretches do not cover its documents is refused.
         let mut lane = two_column_builder();
