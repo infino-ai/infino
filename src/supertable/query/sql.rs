@@ -62,14 +62,19 @@ use arrow::{
 use arrow_array::{Array, Decimal128Array, Int64Array, new_empty_array};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::{
-    common::{Column, ScalarValue},
+    common::{Column, DFSchema, ScalarValue},
     dataframe::DataFrame,
     datasource::DefaultTableSource,
     error::DataFusionError,
     execution::{TaskContext, context::SessionContext},
-    functions_aggregate::count::count_all,
-    logical_expr::{Expr, LogicalPlan},
+    functions_aggregate::{count::count_all, expr_fn::count},
+    logical_expr::{
+        Expr, ExprFunctionExt, LogicalPlan, lit, simplify::SimplifyContext,
+        utils::split_conjunction,
+    },
+    optimizer::simplify_expressions::ExprSimplifier,
 };
+use futures::future::try_join_all;
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
@@ -457,6 +462,79 @@ impl SupertableReader {
         .map_err(QueryError::internal)
     }
 
+    /// The live rows each of `predicates` holds, in order, exactly as
+    /// `SELECT COUNT(*) FILTER (WHERE p) ...` counts them.
+    ///
+    /// Counted with no statement planned when every predicate, simplified, is
+    /// one interval on one range-indexed column, or the literal `true` (every
+    /// live row), and every superfile it keeps carries that column's range
+    /// index ([`Self::count_where_from_index`]). Otherwise the counts run as
+    /// one aggregate, built as a plan.
+    pub(crate) fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, QueryError> {
+        let _foreground = ForegroundQueryGuard::enter();
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let schema = DFSchema::try_from(self.sql_schemas().scan().as_ref().clone())
+            .map_err(QueryError::DataFusion)?;
+        let simplifier = ExprSimplifier::new(
+            SimplifyContext::builder()
+                .with_schema(Arc::new(schema))
+                .build(),
+        );
+        let predicates = predicates
+            .iter()
+            .map(|predicate| simplifier.simplify(predicate.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| QueryError::InvalidQuery(format!("count_where: {e}")))?;
+        if let Some(counts) = self.count_where_from_index(&predicates)? {
+            return Ok(counts);
+        }
+        let aggregates = count_where_exprs(predicates).map_err(QueryError::DataFusion)?;
+        let n = aggregates.len();
+        let ctx = self.sql_session_context()?;
+        let op_stats = op_stats::current();
+        let drive = async move {
+            let df = ctx
+                .table(TABLE_NAME)
+                .await
+                .and_then(|table| table.aggregate(Vec::new(), aggregates))
+                .map_err(QueryError::DataFusion)?;
+            Self::collect_metered_df(df, ctx.task_ctx(), &op_stats).await
+        };
+        count_where_row(&self.block_on(drive)?, n)
+    }
+
+    /// [`Self::count_where`] from the range index, the manifest and the
+    /// tombstones alone. `None` when a predicate is not one interval on one
+    /// range-indexed column nor the literal `true`, or a superfile it keeps
+    /// has no range index over the column.
+    fn count_where_from_index(&self, predicates: &[Expr]) -> Result<Option<Vec<u64>>, QueryError> {
+        let provider = op_stats::suppressed(|| self.sql_provider());
+        let mut counted = Vec::with_capacity(predicates.len());
+        for predicate in predicates {
+            if matches!(
+                predicate,
+                Expr::Literal(ScalarValue::Boolean(Some(true)), _)
+            ) {
+                counted.push((None, Vec::new()));
+                continue;
+            }
+            let Some(range) = provider.counted_range(predicate) else {
+                return Ok(None);
+            };
+            let filters = split_conjunction(predicate).into_iter().cloned().collect();
+            counted.push((Some(range), filters));
+        }
+        let provider = &provider;
+        let counts = self
+            .block_on(try_join_all(counted.iter().map(|(range, filters)| {
+                provider.indexed_rows(range.as_ref(), filters)
+            })))
+            .map_err(QueryError::DataFusion)?;
+        Ok(counts.into_iter().collect())
+    }
+
     /// The pushdown-aware provider over this reader's pinned snapshot,
     /// merging value counts through the table's carried sums.
     fn sql_provider(&self) -> SupertableProvider {
@@ -678,6 +756,63 @@ impl Supertable {
             .map_err(InfinoError::from)
             .map_err(|e| e.with_context("value_counts", None))
     }
+
+    /// The live rows each of `predicates` holds over the current snapshot —
+    /// see [`SupertableReader::count_where`].
+    pub fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        self.reader()?
+            .count_where(predicates)
+            .map_err(InfinoError::from)
+            .map_err(|e| e.with_context("count_where", None))
+    }
+}
+
+/// The name [`SupertableReader::count_where`]'s aggregate gives the count of
+/// its `i`-th predicate; a hosted table's statement names them the same way.
+fn count_where_name(i: usize) -> String {
+    format!("count_{i}")
+}
+
+/// One `COUNT(*) FILTER (WHERE p)` per predicate, named by
+/// [`count_where_name`]: the aggregate [`SupertableReader::count_where`] runs
+/// when the range index cannot answer, and a hosted table sends.
+pub(crate) fn count_where_exprs(
+    predicates: impl IntoIterator<Item = Expr>,
+) -> Result<Vec<Expr>, DataFusionError> {
+    predicates
+        .into_iter()
+        .enumerate()
+        .map(|(i, predicate)| {
+            count(lit(1i64))
+                .filter(predicate)
+                .build()
+                .map(|counted| counted.alias(count_where_name(i)))
+        })
+        .collect()
+}
+
+/// The `n` counts of a [`SupertableReader::count_where`] aggregate's one row,
+/// by [`count_where_name`].
+pub(crate) fn count_where_row(batches: &[RecordBatch], n: usize) -> Result<Vec<u64>, QueryError> {
+    let row = batches
+        .iter()
+        .find(|batch| batch.num_rows() > 0)
+        .ok_or_else(|| {
+            QueryError::Internal("count_where: the counts came back with no row".to_string())
+        })?;
+    (0..n)
+        .map(|i| {
+            let name = count_where_name(i);
+            let column = row
+                .column_by_name(&name)
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| {
+                    QueryError::Internal(format!("count_where: no Int64 column `{name}`"))
+                })?;
+            u64::try_from(column.value(0))
+                .map_err(|_| QueryError::Internal(format!("count_where: `{name}` is negative")))
+        })
+        .collect()
 }
 
 /// Drain `_id`-only batches into a `Vec<i128>`. The supertable's

@@ -621,6 +621,14 @@ export class Table {
     return guard(this.remote, () => this.inner.count(column, query, opts.mode));
   }
 
+  /** The rows each SQL predicate (e.g. `"price > 500"`) holds, one count per
+   * predicate in order; `"true"` counts every row. Counted from the range
+   * index without running a query when each predicate is one range on one
+   * range-indexed column; one aggregate runs otherwise. */
+  countWhere(predicates: string[]): number[] {
+    return guard(this.remote, () => this.inner.countWhere(predicates));
+  }
+
   /** `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
    * GROUP BY column` gives them: one record per value with its `count(*)`, a
    * null value for the rows that hold none (or an Arrow `Table`). Read from

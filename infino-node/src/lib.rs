@@ -1255,6 +1255,20 @@ impl Table {
         Ok(n as i64)
     }
 
+    /// The rows each SQL `predicate` (e.g. `"price > 500"`) holds, one count
+    /// per predicate in order; `"true"` counts every row. Counted from the
+    /// range index without running a query when each predicate is one range
+    /// on one range-indexed column; one aggregate runs otherwise.
+    #[napi]
+    pub fn count_where(&self, predicates: Vec<String>) -> Result<Vec<i64>> {
+        let exprs = predicates
+            .iter()
+            .map(|predicate| self.parse_predicate(predicate))
+            .collect::<Result<Vec<_>>>()?;
+        let counts = self.inner.count_where(&exprs).map_err(map_err)?;
+        Ok(counts.into_iter().map(|n| n as i64).collect())
+    }
+
     /// `column`'s rows counted per value, as `SELECT column, COUNT(*) ...
     /// GROUP BY column` gives them: Arrow rows of each value and its
     /// `count(*)`, with a null value for the rows that hold none. Read from

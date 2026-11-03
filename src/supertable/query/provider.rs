@@ -832,30 +832,10 @@ impl SupertableProvider {
         range: Option<&CountedRange>,
         filters: &[Expr],
     ) -> DfResult<u64> {
-        let survivors = self.select_survivors(filters).await?;
-        if survivors.is_empty() {
-            return Ok(0);
-        }
-        let now = Instant::now();
-        self.prefetch_tombstones(&survivors, now).await;
-        let Some(range) = range else {
-            let mut live = 0u64;
-            for entry in &survivors {
-                let deleted = match self.tombstone_cache.as_ref() {
-                    Some(cache) => cache
-                        .bitmap_for(entry.superfile_id, now)
-                        .map_err(QueryError::tombstone_cache)?
-                        .len(),
-                    None => 0,
-                };
-                live += entry.n_docs - deleted;
-            }
-            return Ok(live);
-        };
-        let (total, unindexed) = self.range_index_count(&survivors, range, now).await?;
-        if unindexed.is_empty() {
+        let (total, unindexed) = self.index_count(range, filters).await?;
+        let Some(range) = range.filter(|_| !unindexed.is_empty()) else {
             return Ok(total);
-        }
+        };
         let rows = self
             .unindexed_range_rows(state, unindexed, range, filters)
             .await?;
@@ -865,6 +845,49 @@ impl SupertableProvider {
             .map(RecordBatch::num_rows)
             .sum();
         Ok(total + scanned as u64)
+    }
+
+    /// [`Self::counted_rows`] from the range index, the manifest and the
+    /// tombstones alone, with no scan and so no session: `None` when a
+    /// superfile the filters keep has no range index over the column.
+    pub(crate) async fn indexed_rows(
+        &self,
+        range: Option<&CountedRange>,
+        filters: &[Expr],
+    ) -> DfResult<Option<u64>> {
+        let (total, unindexed) = self.index_count(range, filters).await?;
+        Ok(unindexed.is_empty().then_some(total))
+    }
+
+    /// The rows the filters' superfiles hold by their range index (every
+    /// live row with no `range`), and the superfiles with no range index
+    /// over the column, which the count leaves out.
+    async fn index_count(
+        &self,
+        range: Option<&CountedRange>,
+        filters: &[Expr],
+    ) -> DfResult<(u64, HashSet<Uuid>)> {
+        let survivors = self.select_survivors(filters).await?;
+        if survivors.is_empty() {
+            return Ok((0, HashSet::new()));
+        }
+        let now = Instant::now();
+        self.prefetch_tombstones(&survivors, now).await;
+        if let Some(range) = range {
+            return self.range_index_count(&survivors, range, now).await;
+        }
+        let mut live = 0u64;
+        for entry in &survivors {
+            let deleted = match self.tombstone_cache.as_ref() {
+                Some(cache) => cache
+                    .bitmap_for(entry.superfile_id, now)
+                    .map_err(QueryError::tombstone_cache)?
+                    .len(),
+                None => 0,
+            };
+            live += entry.n_docs - deleted;
+        }
+        Ok((live, HashSet::new()))
     }
 
     /// A row of range counts, one per bucket, over this provider's snapshot

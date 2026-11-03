@@ -18,6 +18,7 @@ use arrow_schema::SchemaRef;
 use datafusion::{
     common::TableReference,
     datasource::{empty::EmptyTable, provider_as_source},
+    error::DataFusionError,
     logical_expr::LogicalPlanBuilder,
     prelude::Expr,
     sql::unparser::{expr_to_sql, plan_to_sql},
@@ -32,7 +33,10 @@ use crate::{
     dynamic::rows_to_batch,
     superfile::VectorSearchOptions,
     supertable::{
-        query::sql::{conform_value_counts, value_count_exprs, value_count_schema},
+        query::sql::{
+            conform_value_counts, count_where_exprs, count_where_row, value_count_exprs,
+            value_count_schema,
+        },
         reindex::{PlannedRepair, ReindexReport, StalenessReport},
         schema::{TableSchema, change::SchemaPatch},
     },
@@ -94,6 +98,29 @@ fn value_count_sql(table: &str, schema: &SchemaRef, column: &str) -> Result<Stri
                 "cannot express value_counts over the remote transport: {e}"
             ))
         })
+}
+
+/// `SELECT COUNT(*) FILTER (WHERE p) AS count_0, ... FROM table` over a hosted
+/// table, built as a plan over a table of `schema` and unparsed as
+/// [`value_count_sql`] is.
+fn count_where_sql(
+    table: &str,
+    schema: &SchemaRef,
+    predicates: &[Expr],
+) -> Result<String, InfinoError> {
+    let fail = |e: DataFusionError| {
+        InfinoError::Query(format!(
+            "cannot express count_where over the remote transport: {e}"
+        ))
+    };
+    let aggregates = count_where_exprs(predicates.iter().cloned()).map_err(fail)?;
+    let source = provider_as_source(Arc::new(EmptyTable::new(Arc::clone(schema))));
+    LogicalPlanBuilder::scan(TableReference::bare(table), source, None)
+        .and_then(|scan| scan.aggregate(Vec::<Expr>::new(), aggregates))
+        .and_then(|counted| counted.build())
+        .and_then(|plan| plan_to_sql(&plan))
+        .map(|statement| statement.to_string())
+        .map_err(fail)
 }
 
 /// Refuse test-only vector tuning overrides on the remote transport. The
@@ -264,6 +291,17 @@ impl Table for RemoteTable {
         let sql = value_count_sql(&self.table_name, &self.schema, column)?;
         let batches = self.catalog.query_sql(&sql)?;
         Ok(conform_value_counts(&batches, &schema)?)
+    }
+
+    /// The wire has no predicate-count call, so the counts travel as one SQL
+    /// aggregate ([`count_where_sql`]) and the hosted side answers it.
+    fn count_where(&self, predicates: &[Expr]) -> Result<Vec<u64>, InfinoError> {
+        if predicates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = count_where_sql(&self.table_name, &self.schema, predicates)?;
+        let batches = self.catalog.query_sql(&sql)?;
+        Ok(count_where_row(&batches, predicates.len())?)
     }
 
     fn count(&self, column: &str, query: &str, mode: BoolMode) -> Result<u64, InfinoError> {

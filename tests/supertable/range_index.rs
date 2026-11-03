@@ -214,6 +214,64 @@ fn assert_same_answers(db: &Connection, queries: &[&str], when: &str) {
             "{when}: {query}"
         );
     }
+    assert_same_counts(db, when);
+}
+
+/// `count_where` on both tables, and the same counts as SQL `COUNT(*) FILTER`
+/// statements on the plain table: ranges the index counts, a `true`, a
+/// conjunct that simplifies away, and shapes it must leave to the aggregate.
+fn assert_same_counts(db: &Connection, when: &str) {
+    let predicates = [
+        (lit(true), "true"),
+        (col("qty").gt(lit(100)), "qty > 100"),
+        (
+            lit(1).eq(lit(1)).and(col("price").gt(lit(500.0))),
+            "1 = 1 AND price > 500.0",
+        ),
+        (
+            col("price")
+                .gt_eq(lit(250))
+                .and(col("price").lt(lit(750.5))),
+            "price >= 250 AND price < 750.5",
+        ),
+        (col("seq").lt(lit(1000i64)), "seq < 1000"),
+        (
+            col("qty").gt(lit(240)).or(col("price").lt(lit(1.0))),
+            "qty > 240 OR price < 1.0",
+        ),
+        (
+            col("qty").gt(lit(0)).and(col("price").gt(lit(500.0))),
+            "qty > 0 AND price > 500.0",
+        ),
+    ];
+    let exprs: Vec<_> = predicates.iter().map(|(expr, _)| expr.clone()).collect();
+    let sql = format!(
+        "SELECT {} FROM plain",
+        predicates
+            .iter()
+            .map(|(_, sql)| format!("count(*) FILTER (WHERE {sql})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let batches = db.query_sql(&sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    let expected: Vec<u64> = (0..predicates.len())
+        .map(|i| {
+            let column = batches[0].column(i);
+            let counts = column
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("an Int64 count");
+            u64::try_from(counts.value(0)).expect("a count")
+        })
+        .collect();
+    for table in ["ranged", "plain"] {
+        let counts = db
+            .open_table(table)
+            .expect("open")
+            .count_where(&exprs)
+            .unwrap_or_else(|e| panic!("{when}: count_where on {table}: {e}"));
+        assert_eq!(counts, expected, "{when}: count_where on {table}");
+    }
 }
 
 #[test]
