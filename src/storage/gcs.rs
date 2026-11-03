@@ -22,12 +22,13 @@ use object_store::{
     ObjectMeta as OsMeta, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload,
     UpdateVersion,
     gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
+    multipart::MultipartStore,
     path::Path as ObjPath,
 };
 
 use super::{
     ObjectMeta, StorageError, StorageOptions, StorageProvider, child_prefix_names, counting,
-    io_counters, logical_list_key, options::apply, retry,
+    hedged_multipart::HedgedUpload, io_counters, logical_list_key, options::apply, retry,
 };
 use crate::runtime_metrics::io::UsageMeter;
 
@@ -482,14 +483,17 @@ impl StorageProvider for GcsStorageProvider {
 
     async fn put_multipart(&self, uri: &str) -> Result<Box<dyn MultipartUpload>, StorageError> {
         let path = self.path(uri)?;
-        let upload = self
-            .store
-            .put_multipart(&path)
+        // A part the store holds is sent again under its part number, so one
+        // held part cannot hold the whole object (see `hedged_multipart`).
+        let upload = HedgedUpload::start(Arc::clone(&self.store) as Arc<dyn MultipartStore>, path)
             .await
             .map_err(|e| translate(uri, e))?;
         // CreateMultipartUpload is billable; count only after the session exists.
         self.meter.record_put(0);
-        Ok(counting::wrap_multipart(upload, Arc::clone(&self.meter)))
+        Ok(counting::wrap_multipart(
+            Box::new(upload),
+            Arc::clone(&self.meter),
+        ))
     }
 
     async fn delete(&self, uri: &str) -> Result<(), StorageError> {

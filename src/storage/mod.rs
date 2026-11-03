@@ -43,6 +43,7 @@ use thiserror::Error;
 pub mod azure;
 pub(crate) mod counting;
 pub mod gcs;
+mod hedged_multipart;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
