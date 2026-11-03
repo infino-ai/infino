@@ -46,6 +46,7 @@ pub mod gcs;
 pub mod local_fs;
 pub(crate) mod options;
 mod retry;
+pub(crate) use retry::stuck_after;
 pub mod s3;
 
 pub use azure::AzureStorageProvider;

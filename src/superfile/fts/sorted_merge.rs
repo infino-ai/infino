@@ -662,3 +662,116 @@ impl<'a> TermChunks<'a> {
 fn read_error(e: FtsError) -> BuildError {
     BuildError::Io(Error::other(format!("fts sorted merge: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{LargeStringArray, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::{
+        superfile::{
+            SuperfileReader,
+            builder::{BuilderOptions, FtsConfig, SuperfileBuilder},
+        },
+        test_helpers::decimal128_ids,
+    };
+
+    /// Inputs in the walk test, each holding a different stretch of terms
+    /// with some shared by all.
+    const INPUTS: u64 = 5;
+    /// Documents per input.
+    const DOCS: u64 = 400;
+
+    fn input(n: u64) -> SuperfileReader {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let opts = BuilderOptions::new(
+            Arc::clone(&schema),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let mut builder = SuperfileBuilder::new(opts).expect("builder");
+        let ids: Vec<u64> = (n * DOCS..(n + 1) * DOCS).collect();
+        let titles: Vec<String> = ids
+            .iter()
+            .map(|&i| format!("shared w{} w{} own{n}x{}", i % 97, (i * 7) % 211, i % 13))
+            .collect();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids(ids)),
+                Arc::new(LargeStringArray::from(titles)),
+            ],
+        )
+        .expect("batch");
+        builder.add_batch(&batch, &[]).expect("add_batch");
+        SuperfileReader::open(Bytes::from(builder.finish().expect("finish"))).expect("open")
+    }
+
+    /// Every term of a walk, in order, with the inputs that hold it.
+    fn walked(
+        readers: &[&FtsReader],
+        dicts: &[Bytes],
+        start: Option<Vec<u8>>,
+        end: Option<Vec<u8>>,
+    ) -> Vec<(Vec<u8>, Vec<usize>)> {
+        let mut out = Vec::new();
+        walk_range(readers, dicts, 0, start, end, |batch| {
+            for term in &batch.terms {
+                out.push((
+                    batch.term_bytes[term.term.clone()].to_vec(),
+                    batch.inputs[term.inputs.clone()]
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .collect(),
+                ));
+            }
+            true
+        })
+        .expect("walk");
+        out
+    }
+
+    /// The ranges a column is walked in cover its terms once each, in
+    /// order: their walks, one after another, are the one walk.
+    #[test]
+    fn a_walk_in_ranges_is_the_whole_walk_in_order() {
+        let inputs: Vec<SuperfileReader> = (0..INPUTS).map(input).collect();
+        let readers: Vec<&FtsReader> = inputs.iter().map(|r| r.fts().expect("fts")).collect();
+        let dicts: Vec<Bytes> = readers
+            .iter()
+            .map(|f| f.dict_bytes().expect("dict"))
+            .collect();
+        let ranges = walk_ranges(&readers, &dicts, 0).expect("ranges");
+        assert_eq!(
+            ranges.len(),
+            WALK_RANGES,
+            "a column past the floor is split"
+        );
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "each range starts where the last ends"
+            );
+            assert!(pair[1].0 > pair[0].0, "cut keys rise");
+        }
+        assert_eq!(
+            (ranges[0].0.as_ref(), ranges[WALK_RANGES - 1].1.as_ref()),
+            (None, None)
+        );
+        let whole = walked(&readers, &dicts, None, None);
+        let pieced: Vec<_> = ranges
+            .into_iter()
+            .flat_map(|(start, end)| walked(&readers, &dicts, start, end))
+            .collect();
+        assert!(whole.len() > WALK_SPLIT_MIN_TERMS);
+        assert_eq!(pieced, whole);
+    }
+}

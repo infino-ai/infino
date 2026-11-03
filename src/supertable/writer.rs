@@ -128,7 +128,7 @@ use crate::{
         op_stats::{self, OpStatsCollector, timed_kernel},
         rss::available_memory_bytes,
     },
-    storage::{StorageError, StorageProvider},
+    storage::{StorageError, StorageProvider, stuck_after},
     superfile::{
         BuildError as SuperfileBuildError, FtsError, ReadError, SuperfileReader,
         builder::{BuilderOptions, SuperfileBuilder, VectorConfig, index_fts_rows},
@@ -2642,15 +2642,15 @@ impl SupertableWriter {
                 if self.buffer_visible_scalar_bytes < target_bytes {
                     return;
                 }
-                // One lane per pool thread, but no more than the rows can
-                // use: every lane is a builder with its own dictionary, and
-                // the freeze merges all of them, so a 5M-row append fed
-                // through 180 lanes on a wide host pays for 180 small
-                // dictionaries and a 180-way term merge for tokenisation it
-                // could do on a few dozen threads. Concurrent appends fill
-                // the pool between them.
-                let buffered_rows: usize = self.buffer.iter().map(|b| b.scalar.num_rows()).sum();
-                let n_lanes = lane_count(options.writer_pool.current_num_threads(), buffered_rows);
+                // The lanes are opened once, before the append's rows are
+                // all known, so their count follows the pool, not the rows
+                // buffered so far: those are one superfile's worth, and a
+                // large append fed through the few lanes they would ask for
+                // would tokenise on a few threads.
+                let n_lanes = options
+                    .writer_pool
+                    .current_num_threads()
+                    .clamp(1, MAX_LANES);
                 let opened = LiveLanes::open(Arc::clone(manifest), n_lanes, options.vector_layout);
                 let live = match opened {
                     Ok(live) => live,
@@ -3635,20 +3635,6 @@ fn reserve_build_scratch(
 /// it just buffered and returns; the next append (or the commit) first
 /// waits for that feed to finish, so the caller blocks only when
 /// tokenizing is slower than its own reading.
-/// Rows a live lane should tokenise at the least. Lanes cost a dictionary
-/// each and a lane-wide term merge at the freeze, so a buffer is fed through
-/// as many lanes as hold this many rows, up to the pool's width: a wide host
-/// does not open a lane per thread for a buffer that cannot fill them.
-const LANE_MIN_ROWS: usize = 1 << 16;
-
-/// How many live lanes a buffer of `rows` rows is fed through on a pool of
-/// `threads` threads: one per [`LANE_MIN_ROWS`] rows, at least one, at most
-/// the pool's width and [`MAX_LANES`].
-fn lane_count(threads: usize, rows: usize) -> usize {
-    let by_rows = rows.div_ceil(LANE_MIN_ROWS).max(1);
-    by_rows.min(threads.max(1)).min(MAX_LANES)
-}
-
 struct LiveLanes {
     /// The manifest the lanes were opened against. A commit under a
     /// different schema cannot seal them.
@@ -13760,23 +13746,11 @@ fn encode_record_batch_ipc(batch: &RecordBatch) -> Result<Bytes, String> {
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
 
-/// How long a content-addressed PUT below the multipart threshold runs
-/// alone before a second attempt starts beside it, plus the object's bytes
-/// at [`HEDGE_BYTES_PER_SEC`]. The stores answer an 8 MB PUT in under half
-/// a second and now and then hold one for the whole request timeout: one
-/// such PUT held a billion-row ingest's commit for a minute. The attempts
-/// write the same bytes under the same name, so the one that lands second
-/// is refused as already present, which the caller takes as success.
-const HEDGE_AFTER_BASE: time::Duration = time::Duration::from_secs(2);
-
-/// The rate the hedge's delay grants an object before its second attempt:
-/// well under what one connection moves, so a PUT that is merely large is
-/// not hedged for its size.
-const HEDGE_BYTES_PER_SEC: u64 = 4 << 20;
-
-/// PUT `bytes` at `uri` as a new object, starting a second attempt after
-/// [`HEDGE_AFTER_BASE`] and the object's share of [`HEDGE_BYTES_PER_SEC`]
-/// if the first has not answered. The first attempt to land wins; one that
+/// PUT `bytes` at `uri` as a new object, starting a second attempt once the
+/// first has run long enough to be taken for stuck (see [`stuck_after`]).
+/// The stores answer an 8 MB PUT in under half a second and now and then
+/// hold one for the whole request timeout: one such PUT held a billion-row
+/// ingest's commit for a minute. The first attempt to land wins; one that
 /// fails waits for the other, so a quick refusal of the hedge cannot cancel
 /// a slow first attempt that would have landed, and the PUT fails only if
 /// both do. Only for an object whose name is its content: a second attempt
@@ -13787,8 +13761,7 @@ async fn put_new_hedged(
     uri: &str,
     bytes: Bytes,
 ) -> Result<(), StorageError> {
-    let delay = HEDGE_AFTER_BASE
-        + time::Duration::from_secs_f64(bytes.len() as f64 / HEDGE_BYTES_PER_SEC as f64);
+    let delay = stuck_after(bytes.len() as u64);
     let mut first = pin!(storage.put_atomic(uri, bytes.clone()));
     tokio::select! {
         answer = &mut first => answer.map(|_| ()),
@@ -13998,21 +13971,6 @@ pub(crate) fn read_vector_layout_from_bytes(bytes: &Bytes) -> VectorLayout {
 #[cfg(test)]
 mod tests {
     use crate::supertable::manifest::ScalarStats;
-    #[test]
-    fn lane_count_follows_the_rows_up_to_the_pool() {
-        // A small buffer gets one lane however wide the pool.
-        assert_eq!(lane_count(180, 1_000), 1);
-        // One lane per LANE_MIN_ROWS rows while the pool has threads to spare.
-        assert_eq!(
-            lane_count(180, 5_000_000),
-            5_000_000usize.div_ceil(LANE_MIN_ROWS)
-        );
-        // Never more lanes than threads, nor than a merged order can name.
-        assert_eq!(lane_count(8, 5_000_000), 8);
-        assert_eq!(lane_count(1_000, 1_000_000_000), MAX_LANES);
-        assert_eq!(lane_count(0, 0), 1);
-    }
-
     #[test]
     fn open_blob_inlines_each_open_range_only_while_it_is_small() {
         // A 16 MiB "superfile": the parquet tail is the last 64 KiB; an
@@ -14848,7 +14806,7 @@ mod tests {
             held: "hedged",
             first: AtomicBool::new(true),
             puts: AtomicUsize::new(0),
-            first_lands_after: Some(HEDGE_AFTER_BASE * 4),
+            first_lands_after: Some(stuck_after(0) * 4),
         };
         let reference =
             put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
@@ -17162,11 +17120,7 @@ mod tests {
                 |w| {
                     assert_eq!(w.live.is_some(), live);
                     if let Some(lanes) = w.live.as_mut().and_then(|l| l.join().ok()) {
-                        assert_eq!(
-                            lanes.len(),
-                            lane_count(THREADS, ROWS_PER_BATCH * BATCHES),
-                            "one lane per 65k rows, at most one per thread"
-                        );
+                        assert_eq!(lanes.len(), THREADS, "one lane per thread");
                         assert!(lanes.iter().all(|lane| !lane.stretches.is_empty()));
                         w.live.as_mut().expect("live").lanes = Some(lanes);
                     }

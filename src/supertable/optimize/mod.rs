@@ -95,14 +95,21 @@ impl Supertable {
         }
         // Index the superfiles the term index does not list, a batch at a
         // time, and fold its layers in runs no larger than a compaction
-        // merge's input or half the free space of the scratch filesystem,
-        // whichever is more: a fold downloads its run to scratch before
-        // merging, so the space there is what bounds it. Under the merge
-        // cap alone a root of fifty layers folded in four passes, each
-        // reading its layers back from storage and publishing a root. Runs
-        // before gc so the sweep keeps the roots it publishes.
+        // merge's input, or than half the free space where the fold spills
+        // if that is more: a fold downloads its run there before merging,
+        // so a host with room folds a root of fifty layers in one pass
+        // where the merge cap alone took four, each reading its layers back
+        // from storage and publishing a root. The merge cap stays the floor,
+        // as it was before free space was read. Runs before gc so the sweep
+        // keeps the roots it publishes.
         if opts.steps.refresh_term_index {
-            let scratch_bytes = available_space(scratch_root()).map_or(0, |bytes| bytes / 2);
+            let spill_root = self
+                .inner()
+                .options
+                .term_index_build_policy()
+                .scratch_root
+                .unwrap_or_else(scratch_root);
+            let scratch_bytes = available_space(spill_root).map_or(0, |bytes| bytes / 2);
             let fold_max_bytes = max_merge_input_bytes(&opts.compaction).max(scratch_bytes);
             self.refresh_term_index_sync(fold_max_bytes)
                 .map_err(OptimizeError::from)?;

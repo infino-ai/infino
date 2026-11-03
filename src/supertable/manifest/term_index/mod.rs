@@ -628,17 +628,19 @@ pub(crate) async fn append_reserved_run(
     let mut root = prior.unwrap_or_default();
     let mut rest = contributions;
     for segment in run.iter_mut() {
-        let Some((own, after)) = segment
-            .contributions
-            .checked_sub(0)
-            .filter(|n| *n <= rest.len())
-            .map(|n| rest.split_at(n))
-        else {
+        if segment.contributions > rest.len() {
             return Err(TermIndexError::Build(
                 "a publish's segments cover more contributions than it carries".into(),
             ));
-        };
+        }
+        let (own, after) = rest.split_at(segment.contributions);
         rest = after;
+        // An append that indexed nothing adds nothing to the root: on its
+        // own it would not have touched the root, and an empty layer would
+        // only bring the next fold forward.
+        if own.is_empty() {
+            continue;
+        }
         let base = root.superfiles.len() as u32;
         let reusable = segment.layer.as_ref().is_some_and(|r| r.built_from(own));
         if !reusable {
@@ -656,6 +658,13 @@ pub(crate) async fn append_reserved_run(
         root.superfiles.extend_from_slice(&reserved.superfiles);
         root.id_mins.extend_from_slice(&reserved.id_mins);
         root.layers.push(layer);
+    }
+    // A contribution no segment claims would be listed by the manifest and
+    // routed to by nothing.
+    if !rest.is_empty() {
+        return Err(TermIndexError::Build(
+            "a publish carries contributions no segment claims".into(),
+        ));
     }
     publish_root(storage, root, policy, pool).await
 }
@@ -8018,6 +8027,58 @@ mod tests {
             [Uuid::from_u128(10)]
         );
         assert!(posted_superfiles(&root, &local, "merged").await.is_empty());
+    }
+
+    /// In a run, an append that indexed nothing adds no layer, and a
+    /// contribution no segment claims fails the publish rather than being
+    /// listed and routed to by nothing.
+    #[tokio::test]
+    async fn a_run_adds_no_layer_for_an_unindexed_append_and_refuses_an_unclaimed_contribution() {
+        let dir = TempDir::new().expect("tempdir");
+        let policy = BuildPolicy::default();
+        let (_store_dir, local, prior) = store_with_base(&dir, &policy).await;
+        let indexed = [contribution(&dir, 9, &[("body", "indexed", 1)])];
+        let mut run = [
+            ReservedSegment {
+                contributions: 1,
+                layer: None,
+            },
+            ReservedSegment {
+                contributions: 0,
+                layer: None,
+            },
+        ];
+        let reference = append_reserved_run(
+            &local,
+            Some(prior.clone()),
+            &indexed,
+            &policy,
+            &mut run,
+            None,
+        )
+        .await
+        .expect("run");
+        let root = load_root(local.as_ref(), &reference).await.expect("root");
+        assert_eq!(
+            root.layers.len(),
+            prior.layers.len() + 1,
+            "one layer, for the indexed append"
+        );
+        assert_eq!(
+            posted_superfiles(&root, &local, "indexed").await,
+            [Uuid::from_u128(9)]
+        );
+
+        let mut short = [ReservedSegment {
+            contributions: 0,
+            layer: None,
+        }];
+        assert!(
+            append_reserved_run(&local, Some(prior), &indexed, &policy, &mut short, None)
+                .await
+                .is_err(),
+            "a contribution no segment claims"
+        );
     }
 
     /// Superfiles other commits list before a retry in the move tests.
