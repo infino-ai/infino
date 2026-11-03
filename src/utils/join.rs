@@ -6,6 +6,7 @@
 
 use std::{
     future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, mpsc::sync_channel},
 };
 
@@ -64,8 +65,13 @@ where
 /// phase: a commit's lanes froze in a fraction of a second and then sat
 /// for tens of seconds while the thread that owned them worked elsewhere,
 /// and the pool ran at half its width. Every task reports before this
-/// returns, so a failed task's siblings finish rather than outlive it; a
-/// task that ends without reporting (a panic) is `lost`'s error.
+/// returns, so a failed task's siblings finish rather than outlive it.
+///
+/// A task that panics is `lost`'s error: the panic is caught in the task,
+/// since a pool with no panic handler aborts the process on a spawned
+/// job's panic. Each task lets go of `work` before it reports, so once
+/// this returns no task holds anything `work` captured: a caller that
+/// shared state with the tasks through an `Arc` can take it back.
 pub(crate) fn run_spawned<T, R, E, F>(
     pool: &ThreadPool,
     items: Vec<T>,
@@ -84,9 +90,14 @@ where
     for (i, item) in items.into_iter().enumerate() {
         let (tx, work) = (tx.clone(), Arc::clone(&work));
         pool.spawn(move || {
-            // The receiver is gone only if the caller gave up; there is
-            // nobody left to tell.
-            let _ = tx.send((i, work(i, item)));
+            let result = catch_unwind(AssertUnwindSafe(|| work(i, item)));
+            drop(work);
+            // A panicked task reports nothing; its slot stays empty and the
+            // caller reads it as lost. The receiver is gone only if the
+            // caller gave up; there is nobody left to tell.
+            if let Ok(result) = result {
+                let _ = tx.send((i, result));
+            }
         });
     }
     drop(tx);
@@ -109,9 +120,85 @@ mod tests {
     };
 
     use futures::{FutureExt, poll};
+    use rayon::ThreadPoolBuilder;
     use tokio::time::{sleep, timeout};
 
     use super::*;
+
+    /// Tasks in each spawned run, more than the pool has threads.
+    const TASKS: usize = 64;
+    /// Threads in the spawned runs' pool.
+    const POOL_THREADS: usize = 4;
+
+    fn pool() -> ThreadPool {
+        ThreadPoolBuilder::new()
+            .num_threads(POOL_THREADS)
+            .build()
+            .expect("pool")
+    }
+
+    #[test]
+    fn spawned_results_come_back_in_the_items_order() {
+        let out = run_spawned(
+            &pool(),
+            (0..TASKS).collect(),
+            |i, item: usize| Ok::<_, String>(i * 1000 + item),
+            || "lost".to_string(),
+        )
+        .expect("every task reports");
+        assert_eq!(out, (0..TASKS).map(|i| i * 1001).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_failed_task_is_the_runs_error() {
+        let out = run_spawned(
+            &pool(),
+            (0..TASKS).collect(),
+            |_, item: usize| match item {
+                7 => Err("seven".to_string()),
+                _ => Ok(item),
+            },
+            || "lost".to_string(),
+        );
+        assert_eq!(out, Err("seven".to_string()));
+    }
+
+    /// A panic in a task is caught there and read as lost: a pool with no
+    /// panic handler would otherwise abort the process.
+    #[test]
+    fn a_panicking_task_is_lost_not_an_abort() {
+        let out = run_spawned(
+            &pool(),
+            (0..TASKS).collect(),
+            |_, item: usize| {
+                assert_ne!(item, 11, "a task that panics");
+                Ok::<_, String>(item)
+            },
+            || "lost".to_string(),
+        );
+        assert_eq!(out, Err("lost".to_string()));
+    }
+
+    /// Once the run returns, no task still holds what the work captured, so
+    /// state shared through an `Arc` can be taken back at once.
+    #[test]
+    fn the_work_is_released_before_the_run_returns() {
+        for _ in 0..TASKS {
+            let shared = Arc::new(vec![1u8; 1024]);
+            let held = Arc::clone(&shared);
+            run_spawned(
+                &pool(),
+                (0..TASKS).collect(),
+                move |_, _: usize| Ok::<_, String>(held.len()),
+                || "lost".to_string(),
+            )
+            .expect("every task reports");
+            assert!(
+                Arc::try_unwrap(shared).is_ok(),
+                "a task still held the shared state"
+            );
+        }
+    }
 
     /// Futures in each join, more than any limit below.
     const UNITS: usize = 20;

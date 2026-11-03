@@ -67,6 +67,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     ops::Range,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     pin::pin,
     str::from_utf8,
@@ -1474,7 +1475,7 @@ struct AppendQueueState {
     parked: BTreeMap<u64, ParkedPublish>,
     /// What a leading ticket published for the tickets it took on, by
     /// ticket, until each collects it.
-    results: BTreeMap<u64, Result<(), String>>,
+    results: BTreeMap<u64, Result<(), BuildError>>,
 }
 
 /// A publish ready to go, parked on the [`AppendQueue`].
@@ -1507,6 +1508,7 @@ impl AppendQueue {
             number: state.issued,
             leading: false,
             grouped: false,
+            followers: Vec::new(),
         };
         state.issued += 1;
         ticket
@@ -1523,8 +1525,7 @@ impl AppendQueue {
         let mut state = self.lock();
         if !state.publishing {
             state.publishing = true;
-            ticket.leading = true;
-            return Turn::Lead(take_run(&mut state, parked));
+            return Turn::Lead(lead_run(ticket, &mut state, parked));
         }
         state.parked.insert(ticket.number, parked);
         loop {
@@ -1534,33 +1535,60 @@ impl AppendQueue {
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(result) = state.results.remove(&ticket.number) {
                 ticket.grouped = true;
-                return Turn::Published(result.map_err(BuildError::Store));
+                return Turn::Published(result);
             }
             if !state.publishing && state.parked.keys().next() == Some(&ticket.number) {
                 state.publishing = true;
-                ticket.leading = true;
                 let mine = state
                     .parked
                     .remove(&ticket.number)
                     .expect("parked by this ticket; a leader that took it left a result");
-                return Turn::Lead(take_run(&mut state, mine));
+                return Turn::Lead(lead_run(ticket, &mut state, mine));
             }
         }
     }
 
-    /// Record what the leading ticket published for the `followers` it
-    /// took on, by ticket number, and wake them.
-    fn publish_followers(&self, followers: Vec<u64>, result: Result<(), String>) {
-        if followers.is_empty() {
-            return;
-        }
-        let mut state = self.lock();
-        for number in followers {
-            state.results.insert(number, result.clone());
-        }
-        drop(state);
-        self.turn.notify_all();
+    /// Record what the leading `ticket` published for the tickets it took
+    /// on, and wake them. Each sees the leader's error of the same kind, so
+    /// refused credentials or a lost race read the same to every append
+    /// the publish carried.
+    fn publish_followers(&self, ticket: &mut AppendTicket<'_>, result: &Result<(), BuildError>) {
+        answer_followers(self, ticket, |_| match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(error.for_follower()),
+        });
     }
+}
+
+/// Answer the tickets `ticket` took on with `outcome`, and wake them.
+fn answer_followers(
+    queue: &AppendQueue,
+    ticket: &mut AppendTicket<'_>,
+    outcome: impl Fn(u64) -> Result<(), BuildError>,
+) {
+    let followers = mem::take(&mut ticket.followers);
+    if followers.is_empty() {
+        return;
+    }
+    let mut state = queue.lock();
+    for number in followers {
+        state.results.insert(number, outcome(number));
+    }
+    drop(state);
+    queue.turn.notify_all();
+}
+
+/// Make `ticket` the leader of `mine` and the parked publishes it can take
+/// on, and record which tickets it owes an answer.
+fn lead_run(
+    ticket: &mut AppendTicket<'_>,
+    state: &mut AppendQueueState,
+    mine: ParkedPublish,
+) -> Vec<ParkedPublish> {
+    ticket.leading = true;
+    let run = take_run(state, mine);
+    ticket.followers = run[1..].iter().map(|parked| parked.number).collect();
+    run
 }
 
 /// `mine` and every parked publish its list metadata can share a publish
@@ -1591,6 +1619,8 @@ struct AppendTicket<'a> {
     leading: bool,
     /// Published by the ticket leading it.
     grouped: bool,
+    /// The tickets this one leads a publish for and has not yet answered.
+    followers: Vec<u64>,
 }
 
 impl Drop for AppendTicket<'_> {
@@ -1598,6 +1628,14 @@ impl Drop for AppendTicket<'_> {
         if !self.leading {
             return;
         }
+        // A leader that unwinds before it answers the tickets it took on
+        // would leave them waiting for ever: they are off the parked list,
+        // so none of them can lead. They fail as the leader did.
+        answer_followers(self.queue, self, |_| {
+            Err(BuildError::Store(
+                "the append publishing this one ended before it finished".into(),
+            ))
+        });
         let mut state = self.queue.lock();
         state.publishing = false;
         drop(state);
@@ -3432,11 +3470,9 @@ impl SupertableWriter {
         // turn in the run comes.
         let mut lead = run.remove(0);
         let mut segments = vec![lead.segment];
-        let mut followers = Vec::with_capacity(run.len());
         for follower in run {
             lead.batch.absorb(follower.batch);
             segments.push(follower.segment);
-            followers.push(follower.number);
         }
         let published = bridge_on_runtime(
             persist_superfile_publish_batch_async(
@@ -3447,12 +3483,12 @@ impl SupertableWriter {
             ),
             &runtime,
         );
-        self.inner.append_queue.publish_followers(
-            followers,
-            published.as_ref().map(drop).map_err(ToString::to_string),
-        );
+        let published = published.map(drop);
+        self.inner
+            .append_queue
+            .publish_followers(&mut ticket, &published);
         drop(ticket);
-        published.map(drop)
+        published
     }
 }
 
@@ -3754,37 +3790,43 @@ impl LiveLanes {
                     lane = i
                 )
                 .entered();
-                let fed = timed_kernel(&stats, || {
-                    lane.builder.set_spill_threshold_bytes(threshold);
-                    let mut base = first_row;
-                    for batch in batches.iter() {
-                        let rows = batch.num_rows();
-                        let (start, end) = (rows * i / n, rows * (i + 1) / n);
-                        if start < end {
-                            let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
-                            index_fts_rows(
-                                &mut lane.builder,
-                                &col_idxs,
-                                &batch.slice(start, end - start),
-                                first_doc,
-                            )?;
-                            let (row, len) = ((base + start) as u32, (end - start) as u32);
-                            match lane.stretches.last_mut() {
-                                // Rows that carry straight on from the last
-                                // stretch extend it.
-                                Some(s) if s.row + s.len == row => s.len += len,
-                                _ => lane.stretches.push(Stretch {
-                                    doc: first_doc,
-                                    row,
-                                    len,
-                                }),
+                // A panic is caught here and reported as the lane's error: a
+                // pool with no panic handler aborts the process on a spawned
+                // job's panic.
+                let fed = catch_unwind(AssertUnwindSafe(|| {
+                    timed_kernel(&stats, || {
+                        lane.builder.set_spill_threshold_bytes(threshold);
+                        let mut base = first_row;
+                        for batch in batches.iter() {
+                            let rows = batch.num_rows();
+                            let (start, end) = (rows * i / n, rows * (i + 1) / n);
+                            if start < end {
+                                let first_doc = lane.stretches.last().map_or(0, |s| s.doc + s.len);
+                                index_fts_rows(
+                                    &mut lane.builder,
+                                    &col_idxs,
+                                    &batch.slice(start, end - start),
+                                    first_doc,
+                                )?;
+                                let (row, len) = ((base + start) as u32, (end - start) as u32);
+                                match lane.stretches.last_mut() {
+                                    // Rows that carry straight on from the last
+                                    // stretch extend it.
+                                    Some(s) if s.row + s.len == row => s.len += len,
+                                    _ => lane.stretches.push(Stretch {
+                                        doc: first_doc,
+                                        row,
+                                        len,
+                                    }),
+                                }
                             }
+                            base += rows;
                         }
-                        base += rows;
-                    }
-                    Ok::<(), BuildError>(())
-                })
-                .map(|()| lane);
+                        Ok::<(), BuildError>(())
+                    })
+                    .map(|()| lane)
+                }))
+                .unwrap_or_else(|_| Err(BuildError::Store("a live lane's feed panicked".into())));
                 // The receiver is gone only if the writer was dropped
                 // mid-feed; there is nobody left to tell.
                 let _ = tx.send((i, fed));
@@ -13734,9 +13776,12 @@ const HEDGE_BYTES_PER_SEC: u64 = 4 << 20;
 
 /// PUT `bytes` at `uri` as a new object, starting a second attempt after
 /// [`HEDGE_AFTER_BASE`] and the object's share of [`HEDGE_BYTES_PER_SEC`]
-/// if the first has not answered; the first answer wins. Only for an
-/// object whose name is its content: a second attempt that lands second
-/// is refused as already present, which is the same outcome.
+/// if the first has not answered. The first attempt to land wins; one that
+/// fails waits for the other, so a quick refusal of the hedge cannot cancel
+/// a slow first attempt that would have landed, and the PUT fails only if
+/// both do. Only for an object whose name is its content: a second attempt
+/// that lands second is refused as already present, which the caller takes
+/// as the same outcome.
 async fn put_new_hedged(
     storage: &dyn StorageProvider,
     uri: &str,
@@ -13750,8 +13795,14 @@ async fn put_new_hedged(
         () = sleep(delay) => {
             let mut second = pin!(storage.put_atomic(uri, bytes));
             tokio::select! {
-                answer = &mut first => answer.map(|_| ()),
-                answer = &mut second => answer.map(|_| ()),
+                answer = &mut first => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => second.await.map(drop),
+                },
+                answer = &mut second => match answer {
+                    Ok(_) => Ok(()),
+                    Err(_) => first.await.map(drop),
+                },
             }
         }
     }
@@ -14705,6 +14756,9 @@ mod tests {
         held: &'static str,
         first: AtomicBool,
         puts: AtomicUsize,
+        /// How long the first PUT takes before it lands; `None` holds it
+        /// for ever. Later PUTs fail at once when it is set.
+        first_lands_after: Option<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -14725,8 +14779,14 @@ mod tests {
         ) -> Result<Option<String>, StorageError> {
             if uri.contains(self.held) {
                 self.puts.fetch_add(1, Ordering::SeqCst);
-                if self.first.swap(false, Ordering::SeqCst) {
-                    pending::<()>().await;
+                let first = self.first.swap(false, Ordering::SeqCst);
+                match (first, self.first_lands_after) {
+                    (true, None) => pending::<()>().await,
+                    (true, Some(after)) => tokio::time::sleep(after).await,
+                    // Any refusal but "already present", which the caller
+                    // would take as success.
+                    (false, Some(_)) => return Err(StorageError::NotFound { uri: uri.into() }),
+                    (false, None) => {}
                 }
             }
             self.inner.put_atomic(uri, bytes).await
@@ -14761,6 +14821,7 @@ mod tests {
             held: "hedged",
             first: AtomicBool::new(true),
             puts: AtomicUsize::new(0),
+            first_lands_after: None,
         };
         let reference =
             put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
@@ -14775,6 +14836,30 @@ mod tests {
             storage.inner.head(&reference.uri).await.is_ok(),
             "the hedge landed the object"
         );
+    }
+
+    /// A hedge that fails at once does not cancel a slow first attempt
+    /// that would land: the PUT waits for it and succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_hedge_waits_for_the_first_attempt() {
+        let dir = TempDir::new().expect("tempdir");
+        let storage = HeldFirstPutStorage {
+            inner: LocalFsStorageProvider::new(dir.path()).expect("provider"),
+            held: "hedged",
+            first: AtomicBool::new(true),
+            puts: AtomicUsize::new(0),
+            first_lands_after: Some(HEDGE_AFTER_BASE * 4),
+        };
+        let reference =
+            put_content_addressed(&storage, |hash| format!("hedged/{hash}"), b"bytes".to_vec())
+                .await
+                .expect("the first attempt lands");
+        assert_eq!(
+            storage.puts.load(Ordering::SeqCst),
+            2,
+            "the first, and a hedge that failed"
+        );
+        assert!(storage.inner.head(&reference.uri).await.is_ok());
     }
 
     #[test]
@@ -18226,7 +18311,8 @@ supertable:
                 vec![99, 1, 2],
                 "its own publish first, then the parked ones oldest first"
             );
-            queue.publish_followers(vec![1, 2], Ok(()));
+            lead.followers = vec![1, 2];
+            queue.publish_followers(&mut lead, &Ok(()));
             drop(lead);
             for follower in followers {
                 assert!(
@@ -18239,6 +18325,71 @@ supertable:
         drop(third);
         assert!(!queue.lock().publishing, "the queue is free after the lead");
         assert!(queue.lock().parked.is_empty());
+    }
+
+    /// A leader that unwinds after taking tickets on, before it answers
+    /// them, fails them as it failed rather than leaving them waiting: they
+    /// are off the parked list, so none of them could lead.
+    #[test]
+    fn a_leader_that_ends_unanswered_fails_its_followers_instead_of_stranding_them() {
+        let queue = AppendQueue::default();
+        let queue = &queue;
+        let mut lead = queue.reserve();
+        let mut second = queue.reserve();
+        match queue.lead_or_follow(&mut lead, parked_for_test(0)) {
+            Turn::Lead(run) => assert_eq!(run.len(), 1),
+            Turn::Published(_) => panic!("nothing was publishing"),
+        }
+        thread::scope(|scope| {
+            let follower = scope.spawn(|| {
+                let parked = parked_for_test(second.number);
+                match queue.lead_or_follow(&mut second, parked) {
+                    Turn::Published(result) => result.is_err(),
+                    Turn::Lead(_) => false,
+                }
+            });
+            while queue.lock().parked.is_empty() {
+                thread::yield_now();
+            }
+            // The leader takes the parked ticket on, then ends without
+            // answering it, as one that panicked mid-publish would.
+            let taken = take_run(&mut queue.lock(), parked_for_test(99));
+            assert_eq!(taken.len(), 2);
+            lead.followers = vec![1];
+            drop(lead);
+            assert!(
+                follower.join().expect("follower thread"),
+                "the follower fails rather than waits"
+            );
+        });
+        drop(second);
+        assert!(!queue.lock().publishing);
+        assert!(queue.lock().results.is_empty());
+    }
+
+    /// A follower sees the leader's error of the same kind, so the public
+    /// mapping reads it the same way whichever append led.
+    #[test]
+    fn a_follower_sees_the_leaders_error_of_the_same_kind() {
+        let queue = AppendQueue::default();
+        let mut lead = queue.reserve();
+        lead.followers = vec![7];
+        queue.publish_followers(
+            &mut lead,
+            &Err(BuildError::PermissionDenied("refused".into())),
+        );
+        assert!(matches!(
+            queue.lock().results.remove(&7),
+            Some(Err(BuildError::PermissionDenied(message))) if message == "refused"
+        ));
+        assert!(matches!(
+            BuildError::WriteContention.for_follower(),
+            BuildError::WriteContention
+        ));
+        assert!(matches!(
+            BuildError::NoDocsToBuild.for_follower(),
+            BuildError::Store(_)
+        ));
     }
 
     /// A ticket parked while another publishes leads itself once that
